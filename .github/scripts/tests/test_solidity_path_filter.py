@@ -16,7 +16,8 @@ CHANGES_JOB = WORKFLOW["jobs"]["changes"]
 PATH_FILTER_STEPS = {
     step["id"]: step["with"]
     for step in CHANGES_JOB["steps"]
-    if step.get("uses") == "dorny/paths-filter@v4"
+    # By action, not ref: the ref is a commit SHA that Dependabot moves.
+    if str(step.get("uses", "")).split("@", 1)[0] == "dorny/paths-filter"
 }
 DIRECT_OUTPUT = re.compile(r"\$\{\{\s*steps\.([\w-]+)\.outputs\.([\w-]+)\s*\}\}")
 BOOLEAN_OUTPUT = re.compile(

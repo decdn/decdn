@@ -105,15 +105,27 @@ repos:
 
       # --- workspace shape ---------------------------------------------
       # The Rust version lives in rust-toolchain.toml, Cargo.toml's
-      # rust-version and every dtolnay/rust-toolchain@… ref in the workflows,
-      # each read by a different tool. Dependabot bumps only the action refs,
-      # so without this CI quietly compiles on a different compiler from every
-      # developer. The `packaging` CI job is authoritative.
+      # rust-version, the `toolchain:` input of every dtolnay/rust-toolchain
+      # step and deploy/sponsord/Dockerfile's `rust:` tag, each read by a
+      # different tool. A Rust release arrives as Dependabot's bump of that
+      # `rust:` tag alone, and this holds the PR red until the other sites move
+      # with it. The `packaging` CI job is authoritative.
       - id: toolchain-pin
         name: rust version agrees across toolchain, manifest and workflows
         entry: .github/scripts/check-toolchain-pin.sh
         language: system
         files: '^(rust-toolchain\.toml|Cargo\.toml|deploy/sponsord/Dockerfile|\.github/(workflows|actions)/.*\.ya?ml|\.github/scripts/check[-_]toolchain[-_]pin\.(py|sh))$'
+        pass_filenames: false
+
+      # A workflow step runs with the job's token, so an action fetched from a
+      # moved tag, a tool at whatever version is newest, or a token left in a
+      # checkout's git config, hands it to code nobody reviewed. The
+      # `packaging` CI job is authoritative.
+      - id: workflow-hardening
+        name: workflows pin actions, images and tools and scope their tokens
+        entry: .github/scripts/check-workflow-hardening.sh
+        language: system
+        files: '^\.github/(workflows/.*\.ya?ml|actions/.*\.ya?ml|scripts/check[-_]workflow[-_]hardening\.(py|sh))$'
         pass_filenames: false
 
       # A member that restates `version` ships its own number; one without

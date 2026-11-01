@@ -20,7 +20,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: foundry-rs/foundry-toolchain@v1.9.1
+    - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
       with:
         version: v1.7.1
 
@@ -29,7 +29,7 @@ runs:
     # foundry.toml, which pins `solc_version`; the bare `svm-` restore-key still
     # recovers an older directory so only genuinely-missing versions download.
     - name: Cache solc (svm)
-      uses: actions/cache@v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.svm
         key: svm-${{ hashFiles('contracts/foundry.toml') }}
@@ -41,7 +41,7 @@ runs:
     # only changed files (large stable inputs like lib/ submodules are reused).
     - name: Cache forge build artifacts
       if: inputs.cache-profile != 'none'
-      uses: actions/cache@v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           contracts/cache

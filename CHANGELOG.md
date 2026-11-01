@@ -1,5841 +1,1684 @@
 # Changelog
 
-<!-- Maintained by hand, one entry per PR. `cargo release` does NOT rewrite
-     this file — git-cliff is used only to generate the GitHub release notes
-     (see .github/workflows/release.yml). Keep entries grouped by subsystem
-     as described under Conventions below. -->
-
-All notable changes to deCDN will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-SemVer applies once the first tag (`v0.1.0`) is cut.
-
-## Conventions
-
-- Entries group by **subsystem** inside each release (runtime, cache, gossip,
-  config, CLI, …) so operators can scan for what affects them.
-- **Wire-breaking** changes (ALPN bump, message-layout change per ADR 013)
-  are called out explicitly — operators cannot hot-upgrade across them.
-- **Config-breaking** changes name the field (rename, new required field,
-  default shift).
-- Security advisories cite the `RUSTSEC-YYYY-NNNN` id.
-- Commit prefixes follow [Conventional Commits](https://www.conventionalcommits.org/).
-
-## [Unreleased]
-
-Pre-release development — no versioned tag yet. Entries below track state
-since project inception and will roll into the first tagged release.
-
-### Changed (BREAKING)
-
-- **sponsord-onramp: `ONRAMP_DECDN_RELEASE` must be v0.3.0 or later
-  (#2683).** The installers run `decdn get` without `-o` for a bundle or
-  entry URI so that it keeps its overwrite and hidden-path guards. v0.2.x's
-  `decdn get` has no hidden-path guard (GHSA-rff9-95mx-xpw9), so the onramp
-  refuses to start with a pin below v0.3.0, a pre-release of it included.
-
-- **CLI: a whole-bundle `decdn get decdn:<hash>/` without `-o` pulls into
-  `./<hash>/` (lowercase hex), not `.`, and a pull into a default
-  destination refuses hidden entry paths (GHSA-rff9-95mx-xpw9).** Without
-  `-o`, a bundle lands in its own directory, and any landed path with a
-  `.`-prefixed component — an entry URI's landing name included — is
-  refused before any entry lands; the error names the first such path and
-  how many more there are, and `--overwrite` does not lift it. An explicit
-  `-o` names the directory, so it takes hidden paths unchanged. `--dry-run`
-  with a cached manifest applies the same refusal. `decdn quote` reads and
-  caches a bundle's manifest under the same `./<hash>/` default, and
-  without `-o` warns when a default `decdn get` would refuse the plan. When
-  `./<hash>` holds a file — the raw manifest a `decdn get decdn:<hash>`
-  without the trailing `/` writes — a whole-bundle `get` or `quote` without
-  `-o` stops before any network call instead of paying for a manifest it
-  cannot land. A resumed default-destination pull now finds its state
-  under `./<hash>/`. An older interrupted pull into `.` resumes with
-  `-o .`, but that turns off both the overwrite and the hidden-path
-  guards: use it only for a bundle you trust. Otherwise delete the old
-  `.decdn-partial/` and pull again into the new default.
-
-- **CLI: `decdn quote` opens no pool unless `--open-pool` (#2675).** A
-  bundle quote with no cached manifest fetches it with a small paid pull from
-  the buyer's open pool. With no open pool to reuse or adopt, the quote sends
-  no approve or `openPool`, exits non-zero, and names both ways on:
-  `--open-pool`, which lets the fetch open one at the working deposit
-  (10 USDC by default) and pay its gas, and `decdn pool open`. A script that
-  relied on `quote` opening the pool adds `--open-pool`. With or without the
-  flag, an open pool gets a `topUp` when it runs low or a node refuses it for
-  funds, which escrows USDC and pays gas. `decdn get` opens a pool as before.
-  - `decdn-client`: `DepositPolicy` carries `open:
-    decdn_client::session::PoolOpen` (`Allowed` or `Refused`), a required
-    field. Under `Refused`, a lane build with no open pool to reuse or adopt,
-    and a funding recovery step that would replace the run's pool, end the
-    command with `decdn_client::PoolOpenRefused` before any allowance or
-    `openPool`; `PoolOpenRefused::find` detects it in a pull's error.
-
-- **Config: `cache.node_to_node_pull_through_enabled` defaults by role
-  (#2603).** Absent, it resolves on for a node with no origin backend and off
-  for a node that configures one, the same derivation as
-  `cache.relay_foreign_namespaces`. It was off everywhere, so a node started
-  from `decdn config init` or the README refused every miss it could not fill
-  from its own backend. A node with no origin and no explicit value now buys
-  its misses from peers and spends USDC from its buyer wallet. It escrows
-  `blockchain.buyer_working_deposit_micro_usdc` (10 USDC) in a pool and
-  refills the pool toward it whenever it falls below low water, so its spend
-  is bounded by the wallet's USDC, not by the working deposit. Set the field
-  to `false` to keep the old behaviour.
-  - Admin wire: `StatusResponse` carries `pull_through`
-    (`PullThroughStatus { enabled, buyer_wallet_micro_usdc }`), and `decdn node
-    status` prints it on a `pull_through=` line that flags an empty buyer
-    wallet. The field is required, so a `decdn` CLI at this release reads
-    `admin_v1_status` only from a daemon at this release.
-  - A node with pull-through on logs a warning at each read of an empty buyer
-    wallet: at bootstrap, then once per hourly reclaim sweep.
-
-- **Admin wire: `EarningsResponse` carries `covered_from_unix` in place of
-  `ledger_since_unix` (#2624).** The field is the time the figures cover from:
-  on the daemon, when the settlement ledger started recording (a stamp in
-  `settle.redb`), or an earlier row's time; with `decdn node earnings
-  --address`, the first scanned block's time. It is a required `u64`, so a
-  `decdn` CLI at this release reads `admin_v1_earnings` only from a daemon at
-  this release. `decdn node earnings` prints `covered_from=<date>` in its
-  header and labels a period that starts earlier `(covered from <date>)`; the
-  `decdn dashboard` earnings panel always shows the date.
-
-- **Admin wire: `BuyerPoolSnapshot` carries `spent_micro_usdc`.** The field
-  is the pool's spend as the store knows it (every tracked lane plus the
-  spend other signers redeemed). It is a lower bound, so deposit less spend
-  is an upper bound on what every signer on the pool can still spend. The
-  field is required, so a `decdn` CLI at
-  this release reads `admin_v1_pools` only from a daemon at this release.
-  `decdn node pools` and `decdn pool list` gain a `SPENT` column between
-  `DEPOSIT` and `LANES`, which moves `LANES`.
-  - Why: `decdn dashboard` shows each pool's headroom, which the deposit
-    alone overstates on a shared pool.
-- **Admin wire: `LaneSnapshot` carries `unredeemed_micro_usdc` (#2598).** The
-  field is required, so a `decdn` CLI at this release reads `admin_v1_lanes`
-  only from a daemon at this release (`decdn node lanes` fails with "missing
-  field `unredeemed_micro_usdc`" against an older one), and the `node lanes`
-  text table gains an `UNREDEEMED` column between `OUTSTANDING` and
-  `DEPOSIT`, which moves the positional columns after it.
-- **Bundles: a manifest with an entry or chunk hash that does not parse is
-  malformed, and serves no entry (#2561).** `BundleManifest::parse` checks
-  the version first, then returns the new `MalformedManifest` error naming
-  the entry and the hash. `decdn get` of the bundle or of any one entry, and
-  the gateway's index and every entry, fail with it and say the publisher
-  must publish a fixed manifest; they give no raw-blob hint, since the raw
-  blob is the same broken JSON. Before, `get` of the bad entry failed, a
-  bundle pull failed only that entry's group and landed the rest, and the
-  gateway answered 404 for that entry while its index linked it.
-  `decdn-client`: `ManifestEntry::hash` and `ManifestChunk::hash` are
-  `[u8; 32]`, `ManifestEntry::new` and `ManifestChunk::new` take one, and
-  `bundle::format_hash` writes the `b3:<hex>` form. `ManifestEntry` and
-  `ManifestChunk` no longer implement `Deserialize`: `BundleManifest::parse`
-  is the way from bytes to entries. A bundle pull groups entries by the
-  parsed hash, so two spellings of one blob's hash (`b3:`, `0x` or no
-  prefix; upper- or lowercase hex) fetch it once.
-  `decdn get decdn:<hash>/ --dry-run --json` prints every entry hash in the
-  `b3:<hex>` form.
-- **`decdn-client` pools connections per node on one ALPN, on a map-chosen
-  runtime (#2475).** `Connections::with_options(endpoint, alpn, dial_runtime)`
-  builds a map whose every dial and connection driver runs on `dial_runtime`
-  (`None` dials on the caller's runtime), `Connections::alpn` names its ALPN,
-  and `Connections::get_or_dial` returns a `Lease` that says whether the call
-  dialled the connection or took one already pinned. A pull on a map's
-  connection that was pinned before the open and is closed under it redials
-  once; a fresh dial that fails is not retried. `PeerSource::open_span` opens
-  one range of a hash on the source's connection. `PeerSource::with_dial_runtime`
-  and the `dial_runtime` argument of `open_progressive_pull` do not exist: a
-  caller that pulls on a runtime it drops afterwards opens its pulls through a
-  map with a dial runtime, and a map-less open dials on the caller's runtime.
-- **`decdn-protocol`: `ProbeResponseExt::consistent_with` takes the signed
-  `&ProbeResponseBody`, not `has_blob` alone (#2471).** The rule keys on
-  `body.hash`: for `EMPTY_ROOT` (new constant, the BLAKE3 hash of zero bytes)
-  the coverage must be empty and `has_blob` alone says whether the node serves
-  the blob; every other hash keeps `has_blob ⟺ non-empty coverage`. On the
-  wire, a node signs `has_blob: true` for the empty root, which an older
-  requester rejects as malformed. The fix is under Fixed.
-- **`decdn-client`: `BundleOutcome::replaced` is a `Vec<PoolReplaced>`
-  (#2519).** It lists every pool replacement the pull made, in order, a
-  second-pass replacement too. Iterate it where code matched the `Option`.
-  `BundlePuller::replacements` lists the puller's every replacement, a
-  manifest fetch's and a cancelled pull's included, and
-  `RecoveryGate::replacements` does the same for one gate.
-- **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` return
-  an `UnrecordedEscrow` beside the outcome (#2515).** `open_pool` returns
-  `(OpenedPool, UnrecordedEscrow)` and `top_up` returns
-  `(ToppedUpPool, UnrecordedEscrow)`. The `UnconfirmedEscrows` handle keeps a
-  mined transaction pending until the caller resolves the guard:
-  `recorded()` once its record or credit commits, or `untracked(err)` once it
-  fails, which holds the escrow as untracked before it releases the pending
-  entry. A guard dropped unresolved leaves the transaction pending. A caller
-  that passes no handle can drop it. An `openPool` whose receipt holds no
-  `PoolOpened` event is now held as untracked by `open_pool` itself.
-- **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` take a
-  `receipt_timeout: Option<Duration>` (#2433).** `Some` bounds the receipt
-  wait. A lapse returns `OpenUnconfirmed` / `TopUpUnconfirmed` with the tx
-  hash, because the transaction may still mine. `None` waits until the receipt
-  arrives or its read fails. The CLI passes
-  `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) to both. The node passes it
-  to both as well, and settles an unconfirmed open or top-up against the chain.
-  `open_pool` also refuses to send while the `UnconfirmedEscrows` it is given
-  already holds an open, and fails with that `OpenUnconfirmed`.
-- **Admin/CLI: a lane's `counterparty` is its pool owner, not its voucher
-  signer (#2484).** `admin_v1_lanes` filled `LaneSnapshot.counterparty` with
-  the lane signer, so every `decdn get` lane (signed by a key derived for its
-  data dir) and every `--capability` lane showed that key instead of the
-  wallet that funds the pool. The node now names the owner (`getPool.owner`)
-  from its event-fed pool view, then from an owner cache, then with one bounded
-  `getPool` read per pool in neither, at most eight at once. A pool's owner
-  never changes, so the cache keeps every owner it reads. The first
-  `decdn node lanes` after a restart reads the owner of each carried-over pool.
-  The read is separate from the serve path's pool resolver, so a failed read
-  never makes the node refuse serves on that pool. **Wire-breaking:**
-  `counterparty` is `Option<String>`, `null` when the read fails or finds no
-  such pool. The node logs one warning per call that has failed reads, and
-  reads those pools again on the next call. It never falls back to the signer.
-  `decdn node lanes` prints `unknown` in that case, and `--json` prints
-  `null`. `voucher_signer` is unchanged. To find a client by its funding
-  wallet, match on `counterparty`; to find a lane by its signing key, match
-  on `voucher_signer`.
-- **SDK: an owned pool pays through `decdn_client::buyer_pool::OwnedPayer`
-  (#2468).** `OwnedPayer::for_store(owner, store)` pairs the owner key with
-  the lane key the store's salt derives; `OwnedPayer::sole(owner)` signs with
-  the owner key alone. `self_owned_lane_ctx` and `issue_self_capability` take
-  an `&OwnedPayer`, and `lanes::LanePayer::Owned` holds one.
-  `buyer_pool::open_pool` and `opened_from_receipt` no longer take a signer,
-  and `OpenedPool` drops its `ctx` and `capability`: build a lane on the new
-  pool with `self_owned_lane_ctx`. `bundle::Funding::SelfOwned` names its key
-  `owner`. `BuyerPoolStore` gains the required `lane_salt` method.
-- **CLI: `decdn get <decdn: URI>` replaces `decdn fetch` and `decdn bundle
-  pull` (#2449).** One `decdn:` URI names what to pull
-  (`adr/appendix-bundles.md` § `decdn:` URIs), and `get` routes it:
-  - `fetch --hash H -o file` is `get decdn:H -o file` (`-o -` streams to
-    stdout as before).
-  - `bundle pull --hash H -o dir` is `get decdn:H/ -o dir`.
-  - `get decdn:H/a/b.txt -o dir` pulls the one entry whose manifest path is
-    `a/b.txt`, matched exactly, to `dir/a/b.txt`.
-  - `--namespace N` is `?ns=N` in the URI.
-  - `bundle pull -i <manifest file>` has no replacement: publish the manifest
-    (`origin import` writes it) and pull it by hash.
-  - The bundle flags (`--include`, `--exclude`, `--select`, `--jobs`,
-    `--max-lane-streams`, `--overwrite`, `--dry-run`, `--json`) are an error
-    on an entry URI with `-o -`, and the entry filters are an error on an
-    entry URI. On a blob URI they are an error too, except `--dry-run`, and
-    `--json` with `--dry-run`.
-  - `decdn:H/` on a blob that is not a manifest fails with a hint to drop the
-    trailing `/`. `decdn_client::bundle::BundleManifest::parse` returns a
-    typed `NotAManifest` for that case.
-- **`decdn_client::buyer_pool::open_pool` and `top_up` take an `escrows`
-  handle (#2418, #2491).** The argument before `receipt_timeout`,
-  `Option<&UnconfirmedEscrows>`, holds the `openPool` or `topUp` from before
-  its submit until the caller resolves the returned `UnrecordedEscrow`
-  (#2515). Pass `None` when nothing can drop the
-  future or its error. `UnconfirmedEscrows::pending` returns
-  `EscrowUnconfirmed` entries (`Open` or `TopUp`).
-  `BundlePullerBuilder::unconfirmed_escrows` hands a bundle pull the same
-  handle. The fix is under Fixed.
-- **Buyer-store API: delegate lanes (#2435).** `BuyerPoolStore` gains three
-  required methods, `delegate_lanes`, `advance_delegate_progress` and
-  `rebase_delegate_progress`, so an implementor outside the workspace must add
-  them. In `decdn-client`, `ProgressWrite::apply` takes a `WatermarkRow` (the
-  owner's pool row, or the delegate lanes of a deployment) in place of the
-  owner address, and no longer takes a separate pool id: the lane key carries
-  it.
-- **Buyer metrics (#2405).** A lane-seed refusal now moves
-  `decdn_node_pull_pool_open_failures_total` once, beside
-  `decdn_buyer_lane_seed_failures_total`, so the open-failure total counts
-  every cause. A dashboard or alert that reads the total now sees seed refusals.
-  A buyer row that vanishes while a lane seed is persisted now refuses the pull
-  and counts as a seed refusal; the pull no longer pays against a pool the store
-  does not record. A store read fault under the seed lock also counts in
-  `decdn_buyer_lane_seed_failures_total`.
-  `decdn_voucher_nonce_gaps_total` is removed: vouchers carry no nonce, and
-  nothing emitted it.
-- **The `decdn` CLI ships as a container image, and the `decdn-node` image
-  carries it too (#2398).** A release publishes two images, built as two stages of
-  one `Dockerfile` from the same signed Linux archives:
-  - `ghcr.io/decdn/decdn` / `decdn/decdn` (new): the CLI only, with `decdn`
-    as entrypoint. Mount `~/.decdn` at `/home/decdn/.decdn`. The name was
-    unused by any release; a local script still pinning it for the daemon
-    now gets the CLI.
-  - `ghcr.io/decdn/decdn-node` / `decdn/decdn-node`: the daemon as before,
-    plus `/usr/local/bin/decdn`, so `docker exec <container> decdn node
-    status` reaches the loopback admin port.
-  - Release assets are per image. `image-digest.txt` becomes
-    `decdn-node-image-digest.txt` and `decdn-image-digest.txt`; the SBOM
-    `decdn-<version>-sbom.spdx.json` becomes `decdn-node-<version>-sbom.spdx.json`,
-    and `decdn-<version>-sbom.spdx.json` now describes the CLI image. Each
-    file has its own `.asc`.
-  - `sign-release.sh`: `DECDN_DOCKERHUB_REPO` is the Docker Hub counterpart
-    of `DECDN_REPO` (default `DECDN_REPO`), and both Hub names derive from it
-    — set it to `decdn/decdn`, not `decdn/decdn-node`; the script refuses a
-    value ending in `-node`. The Docker Hub repository `decdn/decdn` must
-    exist before the next release.
-  - `sign-release.sh` checks every promoted repository without credentials
-    and refuses to publish while one is private. GHCR creates a package
-    private on its first push, so each package must be made public once.
-- **Pre-launch compatibility shims removed (#2367).**
-  - Admin wire: `admin_v1_drain` requires its `DrainRequest` parameter with
-    `wait_admin` set, and `admin_v1_evict` requires `dry_run`. A call without
-    them gets `-32602 Invalid params`, and a refused drain does not fire.
-    The positional wire form is `"params":[{"wait_admin":false}]`.
-    `decdn node drain --wait` still refuses to poll when another drain without
-    `wait_admin` fired first.
-  - Storage: both buyer tables move to `buyer_pool_state_v1` /
-    `buyer_pool_owner_index_v1` (record schema 1). **Existing buyer rows are
-    not read:** on first run the store reads as empty. A node re-adopts its
-    live pool from chain, and so does a `decdn fetch` / `bundle pull` client
-    whose store and keystore are its own. A client whose store or keystore sits
-    in a node's data dir does not adopt: its next buy opens a second pool, and
-    the old one keeps its deposit. Recover it with `decdn pool list --all`, then
-    `decdn pool close` and `reclaim`. The node no longer drops the
-    `capability_v1` / `capability_v2` tables from `lanes.redb` at open.
-  - Config: the startup warning for a set `DECDN_DELIVERY_CEILING` is removed.
-    `decdn node doctor` no longer suggests unsetting an environment variable.
-- **Monitoring-breaking: `monitoring/` moves to
-  [`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring).**
-  The four Grafana dashboards and `prometheus-alerts.yml` live in
-  `charts/decdn-node/files/monitoring/` there, and this repository no longer
-  ships them. The four `decdn-node` tests that checked the dashboards and
-  rules against the exporter are deleted, and nothing checks them in CI now.
-  `adr_registry_names_are_exported` still gates the ADR metric registry. Import dashboards and load alert rules from
-  the devops repository instead.
-- **`decdn-cache` network origins bind to the runtime they are built on
-  (#1675).** `HttpOrigin::new`, `HttpOrigin::new_with_user_agent`,
-  `HttpOrigin::parse`, `S3Origin::new` and `S3Origin::from_parts` capture the
-  current tokio runtime, and every request send runs there, so build them on
-  a runtime that outlives every fetch. Each fails outside a tokio runtime, so
-  a caller that built an `HttpOrigin` from synchronous code builds it inside
-  the runtime instead. `S3Origin::from_parts` returns `anyhow::Result<Self>`;
-  a caller adds `?`.
-- **Buyer pool rows keep an adopted pool's redeemed spend, and both buyer
-  tables move to `_v6` (#2292).** A row adopted from chain has no lanes, so
-  the pool's `totalRedeemed` is its only record of what other lanes paid
-  out. The row now stores it (record schema 4), so every later `decdn fetch`
-  and `decdn bundle pull` that reuses the row counts it, not only the run
-  that adopted the pool. A lane seeded from its on-chain watermark takes its
-  own share out of that amount, so the pool spend is the tracked lanes plus
-  what no tracked lane accounts for, and stays right as a seeded lane
-  advances. A node adopts its pool the same way, and its low-water refill
-  reads the same pool spend. **Existing buyer rows are not read:**
-  `buyer_pool_state_v5` / `buyer_pool_owner_index_v5` become `_v6`, so on
-  first run the store reads as empty, and a node or client re-adopts its live
-  pool from chain.
-
-- **`bundle pull --json` renames `deduped` to `reused` and adds `excluded`
-  (#2190).** `deduped` counted whole-file reuse only, so beside a
-  `range-dedup: spliced 12.7 GB` line a `0 deduped` count read as a
-  contradiction. The field, the counts line and the `whole-file dedup` line
-  now say `reused`, which pairs with `reused_bytes`. `excluded` counts the
-  entries that `--include`/`--exclude` dropped or `--select` deselected, so
-  every manifest entry appears in one count:
-  `(4 fetched, 0 linked, 12 skipped, 0 reused, 1 excluded, 0 failed)`.
-  Scripts that read `deduped` must read `reused`.
-
-- **Buyer pool rows carry the chain id beside the `PaymentPool` address, and
-  both buyer tables move to `_v5` (#2198).** The row tag was the contract
-  address alone, but the same deployer nonce gives the same `PaymentPool`
-  address on every chain, and `poolId = keccak256(owner, ownerPoolNonce)`
-  repeats there too. A node or client repointed at another chain with its data
-  dir intact therefore reused a row from the other chain as its own.
-  `BuyerPoolState` now carries a `Deployment` (chain id and `PaymentPool`
-  address, the type the seller store is stamped with, now in
-  `decdn-incentive`), and every path that checks the tag compares both: node
-  bootstrap, the node's pull hot path, and `decdn fetch`. The bootstrap and
-  reuse WARNs add `foreign_chain_id` and `configured_chain_id`. **Existing
-  buyer rows are not read:** `buyer_pool_state_v4` / `buyer_pool_owner_index_v4`
-  become `_v5` (record schema 3), so on first boot the store reads as empty and
-  both a node and a client re-adopt the live pool from chain. A deposit held
-  by an orphaned row is recoverable only on the deployment it was opened on.
-  `decdn pool list --json` and `admin_v1_pools` gain `chain_id`.
-  `decdn_client::buyer_pool::open_pool` takes the `Deployment` in place of the
-  voucher EIP-712 domain, and `BuyerPoolService::bootstrap` takes it in place
-  of the `PaymentPool` address and the voucher domain.
-
-- **`decdn fetch` and `decdn bundle pull` recover through one acquire loop,
-  and a blob's size is a hint (#2239; #2223, #2215, #2214, #2225, #2213,
-  #2218, #2230).** Both commands drive every holder of a blob from one loop.
-  A node that faults cools (2 s, doubling to 60 s) and returns when its
-  cooldown ends or it delivers a verified byte, so a holder that restarts
-  mid-fetch still finishes the fetch. The manifest fetch of a bundle shares the
-  same holder table and progress clock. A fetch stops on a fault only the user
-  can fix (a voucher rejection, an origin blacklist, no affordable holder, a
-  local disk fault), or when no verified byte arrives for the give-up window.
-  A terminal has no window; a script gives up after 10 minutes. The give-up
-  exits with code 75. A blob over `--max-blob-mb` ends only its own item. The
-  new `--give-up-after-secs` sets the window. Config-breaking, removed with no
-  alias: `--stall-timeout-ms`, `--unit-deadline-ms`, `--min-throughput-bps`,
-  `--multi-source-min-bytes`, `--multi-source` / `--no-multi-source` and
-  `--entry-retries`. A lane's fixed 10 s watchdog replaces the stall and
-  throughput floors. The size of a blob is now a hint. The first claim comes
-  from the nearest probe answer (or one holder's header, or the manifest
-  `size` of a bundle entry), every claim is clamped to `--max-blob-mb`, and
-  each leg verifies under the size its sender signs. A verified final chunk
-  proves the size. Until then the bound grows by `max(bound + 64 MiB, first
-  claim + 2 * verified bytes past it)` and shrinks when a leg proves less. A
-  disagreeing size no longer ends a fetch, and the client's size-consensus
-  rule is removed. A bundle entry whose blob differs from its manifest `size`
-  succeeds and prints `<path>: manifest says X bytes, the blob is Y bytes`.
-  Wire-visible: a node serves a range up to the blob's end and refuses
-  (`RangeNotSatisfiable`) only a start at or past the end, on every serve tier.
-  The client's ranged store is keyed by offset, not by size, so a partial
-  written under one claim resumes under another. A finalize whose whole-file
-  hash does not match fetches the blob once more before the item fails. One
-  command keeps one connection per node for all of its entries and lanes. When
-  a lane faults and no idle lane covers its remainder, a busy lane that covers
-  it takes one extra stream for it (#2231). Config-breaking:
-  `--max-lane-streams` takes 1 to 64; 0 and values above 64 are refused.
-  `decdn-client` SDK breaks: `PeerSource::new` and
-  `IngestStore::ingest_stream` take new parameters, `IngestStore` gains
-  `proven` and `set_bound`, `SourceSet::record_fault` takes the faulted
-  `LaneRange`, `ClientRangedStore::open` takes no size and
-  `ClientRangedStore::create` takes a bound hint. Removed:
-  `SignedSizeMismatch`, `NoSourceAgreesOnSize`, `DownloadTarget::size_signer`,
-  `Fault::WrongSize`, `SourceSet::mark_wrong_size`,
-  `SourceSet::set_size_signer`, `ClientRangedStore::discard` and
-  `ClientRangedStore::tree`. Added: `Connections`, `LaneWiden`, `LaneRange`,
-  `StreamCandidate::widen`, `Probed::total_bytes`,
-  `ClientRangedStore::{bound, proven, set_bound}`, `AcquireEnv::max_blob_bytes`
-  and the `Downloader::max_blob_bytes` and `Streamer::max_blob_bytes`
-  builders. ADR 039, ADR 005, ADR 037 and the bundles appendix describe the
-  behavior.
-- **`decdn-client` lanes carry what they hold while they stream (#2208).**
-  `RangeLane` gains `release: Option<LaneRelease>`, which the range driver
-  calls as each gap worker stops. `StreamCandidate` gains `lease: LaneLease`
-  and `SourceLane` gains `lease: Option<&LaneLease>`; the scheduler drops the
-  lease when that lane's worker stops. A caller that builds these structs
-  sets the new field (`None`, or `LaneLease::default()`).
-- **`decdn-client` dials on a caller-chosen runtime (#2185, #2475).**
-  `WarmConnection::connect` takes a `dial_runtime: Option<&Handle>` argument,
-  and a `Connections` map built with `with_options` dials every connection on
-  its own dial runtime; `None` dials on the caller's runtime. A caller that
-  pulls on a runtime it drops afterwards opens its pulls through a map with a
-  long-lived dial runtime, so every connection's QUIC driver outlives the pull.
-  `DialObserver` and `PeerSource::with_dial_observer` do not exist.
-- **An underpaying voucher gets an `Underpaid` rejection carrying the node's
-  watermark, and a diverged payer lane heals itself.** Wire-breaking:
-  `VoucherRejectReason::Underpaid` is appended as discriminant 14 and is
-  watermark-gated. A node used to answer a voucher that underpaid its span by
-  dropping the stream with no frame, so the payer saw
-  `frame I/O error: early eof`. The payer had already counted that voucher as
-  paid, because a voucher is committed once its send succeeds, and it saved
-  it. After that, every later voucher looked short to the node and the lane
-  was stuck for good, across restarts. The node now sends
-  `VoucherRejected { Underpaid, bundle }` with its last-accepted watermark.
-  The payer checks the bundle against its own signature and moves its ledger
-  down to it with `PoolLedger::rebase`, which waits for any voucher still
-  being sent. Each rebase starts a new ledger generation, and every voucher
-  proof carries the generation it was signed under
-  (`StreamProof::Voucher { generation }`,
-  `UpstreamVoucherRejected::proof_generation`). A rejection of a voucher from
-  an older generation is stale: the payer retries without moving again. A
-  rejection from the current generation rebases again. The payer saves the
-  rebased watermark once, through the new `BuyerPoolStore::rebase_progress`
-  (overwrite down to that watermark, then advance). Every later save is a
-  monotone advance again. The node does the same for the pools it pays from:
-  `record_progress` takes the rebase point. A bundle-less `Underpaid` on the
-  node's pull leg is ruled `OurLocalFault` rather than a dead lane. ADR 003 §
-  Voucher withholding and ADR 005 § `VoucherRejected` semantics describe the
-  behaviour.
-- **Buyer pool rows are scoped to their `PaymentPool` deployment, and the
-  buyer table moves to `_v4` (#2087).** `PaymentPool.openPool` derives
-  `poolId = keccak256(owner, ownerPoolNonce)` — no contract address, no chain
-  id — and a fresh deployment restarts that nonce at zero, so the same owner's
-  Nth pool carries a byte-identical id on every deployment. A persisted row was
-  therefore ambiguous across a redeploy, and worse than ambiguous: once the
-  owner's nonce walked back over the tracked id, the row named an existing,
-  unrelated pool, and the node resumed lane progress the live pool had never
-  redeemed against — paying a provider for bytes it never delivered.
-  `BuyerPoolState` now carries `payment_pool`, every path that reuses a row
-  checks it (node bootstrap, the node's pull hot path, `decdn fetch`), and the
-  node drops a foreign row at bootstrap. **Both buyer tables move from `_v3` to
-  `_v4`, which orphans every row written by an earlier binary** — including
-  rows for pools on the configured contract. Those read as an empty store on
-  first boot, and both a node and a client re-adopt the live pool from chain
-  (see the client-adoption entry under Fixed). A
-  deposit held by an orphaned row is recoverable only against the contract it
-  was opened on, and the bootstrap warning names that address. `payment_pool`
-  is now surfaced by `decdn pool list --json` and `admin_v1_pools`.
-
-- **CLI: `decdn fetch` and `decdn bundle pull` refuse a `decdn-node` data dir
-  they were not pointed at (#2082).** `decdn pool` already refused to escrow
-  into a daemon's data dir (#2078), but these two opened the client store on
-  the same resolved `data_dir` with no such check — and the keystore defaults
-  to that dir too, so on a node host they opened a client pool under the
-  **node's own operator address**. The daemon's stranded-pool report then names
-  a pool a human may be fetching against, and its adoption path can take that
-  pool over, putting two independent voucher watermarks on one lane. A human
-  buying on a node host is a legitimately separate client, so the rule is
-  weaker than `pool`'s: `--data-dir <node dir>` on the command line is accepted,
-  while arriving there implicitly — `identity.data_dir` from
-  `~/.decdn/node.toml`, which is the node's dir on a node host — is refused.
-  Scripts that ran a bare `decdn fetch` on a node host must add
-  `--data-dir <client dir>` (the usual intent) or name the node's dir
-  explicitly. The refusal runs before the keystore prompt. Recorded in
-  [ADR 012](adr/012-client.md) beside the store-split paragraph, where the
-  asymmetry was previously an omission rather than a decision.
-
-- **CLI: `decdn pool` refuses to write a store a `decdn-node` daemon owns
-  (#2078).** Every store-backed `pool` subcommand — `list`, `open`, `top-up`,
-  `close`, `reclaim`; `assign` touches no store — used
-  `<data_dir>/buyer-pools.redb`, the *client's* store. A daemon keeps its buyer state in `<data_dir>/buyer.redb`, so
-  on a node host the CLI read and wrote a different file than the node it was
-  pointed at — and `Database::create` manufactured that file where none existed.
-  A data dir containing any of the daemon's store files (`buyer.redb`,
-  `lanes.redb`, `settle.redb`, `checkpoint.redb` — the whole set, because the
-  buyer store is exactly the file a reset loses) is now recognized as a
-  daemon's:
-  `pool open` and `pool top-up` refuse (they escrow USDC into a store the node
-  never reads, which is exactly the stranded deposit #2075 exists to prevent);
-  `close --all` and `reclaim --all` refuse (they enumerate from chain by keystore
-  address, so they would close the pool the daemon is paying from right now);
-  `close --pool` and `reclaim --pool` still run their on-chain leg — the stranded
-  pool recovery path — but no longer report a no-op local `forget` as a clean
-  close, naming the daemon row they could not touch instead. `pool list` routes to
-  the daemon (see Added) and prints `store=<path>` above the table, so `pools=0`
-  names the file that produced it. `pool list --json` gains `store` and `source`
-  fields instead; read `source` before the pool objects, because the two stores
-  emit different shapes (`deposit_usdc` as a decimal string and lowercase
-  addresses from the client store, `deposit_micro_usdc` as a number and EIP-55
-  addresses from the daemon). `decdn node pools` names the admin URL it asked.
-  Scripts that ran `pool open` against a node config must stop: the daemon opens
-  and tops up its own pool from `blockchain.buyer_working_deposit_micro_usdc`.
-
-- **Cache: `Origin::fetch_range` is now the data-only `Origin::fetch_range_data`
-  (#2065).** The outboard comes from `Origin::fetch_outboard`, read once per fill.
-  A custom `Origin` that overrode `fetch_range` must implement both methods;
-  overriding only one silently disables range pulls. `CacheEngine::origin_encode_range`
-  is now the streaming `CacheEngine::origin_range_wire`.
-- **Node: every authorized `cdn/client/v1` cache miss — whole blob, bounded range,
-  resumed tail — routes through the two-leg serve-miss spine when its origin (or a
-  window provider) is serviceable (#2060).** The buffered `try_range_pull_through`
-  tier and `CacheEngine::pull_through_range` / `RangePullOutcome` are deleted: the
-  spine signs `StreamResponse` before the first origin draw and never holds a
-  requested span in memory. The whole-blob fallback tiers (local populate, buffered
-  pull-through) remain for origins with no `{H}.obao4`. `FillRegistry::claim`
-  attaches a request to a live fill only when the request starts at or behind that
-  fill's paid frontier (#2062).
-
-- **Contracts: the Balancer V3 buyback venue is deleted; Uniswap V3 is the sole
-  canonical TOKEN/USDC POL and buyback venue (#2043).** `BuybackBurnerBalancerV3`, the
-  three `IBalancerV3*` interfaces, `IBalancerV3PoolCreation`, `IPermit2` (Permit2 was
-  Balancer-only — Uniswap V3 pulls `tokenIn` through a direct ERC20 allowance), and the
-  four Balancer test/fork suites are gone. The abstract `GuardedBuybackBurner` base and
-  the single concrete `BuybackBurnerUniswapV3` subclass stay, so a second venue is a
-  subclass-and-deploy change rather than a dispatch layer.
-  - `BuybackVenueLib` loses the venue enum, the venue-string parser and the seed/venue
-    drift machinery; it holds `steadyShares()`, `requireUniswapWiring` and
-    `deployUniswapBurner`. `BuybackActivation` carries one unconditional
-    `UniswapVenueParams uni` field in place of the `uni`/`bal` pair, so
-    `VenueFieldsCrossWired`, `VenueFieldsUnwired` and `PoolSeedVenueMismatch` go with
-    the choice they guarded. `_assertVenueSeedMatches` is now `_assertPoolSeedDerived`.
-  - Deploy and activation drop the `BUYBACK_VENUE` and `BALANCER_POOL` env vars along
-    with the Balancer Vault/Permit2 ones. `contracts/foundry.toml` drops the `arbitrum`
-    and `sepolia` `[rpc_endpoints]` aliases, and the `solidity fork test` job drops the
-    matching `ARBITRUM_RPC_URL` and `SEPOLIA_RPC_URL` secrets: one fork suite remains,
-    `GenesisBuybackActivation.fork` on `ARBITRUM_SEPOLIA_RPC_URL`, superseding the
-    four-suite counts in the fork-RPC and #1090 entries below.
-  - [ADR 018](adr/018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)
-    is rewritten around a full-range 50/50 Uniswap V3 TOKEN/USDC pool, dropping the
-    80/20-weighted decision and the Balancer-specific Vault/Permit2/Router indirection.
-    The venue-neutral MEV stack (TWAP floor, `minTokenOut`, private-RPC routing,
-    per-epoch cap) is unchanged.
-  - POL keeps its 10% allocation, but the pool is not seeded at genesis: the DAO funds
-    the USDC side from its 10% `FeeRouter` revenue share and creates the pool at its own
-    discretion, then deepens it from a Timelock reserve and the buyback glidepath (each
-    swap adds USDC to the pool, so seed depth is a floor that glides up). The
-    [ADR 026](adr/026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc) pre-seed table
-    therefore drops the POL-seed earmark into operator infrastructure subsidies —
-    ~85% subsidies, ~10% incident contingency, ~5% audits and legal.
-
-- **Runtime: OTLP span export is always compiled into `decdn-node`; the `otlp`
-  cargo feature is gone (#2039).** Release archives and the Docker image now honour
-  `observability.otlp_endpoint` / `--otlp-endpoint` / `DECDN_OTLP_ENDPOINT`
-  instead of ignoring it with a stderr warning. With no endpoint set, no OTel
-  layer is installed. Building with `--features otlp` is now an error.
-  - The endpoint must be `http://host:port`: config resolution rejects
-    `https://` (the exporter has no TLS), a missing port, a path, query or
-    fragment (an OTLP/HTTP `…:4318/v1/traces` URL is the wrong protocol),
-    userinfo (including an empty `@`), and surrounding whitespace. Rejections never echo any part of the
-    endpoint. An exporter that fails to build aborts start-up.
-  - New counter `decdn_otlp_export_failures_total` and warning alert
-    `DecdnOtlpExportFailing` surface a dead or wrong collector. The counter
-    counts failed export batches only: queue-full drops and partial-success
-    rejections are not counted. While a collector is down, the SDK also logs
-    each failed batch at `error` under the `opentelemetry_sdk` target.
-  - A failed run logs its (redacted) error before the exit-time flush, so the
-    error is exported with the run's last spans.
-  - A SIGHUP that changes a restart-required `[observability]` field
-    (`log_format`, `metrics_port`, `metrics_bind`, `admin_port`,
-    `otlp_endpoint`) now logs one `warn` per changed field, comparing the
-    resolved value (CLI/env > file) with startup. An unchanged field stays
-    silent, where it previously logged an `info` notice on every reload.
-  - Queued spans flush on exit, on both the clean and the failed-run path. The
-    flush runs on its own thread and the exit path waits at most 6 s for it.
-  - The OTel layer drops `h2`/`hyper`/`hyper_util`/`tonic`/`tower` spans, so
-    `trace` level cannot feed the export connection back into itself.
-
-- **Contracts: `OriginAssignment` drops its `ContentBlacklist` coupling; the
-  routing consumer filters instead (#2032).** The seat set is a routing hint, so
-  blacklist filtering moves to the party that acts on it. Removed from
-  `OriginAssignment`: the `contentBlacklist` pointer and `setContentBlacklist`
-  setter, the `ContentBlacklistUpdated` event, the `addOrigin` blacklist guard,
-  and the `ContentBlacklistNotSet` / `OperatorBlacklisted` / `OperatorNotBlacklisted`
-  errors. The `contentBlacklist_` constructor argument is gone, which erases the
-  post-deploy `setContentBlacklist` wiring step (ADR 016 § Post-Deployment
-  Initialization renumbers 1–6) and the deployment-window bootstrap. The
-  `IContentBlacklistOriginView` interface is deleted (`OriginAssignment` was its
-  only user; `SlashJudge`'s `IContentBlacklistHashView` is unrelated and
-  unchanged).
-  - **Renamed** (an indexer should map these rather than treat them as removed):
-    `pruneBlacklistedOrigin(uint256,address)` → `pruneInactiveOrigin(uint256,address)`,
-    now keyed on `CapacityBond.isActive(operator) == false` (reverts
-    `OperatorStillActive`) rather than on blacklist membership — it reaches every
-    exit from the active set, including an operator-level blacklist, which ejects
-    from `CapacityBond`. Event `BlacklistedOriginPruned` → `InactiveOriginPruned`
-    (same topic shape: `(uint256 indexed, address indexed, address indexed)`).
-  - The node's chain-backed origin directory now drops any `getOrigins` operator
-    on its live blacklist deny-set (the origin ∪ operator union already synced
-    for the delivery gate), applied at resolve time so a governance blacklist
-    takes effect without waiting out the `getOrigins` cache TTL. ADR 011
-    § Interaction with ContentBlacklist and ADR 016 are rewritten to match.
-- **CLI/runtime: a keystore password source is chosen by PRESENCE, not by being
-  non-empty, so an empty password is a password.** `DECDN_KEYSTORE_PASSWORD` set
-  to the empty string, and a `--keystore-password-file` that is empty after the
-  one stripped trailing newline, each supply the empty string instead of falling
-  through to the next source. A password file that does not EXIST is now the
-  only file case that falls through; a path that exists but cannot be read — a
-  directory, a permission denial, non-UTF-8 contents — is a hard error, as is an
-  env var set to non-UTF-8. Precedence is unchanged: env var, then file, then an
-  interactive prompt on a TTY.
-  - Why: the old rule could not tell "the operator chose no password" from "the
-    source is absent", so a deliberately empty password — what tools that write
-    a keystore with no password produce — was unreachable from any
-    non-interactive source, and an empty file silently fell through to a prompt
-    a systemd unit can never answer.
-  - Two operator workflows change. `export DECDN_KEYSTORE_PASSWORD=` no longer
-    means "unset"; `unset DECDN_KEYSTORE_PASSWORD` does. And a mistyped
-    `--keystore-password-file` no longer fails at the read: on a terminal it
-    prompts, and headless it fails with `no keystore password source available
-    (...)`, which now lists every source that fell through — including the path
-    that was tried — rather than only the last one.
-  - `decdn fetch`, `decdn bundle pull`, and `decdn pool` gain
-    `--keystore-password-file` (env `DECDN_KEYSTORE_PASSWORD_FILE`), the flag
-    the operator commands and `decdn-node run` already had. Without it those
-    commands had only the env var and a prompt, so a headless client had no file
-    source to make empty. `decdn key-gen --keystore-password-file` also
-    tilde-expands its argument now, matching every other path flag — an
-    unexpanded `~/pw.txt` would otherwise fall through silently.
-  - `decdn key-gen` warns on stderr when it CREATES a keystore under an empty
-    password. The file stays encrypted and stays `0o600`, but a password anyone
-    can guess leaves that mode and the `0o700` data dir as the only protection.
-    Creation only — warning on every load would fire on every fetch.
-
-- **CLI: `decdn key-gen` renames its password-file flag from `--password-file`
-  to `--keystore-password-file`**, matching the spelling every other command
-  uses. The env var `DECDN_KEYSTORE_PASSWORD_FILE` is unchanged; scripts or
-  runbook steps that pass the old flag must be updated.
-
-- **config: `cache.tinylfu.sketch_bytes` now carries a floor of 16384 bytes,
-  enforced whichever cache policy is selected.** A value below the floor is a
-  load-time error on both `decdn node` startup and `decdn config validate`; the
-  node never clamps it, because a clamp hides the mistake. The check does not
-  consult `cache.eviction_policy` / `cache.admission_policy`, and for this knob
-  that is not merely defensive: the default `cache.serve_economics.policy =
-  "margin"` builds the same frequency sketch, so `sketch_bytes` sizes a live
-  estimator on a node running the default `lru` / `always` selectors. Operators
-  with an explicit `[cache.tinylfu] sketch_bytes` below 16384 must raise it
-  before upgrading. See [ADR 040 § Configuration
-  surface](adr/040-cache-policy.md).
-
-- **`ProbeResponse` and `StreamResponse` unsigned fields moved into trailing
-  extension structs; `cdn/dht/v1` gains the same seam.** `ProbeResponse` is now
-  exactly `{body, slash_sig}` with `total_bytes` in a new `ProbeResponseExt`;
-  `StreamResponse` is `{body, slash_sig}` with `error` in `StreamResponseExt`.
-  Both are encoded and decoded two-phase, via `encode_probe_response` /
-  `parse_probe_response_ext` and the `StreamResponse` twins. `dht.rs` gains
-  `FindValueResponseExt` and `StoreRequestExt` (both empty today) plus
-  `encode_find_value_response` / `encode_store_request`, wired through the DHT
-  handler's write and read paths so all three ALPNs carry the seam ADR 013 §Tier 1
-  requires — and so the DHT half is exercised rather than merely reserved.
-  - Why: postcard fills no defaults for absent trailing fields, so an `Option<T>`
-    appended to an existing struct fails to decode against an older sender. A
-    separately-encoded extension is the only way to add an unsigned field without
-    an ALPN bump. The ADRs already described these fields as trailing; the code
-    had them embedded between `body` and `slash_sig`.
-  - Why now rather than later: only the *relocation* is wire-breaking and so
-    pre-launch-only. The extension mechanism itself could be added at any time —
-    every reader decodes with `take_from_bytes` and already tolerates trailing
-    bytes. What this buys is a frozen base that is exactly signed content plus its
-    signature, with every unsigned field in one place.
-  - `StreamResponse::validate` no longer checks `ok`/`error` agreement, because it
-    can no longer see `error`. That rule moved to `StreamResponseExt::validate`,
-    which takes `ok`; a receiver must call both.
-  - No contract change: `SlashJudge` is coupled to the signed field set, not the
-    wire encoding — the challenger re-encodes the four signed fields as a fresh
-    ABI blob, so an unsigned extension is invisible on-chain.
-
-- **`cdn/client/v1`: `ChunkData` frame size is now the sender's choice.** The
-  protocol bounded a payload at 1,024 bytes; it now bounds it only as non-empty,
-  with the framing layer's `MAX_CHUNK_FRAME` (one `CHUNK_BYTES` payload) as the
-  effective ceiling.
-  `decdn_protocol::CHUNK_SIZE` and `MessageValidationError::ChunkTooLarge` are
-  removed. A serving node coalesces to `payment.frame_target_bytes` (new, default
-  1 MiB) instead of chopping at 1 KiB, so a served MiB costs about one frame
-  rather than 1,024 — the per-frame validate/copy/encode/write cost per byte
-  served drops by the same factor. The 1,024-byte value was vestigial: it tracked
-  iroh-blobs' internal granularity, which ADR 038 superseded with 16 KiB bao chunk
-  groups verified independently of frame boundaries.
-  - Wire-breaking in the new-sender-to-old-receiver direction: an old receiver
-    rejects an oversized frame. Both sides change here, per the pre-launch policy.
-  - A frame never crosses a `CHUNK_BYTES` payment boundary. The old 1 KiB size got
-    that property for free (1,024 divides 1 MiB); at any other size it has to be
-    arranged, or the payer settles residuals with a signed voucher per frame
-    instead of releasing one hash-chain preimage per interval.
-  - New config key `payment.frame_target_bytes` (restart-required, like the rest
-    of `[payment]`), valid in `1..=1048576`. Node-local and never negotiated:
-    nothing on the wire carries it, and the serve loop clamps each frame both to
-    the payment-chunk boundary and to the credit window's remaining room. One
-    payment chunk is the ceiling because a frame never crosses a boundary; a
-    larger value is rejected rather than silently ignored.
-
-- **Container image renamed to `decdn-node`, and now published to Docker Hub as
-  well as GHCR.** `ghcr.io/decdn/decdn` becomes `ghcr.io/decdn/decdn-node`, and
-  the same image is published as `decdn/decdn-node` on Docker Hub. The image
-  runs the daemon, so it is not named after the repository. No release had
-  been cut under the old name, so nothing existing breaks. The repository
-  name `decdn` now belongs to the CLI image (see the container-image entry
-  above).
-  - The mirror is a manifest copy, not a second build: `sign-release.sh` uses
-    `docker buildx imagetools create`, which copies the manifest bytes verbatim,
-    so both registries serve one identical digest and the existing GPG signature
-    over the image's digest file covers both. The script re-reads every tag on
-    both registries and refuses to publish the release if any resolves to a
-    different digest. The digest file records the GHCR reference.
-  - New env overrides: `DECDN_SKIP_DOCKERHUB=1` (tag on GHCR only) and
-    `DECDN_DOCKERHUB_REPO` (meaning as in the container-image entry above). No new Actions secret — the mirror happens on the
-    maintainer's machine at signing time, keeping "no publish credential in CI".
-- **`TERMS.md` and `TERMS_README.md` moved from the repo root to
-  `crates/cli/`.** The terms text is embedded by `decdn-cli` with
-  `include_str!`, which cannot reach outside its own package; from the root it
-  was unreachable in a published `.crate` and `cargo install decdn-cli` would
-  have failed to build. The file's bytes are unchanged, so the on-chain
-  `currentTermsHash` preimage and the hash lock in `terms.rs` are unaffected.
-  The out-of-band verification command becomes
-  `cast keccak 0x$(xxd -p -c1000000 crates/cli/TERMS.md)`.
-
-- **ABI-breaking: `OriginAssignment` replaces propose/ratify with publisher
-  vetting plus instant origin seating (#1491).** Origin authorization used to
-  couple two decisions in one flow — a publisher proposed a whole operator set
-  and governance ratified it after a timelock — so every routine add needed a
-  governance vote and re-validated the already-serving origins. Governance now
-  vets the publisher **wallet** once; the vetted publisher then seats and unseats
-  origins for its own namespaces itself, one operator at a time, effective in the
-  transaction that carries them.
-  - **Removed, with no replacement:** `proposeAssignment`,
-    `activateAssignment`, `cancelAssignmentProposal`, `getPendingAssignment`,
-    and the events `AssignmentProposed` / `AssignmentProposalCancelled` /
-    `AssignmentActivated`. Seating is still evented — `OriginAdded` replaces it,
-    as a per-operator delta rather than a whole-set activation.
-  - **Added:** `requestVetting()`, `cancelVettingRequest()`,
-    `grantVetting(address)`, `setPublisherVetted(address,bool)`,
-    `isVettedPublisher(address)`, `getPendingVetting(address)`, and
-    `addOrigin(uint256,address)` — the single "origin seated" path. New events:
-    `OriginAdded`, `VettingRequested`, `VettingRequestCancelled` (the publisher
-    withdrawing its own request), and `PublisherVetted` — which also closes any
-    pending request, since `grantVetting` and `setPublisherVetted` both clear one
-    while fulfilling or revoking it.
-  - **Renamed** (an indexer migrating off the old topics should map these rather
-    than treat them as removed): `revokeAssignment` → `removeOrigin`,
-    `pruneBlacklistedAssignment` → `pruneBlacklistedOrigin`,
-    `assignmentTimelock` / `setAssignmentTimelock` → `vettingTimelock` /
-    `setVettingTimelock` (same 24h–14d bounds, same 3-day default — it now delays
-    vetting, not any assignment). Events follow: `AssignmentRevoked` →
-    `OriginRemoved`, `BlacklistedAssignmentPruned` → `BlacklistedOriginPruned`,
-    `AssignmentTimelockUpdated` → `VettingTimelockUpdated`.
-  - `IPublisherRegistryOwnership` gains `namespaceCount(address)`, which
-    `requestVetting` reads to reject a caller that owns no namespace.
-  - The node's origin-directory watcher follows the renamed events; its read
-    semantics (authoritative `getOrigins` re-read, fail-closed retry, no replay)
-    are unchanged. ADR 011 § Origin Assignment Authority and ADR 016 are rewritten
-    to match; the ADR 009 governable-parameter row is now "Publisher vetting
-    timelock".
-- **CLI-breaking: `decdn publish assign` is instant and per-operator, and gains
-  two sibling subcommands (#1491).**
-  - `publish assign <ns> <op…>` now sends one `addOrigin` per operator instead of
-    a single `proposeAssignment`, in the order given, stopping at the first
-    failure. Its receipt changes accordingly: the `ready_at` and `replaced_prior`
-    fields are gone, `status` is `seated` / `partial` / `failed` / `unknown` /
-    `dry_run` instead of `proposed_pending_dao`, and the JSON gains an
-    `origins: [{operator, tx, state}]` array listing **every** requested operator
-    with what happened to it (`seated`, `reverted`, `not_attempted`, or
-    `in_flight`). A run that stops part-way prints its receipt before the error,
-    so the operator can see which seats landed; `in_flight` marks a transaction
-    that was broadcast without a readable outcome and must be checked rather than
-    blindly re-sent.
-  - **New `publish request-vetting`** — the one governance-gated step; prints the
-    `ready_at` the vetting timelock elapses.
-  - **New `publish revoke <ns> <operator>`** — unseats one authorized origin.
-  - `request-vetting` and `revoke` report the same status vocabulary as `assign`
-    where it applies: `dry_run`, `failed` (nothing reached the chain), `unknown`
-    (broadcast, but the receipt could not be read — check the printed tx before
-    retrying), and the per-command success label.
-- **Config-breaking and CLI-breaking: `blockchain.buyer_deposit_micro_usdc` is
-  split into two knobs (#1497).** The buyer path now opens a channel small and
-  graduates it, so the single deposit knob becomes a pair. There is **no alias**:
-  `[blockchain]` is `deny_unknown_fields`, so any existing config file carrying
-  the old key fails at load with an unknown-field error until it is migrated.
-  - `blockchain.buyer_initial_deposit_micro_usdc` — the first-contact
-    `openChannel` lock. **Default 0.5 USDC (`500_000`), down from the old key's
-    10 USDC**: a channel now escrows 20× less at open, so an unproven provider
-    holds correspondingly less of the buyer's capital. Validated `> 0`.
-  - `blockchain.buyer_working_deposit_micro_usdc` — the target every `topUp`
-    refills toward. Default 10 USDC (`10_000_000`), matching the old key's
-    default. `0` disables top-up entirely; any other value must be
-    `>= buyer_initial_deposit_micro_usdc`.
-  - The `decdn fetch` flag `--deposit-micro-usdc` is likewise **renamed with no
-    alias** into `--initial-deposit-micro-usdc` / `--working-deposit-micro-usdc`;
-    the old spelling is now rejected as an unexpected argument.
-  - Operator impact beyond the rename: because channels open at 0.5 USDC, a
-    *first-contact* pull is bounded by what that deposit buys (~500 MB at ADR
-    003's ceiling rate) until the channel graduates. `decdn fetch` recovers
-    in-flight by topping up mid-transfer and resuming at the paid frontier; the
-    daemon's node-to-node pull and `decdn bundle pull` graduate only on reuse,
-    so an oversized *first* pull on those paths can now fail where a 10 USDC
-    open previously succeeded. Raise `buyer_initial_deposit_micro_usdc` if that
-    matters for a given deployment. See
-    [ADR 003 § Deposit Economics](adr/003-payments.md#deposit-economics).
-
-- **Deploy-script-breaking: `DeployConfig` and `BuybackActivation` changed shape
-  (#1090, #1175).** Both are `BaseProtocolDeploy` structs, so only out-of-tree
-  callers that construct them by hand are affected — no contract ABI, config
-  file, or CLI surface changes, and a `DeployProtocol` run with an unchanged
-  environment produces the same deploy it did before. The written manifest does
-  change shape: `deployments/<chainId>.json` gains an `externalDeps.bootstrapMultisig`
-  key, which matters to anything parsing it.
-  - `DeployConfig` gains `bootstrapMultisig` (read from the new optional
-    `BOOTSTRAP_MULTISIG` env var). Unset/zero keeps today's behaviour exactly:
-    `DecdnGovernor` is seated as the `TimelockController`'s proposer at deploy,
-    so DAO voting is live immediately.
-  - `BuybackActivation`'s 17 flat fields regroup into the venue-independent `guard`,
-    the venue-derived `seed`, and the venue-scoped `uni` / `bal`. The flat layout let a
-    Balancer field be set under `venue == UNISWAP` and silently dropped;
-    `_activateBuyback` now rejects both halves of that mistake —
-    `VenueFieldsCrossWired` for a field on the unselected venue, `VenueFieldsUnwired`
-    for a required field missing on the selected one (a Balancer activation without
-    its Vault otherwise ships a burner that can never swap while already receiving
-    30% of protocol revenue). `PoolSeed` additionally records the venue it was
-    derived for, since the 80/20-vs-1:1 seed weighting means a mismatched pair
-    mis-anchors the genesis pool silently (`PoolSeedVenueMismatch`).
-  - `BalancerVenueParams` nests `BuybackVenueLib.BalancerWiring` rather than
-    restating five of its fields, and the guard band is
-    `GuardedBuybackBurner.GuardParams` rather than a fourth copy of the same shape.
-
-- **Monitoring-breaking: `monitoring/` no longer ships rules and panels that
-  could never fire (#1513).** Eleven `decdn_*` series referenced by the
-  reference alerts and dashboard were never exported by any node. Nothing in CI
-  compared the two, so each shipped as coverage while being permanently silent.
-  Both files now reference only live series, enforced by a new
-  `monitoring_selectors_are_exported` test.
-  - **Renamed:** `decdn_peer_table_size` → `decdn_gossip_peer_table_size`
-    (exporter field `gossip_peer_table_size`). This revives
-    `DecdnPeerTableThin`, which has never been able to fire, and fixes the
-    "Peer table size" dashboard panel. **Any forked dashboard or alert file
-    needs the same edit.**
-  - **Alerts deleted:** `DecdnBlacklistSyncLagWarning`,
-    `DecdnBlacklistSyncLagCritical`, `DecdnBlacklistVersionBehind`,
-    `DecdnBlacklistVersionFarBehind` (on `decdn_blacklist_sync_lag_seconds` /
-    `decdn_blacklist_version_behind`, neither emitted — the blacklist watcher is
-    unimplemented; `DecdnBlacklistWatcherStalled` is the real coverage), and
-    `DecdnHashMismatchAppearing` (on
-    `decdn_streams_failed_total{reason="hash_mismatch"}`). Delivery hash
-    mismatch is genuinely unmetered — a real coverage gap, now recorded in
-    `docs/runbook.md` rather than papered over with a rule that cannot fire.
-  - **Alert replaced:** `DecdnHighStreamErrorRate` →
-    `DecdnServeInternalErrorRate`. The old rule divided
-    `decdn_streams_failed_total` by `decdn_streams_{failed,completed}_total`;
-    none exist. There is no serve-attempt counter to build a ratio from, so the
-    replacement is an absolute rate on
-    `decdn_serve_stream_rejected_internal_error_total` — the one refusal reason
-    that means the node itself is at fault rather than the client.
-  - **Panels changed:** "Blacklist sync lag" → "Blacklist watcher tick age";
-    "Throughput (served vs received)" now reads
-    `decdn_cache_bytes_returned_total` / `decdn_cache_pull_through_bytes_total`
-    (whose ratio is the origin-egress amplification factor) instead of
-    `decdn_bytes_{served,received}_total`; "Probe responses by result" and the
-    p50/p95/p99 "Probe fan-out latency" panel are replaced by one probe
-    request-rate + probe-cache hit/miss panel (the exporter registers no
-    histograms at all, so no quantile panel is buildable today); "Stream
-    failures by reason" is dropped as redundant with the real serve-refusal
-    panel, which gains an `internal error` series; the payments panel drops its
-    settled-channel and vouchers-signed series for
-    `decdn_voucher_nonce_gaps_total`.
-
-- **Phantom-announcement offense retired; probe holds are now best-effort.**
-  `SlashJudge` adjudicates two offenses instead of three. The
-  announce-then-fail-to-deliver ("phantom announcement") offense is gone: it
-  punished an availability miss, and enforcing it required the node to withhold
-  truthful `has_blob` answers under load, which a probe flood could weaponize
-  into a network-wide availability blackout.
-  - **ABI:** `submitPhantomChallenge(address,bytes32,bytes,bytes,bytes,bytes,bytes32)`
-    is removed, along with the `NotPhantom()` error. `ISlashJudge.OffenseType`
-    drops its leading `Phantom` variant and **renumbers**: `RateManipulation`
-    `1 → 0`, `Blacklist` `2 → 1`. The ordinal is durable — it is persisted in
-    `SlashEscrowLib.SlashRecord.offenseType`, emitted in both (non-indexed)
-    `Slashed` events, and folded into the `evidenceHash` preimage that keys
-    `usedEvidenceHash` and `commitments`. `SlashAppeal` is offense-agnostic and
-    needs no migration. `InterfaceFreeze.t.sol` now pins the ordinals, since
-    selectors are invariant under a reorder.
-    - **Migration:** any consumer decoding `offenseType` off-chain — including
-      the `decdn node slashes` admin RPC field `offense_type` — must be
-      updated. A pre-existing on-chain record or log with `offenseType == 1`
-      meant `RateManipulation` and now decodes as `Blacklist`; `2` no longer
-      names an offense. Re-deploy rather than upgrade in place.
-  - **Rate manipulation now requires `stream.ok == true`.** A signed refusal
-    cannot overcharge on a delivery it declined, so a refusal is inert as
-    evidence and a node may sign `ok: false` freely — under either remaining
-    offense (blacklist violation requires a served claim).
-  - **Probe behaviour (observable on the wire).** Presence, not a guaranteed
-    hold, governs `has_blob`. Under hold-budget exhaustion or a stake-lane
-    reservation the node now answers `has_blob: true` and forgoes only the
-    eviction hold, where it previously answered `has_blob: false`. Such a blob
-    stays LRU-evictable, so a pull that loses the race costs one wasted round
-    trip. `max_probe_holds = 0` still answers `has_blob: false`, but only for
-    store-backed content — origin-servable content takes no hold and is
-    advertised regardless. Peer selection will now pick nodes that previously
-    excluded themselves.
-  - **Monitoring-breaking:** `decdn_slash_evidence_exposure_total` and its
-    `DecdnSlashEvidenceExposure` alert are deleted (the series was documented
-    but never emitted, so no dashboard was ever populated by it). The
-    `decdn_probe_hold_unavailable_total{reason}` counter keeps its name while
-    two of its three reasons change meaning — `exhausted` and
-    `stake_lane_reserved` now record an advertised-without-hold probe rather
-    than a suppressed answer. Alert text and the runbook are updated
-    accordingly; review any custom rules built on them.
-- **`PaymentChannel.minDeposit` removed (#1515).** **ABI-breaking, not
-  config-breaking.** The network minimum-deposit parameter is gone: the
-  `minDeposit()` view and the `setMinDeposit(uint256)` governance setter no
-  longer exist (an integrator calling either now reverts on a missing selector),
-  the `MinDepositUpdated` event is gone (a subscriber filtering its topic sees
-  zero events, silently), and the `DepositBelowMinimum` error selector is
-  retired. `openChannel` now accepts **any non-zero deposit** and reverts
-  `ZeroAmount` on zero — both before the transfer and on the received balance
-  delta, so a fee-on-transfer token cannot shave a deposit to nothing. Because
-  the parameter no longer exists, any pending or scripted `setMinDeposit`
-  governance proposal is un-executable. `PaymentChannel` has a constructor and no
-  proxy, so this requires a **fresh deployment**; existing testnet instances must
-  be redeployed. The floor bounded nothing that is not already bounded — service
-  by the seller-side per-voucher ceiling (see the #1516 entry under Fixed),
-  channel spam by gas — and the client-side 10 USDC recommendation of
-  [ADR 003 § Deposit Economics](adr/003-payments.md#deposit-economics) is
-  unchanged. `blockchain.buyer_deposit_micro_usdc` kept its name, its 10 USDC
-  default, and its `> 0` validation at the time of this change; buyer paths
-  simply no longer read the contract to clamp up to a floor. (That knob was
-  subsequently split into `buyer_initial_deposit_micro_usdc` /
-  `buyer_working_deposit_micro_usdc` — see the two-tier deposit entry above.)
-  The internal `MIN_DEPOSIT_FLOOR` constant
-  bounded two different things — `setMinDeposit`'s own lower bound and the
-  delivery-*rate* floor. With the former gone it is renamed `MIN_RATE_FLOOR` to
-  match what it still does; same value, two remaining call sites (the constructor
-  and `setRateBounds`), no behaviour change.
-- **Log-replay start-block config knobs removed.** **Config-breaking:** the
-  three `[blockchain]` scan-floor fields — `origin_directory_from_block`,
-  `slash_judge_from_block`, and `content_blacklist_from_block` — are removed.
-  Every chain watcher now enumerates its state on chain and seeds the live tail
-  rather than replaying `eth_getLogs` history from a configured floor, so none
-  of the three is read anymore. Because `[blockchain]` uses
-  `deny_unknown_fields`, a config file that still sets any of them now fails
-  `decdn config validate` and node startup — delete the keys. There is no
-  replacement setting.
-- **Payment-channel funder and voucher signer are now separate roles.**
-  `openChannel` takes a third argument pinning the channel's `voucherSigner` —
-  the address every voucher signature is verified against, on all four
-  settlement paths (`closeChannel`, `disputeChannel`, `withdraw`,
-  `cooperativeClose`). It is fixed at open and has no setter. Passing the zero
-  address resolves it to `msg.sender`, so a funder that signs its own vouchers
-  keeps today's behaviour. `ch.client` keeps the funder role — it deposits and
-  tops up, receives the refund, owns the `channelId` nonce, and is the address
-  the ADR 011 compliance gates check — but its signature no longer authorizes
-  anything on its own.
-  - **ABI:** `openChannel(address,uint256)` →
-    `openChannel(address,uint256,address)`, so the **selector changes** and an
-    integrator built against the old ABI reverts on every open. `ChannelOpened`
-    gains a sixth parameter (`voucherSigner`), so **topic0 changes** — a log
-    subscriber still filtering the old event hash sees zero events and silently
-    registers no channels, which fails quietly rather than loudly. `getChannel`
-    returns a `Channel` tuple with `voucherSigner` inserted at index 3, so an
-    old-ABI consumer mis-decodes `provider`, `expiresAt`, `token`,
-    `disputeDeadline` and every field after them. All three must be upgraded in
-    lockstep with the deployment.
-  - **On-disk (runtime):** the node's seller channel-state record in
-    `<data_dir>/channels.redb` (`channel_state_v1`) goes to `schema_version` 3,
-    which appends the channel's pinned `voucher_signer` as a trailing segment.
-    The version — not the trailer's byte width — is what tells the decoder the
-    segment is there, so unknown trailing bytes on an older record can never be
-    misread as a signer address and silently move the voucher
-    signature-recovery target. Upgrade is transparent: a v1/v2 record hydrates
-    `voucher_signer` from the stored `client`, correct by construction because
-    those channels predate the funder/signer split and are self-signing.
-    **Rollback is not supported** — an older binary reading a v3 record raises
-    `UnsupportedSchema`, and the seller table is fail-closed, so node startup
-    aborts. Downgrading means restoring `channels.redb` from a pre-upgrade
-    backup.
-- **Blacklist-entry appeals removed (#1432).** `ContentBlacklist` no longer
-  carries a second appeal state machine on top of enforcement. The six appeal
-  entry points (`openBlacklistAppeal`, `fastTrackBlacklistAppeal`,
-  `rejectBlacklistAppeal`, `rejectAppealAsPerjury`,
-  `ratifyBlacklistAppealRemoval`, `reverseBlacklistAppeal`,
-  `cleanupExpiredBlacklistAppeal`), the `StandingPath` enum, the per-filer
-  rejection cooldown and perjury denylist, the interim-relief caps, and the
-  `setAppealBond` / `setRejectionCooldownWindow` governance knobs are gone.
-  Enforcement is untouched: adding hashes/origins/operators (global, regional,
-  emergency), the compliance window, emergency auto-expiry, regional-body
-  registration and suspension, and slashing for serving blacklisted content all
-  behave exactly as before. A wrongful entry comes off via `removeHashRegional`
-  (the issuing body) or a DecdnGovernor `removeHashGlobal` proposal; restitution
-  for a slash already taken remains `SlashAppeal` (ADR 028), now the protocol's
-  only appeal surface.
-  - **ABI:** the `ContentBlacklist` constructor drops `publisherRegistry_` and
-    `appealBond_`. `getHashEntry` and `IContentBlacklistHashView` lose the
-    `suspended` tuple slot — a node built against the old ABI mis-decodes the
-    entry and must be upgraded in lockstep with the deployment.
-    `HashSuspensionUpdated` and the seven `BlacklistAppeal*` events are removed,
-    as is the `IPublisherRegistryStanding` interface. `PublisherRegistry` itself
-    is unchanged; `OriginAssignment` reaches it through
-    `IPublisherRegistryOwnership`.
-  - **Deploy:** `BLACKLIST_APPEAL_BOND` is no longer read, and the
-    `ContentBlacklist` constructor no longer takes a token: with the appeal-bond
-    escrow gone it custodies no funds at all.
-  - **Size:** `ContentBlacklist` deployed bytecode drops 19,723 → 11,143 bytes.
-  - ADR 031 is archived to `adr/_history/`; ADR 011 § Blacklist Entry Appeals is
-    replaced by § Removing a Wrongful Entry. ADR 030's `REGION_STABILITY_WINDOW`
-    is retained — only its appeals-standing leg is cut, since the window also
-    forecloses a reactive blacklist-scope flip.
-- **Settlement-weighted bootstrap ranking removed (#1434).**
-  `FeeRouter.routeSettlement` no longer calls
-  `CapacityBond.recordSettlement(operator)` on every settlement and mid-channel
-  withdraw. Nothing consumed the resulting `SettlementRecorded` log: the
-  client's bootstrap ranker reads `getActiveNodes`, orders region-first, and
-  ranks by probe result, which is a strictly fresher signal than a historical
-  settlement record. An external indexer that wants settlement recency should
-  read `FeeRouter.Settled`, already emitted on the same path with the same
-  operator address.
-  - **ABI:** `CapacityBond.recordSettlement(address)`,
-    `SettlementRecorded(address)` and `SETTLEMENT_REPORTER_ROLE()` are removed;
-    `ICapacityBondReporter` is renamed `ICapacityBondEpoch` and narrowed to
-    `epochLength()`. No Rust binding referenced any of them, so nodes need no
-    change.
-  - **Deploy:** one fewer post-deploy `grantRole` and one fewer cross-contract
-    trust edge. `FeeRouter`'s `capacityBond_` constructor arg **stays** — it
-    backs the `bondEpoch == epochLength_` assertion that stops a mismatched
-    deployment mis-anchoring `DecdnGovernor` epoch arithmetic.
-  - **Size:** `CapacityBond` gains 231 bytes of EIP-170 margin (1,165 → 1,396 free).
-- **Advisory `deliveryCeiling` rate bound removed (#1441).** The enforced
-  `deliveryFloor` is unchanged and still gates settlement in
-  `_advanceClaimWatermark`. The ceiling enforced nothing — it appeared in no
-  `require`/`revert` on the settlement path — and asked a seller to self-clamp
-  its own advertised rate downward, which buys no on-chain safety. The absolute
-  upper bound remains the wire constant `MAX_RATE_PER_MB`, enforced in
-  `ProbeResponse` validation; it simply stops being governance-tunable.
-  - **Config-breaking:** `payment.delivery_ceiling` is removed, along with
-    `--delivery-ceiling` and `DECDN_DELIVERY_CEILING`. The TOML key and the CLI
-    flag both fail loudly (`deny_unknown_fields` / clap); a stale
-    `DECDN_DELIVERY_CEILING` in the environment cannot, so the node now logs a
-    startup warning naming it rather than ignoring it in silence. `[payment]` uses
-    `deny_unknown_fields`, so a TOML that still sets the key now fails startup
-    and `decdn config validate` rather than ignoring it. Delete the key; nothing
-    replaces it.
-  - **Governance bound tightened:** the floor is now capped at
-    `MAX_RATE_PER_MB` (10^12, the ADR 005 wire cap) rather than
-    `type(uint64).max`. Every value in the ~18-million-fold gap between them was
-    silently network-isolating — nodes raise every quote to the floor before
-    signing, so a floor above the wire cap makes every `ProbeResponse` and
-    `StreamResponse` undecodable to every honest peer and reverts essentially
-    every voucher at settlement, while the node's only local signal is a clamp
-    warning indistinguishable from a routine retune. The node now also refuses
-    to start against such a floor rather than serving into the void.
-  - **ABI:** `setRateBounds(uint256,uint256)` → `setRateBounds(uint256)`
-    (selector changes), `RateBoundsUpdated` drops `newDeliveryCeiling` (topic0
-    changes), `RateBoundsInvalid` drops its second parameter, `getRateBounds()`
-    returns a single `uint256`, and the `PaymentChannel` constructor drops
-    `deliveryCeiling_`. A node built against the old ABI mis-decodes the event
-    and must be upgraded in lockstep with the deployment.
-  - **API:** `decdn_node::rate_bounds::Bounds` is gone and `RateBounds` collapses
-    to a single atomic floor — `RateBounds::new` and `store` take one argument,
-    and `snapshot()` / `ceiling()` are removed. The `ArcSwap`-for-pair-consistency
-    machinery went with it: with one value there is no half-applied-retune state
-    to defend against.
-
-- **QUIC 0-RTT probe establishment removed (#1429).** `cdn/probe/v1`
-  connections always complete a full TLS 1.3 handshake before the request is
-  sent; no ALPN transmits application bytes as replayable early data. The
-  optimization saved one round trip, and only on a warm reconnection to an
-  already-probed peer, at the cost of a replay-safety surface no server-side
-  gate could enforce. TLS session resumption is retained — a client
-  reconnecting to a known node still skips certificate transmission and
-  signature verification, though the ECDHE key exchange still runs — and so is
-  stream multiplexing on open connections (ADR 005).
-  - **Resumption cache shrinks:** dropping the `max_tls_tickets` call with
-    `SESSION_TICKET_CACHE_SIZE` leaves the client-side `rustls` session cache
-    at iroh's default of 256 entries, down from 1000. That cache backs the
-    retained 1-RTT resumption, not just early data, so a node probing more
-    than 256 distinct peers between reconnections now re-handshakes in full
-    where it previously resumed. Re-tune with `Endpoint::max_tls_tickets` if
-    peer fan-out warrants it.
-  - **Config-breaking:** the `network.enable_0rtt` field is removed. Since
-    `[network]` uses `deny_unknown_fields`, a config that still sets it now
-    fails `decdn config validate` and node startup — delete the line. The
-    resulting behaviour equals the previously supported
-    `network.enable_0rtt = false`, so no other config change is needed.
-  - **Metrics removed:** `decdn_quic_0rtt_attempts_total`,
-    `decdn_quic_0rtt_accepted_total`, `decdn_quic_0rtt_rejected_total`,
-    `decdn_quic_session_ticket_cache_size`,
-    `decdn_quic_session_ticket_peers_dropped_total`. All were label-free, so
-    no dashboard query loses a dimension; panels referencing them go blank.
-    Separately, `decdn_probe_collection_latency_seconds` — specified in
-    `adr/appendix-observability.md` but never implemented — loses the
-    `outcome={0rtt_warm,1rtt_cold}` label it was planned to carry. No
-    deployed series is affected.
-  - **API:** `decdn_protocol::SESSION_TICKET_CACHE_SIZE` is gone, and both
-    `probe_once` requesters drop their 0-RTT switch and metrics-sink
-    parameters.
-- **Trusted-IP rate-limit exemption removed (#1440).** The `cdn/probe/v1`
-  and `cdn/dht/v1` three-layer limiters no longer support an allow-list that
-  bypasses the per-IP layer; every source IP is now bounded by that layer.
-  - **Config-breaking:** the `probe.rate_limit.trusted_ips` and
-    `dht.rate_limit.trusted_ips` fields are removed. Because both
-    `[probe.rate_limit]` and `[dht.rate_limit]` use `deny_unknown_fields`, a
-    config file that still sets either key now fails `decdn config validate`
-    and node startup — delete the key. If the exemption was providing needed
-    headroom, raise `per_ip_rate_per_sec` / `per_ip_burst` instead; that keeps
-    the layer's invariant that no source IP is ever unbounded. Note the
-    exemption never bypassed the per-peer or global layers, nor the always-on
-    `security.per_source_*` bucket in front of the probe path.
-- **`cdn/probe/v1` content-availability + slashing evidence (#318).**
-  `cdn/probe/v1` is now a content-availability query, not just a
-  latency/rate probe (ADR 005, ADR 014). Wire changes (same ALPN —
-  this establishes the v1 signed baseline, not a version bump):
-  `ProbeRequest` is now `{ hash, timestamp_us }` (was `{ nonce }`);
-  `ProbeResponse` is now a signed `{ body: { hash, has_blob,
-  rate_per_mb, timestamp_us }, total_bytes: Option<u64>, slash_sig }`
-  (was `{ nonce, measured_at_unix_ms, node_id, rate_per_mb }`).
-  `slash_sig` is a mandatory, non-empty EIP-712 secp256k1 signature
-  (65-byte EOA `r‖s‖v` form in the PoC, ADR 024 §Off-Chain ERC-1271
-  Verification); requesters reject
-  missing/zero-length or wrong-length signatures.
-  - **CLI** `decdn probe` now requires `--hash <BLAKE3>` (64 hex
-    chars, the `cache.pinned_hashes` form). `--json` keys changed:
-    removed `node_id`, `measured_at_unix_ms`, `nonce`; added `hash`,
-    `has_blob`, `total_bytes` (nullable), `timestamp_us`, `slash_sig`
-    (hex). `rate_per_mb`/`rtt_ms` unchanged.
-  - **Config** new required `blockchain.slash_judge_address`
-    (EIP-712 `verifyingContract` for `slash_sig`; no default — a
-    wrong/zero address silently breaks every signature); new optional
-    `blockchain.chain_id` (default 421614, Arbitrum Sepolia),
-    `cache.max_probe_holds` (default 256; `0` disables `has_blob:
-    true`), and `payment.delivery_floor`/`delivery_ceiling`
-    (PoC-local rate-bounds clamp; defaults `0`..`MAX_RATE_PER_MB` =
-    no-op). Env vars: `DECDN_SLASH_JUDGE_ADDRESS`, `DECDN_CHAIN_ID`,
-    `DECDN_MAX_PROBE_HOLDS`, `DECDN_DELIVERY_FLOOR`,
-    `DECDN_DELIVERY_CEILING`.
-
-- **Config** Origin backend selection moved into a tagged
-  `[cache.origin]` table (#437). The pre-existing flat
-  `cache.origin_url`, `cache.origin_path`, and `cache.decompress`
-  fields are removed; `CacheConfig` now carries
-  `#[serde(deny_unknown_fields)]` so operators with the old shape get
-  a clear "unknown field" error at config load instead of a silent
-  "no origin configured" surprise. Migration:
-
-  ```toml
-  # before
-  [cache]
-  origin_url = "https://origin.example/"
-  decompress = "auto"
-
-  # after
-  [cache.origin]
-  kind = "http"
-  url = "https://origin.example/"
-  decompress = "auto"          # optional; defaults to "auto"
-  ```
-
-  ```toml
-  # before
-  [cache]
-  origin_path = "/var/lib/decdn/origin"
-
-  # after
-  [cache.origin]
-  kind = "fs"
-  path = "/var/lib/decdn/origin"
-  ```
-
-  The same table also accepts `kind = "s3"` for the new S3 backend
-  (see the Cache entry below for the supported keys and provider
-  examples).
-- **CLI** `--origin-url` / `--origin-path` flags (and their
-  `DECDN_ORIGIN_URL` / `DECDN_ORIGIN_PATH` env vars) are removed
-  (#437). Origin selection is now config-only — the S3 backend has
-  too many fields (bucket, region, endpoint, credentials) to fit
-  cleanly on a command line, and keeping all three backends file-only
-  avoids the trap of a CLI-vs-TOML mismatch silently picking the
-  wrong backend.
-- **CLI** Split into two binaries (#421). The daemon is now
-  `decdn-node` (single subcommand: `decdn-node run [--config <path>]`);
-  `decdn run` no longer exists. The user CLI is `decdn` and gains
-  `node {peers,health,announce,drain,evict,reload}`, `key-gen`,
-  `config {init,validate}`, `probe` — all moved from the old fused
-  binary, no behaviour changes. Container image entrypoint becomes
-  `decdn-node`. Release archives ship two tarballs per target:
-  `decdn-node-${VERSION}-${TARGET}.tar.gz` (operators) and
-  `decdn-${VERSION}-${TARGET}.tar.gz` (publishers). See
-  [`adr/appendix-binaries.md`](adr/appendix-binaries.md).
-- **CLI** `decdn probe --json` `rtt_ms` field no longer carries
-  trailing zeros. Pre-#421 always emitted three decimal digits via
-  `{:.3}` (`12.500`); post-#421 the field is quantized to ms precision
-  but emitted as a JSON number, so significant trailing zeros are
-  dropped (`12.5`, `12.501`). Numerically identical to any JSON parser;
-  operator scripts that match a `\.\d{3}` regex must update to
-  `\.\d+`.
-- **Config** Speculative prefetch removed (#1396, #1399). The entire
-  `[prefetch]` config section is gone. Because `FileConfig` uses
-  `deny_unknown_fields`, a config that still carries a `[prefetch]`
-  table now **fails at startup** — and on `decdn node reload` — with an
-  `unknown field` parse error instead of being silently ignored.
-  Operators upgrading MUST delete any `[prefetch]` block from their
-  config. Content propagation now relies solely on reactive cache-miss
-  pull-through ([ADR 037](adr/037-regional-proxy-warming.md)) plus
-  explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
-
-### Fixed
-
-- **sponsord-onramp: the gate page tells a refused check apart from a service
-  fault (#2720).** The built-in page showed "Something went wrong. Please
-  refresh and try again." for every failed `POST /v1/fund` other than a `409`.
-  It now asks for a refresh on a `403` (the check refused the token), asks the
-  person to wait a minute on a `429`, and says the service has a problem on
-  any other status or a network failure, where a refresh does not help.
-  `docs/sponsord/operator.md` lists the statuses a custom gate page handles.
-
-- **Tests: three load-sensitive tests model the node and the planner exactly
-  (#2663, #2723).** `cli_bundle_pull_stripes_a_complement_across_two_holders`
-  seeds `a` on one holder, so the planner never splits it across both lanes
-  and duplicates its proof path. `over_cap_stream_is_reset_without_signing_a_response`
-  writes its second request in one `write_all` and accepts the cap-full
-  `STOP_SENDING` as the expected signal.
-  `throwaway_open_torn_down_before_real_open_still_serves` counts the
-  serviceability probe apart from the origin draws.
-- **Transport: iroh and noq stay at 1.3.0, and CI holds them there (#2585).**
-  noq-proto 1.4 closes a connection with "too many gaps in stream buffer"
-  once the reader falls ~2.4 MiB behind, so a paid pull dies mid-leg and the
-  node's credit-window bytes go unpaid. A lockfile refresh had moved iroh,
-  iroh-base, iroh-dns and iroh-relay to 1.4.1 and noq, noq-proto and noq-udp
-  to 1.4.0; all seven are back at 1.3.0, and the other updates stay. The
-  `packaging` CI job and the `iroh-hold` pre-commit hook now fail when
-  Cargo.lock resolves any of the seven to another version
-  (`.github/scripts/check_iroh_hold.py` holds the table). The hold lifts once
-  a noq release ships its quinn#2814 port (n0-computer/noq#866).
-- **Client: a stream that a lost connection, a stall or a cancel ends bills
-  its delivered tail when the lane resumes (#2718, #2722).** The node streams
-  up to one credit window ahead of the voucher that pays for it. Only a
-  funding refusal kept the delivered-but-unpaid span on the lane: any other
-  early end re-queued the missing bytes alone, and the next stream opened at
-  the delivered frontier, so the span was never billed. A QUIC connection
-  that closed mid-stream under load left about 2 MiB unpaid this way in
-  `cli_fetch_topup` and `cli_bundle_pull_range_dedup`. Now every early end
-  keeps the span owed, priced from the lane's settlement, so a voucher armed
-  when the connection dropped counts as paid. After a delivery fault or a
-  cancel, the missing bytes are queued again from the paid frontier, and one
-  stream bills the span and fetches the rest, so the proof path at the seam
-  is paid once. After a funding refusal, the span still bills in its own
-  stream first. A stream that re-bills a span and pays nothing past its start
-  queues the rest from the delivered frontier, so a source that keeps failing
-  at one point cannot stop progress. ADR 003 § Funding recovery states the
-  rule.
-- **Client: a fetch whose first lanes are still building runs no probe round
-  (#2677).** The acquire loop asks for a discovery when a missing range has
-  no holder to serve it. It judged that against running lanes only, so on
-  its first pass, with every lane still connecting or building, every range
-  read as uncovered. A peer-store fast-path fetch then read the registry and
-  probed every holder mid-transfer, although the store had routed it without
-  a probe. A range a lane still connecting or building covers now counts as
-  covered, so discovery runs only for a range no running or building lane
-  covers, or when no source can start. ADR 012 and ADR 039 § Source set and
-  selection state the rule.
-- **Client: the lane that answered the size open plans its first leg alone
-  (#2740).** A fetch with no size hint keeps the pull it opened for the size
-  on the lane that answered, for that lane's first leg to adopt. The lane
-  reached the acquire loop as a build, and the loop plans the work across
-  every build that has finished when it looks. When another holder's lane
-  built just as fast, the loop split a download between the two lanes. The
-  answering lane's first leg was then part of the blob, so it closed the kept
-  pull after the holder had written up to a credit window into it, and the
-  legs pulled those bytes again: a small blob was served twice. The loop now
-  starts a lane its provider built before the fetch
-  (`SourceProvider::built`) before it polls any build, so that lane is
-  planned alone and its first leg is the pull it keeps. ADR 039 states the
-  rule.
-- **Node: a recovery `topUp` whose nonce the redeemer took is sent again
-  (#2721).** The node signs its sellers' `redeemMany` and its buyer `topUp`
-  with one key. A redemption that mined at the nonce the `topUp` had read
-  made the `topUp` fail `nonce too low`. The settle proved from the chain
-  that nothing escrowed, but the funding recovery step took that as final,
-  so the node-to-node fetch failed. The funding task now sends a fresh
-  `topUp` at a later nonce, at most twice, while it keeps the top-up slot.
-  Every copy of the lost `topUp` was signed at the spent nonce, so none can
-  mine later, and the fresh one cannot escrow twice. Each retry ticks the new
-  `decdn_buyer_topup_nonce_lost_total` counter.
-- **CLI, client, node and sponsord: a transaction goes out with gas headroom
-  above its estimate (#2730).** `eth_estimateGas` prices a call at the pending
-  block's timestamp, and every wallet provider sent at that raw estimate.
-  `CapacityBond.declareMbps` and `deregisterNode` overwrite the operator's
-  last tier checkpoint in the same second, and push a fresh slot in a later
-  one, which costs about 22k gas more. So a `decdn node bond --mbps`, `unbond`
-  or `deregister` estimated in the second of the operator's last checkpoint
-  ran out of gas when it mined in the next second. The transaction reverted,
-  and the `unbond --all` hint wrongly blamed registration. A node's redeem
-  had the same exposure at an epoch roll: `FeeRouter` keys its byte counters
-  by epoch, so a redeem mined in a later epoch than its estimate writes two
-  fresh slots.
-  `decdn_client::provider::build_provider`, the node's buyer and seller
-  wallets and sponsord's treasury provider now fill gas with
-  `decdn_incentive::tx::GasHeadroomFiller`, which adds `GAS_HEADROOM` (50,000)
-  to an estimated limit. A caller-set limit goes out unchanged. Unused gas is
-  refunded.
-- **`decdn-e2e`: a fixture never releases a port before its child binds it
-  (#2729).** Parallel journeys no longer fail at bring-up with `Address
-  already in use`. `anvil` binds port 0 and the fixture reads the port from
-  its `Listening on` line. The daemon's admin and metrics ports and the
-  gateway and dashboard ports are held by a `ports::PortReservation`, a
-  `SO_REUSEADDR` socket that never listens, for the child's lifetime, a
-  `NodeFixture::restart` included. Linux hands a held port to no `bind(…:0)`
-  and to no `connect()`, and the child still binds it. The daemon's QUIC port
-  is a `ports::UdpPortClaim` below the kernel's ephemeral range, locked across
-  fixtures by a TCP socket on the same number. `free_ports` and the retry of
-  an anvil that died at startup are gone. The `decdn-node` anvil tests and the
-  `sponsord` binary anvil test hold their ports the same way.
-- **e2e: `NodeFixture` counts a health answer only from its own daemon
-  (#2738).** `wait_healthy` compares the `node_id` in `admin_v1_health` with
-  the key in the fixture's data dir. The admin port is picked free and released
-  before the daemon binds it, so a daemon from another test process can hold
-  it first. The wait then returned on that daemon's answer, and the journey
-  asserted against the wrong node: `g_node_04::global_blacklist_compliance`
-  saw a dry-run `evict` report `was_present: false` for a blob its node held.
-  The wait now keeps polling until its own daemon answers. If that daemon exits
-  first, the error names the node that held the port.
-- **`decdn-node` tests: `over_cap_accept_prunes_refilled_keyspace` holds on
-  a loaded runner (#2733).** The test fills 8 per-source buckets and expects
-  none to refill before the loop ends. A 1 ms refill gave the loop a 1 ms
-  margin, so a preempted loop lost a bucket to the over-cap sweep. The refill
-  is now 100 ms and the wait 400 ms.
-- **`decdn-e2e`: the G-NODE-07 iroh rotation stops the daemon before it
-  rotates (#2727).** The journey rotated with the daemon running, then
-  restarted it with SIGKILL. A pre-rotation voucher the hint path had not sent
-  yet then waited for the restarted daemon's next full redeem interval, past
-  the 90 s settlement poll. The journey now sends SIGTERM first, as the
-  runbook's "Stop" step does, so the final redeem sweep settles it.
-- **`decdn-e2e`: the bundle multi-source journey splits its large entry on the
-  first pull (#2741).** The entry was 640 KiB. Its probe round starts the
-  fetch at the first holder that answers, and that lane takes the whole blob.
-  The other holder joins a few milliseconds later, but ADR 039 splits no range
-  below `min_split_size` (16 MiB) for a late lane. So a pull split the entry
-  only when both holders answered before the fetch started (6 of 82 pulls in a
-  local sample), and the 90 s retry ladder sometimes ran out. The entry is now
-  64 MiB, so the late holder steals half of it.
-- **Client: a streamed fetch with no size hint keeps the pull it opened for
-  the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
-  fast path, or a gateway pull whose size lookup finds none), the client read
-  the size from a whole-blob open and primed that pull for the first leg. A
-  streamed drive's first leg is cut to the read-ahead window, so it never took
-  the pull. It closed the pull and opened offset 0 again, and the node had
-  already written into the closed pull for up to a round trip. The size open
-  of a streamed fetch now pulls the streamed drive's first leg, which the
-  drive adopts. A download still opens the whole blob. ADR 039 states the
-  rule.
-- **Client: a funding recovery step replaces a stored pool the chain has no
-  record of (#2665).** `getPool` on an unknown pool id returns a zeroed
-  struct: a zero owner, and the status `Open` (enum value 0). The step read
-  that as another owner's pool and tried a `topUp`, which reverts
-  `NotPoolOwner`, so the fetch ended "funding needed" behind an opaque revert.
-  On a full pool it settled on a pool that does not exist instead. The step
-  now opens a replacement, as for a closed pool, unless a run of the same
-  command opened the pool, topped it up, or read it on chain as this wallet's.
-  Such a pool reads as unknown only on a lagging RPC, and a replacement would
-  escrow a second deposit beside it. The step decides under the run's `topUp`
-  lock and refuses while a `topUp` of the command is unconfirmed. The run's escrow handle (`UnconfirmedEscrows`)
-  records the pools it saw live. ADR 003 § Funding recovery states the rule.
-- **Client: a fetch the node stops for a short deposit or a spent signer cap
-  bills its whole credit-window tail when it resumes (#2629).** When the
-  node's mid-stream solvency check stopped a stream with `PoolExhausted` or
-  `SignerCapExhausted`, the client rewound its last proof, although the node
-  had accepted it. The resumed stream re-sent that proof, drew
-  `AmountRegression`, and reseeded to the node's watermark. The reseed then
-  marked the whole delivered frontier paid, so the bytes delivered past the
-  node's watermark (up to one credit window) were never billed. The client now
-  rewinds a proof only when the reason refuses it
-  (`VoucherRejectReason::refuses_proof`, new in `decdn-protocol`). A reseed's
-  jump no longer counts as payment for the leg it interrupts, since it can be
-  the node's watermark from earlier blobs, and a stale heal keeps the leg's
-  anchor. The next leg re-delivers and bills what the leg's own vouchers did
-  not pay for.
-- **Client: a funding recovery top-up covers the pool's overdraft (#2629).**
-  The node's mid-stream solvency check reads the on-chain balance, which moves
-  only on redemption, and runs on a cadence, so a fast stream can sign
-  vouchers past the deposit before the check trips. The recovery step
-  topped up only toward the working deposit, and the node then redeemed the
-  overdraft out of that top-up and kept refusing the pool, so the fetch ended
-  "funding needed" with a funded wallet. The step now adds the overdraft (the
-  pool's spend past its on-chain deposit) to the top-up, taking the larger of
-  the recorded and the on-chain deposit so a lagging read invents none. When
-  the pool read fails, it takes the overdraft from the run's own lanes and the
-  stored deposit.
-- **Gateway: the first request for a raw blob has its length, `HEAD` and
-  `Range` too (#2645, #2616).** A raw blob that no pull on the gateway had
-  verified streamed with no `Content-Length`, ignored `Range`, and its
-  `HEAD` had no length. Before it answers such a blob, the gateway now
-  proves its size: it pays for the last chunk group under the first node's
-  size claim, and only the true size verifies a final chunk (ADR 039). The
-  proven size gives the response its length, admits it against the
-  allowance (402 when it does not fit), caps its pull and lets one `Range`
-  through (206, or 416 past the end). A proof costs at least one chunk group
-  (16 KiB and its proof) per blob of unknown size, counted against a public
-  gateway's allowance, a request dropped mid-proof included. A cold `HEAD`
-  pays for its proof too: it now waits through discovery and a paid open,
-  and answers as its `GET` would when the proof cannot run (402 once the
-  allowance is spent, 502 when no node holds the blob, 503 when the pool
-  cannot pay). A blob whose proof proves nothing (a claim whose last chunk
-  group is not the blob's last, a claim past `--max-blob-mb`, or every
-  holder fails it) still streams with no length; a node's claim never gives
-  one. `decdn-client` gains `Streamer::prove_size`.
-- **Gateway: a raw blob the gateway pulled whole answers with its length,
-  `HEAD` and `Range` (part of #2616).** `GET /<hash>` on the bare host and
-  `/_decdn/<hash>` on a site streamed with no `Content-Length` and ignored
-  `Range`, and a `HEAD` had no length, even for a blob the gateway had
-  already verified. A raw blob that a whole pull on the gateway verified now
-  gets `Content-Length` and `Accept-Ranges`, takes one `Range` (206, or 416
-  past the end), and is refused with 402 before its pull when it does not
-  fit the allowance, as an entry is; its pull is capped at that size. A
-  node's size claim is not used, since a claim below the real size would
-  end a short pull as a whole response; the size proof above (#2645) gives
-  the first request its length. `HEAD /_decdn/<hash>` on a site answered
-  404; it
-  now answers as the bare host does, and `HEAD` of a bundle or an entry
-  under `/_decdn/` redirects to its site.
-- **Client: a download adopts the stream it opened for the blob's size
-  (#2633).** A fetch with no size hint (the peer-store fast path, or a
-  pinned node whose probe gave no size) opened the whole blob to read its
-  signed size, then dropped the stream unread, after the node had already
-  written up to a credit window into it. The stream is now kept on its lane
-  for up to 2 seconds, and a download whose first leg is the whole blob
-  adopts it. Any other first leg (a resumed download's gap, a streamed
-  fetch's window) closes the kept stream before it opens its own, so the
-  node never holds the floor it reserved for both at once (#2644 tracks
-  streamed fetches). The peer-store e2e checks that
-  a fast-path download makes the holders write the blob's wire bytes once
-  and probe nothing.
-- **Gateway: a blob that is no bundle manifest is pulled once (#2478).** A
-  `/<hash>/` or `/<hash>/<path>` request for a blob over the manifest cap,
-  one whose bytes do not parse, or a malformed manifest answered 404 but
-  pulled, and paid for up to the manifest cap, again on every request. The
-  gateway now keeps up to 1024 such hashes for its run, and a repeat request
-  answers the same 404 with no pull; its raw-blob hint names the asker's
-  namespace. Each kept verdict holds at most 1 KiB of text, since a parse
-  error quotes the publisher's paths and hash strings. A pull that failed
-  upstream, on funding or on the allowance is not kept.
-- **Gateway: a repeat bare-hash pull on a pinned gateway sends no probe
-  (#2632).** A `decdn gateway` pinned with `--node-id` probed the node for
-  the size of every bare-hash pull, and above about 5 pulls per second the
-  node's per-peer probe bucket shed them, so those pulls fell back to the
-  header-only open. The fetch host now keeps the verified size of up to
-  4096 blobs it pulled whole, and a repeat pull takes it as the first size
-  claim. The gateway e2e checks that repeat pulls of verified blobs probe
-  nothing.
-- **Gateway: `/_status` counts a capability's pulls in flight (#2640).**
-  Each `pools.delegate_lanes` row gains `spent_micro_usdc` and
-  `bytes_delivered`: per lane, the larger of the stored watermark and the
-  live voucher ledger of a pull in flight, read before the store so a pull
-  that ends during the read is not lost. `decdn dashboard`'s "Spent of
-  cap" reads them and marks a capability with pulls in flight as live, so
-  a long pull no longer reads as nothing spent until it ends.
-- **Client: a pull pinned to one node takes its size from a probe, not
-  from a stream it drops unread (#2619).** A fetch pinned with `--node-id`
-  (`decdn get` of a blob or a bundle, or `decdn gateway`) read its first
-  size claim from the header of a whole-blob paid open, then dropped that
-  stream; `decdn get` of a bundle did so only for the manifest and entries
-  the manifest gives no size. The node wrote up to a credit window into
-  it first, 1 to 2 MiB per pull in the gateway e2e, and counted it in
-  `decdn_bytes_served_total`; there the node wrote 1.36 times the wire bytes
-  of the pulls. A known size is now the first claim: a manifest's entry
-  size, which the gateway also uses for the entries it serves. With no known
-  size, the fetch probes the pinned node once on `cdn/probe/v1` (2 s
-  timeout, no backoff on a shed probe, no wait for a direct path) and takes
-  the size it reports as the hint. The header open stays only for a probe that fails, does not
-  verify, or gives no size, such as a node that does not hold the blob yet.
-  A rediscovery of a pinned node probes nothing. The gateway e2e checks that
-  the node writes the wire bytes of its pulls and no more. The
-  observability registry names `decdn_bytes_served_total` as bao wire
-  bytes, the unit payment uses (content plus about 0.4% proof), including
-  frames a requester never pays for; the gateway appendix says how it
-  differs from `decdn_gateway_bytes_served_total`.
-- **Node: `decdn node lanes` / `admin_v1_lanes` report what each lane is owed
-  (#2337).** `LaneSnapshot.outstanding_micro_usdc` was the cumulative of the
-  last signed voucher only. A hash-chain lane pays with preimages, which move
-  only the verified frontier, so the field trailed the lane's claim by up to
-  one chain, and read `0` on a lane's first epoch even while the node redeemed
-  it. The field is now the lane's owed amount: the signed anchor plus the
-  verified chain frontier, the same claim the redeemer submits.
-  `settlement_eligible` is measured against that figure too, and its doc no
-  longer says it predicts the next redemption: the redeemer gates on the
-  unredeemed value per `redeemMany`, not on this per-lane bar.
-  `seconds_since_last_voucher` also counts preimages. The delegated-capability
-  e2e journey now checks that the node's owed figure stays within the
-  registered cap and that the chain pays exactly that figure.
-- **Node: an oversize `redeemMany` that gets a bare HTTP 413, or that reads
-  as possibly broadcast, is split in half (#2575).** The redeemer halved a
-  chunk only when the refused send's text named an oversize cause. A
-  gateway's 413 with an empty body (`HTTP error 413 with empty body`) never
-  matched, and a proxy that turns an upstream 413 into a 5xx made the send
-  possibly broadcast, which the split never saw. In both cases the chunk was
-  re-sent at full size on every sweep, and its lanes stayed unredeemed until
-  the operator lowered `blockchain.redeem_max_vouchers_per_tx`. The split now
-  reads the HTTP status as well as the text, and runs on a possibly-broadcast
-  send too: redemption is cumulative, so if the full chunk already mined, its
-  halves settle nothing more and cost gas only. The split warning carries the
-  error and `send_outcome` (`send_failed` or `maybe_broadcast`). The halved
-  send still counts into `decdn_onchain_tx_send_failed_total` or
-  `decdn_onchain_tx_maybe_broadcast_total`, but not into
-  `decdn_redemption_failures_total`; a split on every sweep means the cap sits
-  above the RPC's body-size limit. An oversize send that cannot be halved
-  further (one lane, or the split-depth bound) is a redemption failure, even
-  when it reads as possibly broadcast, and its warning names the cap. A
-  connection reset while the body uploads carries no size signal and still
-  does not halve.
-- **Node: every warning of a `redeemMany` or `reclaim` that did not land
-  names the sending account as `signer` (#2576).** A send with no tx hash
-  resolves only by comparing that account's pending and latest nonce
-  (`cast nonce <signer> --block pending` against `--block latest`), and the
-  warning did not name it.
-- **Node: a `redeemMany` or sweep `reclaim` send that fails with no tx hash
-  but may have broadcast is reported as possibly broadcast, not refused
-  (#2568).** The node's wallet providers already carried `SendLegLayer`, but
-  the seller's redeemer and the buyer's reclaim sweep read every failed send
-  as "nothing issued". A send request that times out, resets or gets an HTTP
-  5xx, and a send answered `already known`, `nonce too low` or `replacement
-  transaction underpriced`, now log that the transaction may be in a mempool.
-  Such a `redeemMany` counts into the new
-  `decdn_onchain_tx_maybe_broadcast_total`, not into
-  `decdn_onchain_tx_send_failed_total` or `decdn_redemption_failures_total`,
-  and still parks a hinted lane until a sweep finishes clean. The claims stay
-  for the next sweep either way: if the `redeemMany` mined, that sweep skips
-  the lanes it paid; if it is still pending, the re-send is an on-chain no-op
-  that costs gas only. A `reclaim` still counts into
-  `decdn_buyer_reclaim_failures_total`. Alert on the new counter: an operator
-  who alerts on `decdn_redemption_failures_total` no longer sees a send leg
-  that keeps failing there.
-- **Payments: the sponsord keeper re-sends a `topUp` whose submit returned
-  no tx hash once its nonce is vacant (#2572).** A hold on such a top-up
-  ended only when the treasury's confirmed nonce passed the nonce it was
-  sent with, which never happens on its own when the transaction was not
-  broadcast, so every further top-up waited for an operator's 0-value
-  self-transfers; a `topUp` whose hash the node did not know was held the
-  same way. The keeper now reads the pending nonce too for a top-up the
-  node shows no transaction of and, when the confirmed and pending nonces
-  both equal that nonce, re-sends the `topUp` at it and settles the hold by
-  that receipt; two transactions at one nonce cannot both mine, so the
-  re-send cannot escrow twice. A re-send that reverts `PoolNotOpen` ends
-  the hold, since the pool accepts no funds; any other failure is retried
-  next sweep. An operator steps in only when a transaction stays stuck at
-  the nonce, or an earlier nonce is unfilled: a 0-value self-transfer at
-  that nonce, priced above the stuck one, clears it.
-- **Payments: a send the RPC node answers with `nonce too low` or
-  `replacement transaction underpriced` is reported as possibly broadcast, and
-  an `openPool` or `topUp` that gets either is not sent again (#2562, #2565).**
-  A load-balancing RPC gateway that loses one backend's response and retries
-  the same signed bytes on a second backend gets `nonce too low` once the
-  first copy is sequenced, or `replacement transaction underpriced` while a
-  same-key transaction holds the nonce on that backend and the first copy can
-  still win it. `topUp` read either answer as a foreign nonce collision and
-  re-sent on a fresh nonce, and `openPool` read it as a rejection and released
-  its entry, so either could escrow twice. Both now return `TopUpUnconfirmed`
-  / `OpenUnconfirmed` at the nonce, which the node settles against the chain
-  and the CLI reports instead of retrying. A node whose seller redemption took
-  the nonce resolves the settle as "escrowed nothing" once that redemption
-  mines, and funds again on the next pull that finds the deposit below the
-  low-water mark; the settle reads the chain every 5 s meanwhile, where the
-  re-send cost a quarter second. Every other chain write reports both
-  answers as possibly broadcast too, as for `already known` (#2432): `pool
-  close` and `pool reclaim` warn that the tx may still mine, and so do
-  `publish`, key rotation, bond, register, appeal, and the USDC `approve`.
-- **CLI: `decdn gateway` answers 404, not 502, for a bundle with an entry
-  or chunk hash that does not parse (#2479, #2561).** The manifest is
-  content-addressed, so a bad hash never changes and nothing upstream
-  failed. The manifest is malformed, so its index and every entry answer 404
-  naming the bad entry, logged at info, and no pull for an entry starts. The
-  gateway caches only a manifest that parses, so each request pulls, and
-  pays for, the manifest again (#2478).
-- **Payments: a chain read that fails before a transaction is signed is
-  reported as rejected, not as possibly broadcast (#2431).** A wallet
-  provider reads the pending nonce, the gas estimate, the fees and the chain
-  id before it signs and sends; a timeout or a 5xx on one of those reads used
-  to be reported as a send whose outcome is unknown. The sending providers
-  (`decdn_client::provider::build_provider`, the node's wallet providers,
-  sponsord's treasury provider) now carry `decdn_incentive::tx::SendLegLayer`,
-  which marks a failure of the send request itself, so only that failure (or
-  an `already known` answer) reads as possibly broadcast. A send request the
-  gateway refused with a 4xx that carries `Retry-After` (a rate limit), and
-  one that never connected (a refused connection, a DNS or TLS failure), read
-  as rejected too. `pool close --all` /
-  `reclaim --all` count a pool whose reads failed as `failed`, `openPool` /
-  `topUp` hold no unconfirmed escrow for it, the USDC `approve` does not say
-  it may be pending, and `publish`, bond, register, appeal and key rotation
-  report it as `rejected`. An SDK host that builds its own provider for the
-  `decdn-client` senders must add the layer, or every transport failure reads
-  as "nothing sent".
-- **Payments: a send the RPC node answers with `already known` or `known
-  transaction` is reported as possibly broadcast, not rejected (#2432).** The
-  node returns it when it already holds the same signed transaction, for
-  example after a gateway retried the send on a second backend. `pool close`
-  and `pool reclaim` now warn that the tx may still mine, `--all` counts the
-  pool as unconfirmed, and `openPool` / `topUp` keep the unconfirmed escrow
-  record, so `topUp` holds it at its nonce. Every
-  other chain write reports it as possibly broadcast too: `publish` namespace,
-  seat and revoke statuses, key rotation (which keeps the parked key), bond,
-  register, appeal, and the USDC `approve`. A send with no tx hash now says
-  the transaction may be in a mempool, and the `approve` note says a
-  re-approve to the same value is harmless.
-- **CLI: a bundle pull lands no entry outside its output directory, and
-  applies `[client] region_allowlist` to every entry (#2439).** A manifest
-  path is checked for `..` and absolute components, but the write followed a
-  symlink in the entry's parent directories: with `out/link -> /elsewhere`
-  and an entry `link/file`, the pull wrote `/elsewhere/file`. The pull now
-  holds the output directory open and resolves each entry beneath that
-  handle (cap-std). Such an entry fails with a message that names the path;
-  when the escaping link already exists, it fails before its blob is paid
-  for. The rest of the pull goes on, and a fetched blob stays in
-  `.decdn-partial/` for a rerun. An entry already present behind such a link
-  is still skipped. A relative symlink inside the output directory still
-  works; one with an absolute target is treated as an escape. Each entry's
-  candidate sample now keeps to `region_allowlist` with the same widening as
-  a single fetch, and a list the peer store supplied during a registry
-  outage is not narrowed.
-- **DHT: a bonded peer that is offline costs a lookup one dial budget, once
-  per cooldown, not the 8 s round on every lookup that picks it (#2532).**
-  The registry seeds every bonded peer into every routing table, and a bond
-  does not say whether the node behind it answers. One such peer resolved an
-  address from the registry mirror, so every `FIND_VALUE` dial to it sent a
-  handshake that nothing answered, and the single 8 s exchange timeout ran
-  level with the 8 s round timeout: a third of the fleet's lookups waited the
-  whole round, and nothing recorded which peer it was. The DHT client now
-  bounds the connect and handshake separately at `DHT_DIAL_TIMEOUT` (2 s)
-  and fails them as a typed `DialTimeout`; the lookup marks that peer in the
-  routing table (`RoutingTable::mark_unreachable`), and this node's lookups
-  skip it for `DIAL_FAILURE_COOLDOWN` (5 min): the seed is the nearest peers
-  that are not skipped, a `closer_nodes` referral to a skipped peer is not
-  followed, and a dead peer reached only through a referral is marked too.
-  The peer stays in the table and in the
-  answers this node gives; an inbound request from it ends the skip. The
-  `dht_lookup` span records the `cooling` peers skipped, and
-  `decdn_dht_lookup_dial_timeouts_total` counts the dials that timed out
-  ([ADR 022 § Routing Table](adr/022-content-discovery.md#routing-table)).
-- **Node-origin: a DHT answer that names only the requester falls back to
-  the origin directory (#2534).** The serve-miss pull leg drops the node that
-  sent the request from its candidates, because a node never pulls from the
-  node it answers. The drop ran after discovery had chosen between the DHT
-  answer and the directory fallback, so when the requester was the hash's
-  only DHT provider (a partial holder asking for the blocks it lacks) the leg
-  ended with no provider and refused `NotFound` with
-  `source=dht discovered=0`, without reading the directory that lists the
-  origin. Discovery now drops the requester from both the DHT answer and the
-  directory list before it judges the fallback, so that answer reads the
-  directory and the origin fills the serve
-  ([ADR 022 § FIND_VALUE Flow](adr/022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)).
-- **Probe: a node advertises the empty blob, and a requester accepts the
-  answer (#2471).** The empty (0-byte) blob spans zero discovery blocks, so
-  its coverage bitmap is empty on every holder. The probe handler derived
-  `has_blob` from the bitmap and signed `has_blob: false` for a blob every
-  store holds and serves, and the requester's consistency rule
-  (`has_blob ⟺ non-empty coverage`) rejected a `has_blob: true` answer for it
-  as malformed. A client saw no holder, dropped the size hint, and opened a
-  paid lane for zero bytes; a node pulling through for the empty root found no
-  provider. Now the handler signs `has_blob: true` for the empty root when its
-  presence check passes, and `ProbeResponseExt::consistent_with` takes the
-  signed body: for the empty root the bitmap must be empty and `has_blob`
-  alone decides. The rule keys on the signed hash, never on the unsigned
-  `total_bytes` hint. `decdn_protocol::EMPTY_ROOT` names the hash. ADR 022
-  § Consistency rule records the exception. The API change is under Changed
-  (BREAKING).
-- **Node-origin: the coverage-union probe round spans the empty root once one
-  holder is admitted (#2526).** The ranged pull leg gathers holders until their
-  coverage union covers every discovery block of the blob. The empty blob has
-  zero blocks, so the block target stayed at zero and the union never spanned
-  it: the probe round waited for every probe to answer or time out, the
-  origin-directory lookup always ran, and a cached holder list never counted
-  as a probe-cache hit. Now the union spans the empty root once one holder is
-  admitted. The rule keys on the requested hash, never on the unsigned
-  `total_bytes` hint, so a holder that reports a zero size for a real blob
-  closes nothing.
-- **CLI: a `decdn get` that ends before a `topUp` confirms names the tx
-  (#2491).** A refill or a funding recovery step can still wait on its `topUp`
-  receipt when the command ends: on a give-up after the no-progress limit, a
-  Ctrl-C, a fault in a sibling bundle entry, or the 30 s drain of late lane
-  builds after a fetch that succeeded. The command dropped the wait and named
-  no tx. A give-up exited 75 ("rerun to resume"), a drain exited 0, and a
-  re-run before the `topUp` confirmed escrowed a second top-up. Now a
-  `topUp` is named on every such end, as an `openPool` is: a give-up with one
-  pending exits 1, not 75, a command that otherwise succeeded exits nonzero,
-  and a second Ctrl-C prints it. A `topUp` left unconfirmed also refuses every
-  later `topUp` in the same command, across passes and fetches.
-  `decdn pool top-up` now handles Ctrl-C as `decdn pool open` does: it names
-  the `topUp` instead of dying with no output. A `topUp` whose submit
-  returned no hash reads "returned no tx hash", not "failed in transport",
-  since a submit dropped in flight holds no hash either.
-- **Client: a late lane build that may have escrowed with no record fails the
-  fetch (#2500).** During the 30 s drain of late lane builds, a build could
-  send a `topUp` or `openPool` that mined, or may have mined, with no local
-  record to credit it. The drain logged that error at debug only. A completed
-  `decdn get` exited 0, a give-up exited 75, and nothing named a tx the
-  receipt read had already cleared from the pending-escrow handle. Now such a
-  build fails `acquire` with a `LaneBuildFault` that names the tx when the
-  submit returned one, whatever the fetch's own outcome was. A fetch that
-  completed fails. A fetch that failed keeps its error only as text, so its
-  give-up cannot exit 75 and a `PoolReplaced` cannot start a second pass,
-  either of which would invite a rerun that escrows again. Any other late
-  build failure leaves the result unchanged. `decdn get -o -` and the manifest
-  fetch of an entry URI also dropped the drain once the reader hit the end of
-  the stream. They now wait for it through the new `StreamDrive::finish`,
-  which runs a stream's drive to its end and returns the error the fetch
-  ended with. A consumer that reads a stream to its end calls it before it
-  reports success.
-- **Client: no second escrow after an untracked one (#2506).** When a run's
-  `topUp` mined and its local credit failed, the build failed as escrowed and
-  untracked, but a sibling lane build of the same run could still escrow
-  again. Builds of one fetch wait behind each other on the pool lock. The
-  next one in line ran before the acquire loop saw the first one's error, or
-  in the drain after it. That build read the uncredited row, saw the pool low,
-  and sent a second `topUp`: the receipt read had already cleared the first
-  one, so nothing refused it. A failed record after a mined `openPool` could
-  let the next build open a second pool the same way. Now a run that holds an
-  untracked `topUp` or `openPool` refuses every later `topUp` and `openPool`
-  of that command, across passes, before its allowance read or send, from a lane build or a
-  funding recovery step. The refusal names the held escrow and ends the
-  command. It is not reported as a second escrow. An `openPool` that mined
-  with no `PoolOpened` event for the owner also fails as escrowed and
-  untracked (`EscrowUntracked`), not as a plain error: the acquire loop
-  retried that lane build, and the retry opened a second pool.
-- **Client, CLI: every end of a command names its untracked escrows (#2511).**
-  The hold on a run's untracked `topUp` or `openPool` lived in the run's
-  per-pass state, and no end of the command read it. A Ctrl-C during the 30 s
-  drain of late lane builds dropped the fetch, and `decdn get` printed
-  "interrupted; run the same command again to resume": the receipt read had
-  already cleared the tx from the pending-escrow handle, and a re-run read the
-  uncredited row and escrowed again. A bundle pull whose entry with the escrow
-  was dropped could give up with exit 75 the same way. The hold also kept
-  only the first such escrow, so a second one in a dropped entry was named
-  nowhere. Now the command's `UnconfirmedEscrows` handle holds every
-  untracked escrow (`UnconfirmedEscrows::untracked`, a new `UntrackedEscrow`
-  with the tx; `EscrowUntracked::tx` reads it from the error). The hold
-  outlives a dropped fetch, a dropped bundle entry and a pass, and every
-  later pass on the handle refuses to escrow. `decdn get`, for a blob or a
-  bundle, names each one on every end that does not already name its tx: a
-  Ctrl-C says `interrupted: <escrow>` and still exits 130, a give-up exits 1,
-  not 75, and a success exits 1. A second Ctrl-C names them too. `decdn pool
-  open` and `decdn pool top-up` hold theirs too, and their own error names the
-  tx, so it is named once. A `BundlePuller` pull that is not interrupted ends
-  `BundleEnd::Stopped` while
-  its handle holds one, with the escrow as its error and the pull's own stop
-  as text, so a give-up, a pool replacement or "funding needed" cannot invite
-  a rerun. An interrupted pull stays `Interrupted`, and its caller names what
-  the handle holds through the new `BundlePuller::unconfirmed_escrows`.
-- **Client: a bundle pull lets sibling entries finish their lane builds
-  (#2509).** When one entry ended the pull (a give-up, a pool replacement, a
-  fault that stops every entry), every other entry was dropped where it
-  stood. An entry in the middle of a `topUp` or `openPool` lane build lost it
-  before the receipt read and the local record, which left a tx for the
-  operator to reconcile by hand. Now the pull halts the other entries. Each
-  stops at its next wait or loop pass, starts no new lane build or funding
-  recovery step, and waits up to 30 s for the builds in flight, as one fetch
-  does when it ends. A recovery step already in progress runs to its outcome
-  first. The pull waits up to 40 s for them all, then drops any entry still
-  running, as before: the command names an `openPool` or `topUp` it left
-  unconfirmed. A build that may have escrowed USDC no record credits wins
-  over the stop: the pull ends on the escrow, with the stop kept as text, so a
-  give-up does not exit 75. A halted entry, like a dropped one, counts as not
-  run in the summary (#2517), and a pass that keeps an entry's earlier
-  landing does so for a halted one too. The first open of a blob (its size
-  from a header) waits for its lane build the same way on a give-up. A
-  funding recovery step there runs to its outcome, so a give-up can land
-  after the limit while the step finishes.
-- **Client: a fatal lane build names every escrow in its batch (#2508).** The
-  acquire loop takes every lane build that is ready as one batch. When one
-  build in the batch was fatal, the loop returned at once and dropped the rest
-  of the batch. Those builds were already out of the set the drain of late
-  builds awaits, so a second build in the batch that may have escrowed USDC no
-  record credits was named nowhere. A full disk that failed a lane's record
-  write beside a mined `topUp` whose credit failed reported only the disk
-  fault, and a re-run after the operator freed space escrowed again. Now each
-  such escrow in the batch is folded into the error the fetch ends with, as
-  the drain folds a late build's: the escrow is the error a caller downcasts,
-  and the fault that ended the fetch survives as text.
-- **Client: a lane build sends no `openPool` or `topUp` after its fetch ended
-  (#2513).** When a fetch ends, it awaits its lane builds still in flight for
-  up to 30 s. A build in that drain that had not yet read its pool could still
-  run the proactive refill and send a `topUp`, or open a pool, for a lane that
-  never runs. The escrow was recorded and withdrawable, but no fetch needed
-  it. Now each fetch ends for its builds as its drain starts. A build that
-  reaches its `openPool` or `topUp` after that sends none and reads no wallet
-  balance. It fails, and the drain logs it at `debug`. The build checks before
-  its allowance leg and again before the send, so a fetch that ends during an
-  `approve` sends no `topUp` after it. A build already inside its `openPool` or
-  `topUp` send (its nonce read, its submit) runs to its receipt, as before. The first open of a blob ends
-  its builds the same way on a stop or an error. A re-fetch on the same
-  lanes after a hash mismatch is a new fetch, so its builds can still escrow.
-- **Client, CLI: an escrow stays named until its record commits (#2515).**
-  `open_pool` and `top_up` released a mined transaction from the
-  pending-escrow handle as soon as they read its receipt. The caller wrote the
-  pool record or the deposit credit after that, with an fsync. During that
-  write the transaction was in neither the pending nor the untracked list. A
-  second Ctrl-C there exited at once, named no escrow, and left the record
-  unwritten, so a re-run read an uncredited row and escrowed again. Now the
-  handle keeps the transaction pending until the record commits, and a failed
-  record holds it as untracked before it releases the pending entry. `decdn
-  get`, for a blob or a bundle, `decdn pool open` and `decdn pool top-up` name
-  it on every exit during the write. The pending line reads "was broadcast and
-  no local record credits it", which holds before and after the receipt
-  read.
-- **Client, CLI: a halted bundle pull reports its replacement, the entries it
-  did not run, and its pending escrows (#2517).** Three gaps remained at the
-  end of a pull that one entry ended. First, the pull took its pool
-  replacement only from the fault that ended it. A sibling entry's recovery
-  step that replaced the pool during the drain, or a replacement that a late
-  escrow folded over, went unreported, and `decdn get` of a bundle printed no
-  "reclaim it with: decdn pool reclaim" note for the closed pool. The pull now
-  reads the replacement from the recovery gate, and lists it in
-  `BundleOutcome::replaced`. Only a replacement that ended the first pass runs
-  the rest again. A later pull on the same `BundlePuller` starts as a pass
-  against the new pool, with fresh lane and funding state: it runs no extra
-  pass, and its recovery step tops up the new pool, not the closed one. Second, entries the pull did not run were in no count, so
-  the summary did not add up to the entry count. The new
-  `BundleReport::not_run` counts them, the summary line adds `N not run` when
-  there are some, and `--json` carries `not_run`. Third, a `BundlePuller` pull
-  that dropped an entry while its `topUp` or `openPool` receipt read was
-  pending ended with only its own stop. Only `decdn get` named the tx, from
-  the handle. A pull that is not interrupted now ends
-  `BundleEnd::Stopped` on each pending escrow, as it does on an untracked one.
-  `decdn get` names each one once.
-- **Client, CLI: `decdn get` names every pool a replacement closed, on
-  every exit (#2519).** Several paths printed no "reclaim it with: decdn pool
-  reclaim" note for a closed pool that may still hold a balance:
-  - a blob `get` took its replacement only from the error that ended the
-    pass, so a late lane build's escrow folded over it hid it;
-  - after a second replacement, in the pass against the new pool, the
-    command named only the first closed pool, for a blob or a bundle alike,
-    though it had funded the pool the second one closed at the full working
-    deposit;
-  - a Ctrl-C during a blob `get` dropped the note with the fetch;
-  - a bundle `get` whose manifest fetch replaced the pool named it nowhere,
-    and its error said the remaining work runs again, though nothing did.
-  Now the recovery gate lists every replacement its steps make, and the
-  command prints one reclaim note per closed pool as it ends, however it
-  ends. A replacement runs the rest again only when it ended the first pass.
-  A replaced manifest fetch says the new pool is current and the pull must
-  be run again. An entry URI's fetch starts clear of the replacement its
-  manifest fetch left, as a bundle pull does.
-- **Client: a lane build drained after its fetch ended sends no `topUp`,
-  and waits on no lock (#2520).** A drained build waited for the
-  open-or-reuse lock (bundle-wide, or the payer's for a blob `get`) and the
-  run's `topUp` lock before it checked the fetch end. A sibling that held
-  either through its receipt wait kept the build waiting for the whole 30 s
-  drain, which then logged "lane builds still running". Now a build queued on
-  either lock ends at once with the fetch, and one that reaches its `topUp`
-  send after the fetch ended is refused before the send. Neither sent
-  anything, so neither escrows. A refill refused so logs that it was not
-  sent, beside its "topping up" line.
-- **Node: a top-up for one pool no longer joins a `topUp` for another
-  (#2496).** The top-up slot did not record which pool its `topUp` funds. When
-  the store replaced the pool while a `topUp` for the old one waited for its
-  receipt, a recovery top-up for the new pool joined it. It claimed the old
-  pool's refill as its own headroom, and when that `topUp` escrowed, the
-  recovery failed as escrowed and untracked. A fill could also wait on a
-  sibling's recovery top-up for the old pool. It then failed, or, when that
-  `topUp` reverted `PoolNotOpen`, replaced the new pool, which was still open.
-  The slot now records its pool. A recovery step that finds the slot funding
-  another pool fails at once as a local fault, names both pools, and counts on
-  `decdn_node_pull_recovery_step_refused_total`. A low-water refill does
-  nothing meanwhile.
-- **Node: a funding recovery step fails at once while a `topUp` settles
-  (#2494).** A recovery top-up that found the top-up slot held for an
-  unconfirmed `topUp` joined it and waited for the whole settle, which lasts
-  as long as the chain takes. Each such cache miss waited until its deadline
-  dropped it. The recovery step now fails at once as a local fault, like a
-  miss that finds the open slot held, and counts on
-  `decdn_node_pull_recovery_step_refused_total`. A recovery step that joined
-  before the settle began still waits for its outcome, and a low-water refill
-  still does nothing and no longer logs that it funds. A recovery top-up whose
-  earlier join already landed returns that headroom when a later funding call
-  finds the slot held.
-- **CLI: a transaction dropped from the mempool no longer hangs the command
-  (#2433).** alloy's receipt wait has no bound, so a broadcast transaction
-  that never mined left these commands waiting forever: `decdn pool {open,
-  top-up, close, reclaim}`, `decdn get`'s pool open and top-up,
-  `decdn node {bond, unbond, register, deregister, update-region,
-  update-multiaddrs, rotate-key}`, `decdn publish`, `decdn appeal slash` and
-  `decdn setup`. Under `pool close --all` and `reclaim --all`, a pool whose
-  transaction was dropped also blocked every pool after it. Each wait now ends
-  after 3 minutes (`decdn_incentive::tx::RECEIPT_TIMEOUT`, the bound the USDC
-  `approve` already used). A lapse is reported like a receipt that could not
-  be read: the error names the tx hash and says it may still mine, and a
-  `--all` sweep counts the pool as unconfirmed and moves on. A transaction
-  that is stuck rather than dropped holds its nonce, so each later pool's
-  transaction queues behind it and lapses in turn. A `decdn get` whose
-  `openPool` or `topUp` lapsed never sends a second one in the same run, so
-  no other lane, bundle entry or funding recovery step escrows a second
-  deposit beside it. The run sends one `topUp` at a time.
-- **Node: an `openPool` dropped from the mempool is re-sent (#2433).** The
-  node waited for the receipt of its own `openPool` with no bound, so a
-  dropped open held the open slot forever, and every miss that joined it
-  waited out its budget. The wait now ends after `decdn_incentive::tx::RECEIPT_TIMEOUT`, and the open
-  goes to the settle loop, which re-sends it at the same nonce when the chain
-  holds no transaction there.
-- **Node: an unconfirmed `topUp` is settled against the chain, not
-  forgotten (#2489).** A `topUp` whose receipt read failed, or whose submit
-  failed in transport, freed the node's top-up slot. The next low-water
-  refill then sent a second `topUp` beside one that could still mine. A
-  recovery top-up that joined the failed one also sent its own. A dropped
-  `topUp` held the slot forever instead, so the node funded no pool again
-  until a restart. The receipt wait now ends after
-  `decdn_incentive::tx::RECEIPT_TIMEOUT`. An unconfirmed `topUp` keeps the
-  slot until the chain resolves it: its receipt credits the row, a nonce that
-  no transaction holds gets a re-send at that nonce, and a spent nonce with no
-  receipt credits what the pool's on-chain deposit holds above the row as it
-  stood when the settle began. A re-send that reverts `PoolNotOpen` ends the
-  settle once one block shows the nonce unspent and the pool closed, so the
-  recovery step opens a new pool. A re-send that reverts on the allowance
-  sends an `approve` at the nonce, which restores the allowance and fills the
-  nonce. A settle that may have
-  escrowed but cannot credit the row logs the "ESCROWED AND UNTRACKED" error,
-  and so does a funding task that dies mid-settle, which no joiner then funds
-  over. The
-  hourly reclaim sweep's `reclaim` receipt wait is bounded the same way, so
-  one dropped `reclaim` no longer stalls the sweep. `decdn-client` adds
-  `buyer_pool::send_top_up_at` and `buyer_pool::topped_up_from_receipt` for
-  the settle step.
-- **CLI: two `decdn get` runs with separate `--data-dir`s on one wallet no
-  longer pay on the same lanes (#2468).** A fresh data dir adopts the
-  wallet's live pool, and both runs signed vouchers with the wallet key, so
-  they shared each `(pool, signer, provider)` lane from separate watermarks.
-  Providers rejected the run that fell behind as `UnderFold`, and the runs
-  spent their resume budget re-fetching bytes elsewhere. Each client data dir
-  now signs with a key derived from the wallet key and a random salt that its
-  `buyer-pools.redb` keeps in the new `buyer_lane_salt_v1` table. The derived
-  key is never stored, and the wallet key signs the capability that authorizes
-  it. Data dirs keep sharing the pool, but each pays on its own lanes, so the
-  `AlreadyOpen` advice to give each concurrent run its own `--data-dir` is
-  safe on the wallet's own pool. Two data dirs on one `--capability` delegate
-  key still sign with that key and share its lanes. A data dir tracks only its
-  own lanes, so its funding reads the pool's deposit and `totalRedeemed` from
-  chain at the run's first lane build and before each funding recovery step:
-  a pool another data dir drained gets a top-up instead of a settle wait that
-  ends the run "funding needed". The daemon still signs its
-  own buyer lanes with the node key. An existing pool row keeps its
-  wallet-signed lanes as spend; new vouchers sign on fresh lanes.
-- **CLI: `decdn gateway` pays for at most 64 MiB to read a bundle manifest
-  (#2474).** A `/<hash>/` or `/<hash>/<path>` request reads the manifest
-  `<hash>` into memory. That pull ran under the gateway's `--max-blob-mb`
-  (1 TiB by default), so for a large blob that is not a manifest, the
-  gateway paid for 64 MiB plus the lanes' read-ahead before it failed. Anyone
-  who could reach the gateway could spend the operator's funds this way. The
-  manifest pull now runs under the manifest cap (64 MiB, or a lower nonzero
-  `--max-blob-mb`), as `decdn get decdn:<hash>/<path> -o -` does, and its
-  lanes request no byte past it. A blob over that cap, or one that does not
-  parse as a manifest, answers 404 instead of 502, because nothing upstream
-  failed. The 404 names the raw blob's gateway path when the gateway serves
-  that blob.
-- **CLI: a command that ends before an `openPool` confirms names the tx
-  (#2418).** A Ctrl-C during the `openPool` submit or receipt wait in `decdn
-  fetch` or `decdn bundle pull` printed only "run the same command again", and
-  `decdn pool open`, or the `--hash` manifest fetch of `bundle pull`, died with
-  no output. A give-up after the no-progress limit printed "rerun to resume"
-  and exited 75. The tx can still mine and escrow its deposit, and a re-run
-  before it confirms opened a second pool. Now every such end prints each
-  pending tx hash, or the nonce when the submit returned no hash, says that a
-  second open escrows again, and points to `decdn pool list --all`.
-  - An interrupt still exits 130, and a second Ctrl-C names the opens before
-    it exits. A give-up with an open pending exits 1, not 75, because 75 tells
-    a wrapper that a re-run is safe.
-  - A fault that ends the command, or a receipt read that fails while the
-    command drains, names the tx the same way. A command that otherwise
-    succeeded exits nonzero.
-  - The `OpenUnconfirmed` message points to `pool list --all`, because only
-    the on-chain list shows a pool the local store never recorded.
-
-- **CLI: Windows builds embed the canonical operator terms.** A Windows
-  checkout converted `crates/cli/TERMS.md` to CRLF, so `decdn.exe` hashed
-  different bytes and `decdn node register` failed with an operator terms
-  mismatch against the network's `currentTermsHash`. `.gitattributes` now
-  keeps `TERMS.md` byte-exact, and the build fails if the embedded terms
-  contain a carriage return.
-
-- **A delegated client records its lane watermarks (#2435).** A client that
-  pays under a `dcap1` capability on a pool another owner funds owns no pool
-  row, so every lane watermark write it made was dropped with a warning. Its
-  lanes now go to a new `buyer_delegate_lanes_v1` table in
-  `buyer-pools.redb`, keyed by chain id, `PaymentPool` address, pool id,
-  signer key and provider. A later `decdn fetch`, `bundle pull` or
-  `decdn_client::bundle` run on the same data dir resumes each lane from its
-  record instead of from zero, and the ADR 039 funding signal counts what
-  earlier runs signed under the key. The pool tables are unchanged, so
-  existing rows still read and no lane reseeds. A delegate-lane record the
-  store cannot read fails the fetch as a local fault instead of retrying. The
-  API changes are under Changed (BREAKING).
-- **`decdn pool close` and `pool reclaim` clear the local row of a pool that
-  is no longer Open (#2425).** When a `closePool` or `reclaim` mined but its
-  run could not clear the client-store row (the clear faulted, or the tx's
-  outcome was unknown), every re-run stopped at a status refusal or skip
-  before it touched the store. The row survived, and a later fetch reused a
-  closing or closed pool whose vouchers `redeemMany` rejects. Now each `close`
-  or `reclaim` that reads the pool as `Closing` or `Closed` clears its row:
-  `close --pool` and `reclaim --pool` on their refusal, and `close --all` and
-  `reclaim --all` on their skip. The refusal or skip line says when it cleared
-  a row. Exit codes for a `--pool` refusal do not change: it still exits
-  nonzero.
-  - The clear is compare-and-delete, so a row for a newer pool stays.
-  - Every row-clear in `pool close` and `pool reclaim`, including the one
-    after a landed tx, touches only a row on the command's chain and
-    `PaymentPool`. A pool id repeats across deployments, so a command run
-    against an old `--payment-pool-address` leaves the live row for the same
-    id on the current deployment alone.
-  - `reclaim --pool` clears the row with the pool's on-chain owner, so its
-    refusal still asks for no keystore password. A local store that will not
-    open (another `decdn` process holds it) only warns: the refusal still
-    names its cause.
-  - A skipped pool whose row-clear faults counts in a new `row not cleared`
-    summary count, and the sweep exits nonzero, so a failed repair does not
-    read as success.
-  - On a daemon data dir the CLI leaves the daemon's row as it is and says so.
-- **`decdn pool close --all` counts a landed close whose row-clear faulted as
-  closed, not as failed (#2425).** The per-pool line no longer reads "failed
-  to close" for a close that is on-chain. The pool counts in `row not
-  cleared`, and the sweep still exits nonzero, naming the re-run that clears
-  the row. `close --pool` names that re-run as well, and both put the store
-  fault next to the word "failed".
-- **`decdn pool close` and `pool reclaim` name the revert that gas estimation
-  rejects, and no longer call it on-chain (#2426, #2417).** A `closePool` or
-  `reclaim` that would revert fails at gas estimation, before anything is
-  sent. The error now says so, names the `PaymentPool` error
-  (`PoolNotOpen()`, `NotPoolOwner()`, `PoolNotClosing()`,
-  `GraceWindowActive()`) with its likely cause, and keeps the raw revert data.
-  A `reclaim` estimation revert with any other selector points at the USDC
-  refund transfer to the owner.
-- **`decdn pool close`, `pool reclaim`, and the USDC `approve` warn when a
-  failed send may have broadcast (#2416).** A `closePool`, `reclaim`, or
-  `approve` send that fails in transport (a timeout, a connection reset, an HTTP
-  5xx) may have reached the node and broadcast the tx with no hash returned.
-  The error now says so and tells the operator to check this signer's pending
-  and mined transactions before re-running. The `approve` runs from `pool
-  open`, `pool top-up`, `fetch`, and the daemon's buyer funding. A send the RPC
-  node rejects outright carries no warning.
-- **`decdn pool close --all` and `pool reclaim --all` count a transaction
-  that may still mine as unconfirmed, not failed (#2427).** A send that fails
-  in transport, or a broadcast tx whose receipt cannot be read, now adds to an
-  `unconfirmed` count in the summary line. The final error names that count
-  apart from the failed one and tells the operator to check this signer's
-  pending and mined transactions before re-running. The exit code stays
-  nonzero.
-- **The daemon no longer escrows a second pool deposit after an `openPool`
-  whose outcome it did not see (#2415).** When the `openPool` receipt read
-  failed, or its submit failed in transport, the open task freed the open
-  slot and the next cache miss sent a second `openPool` while the first could
-  still mine. The open task now keeps the slot until the chain resolves the
-  transaction, and only a receipt or a spent nonce releases it: a receipt
-  yields the pool; a nonce spent at block `B` reads `getPools` at `B` and
-  adopts the owner's newest solvent pool, or concludes the open escrowed
-  nothing; a nonce the account has reached and no transaction holds gets a
-  fresh `openPool` at that same nonce, so at most one of them mines. A
-  reconciliation that cannot answer backs the next one off, up to 5 min. While the slot is held, a miss that
-  needs a pool fails at once as a local fault, `decdn_buyer_pool_open_unresolved`
-  reads 1, and a warning repeats every minute with the elapsed time.
-  `openPool` is now sent with an explicit pending nonce, and its unconfirmed
-  error carries the hash and nonce (`OpenUnconfirmed`). `decdn fetch` and
-  `bundle pull` treat that error as fatal to the command, as for an
-  unconfirmed `topUp`.
-- **`decdn fetch` / `bundle pull` steal a slow leg's tail by pull-through
-  (#2348).** A lane could steal only inside a range's covered suffix, so a
-  range whose last block only one lane covered ran on that lane to the end,
-  however slow it was: one 0.5 MiB/s leg ran alone for 35 min while every
-  other lane sat idle. When no covered steal is due, a lane not barred from
-  pull-through now steals the rate-weighted tail of a range on another lane
-  that runs at a quarter of its rate or less, measured over at least 30 s.
-  Its node serves the part outside its coverage by pull-through. A parked
-  lane looks for such a steal every 5 s, and the steal logs at `info`
-  (`kind="slow_victim"`).
-- **`decdn fetch` / `bundle pull` with a spent capability stops with the
-  owner-side remedy instead of retrying until it gives up (#2338).** A node
-  refuses a registered signer whose `cap − spent` cannot cover its serve floor
-  at admission, and answers with the same `NotFound` code as a cache miss. The
-  client cooled the holder and retried until its stop policy gave up. A
-  delegated lane now reads its signer's `getAuthorization` row when a node
-  refuses it with `NotFound`, bounded by the open deadline. An expired
-  registration, or one with nothing left of its cap, ends the command with
-  `SignerCapDrained`. A `cap − spent` below one chunk at the refusing node's
-  signed rate bars that node for the blob, since a cheaper node can still
-  serve; once every node is barred the item ends with `NoSourceServesSigner`.
-  Both ask the pool owner for a capability for a new signer key, as do a
-  mid-stream `SignerCapExhausted` and, for a registered signer, a
-  `SpendingCapExhausted`. A failed or slow read leaves the refusal as it was
-  and logs at info. `SignerAuthorization` moves from `decdn-node` to
-  `decdn_incentive::payment_pool`, so the client and the node test a
-  registration with one predicate.
-
-- **`bundle pull`: a freed provider stream goes to the lane that waited for it
-  first, so one entry's queued range no longer waits minutes behind a sibling
-  entry's short legs (#2341).** Entries share each provider's
-  `--max-lane-streams` permits. A lane asks for an extra stream for a queued
-  range once per growth pass, at most once a second after a refusal. A sibling
-  lane whose short legs restart, or whose leg ends ask for growth, asked the
-  instant a permit freed and so took every one. On testnet a bcl-only 1 GB
-  range waited 450 s while a sibling entry opened 54 legs to bcl. A lane that
-  `grow` refuses now claims the provider's next free permit. Each claim holds
-  back one free permit from every later `grow` ask, and the largest kept
-  permit count stays free after them. A lane that runs no stream goes ahead of
-  the claims of lanes that run one, so every lane gets its first stream before
-  any lane gets a second. A grant or the lane's end clears the claim, and a
-  claim not renewed for 3 s lapses. A lane's first stream still takes any free
-  permit.
-
-- **Every voucher rejection logs its cause at `info` (#2342).** A rejected
-  voucher or chunk preimage ends a paid stream and counts on
-  `decdn_serve_stream_voucher_rejected_total`, which has no reason split. The
-  node logs `rejecting a payment proof` once per rejection, with `proof`
-  (`voucher` or `reveal`), `reason`, `pool_id`, `signer` and `with_watermark`.
-  A voucher that fails the rate check writes no reject frame but counts on the
-  same counter, so it logs the same line with `reason=RateCheck` and the error.
-  Before, the reason logged at `debug` or not at all, so a node at the default
-  level showed the count with no cause.
-
-- **A serve miss keeps the lane answer it resolved, so a lane registered
-  mid-request no longer makes it spend origin egress or answer a false
-  `InternalError` (#2315).** `serve_stream` resolves the request's lane once.
-  Each fill tier then re-read the live lane registry to decide whether the
-  request may make the node spend. When a sibling stream registered the lane
-  between the two reads, the window tier fell through to the size gate, logged
-  a false "just-filled blob" warning and refused `InternalError`, so the
-  requester routed around a healthy node. The local-origin populate tier
-  (#1116) instead filled the blob from the operator's origin and then refused
-  `UnknownLane`. Every fill tier now takes its answer from the request's one
-  lane resolution. A request whose lane was unknown when it resolved refuses on
-  the `no_lane` path (`NotFound`, counted as `cache_miss`) and runs no fill
-  tier.
-- **A lane seeded from the chain watermark below the provider's unredeemed
-  voucher now heals instead of suppressing the provider (#2254).** After a
-  buyer-table schema bump, a node adopts its pool with no lanes, and each
-  lane seeds from `getWatermark` on its first use. The seed sits below any
-  voucher the provider has not redeemed yet. The ledger prices its spans from
-  that lower seed, so its amount passes the provider's anchor while its bytes
-  still trail it, and the provider rejects `BytesRegression` with the anchor
-  attached. The payer now rebases to that anchor, its own voucher, and
-  resumes (ADR 005). Before, the pull ended and node-origin suppressed a
-  healthy provider. A healed `BytesRegression` that keeps rejecting past the
-  resume budget now cools only that source. Two streams that find one lane
-  missing seed it once. Each lane has its own seed lock, and the watermark
-  read times out after 10 s.
-- **A sub-millisecond probe RTT no longer erases the price signal in
-  candidate ranking (#2268).** The selection score multiplies the rate by the
-  probe RTT in whole milliseconds, and a probe faster than 1 ms truncated to
-  0. Every such peer scored 0, so two of them tied whatever they quoted, and a
-  dear one outranked every cheaper peer at 1 ms or more. The score now uses an
-  RTT floor of 1 ms (ADR 001), so peers on a LAN or in one datacenter rank on
-  rate and reputation.
-- **Origin requests keep their connections across serve-miss pulls, and HTTP
-  origins reuse keep-alive connections again (#1675).** A serve-miss pull leg
-  runs on its own current-thread runtime, which drops when the leg returns.
-  A pooled origin connection opened there lived on that runtime, so a
-  concurrent serve that reused it lost its in-flight request with "dispatch
-  task is gone" (#1673). `HttpOrigin` avoided this by turning its keep-alive
-  pool off, and paid a fresh TCP and TLS handshake on every request.
-  `S3Origin` kept its pool and was still exposed. Both origins now capture the
-  runtime they are built on, which is the node's main runtime, and run every
-  request send there. Each pooled connection outlives the pull leg that opened
-  it, and `HttpOrigin` reuses keep-alive connections. A request task that
-  panics, or that the shutting-down main runtime cancels, fails as a
-  permanent origin fault. The constructor changes are under Changed
-  (BREAKING).
-- **The deployment preflight rejects every sibling contract of the
-  `PaymentPool` (#2279).** Startup identified `blockchain.payment_pool_address`
-  by calling `usdc()`, which `FeeRouter` and `BuybackBurner` also answer. A
-  node pointed at either one passed the preflight, then dropped its seller
-  lane state and forfeited the unredeemed vouchers. The probe is now
-  `PaymentPool.getRateBounds()`, which only `PaymentPool` declares
-  (`feeRouter()` would not do: `DecdnGovernor` answers it too), so the node
-  exits before the lane store opens. The startup error now names
-  `PaymentPool.getRateBounds()`.
-
-- **A reactive top-up of a few micro-USDC no longer goes on chain, and a
-  refill reaches lanes already running (#2296).** Right after a refill, a
-  node whose chain watcher had not seen it yet refused the next open as
-  `InsufficientDeposit`, and the client topped the pool up by the few
-  micro-USDC it was short of the working deposit: an `approve` and a `topUp`
-  each, and one of the run's three reactive top-ups. Such a refusal while the
-  deposit sits within the low water (working deposit / 5) of the working
-  deposit now waits out the node's watcher on its own settle budget, and a
-  confirmed exhaustion the deposit can still afford tops up only when it adds
-  at least that low water. A node that keeps refusing past the budget faults
-  as a source (it cools and is asked again, with one WARN), not as priced out
-  by a deposit no top-up raises. A lane build that refilled the pool now raises
-  every running lane to the new deposit, so a lane built before the refill no
-  longer reads a gap the refill paid for as unaffordable.
-
-- **A partial holder that refuses blocks its coverage claims stops being
-  asked for them (#2281).** A `NotFound` for a range inside a probed partial
-  holder's advertised coverage counted as a delivery fault only, so the
-  holder was asked for the same range again every few seconds for the rest
-  of the entry. Such a refusal on the lane's own stream now counts against
-  every discovery block the refused part of the range touches. After three,
-  the block leaves the holder's coverage for a minute, rediscovery included,
-  and its ranges go to the other holders. A `NotFound` can also be a
-  transient refusal, so the block then returns, refusals within one cooldown
-  count once, refusals a minute or more apart never add up, and a verified
-  byte in the block clears its count. An extra stream's covered `NotFound`
-  does not count: it is most often the node's per-signer floor cap.
-
-- **A range-dedup entry that waits for a sibling's chunks no longer holds a
-  `--jobs` slot (#2283).** `decdn bundle pull` kept the slot of an entry
-  whose complement had landed while it waited for the sibling that fetches
-  its donor chunks. On an SDXL pull with `--jobs 5`, such waiters held the
-  run to 2–3 downloading entries for minutes at a time. A waiter now gives
-  its slot to a queued entry while it waits, and takes one again as the wait
-  ends, ahead of entries still to start. A pull's file bar appears once the
-  entry holds a slot.
-
-- **A partial holder steals the covered tail of a busy leg (#2303).** A
-  freed lane stole from a busy lane only when it covered the victim's whole
-  range in flight. In a `decdn bundle pull` of mistral-7b, one node held
-  blocks 0–43 of a shard as one 2.95 GB leg. A lane that covered blocks
-  18–45 went idle in seconds, and the leg ran alone for 8 min on one
-  stream. A freed lane now steals inside the longest suffix of a range in
-  flight whose blocks it covers: a split before that suffix moves to its
-  start, and the victim keeps every byte before it. A lane whose blocks stop
-  short of a range's last block still cannot steal from that range. A
-  holder counts as having work, and starts, only when it would steal now:
-  a late partial holder starts and steals, and a holder whose only option
-  is a tail below the steal floors no longer takes a lane slot to park.
-
-- **A queue that one lane drains takes an extra stream (#2252).** In
-  `decdn bundle pull`, a lane's own worker takes queued ranges one after
-  another and does not end between them, so no stream end asked for growth.
-  The first growth pass ran as the lane started, before its worker held a
-  range, and found no busy lane to ask. Nothing asked again, so a
-  range-deduped entry's complement went to one holder as one serial request
-  per run. While a range waits and a running lane can be granted streams,
-  the acquire now asks again every second, also when no busy lane could be
-  asked. A busy lane takes an extra stream for every waiting range that its
-  provider has a permit for, not only one, and one growth pass fills every
-  free permit. A lane that waits with nothing to take gives its permit back
-  while it waits, so an idle lane of one entry no longer holds a stream that
-  another entry's queue needs; it takes a free permit again before it takes
-  a range. At `--max-lane-streams` 3 or more, an extra stream never takes a
-  provider's last free permit, so a sibling entry's first stream to that
-  provider still opens; a lane that starts again can take it. The info line
-  `a queued range waits for a stream` logs on the first wait and then at
-  most every 30 s while ranges wait, in place of a line on every change;
-  each change between those lines logs at debug.
-
-- **The client funds a buyer pool from its pool-wide spend, and a short
-  wallet no longer drops lanes (#2288, #2289).** The low-water refill
-  compares the deposit with the spend of every lane of the pool, not only
-  the lane being built, so a pool spent across many providers refills. The
-  reactive top-up and the check of a node's `SpendingCapExhausted` refusal
-  use the same pool-wide view. When the wallet holds too little USDC for a
-  refill, the fetch continues on the pool's remaining deposit, logs one WARN,
-  makes no further refill attempts that run, and ends with one
-  `warning: wallet … holds … µUSDC, less than the … µUSDC top-up …` line on
-  stderr, visible without `-v`. A pool with nothing left and a short wallet
-  ends the command with the top-up remedy. A `topUp` whose receipt cannot be
-  read, or that mined but could not be recorded locally, now ends the command
-  and names the tx instead of retrying, because a retry escrows again. A
-  failed reactive top-up retries without cooling the serving node.
-
-- **The node no longer faults a paying client whose bytes are still in
-  flight (#2230).** A write returns once the transport buffers it, so the
-  node's wait for a proof can start while several chunks are still on the
-  way to the client. The wait now faults only after 10 s with no proof and no
-  new STREAM frame sent on the connection. All the proofs for one owed chunk
-  share a 30 s ceiling from the chunk's first wait, so proofs that credit
-  nothing cannot stretch it. A client that stops reading faults at 10 s when
-  its connection carries nothing else; traffic on sibling streams of the same
-  connection counts as progress and can hold the wait up to the 30 s ceiling.
-  A ceiling fault does not count on
-  `decdn_node_pull_through_client_abandoned_total`. The fault text gives the
-  measured times and the STREAM frames the wait saw, then the connection's
-  selected path (relay or direct, IPv4 or IPv6) with its RTT and congestion
-  window and the path's lifetime totals of lost packets, congestion events and
-  black holes detected: `no proof and no transport progress for 10.0s; …` or
-  `the chunk's proofs ran past their wait ceiling after 30.0s; …`. It replaces
-  `proof read timed out after 10s` in the `serve_stream` failure span.
-
-- **A faulted lane's remainder starts within a second of a stream freeing
-  (#2230).** In `decdn bundle pull`, a lane gives its stream permit back when
-  its own worker ends, so a sibling entry can use it. It starts again only on
-  a permit that is free then, and tries again each second while none is. A
-  queued range that no idle lane takes goes to a busy lane on one extra
-  stream; when part of the range has no running lane that covers it, any busy
-  lane not barred from pull-through can take it by pull-through. When a
-  provider has no free permit for that stream, the acquire asks again every
-  second. A node that refuses a lane's extra streams is asked again after
-  1 s, doubling to 30 s, and its `NotFound` refusals of uncovered ranges on
-  extra streams bar it from pull-through as on its own stream. The info line
-  `a queued range waits for a stream` names the waiting ranges and logs when
-  they change, and every 30 s while they stay.
-
-- **Chain-read logs no longer carry the RPC URL (#2264).** The node's
-  binding check, buyer lane seed, owned-pool walk, top-up, pool open and
-  reclaim sweep log their RPC errors through the URL-stripping redactor, so a
-  provider API key in `blockchain.rpc_url` does not reach the node logs. The
-  client's lane-build and discovery debug lines and the CLI's "no holder
-  resolved yet" warning do the same.
-
-- **A transient `getAuthorization` fault no longer refuses a paying signer as
-  cap-exhausted (#2220).** When the admit-time read faults, the node answers
-  with the last registration it read for that signer, whatever its age, with
-  `spent` raised to the settlement projection's fold. A registration's cap and
-  expiry are write-once, so the old read stays true; an old "unregistered"
-  read is not trusted, because a registration can land at any time. A signer
-  with no registered read is still refused, now as `pool_unconfirmed`
-  (`decdn_serve_stream_rejected_pool_unconfirmed_total`), so
-  `decdn_serve_stream_rejected_signer_cap_exhausted_total` counts only signers
-  whose on-chain cap cannot pay a floor.
-
-- **Partial holders no longer pull a blob from each other in a loop of three
-  or more (#2224).** While a node's own upstream open for a blob is in
-  progress, it refuses a whole-blob request for that blob from an active
-  staker with `NotFound`, so the requester tries its next candidate. New
-  counter: `decdn_serve_stream_rejected_pull_loop_guard_total`, on the "Serve
-  refusals by reason" panels; the debug line names the requester. Ranged
-  requests and client requests are not refused for this reason. A node also drops its own entry from the origin directory's
-  candidates, as the DHT lookup already does.
-
-- **Clustered `eth_getLogs` failures no longer flap every chain watcher
-  (#2253).** A window that fails every in-tick retry no longer fails the
-  tick. The poller ends the tick there, keeps the progress of the windows
-  before it, and the next tick resumes at the deferred window. The tick fails
-  (backoff, `*_watcher_restarts_total`, `*_watcher_down_seconds`) only when no
-  tick reaches head for 2 minutes, so ticks that progress but keep falling
-  behind head still surface. A deferred tick that completes no window does
-  not stamp the watchers' tick gauges. New counter:
-  `decdn_chain_get_logs_deferred_total`, plotted on the chain dashboard's
-  "eth_getLogs window span" panel.
-
-- **A partial holder is not asked again for chunks it cannot pull through
-  (#2262).** A probed holder that refuses a chunk outside its advertised
-  coverage with `NotFound` now counts toward the same three-refusal limit as
-  a non-holder. At the limit the client stops sending it uncovered chunks of
-  that blob for one minute, and keeps sending it the chunks it covers. A node
-  also answers `NotFound` when it sheds miss load, so when the minute ends the
-  holder takes one uncovered chunk again as a probe, and three more refusals
-  bar it again. A rediscovery that reports wider coverage, or a byte the
-  holder verifies on an uncovered chunk after its last refusal, lifts the bar
-  at once. When only uncovered work is left and every source is absent or
-  barred again after its probe, the item ends as a unanimous `NotFound` does.
-
-- **`max_blob_size` caps the bytes of one blob held, not the offsets served
-  (#2256, #2463).** A node serves a pull-through range at any offset of a
-  blob larger than its `max_blob_size` while the bytes it holds for that blob
-  fit; a read past 16 GiB of a 30 GB blob on a 16 GiB node is served, not
-  failed as a node fault. Each pull leg spans at most the room the bytes held
-  leave under the cap, and the pull ends before it opens a leg that could only
-  add bytes past it, so nothing past the cap is paid for. Before it commits, a
-  node refuses `Declined` only when it already holds the cap's worth of the
-  blob and lacks a byte of the range; it never reads the request's offset or
-  the upstream's unverified size. A fill that ends at the cap mid-stream sends
-  the bytes that landed, then a mid-stream `Declined`, and counts on the new
-  `decdn_serve_stream_midstream_blob_too_large_total`, never on
-  `decdn_serve_stream_node_fault_total`; the refusal before commit counts on
-  `decdn_serve_stream_rejected_blob_too_large_total`. The client excludes a
-  proxy or whole holder that refuses as too large for the rest of the blob; a
-  partial holder loses only pull-through. `decdn get --max-blob-mb` caps the
-  bytes the fetch holds the same way: `open_progressive_pull` refuses no
-  offset, and a fetch of ranges that could hold more than the cap runs one
-  stream at a time so concurrent legs cannot pass it. A resumed download whose
-  proven size needs more than the cap ends at once. `decdn_client::BlobTooLarge`
-  names its field `reached`: the bytes held, or the wire bytes one stream
-  received, past `ceiling`.
-
-- **An under-fold heal after a payer crash no longer loops, and a healed
-  lane fault does not end the pull (#2257).** When a trailing-proof
-  rejection's bundle is at or behind the ledger, the client retires the
-  in-process chain root the node never adopted and folds the ledger to its
-  settlement value, as a fresh process does. A watermark rejection that the
-  client heals but cannot resume within the retry budget now cools that
-  source instead of ending the command. A rejection that no bundle heals,
-  and a spending-cap rejection, still end the command. The heal branch and
-  each healed retry log at `info`.
-
-- **A delegated lane is swept when its expiry margin starts (#2233).** The
-  node refuses preimage reveals inside a capability's expiry margin, as it
-  already refused vouchers, so a lane's claim is final when the margin
-  starts. The redeemer sweeps one second later. Before, a lane's final value
-  waited for the next periodic sweep, and a sweep that a receipt wait
-  delayed into the expiry's landing slack skipped the lane and forfeited it.
-  The cutoff sweep batches the lane with the node's other owed lanes, so
-  lanes that are each below `redeem_threshold_micro_usdc` but clear it
-  together are redeemed before the expiry. A node that restarts after a
-  lane's margin starts sweeps that lane at once.
-
-- **Expiry and close deadlines hold a safety margin (#2242).** A node
-  refuses a voucher with `CapabilityExpired` once the capability expires
-  within one redeem interval plus 120 s, so every voucher it accepts meets at
-  least one redeem sweep before expiry. The redeemer skips a `Closing` pool within 120 s of its
-  dispute deadline, and a lane with value owed whose capability has expired
-  (new counter `decdn_redemption_skipped_expired_total`). `decdn pool assign`
-  checks expiry against the chain head timestamp when an RPC is configured,
-  falls back to the local clock with a warning, and warns when the expiry
-  falls inside the default node margin.
-
-- **Node dials use registry multiaddrs, not only the relay.** A node
-  publishes only its relay URL through pkarr, so a dial by bare node id
-  opened over the relay even when the target registered its QUIC address.
-  The daemon's `CapacityBond` watcher now keeps each node's registry
-  `multiaddrs` in an iroh address lookup on the endpoint, so DHT RPCs and
-  upstream probes and pulls connect directly to a reachable node. The CLI
-  keeps the registry addresses on warming proxies and cold-order
-  pull-through targets, and `decdn node lookup` dials with them.
-  `decdn-client`'s `WarmingCandidate` gains `multiaddrs`. A node's pkarr
-  record now carries its globally routable IP addresses next to the relay
-  URL (private, loopback, link-local and CGNAT addresses stay out), so a
-  node with no or stale registry multiaddrs is still dialable directly by
-  node id, on the n0 pkarr server and on an operator-configured
-  `network.discovery.pkarr_url` alike.
-
-- **Node reachability is reported, and registration defaults `--multiaddr`.**
-  At bring-up the node logs whether its default route has a public address
-  (public) or not (behind NAT, where relayed inbound is expected), sets
-  `decdn_node_public_address`, and warns when a public address is missing
-  from its registry multiaddrs. New counters
-  `decdn_inbound_connections_direct_total` and
-  `decdn_inbound_connections_relayed_total` split inbound connections by
-  arrival path, with a "Reachability" row on the node dashboard and a
-  `DecdnPublicNodeInboundRelayed` alert scoped to public nodes. `decdn
-  doctor` reports the same reachability. `decdn setup` and `decdn node
-  register` without `--multiaddr` now register the host's public address on
-  `network.bind_port`, and register none behind NAT.
-
-- **`bundle pull` no longer counts a resumed `.partial` prefix as downloaded
-  (#2236).** A prefix that an earlier, interrupted pull fetched counted again
-  in the entry line's downloaded bytes and rate, and in the summary's
-  `downloaded`. On the testnet a re-pull that resumed a 1.46 GB prefix
-  reported 9.7 GB downloaded for about 8.3 GB moved. The entry reads its
-  resume record before it drives anything and reports the prefix apart
-  (`7.7 GiB downloaded at R, 1.4 GiB resumed, 3.7 GiB spliced from disk`); a
-  byte both resumed and spliced counts as spliced. The summary adds
-  `resumed N from earlier partials`, and `--json` gains `resumed_bytes`.
-  `decdn-client` exports `ClientRangedStore::present_byte_ranges`.
-
-- **A slow client leg phase is logged (#2230).** A leg phase (`unpolled`,
-  `pay` or `read`) that runs past 5 s logs at debug, with the peer, hash,
-  offset and unproved bytes, so a proof stall is named before the node's
-  10 s proof timeout stops the stream.
-
-- **Partial holders no longer pull a blob from each other in a loop (#2227).**
-  A serve-miss read the blob size by opening the whole blob at its
-  top-ranked candidate, even a partial holder that lacked the first block.
-  That holder treated the open as a miss and started its own pull, often
-  from another partial holder or from the node that asked it. On the
-  testnet, fra1, hel1, nbg1 and lon1 asked each other for a Mistral shard
-  none of them fully held, at up to 166 failed streams per node per 5
-  minutes. The size open now asks for one chunk group of a block the
-  candidate advertises, and the requesting node is never a candidate.
-
-- **A serve-miss pull draws for its parked serve leg while a sibling stream
-  of the same blob waits further down (#2219).** Every serve leg's demand went to
-  every live fill of the hash as one high-water mark, so a sibling stream's
-  demand hid a leg parked at its own pull's frontier. That pull paced to
-  `Wait` and neither leg moved until the client gave up. On the testnet, lon1
-  proxying a 13.5 GiB entry went silent for 31 s and the client failed over.
-  Each serve leg now stands its own demand through a `DemandSlot`, routed only
-  to the fill that produces the awaited byte and withdrawn once the leg moves
-  again, and a pull reads the nearest standing demand. `decdn-cache` exports
-  `Demand` and `DemandSlot`; `FillSession::demand_up_to` is removed and
-  `FillSession::serve_demand` returns a `Demand`.
-- **`bundle pull` holds a lane-stream permit only while that stream runs
-  (#2208).** A range-dedup entry held a permit on every candidate, reserve
-  and proxies included, for the whole entry, and a fan-out held one per
-  provider after its lane died. A proxy lane that needed width then ran one
-  stream at a time. Each drive pass now reserves a permit only for the
-  sessions it drives, and each lane gives a permit back as each of its
-  streams stops. A lane with no range left keeps one permit for one idle
-  stream.
-- **The multi-source unit watchdog counts verified bytes, not durable
-  checkpoints (#2209).** It judged progress by the store's missing-byte
-  count, which moves only per 4 MiB checkpoint, so a proxy warming a cold
-  miss in ~1 MB draws was killed inside the 10 s default deadline.
-  `--unit-deadline-ms` is now the longest gap between verified bytes.
-- **`bundle pull` samples probe candidates per entry (#2204).** One
-  `SELECT_K` sample served the whole run, so with more registered nodes than
-  `SELECT_K` some nodes reached no entry, even when they were an entry's only
-  nearby holders.
-- **`bundle pull` no longer counts re-fetched bytes as spliced (#2193).** A
-  failed donor's group-wide re-fetch can cover part of a neighbour that
-  spliced, and the summary's downloaded bytes read low by that overlap.
-- **A peer store that refuses writes is logged (#2203).** The probe-round
-  harvest dropped every write error, freezing the latency ranking without a
-  trace. Each refused write logs at `debug`, and a round whose every write
-  fails logs once at `warn`.
-- **A serve-miss starts its upstream pull without re-hashing held ranges
-  outside the stream's own range (#2205).** Before it spawned the pull, every
-  serve-miss stream seeded the shared outboard from all of the blob's held
-  ranges, and `outboard_pairs` reads and verifies every leaf it exports. On the
-  testnet, lon1 proxied a 13.5 GiB entry: the dead time before each stream's
-  pull grew from 2.4 s to 8.2 s as the node cached more of it, and the stream
-  sent no data frame in that time. The upstream leg itself moved ~50 MB in 6 s.
-  The primed handshake pull also idled past its 2 s adoption limit, so the node
-  opened the same range a second time and forfeited its carried ramp credit at
-  the holder. The seed now covers only the held part of the stream's own
-  chunk-group-aligned range, the only span whose proof nodes its encoder loads.
-  A corrupt held range outside that span no longer fails the stream; the first
-  stream that covers it quarantines the hash. A failed seed is now logged at
-  `WARN`.
-
-- **`DecdnFeeSharesPollFailing` fires on repeated re-read failures, not on
-  one transient RPC error.** The rule fired for 6 h on any single failed
-  `getShares()` re-read, although the next hourly re-read heals it. On the
-  testnet it fired 18–40 h per node over 7 days from 6–11 failures each. It
-  now fires on `increase(decdn_fee_shares_watcher_poll_failures_total[3h]) >= 2`:
-  two failed re-reads inside 3 h, which at the default 1 h cadence is two of
-  the last three. The same 7 days would have fired it for 2–9 h per node.
-
-- **The client peer store no longer ranks a nearby node behind the origin
-  after a cold miss (#2196).** The store's `latency_ms` folded each stream
-  open's time to first byte alongside the probe RTT. On a cache miss that time
-  includes the serving node's own upstream pull, so after a bundle pull the EU
-  nodes read 1–1.8 s against a 57–78 ms RTT, and the sole origin ranked first
-  on the probe-less fast path for the next 10 minutes. Only probes now feed
-  `latency_ms`; a stream open files its quoted rate and clears the failure
-  stamp (`PeerStore::record_open`). `UpstreamPullHeader::ttfb_ms` is removed
-  from the `decdn-client` API, since nothing else read it. Every peer-store
-  mutation now takes one process-wide lock, so a stream open that races the
-  off-path probe harvest no longer writes back a record read before the probe
-  sample landed.
-
-- **A serve-miss whose DHT answer names only partial holders reaches the
-  namespace's origin instead of truncating the client's stream (#2195).**
-  The on-chain origin directory was read only when the DHT answer was empty.
-  Since #2188 a DHT answer can name only partial holders, so the ranged
-  assembly ran out of candidates for the blocks none of them held, and the
-  client got a short stream after `ok: true`.
-  - On the ranged pull leg, when the probed holders' coverage does not span the
-    blob, the node probes the origin-directory candidates that the first round
-    did not probe, an origin past the `probe_fanout` cut among them. A
-    supplemented miss probes at most twice `probe_fanout` peers and records two
-    `decdn_probe_collection_latency_seconds` samples.
-  - A probe-cache entry whose providers do not span the blob counts as a
-    `decdn_probe_cache_misses_total` on the ranged pull leg and runs a fresh
-    lookup.
-  - A partial holder's probe response carries the blob size
-    (`ProbeResponseExt.total_bytes`) with its coverage, so a set of partials
-    that covers every block counts as spanning. No wire change: the field
-    already exists.
-  - Before it signs `ok: true`, the serving node checks, against the signed
-    blob size, that its candidates cover the part of the pull range it does
-    not hold. If they do not, it refuses with a signed miss the client can fail
-    over on, and logs an `info!` naming the range.
-  - A ranged assembly that still ends early logs a `warn!` with its cause:
-    every covering candidate faulted, no progress, an uncovered range, or the
-    reassign budget.
-- **A serve-miss pull no longer re-pays one upstream range for hours after its
-  client leaves (#2194).** Two faults combined.
-  - A serve leg that waits on its pull for the next frame now also watches the
-    client's stream. Before, a wait touched neither stream, so a client that
-    left went unseen. The serve leg held its observer lease and kept the pull
-    alive until the node restarted. A client that stops the stream or loses the
-    connection now ends the serve at once and meters
-    `decdn_node_pull_through_client_abandoned_total`. The serve releases its
-    lease, which cancels the pull once no other serve leg observes it. The
-    node's own close (shutdown) ends the wait without counting an abandon, and a
-    send stream this node already closed is a node fault, as on the write path.
-  - `drive`, `drive_range_set` and `drive_range_lanes` never re-open a range
-    after a clean leg that moved neither the paid nor the delivered frontier.
-    The gap ends with the new `decdn_client::LegNoProgress` error, which fails
-    over to another source (at most one more leg each). A rebase of the shared
-    ledger during the leg voids the check. On a node, every pull path (ranged
-    runs, whole-blob pulls, own-origin fills) bumps
-    `decdn_node_pull_leg_no_progress_total` and logs a `warn!` with the range,
-    both frontiers and the channel's paid wire since the leg opened. An
-    upstream is not scored for it: the `(peer, hash)` pair is suppressed
-    briefly, and a speculative run still debits its warming allowance for the
-    paid leg.
-- **Monitoring: four dashboard panels show live data (#2197).** Each panel
-  showed zero, NaN or a dead series by construction.
-  - The delivery dashboard's "Bytes served, received and pulled through" panel
-    does not plot `decdn_cache_bytes_returned_total` ("served to callers"). That
-    counter is scoped to `CacheEngine::get`, and the serve path never calls
-    `get`, so the line held at zero. "served on the wire"
-    (`decdn_bytes_served_total`, bao wire bytes) is the delivered-bytes series.
-  - The overview's "Pull success rate" reads over a trailing `[1h]` window.
-    `decdn_node_pull_{attempts,success}_total` step only when a pull starts or
-    ends, so a `$__rate_interval` window read NaN during one long pull. "Pull
-    funnel" and the delivery dashboard's "Attempts vs success" say this in
-    their descriptions.
-  - The node dashboard's "File descriptors" panel does not plot
-    `node_filefd_maximum`. A host with no limit reports 2^63−1, and that value
-    flattened the allocated line to zero.
-  - The Tempo latency query, the span-rate panel description and the
-    `adr/appendix-observability.md` span table do not name `origin_range_pull`.
-    No code emits that span.
-- **A node that fills its cache through ranged pulls announces it to the DHT
-  (#2186).** The DHT republisher learned about cached content only from
-  whole-blob pull-through commits and from a boot-time walk of `Complete`
-  blobs. A node that filled only through ranged serve-miss pulls therefore
-  published no provider records. A blob that completed through ranged fills
-  was announced only after the next restart. Now a ranged admit
-  (`admit_bao`, `admit_bao_stream`) that completes a 64 MiB discovery block
-  announces the hash on `subscribe_inserts`, as ADR 022 §STORE Flow requires.
-  It does this even when the admit fails partway, because the store keeps the
-  blocks it verified. The cold-start seed and the lag sweep also walk partial
-  blobs, and the due-time gate drops any partial that covers no block. The
-  eager `Store` on a cache event now goes out only for a hash that has not
-  announced yet, and never with empty coverage. Later blocks widen the
-  advertised coverage on the next republish cycle.
-
-- **A seller repointed at a redeployed `PaymentPool` drops the old
-  deployment's lane state (#2181).** `poolId` names neither the chain nor the
-  contract, so a returning buyer's first pool on the new deployment has the
-  same id as its pool on the old one. The seller kept the old lane for it: it
-  rejected the buyer's first voucher as `AmountRegression`, which suppressed
-  the provider, and it redeemed the old deployment's signatures against the
-  new contract. `lanes.redb` now records the deployment (chain id and
-  `PaymentPool` address) in a `deployment_v1` table. When the node starts
-  against another deployment, it drops the lane table, both pending-settle
-  sets and the watcher checkpoint before it reads them, and logs the drop at
-  WARN with the lane count. The dropped lanes' unredeemed vouchers are forfeit.
-  A store with no record yet takes the configured deployment and keeps its
-  rows — so a node that was repointed at a redeploy **before** this upgrade
-  still carries the colliding rows under the new record; delete its
-  `lanes.redb`, `settle.redb` and `checkpoint.redb` by hand to clear them,
-  and leave `buyer.redb` in place — its rows carry per-row deployment tags
-  and are handled individually.
-  `PersistentPoolStateStore::open` takes the configured `Deployment`.
-
-- **`decdn-node` no longer hangs until systemd's stop timeout after
-  node-to-node pulls (#2185).** A serve-miss pull leg runs on its own
-  current-thread runtime, which drops when the leg returns. An upstream dial
-  made there put the connection's QUIC driver on that runtime, so the driver
-  died with it and the connection never reached QUIC's draining state. On
-  SIGTERM, `router.shutdown()` then waited in `Endpoint::close` until systemd
-  killed the process, which skipped the final redeem sweep, the lane-store
-  flush, the receipt tail and `cache.shutdown`. Every upstream dial the node
-  makes now runs on its main runtime, so each driver outlives the pull leg. The
-  per-leg drain wait is gone, and so is its counter
-  `decdn_node_pull_abandon_drain_timeout_total` and its dashboard series. The
-  router close is also bounded by the 15 s shutdown deadline and logs an error
-  when it gives up, so a stuck endpoint close can no longer cost settlement
-  state. A dial task that panics or is cancelled by its runtime shutting down
-  is this node's fault, and no longer scores the provider unreachable.
-- **Steady-state DHT republishes batch again (#2179).** The republish
-  scheduler ticked every second and sent only the records already due. The
-  per-record `uniform(30, 50 min)` jitter spread due times so thinly that each
-  `BatchStoreRequest` carried about 1.2 hashes, and each paid a fresh QUIC
-  connection, most of them on the relay path. A tick with a due record now
-  also takes the records due within the next 5 minutes, in due order, while
-  each receiver's set stays at or below 32 hashes (below the 40-token per-peer
-  burst). A cycle less than 2 s after the previous one takes due records only,
-  so a receiver's bucket refills between look-ahead batches. Sending early only
-  shortens a record's refresh gap, which stays between 25 and 50 minutes,
-  inside the receiver-anchored 1 h TTL (ADR 022 §STORE Flow "Drain cycle").
-
-- **A backpressure refusal from the only holder of a range no longer fails
-  paid serve streams (#2178).** A node pays every upstream leg from one buyer
-  signer, so its own concurrent pulls can fill a seller's per-signer floor cap,
-  and the seller sends that refusal as `NotFound`. The node's ranged assembly
-  dropped the refusing source on the first refusal. When that source was the
-  only holder of a still-missing range, the assembly ended short and every
-  serve stream attached to it failed after payment. The 30 s `(peer, hash)`
-  suppression then took the holder out of every other pull on the hash.
-  - An open-stage `NotFound` or `Overloaded`, or a transport rate-limit, on a
-    ranged run is now backpressure. When no other holder covers the range, the
-    node waits (250 ms, doubling to 4 s) and asks the same holder again. After
-    six waits with no new verified bytes, the node ends the pull, logs a
-    `warn!`, and suppresses the pair (ADR 039 §Failure handling).
-  - Ranged runs and the first-leg and header handshakes meter a backpressure
-    refusal but do not suppress the pair for it.
-  - New counters: `decdn_node_pull_backpressure_backoffs_total` (one per
-    completed wait) and `decdn_node_pull_backpressure_exhausted_total` (a
-    holder outlasted the wait budget; zero is the expected value).
-
-- **Back-to-back range pulls keep their credit ramp, and a bundle lane widens
-  as sibling entries finish (#2168).** A range-deduped bundle entry served
-  through a cold two-leg miss pulled its complement (147 runs, median
-  11.6 MiB) at about 1 MiB/s. There were two causes, and the fix for the
-  first exposed a third issue in the client:
-  - Every new `cdn/client/v1` stream restarted the node's credit window at the
-    one-chunk floor, on the serve loop and on the pull leg's `RampPacer`. A
-    lane now keeps an in-memory ramp-credit pool of paid content bytes. A
-    stream takes the whole pool when it starts. When it ends fully paid, it
-    returns its carried credit plus the content of its request, so the next
-    request on the lane opens at the window the last one earned. A stream the
-    node refuses before its first byte returns its credit unchanged. A stream
-    that ends any other way forfeits the credit, so a payer that abandons
-    stream after stream gets no more unpaid bytes than
-    `paid / credit_ramp_divisor` plus one floor for each stream. The pool
-    holds at most `credit_max × credit_ramp_divisor`. A restart or a forgotten
-    lane starts at the floor again (ADR 003 §Credit window). The deposit guard
-    and floor reservations still price the floor (ADR 037).
-  - `bundle pull` sized each provider lane once, from the permits free when
-    the drive started, so a lane that started at width 1 while sibling entries
-    held the provider's permits ran its runs one at a time. The lane now takes
-    freed permits, without waiting, each time it starts a gap while more gaps
-    wait (`decdn_client::LaneGrowth`), up to `--max-lane-streams`.
-  - After a proof write fails, the client now reads past the `ChunkData`
-    frames the node sent ahead of its `StreamError`, so an opening window wider
-    than one frame no longer turns an `UnderFold` rejection into a transport
-    error. This also applies at `credit_ramp_divisor = 0`. The skipped frames
-    stay under the request's promised wire length and the received-byte
-    ceiling, and a `StreamEnd` behind skipped frames fails the leg.
-  - `decdn_client::LaneGrowth` hooks receive the number of waiting gaps and
-    never add more workers than that.
-
-- **The `UnderFold` heal documents the path that reaches it (#2169).** A
-  reveal that fails to send locally never reaches the node: the client counts
-  a reveal only after the transport accepted its whole frame. The trailing
-  watermark comes from a payer process that exits after it sends reveals and
-  before it persists them, for example a second Ctrl-C during a `bundle pull`
-  that already persisted earlier entries on the same chain. ADR 003 and the
-  lane docs now name that path, and a loopback test drives it end to end.
-
-- **An under-folding voucher no longer stalls the stream for 10 s (#2167).**
-  A lane can hold a live hash chain from an earlier payer process. When a new
-  process sent a voucher at or above the signed anchor, under a new root, but
-  short of that chain's claim, the node credited it 0 bytes. It then waited
-  for a proof that never came, until the 10 s voucher read timeout. The client failed over to another
-  provider, so every small bundle entry routed to that node took about 11 s.
-  The node now rejects the voucher with the new reason `UnderFold` and the
-  resume bundle. The client folds the proved frontier, reseeds, and resumes on
-  the same provider (ADR 003 §Chain length and rollover).
-  `decdn_serve_stream_client_declined_total` stops rising for this case.
-  - The fold check now binds `bytes_delivered` as well as `amount`. A rollover
-    that pays the whole claim but signs fewer bytes than the chain proved is
-    also refused `UnderFold`. That one does not heal: the bundle does not
-    advance the client's amount, so the client stops and logs a `warn!`.
-  - Concurrent streams on one lane get the same rejection. The first one
-    reseeds; the others find the ledger already healed and retry.
-  - A sealed closing voucher that reaches the node at the anchor after a
-    sibling opened the live chain stays already-satisfied, as before.
-  - The node logs the fold shortfall (axis, owed, got) at `debug!` when it
-    rejects a voucher on lane validation.
-  - **Wire-breaking:** `VoucherRejectReason::UnderFold` is a new variant,
-    appended at the end. A peer built before it cannot decode the reason.
-
-- **Every failed inbound stream now has a reason counter (#2073).** About 91 %
-  of `decdn_streams_failed_total{direction="inbound"}` had none, so the
-  "Unattributed stream failures" panel showed a baseline no operator could
-  read. Five new counters close the gap:
-  `decdn_serve_stream_rejected_stream_cap_full_total`,
-  `decdn_serve_stream_request_unreadable_total`,
-  `decdn_serve_stream_voucher_rejected_total`,
-  `decdn_serve_stream_client_declined_total` (the requester left before a
-  voucher credited a byte, which includes the header handshake a downstream
-  miss pull does not adopt) and `decdn_serve_stream_client_abandoned_total`
-  (the requester left after paying). The serve handler now counts every end in
-  one place, so each inbound failure counts on exactly one reason and the panel
-  reads 0; any positive rate is a bug.
-  - A refusal whose signing fails counts only as a node fault; it used to count
-    as the refusal reason too.
-  - A refusal, a voucher reject, or a mid-stream pool or signer-cap stop whose
-    frame the peer never reads (it already left) keeps its own reason instead of
-    counting as the peer leaving.
-  - A write to a stream the node already closed is a node fault on every write
-    path; the framed writes used to file it as the peer's fault.
-  - A panicked stream counts its node fault before its failure.
-  - The `serve_stream` span records `outcome = "stopped"`,
-    `reason = "proof_budget_exhausted"` for a spent proof budget and
-    `outcome = "reset"`, `reason = "request_unreadable"` for an unreadable
-    request, where both used to record `outcome = "failed"`. Both keep the cause
-    in the span's `error` field, as does a refusal or stop whose write failed.
-  - Both Unattributed panels subtract the node crate's `INBOUND_FAILURE_REASONS`
-    list, and tests hold the panels, the list, and every exported
-    `decdn_serve_stream_*` counter to one another.
-
-- **A transient `eth_getLogs` failure no longer takes every chain watcher down
-  (#2161).** The shared chain-event poller retries a failed window on the same
-  block range up to two times, 2 s apart, before it fails the tick. A retry
-  that succeeds does not fire `on_backoff`, count a watcher restart or start
-  `*_watcher_down_seconds`. Before, the first failed window failed the whole
-  tick, the backoff grew the backlog, and the longer backlog needed more
-  windows, each one another chance to fail: on the dRPC free plan (100-block
-  cap, about 15–20 % of calls failing with code 19 or 30) every watcher showed
-  minutes of downtime although no event was lost. Range rejections keep the
-  shrink path. A rate limit (HTTP 429, `Retry-After`, or rate-limit wording)
-  and a permanent error (a revert, invalid request/method/params, an HTTP 4xx
-  other than 408/429) are not retried and fail the tick at once. Each retry
-  logs its cause at `info` and bumps the new counter
-  `decdn_chain_get_logs_retries_total` (one window adds up to two), plotted on
-  the "eth_getLogs window span" panel. A hung provider now takes up to 34 s
-  per window (three 10 s timeouts plus the sleeps) before the tick fails.
-- **A transient RPC error during a boot-time chain read no longer exits the
-  daemon (#2159).** The CapacityBond registry snapshot, the slash enumeration,
-  the PaymentPool `usdc()` self-check and the ContentBlacklist boot enumeration
-  plus its enforcement pass now retry in process on the chain watchers' backoff
-  (1 s doubling to 60 s), with a `WARN` (`boot chain read failed; retrying
-  after backoff`) and a `decdn_chain_boot_read_retries_total` bump per retry.
-  One 10-minute boot deadline covers all of them, so a dead endpoint still
-  exits. A deterministic fault still fails boot at once: no contract at the
-  address, an ABI mismatch, a revert, an invalid request/method/params
-  response, an HTTP 4xx other than 408/429, or a local eviction error that
-  decides a blacklist enforcement attempt. Startup stays fail-closed: the ALPN router
-  still waits on the blacklist enumeration and enforcement. Supporting changes:
-  - The registry, slash and `usdc()` reads carry the 10 s per-call RPC
-    timeout, so a hung provider reaches the retry instead of wedging boot.
-  - A failed head read keeps its typed provider error through the
-    `SharedHead` cache, so the first read of each bootstrap is classified too.
-  - The slash enumeration reads at its snapshot block, so a lagging
-    load-balanced backend answers "header not found" (retried) instead of
-    reverting on a slash index it has not seen (fatal).
-  - The best-effort fee-share reads (`PaymentPool.feeRouter()`,
-    `FeeRouter.getShares()`) retry on a 1-minute sub-budget of the boot
-    deadline and carry the per-call timeout. They still fall back to the floor
-    share rather than fail boot, but a transient `feeRouter()` error no longer
-    leaves the node on the floor share with the fee-shares watcher
-    unregistered until restart. When it does fall back, the new
-    `decdn_fee_shares_watcher_unregistered` gauge reads `1`. Their failure
-    logs are sanitized, so an RPC URL key cannot leak into them.
-  - The fee-shares watcher's periodic `getShares()` re-read carries the
-    per-call timeout and logs a sanitized error.
-  - The blacklist boot enforcement pass stops at its first failed scope read
-    instead of re-checking every remaining hash against a failing provider.
-  - The client's registry discovery shares the classifier
-    (`decdn_client::provider::is_permanent_contract_error` /
-    `is_permanent_rpc_error`): a provider outage answered as a JSON-RPC error
-    response (for example code `1` "no available upstreams" or `19` "Temporary
-    internal error") is now retried on the ADR 012 schedule instead of failing
-    the read at once.
-- **An own origin that declines `Range` degrades before the node signs
-  (#2069).** The own-origin serve-miss probe now reads the blob's first chunk
-  group as a ranged GET. An origin that publishes `{H}.obao4` but ignores
-  `Range` falls back to the buffered whole-blob pull instead of signing
-  `ok: true` and failing the stream on its first draw. A per-origin latch skips
-  the probe's range read once the origin serves a clean range window, and an
-  origin that serves a wrong-length first window no longer shadows a healthy
-  later origin. A panic in the range encode now surfaces as the new
-  `CacheError::Internal` with its message, logged as a code bug, not as a
-  local-origin fault; a store fault such as a full disk is not. New series:
-  `decdn_cache_range_pull_permit_waits_total` (draws that waited on the full
-  range-pull pool, warning past 10 s) and
-  `decdn_node_pull_through_wait_seconds` (length of each pull pause, warning
-  past 45 s). `decdn_cache_fill_not_coalesced_total` now counts once per claim,
-  and only when the skipped fill overlaps the request.
-
-- **The cache footprint counts a partial blob's present bytes (#2157).**
-  `size_snapshot` sized a partial blob from iroh-blobs' `status()`, which
-  leaves the size unknown until the blob's last chunk arrives and then reports
-  the whole blob. A middle-range or front-range fill counted as 0 bytes, and a
-  fill that holds the tail counted as the full blob. `decdn_cache_bytes` read 0
-  on a node that held gigabytes of node-tier miss fills, and the eviction
-  driver undercounted those fills: they never pushed the cache over its
-  high-water mark, and an eviction of one counted 0 bytes freed. A partial
-  blob now counts the bytes its bitfield marks present. This fixes the gauge,
-  the eviction footprint, and GC reclaim attribution. The size walk re-reads a
-  partial's bitfield at most once per 30 s, because each read of an idle
-  partial fsyncs its store files, so a growing fill's count trails by up to
-  30 s. A partial whose bitfield read fails counts at its last known count,
-  else at `status()`'s size, and the walk goes on; each such failure ticks the
-  new `decdn_cache_partial_size_observe_failures_total` and logs the hash. A
-  partial fill is now an eviction candidate as soon as it is admitted. Before,
-  it became one only after a serve completed, so the driver never selected a
-  fill whose serve aborted or went unpaid.
-
-- **A redemption whose receipt wait fails but whose transaction mined counts
-  as landed, not as a failure (#2154).** A load-balanced RPC can fail the
-  receipt wait with `Unknown block` when the backend that answers has not seen
-  the block yet. The node counted each such `redeemMany` in
-  `decdn_redemption_failures_total`, even though it had mined. The landed path
-  never ran, so `decdn_pool_redemptions_total` missed the vouchers and
-  `registered_until` was not saved, and a later sweep registered the signer
-  again. When a receipt wait fails or times out, the node now fetches the
-  receipt by hash up to three times, waiting 1 s, 2 s and 4 s before each
-  fetch. A receipt found this way counts as landed or reverted, the same as
-  one the wait returned, and also ticks the new
-  `decdn_onchain_tx_receipt_recovered_total`.
-  `decdn_onchain_tx_receipt_failed_total` and `decdn_onchain_tx_timeout_total`
-  now count only transactions that are still unconfirmed after those fetches,
-  and the node's warning names the last fetch's result (`last_lookup`). An
-  unconfirmed `redeemMany` is no longer a redemption failure. The
-  `DecdnOnchainTxTimeouts` alert is renamed `DecdnOnchainTxUnconfirmed` and
-  fires on both unconfirmed counters, so a node that cannot see its own
-  receipts still pages.
-
-- **Chain watchers survive an RPC that caps `eth_getLogs` ranges, and the
-  stalled-watcher alerts catch a watcher that never ticked.** The chain-event
-  poller scanned `[cursor, head]` in fixed 10 000-block windows and never read
-  the error. A provider with a lower range cap (dRPC's free tier rejects about
-  150 blocks, Alchemy's free tier 10) rejected every window, the cursor held,
-  and each backoff retry asked for a wider range, so every watcher stayed
-  blind. A restart did not help once the settlement checkpoint was more than
-  the cap behind head. The poller now sets its window to half the rejected
-  window when the provider's JSON-RPC error names a range or result limit,
-  retries at once, and doubles the span back after 32 accepted windows;
-  timeouts, rate limits, head-lag errors and other errors keep the backoff
-  path. The five `*WatcherStalled` alerts only read the tick gauge behind a
-  `> 0` guard, and a never-ticked watcher reads `0`, so none fired. Each now
-  also fires on `decdn_<watcher>_watcher_down_seconds > 180`. The "Oldest
-  watcher tick", "Watcher tick age" and "Settlement watcher freshness" panels
-  show a failing never-ticked watcher by its down-seconds instead of dropping
-  it.
-
-- **Tracing: dependency spans no longer export, and each run of a streaming
-  miss has an `upstream_stream` span (#2048).** The OTLP export filter
-  admitted any span at `WARN` from a non-deCDN crate. iroh opens its periodic
-  network-report spans (`QADv4`, `QADv6`, `reportgen-actor`, `run-probe`,
-  `captive-portal`) at `WARN`, so they made up about 95% of the spans in
-  Tempo. The filter now exports no span from another crate at any level. A
-  dependency's `WARN` and `ERROR` events still land on the deCDN span around
-  them, as [ADR appendix-observability](adr/appendix-observability.md#trace-spans)
-  specifies. The ranged pull leg now opens an `upstream_stream` span for each
-  run it pulls from a peer, with the same `peer`, `local_node_id`, `hash` and
-  `pool_id` fields as the buffered path. Its `outcome` is `filled`,
-  `reassigned`, `terminal` or `cancelled`. A streaming miss from a peer now
-  nests as `serve_stream` → `serve_miss_pull` → `upstream_stream` →
-  `open_progressive_pull`; a first leg adopted from the header handshake
-  stays under `serve_stream`.
-- **Runtime: every JSON log event carries `node_id` (#2050).** ADR
-  appendix-observability lists `node_id` as a mandatory log field, but only
-  the identity line and the startup banner carried it, so a log line in the
-  aggregator could not be joined to the NodeId that peers and the chain see.
-  The JSON formatter now writes `node_id` (lowercase hex) as a top-level key
-  beside `timestamp`, `level`, `target` and `fields`. The daemon loads its
-  node key before the tracing subscriber starts, so the first event of the
-  process already has it. The start order is now: OTLP exporter, node key,
-  subscriber, RPC preflight. So a key-load error prints to stderr as a plain
-  `Error:` line, like a config error, and is not a JSON event or an OTLP
-  span. A first start writes `node.secret` even when the RPC is unreachable.
-  The `pretty` format is unchanged. ADR appendix-observability now names the
-  JSON keys as written (`timestamp`, not `ts`) and records which OTLP
-  resource attributes the node sets and which the collector adds.
-- **Client: a fault before a range's first leaf no longer marks the rest of
-  the blob present.** A leg that faults after its bao parents and before its
-  first leaf checkpoints the parents with an empty received prefix. The
-  checkpoint treated that zero length as "to the end of the blob" and added
-  every byte from the leg's start to the end of the blob to the present set,
-  with no data behind it. A later drive then skipped those bytes, the
-  `.ranges` record kept them, and the local verify at finalize failed. An
-  empty prefix now adds nothing.
-- **CLI: a multi-source fetch whose lanes all crawl now stalls as a whole
-  (#2123).** The drive-level throughput floor (`--min-throughput-bps` over
-  `--stall-timeout-ms`) covered single-source and range-dedup drives only. The
-  multi-source scheduler's per-unit watchdog judges one lane's unit at a time,
-  so a fetch where every lane moved a little inside `--unit-deadline-ms` never
-  tripped anything. The floor now also runs over a multi-source fetch, measured
-  on its position across every lane. A trip falls back to single-source
-  failover, which resumes the `.partial`. The clock stops while the fetch
-  waits on its own top-up, and the present record is flushed before the
-  fallback. At `-v` the fetch logs its progress, rate and ETA every 10 s. The
-  SDK adds `multi_source_fetch_until` and `Downloader::fetch_to_paths_until`,
-  which take the same `stop` future as `drive_range_set`, and their progress
-  callbacks take a borrowed trait object.
-- **Node: serve-loop payment faults are metered by cause (#2134, #2135).** The
-  miss serve loop counted every proof error and every chunk-write error as a
-  client abandon, including a lane-store `record` failure, a broken paid-frontier
-  invariant, and a write to a stream the node had already closed. Those are
-  node faults, which `decdn_serve_stream_node_fault_total` already meters, so
-  `decdn_node_pull_through_client_abandoned_total` overstated client abandons.
-  The miss serve loop now counts an abandon only when the peer caused the error,
-  in both its chunk-write and its proof-recoup phase. A payer that sends
-  `MAX_PROOFS_PER_CHUNK` proofs for one chunk without settling it now bumps
-  the new counter `decdn_serve_stream_proof_budget_exhausted_total` on both the
-  cache-hit and the miss serve loop. Before, the cache-hit exit logged only at
-  `debug!` and bumped no counter. The delivery dashboard shows the counter
-  beside the other mid-stream stops, and both "Unattributed stream failures"
-  panels subtract it.
-- **Node: a proof that pays part of a chunk no longer wedges the runtime
-  (#2132).** A proof credits at most the lane headroom it finds, so a sealed
-  voucher that moves the watermark by a sliver pays a sliver of the chunk. Both
-  serve loops added that sliver to `paid` but dropped the whole chunk from the
-  queue of owed chunks. The unpaid rest was then tracked nowhere. On a cache
-  hit, once it filled the credit window, the serve loop went around forever
-  without awaiting, and held one tokio worker per stream. Two such streams
-  stopped a 2-vCPU node: serving, watchers, logs, and `/metrics` all went
-  silent, while systemd still showed the unit `active`. Any paying client could
-  trigger it. A partly paid chunk now stays owed until proofs pay all of it.
-  `MAX_PROOFS_PER_CHUNK` counts every proof that leaves the chunk unsettled, so a
-  payer that sends sliver after sliver hits the bound. The chunk's delivered
-  length, not its unpaid rest, still decides whether a metering voucher may pay
-  it. Both serve loops now check after each recoup that `delivered − paid`
-  equals the bytes not yet cut into a chunk. When an iteration neither delivers
-  nor credits a byte, they end the stream as a node fault, logged at `error!`.
-  The miss path used to file that state as a client abandon, so
-  `ServeStop::ClientAbandoned` is gone.
-- **CLI: a range-dedup bundle entry pays its complement over one warm session,
-  concurrently (#2119).** An entry that shares most of its chunks with a sibling
-  pays for about one 16 KiB chunk group at each seam its donors cannot cover —
-  about 1,300 ranges for a 13.8 GB file. `bundle pull` paid them one at a time,
-  each on a new QUIC connection with its own handshake, so the complement took
-  close to an hour. The entry now opens one session per provider and reuses it
-  for every drive (the complement, a donor re-fetch, each deferred fallback, the
-  self-heal re-drive). The session keeps one connection open, redials it if it
-  closes, and fills the merged ranges up to `--max-lane-streams` at a time
-  through `decdn_client_pull::drive_range_set`. Concurrent ranges on one deposit
-  top up one at a time: `SharedPool` gains a `topup_lock` (the run's is
-  `LaneLedgers::topup_lock`), and a range that waited on it re-reads the deposit
-  and draws again instead of escrowing a second shortfall. Without
-  `--max-approve` the second `topUp` used to revert on the allowance the first
-  one spent.
-- **CLI: the fetch prelude's first open is the drive's first leg, not a
-  throwaway (#2063).** `decdn fetch` and `bundle pull` opened every entry once
-  to read its size, dropped that pull, and opened the same range again. The
-  node treats each open as real, so every cold entry cost a duplicate origin
-  draw and a delayed first byte. The prelude now opens exactly the range the
-  drive opens first (`decdn_client_pull::first_leg`) and parks it in a
-  `PrimedSource`, which hands it to that open. A range-dedup entry, whose size
-  the manifest gives, opens a bounded first leg instead of the whole blob. On a
-  whole-blob resume the size must be read before the store can say what is
-  missing, so that open is still dropped, and so is a multi-source fetch's size
-  probe.
-- **CLI: a drive whose short legs each clear the floor still stalls as a whole
-  (#2120).** The throughput floor (`--min-throughput-bps` over
-  `--stall-timeout-ms`, by default 4096 B/s over 30 s) judged one stream at a
-  time, and each short range leg is briefly healthy, so an entry could crawl
-  for 20 minutes with no stall and no failover. Every single-source and
-  range-dedup drive now also runs under the same floor, measured on the drive's
-  own progress across all of its legs and the waits between them. The clock
-  stops while the drive waits on its own top-ups, and it races only the gap
-  work (`drive_range_set`'s new `stop`), so the local check of a complete blob
-  is never cut off and the present record is flushed before the drive returns.
-  A drive that averages below the floor fails over like a stall. The
-  multi-source path keeps its per-unit watchdog. At `-v`, a drive logs its
-  progress, rate and ETA every 10 s, and each bundle entry logs its size, time
-  and rate when it lands.
-- **CLI: failed bundle entries are retried, and a provider list that runs out
-  says so (#2118).** Each entry walked its candidates once, the last failure
-  logged no warning, and a provider that failed once never served the entry
-  again, so one transient fault could lose a large entry for the whole run. The
-  new `--entry-retries N` (default 2) gives each entry that failed in a way
-  another round can fix up to N more rounds after the first pass, backing off
-  2 s, then 4 s, doubling to a 30 s cap. Each round probes again and resumes
-  from the entry's `.partial`, so no byte is paid for twice, and a group that
-  runs again is not "finished" for its deferring siblings until it finishes
-  again, so they wait for its shared chunks rather than paying for them too. A
-  spent pool, a size that disagrees with the manifest and a local disk fault
-  never start a round. A pool exhaustion now fails over on the
-  range-dedup path as it already did on the whole-file path, the last failover
-  logs a warning, and the error of an entry that ran out of providers names how
-  many it tried. A retried entry's bar does not count its landed prefix into the
-  total bar twice. A range-dedup entry with nothing to pay for up front now
-  creates a real ranged store before it splices, so a later drive no longer
-  truncates the spliced bytes and pays for the whole blob again, and
-  `ClientRangedStore::open_or_create` treats a failed stat of the `.ranges`
-  record as an error rather than as "no record", which would truncate the
-  `.partial`.
-- **CLI: an unreadable data dir no longer passes as a client's (#2086).**
-  `decdn_common::data_dir::daemon_marker` used `Path::exists`, which reads every
-  stat error as "absent", so a node data dir whose store files could not be
-  stat'd (a permission denial, a loop, a transient I/O fault) was classified as a
-  client's, and the guards that refuse to escrow, sweep or buy into a node's dir
-  let the command through. It now returns `io::Result` and treats only
-  `NotFound` as absent; the guards, `ChainAdoption::for_buy` and `pool list`
-  refuse or report the owner as unknown instead.
-- **Node: a cold multi-GB cache miss streams at bandwidth, not one round trip
-  per chunk (#2061).** The two-leg serve-miss spine re-read the whole
-  `{H}.obao4` outboard (blob / 256 bytes) from the origin on every draw, and
-  opened a new upstream request for each small piece of room a voucher
-  released — often one chunk. A proxy-warmed bundle pull fell from 40–60 MiB/s
-  to 1–8 MiB/s once it reached content only one node could fill.
-  - The cache engine keeps each outboard, tagged with the origin that served
-    it, in a 256 MiB memory cache. The serviceability probe and every draw read
-    it from there. Each draw takes the outboard and the data from the same
-    origin, and a verify fault evicts the copy the draw used. Concurrent cold
-    misses of one hash wait for one origin read. An outboard over 256 MiB (a
-    blob over 64 GiB) is read on each draw.
-  - Once the ramped window reaches four pull-window floors, the pull leg waits
-    until half of it is open before it draws, except for a serve-demand draw or
-    the end of a gap. The exposure bound is unchanged. The new counter
-    `decdn_node_pull_through_min_draw_waits_total` meters these waits apart
-    from `decdn_node_pull_through_window_paused_total`.
-  - Each origin read on this path (an outboard fetch or one data window of at
-    most 4 MiB) has a time budget of `cache.node_pull_stall_window_sec` plus
-    the read size at `cache.node_pull_min_throughput_bps`. A read past it fails
-    as an origin fault and bumps `decdn_cache_origin_range_timeouts_total`.
-    `node_pull_min_throughput_bps = 0` leaves these reads unbounded.
-  - `decdn_cache_pull_through_bytes_total` counts each outboard the origin
-    serves once, including wrong-length copies.
-
-- **CLI: `decdn fetch` and `decdn bundle pull` adopt the pool the wallet
-  already owns on chain, instead of opening a second one.** The client decided
-  whether it owned a pool from its local store alone, so a lost row read as "no
-  pool": it escrowed a fresh `buyer_working_deposit_micro_usdc` beside the live
-  one. On a wallet whose USDC was already escrowed in that pool the second
-  `openPool` reverted outright (`ERC20: transfer amount exceeds balance`, graded
-  `insufficient_deposit`). The `_v4` buyer-table move in #2087 made this the
-  common case — every client row written before it reads as absent — but any
-  store loss reached it: a reset data dir, a new machine. With no usable row the
-  client now asks the chain (`getPools`) and adopts the newest `Open` pool that
-  still has deposit to spend, recording it; it opens a pool only when none
-  qualifies, and a chain read that fails aborts rather than opening one. A lane
-  with no local record — every lane of an adopted pool, and a tracked pool's
-  first contact with a provider — resumes from the chain watermark
-  (`getWatermark`) rather than zero, where every voucher at or below it redeems
-  nothing; that is one extra read per new lane, and a fault on it now aborts the
-  fetch. An adopted pool's refill decision counts what the pool has already paid
-  out (`totalRedeemed`), so a pool other lanes drained is topped up rather than
-  trusted as full. A buy whose store or key belongs to a node never adopts —
-  a node's dir named with `--data-dir` (#2082), or a client dir pointed at the
-  node's keystore with `--keystore`/`blockchain.eth_keystore`: the wallet is the
-  operator's, so its live pool is the daemon's own, and adopting it would put a
-  second voucher series on the daemon's lanes. Adoption assumes one buyer per
-  wallet, and a key copied out of a node's dir, or shared between two clients,
-  is not detectable locally.
-
-- **CLI: `decdn whoami` reports a keystore the shared password does not open
-  (#2008).** The command resolved one password and applied it to both
-  `<data_dir>/keystore.json` and `<data_dir>/client/keystore.json`. `key-gen`
-  writes those at different times and prompts for each, so they can hold
-  different passwords — and when they did, the first `Mac Mismatch` aborted the
-  whole command. Nothing printed: not the node id, not the key paths, not the
-  address of the keystore whose password was correct. The shared password is
-  still tried first; a keystore it does not open now degrades its own line to a
-  note naming the keystore and the reason, and on a TTY that keystore gets one
-  prompt of its own before the note. Every other line still prints and the
-  command exits 0, which is what its documented ordering already promised for
-  the node id and the paths.
-
-- **CLI/node: `decdn doctor` checks the store files a daemon actually owns
-  (#2083).** `doctor` kept a private copy of the daemon's store-file list and
-  it had drifted: it reported on a `floor-loss.redb` that nothing creates, and
-  a fifth daemon store would have been checked by nothing. The list now comes
-  from `decdn_common::data_dir::DAEMON_STORE_FILES` plus `CLIENT_BUYER_DB_FILE`,
-  the same names the daemon's own store and the client store use. A new
-  `pool_store` test asserts that opening `PersistentPoolStateStore` creates
-  every file in that set and no `.redb` outside it, which turns the premise
-  `daemon_marker` — and with it the node-vs-client classification from #2078 —
-  rests on into a checked fact.
-
-- **Node: bootstrap distinguishes "this pool is not open" from "its status could
-  not be read" (#2078).** The stale-row drop below judged a tracked pool by its
-  absence from the set of pools read as `Open`, and a `getPool` call that faulted
-  produced the same absence. One transient RPC error at bootstrap — there is no
-  retry on that call — would therefore delete the node's only record of a funded
-  pool, and the next miss would escrow a second deposit: the #2072 failure,
-  self-inflicted, and invisible because the stranded-pool report cannot name a
-  pool it failed to read either. A row is now dropped only on a successful read
-  that returned a non-`Open` status. An id `getPools` does not list also counts
-  as unknown: that view derives ids from `ownerPoolNonce` and `closePool` /
-  `reclaim` only change a pool's status, so it is append-only and an absent id
-  has no on-chain producer.
-
-- **Node: a buyer-pool row the chain no longer lists as open wedged the buy leg
-  (#2078).** `reuse_or_report` reads the tracked row without a status check, and
-  bootstrap answered `AlreadyTracked` for any row at all, so a pool closed or
-  reclaimed out of band — which is what `decdn pool close --pool` from a node
-  host leaves behind, since it cannot write the daemon's store — pinned every
-  later pull to a pool `redeemMany` rejects every voucher against. Restarting
-  did not help. Bootstrap now checks the tracked pool against the chain's open
-  set, drops a stale row, and adopts or opens a replacement.
-
-- **Node: a node with an intact buyer store never reported its stranded pools
-  (#2078).** `reconcile_owned_pool` returned as soon as the store named a tracked
-  pool, before it enumerated `getPools` — so `report_stranded_pools` was reachable
-  only on the adoption path. The steady state (store intact, a deposit stranded by
-  an earlier build) was therefore permanently silent, and only a direct `getPools`
-  read surfaced it. The enumeration now runs on every bootstrap, and the stranded
-  set is measured against the pool the *store* names rather than the one an
-  adoption would have selected. A fully-redeemed `Open` pool is no longer listed:
-  `reclaim` refunds `deposit - totalRedeemed`, so there is nothing to recover.
-  `decdn_buyer_pool_adoption_failures_total` is deliberately **not** widened — an
-  enumeration failure on the already-tracked path warns instead, because the
-  counter means "about to open a second pool" and that path never is.
-
-- **Node: the pre-redeem watermark reconciliation never decoded on a chain
-  without Multicall3 (#2076).** The seller's last gas check before a `redeemMany`
-  batched its per-lane `getWatermark` reads through Multicall3 at
-  `0xcA11bde05977b3631167028862bE2a173976CA11` — a contract the protocol neither
-  deploys nor verifies. Where it is absent, including every `anvil` chain, the
-  `eth_call` returned empty, alloy decoded the empty buffer as `ABI decoding
-  failed: buffer overrun`, and the fail-open arm submitted the plans unchanged on
-  every sweep. It stayed silent because the contract's own `claimed <= w.amount`
-  guard makes an already-redeemed lane a harmless no-op, so the only symptom was
-  wasted gas. The read is now `PaymentPool.getWatermarks(bytes32[], address[],
-  address[])`, the batch companion to `getWatermark`: one `eth_call` per batch of
-  at most 512 lanes, against the protocol's own deployment. A failed or
-  short-returning batch keeps the prefix already read instead of discarding the
-  whole result, and a return whose length does not match the batch fails that
-  batch rather than pairing values it cannot trust. Each batch now meters itself
-  as `decdn_redemption_reconcile_ok_total` /
-  `decdn_redemption_reconcile_failures_total`, with a `DecdnWatermarkReconcileFailing`
-  alert — a zero `decdn_redemption_reconciled_skip_total` alone cannot separate a
-  healthy sweep from a read that never landed, which is what let this hide. This
-  is an **additive contract-surface change** — one new view selector on
-  `PaymentPool`; no storage layout, event or write path changes.
-
-- **Node: a reset buyer-pool store stranded the node's deposit and wedged every
-  node-to-node pull (#2072).** The buyer store was the only record that the node
-  owned a `PaymentPool` deposit, so a moved or re-provisioned `identity.data_dir`
-  lost it. The node then opened a second deposit beside the first, forgot that one
-  too, and once the wallet was drained every cache-miss pull failed
-  `ERC20: transfer amount exceeds balance` with its own escrow sitting idle
-  on-chain — contradicting ADR 003 §node→node ("a pool is opened once and reused",
-  "owner funds are never stranded"). `BuyerPoolService::bootstrap` now reconciles
-  against `PaymentPool.getPools` and adopts the newest `Open` pool the owner
-  already holds; adoption failure is soft, leaving the first miss to open one the
-  old way. A lane with no local progress reseeds from the contract's
-  `watermark(pool, signer, provider)`, because `PoolLedger` signs `prior + accrued`
-  and resuming a paid lane from zero signs cumulatives the contract pays nothing
-  for. That read **refuses the pull** on failure rather than degrading: the pull
-  persists its own progress on every exit path, so a zero-resumed lane gains a
-  local row and the reseed never runs for that provider again — one RPC blip
-  would strand the lane permanently. A fully-redeemed pool is skipped (it is
-  still `Open` on chain, and adopting one would wedge buying against a deposit
-  that funds no voucher), and any further open pools are named in the log so
-  their deposits are recoverable. `enumerate_owned_pools` moved from `decdn-cli`
-  to `decdn_incentive::payment_pool` so both binaries share one pager.
-
-- **Node: one failed `openPool` moved `node_pull_pool_open_failures_total` twice,
-  and blamed the wrong host (#2072).** `run_open`'s `openPool` leg metered the
-  counter without marking the error `OpenReported`, so the `node_origin` classifier
-  counted it again in its residual arm — the live fleet read 46 pool-open failures
-  against 23 pull attempts. That fall-through also scored a chain revert as
-  `node_pull_local_fault_total` and logged "suspect this node's store or lock
-  state" for an on-chain failure. The leg now meters once where it is raised,
-  marks `OpenReported`, and adds `LocalPullFault` for the failures that no other
-  provider can answer. `openPool` names no provider, so neither an unfunded
-  wallet nor a chain lane that cannot carry the transaction varies per candidate:
-  both now refuse rather than walking the candidate list and then reporting the
-  blob absent. A `ContractRevert` still walks on. The join-error leg meters too,
-  which is what makes the "meters iff marks `OpenReported`" invariant true rather
-  than merely documented. The ladder's arm choice is a pure
-  `classify_pool_open_arm`, so the one-increment invariant is unit tested.
-
-- **Incentive: an under-funded wallet was classified `contract_revert` (#2072).**
-  `PoolOpenFailureReason` matched only `OpenZeppelin` v5 custom errors, so a USDC
-  that reverts `Error("ERC20: transfer amount exceeds balance")` — the deployed
-  Sepolia token — reported as an opaque on-chain fault naming no remedy. String
-  reverts now classify as `insufficient_deposit` on their message.
-
-- **Metrics: `decdn_pool_deposit_usdc` was hardcoded to zero (#2072).** Both
-  callers of the seller-side lane snapshot passed `U256::ZERO`, because a lane
-  carries no pool deposit — the gauge has read zero since #1667 while
-  `adr/appendix-observability.md` documented it `live`, and the name gate only
-  checks that a series is exported, not that anything sets it. The redeemer tick
-  now publishes `Σ (deposit − totalRedeemed)` over the pools it plans lanes
-  against, beside `decdn_unredeemed_usdc`; the lane count gets its own
-  `set_lanes_open`. The publish is skipped when nothing is pending redemption —
-  the healthy steady state — so the gauge does not sawtooth to zero after every
-  successful sweep and read as insolvent counterparties.
-
-- **Cache: origin range pulls held the whole requested span in memory — twice
-  (#2065).** A few multi-GB range requests against a partially held blob OOM-killed
-  the node. `CacheEngine::pull_through_range` now reads the `{H}.obao4` outboard once
-  and fetches, verifies, and imports the span in `RANGE_PULL_WINDOW_BYTES` (4 MiB)
-  windows, so a pull holds `O(window + outboard)` bytes whatever `byte_len` is. The
-  own-origin serve-miss (Flow A) streams its wire the same way:
-  `CacheEngine::origin_range_wire` runs one coherent encode over on-demand windows
-  behind a bounded channel and ends a faulted wire with one terminal `Err` — a window
-  that fails verification against `H` is still a hard `VerifyFailed`, and a panicked
-  or cancelled encode is an `OriginError`, never a clean end. Each path runs at most
-  `MAX_CONCURRENT_RANGE_PULLS` (4) origin range pulls at once, from separate pools so
-  a long range pull never stalls a committed own-origin serve; a pull past the bound
-  waits rather than degrading to a whole-blob pull. See the `Origin::fetch_range_data`
-  entry under Changed (BREAKING).
-- **`DecdnWatcherTaskPanicked` could never evaluate.** Its expr was
-  `rate({__name__=~"decdn_.+_task_panicked_total"}[10m]) > 0`, and `rate()` drops
-  `__name__`, so the five per-watcher series on a node collapsed to five identical
-  label sets and Prometheus refused the vector outright
-  (`vector cannot contain metrics with the same labelset`). Wrapping it in
-  `sum by (instance)` does not help — the duplicate exists before the aggregation
-  runs. The rule now lifts the watcher out of the metric name with `label_replace`
-  while the raw selector still has it, and subtracts a 10-minute offset in place of
-  `rate()` so nothing strips the name mid-expression; a counter reset reads negative,
-  so a restart cannot fire it. The annotation reports `{{ $labels.watcher }}`, which
-  a binary operation preserves, rather than `{{ $labels.__name__ }}`, which it does not.
-  Nothing evaluated these rules before, so the breakage was invisible.
-
-- **`DecdnCacheInflightMutexPoisoned` could never resolve.** The counter is
-  monotonic and process-local and the annotation tells the operator not to restart,
-  so a bare `> 0` latched for the life of the process. It now reads
-  `increase(...[1h]) > 0`: a single occurrence still fires, and the window only
-  decides when it clears.
-
-- **`DecdnNodeRestarted` fired for five minutes after every deploy.**
-  `decdn_node_uptime_seconds < 300` holds true for the whole window and a
-  crash-looping node re-entered it continuously instead of escalating. Now
-  `resets(decdn_node_uptime_seconds[15m]) > 0`, so one restart is one event.
-
-- **A stale comment claimed six chain-event watchers.** The exporter has five —
-  `slash`, `staker_set`, `blacklist`, `settlement`, `fee_shares`.
-
-- **Cache: a held blob whose stored bytes change after admission is
-  quarantined on the first serve that trips it (#1984).** Every serve export
-  already validates the exported chunk groups against the content root, so a
-  rotten or tampered group aborts the serve and no buyer pays for it. The node
-  did not act on the mismatch: the hash stayed advertised, and every buyer
-  tripped it again until an operator ran `decdn node evict`, which is a
-  permanent takedown. Now a hash mismatch or short read over held content
-  quarantines the hash in memory. The node stops serving, announcing, and
-  re-acquiring it, answers stream requests with `EvictedSinceProbe`, and drops
-  its protecting tags even when it is pinned. When GC reclaims the entry, the
-  quarantine lifts and a pull-through re-admits a verified copy. New counter:
-  `decdn_cache_held_corruption_quarantined_total`. Reclaim needs
-  `cache.gc_interval_sec > 0`. `ServeAudit::Unavailable { evicted }` is renamed
-  `withdrawn` (`is_evicted()` → `is_withdrawn()`) and covers both evict and
-  quarantine.
-- **CLI: `pool top-up`, `pool close`, `pool assign` and `fetch`'s auto-refill now
-  exit non-zero when a landed on-chain effect cannot be recorded locally.**
-  Four sites printed the failure to stderr and returned `Ok(())`. All shared one
-  shape — the on-chain effect landed, the local write failed — and the money had
-  already moved, so exiting 0 was the one outcome that guaranteed nobody
-  reconciled it. A wrapper (`if decdn pool top-up …; then mark_funded; fi`)
-  recorded the pool as funded while the local `deposit` stayed short by
-  `credited`, which both re-triggered the low-water auto-top-up on every later
-  fetch and made a retry of the command escrow again. After a `pool close` whose
-  row-clear failed, `open_or_reuse_pool` reused a winding-down pool: later
-  fetches signed vouchers that stop being redeemable at the dispute deadline,
-  against a deposit the owner is about to reclaim.
-  - This is a consistency fix, not a new policy. The reactive mid-fetch top-up
-    already bails terminally on the same hazard, and the daemon already meters it
-    as a top-up *failure* rather than a success. Only the proactive and manual
-    legs had not adopted it.
-  - `decdn pool assign` is in scope on different grounds: its middle arm had a
-    `getPool` read that **succeeded** and proved the on-chain owner is not this
-    keystore, yet still printed the `dcap1:` token, so
-    `decdn pool assign … > delegate.token` exited 0 with a capability already
-    proven dead at redemption. That arm now fails. The sibling arms — an
-    unreachable RPC, a provider that would not build — keep degrading to a
-    warning, because offline issuance is valid and a read that could not be
-    performed proves nothing.
-  - `pool close` fails on the `Err` only. `forget_if_pool` is compare-and-delete,
-    and its `Ok(false)` means it found nothing to delete — no row, or a row for a
-    newer pool — so nothing maps the owner to the closed pool and the close is
-    clean. Closing a pool the local store never tracked (a second machine, a
-    fresh `--data-dir`) lands there routinely. The `Err` error carries both the
-    close tx and the `pool reclaim` deadline, and a re-run of the close or the
-    reclaim clears the stale row.
-  - Unchanged and deliberately so: `pool reclaim`'s row-clear and `fetch`'s
-    `persist_watermark`. The reclaim stays a warning because the refund itself
-    landed and re-running the reclaim clears the row; its warning now names that
-    remedy. `persist_watermark` runs after delivery, so failing the fetch would
-    neither un-pay the bytes nor do anything but misreport a fetch that
-    succeeded; its warning now names the close-and-reopen remedy.
-  - `client_pull::buyer_pool::top_up` now returns the `topUp` tx hash alongside
-    the credited amount as a `ToppedUpPool`, so every one of these errors names
-    the transaction an operator reconciles against — the handle the `open` path
-    already had. The node's `fund_pool` returns the new deposit rather than a
-    `DepositOutcome` and grades both credit-failure channels through the same
-    helper, so its propagated error names the tx too and a store fault meters as
-    `buyer_topup_failure` rather than slipping past unmetered.
-  - The shared error now tells the operator not to re-run the command: an escrow
-    that already landed escrows a second time on retry.
-  - `pool assign` also distinguishes a pool that does not exist on the contract
-    (`getPool` zero-fills an unknown key rather than reverting) from an ownership
-    dispute, so a wrong `--pool` / `--payment-pool-address` / `--chain-id` is
-    diagnosed as such instead of "sign with the owner keystore".
-  - **Script impact:** these commands previously exited 0 in the degraded case.
-    Wrappers that treated exit 0 as "recorded" must now handle a non-zero exit
-    that means the on-chain effect landed and needs reconciling — not that it
-    failed to happen.
-- **config: resolve-time notices now reach the operator instead of raw stderr.**
-  Every `*_into` resolver wrote its non-fatal warnings with `eprintln!`, on the
-  documented grounds that no `tracing` subscriber exists at `resolve_config`
-  time. That held for startup, but `resolve_security_into` also runs on the
-  SIGHUP reload path, against a daemon whose subscriber has been live for hours.
-  An operator on `log_format = "json"` who set `security.max_tracked_sources = 0`
-  and reloaded got the "bookkeeping map is unbounded" warning on a stderr nobody
-  was reading, and nothing in their log pipeline — the reload's own "section
-  applied" event carried the new value but neither the severity nor the word to
-  alert on. The resolvers now record `ConfigNotice`s on the shared
-  `ConfigDiagnostics` bag (formerly `ConfigErrorBag`, renamed because it carries
-  both channels), and the caller renders them once it knows which sink it has:
-  `decdn-node` replays them through `tracing` right after `init_tracing`,
-  the SIGHUP path emits them from `reload` once every gate that can abort the
-  reload has passed, `decdn config validate` prints them under its field
-  summary, and `decdn node doctor` turns them into findings. Nothing became a
-  hard error — `0 = unbounded` stays a documented escape hatch and an inherited
-  orchestrator env var must not refuse boot. Notices carry a severity: an
-  unbounded bookkeeping map or a collapsed relay-failover list is `Warn`, which
-  is what an operator alerts on and what `decdn node doctor --strict` gates its
-  exit status on, while a deliberately disabled rate limit is `Info` and never
-  reaches an exit status.
-  - Covers all eleven former direct-emission sites — the retired-env-var
-    notice, the well-known-port notice, the #843 `--relay-url`-overrides-the-list
-    notice, the duplicate-`cache.origins` notice, and the unbounded-map notices
-    across `security`, `dht.rate_limit` and `probe.rate_limit`. Each is now
-    asserted by a test; previously the only thing a test could check was that
-    the value resolved.
-  - `resolve_config` returns `(ResolvedConfig, Vec<ConfigNotice>)`. Notices are
-    dropped on the error path: a config that does not resolve is not the one the
-    operator is running, so they do not surface until the config resolves.
-  - Delivery on the daemon follows the log filter, where raw stderr did not: a
-    node on `log_level = "error"`, or on a `RUST_LOG` naming other targets,
-    receives no notices. Reach them without a log stream via `decdn node doctor`
-    or `decdn config validate`, neither of which depends on a subscriber.
-
-- **cache: an origin size probe that faults no longer drops the hash from the
-  announce set.** `rescan_origins` resolved each candidate through
-  `origin_size`, whose per-origin error handling is swallow-and-advance, so a
-  transport fault arrived as `Ok(None)` — indistinguishable from an origin that
-  genuinely does not hold the object. A throttled `HeadObject` window during a
-  rescan therefore evicted those hashes from the origin-held index, and an
-  origin-only node that hit one at boot advertised a fraction of its content for
-  a whole rescan interval with every downstream signal green. The rescan now
-  walks the origin chain through the same fault-aware primitive the serve gate
-  uses, bypassing its memo so a large enumeration cannot evict the live path's
-  warm entries. A faulted candidate keeps whatever the previous index held for
-  it; one first seen inside the fault window has nothing to carry forward and is
-  absent until a later rescan. Faults surface on
-  `decdn_cache_origin_probe_failures_total` and reach every DHT seed path through
-  `HolderSnapshot`, the origin half's counterpart to `store_error`. An HTTP
-  origin still reports a server-side 5xx as a plain negative (the `Origin::size`
-  contract), so that one case stays invisible; its transport faults, S3/R2 and
-  the filesystem all count.
-  - The index and its unresolved counts are one `ArcSwap` payload, published and
-    read together, so a seed cannot pair a fault-truncated set with a later
-    rescan's zero count and call it healthy. `origin_held_snapshot` is the only
-    way to read it — `origin_held_hashes` is gone, because a caller that could
-    take the set without the counts is how that pairing gets lost.
-  - One rescan at a time, with any number of triggers arriving during a pass
-    collapsing into a single rerun. Carrying an entry forward makes a rescan a
-    read-modify-write spanning the whole walk, and both triggers fire detached,
-    so overlapping passes let the slower one publish a payload derived from a
-    pre-empted index — dropping whatever the fresher pass found. Excluding alone
-    is not enough: queueing every trigger behind a lock piles up one waiter per
-    tick for as long as a walk outruns the cadence, then runs that backlog of
-    obsolete passes back to back against an origin already struggling.
-  - Only a retry-eligible fault carries an entry forward. A permanent one — a
-    revoked ACL, a symlink escape — reads the same on every rescan, so carrying
-    it would advertise content the serve path refuses until an operator
-    intervened.
-  - Candidates dedupe on their own `seen` set. Keying off the index being built
-    re-probed every hash that resolved absent, or faulted with nothing to carry
-    forward, once per listing it appeared in — and counted a fault per probe.
-  - Rescan probes are bounded by their own ceiling rather than
-    `cache.origin_probe_timeout_ms`, which is sized to stop a slow origin
-    stalling the probe *serve* path. Borrowing it would turn a merely slow origin
-    into an all-fault rescan, and on a cold boot — where nothing can be carried
-    forward — into a permanently empty announce set.
-  - `decdn_cache_origin_enumerate_failures_total` covers the rescan's other leg.
-    An origin whose listing fails contributes no candidates at all, so its hashes
-    leave the announce set with no per-hash fault and nothing to carry forward:
-    the same silent shrink, one step earlier.
-  - The origin-only ownership probe each stored hash is put to counts its faults
-    on `decdn_dht_republish_seed_origin_probe_failures_total`, the origin-side
-    twin of the store-walk counter beside it. A `Fault` there is skipped rather
-    than announced, which on a remote origin dropped a node's own store-only
-    content on a transport blip while the snapshot read healthy. `HolderSnapshot`
-    keeps those faults separate from the ones it inherits from the rescan: the
-    seed's counter must not move on a node that asks the origin nothing, and the
-    rescan's are already metered on the cache's own counter.
-  - All three seed paths report a short set. The periodic rescan seed runs far
-    more often than the boot seed or the lag sweep, so leaving it silent made the
-    most common truncation the least visible one.
-
-- **dht: a poisoned scheduler lock no longer wedges the republisher for the
-  process lifetime.** Every `Mutex` site in `RepublishScheduler` swallowed
-  poison — `len()` read `0`, `is_empty()` read `true`, `drain_due` returned
-  empty, `unschedule` and the schedule path no-opped. `Mutex` poison is sticky,
-  so one panic under a guard turned the scheduler into a black hole: nothing
-  scheduled, nothing drained, and the node silently stopped advertising every
-  hash it held while continuing to serve, probe and settle. All five sites, plus
-  the two routing-table sites in the same file, now run through
-  `chain_projection::with_lock`, a `Mutex` analogue of the existing
-  `with_read`/`with_write` that recovers via `PoisonError::into_inner` and warns.
-  Recovery is safe here: the invariant is "`scheduled` mirrors the heap", and
-  both sides already tolerate the other's entry being absent, so a torn state
-  costs one spurious or one skipped republish rather than corruption. All three
-  helpers clear the poison as they recover, so the warning is one line per panic
-  rather than one per acquisition — these locks sit on a 1 Hz timer and on the
-  inbound `Store` path, where an ungated log is the flood `dispatch`'s own poison
-  gate exists to prevent.
-
-- **dht: a lag sweep is cancelled at shutdown instead of racing the cache
-  flush.** The sweep is detached and holds a `CacheEngine` clone, and
-  `run_republish` returned on its stop signal without touching it. A walk still
-  in flight when the runtime flushed and closed the store saw the store go away,
-  took the store-walk failure branch, and fired
-  `decdn_dht_republish_seed_store_walk_failures_total` plus a degradation warning
-  on an ordinary clean restart — an alertable counter on a non-event.
-  `run_republish` now takes a `CancellationToken` the runtime owns and cancels
-  before it flushes the store, and the sweep worker selects against that same
-  token. The ordering is the point: a signal the republisher had to forward would
-  reach the sweep only once that task was next polled, which is not ordered
-  against the flush at all. The worker's `select!` is `biased` on that token, so
-  a sweep polled any time after the flush takes the cancel arm instead of
-  observing the store it was walking disappear. Nothing joins the worker, so it
-  may outlive the flush by a poll — it just cannot report anything once
-  cancelled. A queued pass is discarded along with it, which is correct here and
-  is now stated rather than claimed away — see #1814 for the panic path, where it
-  is not.
-
-- **node: the capacity-bond registry resync now reports whether it is working.**
-  `RegistrySink::on_tick_complete` is the only systematic repair for a drifted
-  active-staker set, and it returns `Ok` on a failed read by design — an `Err`
-  would mark the route errored and stall event pickup. That left a persistently
-  failing repair moving no metric at all. It now bumps
-  `decdn_capacity_bond_registry_resync_failures_total` on failure and stamps
-  `decdn_capacity_bond_registry_last_resync_timestamp_seconds` on success. The
-  gauge is what catches the repair being *skipped* rather than failing: the
-  reconcile does not run at all while the route is errored, which emits nothing.
-  It reads `0` until the first success, so its alert carries the `> 0` guard.
-
-- **node: an active-staker set drifted by an RPC outage is repaired when the
-  watcher recovers, not on the next cadence tick.** The re-enumeration was
-  cadence-driven only, and the cadence slips in exactly the scenario that causes
-  the drift: the reconcile is skipped while the route is errored, and a failed
-  read stamps the clock and defers a further interval. `LogSink` gains
-  `on_recovered`, a sync no-op-by-default seam the poller fires on the tick a
-  route comes back from an errored one — before that tick's reconcile, so a sink
-  that clears its cadence clock there re-reads immediately rather than a full
-  interval later. All five sinks on the shared poller use it: the registry,
-  slash, blacklist, fee-shares and rate-bounds sinks each gate their reconcile on
-  a clock they stamp *before* the read, so all five deferred a further interval
-  after exactly the outage that made them stale.
-  - The forced re-read is floored at a fifteenth of each sink's own cadence. A
-    recovery edge fires whenever a route comes back from an errored tick, so an
-    endpoint that flaps rather than staying down would otherwise buy a full
-    authoritative re-read per flap, aimed at an endpoint already failing.
-  - The bootstrap enumeration stamps
-    `decdn_capacity_bond_registry_last_resync_timestamp_seconds`. It is the same
-    read against the same contract, and without it the staleness alert's `> 0`
-    guard suppressed the alert forever on exactly the node it exists to find —
-    one where no later resync ever succeeds. Its companion failure alert measures
-    `increase(...[1h])`: attempts are one resync interval apart, so a window of
-    that same length sees a zero-rate gap on any delay and never sustains.
-  - `ErasedSink`'s method defaults are gone. It has exactly one implementation —
-    the blanket forward — so a default there is unreachable, and its only effect
-    was to turn a forgotten forward into a silent no-op that swallowed every real
-    sink's implementation.
-  - The recovery edge is armed by `fail_whole_tick` too, so a shared head-read
-    failure — the shape a whole-RPC outage takes — arms it for every route.
-
-- **dht: coalesced lag sweeps are countable.**
-  `decdn_dht_republish_lag_sweeps_total` counts lag *events* rather than store
-  walks, which is what makes a wedged sweep slot diagnosable, but left no way to
-  tell a climbing counter caused by commits outrunning the scheduler from one
-  caused by a long walk absorbing a burst. The sibling
-  `decdn_dht_republish_lag_sweeps_coalesced_total` splits it into the lags that
-  claimed an idle slot and the lags that did not. Neither it nor the difference
-  counts walks — the slot holds one queued position, so any number of lags
-  arriving behind a running worker collapse into a single further pass. The ratio
-  is what reads: coalesced climbing at the lag rate with the difference flat is a
-  slot that is never released.
-
-- **dht: a lagged cache-commit channel now re-seeds the republish scheduler.**
-  The republisher schedules a blob's first DHT `Store` off the cache's
-  `subscribe_inserts` broadcast. That channel is bounded and retains nothing it
-  drops, so a `Lagged` receiver cannot backfill — and the handler only logged,
-  leaving every hash committed inside the lag window with no DHT record until an
-  operator restarted the node. It now re-derives the held set (origin-held index
-  plus, when relaying foreign namespaces, the committed store) and seeds whatever
-  is missing, drawing `uniform(0, 40 min)` per record so the repair costs one
-  cold-start window rather than a burst (ADR 022 §Bootstrap, AC 20). The sweep
-  runs detached, and coalesces by re-running rather than skipping: each pass
-  re-derives the held set once at its start, so a lag observed mid-walk earns a
-  further pass instead of riding a snapshot taken before its own commits. The
-  single-flight slot is released through the shared `PruneGuard`, so a panic in
-  the store walk cannot strand it and silently disable every later sweep.
-  - `RepublishScheduler` now tracks each hash's authoritative due time rather
-    than bare membership, and `drain_due` discards a popped entry whose due time
-    disagrees. A `BinaryHeap` cannot reschedule an interior entry, so every
-    supersede left a tombstone that a later schedule resurrected into a spurious
-    republish — reachable three ways: a re-seed racing the eager per-insert
-    publish, a re-seed racing the tick path's drain-then-reschedule, and
-    `unschedule` followed by a re-seed. `seed_cold_start` leaves an
-    already-scheduled hash alone and returns the count *newly* scheduled;
-    `schedule_cold_start` is removed, since nothing called it.
-  - The due-time gate accepts origin-held content. `cache_still_holds` consulted
-    only the iroh-blobs store, so a filesystem or pinned-origin hash that was
-    never imported got advertised at probe time yet dropped at its first due
-    time, publishing no `Store` at all — silently discarding what the cold-start
-    seed has fed it since #1130.
-  - An origin-only node now recovers its own store-only content. The origin-held
-    index covers enumerable origins plus present pins, and a remote S3/R2/HTTP
-    origin deliberately does not enumerate, so an unpinned object the node owns
-    was in neither half of the snapshot. Stored hashes are now put to
-    `origin_probe_presence` — the same question the origin-only serve gate asks —
-    so the snapshot advertises exactly what the node would serve.
-  - New counters `decdn_dht_republish_lag_sweeps_total`,
-    `decdn_dht_republish_sweep_reseeded_total`, and
-    `decdn_dht_republish_seed_store_walk_failures_total` make the window
-    alertable. The last covers the boot-time cold start too, which shares one
-    derivation with the sweep and previously degraded with no metric at all.
-  - A closed cache-commit channel now stops the republisher instead of being
-    logged and re-polled. `recv` on a closed channel resolves instantly and
-    forever, so the old arm would have spun a core; the task's own `CacheEngine`
-    clone keeps the sender alive, which is what made it unreachable.
-
-- **node: the cache-miss serve leg now re-ramps its credit window.** `serve_leg`
-  resolved the window once before its delivery loop and never recomputed it, so a
-  stream served through a miss stayed pinned at the one-chunk ramp floor however
-  much the client paid — strict stop-and-wait, one chunk per round trip, while the
-  cache-hit path ramped toward `payment.credit_max` for the same client. It now
-  recomputes per iteration exactly as the hit path does. Throughput only; the
-  window bound itself was never exceeded.
-
-#### Payments
-
-- **`PoolFloorLossStore` enforces its monotonic contract, and a no-op write no
-  longer fsyncs.** The trait doc stated that a pool's dead charge was monotonic
-  "by caller discipline", but a floor-reservation drop reads its cumulative total
-  under the pool-map lock and then persists it from an independent blocking task,
-  so no caller can order its write against another's — and the redb store already
-  clamped while the in-memory
-  store overwrote, leaving tests written against the memory store unrepresentative
-  of what ships. Both impls now raise the stored total and never lower it, with
-  `forget_loss` the only downward transition. The redb store reads the row and
-  aborts the transaction instead of committing when the total does not advance,
-  so a late, smaller write costs no fsync — this table shares one file with the
-  lane table, where an unconditional commit contended with the periodic voucher
-  flush. Skipping the commit is sound only because every writer of that file uses
-  `Durability::Immediate`, so the stored total is already durable.
-
-- **A cooperative close now reconciles when the client's watermark lags the
-  node's (#1495).** `decdn channel coop-close`
-  refuses any provider tuple above what the client persisted — correctly, since
-  without that guard a provider could ask the client to sign away up to the full
-  deposit. But the guard had no reconciliation branch, so a client that signed
-  vouchers it did not durably persist before an unclean exit could not
-  cooperatively close at all. Nothing was lost — the `closeChannel` → dispute
-  window → `settleChannel` fallback remains — but the one-transaction settle was
-  unreachable, and the fallback submits a voucher *below* what the client
-  actually signed, underpaying the provider unless it watches the window and
-  disputes. The node now echoes the client's
-  **own** last-accepted voucher signature alongside the waiver, and the client
-  settles at the node's state only when that signature recovers to its own
-  voucher-signing key over exactly the tuple being settled. Anything else keeps
-  the refusal. This is the same self-heal primitive the fetch path already uses
-  (`WatermarkBundle.last_signature`, #1481), and it strengthens rather than
-  relaxes the check: only the client could have produced the signature.
-  - **Wire-breaking (pre-launch).** The echo is a new `last_signature` field on
-    `CooperativeCloseAuth` itself, not a trailing extension — the network is
-    pre-launch, so there is no mixed-version population to preserve and the field
-    is added directly rather than negotiated. It is empty when the node holds no
-    stored signature for the channel, in which case the client keeps the
-    pre-existing refusal.
-  - `cooperative_close` gains a `reconciled: &mut Option<AuthorizedWatermark>`
-    out-param carrying the healed watermark, written **before** the transaction
-    is sent so every return path reports it — including the error ones, where a
-    failed `get_receipt` leaves the settlement unknown and the chain may already
-    have settled higher. Both callers persist it before inspecting the outcome,
-    so the buyer store is advanced before the channel row is dropped and a
-    `closeChannel` fallback submits the voucher actually signed.
-    `CooperativeCloseOutcome` itself is unchanged (three fieldless variants).
-
-#### Contracts
-
-- **`GuardedBuybackBurner` no longer accepts a slippage tolerance that disables
-  the MEV defense, or a buyback band that can never execute (#1532).**
-  `slippageBps` was rejected only at `>= 100%`, so a value like 9999 scaled the
-  TWAP floor to 0.01% of fair value — the entire ADR 018 MEV stack off, with no
-  revert, no event, and a green deploy. It is now bounded at
-  `SLIPPAGE_CEILING = 1000` (10%, against a 200 bps default) at both the
-  constructor and `setSlippageTolerance`, mirroring the `[1%, 30%]` bound the
-  neighbouring `epochLiquidityCapFraction` already carried at both sites.
-  Separately, `maxBuybackAmount == 0` constructed cleanly and then reverted
-  `AboveMaxBuyback` on every call forever — a burner accruing the FeeRouter's
-  buyback bucket with no way to spend it — and governance could walk the band to
-  `0/0` in two calls, since a zero ceiling is not an *inverted* band once the
-  floor is also zero. Both entry points now revert `BuybackBandDead`. The
-  deploy-time fail-fast `BuybackVenueLib.GuardBandDead` is retained so a mis-set
-  env var still surfaces before the deploy transaction is broadcast. Both bounds
-  are stated in the ADR 018 parameter table; the shipped defaults satisfy them,
-  so no deployment path changes.
-
-#### Cache
-
-- **A poisoned coalescing mutex no longer silently costs origin egress and USDC
-  (#1517).** `CacheEngine`'s in-flight fill-coalescing map is what stops N
-  concurrent requests for one missing blob from opening N origin pulls. Three of
-  its **six** lock sites discarded the `PoisonError` — `get`'s loop and
-  `populate_inner`'s fell through to a *direct* pull, and `InflightGuard::drop`
-  skipped its removal — while the three tee-path sites (`open_tee_sink`,
-  `TeeReservation::drop`, `TeeSink::drop`) already recovered the guard with
-  `PoisonError::into_inner`. Since nothing cleared the poison, and a
-  `std::sync::Mutex` stays poisoned until something does, one panic permanently
-  disabled coalescing: an unbounded
-  egress multiplier on a metered `http`/`s3` origin, and on the `Peer` origin
-  reached via `populate` a double-spend of USDC vouchers upstream — the exact
-  hazard `TeeOpen::InFlight` is documented to prevent. Nothing logged it and
-  nothing counted it; the only observable was
-  `decdn_cache_pull_through_bytes_total` outrunning request volume.
-  - All six sites now go through one `Inner::lock_inflight` choke point that
-    recovers the guard, matching the crate's dominant idiom and the rationale
-    already written for `evicted` / `is_evicted`. **Coalescing survives poison**,
-    so the hazard is removed rather than merely reported. Having established that
-    the critical sections contain no user code (so the map cannot be torn), it
-    also calls `Mutex::clear_poison`, returning the mutex to a healthy state — no
-    restart is needed, and the counter below counts *poisonings* rather than
-    locks-taken-since-a-poisoning, so a `rate()` panel shows incidents instead of
-    request volume.
-  - The dropped removal in `InflightGuard::drop` was a second, unrecorded bug:
-    `notify_waiters()` wakes only *current* waiters, so a leaked entry left every
-    later request for that hash parked on a `Notify` that would never fire again
-    — the permanent hang the guard exists to prevent.
-  - **New metric:** `decdn_cache_inflight_mutex_poisoned_total`, paired with a
-    single latched `tracing::error!`, an `appendix-observability.md` registry
-    row, and a `DecdnCacheInflightMutexPoisoned` alert on `> 0`. The anti-panic
-    policy makes poison close to unreachable, so any nonzero value is a bug
-    report, not a threshold to tune; `docs/runbook.md § Cache coalescing mutex
-    poisoned` says so, and says explicitly **not** to restart. No config, wire,
-    or ABI change.
-
-#### Observability
-
-- **The ADR metric registry can no longer document series the node never emits
-  (#1513).** `adr/appendix-observability.md` calls itself the canonical registry
-  but had no way to say "specified, not built" — its only axis was the M/R
-  *requirement* tier — so roughly a third of its rows read as shipped while
-  nothing exported them.
-  - **New `Status` column** (`live` / `planned`) on every registry table, and a
-    new `adr_registry_names_are_exported` test asserting every `live` row
-    resolves against the encoder's output. `planned` is the allowlist that gate
-    skips, which is what lets the check be absolute instead of carrying a
-    hand-maintained skip list that would rot the same way the names did.
-  - **Corrected names:** `decdn_peer_table_size` →
-    `decdn_gossip_peer_table_size` (also in `adr/appendix-peer-table-eviction.md`
-    and a `crates/common` config doc) and `decdn_gossip_announces_sent_total` →
-    `decdn_gossip_announces_published_total`. ADR 005 and ADR 022 specified a
-    single labelled `decdn_{probe,dht}_rate_limit_rejections_total`; the exporter
-    has always emitted sibling trios, and the ADRs now say so.
-  - **Added rows** for both rate-limit families (rejected / prune-sweeps /
-    tracked, 14 series), which existed only as brace-expanded shorthand in the
-    reason-splits table and so carried no Type, Tier, or description anywhere.
-  - `decdn_peer_table_evicted_registry_total` was specified with a `reason`
-    label, contradicting the same appendix's claim that
-    `decdn_probe_hold_unavailable_total{reason}` is the one labelled reason
-    split. It is now two sibling counters, per #1475.
-  - The doc comments in `crates/node/src/dht/rate_limit.rs` and
-    `crates/node/src/handlers/probe_rate_limit.rs` justified sibling counters
-    with "the `iroh_metrics::MetricsGroup` backend has no per-field labels".
-    That is false — `probe_hold_unavailable` and `streams_active` are both
-    `Family<L, M>` — and it contradicted five other comments in the tree.
-    Rewritten to state the #1475 convention as the deliberate choice it is.
-  - `decdn_cache_tag_drop_failures_total` joins the name-pinning array; it has
-    been bumped since #860/#837 but was never pinned.
-
-#### Node serve path
-
-- **A `pull_leg_miss` refusal names the walk that found no target (#2366).**
-  The `serve-miss: refusing the request` line for a pull-leg miss now records
-  where the candidate list came from (`source`: `cache`, `dht`, `directory`
-  or `none`), how many providers it held (`discovered`), how many the probe
-  rounds skipped as suppressed or wedged (`skipped`), probed (`probed`), lost
-  to a failed probe (`unreachable`), heard `has_blob: false` from (`absent`)
-  or dropped on this node's own policy (`dropped`), how many holders they
-  admitted (`holders`) and whether those span the blob (`spans`), how many
-  handshakes ran (`handshakes`) and why the last one failed (`last_fault`).
-  Every serve-miss refusal line also carries the request's `namespace_id`.
-  Before, the line said only `cause=clean_miss`, so a fleet logging at info
-  could not tell an unreachable sole candidate from an empty directory.
-- **A fault in this node is no longer signed to clients as a `NotFound` about
-  the content (#1560).** When a node-to-node pull failed for a reason that was
-  *ours* — a buyer key that cannot sign the ADR 005 client binding, a voucher
-  signature the upstream cannot verify (`BadSignature` / `WrongSigner`), an
-  unusable `cache.node_pull_timeout_sec` / `cache.node_pull_stall_timeout_sec`
-  budget, or a buyer pool store this node cannot read — the serve path
-  collapsed it onto the same clean `NotFound` as "no provider had it". The
-  failure was metered honestly all along
-  (`decdn_node_pull_local_fault_total`, "any sustained rate is an emergency"),
-  but the wire answer told the client the blob does not exist, when in fact it
-  may be one hop away and perfectly reachable. That is the laundering
-  `StreamError::InternalError` ("unexpected failure; do not retry this node")
-  exists to prevent. Each candidate attempt now reports either the payload or a
-  `PullMiss` saying whether the failure was ours: the buffered `Origin::fetch`
-  surfaces a local fault as `OriginPullError::Permanent`, which the cache engine
-  already maps through `CacheError::OriginError` → `FillOutcome::HardFault` →
-  `ServeRejectReason::InternalError`, and the window-paced path folds it into
-  the same `fault_seen` latch the reactive local-origin tier has used since
-  #1129. Buyer pool-open failures are attributed at the site that raises them
-  rather than guessed at by the caller: a poisoned open lock, an unreadable
-  pool store, a store write that leaves a deposit untracked, a panicked open
-  task, and a wallet that cannot fund a deposit all refuse, while a pending open,
-  a reconcile-held slot, a per-provider on-chain
-  revert, and a transient RPC fault stay clean misses.
-  - Scope is deliberately narrow: only a local fault changes the wire code. A
-    wedged or settled *lane* to one provider still answers `NotFound` — it is
-    not evidence this node is broken for every client and every blob, and it
-    already has its own remedy. So does an `OriginBlacklisted` refusal, which is
-    node-wide but is a governance policy state rather than an unexpected failure,
-    and the node can still serve everything already in its cache. A local fault
-    also latches rather than aborting the walk, so a candidate that faults on our
-    own encode or range does not throw away a blob the next candidate was about
-    to serve.
-  - **Operator-visible:** refusals that used to land in
-    `decdn_serve_stream_rejected_cache_miss_total` — the noisiest benign counter
-    on the serve path — now land in
-    `decdn_serve_stream_rejected_internal_error_total`, so
-    `DecdnServeInternalErrorRate` can fire on a node whose buyer side is broken.
-    A buffered-path local fault also now bumps
-    `decdn_node_pull_through_errors_total`, where it previously took the silent
-    clean-miss branch. No metric was added or renamed.
-  - **Known gaps, unchanged by this fix:** when the pull-through deadline expires,
-    `tokio::time::timeout` drops the walk and any latched fault dies with it, so
-    that exit can only report a fault an earlier tier saw. A node whose buyer
-    bootstrap never completed is likewise indistinguishable on the wire from one
-    with pull-through switched off.
-
-- **An underfunded channel no longer gets one interval free per request
-  (#1516).** The direct-serve path signed a success `StreamResponse` and streamed
-  a full credit window — one 1 MB voucher interval at the default cadence, more
-  if `credit_window_bytes` is configured — before the per-voucher deposit ceiling
-  could fire at the first voucher boundary. A channel that could not cover even
-  that first window was therefore served it anyway, on every request, and a
-  client's resume loop could farm a fresh one per retry attempt. The serve path
-  now reserves `min(credit window, requested span)` against the channel's
-  *remaining* headroom (`deposit − last claimed amount`, matching how both the
-  off-chain and on-chain ceilings compare cumulative voucher amounts) and refuses
-  before signing, metered as `serve_stream_rejected_insufficient_deposit` — the
-  same guard the cache-miss pull-through path has carried since #856, against a
-  narrower ceiling. The span is chunk-group-aligned, because
-  `export_bao_range_stream` serves the aligned superset and the serve path does
-  not trim back, so pricing the requested span would under-reserve a small
-  bounded range by up to two 16 KiB groups. What remains unreserved is only bao's
-  proof interleave (the reservation counts content bytes, delivery bills wire
-  bytes): at most ~1.3 KiB per request, against the 1 MiB-or-wider window that
-  used to ship free. The mid-stream ceiling remains the exact authority. A funded
-  request for a blob or range smaller than one interval is unaffected — the
-  reservation is capped by the span, not by the cadence. This gate's placement
-  relative to the cache-miss fill tiers is corrected by the next entry. No wire,
-  config, or ABI change.
-- **An underfunded channel can no longer make the node spend before it is refused
-  (#1519).** The gate above runs on the serve path, which a cache miss reaches
-  only *after* the fill tiers — and `try_range_pull_through`,
-  `try_local_populate` and `try_pull_through` were gated on channel ownership
-  (`pull_authorized`) but not on solvency, the last of them reaching the paid
-  `Peer` origin. So a dust-deposit channel could name absent hashes, make the
-  operator pay origin egress and upstream USDC for each, and be refused
-  afterwards: the client gained nothing, but the bill was real. A **pre-spend
-  floor** now runs above every tier, refusing when remaining headroom cannot
-  cover one credit window. It is deliberately a floor rather than the serve
-  path's exact span-capped ceiling, because `total_bytes` is unknowable before
-  the fill — so it catches a channel that cannot pay for anything at all, and
-  does not pre-judge a merely small request. Two deliberate consequences: a cold
-  sub-window fetch that previously got a free fill is now refused (such a channel
-  could not have completed the transfer either way), and this refusal *pre-empts*
-  the #1129 fault latch — a client-attributable refusal wins over "this node is
-  degraded", because it would refuse regardless of origin health. **Residual:** a
-  channel funded to exactly one window can still trigger a whole-blob buffered
-  node-to-node pull costing more than it can repay; that tier is bounded by the
-  cache engine's enforcement of `cache.max_blob_size_mb` rather than by anything the
-  handler prices (not a *separate* knob — both derive from the same config field, but
-  only the engine bounds that tier), and giving it a ceiling in its own quantity is
-  tracked separately.
-  Internally, `respond_error` now takes the request's price as a required
-  argument and `serve_stream` holds the crate's only production `clamped_rate()`
-  call. That stops this function from recomputing the price *implicitly*, which is
-  the shape the bug took — it does not make the invariant type-checked, since a
-  caller can still pass an inline `self.clamped_rate()` or the wrong value. What
-  holds it is the single call site plus two new tests
-  (`a_refused_request_clamps_the_rate_exactly_once` and its zero-case sibling),
-  where before it was review attention alone. No wire, config, or ABI change.
-- **Buyer channel rows now record the deposit the contract credited, not the amount
-  requested (#1521).** `openChannel` and `topUp` credit a measured balance delta —
-  deliberately, so a fee-on-transfer settlement token cannot over-state a channel
-  against the shared USDC pool — and emit that delta in `ChannelOpened.deposit` /
-  `ChannelToppedUp.additionalDeposit`. The buyer path recorded its own requested
-  amount instead, so under such a token its local row would over-state the deposit.
-  The harm is buyer-side rather than a settlement revert: nothing in the buyer bounds
-  vouchers by this field, and the seller refuses off-chain via `stage_voucher` long
-  before any on-chain call. What breaks is the buyer's own headroom arithmetic — the
-  auto-refill reads `deposit - prior_amount` from the inflated row, so it fires late
-  or short, and because credits accumulate the drift compounds with every top-up
-  until every seller refuses us. `open_channel` now reads `ChannelOpened.deposit` (it
-  already took `channelId` and `expiresAt` from that event) and `top_up` decodes
-  `ChannelToppedUp` rather than assuming the requested amount landed. If that event
-  is absent — meaning our view of the contract is wrong, which is the worst state in
-  which to guess — it reconciles against `getChannel` and `warn!`s; only if that
-  read *also* fails does it credit the requested amount, and then at `error!`. Not reachable
-  today — mainnet USDC is not fee-on-transfer — so this is defensive depth, not a
-  live fix. Note what protects us is that the settlement token's ADDRESS is immutable
-  at deployment, not its behaviour: real USDC is an upgradeable proxy, which is the
-  hazard `PaymentChannel`'s own comment names. **Contract
-  behaviour is unchanged:** a partial shave is still credited as received rather
-  than reverted, which is now an asserted decision instead of an unexercised path;
-  reverting would hard-code "the settlement token must never be fee-bearing" into
-  the contract, a policy call larger than the test gap that prompted this.
-- **A degraded node no longer reports itself as merely empty (#1129).** On a
-  `cdn/client/v1` cache miss, a transient origin/store fault during a reactive
-  pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit
-  breaker, an fs I/O error) was indistinguishable from a clean miss and refused
-  with `CacheMiss` — wire `NotFound`, the code a *healthy but empty* node
-  returns. Such faults now refuse with `InternalError` ("do not retry this
-  node"), so clients route around a node whose origin is down and the operator's
-  reject metric names the real cause — which matters because seven distinct
-  reject reasons collapse to the single `NotFound` wire code, making the
-  per-reason counter the only server-side place the true cause is visible. A
-  genuine absence still returns `NotFound`; a deterministic refusal
-  (`BlobTooLarge`, `HashMismatch`) is not a fault and does not steer clients off
-  the node; and a fault on one tier is latched across a legitimate fall-through
-  to a later tier. No wire change — `StreamError::InternalError` already existed;
-  this is a reclassification within the existing surface.
-- **A wedged upstream candidate no longer starves the fallback loop (#1141).**
-  The window-paced node→node pull (`open_progressive_pull`) applied no
-  per-candidate timeout, so a provider that accepted the connection and then went
-  quiet consumed the entire outer deadline — which is deliberately sized to fit
-  all `MAX_PROVIDER_ATTEMPTS` per-candidate budgets precisely so candidates #2..N
-  stay reachable (#859) — and the serve path then refused a blob the honest
-  fallback held. The progressive-OPEN stage is now bounded by `pull_timeout`, as
-  the buffered fetch stage already was; a timed-out candidate is skipped and, per
-  #857, not blamed. (The `open_or_reuse_channel` stage remains unbounded on both
-  paths — a wedged on-chain RPC can still consume the outer deadline. Tracked
-  separately.)
-
-#### Origin directory
-
-- **Origin-directory genesis replay no longer skips silently on an inverted
-  block range (#1152).** Superseded before release by the #1504 enumeration
-  rewrite, which removed genesis replay entirely: there is no `replay_from`, no
-  persisted origin checkpoint and no `backfill_windows` call left on that path,
-  so the inverted-range case it guarded against is unreachable and the
-  `decdn_origin_directory_bootstrap_range_anomaly_total` counter it added no
-  longer exists. Retained here only so the issue number resolves.
-
-### Changed
-
-- **client: the lane-fault line reports the range the lane held after a
-  steal and the bytes it re-queued (#2376).** A steal trims the victim's
-  range to end at the split, and the stolen tail is the stealer's. The
-  "a lane faulted" line logs that held range as `offset`/`len`, the missing
-  bytes of it that go back to the queue as `requeued`, and the range as the
-  lane picked it as `picked_offset`/`picked_len`. `landed` counts each byte
-  the lane made present once, so a byte a healed leg or an owed span
-  delivered again does not count twice. For a range the store held no byte
-  of at the pick, `landed` and `requeued` add up to `len`. A
-  `NotFound` from a partial holder counts toward the blocks of the held
-  range only. The "stole the tail of a lane's missing remainder" line
-  carries `hash` at debug and at info, so a steal matches the fault it
-  precedes without offset arithmetic.
-- **CLI: a pull record prune deletes only records, and an entry run's record
-  keeps its counts (#2754, #2753).** A `decdn get` run prunes only files named
-  `<start-ms>-<pid>.json` in `~/.decdn/activity/pulls/`. Any other `*.json`
-  there stays, does not count toward the 200 kept records, and the dashboard
-  still lists it. The record of a bundle entry written to a
-  file (`decdn get decdn:<hash>/<path> -o FILE`) holds its entry counts, as a
-  bundle run's does, so its dashboard row says whether the entry was fetched,
-  skipped, reused, failed or not run. An entry streamed to stdout records
-  `counts: null`.
-- **Cache: iroh-blobs 0.104 and bao-tree 0.17.** iroh-blobs ends an
-  `export_bao` stream after the leaf that completes the requested ranges and
-  no longer sends `Done`, so the serve path reads the end of the stream as a
-  complete export. An export the store stops sending early arrives as an
-  `UnexpectedEof` error from iroh-blobs instead. That error fails the serve
-  but does not quarantine the blob, because it is a store fault and not a
-  short data file. iroh and its QUIC crates stay at 1.3.0: the noq gap-cap
-  fix (n0-computer/noq#866) is merged but not yet released.
-- **Dev builds carry line tables only, and dependencies no debuginfo.**
-  `[profile.dev]` sets `debug = "line-tables-only"` and
-  `[profile.dev.package."*"]` sets `debug = false`, so a panic backtrace and a
-  test failure still name `file:line` but a debugger shows no locals. Measured
-  on a 16-core `cargo build --workspace --all-targets`: a clean build 329s ->
-  204s, a rebuild after a one-line `decdn-protocol` edit 75s -> 44s, and
-  `target/` 44 GB -> 11 GB. `CARGO_PROFILE_DEV_DEBUG=true` restores full
-  debuginfo on workspace crates. Release builds do not change.
-  - Why: every one of the ~100 integration-test binaries links the
-    debuginfo, so it dominated dev build time, disk, and the CI cache.
-- **`decdn-e2e` finds `contracts/` at run time.** `chain::contracts_dir` reads
-  `CARGO_MANIFEST_DIR` from the test process, not with `env!`, so the checkout
-  path is not part of the library's compiled output. A compiler cache (kache,
-  sccache) reuses `decdn-e2e`, and every test binary that links it, in a new
-  worktree.
-- **Gateway: `--metrics-listen` works on every gateway, and serves
-  `/_status` beside `/metrics`.** A loopback gateway counts
-  its requests too, and the flag no longer needs `--public-url`. The
-  listener answers only its own loopback names in `Host` and refuses any
-  other with 403, `/metrics` included, so a scraper addresses it by
-  `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` or the listen
-  address. A non-loopback address is refused when the flag is parsed.
-- **Gateway: a public gateway answers every origin (#2628).** `decdn gateway
-  --public-url` adds `Access-Control-Allow-Origin: *` and exposes
-  `Content-Length`, `Content-Range`, `Accept-Ranges`, `Content-Type`,
-  `Content-Disposition`, `ETag`, `Retry-After` and `Link` on every answer,
-  and `OPTIONS` is a 204 preflight that admits `GET`/`HEAD` with `Range` on
-  content, and `PUT` with `content-type` on the bare host's `/_pointer`. This
-  is a behaviour change of the public gateway: `OPTIONS` answered 404 on the
-  bare host and 405 on a site host before. A proxy in front must pass
-  `OPTIONS` and these headers through, and add no CORS headers of its own. A
-  loopback gateway is unchanged.
-  - Why: a web page, and the TypeScript SDK
-    ([decdn/sdk-typescript](https://github.com/decdn/sdk-typescript)) in a
-    browser, read content and the 402/503 fallback URI straight from a public
-    gateway.
-- **sponsord joins the workspace.** The sponsorship daemon and its onramp,
-  which were the `decdn/sponsord` repository, are workspace members:
-  `sponsord` (the daemon binary), `sponsord-onramp` (the public onramp
-  binary), `sponsord-core`, `sponsord-api` and the unpublished
-  `sponsord-e2e`, with their history. They depend on `decdn-client`,
-  `decdn-common` and `decdn-incentive` by path, so a change to a shared type
-  is one pull request, and they ship with every release: the `sponsord` and
-  `sponsord-onramp` Linux archives join `SHA256SUMS`, and the
-  `ghcr.io/decdn/sponsord` and `ghcr.io/decdn/sponsord-onramp` images are
-  two more stages of the root Dockerfile, signed, tagged and mirrored to
-  Docker Hub like the others. The crates.io names do not change; their
-  `repository` metadata is this repository. Their guides live under
-  `docs/sponsord/`, the Compose and systemd material under
-  `deploy/sponsord/`, and the OpenAPI snapshots inside `sponsord-api`.
-  `publish-crates.sh` no longer opens a sponsord bump PR, and sponsord's
-  decdn-pin tooling is gone with the pin. The sponsord crates take the
-  workspace's `alloy` and `reqwest` entries, so both servers link ring and
-  no aws-lc-rs, and `check_crate_edges.py` guards their closures like the
-  CLI's; `sponsord-core` installs the rustls provider before it builds a
-  provider, and the onramp before its first `reqwest::Client`.
-  - Why: every decdn release needed a sponsord bump PR against crates.io and
-    a `decdn-e2e` git pin, and sponsord ran its own CI, release pipeline and
-    a mirror of this repository's tooling.
-- **Node: one warm connection per peer for DHT calls and pull legs (#2475).**
-  A node keeps one `cdn/dht/v1` connection per peer, shared by bootstrap,
-  bucket refresh, republish and lookups, and one `cdn/client/v1` connection
-  per upstream, shared by every pull leg and header handshake. Both maps dial
-  on the main runtime, so no pull leg's throwaway runtime owns a connection
-  driver. A DHT call whose pinned connection is closed under it redials once
-  and never retries a connection it dialled itself; a call that times out, or
-  that a lookup round deadline aborts, unpins its connection. The DHT server
-  waits 5 s for a connection's first stream and 30 s between streams, the
-  `cdn/client/v1` idle window, then closes an idle connection with reason
-  `dht-idle`; the 256-request and 5-minute caps are unchanged. A warm
-  connection holds one dispatch permit while it idles; `decdn_dispatch_in_flight`
-  shows the headroom under `max_concurrent_handlers`.
-- **`decdn gateway` runs pulls at once on one long-lived worker (#2458).**
-  The endpoint, the buyer-pool store and the connections to nodes are built
-  once per gateway run instead of once per request, and up to 16 pulls stream
-  at once instead of one. A response whose reader stops (a preloaded
-  `<video>`, a background tab) holds only its own pull until the no-progress
-  give-up, so other requests no longer wait behind it. Pulls under one
-  capability that overlap share each lane's voucher ledger, so the node
-  rejects none of their vouchers as `AmountRegression`.
-- **Client builds link one TLS backend and no JSON-RPC server (#2454).**
-  `decdn-client` and the `decdn` CLI link ring alone: alloy's default
-  `reqwest-rustls-tls` and the workspace's reqwest `rustls` feature each
-  compiled in aws-lc beside the ring that iroh's QUIC stack already uses.
-  reqwest is now built with `rustls-no-provider`, which panics in
-  `Client::build` until a process-wide rustls provider is installed, so
-  `decdn_common::tls::install_crypto_provider` installs ring. Both binaries
-  call it at start, and the SDK's provider builders and registry discovery
-  call it before they build a client; a provider the host application
-  installed first stays in place. The daemon's chain RPC moves from aws-lc to
-  ring as well; its S3 client keeps aws-lc. `decdn-common` puts the admin
-  RPC's server half (`AdminRpcServer`, `jsonrpsee-server`) behind a new
-  `admin-server` feature that only `decdn-node` enables. The crate-edges check
-  now resolves the `decdn-cli` and `decdn-client` closures per crate with
-  `cargo tree` and fails on `aws-lc-*` or `jsonrpsee-server` in either.
-
-- **Published crate docs read for crates.io and docs.rs users (#2442).** The
-  crate roots of `decdn-protocol`, `-incentive`, `-node`, `-reputation`,
-  `-bao-range`, `-config-types` and `-cache` each open with a one-sentence
-  purpose and a map of the crate's API, and link ADRs by absolute URL. Six of
-  them map it as a module or entry-point table; `decdn-reputation`, whose API
-  is one type and its config, names them in prose.
-  `decdn-protocol` and `decdn-incentive` each carry a compiled example (frame
-  round-trip, voucher sign and verify). docs.rs builds `decdn-incentive` with
-  the `redb` feature, so `buyer_pool_redb` and `buyer_pool_table` render with
-  feature badges. The `decdn-node`, `-bao-range`, `-config-types`,
-  `-incentive` and `decdn-e2e` package descriptions say what the crate is.
-
-- **`decdn-client`: a delegated fetch or bundle pull takes a credential swap
-  mid-run (#2429).** Every lane reads the `CredentialSlot`'s current key and
-  capability when it is built, so a credential the application swaps in takes
-  over at the next voucher boundary. Before, lanes signed under the key the
-  fetch started with. A fetch shares one slot across all its lanes, and a
-  bundle pull shares it across all its entries. The slot records a swapped-in
-  key's earlier spend from the buyer store. A bundle pull prices `RunningLow`
-  on the bundle's undelivered download (the entries that still fetch after the
-  disk check, less resumed partials) at the highest rate any entry was quoted,
-  so the signal fires before the bundle stalls and every entry reports the
-  same need. `decdn fetch` and `decdn bundle pull` swap in no credential and
-  behave as before. The `bundle` example swaps one in on `RunningLow`.
-
-- **`decdn-client`: the paid fetch's network leg lives in the SDK (#2429).**
-  Holder discovery and probing, lane building, pool open-or-reuse and refill,
-  the funding recovery step, watermark persistence and the per-provider
-  stream cap move from the `decdn` CLI into hidden `decdn-client` modules
-  (`session`, `targets`, `lanes`, `funding`, `lane_sources`, `stream_cap`,
-  `ordered_writes`). `decdn fetch` and `decdn bundle pull` drive them, and
-  behave as before, with one exception: the moved code logs under
-  `decdn_client::…` targets, so a module-scoped `RUST_LOG` filter that named a
-  `decdn_cli::commands::fetch` or `cli_sources` target names the new module.
-  The lanes take any `BuyerPoolStore`, so the client needs no `redb` feature.
-  The public API does not change.
-- **Release: `sign-release.sh` and `publish-crates.sh` live in `scripts/`.**
-  Run them as `scripts/sign-release.sh <tag>` and
-  `scripts/publish-crates.sh <tag>`. `.github/scripts/` keeps only what
-  workflows and hooks run.
-- **Both container images run on Debian 13 (`trixie-slim`, glibc 2.41)
-  (#2409).** The binaries are the same cross-built release archives, so
-  nothing changes for an operator who runs the daemon or CLI as shipped. An
-  image built `FROM` either of ours now inherits trixie's packages and apt 3.
-- **Release: `sign-release.sh` signs with your `@decdn.org` key from `KEYS`
-  by default (#2391).** With `DECDN_SIGNING_KEY` unset, the script picks the
-  one secret key that can sign, has a live `@decdn.org` uid and is published
-  in `KEYS`. With no such key, it picks the one secret key that can sign and
-  is published in `KEYS`, whatever its uids. Two or more candidates at either
-  step stop the script with every fingerprint listed; it no longer falls back
-  to the first secret key gpg lists. A key that `KEYS` marks revoked or
-  expired counts as unpublished, even when the local copy still looks live.
-  gpg failures while listing keys now stop the script with gpg's own error
-  instead of reading as "no key". `DECDN_SIGNING_KEY` keeps priority, and
-  `==> Signing as` names the rule that chose the key.
-  - Why: a maintainer keyring usually holds a personal key too. When that key
-    sorted first, the script picked it and died at the KEYS check, so every
-    run needed `DECDN_SIGNING_KEY` set by hand. Keyring order also decided
-    between two published keys during a key rotation.
-- **Toolchain: Rust 1.99.1 is the pinned toolchain and the MSRV (#2378, #2545).**
-  `rust-toolchain.toml`, `rust-version` and every `dtolnay/rust-toolchain`
-  step move from 1.95.0 together. Rust 1.97 makes v0 symbol mangling the
-  default, so a profiler or debugger that reads `decdn-node` symbols needs a
-  v0-aware demangler. CI and the pre-commit hooks deny warnings through
-  `CARGO_BUILD_WARNINGS=deny` (cargo's `build.warnings`) instead of
-  `-- -D warnings` and `RUSTDOCFLAGS`. The setting is not part of the build
-  fingerprint, so a plain local `cargo clippy` and the hook share one build.
-  CI no longer sets `CARGO_INCREMENTAL`: cargo turns incremental compilation
-  off itself when `CI` is set. Tests whose value is `Debug` assert on enum
-  shapes with `assert_matches!`, which prints the value it got when the match
-  fails. The two new pedantic lints `unused_async_trait_impl` and
-  `assert_is_empty` are allowed, because their rewrites read worse than the
-  code they replace.
-  - Why: 1.96.1, 1.97.1 and 1.98.1 each fix a miscompilation, 1.96 fixes
-    Cargo CVE-2026-5222 and CVE-2026-5223, and 1.99 moves to LLVM 23 with a
-    rustdoc its release notes put at 20% faster on average (up to 40%). No dependency was held
-    back by the 1.95 floor.
-- **Node: every cache-miss refusal logs one info line that names its path
-  (#2282).** A node that refuses a paid request from a serve-miss exit
-  (reason `cache_miss`, or `internal_error` when a fill tier faulted) now logs
-  `serve-miss: refusing the request` with `hash`, `byte_offset`, `byte_len`,
-  `reason` and `path`. `path` is `coverage_gate`, `pull_leg_miss`,
-  `pull_leg_timeout`, `buffered_miss`, `no_pull_through` or `no_lane`. A
-  `pull_leg_miss` line adds `cause` (`clean_miss`, `below_margin` or
-  `local_fault`). A `coverage_gate` line adds `pull_offset`, `pull_len`,
-  `candidates` and `first_uncovered_chunk`; the separate coverage-gate detail
-  line is gone. `no_lane` (the request carries no binding, or this node holds
-  no lane for its signer, so no fill tier ran) is a path any peer can reach, so
-  its line is throttled to one per minute with a `suppressed` count. Before,
-  only the coverage gate logged at info, so most refusals showed only as a
-  tick on `decdn_serve_stream_rejected_cache_miss_total`. Other `NotFound`
-  refusals (`pull_loop_guard`, `load_shed_miss`, the channel-class reasons)
-  keep their own logging. The wire answer and the reject counters do not
-  change.
-- **CLI: a range-dedup entry stripes its ranges across its holders (#2123).**
-  A `bundle pull` entry that pays for many scattered complement ranges used
-  one provider's link for all of them, even when several holders were probed.
-  The entry now opens one warm session on each admitted full holder (one per
-  operator, at most `--max-sources`, with multi-source on) and fills its ranges
-  from one shared queue across all of them, up to `--max-lane-streams` per
-  lane. A lane that faults leaves the stripe, with a warning that names its
-  provider, and the other lanes fill what it left. A drive stall is every
-  lane's fault, so the whole stripe leaves; a local disk fault or a terminal
-  fault ends the entry without failover. When no striped lane is left, the
-  entry fails over to its other candidates one at a time, as before. All lanes write into the entry's one
-  ranged store, run under one drive-level floor, and spend one top-up budget.
-  A lane that served every gap it took in a drive that filled every range
-  settles at its committed cumulative; any other lane settles at its armed
-  cumulative. Only the last session opened for a drive opens its first leg, so
-  the primed pull is not left to go stale. Every leg now checks the provider's
-  signed size against the store's before it reads a byte
-  (`SignedSizeMismatch`), so a lane that never opened a first leg still
-  refuses a manifest whose size is wrong. That refusal blames no peer and
-  starts no retry round. The SDK adds `drive_range_lanes`, `RangeLane`,
-  `RangeSetOutcome` and `SignedSizeMismatch`. `drive_range_set` is the
-  one-lane case.
-- **Logging: one field name per concept, and peer-triggered warnings are
-  throttled.** Every tracing event names its error field `error` (was a mix of
-  `err`, `%err` and `error`); a `tracing-field-names` pre-commit hook keeps it
-  that way. Update any log query or alert that matched `err=`. DHT logs name the
-  remote id `peer` (was `responder` / `seed`) and print it as lowercase hex, the
-  same as the transport's `peer`. The client-binding, unbound-request,
-  unknown-lane and probe read-fault `warn!` lines — all of which a remote peer
-  can trigger at will — now fire at most once a minute per cause and carry
-  `peer` and a `suppressed` count. A failed `redeemMany` receipt wait or timeout
-  logs the transaction hash, since the transaction may still mine.
-- **A config reload no longer replaces a `RUST_LOG` filter.** `RUST_LOG` wins
-  over the config file `log_level` at startup; a SIGHUP or admin reload used to
-  swap it for the bare file level, dropping its per-target directives. The
-  reload now leaves a `RUST_LOG` filter in place and logs that it did.
-
-- **The workspace reads `0.0.0` until the first release is cut, and the
-  versioning invariants are enforced rather than described.** `decdn
-  --version` and the default user agent report `0.0.0`; the first `cargo
-  release minor` makes it `0.1.0`. Three guards under `.github/scripts/` run
-  in the `packaging` CI job and as pre-commit hooks: the Rust version must be
-  one identical `X.Y.Z` across `rust-toolchain.toml`, `Cargo.toml`'s
-  `rust-version` (now `1.95.0`) and every `dtolnay/rust-toolchain` step;
-  every member inherits `version`/`edition`/`license`/`rust-version` and the
-  workspace lint table, and reaches a sibling only through its
-  `[workspace.dependencies]` alias; and the crate dependency flow in CLAUDE.md
-  is held as a table over `cargo metadata`, with `decdn-cli`'s closure kept
-  free of `iroh-blobs` and the AWS SDK. GitHub release notes open with a
-  `### Breaking` section.
-  - Why: the manifest claimed `0.1.1`, a release that was never tagged or
-    published, and nothing compared the fourteen sites that spell the Rust
-    version, so a Dependabot action bump could move CI onto a compiler no
-    developer runs.
-
-- **`missing_docs` is on, and the 230 public items that lacked a doc comment
-  have one.** 170 were struct fields and 24 enum variants — the shapes rustdoc
-  renders as a bare name with no explanation, which is where the gap actually
-  hurt: `ResolvedConfig`'s twelve sections, `ClientHandlerDeps`' required
-  wiring, the `expected`/`recovered` pairs on every signature-recovery error,
-  and the `PoolError` operands a node reads when it refuses a voucher. The
-  `alloy::sol!` bindings needed nothing: each generated block already opts out
-  where it is declared. Every new comment is also link-checked, since the `doc`
-  gate denies rustdoc warnings.
-
-- **`elided_lifetimes_in_paths` and `unreachable_pub` are on.** A type path that
-  borrows now says so — `TableDefinition<'_, …>` across `pool_store`'s eleven
-  redb table definitions, `EvictionContext<'_>` in the cache's admission and
-  eviction policy traits — so a reader sees the borrow at the call site instead of
-  having to look the type up. `unreachable_pub` narrows 46 items that were `pub`
-  inside a private module to the visibility they actually had: mostly the shared
-  integration-test helper modules (`node/tests/support`, `cache/tests/util`,
-  `cli/tests/common`), plus `client-pull`'s `progress` and `ledger` internals and
-  `load_shed`'s egress-budget helper. No item's real reachability changes.
-
-- **The workspace moves to cargo's MSRV-aware resolver and denies stray output,
-  scaffolding macros, and lossy numeric casts.** `resolver = "3"` changes nothing
-  about feature unification — that was resolver 2, which the workspace already
-  had — but it defaults `resolver.incompatible-rust-versions` to `fallback`, so
-  cargo prefers dependency versions whose declared `rust-version` is at or below
-  the pinned 1.95. Nothing resolves differently today and `Cargo.lock` is
-  unchanged; the guard is against a future `cargo update` pulling a dependency
-  that raised its MSRV past the toolchain. Alongside it, `print_stdout`,
-  `print_stderr`, `dbg_macro`, `todo`, and `unimplemented` become `deny`, and
-  `cast_possible_truncation` / `cast_sign_loss` / `cast_precision_loss` move from
-  `warn` to `deny`. The cast promotion adds no new violations — CI clippy and the
-  pre-commit hook already pass `-D warnings`, so every cast was fatal there; it
-  only makes a bare local `cargo clippy` agree. `dbg_macro`, `todo`, and
-  `unimplemented` had zero occurrences and are pure regression guards. The `decdn`
-  CLI allows both print lints at its crate roots because it is a terminal UI; the
-  handful of production `eprintln!` sites that run before the tracing subscriber
-  exists carry a per-site `#[expect]` naming that reason, which leaves every
-  library crate and every node handler with no way to print.
-
-- **Dev builds compile the keystore KDF at `opt-level = 3`.** `alloy`'s
-  `signer-keystore` runs scrypt on every keystore encrypt and decrypt, and an
-  unoptimized scrypt costs about 0.5s per operation. Raising `scrypt`, `salsa20`,
-  `pbkdf2`, `sha2`, and `hmac` to `opt-level = 3` under `[profile.dev.package]`
-  takes the `decdn-cli` suite from 3.79s to 3.20s (-16%), with the `key_gen_e2e`
-  tests themselves 16-22% faster; the `anvil-e2e` journeys pay the same cost once
-  per keygen. Nothing else about the dev profile changes, so debuginfo on
-  workspace crates is untouched.
-
-- **The node flushes lane writes to redb in table-key order, and the workspace
-  floor moves to `redb = "4.2"`.** `flush` drains a `HashSet` of dirty lanes, so
-  the batch reached redb in an arbitrary order. Sorting it by the
-  `pool_id ‖ signer ‖ provider` table key first hits redb's append fast path,
-  which fills a leaf page before opening the next instead of leaving each one
-  part-full at a random split point: measured over 512 lanes, `lane_state_v1`
-  occupies about 30% fewer leaf pages (47 against 65-68). The gain lands on keys
-  appended past the end of the table — new lanes, and the cold-load case — since
-  an overwrite of a hydrated lane replaces in place whatever order it arrives in.
-  The `4.2` floor is load-bearing: that append fast path arrives in 4.2, and below
-  it the same sort is a pessimization (1.31x MORE leaf pages on 4.1), so a
-  lockfile regeneration resolving under the floor would silently invert the
-  change. Tombstones sort alongside the writes, so a flush is deterministic.
-
-- **config: `cache.max_blob_size_mb` now defaults to `cache.cache_size_mb`
-  instead of a fixed 1 GiB.** The old memory-era default refused a blob a node's
-  disk could easily hold. Unset, the disk budget is now the admission ceiling; a
-  node admits any blob it can store. The knob stays node-configurable for
-  operators who want a tighter per-blob bound (for example to cap the RAM the
-  buffered miss tier spends on one pull). The load-time invariant relaxes from
-  `max_blob_size_mb < cache_size_mb` to `<=` so the default (equality) is legal;
-  a value above `cache_size_mb` is still rejected as a permanent-reject
-  misconfiguration, and `0` still means unlimited.
-
-- **`contracts/script/lib/BuybackVenueLib.sol` is now the single home for buyback
-  venue dispatch and burner construction (#1090).** The steady-state FeeRouter
-  split, the canonical Permit2 address, the `BUYBACK_VENUE` string dispatch, and
-  the per-venue `Config` literal were duplicated across `BaseProtocolDeploy`,
-  `ActivateBuyback`, and `DeployProtocol`. Four items each had two copies — the
-  steady-state split, the canonical Permit2 address, the venue-string dispatch, and
-  the per-venue `Config` literal — so the deploy-time genesis activation and the
-  post-deploy runbook could wire different burners from the same inputs. Behaviour
-  is unchanged; the duplication is gone.
-- **Burner wiring and guard-band validation moved into `BuybackVenueLib`.** The
-  completeness checks added earlier lived on `BaseProtocolDeploy`, so only the
-  genesis path had them — `ActivateBuyback`, the post-deploy runbook with no
-  `_assertBuybackActivated` backstop, had none. That is the two-entry-point drift
-  #1090 exists to remove, reintroduced by the fix for it. Both paths now validate at
-  the library both already call (`WiringIncomplete`), which also closes a second
-  dead-burner door: at the time `GuardedBuybackBurner` rejected an inverted band
-  but not a zero one, so `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0` constructed
-  cleanly and then reverted `AboveMaxBuyback` on every non-zero buyback
-  (`GuardBandDead`). Superseded by #1532 — the burner now rejects a zero ceiling
-  itself, and the library guard is retained as a pre-broadcast fail-fast.
-- **`PoolSeed` is self-checking rather than self-describing.** It now records
-  `targetPrice`, and `_assertVenueSeedMatches` re-derives `tokenSeed` instead of
-  trusting the venue tag. A tag alone is an unverifiable claim by whoever built the
-  struct, and `Venue.UNISWAP == 0` made it vacuous on a default-constructed seed —
-  which is the venue the Arbitrum Sepolia launch uses. A mismatch now reverts
-  `PoolSeedNotDerived`; an unset one reverts `TargetPriceZero`.
-- **`_activateBalancer` rejects a caller-supplied `bal.wiring.pool`** rather than
-  overwriting it (`PoolPrefilled`). The field is filled from the pool the script
-  creates, so a supplied value was silently discarded and a second pool created and
-  seeded with real protocol-owned liquidity — the natural mistake, since
-  `ActivateBuyback` reads `BALANCER_POOL` from env because it wires a live pool.
-- **The `solidity fork test` job now reports which fork RPCs are configured.** A
-  skipped step yielded a green job rendered identically to one where every fork
-  suite passed, which is how it went unnoticed that no fork RPC secret has ever
-  been set — all four suites have been permanently unexecuted behind a passing
-  check. The job now always writes each secret's state to the run summary and
-  emits a warning for the missing ones. Deliberately not a hard failure: fork PRs
-  cannot carry secrets by policy.
-- **`_assertTimelockRoleSeating` is mode-independent and also checks the deployer.**
-  Its negative half was gated on bootstrap mode, so a default deploy asserted
-  nothing about anyone *other* than the Governor holding a scheduling role, and the
-  deployer was never checked for one at all — it admins the Timelock through phases
-  3-5, so a future `_postWiringHook` could grant itself one and survive the handoff.
-  `ProposerNotSeated(address, bytes32, bool)` splits into `TimelockRoleMissing` and
-  `TimelockRoleUnexpected`: the two directions mean opposite things (ungovernable
-  vs. governance live too early) and a boolean three commas deep does not say which
-  at the moment a deploy aborts mid-broadcast.
-- **CI runs the Uniswap genesis-activation fork suite (#1090).** The
-  `solidity fork test` job now passes `ARBITRUM_SEPOLIA_RPC_URL` through, so
-  `GenesisBuybackActivation.fork.t.sol` can execute instead of self-skipping. It
-  covers the Arbitrum Sepolia deploy path, which had no executable CI coverage.
-  **Still gated on the secret existing** — no fork RPC secret is configured on the
-  repo today, so all four fork suites remain unexecuted; see the fork-RPC reporting
-  entry above, which is what makes that visible.
-
-#### Node selection & observability
-
-- **The node's upstream probe budget is 1 s (#2366).** `PROBE_TIMEOUT` was
-  500 ms. A probe dials a fresh connection, so it costs two RTTs (the
-  connection handshake and the request); at inter-continental RTTs that sits
-  at or past 500 ms, and a node whose only candidate was a far origin dropped it as
-  unreachable and signed `NotFound` for content that origin serves. On the
-  testnet, 106 of hel1's 156 probe rounds in one day overran the old ceiling.
-  The outer pull-through deadline at defaults is 168 s (was 167.5 s). ADR 001
-  § Probe response collection and ADR 005 carry the new figure.
-- **`Candidate.stake` is now `u64`, not `Option<u64>`** (internal API,
-  `decdn-node`). The `Option` conflated "not looked up" with "looked up, holds
-  no bond", and the stake tie-break ranked unknown strictly *below* a known
-  zero. That is a hazard the moment on-chain stake lookup is wired: a chain read
-  succeeds for some peers and fails for others, so one flaky RPC call would have
-  silently sunk a well-staked peer below an unbonded one. The type no longer has
-  a way to express a failed read — the lookup layer must retry or drop the
-  candidate. Nothing populates stake yet, so the tie-break tier is unchanged in
-  behaviour.
-- **The metric reason-split convention is settled: sibling counters, not
-  labels.** `decdn_probe_hold_unavailable_total{reason}` remains the one labeled
-  *reason split* — not the only labelled metric, since `decdn_streams_active`
-  is labelled on another axis — and is now
-  documented as the deliberate exception (its values share one aggregate and one
-  budget axis; they pointedly do not share an alert, which is why the alert
-  filters to `reason="exhausted"`); `dispatch_rejected_*`,
-  `probe_rate_limit_rejected_*`, `pool_open_failures_*` and the gossip
-  rejection counters stay siblings. **No metric is renamed.** The
-  observability appendix is corrected accordingly: it documented
-  `decdn_gossip_messages_rejected_total{reason="clock_skew"}`, a labeled name
-  the node has never exported — the real series is
-  `decdn_gossip_messages_rejected_clock_skew_total` — and the three sibling
-  families are now listed in the registry, where previously they appeared in no
-  operator-facing artifact at all.
-
-#### Cache / node
-
-- **Blob delivery no longer materialises the whole blob in memory.** The serve
-  path drives a streaming bao export instead of building the entire aligned wire
-  form up front, and the origin pull-through no longer reads a freshly-committed
-  blob back out of the store to hand to `populate`, which discarded it. Serving a
-  708 MB blob previously cost ~708 MB resident per concurrent serve, and again on
-  the cache-miss leg; both are now bounded by one chunk group.
-  - Observable change: the truncated-export refusal (the store's item channel
-    closing without a terminal `Done`) can only be detected after the last item,
-    so it now aborts the delivery **mid-stream** rather than failing before the
-    first byte. The billing invariant is unchanged — the client sees a short
-    delivery and never pays the closing voucher.
-
-#### Contracts
-
-- **`closeChannel`'s voucher-less path now works at any watermark.** Calling it
-  with `amount == 0`, `nonce == 0`, `bytesDelivered == 0` and an empty signature
-  skips voucher verification and closes at the recorded `claimed*`; the extra
-  `claimedNonce == 0` condition that restricted it to channels no `withdraw` had
-  ever touched is gone. The safety argument is unchanged — the path advances no
-  watermark — and the old condition only forced a party with no newer voucher to
-  wait for `expiresAt`. Observable change for anyone who built around the old
-  revert: the call now succeeds where it used to fail.
-
-#### Documentation
-
-- **Safe-as-recommended-wallet and the node-side off-chain ERC-1271 path are
-  dropped from the PoC surface (#1431).** ADR 024 keeps the piece that shipped
-  — OpenZeppelin `SignatureChecker` at every on-chain verification site — and
-  stops recommending a wallet. The encrypted EOA keystore is now the documented
-  default for node operators and clients; a Safe, or any other ERC-1271 smart
-  account, stays **supported** on the on-chain paths precisely because
-  `SignatureChecker` is retained, but deCDN neither recommends one nor commits
-  to tooling for one. By ADR 024's own words a 1-of-1 Safe carries "the same
-  trust posture as today's `eth_keystore`", and the multi-owner threshold that
-  would buy real security cannot be reached at `slash_sig` wire speed — so the
-  recommendation delivered nothing the retained contract-level piece does not
-  already enable, at the cost of a Safe-deployment step on every operator's
-  critical path. The node-side off-chain ERC-1271 verifier (an address-code
-  probe plus an `isValidSignature` RPC per client connection, behind a code
-  cache) is relabelled from a PoC deliverable to Production-deferred, which is
-  what the Rust has said all along. The Production session-key design
-  (Safe-7579 + `erc7579/smartsessions`) is untouched and remains the answer to
-  hot-path multisig and to smart-account clients.
-  - **Contracts:** unchanged. `SignatureChecker` stays wired in
-    `PaymentChannel` (voucher + provider waiver), `CapacityBond`
-    (`registerNode` / `bindNodeId`), `SlashJudge` (rate / blacklist
-    evidence), and `DecdnGovernor` (EIP-712 delegation); the
-    `MockERC1271Wallet` fixtures and ERC-1271 branch tests stay with them. No
-    ABI, deploy, or bytecode change. This is the insurance against a
-    coordinated on-chain retrofit and is exactly why deferring the node-side
-    path is cheap.
-  - **Node:** no code removed — the off-chain ERC-1271 path was never built.
-    `bind_sig::verify_binding`, voucher and `slash_sig` verification, and the
-    65-byte length checks are unchanged. Only the deferral comments move to a
-    stable citation: the `ADR 024 §18` **line**-number references in
-    `crates/protocol` become `ADR 024 §Off-Chain ERC-1271 Verification`, the
-    heading `crates/incentive` already cited, so a reworded ADR can no longer
-    silently rot them.
-  - **Config / CLI:** nothing removed. There is no Safe, smart-account, or
-    wallet-type config surface, and `decdn setup` never grew the Safe-creation
-    flow ADR 024 § Consequences promised — dropping that obligation retires an
-    unmet promise rather than deleting a feature.
-  - **Newly documented constraint:** a Safe-addressed *node operator* cannot
-    serve traffic today. Requesters verify `slash_sig` off-chain by recovery
-    against the registered address, and a Safe owner-key signature recovers to
-    the owner, not the Safe. ADR 024 § Node Operators and
-    `appendix-operator-key-rotation.md` now state this; the appendix's EOA →
-    Safe migration is retained in full but is *optional* rather than
-    *recommended*.
-  - ADR 024 keeps its number and title — Safe is still supported. § Safe as
-    Recommended Wallet becomes § Wallet Support — EOA Default, Safe Supported;
-    § Off-Chain ERC-1271 Verification keeps its heading and both inbound
-    anchors but loses its `alloy` implementation sketch and now reads as
-    Production-deferred; § Session Keys is unchanged. ADR 003 § Smart Account
-    Support and § Off-Chain (Ephemeral) Binding, ADR 012 § Ethereum Key and
-    § Identity Lifecycle, ADR 019, `appendix-operator-key-rotation.md`, and
-    `architecture.md`'s ADR 024 summary follow.
-
-#### Runtime (observability)
-
-- **The three probe-hold refusal counters are collapsed onto one `reason`
-  label (#1443).** `decdn_probe_hold_violations_total`,
-  `decdn_probe_holds_disabled_total` and `decdn_probe_stake_lane_reserved_total`
-  answered one question — "could not hold, by cause" — under three names. They
-  are now `decdn_probe_hold_unavailable_total{reason="exhausted"|"disabled"|
-  "stake_lane_reserved"}`. Every semantic distinction is preserved as a label
-  value, including that `stake_lane_reserved` fires *before* the hold attempt
-  and so never consults the cache. All three children are materialized at
-  startup, so each series is exported at zero from a fresh registry rather than
-  appearing on first increment — the property the three separate counters had,
-  and one a `Family` does not give for free. **Migration:** replace
-  `decdn_probe_hold_violations_total` with
-  `decdn_probe_hold_unavailable_total{reason="exhausted"}`,
-  `decdn_probe_holds_disabled_total` with `{reason="disabled"}`, and
-  `decdn_probe_stake_lane_reserved_total` with `{reason="stake_lane_reserved"}`.
-  The shipped `monitoring/prometheus-alerts.yml` and
-  `monitoring/grafana-dashboard.json` are updated in place; the
-  `DecdnProbeHoldViolations` alert keeps its name and now filters on
-  `reason="exhausted"`, which is what keeps a deliberate disable or a
-  stake-lane reservation from tripping a "raise `max_probe_holds`" page. Custom
-  dashboards querying the old names go blank. Note this makes
-  `probe_hold_unavailable` the one labeled counter in `decdn-node`; the other
-  reason-style splits (`dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
-  `pool_open_failures_*`) remain sibling counters for now.
-
-- **The `decdn_node_address_watcher_*` metrics are removed (#1231).** Gone:
-  `decdn_node_address_watcher_restarts_total` and
-  `decdn_node_address_watcher_down_seconds`. Since #1226 collapsed the
-  node-address and staker-set watchers into one `capacity-bond` loop, these were
-  a perfectly-correlated shadow of `decdn_staker_set_watcher_restarts_total` /
-  `decdn_staker_set_watcher_down_seconds` — one loop's health reported twice.
-  **Migration:** use the `decdn_staker_set_watcher_*` family, which now covers
-  the bindings projection too because the same loop feeds it. Worse than
-  redundant, the removed family was gated on the bindings projection existing,
-  so a node with `cache.node_to_node_pull_through_enabled = false` reported
-  `down_seconds` frozen at `0` forever — an alert that could never fire.
-  `decdn_node_address_directory_size` is **not** affected: it measures the
-  projection's cardinality rather than the loop's health, and is retained. Note
-  that it is exported even when pull-through is off, where it sits at a
-  permanent `0`; scope any alert on it to nodes with pull-through on.
-
-#### CLI
-
-- **`decdn fetch` streams to disk and resumes an interrupted download.** Verified
-  bao chunk groups are written to `<output>.partial` as they land and the file is
-  renamed into place at the end, instead of the whole blob being buffered in RAM
-  (twice — wire form then decoded form) and written once. Peak memory is now
-  independent of blob size. If a fetch is interrupted, re-running it picks the
-  partial up, asks the node for the un-fetched tail only, and **re-pays only for
-  that tail**; previously it restarted from byte 0.
-  - Observable change: a failed fetch now leaves a `<output>.partial` file behind
-    on purpose — that is what the next run resumes from. It is renamed into place
-    on success, and discarded on a failed integrity check or when the node cannot
-    serve a resume at its offset (which means it belongs to a different blob).
-  - Bytes inherited from a previous run's partial are not verified as they are
-    read: the CLI persists no bao outboard sidecar beside the `.partial`, so it
-    has nothing to check the prefix against. A **resumed** fetch therefore
-    re-hashes the assembled file against the content hash before promoting it,
-    and on mismatch discards the partial and fails rather than writing a wrong
-    output file. A fetch that started at byte 0 skips this — every byte was
-    verified on the wire as it landed.
-- **`decdn node lanes` has a `SIGNER` column.** It reports the lane's voucher
-  signer — the key whose signature is required on every voucher — next to
-  `COUNTERPARTY` (the pool owner, and the address the ADR 011 compliance gates
-  check). The two are equal only when the owner signs its own vouchers, as a
-  node buyer does. A `decdn get` on its own wallet's pool signs with a key
-  derived for its data dir, and a `decdn get --capability` signs with the
-  delegate key the capability names. **Output-breaking for scripts:**
-  the table is ~15 characters wider and column positions after `COUNTERPARTY`
-  have shifted, so positional parsers (`awk '{print $N}'`, fixed-offset `cut`)
-  need updating.
-
-- **The CLI now rejects the zero address for the four addresses resolved by
-  `resolve` / `resolve_appeal` / `resolve_publish`, not just the appeal address
-  (#1153).** Those four (`capacity_bond_address`, `slash_appeal_address`,
-  `publisher_registry_address`, `origin_assignment_address`) route through a
-  shared `parse_nonzero_address` guard, so a misconfigured `0x0000…0000` fails
-  fast at resolve time with a clear "must not be the zero address" error instead
-  of an opaque on-chain revert later. Previously only `slash_appeal_address` was
-  guarded. This is a new hard error on `0x0` for the three other addresses
-  (present-but-zero only; an unset optional publish address still resolves to
-  `None`).
-
-- **The zero-address guard now covers every parsed contract address across the
-  CLI, not just the resolve\* family (#1213).** The `fetch`
-  (`payment_channel_address`, `slash_judge_address`, `capacity_bond_address`),
-  `channel` (`payment_channel_address`), and `setup` (`usdc_address`) sites, plus
-  the swap venue addresses parsed in `decdn-incentive`'s `swap_venue`
-  (`swap_router_address`, `swap_quoter_address`, `swap_pool_address` /
-  `swap_balancer_pool`, `usdc_address`), now reject `0x0000…0000` with the same
-  "must not be the zero address" error instead of an opaque on-chain revert later.
-  This closes the inconsistency where the *same
-  logical address* was guarded via `resolve()` but not via `fetch`. New hard error
-  on `0x0` (present-but-zero only; unset optionals still resolve to `None`).
-  Account/EOA addresses (`--provider-address`, `operator`) are unchanged — the
-  guard is contract-specific.
-
-#### Gossip
-
-- Gossip publisher / subscriber / TTL-sweeper tasks now shut down
-  cooperatively via a `CancellationToken` owned by `GossipService`,
-  instead of the runtime reaching in with `JoinHandle::abort()` (#805).
-  Each loop returns at a clean await boundary on cancellation — including
-  interrupting the subscriber's reconnect backoff — so the drain phase
-  finishes promptly without abrupt mid-await cancellation. Lifecycle
-  ownership only; no steady-state behavior change.
-
-### Added
-
-- **Release: `cargo binstall` verifies each archive's minisign signature (#2765).**
-  `sign-release.sh` now signs every archive with the maintainer minisign key,
-  in the same run as `SHA256SUMS.minisig`, and uploads `<archive>.minisig`
-  beside it. The four binary crates' `[package.metadata.binstall.signing]`
-  names that key, so binstall refuses an archive whose signature is missing or
-  does not verify. `sign-release.sh` reads the key from the tag's manifests
-  before it signs anything, verifies every minisign signature with `-H` (the
-  prehashed format `decdn self-update` and binstall accept), and refuses a
-  release whose archives do not verify under the key. `publish-crates.sh`
-  refuses a release missing an archive `SHA256SUMS` names or its `.minisig`,
-  and runs `check_binstall_metadata.py` at the tag before the first upload.
-  `check-binstall-metadata.sh` also checks that the crates name the same key,
-  that it is one of `crates/cli/minisign-*.pub`, that it sits on the one line
-  form `sign-release.sh` reads, and that no override carries its own
-  `signing`. The key follows whoever signs: RELEASING.md § The minisign keys.
-- **Release: `cargo binstall` installs the release archives (#2764).** `decdn-cli`,
-  `decdn-node`, `sponsord` and `sponsord-onramp` carry
-  `[package.metadata.binstall]`, so `cargo binstall <crate>` downloads the
-  GitHub Release archive for the target instead of compiling. The fallback to
-  third-party cargo-quickinstall builds is off; a target with no archive
-  compiles from source. Windows overrides are keyed by exact target triple,
-  which every binstall release reads. `.github/scripts/check-binstall-metadata.sh`
-  (in the `packaging` CI job and pre-commit) fails when a crate's `pkg-url`,
-  `pkg-fmt` or `bin-dir` stops naming what release.yml's `build-binaries` job
-  ships, including its archive step lines, or uses a placeholder binstall does
-  not offer that key. `decdn self-update` now names
-  `cargo binstall --locked decdn-cli` next to `cargo install --locked decdn-cli`
-  when it refuses a binary in a cargo bin directory.
-- **CLI: `decdn setup` checks the buyer wallet's USDC on a pull-through node
-  (#2676).** A node with pull-through on buys its cache misses from peers.
-  Opening the pool those pulls pay from escrows
-  `blockchain.buyer_working_deposit_micro_usdc` (10 USDC by default). Setup
-  now prints a `buyer_usdc` pre-flight row with the working deposit and the
-  wallet's USDC (`PaymentPool.usdc()`). Below the deposit, the row warns with
-  the shortfall, the address to fund and, on the testnet, the USDC faucet. It
-  reads the pool as `decdn-node` does (`DECDN_PAYMENT_POOL_ADDRESS`, else
-  `blockchain.payment_pool_address`) and flags a missing or zero pool address
-  or a zero deposit, which the node refuses to start with. The row never fails
-  the run. `--json` reports it as `preflight.buyer_usdc`: `null` when
-  pull-through is off, else an object whose `state` is `covered`, `short`,
-  `no_wallet` (the keyless dry run), `config_error` or `read_error`.
-- **Node: metrics for the settlement re-anchor path (#2710).** The settlement
-  watcher re-reads each pool that it seeded from one `getPool` after a restart,
-  at a pinned block. Before, it reported the outcomes only in logs, so a pool
-  that stayed pending for good was invisible. A reorg that dropped the open,
-  a reorg that lowered `totalRedeemed` or the deposit, or a read that keeps
-  failing are such cases. New series:
-  `decdn_settlement_reanchor_pending_pools` (gauge, set each tick), and the
-  counters `decdn_settlement_reanchor_{block_read_failures,
-  behind_watcher, pool_read_failures, absent, skipped_below_folded,
-  skipped_lower_redeemed, skipped_lower_deposit, anchored}_total`. A skipped
-  read now also logs a `warn!` that names the pool, the held value and the read
-  value. See `adr/appendix-observability.md`.
-- **Gateway: `GET /_status`.** `/_status` is one JSON document of what the
-  gateway holds and did: its counters, the pulls in flight, the
-  capabilities, a public gateway's allowance buckets and pointers, and the
-  buyer-pool store's pools and lanes. A loopback gateway answers it on its
-  own host behind the gateway token. `--metrics-listen` serves it too, with
-  no token on a public gateway and behind the token on a loopback one. A
-  public gateway's public host does not answer it. See
-  [`adr/appendix-gateway.md` § State](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#state).
-- **CLI: `decdn dashboard`, one page of this host's pulls, gateway and
-  node.** It serves a page on `127.0.0.1:8485` (`--listen`) that shows the
-  `decdn get` runs on the host, live and finished; the gateway at
-  `--gateway` (default `http://127.0.0.1:8484`), from its `/_status`, when
-  one answers, with the gateway token sent to a loopback address only; and the local node's health, `node top` metrics, lanes,
-  earnings, buyer pools and slashes, from its admin RPC and `/metrics`, when
-  one runs. The dashboard process reads every source and the page reads
-  only the dashboard's own `/_status`, behind the dashboard's token
-  (`~/.decdn/dashboard/token`); the printed
-  `http://127.0.0.1:8485/#token=<token>` link hands the page the token. The
-  page only reads. It is a Vite app in `crates/cli/dashboard/`, embedded by
-  `decdn-cli`'s build script; a build with no Node toolchain embeds a page
-  that says how to build it, and no release ships that page. A finished
-  pull shows the bytes it downloaded apart from those it resumed or reused,
-  and a bundle pull its entry counts (`11 skipped, 9 excluded`), failed and
-  not-run counts in red (#2638, #2639). A file in the records directory that
-  is not a record shows with its path and why (#2666). See
-  [`adr/appendix-binaries.md` § Dashboard](https://github.com/decdn/decdn/blob/main/adr/appendix-binaries.md#dashboard).
-- **CLI: every `decdn get` run keeps a record for the dashboard.** A run
-  writes `~/.decdn/activity/pulls/<start-ms>-<pid>.json`, whatever its
-  `--data-dir`, and rewrites it every second: the URI, the destination, the
-  bytes verified, split into downloaded, resumed from an earlier run's
-  `.partial`, and reused from files on disk (an interrupted run's
-  unfinished blobs included), what each node was paid, and at the end the
-  result, with a bundle run's entry counts (also when it has nothing to
-  fetch). A run
-  that cannot write its record pulls on, and warns once. A run prunes the
-  directory to the newest 200 records when it starts. `--dry-run` writes
-  none.
-- **CLI: `decdn get` ends with a pull receipt, and `decdn receipt
-  {verify,settle}` checks and settles it (#2599).** Every `get` that paid
-  prints a receipt block: the hash, the bytes verified and paid, each node
-  and the bytes it was paid for, the USDC and pool, and the start and end
-  times. `--receipt <FILE>` writes the receipt as JSON (`decdn-receipt/1`):
-  per `(pool, signer, provider)` lane, the node's first signed
-  `StreamResponse` for each hash it served and a `proof` of the lane's claim
-  (the voucher that signs its anchor and the deepest revealed chain
-  preimage). The path is checked before the pull pays anything, and may not
-  name the blob's destination or a bundle entry's. A run that succeeds
-  without paying writes no receipt, says so, and removes the file an earlier
-  run left at that path; a failed run and a `--dry-run` leave it alone. A pull that fails after paying still gets a receipt,
-  marked incomplete, that lists the started blobs that did not land. A
-  lane's prior watermark moves with every jump to a node's watermark, so a
-  jump never counts as the pull's payment. `decdn receipt verify <FILE>`
-  re-checks every signature offline against the receipt's chain id,
-  `PaymentPool` and `SlashJudge` (and, on a chain the build knows, that those
-  are its contracts; on any other chain it says they are unchecked), and
-  exits non-zero on any fault. `decdn receipt settle <FILE>` verifies the
-  receipt first, then scans `PaymentPool.PoolRedeemed` from an hour before
-  the receipt's start and rebuilds each lane's settlement from the events it
-  reads: the redemption that covers its claim, or the highest one short of
-  it. The block goes to stderr when stdout
-  carries data (`-o -`) or JSON (`--json`). The SDK side is
-  `decdn_client::receipt` (`ReceiptEvidence`, `PullReceipt`) and
-  `BundlePullerBuilder::receipt_evidence`. What a receipt proves, and that it
-  adds no slashing offense or evidence path, is in
-  `adr/appendix-pull-receipts.md`. The date parser behind it also backs
-  `decdn node earnings --since`, which refuses a signed year (`+202-10-25`).
-- **CLI: `decdn quote <URI>` prices a pull from the nodes' signed probe
-  rates, before any paid byte (#2600).** One unpaid `cdn/probe/v1` round
-  reaches every node a pull can draw from (the peer store's or the registry's
-  list, narrowed by the region allowlist, not sampled down) and verifies each
-  answer's signed rate against its operator. The quote prints the size, how
-  many nodes hold the content (and how many did not answer or rate-limited
-  the probe), their rate range in USDC per GB, the `--max-rate-per-mb`
-  ceiling, and the cost: every byte at the cheapest rate, at the most
-  expensive, and the likely cost split evenly over the first `--max-sources`
-  nodes in the order a pull that probed every node would try them, one node
-  per operator. Costs are on bao wire bytes, as the nodes meter them, for a
-  fresh pull: files already on disk still count. A blob's size is the nearest
-  holder's report. A bundle's size is its manifest's planned download, with a
-  duplicate blob and a shared chunk counted once; the quote probes the 4
-  largest blobs and prices the rest, and any probed blob with no usable rate,
-  at their mean rate, because the reference node signs one rate for every
-  hash. The manifest comes from the output directory's cache, or from a small
-  paid pull from the buyer's open pool that caches it for the `get` that
-  follows; with no open pool, it opens one only under `--open-pool` (#2675).
-  `--json` gives every amount in micro-USDC. `decdn get --dry-run` prints the same block, on a blob
-  URI too, where `--json` also applies with `--dry-run`; it sends no
-  transaction and opens no keystore, but reads the registry when the peer
-  store cannot supply it, and probes. Its `--json` plan carries `quote` and
-  `quote_error`. Without a cached manifest it names the `decdn quote` command
-  to run. `get` prints a one-line `Estimate:` on stderr before the pull (not
-  under `--json`), from the rates its own probe round and the peer store
-  hold. In `decdn-client`: the `quote` module (`census`,
-  `HashCensus::serve_order`, `price`, `wire_bytes`) and
-  `bundle::planned_downloads`.
-
-- **CLI: `decdn node earnings` prints settled and owed USDC per period
-  (#2598).** The table has one row per period (the last 24 hours, the last
-  7 days, and since the node's settlement ledger started) with the USDC the
-  operator received, the bytes those settlements paid for and the settlement
-  count, then the last settlement (time, tx, block) and the pending line:
-  what the lanes still owe and when the next redeem sweep is due. `--json`
-  prints the `admin_v1_earnings` response; `--since <YYYY-MM-DD|unix>` adds a
-  period. `--address <0x…>` builds the same table from the chain alone (no
-  daemon, no pending line): a windowed `FeeRouter.Settled` scan for that
-  operator from the deployment's L2 block, with the net per settlement
-  reconstructed from the fee split in force; slow on an RPC that caps
-  `eth_getLogs` windows, so progress prints to stderr and `--from-block`
-  shortens it. Behind it:
-  - the daemon keeps a forward-only **settlement ledger** (`settlement_ledger_v1`
-    in `settle.redb`): one row per `redeemMany` that paid, decoded from the
-    receipt (gross, bytes and epoch from `FeeRouter.Settled`, the exact net
-    from the USDC transfer to the operator, the block's timestamp). The
-    `PoolRedeemed` watcher backfills a row for a landing the redeemer never
-    saw, off the poller's task; shutdown waits for the backfills in flight, so
-    only a crash mid-catch-up can lose one (`--address` has the chain's
-    record). Each row names its operator, so after `decdn
-    node rotate-key eth` the earlier address's rows stay in the file but out
-    of the figures. The file also stamps when the ledger started recording
-    (`settlement_ledger_start_v1`), and both drop with the other seller tables
-    on a `PaymentPool` repoint. Nothing is backfilled from before the
-    watcher's first scan, so the bottom row reads `since <date>`, never "all
-    time", and a period that starts earlier reads `(covered from <date>)`
-    (#2624). The date is when the ledger started (or an earlier row the
-    watcher backfilled), not its first settlement: once the ledger has run
-    for 7 days, the 7-day row has no note, whether or not anything settled in
-    it. In `--address` mode the date is the first scanned block's time;
-  - the admin RPC gains `admin_v1_earnings` (and `EARNINGS_UNAVAILABLE_CODE`):
-    `covered_from_unix` (the time the figures cover from), named
-    periods `last_24h`, `last_7d`, `since_ledger_start` and the optional
-    `since`, the last settlement, and `pending` split into what the next sweep
-    can redeem and what is stranded (expired capability, another provider's
-    lane). `LaneSnapshot` gains `unredeemed_micro_usdc` (`owed −
-    paid_cumulative`, the per-lane term of the pending total), which `decdn
-    node lanes` shows as an `UNREDEEMED` column;
-  - the redeemer publishes its sweep schedule for the "next sweep in" and
-    "last sweep" figures;
-  - two counters: `decdn_settlement_ledger_write_failures_total` and
-    `decdn_settlement_ledger_skipped_rows_total`, so a ledger that stops
-    growing is visible to a dashboard and not only to `node earnings`;
-  - `decdn node status` appends an `earnings=ok …` / `earnings=unavailable
-    reason=…` line (text mode only) and `decdn setup` closes with
-    `earned_so_far=` when a daemon answers, or `earned_so_far=unavailable
-    reason=…` when one is listening but its answer is an error, late, or does
-    not decode; only a refused connection prints nothing. Both lines render a
-    daemon's JSON-RPC error as its code and message.
-- **CLI: a namespace is a stable host on a public gateway (#2614).**
-  `decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a
-  namespace pointer (an EIP-712 record over the `PublisherRegistry`
-  deployment: `namespaceId`, `root`, `seq`) with the namespace owner's
-  keystore and `PUT`s it to the gateway as `/_pointer`. The gateway recovers
-  the signer, checks it against `PublisherRegistry.ownerOf`, keeps the
-  pointer in `<data-dir>/pointers/<ns>.json` (bound to the chain and
-  registry it was verified on: a data dir moved to another deployment stops
-  the gateway instead of serving its pointers), and from then on serves the
-  bundle as a website at `<ns>.<host>`. A pointer at a `seq` not above
-  what the gateway stored from the same signer is 409 before any chain
-  read; one from another signer who owns the namespace now replaces the
-  held one whatever the holder's `seq`; a stranger's is 403; the owner
-  lookups are budgeted per minute (429 past it), with a budget of its own
-  per namespace for a signer stored before. On a namespace host,
-  `/_decdn/` content from another bundle spends the shared allowance. `decdn gateway` takes `--publisher-registry-address`
-  (default: the config file, else the built-in testnet) and
-  `--allowance <ns>=<bytes>`, repeatable, which gives one namespace a daily
-  allowance of its own for the requests its pointer serves, in place of the
-  shared one; a `?ns=` or a `<ns>.<hash32>.` label still spends the shared
-  one. `decdn_gateway_pointer_updates_total` counts stored pointers. The
-  design is in `adr/appendix-gateway.md` § Namespace pointer. Part of #2593.
-
-- **CLI: the public gateway serves its metrics on a loopback listener
-  (#2611).** `decdn gateway --public-url … --metrics-listen <addr>` serves
-  Prometheus text at `GET /metrics`: content bytes served, answers by outcome
-  (ok, not found, refused, allowance exhausted, pool cannot pay, upstream
-  failed) as one unlabeled sibling counter each, and pulls in flight as a
-  gauge. The listener takes a loopback address only. The series are listed in
-  `adr/appendix-gateway.md`, the gateway's new appendix. Part of #2593.
-
-- **CLI: the gateway answers `Range` on a sized bundle entry (#2612).** An
-  entry whose manifest declares its size takes one `Range` (`bytes=a-b`,
-  `bytes=a-`, `bytes=-n`): the response is 206 over exactly that window, with
-  `Content-Range` and the window's length, and the pull pays only for the
-  chunk-group-aligned span around it (ADR 038). A range past the end is 416.
-  A range the gateway cannot honour (several, another unit, a rewritten page,
-  a blob of unknown size) is ignored and the whole body is served. A sized
-  response advertises `Accept-Ranges: bytes`, on `HEAD` too, so `curl -r`, a
-  resumed download and a BEP 19 webseed work. Part of #2593.
-
-- **CLI: `decdn gateway --public-url` serves anyone from its own pool
-  (#2608).** A public gateway serves a domain behind a TLS-terminating
-  proxy: `<origin>/<hash>[/<path>]` on the bare host, every bundle as a site
-  at `[<ns>.]<hash32>.<host>`, and a namespace host that answers 404 until it
-  has a pointer. It takes no token and no capability: every request pays from
-  the keystore's own pool, and `--allowance-bytes-per-day` bounds the bytes it
-  delivers per UTC day. A request past the allowance, or an entry that does
-  not fit what is left, answers 402 before any pull; a stream of unknown size
-  is cut when the allowance runs out; a pool that cannot pay answers 503. Each
-  names the canonical `decdn:` URI in a `Link` header and a JSON body. `HEAD`
-  is answered from the bundle manifest at no pull of the entry. The buyer
-  store lives in `<data-dir>/store`, so the pool survives a restart. Loopback
-  mode is unchanged. Part of #2593.
-
-- **CLI: `decdn gateway` serves every bundle as a website on its own origin
-  (#2457).** `http://[<ns>.]<hash32>.localhost:<port>/` (`<hash32>` is the
-  manifest hash in lowercase unpadded base32) serves the bundle's
-  `index.html`, its entries by path, and a directory's `index.html`, with
-  HTML, CSS and scripts as themselves under a policy that confines the page
-  to its origin. It works in a plain browser: `Sec-Fetch-*` lets the site's
-  own requests, typed URLs and top-level navigation spend, refuses every
-  other cross-origin request, and pays with the capability covering the
-  site's host, `*` included. A site's `decdn:` URIs in HTML attributes,
-  `<style>` and CSS are rewritten as they stream to `/_decdn/<hash>…` on the
-  site's origin, which serves the page's requests and redirects a navigation
-  to the other bundle's site. A tokenless `GET /<hash>/[<path>]` on the
-  gateway origin redirects to the site.
-
-- **Client: `Streamer::open_range` streams one verified byte window (#2607).**
-  A caller that knows a blob's size opens a consumption-paced stream over
-  `[offset, offset + len)` instead of the whole blob. The fetch opens, and
-  pays for, only the chunk-group-aligned span around the window (ADR 038);
-  the reader hands out exactly the window, a zero length is a tail to the
-  proven size, a window is never teed to the cache, and a whole-blob cache
-  hit serves the window from memory. `open` is the whole-blob window. This
-  is the client half of the HTTP `Range` the public gateway answers (#2593).
-
-- **CLI: `decdn self-update` and a daily update notice (#2537).**
-  `decdn self-update` resolves the latest GitHub release, verifies its
-  `SHA256SUMS.minisig` against a maintainer's minisign public key embedded
-  from `crates/cli/minisign-<maintainer>.pub`, checks the archive against the
-  signed manifest,
-  and replaces the running binary in place (`--check` only reports). A binary
-  `cargo install` placed is refused with `cargo install --locked decdn-cli`;
-  one in a directory the user cannot write (the container image, a managed
-  fleet path) is refused by path. A downgrade or a pre-release is never
-  applied. At most once a day (stamp `~/.decdn/self-update-check`) the CLI
-  looks the latest release up alongside the command and, once the command
-  succeeds, prints one stderr line naming the newer version and
-  `decdn self-update`; the command waits at most one second for the lookup,
-  and a `get` outlasts it. Never for `--json` output and never when stdout or stderr is not a
-  terminal. New config section `[self_update]` with
-  `check` (default `true`), overridden by `DECDN_SELF_UPDATE_CHECK`.
-  `DECDN_RELEASES_BASE` points a test at another release page.
-- **Release tooling: `SHA256SUMS.minisig` and pre-release marking (#2537).**
-  `scripts/sign-release.sh` signs `SHA256SUMS` with the minisign key
-  `DECDN_MINISIGN_KEY` names (default `~/.minisign/minisign.key`), verifies
-  it against the `crates/cli/minisign-*.pub` maintainer keys in the tag's tree
-  (the keys the released binary embeds), and uploads it beside the `.asc`
-  files;
-  It also verifies the signature against the keys in the previous tag's
-  tree, the keys installed binaries embed, so a key new in a release cannot
-  sign that release. `scripts/publish-crates.sh` requires it. A version with a
-  pre-release suffix is created and published with `--prerelease`, so it never
-  becomes GitHub's "latest" release.
-- **Node: `decdn_buyer_topup_unresolved` gauge (#2493).** It reads 1 while
-  the node holds its top-up slot for a `topUp` whose outcome the chain has not
-  resolved, and 0 again once the settle ends, including when its task is
-  aborted. `adr/appendix-observability.md` and `docs/runbook.md` describe what
-  keeps it at 1 and what the operator does.
-- **CLI: `decdn get decdn:<hash>/<path> -o -` streams one bundle entry to
-  stdout (#2467).** The command reads the bundle manifest into memory (at
-  most 64 MiB, and the manifest fetch requests and pays for no more), then
-  streams the entry's verified blob to stdout. Both fetches share one payer,
-  so the keystore password is read once. The bundle flags are an error with
-  `-o -`, and `-o -` on a whole bundle (`decdn:<hash>/`) stays an error.
-- **CLI: `-o` is optional on `decdn get` (#2466).** Without `-o`, a blob
-  lands at `./<hash>`, a bundle in `./<hash>/`, and an entry URI
-  (`decdn:<hash>/<path>`) at `./<name>`, the last segment of its path, with
-  no parent directories. A bundle or entry pull without `-o` refuses a path
-  that holds a file no earlier pull left there unchanged, unless
-  `--overwrite` (#2472). The earlier pull must be of the same entry (the
-  same manifest hash and manifest path), or have written the same bytes. A
-  new version of a bundle has a new hash, so it lands in its own directory;
-  `-o <old dir>` updates the old one in place: it replaces the files that
-  changed and skips the rest. `--overwrite` fetches every file again. The
-  error says why: no pull wrote the file, it changed after a pull wrote it,
-  or a pull wrote it from another entry, named as a `decdn:` URI. So `decdn get
-  decdn:<h>/tokenizer/config.json` does not replace the `./config.json`
-  that `decdn:<h>/text_encoder/config.json` wrote. Each
-  `.decdn-manifest.json` record names its manifest hash and manifest path.
-  A `.decdn-manifest.json` an older build wrote vouches for no file, so the
-  first pull without `-o` into such a directory refuses its files, and the
-  error names the version mismatch; name the directory with `-o <dir>` once
-  to pull there. The pull leaves its `.decdn-bundles/`,
-  `.decdn-manifest.json` and `.decdn-partial/` in the output directory.
-  Without `-o`, the command prints `Downloading to <absolute path>` on stderr
-  before the pull starts (not under `--json` or `--dry-run`). With `-o`, each
-  target lands where `-o` names. A bundle entry at `.decdn-manifest.json` or
-  under `.decdn-bundles/` fails, like one under `.decdn-partial/`: those
-  paths hold the pull's own state.
-
-- **Release: Docker Hub overviews for `decdn/decdn-node` and `decdn/decdn`
-  (#2440).** Each image's Hub short description and overview live in
-  `docker/README.<stage>.md`. `sign-release.sh` pushes them after the Docker
-  Hub mirror, from the files as committed at the tag, and reads them back
-  without credentials. A prerelease leaves them alone. A failed push only
-  warns; running `scripts/dockerhub-description.py` by hand repeats it. The
-  push logs in with `DECDN_DOCKERHUB_USERNAME` and `DECDN_DOCKERHUB_TOKEN`
-  when both are set, else with the `docker login docker.io` credential, and
-  needs `python3`. `DECDN_SKIP_DOCKERHUB` skips it with the mirror.
-  `check-image-name.sh` fails an image with no overview file.
-- **`decdn-client`: a public bundle pull, `decdn_client::bundle` (#2429).**
-  `BundlePuller` pulls every blob of a bundle manifest into a directory over
-  one paid run, with what `decdn bundle pull` does: fetch-once per blob,
-  hard-link duplicates, whole-file and range dedup against the output
-  directory, resume from `.partial` prefixes and the skip-cache, a jobs cap
-  and a per-provider stream cap, and the funding recovery second pass.
-  `select_nodes` resolves the pinned node or the run's registry list first, so
-  a failed discovery costs no key unlock. `Funding` is the buyer's own pool or
-  a delegated `CredentialSlot`. Progress reaches a `BundleObserver`, a
-  `CancellationToken` stops the pull, and the result is a typed
-  `BundleOutcome`: how it ended (`BundleEnd`: `Complete`, `Interrupted`,
-  `FundingNeeded`, `Stopped`), the pool replacements, and a `BundleReport`. The new public `decdn_client::session` module holds the
-  inputs: `ChainConfig`, `PullSite`, `DepositPolicy`, `DiscoveryOptions`.
-  `decdn bundle pull` is now a caller of it; its output, `--json` report and
-  exit codes do not change. The pull future is not `Send`.
-
-- **Release: `publish-crates.sh` opens devops' decdn bump PR (#2399, #2421).**
-  After the upload, the script clones decdn/devops into a temporary directory
-  and runs its `open-decdn-bump.sh <tag>`, which opens the PR that pins devops
-  to the new release with the maintainer's `gh` login: the Ansible role, Helm
-  chart, Compose and onramp pins. A failure prints the command to run later
-  and never fails the publish; a `DECDN_REPO` other than `decdn/decdn` opens
-  nothing, and `DECDN_SKIP_DEVOPS_BUMP=1` (or `true`/`yes`) skips it.
-  - Why: devops pins decdn at a release tag, and the move was a PR opened by
-    hand after the release.
-- **`serve_stream` spans time their serve loop's waits by cause (#2348).** A
-  serve loop records `store_wait_ns`, `send_wait_ns` and `proof_wait_ns` as
-  it ends, with the QUIC path's state: `path_kind`, `path_rtt_us`,
-  `path_cwnd`, `path_congestion_events`, and the connection's
-  `conn_lost_packets`, `conn_lost_bytes` and `conn_sent_bytes` over the
-  loop. A slow stream's trace now says whether the store, the path, the
-  client's receive window, or the client's proofs hold it back
-  ([appendix-observability § Trace Spans](adr/appendix-observability.md#trace-spans)).
-- **`bundle pull` warns on a filter glob that matches no entry, and on
-  leftover partials (#2190).** Each `--include`/`--exclude` pattern that
-  matches no manifest entry prints one `warning:` line on stderr, in a real
-  pull and under `--dry-run`. A pattern matches the whole path from the bundle
-  root, so when its `**/` form would match, the warning names it:
-  `--exclude 'metal/*' matched no entries (… did you mean '**/metal/*'?)`. At
-  run end, staging files under `.decdn-partial/` for blobs the run did not
-  select (a partial an earlier run left for an entry this run excluded) print
-  one warning with their count and size. The pull keeps them for a later run
-  that selects the entry again.
-- **`bundle pull --hash --dry-run` checks the filters against a cached
-  manifest (#2327).** When an earlier pull into the same output directory
-  cached the bundle manifest, the dry run lists the filtered plan and warns
-  on each `--include`/`--exclude` pattern that matches no entry, as
-  `-i --dry-run` does. The dry run reads the cache even under `--overwrite`.
-  With no cached manifest, it prints the bundle hash and output directory it
-  would pull into; under `--json` it prints `count`, `entries` and `quote`
-  as `null`. A malformed `--hash` fails the dry run, as it fails a real pull.
-- **`bundle pull --hash` names a cached manifest it cannot use (#2361).** A
-  cache file under `.decdn-bundles/` that cannot be read, or whose bytes fail
-  the hash check, fails `--dry-run` with the file path and the reason. A real
-  pull prints the same reason as a warning and fetches the manifest fresh. A
-  cache write that fails prints a warning that names the path.
-
-- **Paid-leg diagnostics at `debug` (#2211).** Each paid leg's open logs its
-  peer, hash, `byte_offset` and `byte_len`. A throughput-floor trip logs the
-  range, bytes against expected, the window's bytes, and the gap since the
-  previous floor sample. An ingest wait of 1 s or more on a checkpoint slot
-  logs its length.
-- **`blockchain.get_logs_max_block_span` sets the ceiling on the block span of
-  one chain-watcher `eth_getLogs` request** (default 10 000, must be > 0,
-  restart-required). Set it to the RPC provider's range limit so the poller
-  neither learns it from rejections after each restart nor probes it again
-  each time the span doubles back.
-
-- **Chain-event poller span metrics and a flapping-watcher alert.**
-  `decdn_chain_get_logs_span` reports the poller's current `eth_getLogs`
-  window span and `decdn_chain_get_logs_range_rejections_total` counts the
-  windows the provider rejected; the chain dashboard plots both.
-  `DecdnChainWatcherFlapping` fires, once per node, when the chain watchers
-  enter four or more failure windows in 30 minutes and keep doing so for 45
-  minutes: each recovery resets the stalled alerts, so watchers that fail on
-  and off otherwise lag head unseen. It uses `increase()`, so a daemon restart
-  does not clear it, and a single burst does not fire it.
-
-- **Observability: the first latency histograms, so a latency SLO can be
-  written in PromQL (#2047).** Before this change the exporter had no
-  histogram, and latency came only from Tempo span durations. Those depend on
-  trace sampling, and the `serve_stream` duration grows with blob size. Four
-  histograms are now live:
-  `decdn_probe_collection_latency_seconds` (M-tier, from the start of the
-  concurrent probes to the end of collection), `decdn_serve_first_byte_hit_seconds`
-  and `decdn_serve_first_byte_miss_seconds` (from the decoded request to the
-  first `ChunkData` frame, split by the availability gate's class), and
-  `decdn_node_pull_first_byte_seconds` (from the start of each paid pull leg's
-  open, dial included, to its first bao bytes). A drive that adopts a
-  header-handshake pull keeps the start of the handshake open, so that leg's
-  time to first byte does not read as zero. On a buffered miss fill the whole
-  blob lands before the first frame, so that tier's miss latency grows with
-  blob size. The delivery dashboard gains serve and pull time-to-first-
-  byte panels, and the node dashboard gains a probe collection latency panel.
-  No alert rule reads them yet.
-
-- **Runtime: `decdn-node` heartbeats the systemd watchdog from its tokio
-  runtime.** When the unit sets `WatchdogSec=`, the node sends `WATCHDOG=1` to
-  `NOTIFY_SOCKET` every half period from a runtime task. A node whose runtime
-  workers are all held by work that never yields stops the heartbeat, and
-  systemd restarts it. Without the watchdog, such a node stays `active` while it
-  serves nothing, logs nothing and answers no `/metrics` scrape. The node has
-  no setting for this: `WatchdogSec=` turns it on, and without `WATCHDOG_USEC`
-  in the environment the heartbeat does not start. The unit must allow
-  `NotifyAccess=main` and `AF_UNIX`. A regression test runs the #2132
-  sliver-voucher case on a one-worker runtime and fails if a heartbeat task on
-  that runtime stops ticking.
-
-- **CLI: `decdn pool list --all` shows every pool the keystore owns on chain
-  (#2077).** `pool list` read only the local buyer store, so it could not show
-  a pool whose store row was gone — precisely the situation an operator runs it
-  in. A reset `identity.data_dir` loses the only local record of a funded
-  deposit, and the default listing then prints nothing, because the file it
-  reads is the file that went missing. `--all` enumerates
-  `PaymentPool.getPools` by the keystore address and prints every pool in every
-  lifecycle state with its on-chain `deposit`, `totalRedeemed` and reclaim
-  window, marking which ones the local record tracks. Every local read on this
-  path is read-only: `--all` sends no transaction, writes no pool record, and
-  manufactures no store — creating one and reporting its emptiness is the #2078
-  defect, and it would make a lost store indistinguishable from a store that
-  tracks nothing. `TRACKED` distinguishes `no` from `?`: a pool the local record
-  cannot answer for — an unreadable store, or a row that will not decode — is
-  unknown rather than untracked, because the remedies differ (a lost store
-  versus a record to repair) and one bad row must not blank the verdict for the
-  pools either side of it. A store that will not open is named on stderr with
-  the reason, and the table carries `local_store=read|unreadable` so the
-  distinction is not `--json`-only. Unlike `close --all` / `reclaim --all` it is
-  **not** refused on a node's data dir — those two write, this one reads, and a
-  node host is where it is most needed. `--json` emits a third document shape
-  with `source: "chain"`; read `source` before `pools`, as with the other two.
-  `PoolListArgs` now flattens `PoolChainArgs`, matching `close` and `reclaim`:
-  `--data-dir` is unchanged and the chain flags are new, read only by `--all`.
-  The `docs/runbook.md` stranded-pool section that was written around this gap
-  now uses it.
-
-- **CLI: `decdn pool list` reads a stopped node's `buyer.redb` off disk
-  (#2084).** #2081 routed the listing on a node data dir through
-  `admin_v1_pools` and deliberately did not fall back to the client store,
-  which left a stopped node's buyer store readable by nothing — no route for a
-  post-mortem after a crash, or for a host down for maintenance. `redb` holds
-  its process-exclusive lock only for the lifetime of an open `Database`, so on
-  a refused admin connection the CLI now tries a read-only open of the daemon's
-  own `buyer.redb`. It opens, so no daemon holds it: the listing renders with
-  `store=… (read from disk; no daemon running)` and `source=node_store_offline`
-  under `--json` — its own value, never the client store's. It is write-locked,
-  so a daemon **is** running: the error says the admin URL or `admin_port` is
-  wrong rather than telling the operator to start a node that is already up.
-  Anything else keeps the previous error with the disk read's reason appended.
-  New `decdn_incentive::buyer_pool_redb::ReadOnlyBuyerPoolStore` takes a file
-  path rather than a data dir and never creates, which is what keeps #2078
-  closed; a `redb` database left unrepaired by a crash reports the new
-  `StoreError::NeedsRepair`, naming the one fix (start the daemon once). Only a
-  refused connection takes this route — a timeout or a JSON-RPC error means the
-  daemon answered, so neither goes near the file.
-
-- **Admin/CLI: `admin_v1_pools` and `decdn node pools` read the node's buyer-side
-  `PaymentPool` state (#2078).** The buyer-side counterpart of `admin_v1_lanes` /
-  `decdn node lanes`: every pool the buy leg tracks, the deposit it believes each
-  holds, and the per-lane amount already signed away to each provider. This is the
-  *only* read path to that state on a running node — `redb` holds a
-  process-exclusive lock on `buyer.redb` for the daemon's lifetime, so no other
-  process can open it, not even read-only. A node with no `[blockchain]` wiring
-  answers `BUYER_POOL_UNAVAILABLE_CODE` (`-32011`) rather than an empty list,
-  because "this node never pays for pulls" and "this node owns no pools" send an
-  operator hunting a stranded deposit in opposite directions; a store read failure
-  answers `BUYER_POOL_STORE_ERROR_CODE` (`-32010`). `decdn pool list` gains
-  `--admin-url` and `--timeout-ms`, used only when the data dir turns out to be a
-  daemon's.
-
-- **Metrics: the buyer leg reports itself (#2072).** New gauge
-  `decdn_buyer_wallet_usdc`, read once per reclaim sweep and at bootstrap, plus
-  two counters for the states that silently cost USDC:
-  `decdn_buyer_lane_seed_failures_total` (pulls refused because a lane's
-  already-paid watermark could not be established) and
-  `decdn_buyer_pool_adoption_failures_total` (bootstraps that could not tell
-  whether this node already owns a pool, and so are about to open a second). The
-  buyer leg is the one part of the node that spends rather than earns, and
-  nothing reported on it: an operator who never funded the wallet saw a node that
-  served perfectly and silently bought nothing. Two alerts go with it —
-  `DecdnBuyerWalletUnfunded` (below one working deposit, scoped to nodes that
-  actually pull) and `DecdnNodePullNeverSucceeds` (attempts with no success over
-  6h), plus a `docs/runbook.md` section covering wallet funding and recovering a
-  pool the node has forgotten.
-
-- **Metrics: the serve path reports its own cache hit rate.** New siblings
-  `decdn_serve_cache_{hit,partial_hit,miss}_total`, bumped at the
-  blob-availability gate in the client dispatch path — ahead of the load-shed
-  admission, so the ratio stays a property of the store rather than of current
-  pressure. Exactly one of the three fires per request reaching the gate; a
-  withdrawn hash is refused before it and counts in none.
-  - These exist because `decdn_cache_hits_total` and
-    `decdn_cache_bytes_returned_total` are scoped to `CacheEngine::get`, the
-    whole-blob buffered read the paid serve path never calls — it streams
-    through `export_bao_range_stream` instead. A node serving only paying
-    clients therefore holds both at zero under full production load — while
-    `decdn_cache_misses_total`, which the fill tiers bump too, keeps climbing,
-    so the pair reads as a populated permanent 0% rather than an empty series, so the fleet dashboard's hit-ratio panel read a permanent
-    0% and its throughput panel plotted a flat-zero series as "served". The
-    registry rows for the `get`-scoped counters now say so, and the panels read
-    `decdn_bytes_served_total` (bao wire bytes) for delivered bytes.
-  - `decdn_serve_cache_partial_hit_total` is counted apart from the plain hit so
-    the payoff of partial-holder advertisement (ADR 038) stays legible; both are
-    hits for hit-rate purposes.
-
-- **Monitoring: unattributed stream failures and pull success rate are on the
-  dashboards.** The fleet overview and the delivery dashboard gain a residual
-  panel — `rate(decdn_streams_failed_total{direction="inbound"})` minus the 22
-  seller-leg counters that each end exactly one inbound stream — which makes a failure mode that no counter names
-  visible as a step change. The overview also promotes node-to-node pull success
-  rate, so a pull leg failing every attempt reads as a ratio pinned at zero
-  rather than as low traffic. `decdn_serve_stream_rejected_bad_binding_total` and
-  `decdn_node_pull_pool_open_failures_total` join the refusal and pull-failure
-  breakdowns they were missing from, and eleven further exported-but-unplotted
-  series (probe read faults, the fee-shares watcher downtime/restart pair, the
-  reconciled-redemption skip, the per-peer rate-limit prune sweeps and the iroh
-  path-composition family) land on their existing panels.
-
-- **Metrics: stream outcomes, byte volume, on-chain transactions and DHT
-  health are exported, and the gaps they expose now alert.** New series:
-  `decdn_streams_{completed,failed}_total{direction}`, `decdn_bytes_served_total`,
-  `decdn_bytes_received_total`, `decdn_pool_redemptions_total`,
-  `decdn_vouchers_received_total`, `decdn_pool_grace_closes_total`,
-  `decdn_onchain_tx_{landed,reverted,send_failed,receipt_failed,timeout}_total`,
-  `decdn_dht_{findvalue_queries,lookup_round_timeouts,store_published,bucket_refresh_failures,bootstrap_find_node_failures}_total`,
-  `decdn_dht_routing_table_size`, `decdn_fee_shares_watcher_{poll_failures_total,restarts_total,down_seconds}`,
-  `decdn_config_reload_failures_total`, `decdn_receipt_write_failures_total` and
-  `decdn_serve_stream_midstream_pool_exhausted_total`. The ten registry rows
-  that were `planned` for these ship as `live`; `decdn_streams_failed_total`
-  carries `direction` only, with the reason split in the existing sibling
-  counters. New alerts: `DecdnSlashDetected`, `DecdnRpcUnhealthy`,
-  `DecdnFeeSharesWatcherStalled`, `DecdnFeeSharesPollFailing`,
-  `DecdnRedemptionFailing`, `DecdnOnchainTxTimeouts`, `DecdnServeNodeFault`,
-  `DecdnFrameAccountingFault`, `DecdnWatcherPersistFailures`,
-  `DecdnLaneFlushFailures`, `DecdnNodePullCorruption`,
-  `DecdnConfigReloadFailed` and `DecdnReceiptLogWriteFailing`. The delivery,
-  chain and node dashboards gain panels for each family.
-- **Tracing: deCDN emits its own spans.** Each inbound client stream is a
-  `serve_stream` span with its `outcome` (`completed`, `refused`, `stopped`,
-  `reset`, `failed`, `panicked`, `cancelled`), `reason`, `bytes` and `error`. A
-  buffered cache miss nests `pull_through`, `origin_pull`, `node_pull`,
-  `upstream_stream` and `open_progressive_pull` under it; a streaming miss nests
-  `serve_miss_pull` and `open_progressive_pull`. `dht_lookup`, `redeem_cycle`
-  and `onchain_tx` cover discovery and settlement. A failed pull or
-  transaction carries an error status. Both ends of a transfer record the same `hash`, `pool_id`,
-  `byte_offset`, `peer` and `local_node_id`, so one TraceQL query finds both
-  sides. No trace context crosses the wire. The span export no longer follows
-  `log_level`; it exports `INFO` spans from the deCDN crates and `WARN`
-  events from the rest, and the OTLP
-  resource carries `service.version`. The node dashboard gains a deCDN
-  operation latency panel ([appendix-observability](adr/appendix-observability.md#trace-spans)).
-- **CLI: `-v` / `-vv` / `-vvv` turn on client-side logging** at `info` /
-  `debug` / `trace`. `--log-level` wins over the count, and `RUST_LOG` wins over
-  both.
-
-- **Monitoring: the chain dashboard shows a world map of active nodes by
-  declared region.** New gauge `decdn_staker_set_active_by_region{node_region}`
-  counts active stakers per region (ADR 030) from the CapacityBond registry.
-  Each node holds the whole network, so a single scrape counts every active node.
-  New gauge `decdn_staker_set_active_unknown_region` counts active stakers with
-  an empty or invalid `regionHint`. `monitoring/dashboard-chain.json` gains an
-  "Active nodes by country" Geomap panel, an "Active nodes per region" table
-  (which also lists codes the map cannot place) and an "Active nodes without a
-  region" stat panel.
-  - The label is `node_region`, not `region`, so it does not collide with the
-    scrape-side `region` target label. Query it with `max by (node_region)`:
-    summing across nodes multiplies the count by fleet size.
-  - The CapacityBond registry now follows `RegionUpdated`, so a region change
-    reaches the region map, the dashboard and the ADR 030 latency penalty on
-    the next watcher tick instead of the next 15-minute re-enumeration.
-  - The registry's region map stores the canonical region code: a raw
-    `" de "` on chain becomes `DE`, and an invalid hint has no entry. The
-    ADR 030 latency penalty compares these codes against the node's own
-    normalized `identity.region`, so a padded or lower-case hint no longer
-    evades it.
-
-- **Observability: the single reference dashboard becomes a four-dashboard suite
-  covering metrics, logs and traces.** `monitoring/` gains
-  `dashboard-delivery.json` (`decdn-delivery`), `dashboard-chain.json`
-  (`decdn-chain`) and `dashboard-node.json` (`decdn-node`) beside the rebuilt
-  `grafana-dashboard.json` (`decdn-poc-overview`, retitled "fleet overview"; uid
-  and filename unchanged so existing links hold). Coverage goes from 25 named
-  series to 207 — every serve-refusal reason, the whole `decdn_node_pull_*`
-  funnel, all five chain-event watchers, the `decdn_iroh_*` transport
-  sub-registry, and `node_exporter` host panels that join on the same `instance`
-  label. Loki panels parse the daemon's tracing JSON (`| json lvl="level"`),
-  since journald stamps every stdout line priority `info` and the Loki `level`
-  label reports that, not the event's real severity. Tempo panels supply the only
-  latency distribution available anywhere: the exporter registers no histograms,
-  so `histogram_quantile` has nothing to read.
-  - `monitoring_selectors_are_exported` now sweeps every `.yml` and `.json` under
-    `monitoring/` instead of two hard-coded filenames, so a new dashboard is gated
-    the day it lands. The exported set it compares against includes the
-    `decdn_iroh_*` sub-registry, which `Metrics::new()` alone does not carry —
-    `register_iroh_endpoint` is split so the test can register an
-    `EndpointMetrics::default()` without standing up a socket. Without that split
-    every iroh panel would read as an unexported name.
-  - Query bugs fixed while rebuilding: the cache hit ratio no longer clamps a
-    per-second *rate* denominator to a floor of 1.0 (which understated every node
-    doing under one lookup per second — all of them); USDC gauges are scaled out
-    of raw 6-decimal base units and carry `currencyUSD`; watcher tick-age
-    thresholds move from 600/1800s to 120/180s so the panel cannot read green
-    while `DecdnBlacklistWatcherStalled` is firing; panels that aggregate
-    `by (instance)` carry `{{instance}}` in the legend instead of emitting one
-    identically-labelled series per node.
-
-- **Alert rules gain `component` labels and `runbook_url` annotations.** All 18
-  rules carry a `component` for routing; the 14 with a matching `docs/runbook.md`
-  section link straight to it, so Alertmanager and Grafana can render a button
-  rather than burying the path in prose.
-
-- **`decdn fetch` fans a large blob out across several holders at once (ADR 039,
-  #1164).** A blob above `--multi-source-min-bytes` (64 MiB) with at least two
-  operator-distinct holders is fetched in parallel over the existing paid
-  `cdn/client/v1` protocol: bao-aligned segments, one per source, with a freed
-  source stealing the second half of the largest range still in flight. No new
-  wire surface — a bounded `byte_len` request already exists and the node
-  already bills the exact aligned span. New flags: `--multi-source` /
-  `--no-multi-source`, `--max-sources` (4), `--multi-source-min-bytes` (64 MiB),
-  `--unit-deadline-ms` (10 s). The node's cache-miss pull leg is untouched, and
-  `bundle pull` stays single-source.
-  - **One payment lane per operator, enforced.** A voucher lane is keyed on
-    `(signer, provider)` and `provider` IS the operator address, so admission
-    takes at most one node per operator and the admitted set shrinks rather than
-    repeat one. The scheduler re-checks the same precondition on the lane set it
-    is handed.
-  - **One deposit, one set of pool facts.** Every lane's deposit gate subtracts
-    the spend committed across ALL lanes, the reactive-top-up budget is counted
-    once per fetch rather than once per lane, and a landed top-up credits every
-    lane's context.
-  - **A failed fan-out falls back to single-source failover** unless the failure
-    is terminal (a pool exhaustion, or what the shared classifier rules
-    terminal). The fetch reports what every source did and keeps the last real
-    error as the cause.
-
-- **The workspace is published to crates.io.** Eleven crates ship —
-  `decdn-protocol`, `-config-types`, `-bao-range`, `-common`, `-cache`,
-  `-gossip`, `-reputation`, `-incentive`, `-client-pull`, `-node` and
-  `decdn-cli` — making `cargo install decdn-cli` and `cargo install decdn-node`
-  work. `decdn-e2e` stays `publish = false`.
-  - Publishing is a new maintainer-run step, `scripts/publish-crates.sh`,
-    which runs *after* `sign-release.sh`. It verifies the tag against `KEYS` and
-    against `origin`, requires the GitHub Release to be published rather than a
-    draft, and publishes from a detached worktree at the tag rather than from the
-    working copy. There is still no registry credential in Actions secrets.
-  - `[workspace.package]` gains `version`, `repository`, `homepage`, `keywords`
-    and `categories`; every crate inherits them and carries its own `README.md`.
-    The internal `[workspace.dependencies]` entries gain `version` fields, which
-    is what makes them publishable — cargo rejects a path dependency with no
-    version, since a published crate has no path to follow.
-- **Two packaging gates, because a crates.io version can never be replaced.**
-  `release.yml` now runs `cargo publish --workspace --dry-run --locked` before
-  the draft release is created, which packages and verify-builds every crate. A
-  cheap `packaging` CI job (and matching pre-commit hooks) runs
-  `check-package-embeds.sh` — no publishable crate may `include_str!` a file
-  outside its own package — and `check-deployment-mirror.sh`.
-  - The checker covers `include!`, `include_str!`, `include_bytes!` in all three
-    delimiter forms, and `#[path = "…"]`; it enumerates workspace members from
-    the root manifest rather than a `crates/*` glob, treats a target that git
-    does not track as unshipped, and fails rather than reporting success when it
-    finds no publishable crates. Its logic lives in
-    `.github/scripts/check_package_embeds.py` with unit tests under
-    `.github/scripts/tests/`.
-  - `#[cfg(test)]` sites are accepted rather than failed — the verify build does
-    not enable `cfg(test)`, so they do not block publishing — but each must be
-    listed in the checker's `KNOWN_TEST_ONLY` allowlist, and a listed entry that
-    no longer fires also fails. Two are listed today, both embedding
-    `examples/configs/arbitrum-sepolia.toml`
-    (`crates/cli/src/commands/config.rs`, `crates/common/src/config/mod.rs`);
-    `cargo test` cannot run from those published crates as a result.
-  - The `packaging` job also runs `cargo package --workspace --no-verify` and
-    asserts the image repository agrees across `release.yml`, `sign-release.sh`
-    and `security.yml`.
-- **`crates/cli/deployments/421614.json`,** a byte-identical mirror of
-  `contracts/deployments/421614.json` (which stays canonical — the Foundry
-  deploy script writes it). Same `include_str!` constraint as `TERMS.md`. A
-  redeploy must be copied across; `check-deployment-mirror.sh` fails on drift in
-  both CI and pre-commit, so stale baked-in contract addresses cannot ship
-  silently.
-- **The Dockerfile's base image is pinned by digest, and Dependabot now tracks
-  the `docker` ecosystem** to bump it. The pin is what makes two builds of the
-  same release tag ship identical base layers; it is also what makes the
-  Dependabot entry work at all, since Dependabot can update a digest but cannot
-  derive a version from the `trixie-slim` tag.
-- **`publish-crates.sh` refuses to start when more than five crates are new to
-  crates.io.** `PublishNew` allows a burst of five and then roughly one per ten
-  minutes, and the first release creates ten crates — one run would be
-  rate-limited partway through, leaving some permanently published and the
-  version spent. Clearing this is a one-time manual step; see RELEASING.md.
-  Override with `DECDN_ALLOW_RATE_LIMIT=1` once the limit has been raised.
-- **ADR 009 bootstrap-multisig governance phase (#1175).** `DeployProtocol` run
-  with `BOOTSTRAP_MULTISIG=<addr>` seats that multisig as the Timelock's sole
-  `PROPOSER_ROLE`/`CANCELLER_ROLE` holder and grants `DecdnGovernor` neither, so
-  no operator vote can execute while the operator set is still thin enough for a
-  cheap fleet to capture. The Timelock keeps `GOVERNANCE_ROLE` on every target in
-  both modes, so the 48-hour delay applies to the multisig's own changes.
-  `contracts/script/TransitionToGovernor.s.sol` prints the one-way Timelock batch
-  that ends the phase; `_assertNoBackDoors` now fails a deploy whose proposer is
-  not the one its mode seats. Off by default — the initial testnet deploy is
-  unaffected.
-
-#### Cache / config
-
-- A pinned set larger than `cache.cache_size_mb` now logs a warning at startup
-  and on reload. Pinned blobs are LRU-exempt, so the eviction driver could
-  otherwise never reach its high-water target and the disk grows past the
-  configured ceiling. The hazard applies to every node however the pinned
-  content arrived.
-- `decdn config validate` now reports `fs_rescan_interval_sec`, and
-  `decdn config init`'s template documents it. It shipped without either, so its
-  resolved value was invisible to operators.
-
-#### Contracts
-
-- `PaymentChannel.closeChannelWithoutVoucher(bytes32)` — a named entry point for
-  the voucher-less close, callable by either party. It takes the same path as
-  `closeChannel` with all-zero arguments and an empty signature: no signature
-  check, no watermark advance, the channel enters `Closing` at its recorded
-  `claimed*` and emits the same `ChannelCloseInitiated`. Purely additive; the
-  all-zero `closeChannel` spelling still works.
-
-#### Node runtime & wire protocol
-
-- Download-receipt audit log (`download_receipts.jsonl`) is now bounded by
-  size-based rotation (#802). New optional `[receipts]` config section:
-  `receipts.max_file_bytes` (default 128 MiB; rotate the live file at this
-  size) and `receipts.retained_files` (default 4; numbered backups
-  `download_receipts.jsonl.1`..`.N` to keep, `0` truncates in place). Bounds
-  `data_dir` growth to roughly `(retained_files + 1) * max_file_bytes`.
-  Config-additive — absent section preserves prior behaviour with the
-  defaults; rotation is best-effort and never aborts paid delivery.
-- iroh QUIC endpoint bring-up with protocol router (#213).
-- `cdn/probe/v1` ALPN with ADR-013 varint framing and `ProbeMessage`
-  request/response (#225).
-- Compile-time guardrail on `MAX_MESSAGE_SIZE = 16 MiB` per ADR 013 (#287).
-
-#### Cache
-
-- Cache engine wrapping `iroh-blobs` with pull-through on cache miss (#232).
-- HTTP origin adapter with connect / response-headers / chunk-idle timeouts.
-- Filesystem origin adapter using a git-style sharded layout
-  (`{base}/{hex[0..2]}/{hex}`).
-- Origin pull-through retry policy with exponential backoff and jitter
-  (#285). Configurable via `[cache.origin_retry]` (`max_retries`,
-  `initial_backoff_ms`, `max_backoff_ms`, `jitter_ratio`); set once at
-  startup, changes require a restart. **Behaviour change:** *enabled by
-  default* — cache misses now retry transient HTTP (5xx/408/429/timeouts)
-  and filesystem (Interrupted/TimedOut/ResourceBusy/WouldBlock) failures
-  up to 3 times with 100ms…10s exponential backoff. Operators relying
-  on first-attempt failure semantics must set
-  `cache.origin_retry.max_retries = 0`. The active policy is logged at
-  startup on the `cache engine ready` line. Two
-  `decdn_cache_*_total` Prometheus counters track per-fetch volume
-  (`origin_fetches_total`) and terminal exhaustion of the retry budget
-  (`origin_retry_exhausted_total`); operators alert on the rate ratio.
-  The `Origin` trait surface changed to return
-  `Result<OriginFetch, OriginPullError>`; downstream `Origin` impls (if
-  any out-of-tree) must be updated.
-- S3-compatible origin backend (#437). Supports plain AWS S3, Cloudflare
-  R2, Backblaze B2, MinIO, and any other service that speaks the S3 API.
-  Object keys follow the same `{prefix?}{hex[0..2]}/{hex}` sharded layout
-  as the filesystem origin so operators can `aws s3 sync` blobs between
-  the two without renaming. The SDK is wired with `aws-config` for the
-  AWS-CLI-equivalent credential chain (env vars, `~/.aws/credentials`
-  profile, container/instance role) plus an explicit static-credentials
-  variant for non-AWS providers. The HTTP layer uses `aws-smithy-http-client`
-  on hyper-1 + rustls 0.23 + aws-lc-rs to match the rest of the workspace
-  TLS stack — the SDK's stock hyper-0.14 + rustls 0.21 + ring stack is
-  suppressed via `default-features = false`.
-
-  ```toml
-  # AWS S3 (default credential chain via env / profile / IAM role)
-  [cache.origin]
-  kind = "s3"
-  bucket = "decdn-blobs"
-  region = "us-east-1"
-
-  # Cloudflare R2 (virtual-hosted-style addressing on a custom endpoint;
-  # static credentials read from an R2 API token)
-  [cache.origin]
-  kind = "s3"
-  bucket = "decdn-blobs"
-  region = "auto"
-  endpoint_url = "https://<account-id>.r2.cloudflarestorage.com"
-  prefix = "blobs/"
-
-  [cache.origin.credentials]
-  source = "static"
-  access_key_id = "<R2 access key>"
-  secret_access_key = "<R2 secret>"
-
-  # MinIO (path-style addressing required; static creds for the local IAM
-  # surface)
-  [cache.origin]
-  kind = "s3"
-  bucket = "decdn-blobs"
-  region = "us-east-1"
-  endpoint_url = "http://minio.internal:9000"
-  path_style = true
-
-  [cache.origin.credentials]
-  source = "static"
-  access_key_id = "minioadmin"
-  secret_access_key = "minioadmin"
-  ```
-
-  `Content-Encoding` on S3 responses is handled the same way as the HTTP
-  origin (#804): gzip/zstd bodies are transparently decompressed to
-  canonical bytes before the engine's BLAKE3 verify. Controlled by the
-  optional `[cache.origin] decompress` knob (`"auto"` default decompresses;
-  `"strict"` refuses any non-identity encoding), mirroring the HTTP origin.
-  Unknown encodings (e.g. `br`) are rejected with an operator-actionable
-  permanent error.
-
-  **Config-breaking (default shift):** the S3 backend previously rejected
-  *all* `Content-Encoding`; it now defaults to `decompress = "auto"`.
-  Operators who relied on that blanket rejection as a guard against
-  mis-stored objects should set `decompress = "strict"` to keep refusing
-  encoded bodies. The shift is safe by construction — BLAKE3 verify runs
-  over canonical bytes, so a mis-decode fails closed as a hash mismatch
-  rather than caching corrupt data.
-
-  This release also fixes a latent #804 bug on the **HTTP** origin (a second
-  backend, not part of the pure S3 extraction): a compressed body whose
-  *encoded* `Content-Length` fit under `cache.buffered_max_bytes` but decoded
-  above it was falsely rejected as `BlobTooLarge`. Compressed responses now
-  report no `size_hint`, so they always take the streaming path capped at the
-  blob-size limit — parity with the S3 fix, pinned by an HTTP regression test.
-
-#### Gossip
-
-- `NodeAnnounce` publish/subscribe over `iroh-gossip` with an in-memory
-  peer table (#231).
-- Topics: `cdn/global/v1` and `cdn/region/{code}/v1`.
-- Validation of signature, timestamp skew, region, and `popular_hashes`
-  length/dedup.
-
-#### Config
-
-- Three-layer resolution: CLI flag > TOML file > built-in default.
-- `${VAR}` and `~` expansion in TOML fields (#226).
-- EIP-55 checksum validation for contract addresses (#227).
-- `max_blob_size_mb < cache_size_mb` enforced at startup (#256).
-- `rate_per_mb > 0` enforced (#251).
-- `eth_keystore` readability verified at startup (#259).
-- `identity.region` required when `gossip.subscribe_global = true`.
-
-#### CLI
-
-- `decdn-node run` — run the daemon.
-- `decdn config init` / `decdn config validate` (#229).
-- `decdn key-gen` — Ed25519 node key + Ethereum keystore.
-- `decdn probe` — one-shot latency probe over `cdn/probe/v1`.
-
-#### Observability
-
-- Prometheus metrics over loopback HTTP at `observability.metrics_port`
-  (ADR 020).
-- OTLP span export to `observability.otlp_endpoint` (`--otlp-endpoint`).
-- `pretty` and `json` log formats (`--log-format`).
-
-#### Identity
-
-- Ed25519 node-identity key at `{data_dir}/node.secret`.
-- Permissions validated at load: `0600` on the key file,
-  non-world-writable parent (#261).
-
-#### Documentation
-
-- 25 Architectural Decision Records (ADRs 000–025) — see `adr/` for the
-  full set and `adr/architecture.md` for the living overview.
-- `CONTRIBUTING.md` with build / lint / test commands and pre-commit setup.
-
-### Removed
-
-- **ADR 024's ERC-7579 session-key production plan (#1848).** The deferred
-  plan — a Safe-7579 adapter plus the `erc7579/smartsessions` session-key
-  module for hot-path `slash_sig` / voucher signing, an ERC-4337 paymaster,
-  and a bundler — is retired from ADR 024, along with its off-chain ERC-1271
-  verification branch. It had no live consumer and no code footprint (only
-  prose and doc-comments referenced it), and the buyer side it aimed at is
-  already covered by ADR 003 capability delegation: a Safe funds a pool and
-  delegates a capped, expiring EOA `signer`, verified off-chain by recovery,
-  with no account-abstraction machinery. The shipped, load-bearing piece —
-  universal `SignatureChecker` on-chain (`PaymentPool`, `CapacityBond`,
-  `SlashJudge`, `DecdnGovernor`) and EOA-recovery-only off-chain verification —
-  stays as present-tense canon. ADR 024 gains an **§ Unimplemented — Operator
-  Custody While Serving** section that records the one real residual (a node
-  whose serving identity is a smart account, unreachable via capability
-  delegation because `registerNode` binds `msg.sender`) and why the obvious
-  ERC-1271 route is unsound for it: ERC-1271 validity is mutable and
-  operator-controlled, so a signature re-verified later as slash evidence can
-  be made invalid after payment (selective validator, post-payment revocation),
-  DoS'd via a gas-bomb validator, or wrongly cached from an off-chain RPC. The
-  recorded direction is a native EOA operator-signer delegation mirroring the
-  ADR 003 buyer capability, keeping `slash_sig` EOA-recovered — a future ADR,
-  not a commitment here. Dependents move with it: ADR 012, ADR 019, ADR 003's
-  ephemeral-binding note, `appendix-operator-key-rotation.md` (the third
-  "slash-sig session key" and its rotation procedures are gone; the runbook is
-  two keys), `architecture.md`'s ADR 024 summary, and the `RotateKeyTarget`
-  doc note plus the renamed off-chain-verification citations in
-  `crates/protocol` and `crates/incentive`. Docs and comments only — no
-  runtime, wire, config, or ABI impact. ADR 024 stays **Draft**.
-
-- **GitHub Agentic Workflows (gh-aw) and the Agentic Triage workflow.** The
-  `issue-triage` workflow (`.md` source and generated `.lock.yml`), `aw.json`,
-  `.github/aw/actions-lock.json`, the `agentic-workflows` Copilot agent file,
-  `.github/mcp.json`, and the gh-aw-only `.gitattributes` are deleted. The
-  `agentic-lock` CI job, its `agentic` paths filter, its `ci-success` entries,
-  the `copilot-setup-steps` workflow, and the `github/gh-aw-actions` Dependabot
-  ignore block go with them. Repository automation only — no runtime, wire,
-  config, or ABI impact.
-
-- **The VS Code devcontainer (`.devcontainer/`).** The container image and its
-  firewall init script are gone, and most of CONTRIBUTING.md went with them. No
-  CI job built the image, so nothing shipped depended on it; contributors now
-  install a native toolchain per the rewritten
-  [Development Environment](CONTRIBUTING.md#development-environment) section.
-  Contributor tooling only — no runtime, wire, config, or ABI impact.
-
-### Security
-
-- **node: an abandoned stream's free floor survives the stream as floor debt
-  (#2767).** Every stream opens with a free credit floor of one interval plus
-  the verify lag. When an unpaid stream ended, the node released its
-  reservation and kept nothing, so a client that never paid could take a floor,
-  reset, and repeat: about 100 MiB/s of free download per peer at the default
-  serve limit, with upstream `USDC` fronted on every cache miss. When the
-  client ends a stream with bytes unpaid (it leaves, sends a rejected voucher,
-  or spends its proof budget), the node now charges the unpaid bytes as floor
-  debt, capped at the stream's reserved floor, on the signer and on the pool,
-  even when the stream paid its floor first. A stream the node ends (a node or
-  upstream fault, a takedown, a size cap, a drained pool or signer cap)
-  charges nothing. Admission counts live floor plus floor debt: against
-  `remaining − M` for the pool (refused `Unfunded`, so rotating signer keys
-  meets the pool bound) and against `k` windows for the signer (refused
-  `NotFound`). Only payment past a stream's own floor clears debt; time does
-  not. The debt is in memory only, so a restart or a pool reclaim forgives it.
-  A key whose debt fills its `k` windows at one node has no stream left to pay
-  with, so that node refuses it until the node restarts or the pool is
-  reclaimed. The floor-refusal `warn!` lines carry the live and debt parts.
-  `blockchain.pool_floor_signer_live_windows` keeps its name and now bounds
-  live floor plus floor debt.
-
-- **client: a bundle entry path must be a portable file name, and the CLI
-  escapes control characters in the paths it prints (GHSA-jr93-46mf-88wx,
-  #2746, #2705).** Windows joins `README`, `README.` and `README` with a
-  trailing space into one file, and also resolves a `:` stream name, a device name (`NUL.txt`) and an
-  8.3 short name (`LONGFI~1.TXT`) to something other than the path suggests,
-  so two entries could still land at one file there after #2691. A publisher
-  could also put terminal escape sequences in a path and have `decdn get`
-  print them raw. `BundleManifest::parse` now fails with `MalformedManifest`
-  for a path segment that holds a control character or a character Windows
-  reserves (`\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`), ends in `.` or a space,
-  has a Windows device name as its stem, or has the 8.3 short-name stem form (`decdn_client::bundle::path_segment_problem`). The
-  rule applies on every platform. A pull of a manifest built with
-  `BundleManifest::new` fails each such entry, and `decdn origin import`
-  refuses such a tree before it imports, moves or writes any file. The
-  dry-run listing, the `failed:` lines and the progress labels escape control
-  characters. A published bundle with such a path no longer pulls; republish
-  it with the file renamed.
-
-- **incentive: a voucher that repeats the live root can no longer credit a
-  lane past its spending cap (GHSA-jr93-46mf-88wx, #2700).** Such a voucher
-  keeps the verified frontier and adopts its own `chunk_price`, so its claim is
-  `amount + verified_index × chunk_price`. The node checked only `amount`
-  against the cap, so a bump just under the cap credited up to one chain of
-  chunks past it, which the contract never pays. The voucher path now refuses
-  the full claim above the cap with `CapExceeded`, as a reveal already is.
-
-- **client: a bundle manifest with two entry paths that name one file is
-  rejected (GHSA-3c38-gqx6-v7fm, #2691).** A manifest could hold `{p → A}`
-  and `{p → B}`, or paths that differ only in case or Unicode normalization.
-  With A already at `p`, the pull skipped B too and reported success while
-  `p` kept bytes B never matched. `BundleManifest::parse` now fails with
-  `MalformedManifest` when two paths name one file on a case- or
-  normalization-insensitive file system (`decdn_client::bundle::path_collision`:
-  NFD, lower then upper then lower case, NFC), so `decdn get` and the gateway
-  refuse the bundle. A pull of a manifest built with `BundleManifest::new`
-  fails every colliding entry and writes none of them. A saved file whose path
-  names the same file as one the pull writes is no longer a whole-file donor.
-  `decdn origin import` refuses a tree that holds such a pair (`README` and
-  `readme`) before it imports, moves or writes any file.
-
-- **sponsord-onramp: clients behind the documented proxy no longer share one
-  rate-limit budget (GHSA-674v-whmr-xvmw, #2693).** The deploy binds the
-  onramp to localhost behind a reverse proxy, but the env example left
-  `ONRAMP_CLIENT_IP_HEADER` unset. Every request was keyed to the proxy's
-  address, so about four waiting installers filled the poll budget, and one
-  client could spend the fund budget for everyone. The env example now sets
-  `ONRAMP_CLIENT_IP_HEADER=X-Forwarded-For`. The limits count an IPv6 client
-  by its /64, not its full address, and an IPv4-mapped address as its IPv4
-  address. The limiter tracks at most 100,000 clients per minute; any more
-  share one budget, so a flood of addresses can neither grow its memory nor
-  get around the limits. Installer contract: `decdn.sh` and `decdn.ps1` now
-  wait out a `429` from `GET /v1/capability` and retry, the wait doubling from
-  2 s up to 30 s for up to 600 s, instead of failing the run.
-
-- **sponsord-onramp: a Turnstile token is bound to the onramp's hostname and
-  action (GHSA-jr93-46mf-88wx).** The gate decoded only `success` from the
-  siteverify response, so a token minted for the same sitekey on another
-  hostname passed, and nothing tied a token to this gate's widget. The widget
-  now sets `data-action="onramp-fund"`, and `verify()` refuses a response
-  whose `hostname` differs from `ONRAMP_PUBLIC_URL`'s host or whose `action`
-  is not the onramp's. A custom `ONRAMP_GATE_TEMPLATE` must set
-  `data-action="{{ACTION}}"` on its Turnstile widget; the onramp refuses to
-  start with a template that lacks the placeholder. A siteverify failure
-  caused by the gate itself (a missing or wrong `ONRAMP_TURNSTILE_SECRET`,
-  `bad-request`, `internal-error`) is now the gate's own error, answered
-  `500` and logged at warn, not a silent `403` refusal (#2719).
-
-- **Node: a peer's own rate-limit bucket refuses it before the shared
-  global one is charged.** The three-layer limiter behind `cdn/probe/v1` and
-  `cdn/dht/v1` charged the global bucket first, so a
-  request that the peer's own bucket then refused had already spent a global
-  token. One `NodeId` flooding at the global rate drained the node-wide
-  budget for every other requester, even though its own cap let only a small
-  part of the flood through. The layers now fire per-peer → per-IP → global,
-  so a refused request spends no global token, and the new `cdn/client/v1`
-  limiter uses the same order. A request that both its own
-  bucket and the global cap would refuse now counts on the `per_peer` (or
-  `per_ip`) rejection counter instead of `global`. ADR 005 and ADR 022 state
-  the order.
-
-- **Node: unbound requests read no pool on-chain, and admission reads are
-  capped (#2706).** At admission, an unseen `pool_id` cost one `getPool` and
-  an unseen signer one `getAuthorization`, with no global bound, so a stream
-  of requests for fresh random pool ids could spend the operator's RPC quota
-  until the blacklist watcher stalled and the node refused every serve. A
-  request with no verified client binding can name no lane, so the node now
-  refuses it `NotFound` before any chain read, and before an origin-only
-  node's backend `HEAD` (it counts on
-  `decdn_serve_stream_rejected_owner_mismatch_total`). Admission `getPool` and
-  `getAuthorization` reads hold one of 16 node-wide slots. A read waits up to
-  5 s for a slot and its own timeout starts once it holds one; a request that
-  finds no slot in time is refused without caching a fault against its pool,
-  so the pool's next request reads again, and counts on
-  `decdn_serve_admit_read_slot_timeouts_total`. Bound requests are bounded by these
-  slots and by the `[serve.rate_limit]` limiter.
-
-- **Node: inbound `cdn/client/v1` requests pass a three-layer rate limiter
-  before they are read (#2694).** The only gates on `cdn/client/v1` were the
-  per-connection limiter and the stream cap. Most refusals after the request
-  is read sign a response, and an origin-only node sent its backend a `HEAD` for each unseen
-  hash before any lane or payment check, so a flood of unpaid requests spent
-  node CPU and origin requests without limit. A new `[serve.rate_limit]`
-  section (per-peer 100/s burst 400, per-IP 200/s burst 800, global 2000/s
-  burst 5000; a rate of 0 turns a layer off) is checked once per stream,
-  after the stream permit and before the request is read. A refused stream is
-  reset with `RATE_LIMITED` and no signed response, and counts on
-  `decdn_serve_rate_limit_rejected_{per_peer,per_ip,global}_total`. Those
-  three counters are inbound failure reasons, so the devops "Unattributed
-  stream failures" panels need them too. `decdn-client` reads the reset as
-  back-off. ADR 005 § Request rate limiting describes the layers.
-
-- **Node: the DHT routing table admits bonded peers only (#2708).** ADR 022
-  restricts the routing pool to bonded operators, but the table admitted every
-  peer that contacted the node and every id a `closer_nodes` answer named, and
-  a full bucket evicted its oldest entry unconditionally. Free NodeIds could
-  therefore push out the bonded entries, so publish fan-out and lookup seeds
-  went to non-participants, and discovery fell back to the on-chain origin
-  directory. Every routing-table insert now checks the active staker set. The
-  `FindNode` / `FindValue` answers, lookup seeds and publish fan-out skip an
-  entry that has unbonded since it entered. A full bucket evicts an unbonded
-  or dial-cooling entry before the least-recently-seen bonded one.
-
-- **Node: the admin JSON-RPC server refuses requests a web page can send
-  (#2690).** It answered any request on its loopback port. A page that the
-  operator opened could reach that port through DNS rebinding and call
-  `evict` (persisted across restarts) or `drain` (shuts the node down). The
-  server now answers only requests whose `Host` is `127.0.0.1` or
-  `localhost` (any port), refuses any request that carries an `Origin`
-  header with `403`, and refuses batch requests. `decdn node …`, the
-  dashboard and an SSH tunnel to the admin port are unaffected.
-
-- **Node: after a restart, the redeemer reads a pool it does not know before
-  it submits that pool's lanes (#2692).** The redeemer's pool view learns a
-  pool only from the events it folds and the admit path's reads, and the
-  watcher resumes at its checkpoint, so a pool opened before a restart stayed
-  unknown. Its lanes were submitted even once the pool was `Closing` past its
-  deadline, reverted `PoolClosed` (taking the whole `redeemMany` with them)
-  and reverted again on every sweep. Once the candidate lanes together clear
-  the redemption floor, the redeemer now reads each unknown pool with one
-  `getPool` and seeds the view from it. A lane whose pool is past its close
-  deadline stays out of the submit and counts on
-  `decdn_redemption_skipped_insolvent_total`. A lane whose pool is absent,
-  `Closed` or unreadable stays out and counts on the new
-  `decdn_redemption_skipped_pool_unresolved_total`; an absent or `Closed`
-  pool also logs a `warn!` naming it. The first failed read stops the reads
-  for that cycle, so an RPC outage costs one round of timeouts and lanes on
-  known pools still go through. A failed read counts as a chain fault, so
-  parked lanes stay parked until a clean sweep.
-
-- **Node: the mid-stream signer cap check counts a resolved pool's
-  pre-restart spend (#2711).** After a restart the projection seeds a pool it
-  has not folded from one `getPool`, and it counts a signer's spend only from
-  the redemptions it folds after the seed. The mid-stream check read that
-  count alone, so a signer that spent most of its cap before the restart kept
-  being served after other nodes drained the rest. The check now reads the
-  admit-path `getAuthorization` result brought up to the fold, the same
-  number admission reads, and falls back to the fold alone only when it holds
-  no registered read for the signer.
-
-- **Node: racing first streams on a new lane keep its stored voucher frontier
-  (#2701).** `register_lane` recorded the fresh zero lane before
-  it claimed the lane's slot in the live map, so two first streams could both
-  record it, and the second record could overwrite a voucher the first
-  stream's lane had recorded in between. A restart in that window rehydrated
-  the lane at zero, and the redeemer found no signature to submit. Only the
-  stream that claims the slot now records the fresh lane, under the slot's
-  guard.
-
-- **Node: a pool resolved from chain counts its on-chain redemptions toward
-  its remaining deposit (GHSA-9x5g-h559-vp5m).** After a restart the pool
-  projection is empty, so the admit path reads a pool it has not folded with
-  one `getPool`. It seeded that pool with zero redemptions, so a pool drained
-  before the restart reported its whole deposit as `remaining` for the rest of
-  the node's uptime, and the admission solvency gate and the mid-stream
-  re-check served it unpaid. The seed now carries `getPool.totalRedeemed`, and
-  the settlement watcher re-reads each seeded pool at one pinned block at the
-  end of its tick (up to 64 pools per tick, eight reads at a time, in a
-  rotating order; the first faulted read stops the batch). Redemptions
-  folded after that block count on top of the read; one on a lane the
-  projection has no baseline for marks the pool for another re-read rather
-  than a guess, so `remaining` never counts a redemption twice and errs
-  toward serving until a re-read lands. The one exception is a reorg that
-  drops a counted redemption, which stays counted until on-chain
-  `totalRedeemed` passes it again. A re-read pinned below a block the
-  watcher already applied, or whose `totalRedeemed` or deposit is below what
-  the node already holds (a backend behind the watcher or the admit read), is
-  skipped and retried. A pool seeded from a read keeps the read's deposit
-  against replayed `PoolOpened` / `PoolToppedUp` logs the read already holds.
-
-- **Node: request timestamps are bounded to the node's clock before anything
-  is signed (GHSA-fjcq-8x46-cq5c).** The signed probe and stream response
-  bodies echo the requester-generated `timestamp_us` (ADR 014 § Slash
-  Signatures — secp256k1 EIP-712), and the node accepted any value. It now
-  refuses a `cdn/probe/v1` or `cdn/client/v1` request whose timestamp differs
-  from its own clock by more than a fixed 30-second bound
-  (`handlers::timestamp_skew`), before any response is built or signed: a
-  skewed probe closes the connection, and a skewed stream request resets the
-  stream, in both cases with the new `TIMESTAMP_SKEW` application error code
-  (`0x04`, ADR 013 § Application Error Codes) and no signed response. Refusals
-  count on `decdn_probe_timestamp_skew_refusals_total` /
-  `decdn_serve_stream_rejected_timestamp_skew_total` and log a throttled
-  `warn!`, so a misconfigured clock — the requester's, or the node's own — is
-  operator-visible. `decdn-client` types the code as
-  `UpstreamTimestampRejected`: when at least three probed nodes, and most
-  of them, refuse a client's timestamp, `decdn get` / `decdn quote` fail
-  with an error that names this machine's clock rather than "N did not
-  answer"; fewer refusals (which any node can send) keep the ordinary error,
-  with a clock hint. A source that refuses a stream at admission for it
-  leaves the fetch as a decline, with no peer-store failure stamp; a 0x04
-  after bytes have landed is an ordinary source fault. A fetch that every
-  source refuses this way names the clock too. A node pulling from an
-  upstream that refuses its timestamp records no reputation outcome,
-  suppresses the `(peer, hash)` pair briefly as for a rate-limit shed, and
-  counts the refusal on `decdn_node_upstream_timestamp_rejected_total`. A requester that has no
-  mapping for the code treats it as a generic transport error. Honest
-  requesters already stamp a fresh wall-clock read (ADR 005), so no message
-  layout changes — but a requester whose clock is more than 30 seconds off
-  now fails every probe and stream until its clock is fixed. **Operator
-  note:** an upward reprice (`payment.rate_per_mb`, restart-required) now
-  waits 90 seconds of real time after the last probe answered at the old
-  rate, not 30 seconds: each signed timestamp may sit up to 30 seconds from
-  the node's clock, on either side of the 30-second slashing window.
-- **Node and client: a capability `expiry` of `0` reads as expired
-  (GHSA-vq47-w6q7-4rrj).** The node read a capability `expiry` of `0` as
-  "never expires", while the on-chain `PaymentPool` reads it as already
-  expired. `intake_capability` now drops a `0`-expiry capability before any
-  lane registers, so the request refuses as an unknown lane and the client
-  must present a valid capability. Defense in depth: the redeemer's
-  `capability_expired` predicate and the shared
-  `inside_capability_expiry_margin` (the node's admission, voucher and
-  preimage gates, and the client's credential view) read an `expiry` of `0`
-  as expired too. A previously persisted `0`-expiry lane is neither served
-  nor swept, and a client holding a `0`-expiry credential reports it as
-  expired. The wire format and contracts are unchanged.
-- **Node: the mid-stream pool-solvency re-check stops delivery whenever the
-  pool's remaining deposit falls to the refundable floor `M`, independent of
-  outstanding floor-credit accounting (GHSA-3742-7954-qjwq).** Both delivery
-  legs now gate the in-flight re-check on `pool_funds_committed`, which
-  requires `remaining > M` in addition to the committed-floor covers-check
-  (ADR 003 §Pool solvency). Admission and the direct-serve re-validation
-  carry a nonzero reserve in the covers-check and are unchanged.
-- **Node: a peer could pin up to 16 MiB per stream with an oversized frame
-  (#2501).** Every frame read accepted a length prefix up to a global 16 MiB
-  `MAX_MESSAGE_SIZE` and allocated the buffer before the payload arrived, though
-  no request is larger than a few hundred bytes. A peer with no stake or funds
-  could announce a near-16 MiB request, send most of it, and stall, holding the
-  buffer for the 5 s read timeout. On `cdn/client/v1` the node read the request
-  before it checked the per-connection stream cap, so one connection could hold
-  100 such buffers (about 1.6 GiB); the only bound was the attacker's upload
-  bandwidth. Every read now names a ceiling sized to its ALPN's largest
-  legitimate message (ADR 013 § Wire Framing): `MAX_PROBE_FRAME` (1 KiB),
-  `MAX_CLIENT_CONTROL_FRAME` (4 KiB) for requests, payment proofs and
-  `StreamResponse`, `MAX_CHUNK_FRAME` (one `CHUNK_BYTES` `ChunkData`) for the
-  delivery stream, and `MAX_DHT_FRAME` (64 KiB) for DHT requests and responses.
-  The node resets an over-cap client stream with `RATE_LIMITED` before it reads
-  the request. The node's QUIC transport also had no connection-level receive
-  window, so a peer could park about 1.25 MB of out-of-order data per stream
-  below the reader; a new 8 MiB connection window (`QUIC_CONNECTION_RECEIVE_WINDOW`)
-  bounds it, which also caps one connection's in-flight download at about
-  80 MB/s at a 100 ms round trip. At the default 256 handlers the memory stalled
-  peers can hold is now bounded at about 2.2 GiB (ADR 013 § Wire Framing);
-  operators with less memory lower `security.max_concurrent_handlers`.
-  Legitimate traffic is unchanged, so this is not wire-breaking.
-  **API break (`decdn-protocol`):** `read_frame` and `framing::parse_frame` take
-  a required `max`, `MAX_MESSAGE_SIZE` is removed, and `FrameError::TooLarge` is
-  now `{ len: u64, max: u32 }`. Reported by Radeonares32.
-- `aws-smithy-json` → 0.62.7 (CVE-2026-18140: uncontrolled recursion on deeply
-  nested JSON, a denial of service). It reaches the node through the S3
-  origin's AWS SDK: `aws-sdk-s3` and the `aws-config` credential chain (SSO,
-  STS, IMDS) parse JSON responses with it. Lockfile-only bump; no dependency
-  requirement changed. The new `aws-smithy-schema` entry is a dependency of
-  0.62.7.
-- **Probe `slash_sig` is now cryptographically verified before a response can
-  influence selection.** The requester previously checked only the signature's
-  length; `ProbeSlashData::verify_signer` had no production caller, so a node
-  could return 65 bytes of anything and be selected on the `has_blob` and
-  `rate_per_mb` it claimed. `decdn_client_pull::probe::verify_probe_response`
-  now runs the value invariants, the echoed-field correlation, and recovery to
-  the candidate's registered operator address (ADR 014 §1), and `fetch`/`bundle
-  pull` call it before ordering candidates, as does the daemon's own
-  provider-selection probe on a cache miss. A failure drops the response and skips
-  the candidate as requester-local policy — never scored against the peer, since a
-  signature that does not recover attributes nothing to anyone.
-  - `decdn fetch` now distinguishes the two ways every candidate can drop out. A
-    wrong `blockchain.slash_judge_address` or `chain_id` fails verification against
-    every honest node, and reporting that as "none of the probed nodes hold the
-    blob" sends an operator hunting for missing content instead of a local
-    misconfiguration.
-  - The quoted rate is what `slash_sig` makes non-repudiable: quoting `R1` on
-    probe and charging `R2 > R1` within 30 s is slashable on those two signed
-    messages alone. An unverified response is not evidence of anything.
-
-- `ruint` → 1.20.0 (RUSTSEC-2026-0220: `Uint::overflowing_shl`/`overflowing_shr`
-  returned false-negative overflow flags, so `checked_*` returned `Some` instead
-  of `None`, `strict_*` failed to panic, and `saturating_*` wrapped; the bad
-  `checked_shl` result makes `to_base_be` and string formatting loop forever on
-  no-alloc builds for non-limb-aligned widths). Reaches us transitively through
-  `alloy-primitives`, i.e. the U256 arithmetic on the payment path. No deCDN code
-  calls the affected APIs — every `checked_shl` in `crates/` is on a primitive
-  integer (`u64` in `cache/src/retry.rs`, `u32` in `protocol/src/framing.rs`), not a
-  `ruint::Uint`.
-  Lockfile-only bump; no dependency requirement changed. The six new `ark-*`
-  lockfile entries are optional features we do not enable — `cargo tree -e normal`
-  links none of them.
-- `quinn-proto` → 0.11.16 (GHSA-4w2j-m93h-cj5j: remote memory exhaustion in
-  the QUIC state machine, fixed in 0.11.15) (#1465). Lockfile-only bump; no
-  dependency requirement changed.
-- **Gossip rule-2 enforced against the live registry, not a static allowlist
-  (#1170).** `NodeAnnounce` admission (ADR 001 rule 2) now checks the announcer
-  against the live on-chain staker set (`CapacityBond`, kept fresh by the
-  `NodeRegistered` / `NodeDeregistered` / `NodeAutoEjected` event tail) instead
-  of the file-configured allowlist, so a deregistered or slashed node can no
-  longer enter peer tables during its stale-cache window. The rejection metric
-  label changed from `not_allowlisted` to `not_staked`.
-  - **Config-breaking:** the `gossip.allowlist` field is removed. Because
-    `[gossip]` uses `deny_unknown_fields`, a config file that still sets
-    `gossip.allowlist` now fails `decdn config validate` and node startup —
-    delete the key. The staked-node check is no longer operator-tunable; it is
-    always enforced against the registry.
-- `rustls-webpki` → 0.103.12 (RUSTSEC-2026-0098, RUSTSEC-2026-0099) (#253).
-- `rustls-webpki` → 0.103.13 (RUSTSEC-2026-0104: reachable panic in CRL
-  parsing) (#286).
-- **DHT rate-limiter keyspace bounded (#645).** The `cdn/dht/v1` per-IP and
-  per-peer keyed token-bucket maps grew unboundedly under churning sources;
-  same DoS shape that #440 fixed for the connection-level dispatcher. Adds
-  `[dht.rate_limit] max_tracked_per_ip` / `max_tracked_per_peer` knobs
-  (default 4096, `0` = unbounded with a `tracing::warn!` on resolve), an
-  opportunistic prune from `check` at `cap + cap/10`, and a periodic GC
-  task at 60s that calls `retain_recent` on both keyed maps. New metrics:
-  `decdn_dht_rate_limit_prune_sweeps_{per_ip,per_peer}_total` and
-  `decdn_dht_rate_limit_tracked_{per_ip,per_peer}`.
-
-[Unreleased]: https://github.com/decdn/decdn/commits/main
+git-cliff generates this file from the Conventional Commit history; `cargo release`
+rewrites it for each version (see RELEASING.md), and the same commits are the GitHub
+release notes. Do not edit it by hand.
+
+## [0.3.0] - 2026-10-29
+
+### Breaking
+
+- **onramp**: Stop adding -o . so decdn get keeps its overwrite guard (#83) ([b4df86b](https://github.com/decdn/decdn/commit/b4df86b96c67443f33d86cfe03e02d00dcef5005))
+- **onramp**: Installers take get <decdn: URI> and run decdn get (#75) ([dbd84b3](https://github.com/decdn/decdn/commit/dbd84b303b2c9528da14f82f1475b02703b1a063))
+- **onramp**: Pass installer arguments after the hash to bundle pull (#73) ([6d246cc](https://github.com/decdn/decdn/commit/6d246ccc0e7817927e3c08f736115b3469d8c049))
+
+### Features
+
+- **release**: Sign each archive for cargo binstall (#2765) ([37a69f3](https://github.com/decdn/decdn/commit/37a69f39ee2cfdb3f148546d3e100f6ad2fc6343))
+- **release**: Install release archives with cargo binstall (#2764) ([55cd383](https://github.com/decdn/decdn/commit/55cd383176849e520a245090d47b59f5808e40ce))
+- **cli**: Check the buyer wallet's USDC in setup on a pull-through node (#2755) ([1a89e20](https://github.com/decdn/decdn/commit/1a89e20dd485aae21d21875d9d24d2429ccbacb7))
+- **cli**: Show bundle counts, resumed bytes and unreadable records on the dashboard (#2752) ([2e44283](https://github.com/decdn/decdn/commit/2e442831624de711b35a6c54b58bf94b1e444bfc))
+- **node**: Meter the settlement re-anchor path (#2751) ([bb0bfd1](https://github.com/decdn/decdn/commit/bb0bfd10bf6d0725a9137714be86b0621e164932))
+- **node**: Default node-to-node pull-through on for a node with no origin backend (#2674) ([f3593a7](https://github.com/decdn/decdn/commit/f3593a71959545c384fbe6d9af4d3381abb27f2e))
+- **gateway,client**: Prove a raw blob's size before its first byte (#2654) ([a67b76e](https://github.com/decdn/decdn/commit/a67b76e9c36ebd79dfaf45071aa69433760993ce))
+- **client**: Log the provider that served each completed range (#2650) ([c564e2a](https://github.com/decdn/decdn/commit/c564e2ab085562f3def96d9386eb87690be799b6))
+- **cli**: Decdn dashboard and the gateway's GET /_status, with metrics on every gateway (#2637) ([a7fd84c](https://github.com/decdn/decdn/commit/a7fd84c8a7206bbf9f1eaf243046a325d95e73b6))
+- **gateway**: Answer every origin on a public gateway, and run the TypeScript SDK contract against it (#2628) ([77a08da](https://github.com/decdn/decdn/commit/77a08da5c0823bcfc40a30a1aadb14b55596862e))
+- **cli,client**: `decdn get` ends with a verifiable pull receipt (#2599) (#2627) ([3b079e7](https://github.com/decdn/decdn/commit/3b079e75ae80ebfdb08ee0fdd55a2483df9d9ac5))
+- **cli**: `decdn quote <URI>` prices a pull from signed probe rates (#2600) (#2626) ([e3627ad](https://github.com/decdn/decdn/commit/e3627add06ff3424e62fd8d509e0f0071fb43ce1))
+- **cli**: `decdn node earnings` prints settled and owed USDC per period (#2623) ([74951f2](https://github.com/decdn/decdn/commit/74951f2f75beff7ce4a8775cc09dd3f6d694e6f4))
+- **cli**: Namespace pointers give a namespace a stable host on a public gateway (#2614) ([38353ea](https://github.com/decdn/decdn/commit/38353eac6d1ab1c7d509a0fcba17880bbf1c298a))
+- **cli**: The public gateway serves its metrics on a loopback listener (#2611) ([d306fab](https://github.com/decdn/decdn/commit/d306fab965cb71ca77233567cf36e7378c477280))
+- **cli**: The gateway answers `Range` on a sized bundle entry (#2612) ([4ffedb6](https://github.com/decdn/decdn/commit/4ffedb61c4b5c084f5a874bb650efeaa491b7f91))
+- **cli**: `decdn gateway --public-url` serves anyone from its own pool (#2608) ([636061c](https://github.com/decdn/decdn/commit/636061c38c54465122106509e7cfc9016312d519))
+- **cli**: Serve bundles as websites on their own origins (#2457) (#2590) ([4fff77e](https://github.com/decdn/decdn/commit/4fff77efb9dd7a3cd3d8e956726ed16cd1a66382))
+- **client**: `Streamer::open_range` streams one verified byte window (#2607) ([fba631e](https://github.com/decdn/decdn/commit/fba631e444571a03afeee5abd0eec3f4fc1f9d3f))
+- **workspace**: Merge sponsord into the decdn workspace (#2544) ([34da2d8](https://github.com/decdn/decdn/commit/34da2d80251036e58b3db200b5ffe53bebf64f6e))
+- **workspace**: Merge sponsord into the decdn workspace ([2131e64](https://github.com/decdn/decdn/commit/2131e64dbf12bfd1dd5511a1706b96dbc5d29994))
+- **onramp**: Installers download a decdn: blob URI to -o <file> (#82) ([302981b](https://github.com/decdn/decdn/commit/302981b1cc0678d1a9c3f1e32571d9cfe2d2fab6))
+- **onramp**: Tell decdn.sh users how to put ~/.local/bin on PATH (#72) ([ecddde8](https://github.com/decdn/decdn/commit/ecddde885afc5fa411ac789fd5e85475e58acb46))
+- Download through the installer scripts and drop decdn-sponsored (#70) ([95c5115](https://github.com/decdn/decdn/commit/95c5115aa4eb767b437695325b829f59a1d9e3f6))
+- Publish a decdn-sponsored container image (#63) ([489c5dc](https://github.com/decdn/decdn/commit/489c5dcf5f7b02b276cecf2590844182b0d91382))
+- Share one decdn data dir across sponsored downloads (#42) ([7400431](https://github.com/decdn/decdn/commit/74004319e5f829a71add383ca09900156179eba4))
+- **daemon**: /metrics and graceful shutdown (#20) ([a895b1e](https://github.com/decdn/decdn/commit/a895b1e4b1324d1ec23cb3117ef1eb1ff2d21990))
+- **onramp,cli**: Pluggable gate, in-memory hand-off, /v1/profile, rate limits (#19) ([04a749f](https://github.com/decdn/decdn/commit/04a749f6e21c4f7ce12587365559f120467bdacb))
+- **config**: Clap flags + env for both servers; secrets from files (#18) ([59615a6](https://github.com/decdn/decdn/commit/59615a603292455fc3713258e35b9ca3715e978e))
+- **api**: Sponsord-api, one definition of every wire contract (#16) ([2bbc9c1](https://github.com/decdn/decdn/commit/2bbc9c17f509a8f7bb7f0eac36013e91cfadb221))
+- **wrapper**: Pull --namespace, passed through to decdn bundle pull (#9) ([3771568](https://github.com/decdn/decdn/commit/3771568eb5ea92979b9a524a9f51e18e581ed366))
+- Install from pinned GitHub Releases; release workflow (#8) ([ce87944](https://github.com/decdn/decdn/commit/ce8794468c20ffdc6694c76f72eb7e4cbfa4d5ed))
+- Windows x64 and ARM64 support for decdn-sponsored (#7) ([d0ace08](https://github.com/decdn/decdn/commit/d0ace08c1c36373bc6e488995978f7f64ae43662))
+- **wrapper**: Decdn-sponsored with per-download throwaway keys (#6) ([826fb52](https://github.com/decdn/decdn/commit/826fb526b9b131f8465b706941fb4dd9ece1d8ef))
+- **wrapper**: Capability get/poll/fetch flow; drop topup loop and sign_topup ([f6e6252](https://github.com/decdn/decdn/commit/f6e6252c4ec64000a3d2993adc5fefa6779593ab))
+- **wrapper**: Fetch via --capability + --payment-pool-address; classify pool exhaustion ([f767fbf](https://github.com/decdn/decdn/commit/f767fbf964f5c4838e35f69d4f295f9cda568d43))
+- **wrapper**: Sponsor.toml carries payment_pool, not payment_channel ([7f881ba](https://github.com/decdn/decdn/commit/7f881ba5b2f47dbb8e3bc56ce79e73117d0a315a))
+- **wrapper**: Capability client (get/poll /capability), drop channel/topup DTOs ([cccf28a](https://github.com/decdn/decdn/commit/cccf28a3a4d8e86946411c20bb0b5b70f649b3af))
+- **server**: Installer + fund page speak pool/capability, not channel ([af47ffd](https://github.com/decdn/decdn/commit/af47ffdcf0eb21d23df036b3002cbee9784b579d))
+- **server**: Switch sponsor to shared PaymentPool + zero-tx capabilities ([c0b9d27](https://github.com/decdn/decdn/commit/c0b9d27785a580d07e90ada03cba4c7dc746fdc3))
+- Installer script, main serve wiring, readme, publish seam ([8b6a0e1](https://github.com/decdn/decdn/commit/8b6a0e1e2fe56c1f62e7ac065ef9c3581cd7bb82))
+- **server**: Turnstile fund page ([74632d1](https://github.com/decdn/decdn/commit/74632d1bc8a3323e9bc8c1f3e8cc4866fd039b72))
+- **wrapper**: Fund->poll->fetch->topup->resume flow ([5218134](https://github.com/decdn/decdn/commit/521813499aaba0612840c17ec9a8be6d63611aae))
+- **wrapper**: Fetch runner with drain classification ([85eee5d](https://github.com/decdn/decdn/commit/85eee5d387bbdb8033f53c7f356e5cfb834dd507))
+- **wrapper**: Typed backend api client ([292b0b9](https://github.com/decdn/decdn/commit/292b0b964c5f3073067f2155bf09ede215e49dc4))
+- **wrapper**: Keystore address read and top-up signing ([b3cda29](https://github.com/decdn/decdn/commit/b3cda29a578fd0bbfab857a0ce320b9caece1f4d))
+- **server**: Expiry-reclaim background sweep ([3fd54db](https://github.com/decdn/decdn/commit/3fd54dbd897d99f68629ddddeb2ff47368d2168e))
+- **server**: Fund/channel/topup routes with contract tests ([797fec3](https://github.com/decdn/decdn/commit/797fec3bca3207c7ac0fd4b82619b28c9298ee97))
+- **server**: Active-node discovery with deterministic pick ([6ceffb2](https://github.com/decdn/decdn/commit/6ceffb2a432bbaaed7dd865ab3c9b6957f0b2057))
+- **server**: Config from env and shared AppState ([b372193](https://github.com/decdn/decdn/commit/b37219350c18789fd1db2cb5effce0c5c34d89f6))
+- **server**: Treasury trait and decdn-backed open/topup ([c5f2ad9](https://github.com/decdn/decdn/commit/c5f2ad9d06e6fb75b48007dd37031f497688158a))
+- **server**: Cloudflare turnstile verification ([2a1fd9c](https://github.com/decdn/decdn/commit/2a1fd9c4710a6961190e23d569fcb6a513efb564))
+- **server**: Personal-sign top-up challenge verification ([16cdb9d](https://github.com/decdn/decdn/commit/16cdb9d4a6f1c69d65bd1693458fb3fa92285afe))
+- **server**: Per-client monthly cap policy with reserve/refund ([210d0c5](https://github.com/decdn/decdn/commit/210d0c59a3f06151d42c78c951dfe4af259e03a2))
+- **server**: Redb store for channels, client index, monthly cap ([b1b06e9](https://github.com/decdn/decdn/commit/b1b06e9f2cdb11aa9b3452090c7b175288957d99))
+- **server**: Micro-usdc newtype and monthly bucket helper ([4957b0e](https://github.com/decdn/decdn/commit/4957b0e9259d042c8dfa4dba463fe0ff80b79261))
+
+### Bug Fixes
+
+- **client**: Log the held range and re-queued bytes when a stolen-from lane faults (#2762) ([c44dfb2](https://github.com/decdn/decdn/commit/c44dfb2de682eacc2ed8137232e8214033f2e385))
+- **cli**: Prune only pull records and keep an entry run's counts (#2763) ([b647762](https://github.com/decdn/decdn/commit/b6477621424f70ece7f1941c0f0f66f8b1c7c1ef))
+- **sponsord-onramp**: Tell a refused check apart from a service fault on the gate page (#2760) ([f1aaa21](https://github.com/decdn/decdn/commit/f1aaa210e997897f9c7872532f645572c6eb5b9b))
+- **client**: Reject bundle path segments that are not portable file names (#2749) ([ca076a0](https://github.com/decdn/decdn/commit/ca076a01ce830a7397567ea05400dcc8ee3d849f))
+- **incentive**: Bound a same-root voucher's full claim by the cap (#2748) ([94e180d](https://github.com/decdn/decdn/commit/94e180d11ccc7468f4ba60aab5ce802a9e4dac40))
+- **client**: Reject bundle manifests whose entry paths name one file (#2747) ([8473f6e](https://github.com/decdn/decdn/commit/8473f6ecd3340ec55f850f96982779663485a785))
+- **sponsord-onramp**: Key rate limits per real client and raise the decdn floor to v0.3.0 (#2744) ([206fd97](https://github.com/decdn/decdn/commit/206fd977b5fdac5e707a8b74a76d7d4b811a0ea6))
+- **cli**: Neutralise every +xml type and sandbox bare-origin gateway responses (#2717) ([436c59b](https://github.com/decdn/decdn/commit/436c59b9bfb2f0b799e4db304c2182300a57e575))
+- **sponsord-onramp**: Bind Turnstile tokens to the onramp hostname and action (#2715) ([5e1e67d](https://github.com/decdn/decdn/commit/5e1e67dba6c37d61459f3cd5ba4d78d2f49224fd))
+- **client**: Start the size open's lane before any other lane builds (#2742) ([2214834](https://github.com/decdn/decdn/commit/22148342c7ee228e68d517235e13cc960f8f4ec5))
+- **client**: Send estimated transactions with gas headroom (#2735) ([a63eab8](https://github.com/decdn/decdn/commit/a63eab84741b43d4f698c319480f9a1d2d1e488a))
+- **node**: Retry a recovery topUp whose nonce the redeemer took (#2725) ([67737d4](https://github.com/decdn/decdn/commit/67737d402e92325a92604f0601f6fcbc6b5b1b2b))
+- **client**: Skip rediscovery while a full-coverage set's lanes are still building (#2724) ([73a2c5c](https://github.com/decdn/decdn/commit/73a2c5c437cf599ba9ff234304fc2423736edad3))
+- **client**: Bill the delivered tail a resumed leg leaves unpaid (#2728) ([9c66bef](https://github.com/decdn/decdn/commit/9c66beff53797c59277d645171dfada263bb6592))
+- **deps**: Restore the iroh/noq 1.3 hold and guard it in the lockfile (#2732) ([325ccfc](https://github.com/decdn/decdn/commit/325ccfcebeeed077695b7703a5a8011d7bbded2a))
+- **node**: Batch fix for the node security audit issues (#2712) ([dd80ec3](https://github.com/decdn/decdn/commit/dd80ec381c5973e6b68cf3097b5378cf6ff083cf))
+- **node**: Count a resolved pool's on-chain redemptions toward its remaining deposit (#2709) ([6d610cf](https://github.com/decdn/decdn/commit/6d610cfc3eb29b108b324db23a84ea214c9639a1))
+- **cli**: Open no pool from `decdn quote` unless `--open-pool` (#2680) ([928e51f](https://github.com/decdn/decdn/commit/928e51f71dd1292d2b2b6ecc27ad2b15e04fd4a1))
+- **cli**: Label earnings periods by when coverage starts, not by the earliest settlement (#2679) ([f2e3dd4](https://github.com/decdn/decdn/commit/f2e3dd4580a5e62998ff84310fb4808707698787))
+- **cli**: Reject an unknown URI target instead of running it as a bundle (#2670) ([21ee79f](https://github.com/decdn/decdn/commit/21ee79f4df122f2c71ac97c96d8340b68beb3602))
+- **client**: Prime a streamed fetch's size open at the streamed drive's first leg (#2673) ([0ab68bb](https://github.com/decdn/decdn/commit/0ab68bbc82cc3859ca6a8fd8d1bd56bac1edf767))
+- **client**: Replace a stored pool the chain has no record of in a funding recovery step (#2668) ([078606a](https://github.com/decdn/decdn/commit/078606a4e44e7127dca6048a4994c0e4825bb7d5))
+- **client**: Bill the credit-window tail after a funding stop and top up the overdraft (#2662) ([3225d68](https://github.com/decdn/decdn/commit/3225d68ffdf42d8d5fca8773f7434ec377238206))
+- **deps**: Hold noq-proto at 1.3 again, and keep Dependabot off the noq crates (#2655) ([ad3672a](https://github.com/decdn/decdn/commit/ad3672a3d0d956f4e73753d98d50da20257fca08))
+- **gateway,client**: Size a verified raw blob, and adopt the size open's pull (#2646) ([59bbb52](https://github.com/decdn/decdn/commit/59bbb52e3376b6673aae94f94eb4583a35571ce0))
+- **gateway**: Pull a non-manifest once, reuse verified sizes, count live spend on /_status (#2643) ([bce8e64](https://github.com/decdn/decdn/commit/bce8e64aba9d7b6af607d85a173a4dabcea9fbda))
+- **client**: Take a pinned pull's size from a probe, not a dropped stream (#2634) ([da7c178](https://github.com/decdn/decdn/commit/da7c17884f906dfbbd278f173093ff2ac272f0b6))
+- **gateway**: The pointer store is bound to the deployment it was verified on (#2620) ([8201798](https://github.com/decdn/decdn/commit/8201798bc67445f9ef38d9104cc5d45191bcb46d))
+- **client**: Reject a bundle manifest with a malformed hash at parse time (#2589) ([f8f4b1a](https://github.com/decdn/decdn/commit/f8f4b1a8cc99adb8474c0859f6c3eeeb715f3f6d))
+- **node**: Report each lane's owed amount in admin lanes (#2588) ([772c8f4](https://github.com/decdn/decdn/commit/772c8f4fc74338691a437bfa90e9a8aae3988cff))
+- **deps**: Hold iroh/noq at 1.3; deflake two tests ([131f668](https://github.com/decdn/decdn/commit/131f6684d6c482a9391d7c0d6a4b5df05387d600))
+- **hooks**: Run cargo deny without git's repo-scoping env vars (#2566) ([76d7ad9](https://github.com/decdn/decdn/commit/76d7ad94a814691156849bd4edab716af2c56de4))
+- **node**: Halve an oversize redeemMany on a bare 413 or a possibly-broadcast send, and name the signer (#2577) ([5426040](https://github.com/decdn/decdn/commit/5426040d3c77b2461472af3486c5193895afd9ba))
+- **node**: Report a redeemMany or reclaim send with no answer as possibly broadcast (#2568) (#2574) ([bf913ec](https://github.com/decdn/decdn/commit/bf913ec6e166674288456e745e58abf91285c212))
+- **sponsord**: Re-send a hashless topUp once its nonce is vacant (#2573) ([f2c9082](https://github.com/decdn/decdn/commit/f2c9082235ff6e299e612895ee23cdd9d7a3feaf))
+- **client**: Report an underpriced-replacement answer as possibly broadcast, not re-send (#2571) ([617a3bf](https://github.com/decdn/decdn/commit/617a3bf322374e21c10ccf4bebe17ccaf38a62d7))
+- **incentive**: Report a `nonce too low` send as possibly broadcast (#2562) (#2563) ([ea31fba](https://github.com/decdn/decdn/commit/ea31fbadb154bbddbcb22ae8c77a1009cb7ba745))
+- **incentive**: Report a chain read that fails before the send as rejected, not possibly broadcast (#2567) ([3425a25](https://github.com/decdn/decdn/commit/3425a2516476ae388b222435b5f92bb1caa09285))
+- **cli**: Answer 404 for a bundle entry whose hash is malformed (#2559) ([0a31c9e](https://github.com/decdn/decdn/commit/0a31c9ec3f993302ae5024183ab2e9e57c814285))
+- **incentive**: Treat an "already known" send rejection as possibly broadcast (#2560) ([8dabb4f](https://github.com/decdn/decdn/commit/8dabb4fe211b7be2ba1cb41a24d5e27716c3283d))
+- **ci**: Keep the anvil e2e targets out of the plain workspace test run ([f769116](https://github.com/decdn/decdn/commit/f769116c28b3c6da7ce4e06eef4b751f646b9e60))
+- **ci**: Close the gaps the sponsord merge review found ([1115a10](https://github.com/decdn/decdn/commit/1115a107afb0f488481fe3b2eebe7c9e1b6dd05f))
+- **workspace**: Drop the version from the decdn-e2e alias so the sponsord crates package ([1860746](https://github.com/decdn/decdn/commit/186074623fd01a339143fc633bb69a4594bba5d6))
+- **onramp**: Skip installer downloads for binaries already at the pinned release (#69) ([22fc67c](https://github.com/decdn/decdn/commit/22fc67cc7925859c47cec253e9df91e29daaf3b7))
+- Hold pool top-ups while an unconfirmed one may still mine (#41) ([089cc83](https://github.com/decdn/decdn/commit/089cc837d2e125fec77ee3a4da5406afbb889c4d))
+- Keep the RPC URL out of sponsord errors and logs (#39) ([bd3ce39](https://github.com/decdn/decdn/commit/bd3ce39d0bc537961d6c852740d798c222d06e07))
+- Copy the keystore credential to a 0600 runtime file in sponsord.service (#37) ([ae8d598](https://github.com/decdn/decdn/commit/ae8d598e4b626f9b54972a0b9b682a6d5c626dbe))
+- Escape the client address in gate pages so CodeQL rust/xss sees a barrier (#35) ([40efaa8](https://github.com/decdn/decdn/commit/40efaa82557509c46a5a30a1d539533bf6537bfd))
+- Derive wrapper expiry margin from the node; refuse renewal for registered signers (#11) ([ca581cf](https://github.com/decdn/decdn/commit/ca581cfd9d1b87c62f35e74cd7aa419763302071))
+- **server**: Re-issue expired capabilities; harden boot owner check; doc/comment cleanups ([8fb8bbd](https://github.com/decdn/decdn/commit/8fb8bbd47227272dc1ec5d489b8ef78713d346fd))
+- **server**: Idempotency retry, topup happy-path test, test_support out of release ([376eef9](https://github.com/decdn/decdn/commit/376eef904496af6abf393e322bf6bca5e15383ff))
+- **server**: Serialize env-mutating config test ([615fe2c](https://github.com/decdn/decdn/commit/615fe2cb8c10e5551a4684f067363101fa208711))
+- **server**: Align redb to v4 to match decdn ([d5e5e58](https://github.com/decdn/decdn/commit/d5e5e58f9bc7744bce8f0b4c52d67db3c933f38f))
+
+### Refactoring
+
+- **client**: Make NodeSelection an enum, not two Options (#2580) ([21135b5](https://github.com/decdn/decdn/commit/21135b5568feafe40f13db720eb42bd133b15251))
+- **core**: Inject the signer; typed terms; cancellable keeper (#17) ([f680541](https://github.com/decdn/decdn/commit/f6805418eda1aa324fb8590195b875094dbb90ce))
+- Name crate dirs after their packages; one word per component (#15) ([b1673d2](https://github.com/decdn/decdn/commit/b1673d25733464e81692fbead0a9907abecca563))
+
+### Documentation
+
+- **cache**: Gc_bytes_reclaimed reads low — within-one-pass deletions are never counted (#2649) ([fd32581](https://github.com/decdn/decdn/commit/fd32581ecea3bf614f0d680498d15f5e922ce5db))
+- **changelog**: Remove the conflict markers #2611 left under Added (#2613) ([87c96df](https://github.com/decdn/decdn/commit/87c96dfd4d58c171beca8641c75b261dbce20763))
+- **readme**: Lead the one-liner with the 491 MB Qwen2.5 0.5B bundle (#2609) ([0746c74](https://github.com/decdn/decdn/commit/0746c7408255e343f07ff1e2a348fe21f5d2857f))
+- **adr**: Per-IP rate-limit rows say relay-only connections skip the layer (#2579) ([3ade425](https://github.com/decdn/decdn/commit/3ade4258aa3759be30b6a3daa67cb9b63d30c9d1))
+- **readme**: Add Security and CodeQL status badges (#2556) ([a8fd4c5](https://github.com/decdn/decdn/commit/a8fd4c5f44ca4e66689aa23823aae3555fd1e00c))
+- Pin readme status badges to main and add distribution badges ([90f91f6](https://github.com/decdn/decdn/commit/90f91f667b27849b93718f7a35e76899b5b5f279))
+- Tighten the readme quickstart and diagram (#62) ([0e65c11](https://github.com/decdn/decdn/commit/0e65c117a7074efdd29941ba56f08eef6f60518d))
+- Add CI, security, license and MSRV badges to the readme ([42555f8](https://github.com/decdn/decdn/commit/42555f8a0ee307391da3e9d207bc43f6d183822c))
+- Add AGENTS.md with agent guidance; CLAUDE.md includes it ([4f4defc](https://github.com/decdn/decdn/commit/4f4defcb0b7c2d4801934bf449732c77211db543))
+- Operator, integrator, security and CLI guides; deploy kit (#21) ([8baba15](https://github.com/decdn/decdn/commit/8baba1596150001aee7dcb77ca8ad287f6aa3795))
+- README + .env.example for the pool + capability model ([cac8ed0](https://github.com/decdn/decdn/commit/cac8ed04b0b490767596fdc6151b67d6162c9848))
+- **readme**: State the one-liner keeps the get overwrite guard (#2543) ([761e612](https://github.com/decdn/decdn/commit/761e612494f5972cf5bf4eb9f6e4d8890511bfb0))
+
+### Testing
+
+- **node**: Pin the request-timestamp gate ahead of the stale-chain refusal (#2761) ([d806724](https://github.com/decdn/decdn/commit/d806724b773a77300afb1d09ef96a48f414ef795))
+- **e2e**: Call the upstream node a provider in the node-to-node pull journeys (#2759) ([9880c62](https://github.com/decdn/decdn/commit/9880c62c6c0dbcdddfa01c62c77c5b47e4a6f6ce))
+- **e2e**: Share whole_blob_wire_bytes from decdn_e2e (#2758) ([f3e6938](https://github.com/decdn/decdn/commit/f3e69381df2dfd32eed433dacd24a16288513b30))
+- **e2e**: Check the dashboard record of a decdn get -o - run (#2756) ([0cfaf14](https://github.com/decdn/decdn/commit/0cfaf14c315b02c9d99021cc2ae8409ab2660743))
+- **client**: Share the PoolNotOpen revert payload across adoption_tests (#2714) ([1a2b4b8](https://github.com/decdn/decdn/commit/1a2b4b8ba6d88a2a14e168691f4053815ff09bc7))
+- **e2e**: Size the bundle multi-source entry so a late holder splits it (#2743) ([bcf2760](https://github.com/decdn/decdn/commit/bcf2760ba985a91b147e1f1a780f33a211767c41))
+- **e2e**: Stop the daemon before the G-NODE-07 iroh rotation (#2736) ([bb37102](https://github.com/decdn/decdn/commit/bb37102eac44995031c168530263adc73e449962))
+- **node**: Give the over-cap prune test a 100 ms refill margin (#2734) ([ca4d5e3](https://github.com/decdn/decdn/commit/ca4d5e3ef2cffefd50887d14d0bbaf24cc53ee85))
+- Make three load-sensitive tests model the node and planner exactly (#2726) ([fe65325](https://github.com/decdn/decdn/commit/fe65325a5ca0c58f50a1d0d039218d0f3492860e))
+- **e2e**: Accept a node fixture's health answer only from its own daemon (#2739) ([6709b2a](https://github.com/decdn/decdn/commit/6709b2ac2790934ce4628c06e4b40bfd58aa082c))
+- **e2e**: Hold every fixture port until its child binds it (#2731) ([b8ef2e9](https://github.com/decdn/decdn/commit/b8ef2e93b1285a9805ab21e231bb241de8057138))
+- **node**: Settle the inbound-stream counters before one-shot metrics reads (#2716) ([f2bc01c](https://github.com/decdn/decdn/commit/f2bc01c723c2e54fb48fe791f0a1ccf25b8221af))
+- **cli**: Assert the bundle-pull unmatched-pattern warning on stderr from the real binary (#2671) ([ce241f3](https://github.com/decdn/decdn/commit/ce241f301e759f388cfd09e09cf0389f3a8188e4))
+- **node**: Pin that a mid-stream PoolExhausted follows proofs the node accepted (#2669) ([4066747](https://github.com/decdn/decdn/commit/40667478d7d683e45dec525d4b302532817a8141))
+- **cache**: Wait on GC sweeps, not a wall-clock window (#2581) ([5ac5034](https://github.com/decdn/decdn/commit/5ac50347b825f0be299a6f460c2015054db94ef8))
+- Move every inline test module into its own file and guard against inline tests (#48) ([0860085](https://github.com/decdn/decdn/commit/086008538f959bf738621cc1d9d53c5188944083))
+- Retry the anvil-backed tests twice (#46) ([4da447b](https://github.com/decdn/decdn/commit/4da447b73e33b85c10df27218ddd74b76bd87644))
+- **server**: Anvil pool treasury — remaining grows after top_up, owner check ([f97bc8a](https://github.com/decdn/decdn/commit/f97bc8a66cbcf78a5bc94121ecd11fa2ff1cabb9))
+- **server**: /fund issues capability, /capability polls it, idempotent + captcha/hex guards ([96d0eef](https://github.com/decdn/decdn/commit/96d0eefda739dea4399a2a92158bc3c21582f9ab))
+- **server**: Anvil integration for treasury open/topup ([8bbf3e2](https://github.com/decdn/decdn/commit/8bbf3e24a1dd40855020d18b792ee14c81c1e869))
+
+### CI/CD
+
+- Drop the free-disk-space steps (#2652) ([4a6ad77](https://github.com/decdn/decdn/commit/4a6ad77fc5fff3aa68d344e7881ff28668b00501))
+- **release**: Open the decdn bump PR from a script (#56) ([9fc13b3](https://github.com/decdn/decdn/commit/9fc13b322e23a60a0e340ea8be4d62b71070923b))
+- **release**: Skip cargo semver-checks for 0.0.z tags (#55) ([8256fb3](https://github.com/decdn/decdn/commit/8256fb365c7222c7b8ecc192fdeaefa0253b74ae))
+- **release**: Prefer a decdn.org key from KEYS in sign-release.sh (#54) ([b23ef0e](https://github.com/decdn/decdn/commit/b23ef0e4731ba3e179dd46d4b65b04a07254c4ad))
+- **release**: Build each target once and verify alongside the builds (#52) ([8106149](https://github.com/decdn/decdn/commit/810614910053047dd5a7284cdd9ae9f11f39ec10))
+- Run cargo semver-checks before a crate release (#47) ([3e2eddb](https://github.com/decdn/decdn/commit/3e2eddbb9ecc6c40c0564695fd7d883f84e9716a))
+- Model Gate::page client as an html-injection barrier for CodeQL (#34) ([3da51ee](https://github.com/decdn/decdn/commit/3da51eeb8f6e0941eb5b8deaf6b59d088d69de61))
+- Per-crate releases with cargo-release, crates.io tooling and Docker images (#13) ([2356dea](https://github.com/decdn/decdn/commit/2356dea33cea156d14c7dcd28c28ab026b603632))
+
+### Miscellaneous
+
+- **cli**: Carry a pull record's bundle-only fields on its bundle kind (#2651) ([0273aad](https://github.com/decdn/decdn/commit/0273aad236f33ab899c1222da2e6fe280e63e463))
+- Carry line tables only in dev builds, and find contracts/ at run time (#2647) ([e08c315](https://github.com/decdn/decdn/commit/e08c3156427958faf5bac0da7668c0d037f6ae8f))
+- **deps-dev**: Bump fast-uri from 3.1.7 to 3.1.9 in /contracts in the npm_and_yarn group across 1 directory (#2621) ([7971f8d](https://github.com/decdn/decdn/commit/7971f8de9b7cc8d1ac542ba5af4295e353b56066))
+- **ci**: Prefixed label families, five issue forms, PR template gates (#2586) ([cf58c37](https://github.com/decdn/decdn/commit/cf58c37aafe864731c90a50d9814013d9330b7a5))
+- Merge decdn/sponsord history ([b4be86f](https://github.com/decdn/decdn/commit/b4be86f351715ff587eb20dd4b385bdd5becc545))
+- Pin decdn to v0.2.0 (#86) ([1d2852c](https://github.com/decdn/decdn/commit/1d2852c1a5e665c23afb83b935d70a124f0074e1))
+- Take the decdn crates from crates.io (#77) ([98fc12b](https://github.com/decdn/decdn/commit/98fc12b02751bfd3b2391d72802f71e073620219))
+- Pin decdn to v0.1.0 (#76) ([ee33bc4](https://github.com/decdn/decdn/commit/ee33bc43cce9fcb1cf6610f51c55f7467e0a1af3))
+- Pin decdn to v0.0.4 (#74) ([b565493](https://github.com/decdn/decdn/commit/b56549386750c0ceaff8156f641845a281b3c6f7))
+- Base the docker images on debian 13 (trixie) (#71) ([6974a8f](https://github.com/decdn/decdn/commit/6974a8fde8988d02b7a0b7eeb01ce6ac3f7878c8))
+- Move maintainer-run release scripts to scripts/ (#67) ([f2915b9](https://github.com/decdn/decdn/commit/f2915b9e38e244a131b1468ff8be996d728414de))
+- Pin decdn to v0.0.3 (#66) ([4ab8852](https://github.com/decdn/decdn/commit/4ab885221edea744a21eebd8cca1100fbc26359c))
+- Pin decdn to v0.0.2 (#64) ([d2bba12](https://github.com/decdn/decdn/commit/d2bba1297f789d47bfe6f7a11c69f8390d8812e2))
+- Pin decdn to v0.0.1 (#53) ([8fa1baa](https://github.com/decdn/decdn/commit/8fa1baa4cbe617fe02c24e0e411536608f38bd42))
+- Reset the workspace version to 0.0.0 before the first release ([da0fb11](https://github.com/decdn/decdn/commit/da0fb117cb33ccfafccf28ec3f820e45f61db64c))
+- Move the decdn pin to 54deb333 (#51) ([16f412d](https://github.com/decdn/decdn/commit/16f412d259d538c435e9393e832131428442f8be))
+- Raise the MSRV to rust 1.99.0 (#50) ([1d59344](https://github.com/decdn/decdn/commit/1d59344bb1ff8e6ccd1eeff83749fdc4db1d60de))
+- Release the workspace under one shared version (#49) ([574d38e](https://github.com/decdn/decdn/commit/574d38e6c11cdfc7d469436b8631d5f23b90f9db))
+- Adopt decdn's workspace lint set (#45) ([cd1234e](https://github.com/decdn/decdn/commit/cd1234e6121aeb9820b9bfd558f0265f31a32576))
+- Move the decdn pin to a09720ad and hold top-ups by their exact nonce (#44) ([15d5e0f](https://github.com/decdn/decdn/commit/15d5e0f1f8ff20ae8f219cb895ce8d2abc70e4ab))
+- Depend on alloy-primitives instead of alloy in sponsord-onramp (#43) ([9a7bd24](https://github.com/decdn/decdn/commit/9a7bd24867bb0b8da6cc6da0abe45d2ee0193208))
+- Depend on decdn from GitHub; add licenses and contributor docs (#14) ([dbfd7ac](https://github.com/decdn/decdn/commit/dbfd7aca1f3969cdb680572d7467f992bd559fce))
+- Enforce workspace anti-panic clippy lints ([c455fa9](https://github.com/decdn/decdn/commit/c455fa946b525bb301243a336f3d4ec13477423b))
+- **wrapper**: Update Cargo.lock for reqwest/wiremock deps ([a2df7fd](https://github.com/decdn/decdn/commit/a2df7fd344549d4601937dc762b68ab6c43dd1be))
+- Update Cargo.lock for hex dev-dependency ([0eb61ee](https://github.com/decdn/decdn/commit/0eb61ee9ad7c1bef194d19219ed480d5c756e5d1))
+- Commit Cargo.lock for reproducible builds ([de3e31c](https://github.com/decdn/decdn/commit/de3e31c5bded69b8923eb4456623f0aee2badc76))
+- Workspace skeleton with decdn path deps ([1c249de](https://github.com/decdn/decdn/commit/1c249de593c717db03f0978d3789a16d7a717e1a))
+- Initial commit (gitignore) ([e1c088b](https://github.com/decdn/decdn/commit/e1c088b88bc62a506f439df1701131f7b7fedd5a))
+
+### Style
+
+- Cargo fmt (import ordering in runner_classify test) ([a0aaa86](https://github.com/decdn/decdn/commit/a0aaa869dc10e79bdcee67a3ab14aa3dccae30a9))
+
+## [0.2.0] - 2026-10-19
+
+### Breaking
+
+- **protocol,node**: Advertise and accept the empty blob over cdn/probe/v1 (#2528) ([261414e](https://github.com/decdn/decdn/commit/261414e3a0a301010cd099b3327b7ba40d34c625))
+- **client,cli**: Replacement reporting, drained-build lock waits, pool escrow tests (#2519, #2520, #2521) (#2524) ([1c425e4](https://github.com/decdn/decdn/commit/1c425e4c287dec975f700ef6163e77433fab07d0))
+- **client,cli**: Escrow and drain follow-ups (#2508, #2513, #2515, #2517) (#2523) ([397f93d](https://github.com/decdn/decdn/commit/397f93dd65503dbf9ab90717bf98b7edc70a1a03))
+  - buyer_pool::open_pool and buyer_pool::top_up return (OpenedPool, UnrecordedEscrow) and (ToppedUpPool, UnrecordedEscrow).
+- **protocol,node,client**: Cap every frame read at its ALPN ceiling (#2501) ([fd47d44](https://github.com/decdn/decdn/commit/fd47d44b9d8ef2faa35ae3a9ad56ea73ae6faa34))
+- **cli,client**: Name a topUp that may still mine on every decdn get exit (#2499) ([d29e788](https://github.com/decdn/decdn/commit/d29e7888276180e7750ceffe12ad03ad448d3e32))
+- **cli,client,node**: Bound receipt waits so a dropped tx cannot hang (#2490) ([8127fe6](https://github.com/decdn/decdn/commit/8127fe6d9a779f4168fc9157af9bb472a103646e))
+- **node,cli**: Report the pool owner as a lane's counterparty (#2484) (#2488) ([3cb8411](https://github.com/decdn/decdn/commit/3cb841135b9729e6292b9753b5c7e67cd28861f7))
+- **client,cli**: Sign each data dir's owned lanes with a derived key (#2482) ([45fb2eb](https://github.com/decdn/decdn/commit/45fb2eb29a820e3f02dc704de7e653149a1f13b0))
+  - decdn-client SDK. An owned pool pays through
+- **node,client**: Max_blob_size caps bytes held per blob, not offsets served (#2464) ([b715f67](https://github.com/decdn/decdn/commit/b715f677e5f209d2ab614113a69ed036d737c026))
+
+### Features
+
+- **node**: Warm per-peer connections for DHT RPCs and pull legs (#2475) ([63464db](https://github.com/decdn/decdn/commit/63464db5b837c03c268dec0991b819ca34e3b163))
+- **cli**: Decdn self-update and a daily update notice (#2540) ([22091d2](https://github.com/decdn/decdn/commit/22091d21921e6ad1c05df00a6db7977ca57eeecd))
+- **cli**: Decdn get streams one bundle entry to stdout with -o - (#2467) ([75d8b1a](https://github.com/decdn/decdn/commit/75d8b1a183ca2afc7ca123bf39990106f13da542))
+- **cli**: Make decdn get -o optional with per-target defaults (#2466) ([e2b59e9](https://github.com/decdn/decdn/commit/e2b59e95a25029ba99e4a2636dec870e8551944f))
+
+### Bug Fixes
+
+- **client**: Land bundle entries beneath the output root and apply the region allowlist (#2538) ([0f7de48](https://github.com/decdn/decdn/commit/0f7de48cfadb3a282dbb987cbd4323b8d5816544))
+- **cli**: Name the resume directory when a get stops (#2473) (#2531) ([4f6beff](https://github.com/decdn/decdn/commit/4f6befff23d70d8a5703463a5046fdea541fd948))
+- **node**: Bound the DHT dial and skip a peer whose dial timed out (#2536) ([8f17157](https://github.com/decdn/decdn/commit/8f17157b724c079a3b515b9cbc8ae965cf4e4856))
+- **node**: Drop the requester before the directory fallback is judged (#2535) ([3c4d34f](https://github.com/decdn/decdn/commit/3c4d34fabec98489cefee3ea2efd8e760d260eba))
+- **node**: Name the walk on a pull_leg_miss refusal and give the upstream probe one second (#2533) ([f81ab73](https://github.com/decdn/decdn/commit/f81ab73b025af421f7f5b0fceab86c71700e2ee9))
+- **node**: Span the coverage union for the empty root on its first holder (#2529) ([5e8f2a0](https://github.com/decdn/decdn/commit/5e8f2a05089dd48e659ddac56f97cb5321e90e50))
+- **client**: Let sibling bundle entries finish their lane-build drain (#2518) ([36c8239](https://github.com/decdn/decdn/commit/36c823952049078329b1688a541338cef5b5218e))
+- **client,cli**: Name a run's untracked escrows on every end of the command (#2516) ([6d5bbd5](https://github.com/decdn/decdn/commit/6d5bbd542515da063a3bc0c89dea06f953f296e6))
+- **client**: Refuse every escrow of a run after an untracked one (#2514) ([41e5cd5](https://github.com/decdn/decdn/commit/41e5cd52cf235645996bf5bcf91381cbaef2b40c))
+- **client**: Fail an acquire whose late lane build escrowed untracked USDC (#2510) ([c600cda](https://github.com/decdn/decdn/commit/c600cda2403311487b8d716158e76e07723c5a2e))
+- **node**: Stop a top-up for one pool from joining a topUp for another (#2498) ([4dd5306](https://github.com/decdn/decdn/commit/4dd5306fe4d9d364e39d4f82426f956db10a3f1f))
+- **node**: Fail a recovery top-up at once while a topUp settle holds the slot (#2497) ([f521155](https://github.com/decdn/decdn/commit/f5211552d800a45883deae72477e85088528ea7a))
+- **node,client**: Settle an unconfirmed topUp instead of freeing the top-up slot (#2492) ([f06c246](https://github.com/decdn/decdn/commit/f06c246452495429c2d9d430e107dcdb98e67fed))
+- **cli**: Keep a bundle get's bar stack anchored under its header (#2483) ([b1bb14a](https://github.com/decdn/decdn/commit/b1bb14a124ba443e47e5ff4af74a94a23c8a78a6))
+- **cli**: Erase stale bar rows and keep the run header in a bundle get (#2481) ([cc3c646](https://github.com/decdn/decdn/commit/cc3c646f718248f4537c432b05be970eda2bec9c))
+- **cli**: Redraw progress bars in place so a bundle get does not flicker (#2480) ([b63a283](https://github.com/decdn/decdn/commit/b63a283b0c69b48a9a1f8c34e57ce63291b665e0))
+- **cli**: Cap the gateway's manifest pull at the manifest size (#2477) ([0695b2b](https://github.com/decdn/decdn/commit/0695b2b3f0b689c52617b8b36d47c589578ebb17))
+- **cli,client**: Refuse to replace a file no record vouches for in a default destination (#2476) ([4675390](https://github.com/decdn/decdn/commit/4675390bff44e68dd4d4e42d18c5032cd829b29d))
+
+### Documentation
+
+- **adr**: Every requester drops a has_blob/coverage mismatch without scoring (#2530) ([f5d3de6](https://github.com/decdn/decdn/commit/f5d3de67ff728b435cfe34996ad5cd83e6dcd417))
+- **adr**: Record why the node keeps no per-source connection count (#2503) ([d24dd05](https://github.com/decdn/decdn/commit/d24dd056909a2ef3180667d35690740b88f1cb30))
+- **readme**: Restyle as a landing page with the sponsored one-liner (#2487) ([b2cf20a](https://github.com/decdn/decdn/commit/b2cf20a32b0fad75de118ed430611abe5919d5e4))
+- **readme**: Add a demo GIF (#2485) ([3fd77f7](https://github.com/decdn/decdn/commit/3fd77f716c3cc84410cdcad91e8c1ae5d149fbb2))
+- Link Discord and X from the README ([8bf4fb4](https://github.com/decdn/decdn/commit/8bf4fb4050f0a47f1f4f3ccb70596e6672c4ee29))
+- Link website, docs and stats from the README ([31c02d0](https://github.com/decdn/decdn/commit/31c02d09e82e1ba3f8b1fb670e6e9affdaf7cf05))
+
+### Testing
+
+- **node**: Prove the reclaim sweep returns when a reclaim receipt never arrives (#2525) ([6a9fbf5](https://github.com/decdn/decdn/commit/6a9fbf5202010a63faa6faacf16eec948f3c46d8))
+
+## [0.1.0] - 2026-10-14
+
+### Breaking
+
+- **cli**: Decdn get replaces decdn fetch and decdn bundle pull (#2461) ([af677b6](https://github.com/decdn/decdn/commit/af677b6c94ba5d7a68a98723c15392107e1d2871))
+
+### Features
+
+- **cli**: Decdn gateway runs pulls at once on one long-lived worker (#2462) ([7b79f5a](https://github.com/decdn/decdn/commit/7b79f5ad41c54a9e9e3c5dee448d4b57344b733f))
+- **cli**: `decdn gateway` serves `decdn:` URIs to a browser with scoped, in-memory delegates (#2456) ([e260c3d](https://github.com/decdn/decdn/commit/e260c3dded42ad7ce9f1c4ec25fc42881a93d102))
+- **cli**: Add `decdn get <decdn: URI>` over fetch and bundle pull (#2460) ([76d14e8](https://github.com/decdn/decdn/commit/76d14e8aebf86dc6978f2db6de6cb05f0a168c0b))
+- **client**: Parse and print `decdn:` URIs (#2455) ([c50a62e](https://github.com/decdn/decdn/commit/c50a62edbad188e5ab4c687fd6e35637e62abd59))
+- **bundle**: Report the bytes a pull paid for beside downloaded (#2443) ([f532cea](https://github.com/decdn/decdn/commit/f532cea56f8c5c79645bc7d91556bc1600ef5489))
+
+### Bug Fixes
+
+- **cli**: Name an in-flight openPool when a command ends before its receipt (#2452) ([377f3dd](https://github.com/decdn/decdn/commit/377f3ddfc1a8c12c79a204043f76dc75aa242ab0))
+- **cli**: Clear the local row of a pool that is no longer Open (#2450) ([738214f](https://github.com/decdn/decdn/commit/738214f1de3533174cce647ba8d162156befdae5))
+
+### Miscellaneous
+
+- **deps**: Link one TLS backend and no JSON-RPC server in client builds (#2459) ([c511e86](https://github.com/decdn/decdn/commit/c511e86dcdfd656e10f0ab404842e626b06ebbec))
+- **deps**: Refresh Cargo.lock to latest semver-compatible versions ([0dfc706](https://github.com/decdn/decdn/commit/0dfc7068f5b800fc19ccc9e1512d0644913b39a9))
+- **deps**: Bump iroh-blobs to 0.103.1 (#2453) ([d4b7e5c](https://github.com/decdn/decdn/commit/d4b7e5c23e83554bc4e2a2ccc08120cd3d462985))
+- **deps**: Bump rustls-platform-verifier to 0.7.1 (#2451) ([eb57944](https://github.com/decdn/decdn/commit/eb579442c6dcff430745a6076dc4d77688f3aa2e))
+
+## [0.0.4] - 2026-10-12
+
+### Features
+
+- **client**: Let a delegated bundle pull swap credentials mid-run (#2437) ([abbce74](https://github.com/decdn/decdn/commit/abbce7426f02a93079511a3736adc353851762f1))
+- **client**: Add a public bundle pull, decdn_client::bundle (#2436) ([495cceb](https://github.com/decdn/decdn/commit/495ccebb84c5f68b457d505cd8a922183c9f10cf))
+
+### Bug Fixes
+
+- **cli**: Keep TERMS.md byte-exact on Windows checkouts (#2448) ([5a920d9](https://github.com/decdn/decdn/commit/5a920d99bc28b3d034a296ad48622a28df0aecc2))
+- Persist a delegated client's lane watermarks (#2441) ([21c06e1](https://github.com/decdn/decdn/commit/21c06e18cd82e05d414bb2b154ea189a6b1ecf6f))
+- Count a maybe-broadcast pool tx as unconfirmed in --all sweeps (#2430) ([0cfa3f2](https://github.com/decdn/decdn/commit/0cfa3f2665017fec64b31fa4b4f9294c6eb73ab9))
+- Name pool close/reclaim estimation reverts and drop "on-chain" (#2428) ([8613695](https://github.com/decdn/decdn/commit/8613695bf49b17eb6a5a98081795f184b15935f2))
+- Warn when a failed pool send may have broadcast (#2424) ([7422e6e](https://github.com/decdn/decdn/commit/7422e6e2b053fc6c04853885cfdd044a6f4daa3b))
+
+### Refactoring
+
+- **client**: Move the paid fetch's network leg into decdn-client (#2434) ([77649bf](https://github.com/decdn/decdn/commit/77649bfaabbd94cf743a7fd0ecbcb14fd962aa6b))
+
+### Documentation
+
+- Make published crate-root docs read for crates.io/docs.rs users (#2447) ([d898a53](https://github.com/decdn/decdn/commit/d898a5321feadf752437f7b978d23707c4768c49))
+- **docker**: Push Docker Hub overviews for both images from the repo (#2446) ([2bec66c](https://github.com/decdn/decdn/commit/2bec66ceb6cdd4a973e6f3240b74d780f211646d))
+
+### CI/CD
+
+- **release**: Drop sccache from the release build (#2423) ([12ecb06](https://github.com/decdn/decdn/commit/12ecb060c3aee4c21cb182e97913d2d78d0e3428))
+
+### Miscellaneous
+
+- Move maintainer-run release scripts to scripts/ (#2422) ([ce565fe](https://github.com/decdn/decdn/commit/ce565fe94ccf19431f017b0116f0b2bbaee5e98d))
+
+## [0.0.3] - 2026-10-11
+
+### Features
+
+- Open devops' decdn bump PR from publish-crates.sh (#2421) ([3265a71](https://github.com/decdn/decdn/commit/3265a7140ea114528caf953590615b2ebdc24139))
+
+### Bug Fixes
+
+- Hold the open slot until an unconfirmed openPool resolves (#2419) ([23845c2](https://github.com/decdn/decdn/commit/23845c2eb308131ef747e5f5bc951837b592ac5c))
+- Keep the tx hash when a pool tx receipt fetch fails (#2414) ([62d640b](https://github.com/decdn/decdn/commit/62d640bd5255c50c82e4d4fd397c605f2f06afc3))
+- **docker**: Apply bookworm security updates in the image base (#2408) ([038a6a3](https://github.com/decdn/decdn/commit/038a6a35b7d53b143f310a45a14c367dc95eb74b))
+
+### Refactoring
+
+- Retire remaining payment-channel identifiers and stale channel claims (#2412) ([f41ab4c](https://github.com/decdn/decdn/commit/f41ab4c297e79153d3ff6cd7416e808be308fdd7))
+
+### Documentation
+
+- Retire remaining payment-channel wording; meter lane-seed refusals in the open-failure total (#2406) ([f9427b8](https://github.com/decdn/decdn/commit/f9427b85a459516e0eb9a327add76d243271a823))
+- Retire payment-channel vocabulary in node comments (#2404) ([9c4e7a1](https://github.com/decdn/decdn/commit/9c4e7a11027ad4c6e65c670df7e708aebac7de69))
+
+### CI/CD
+
+- **release**: Pull the image base from Docker Hub again ([fae8257](https://github.com/decdn/decdn/commit/fae8257aacffd897ffc95b70153d65d4fef0fe71))
+
+### Miscellaneous
+
+- **docker**: Move the image base to debian trixie-slim (#2409) ([8058697](https://github.com/decdn/decdn/commit/80586979cc27ada703562218565fceaadc03d9ff))
+
+## [0.0.2] - 2026-10-09
+
+### Features
+
+- **release**: Ship the decdn CLI as a container image (#2398) ([16e6b31](https://github.com/decdn/decdn/commit/16e6b3168d5f1395012e666db193538ee76a0b0d))
+
+### Bug Fixes
+
+- **client**: Pay only for bytes the decoder has verified (#2395) ([b7617ca](https://github.com/decdn/decdn/commit/b7617cab880c6ad5fff3454d85d21a525469de3c))
+- **docs**: Link ADRs from doc comments by absolute URL (#2392) ([b468cad](https://github.com/decdn/decdn/commit/b468cad2f3f8f39a0ba1d42d6a1a83a5ad5aaaa1))
+- **release**: Check out submodules in publish-crates.sh's worktree (#2390) ([e7eee84](https://github.com/decdn/decdn/commit/e7eee8467d12579e711066db5b32d60a5b63817d))
+
+### Documentation
+
+- **readme**: Pin status badges to main and add distribution badges ([6f190b8](https://github.com/decdn/decdn/commit/6f190b89fe3a00e5083f6e0e3820b7b3e1f403a3))
+- Fix README claims and retire the pre-launch narrative (#2400) ([dcb30ce](https://github.com/decdn/decdn/commit/dcb30ce70812f24e76b65d2987e9021bb195de9e))
+- Describe how dial targets race direct and relay paths (#2394) ([ccca0ba](https://github.com/decdn/decdn/commit/ccca0bac23cc8e318939f720a8158feec1b5e205))
+- Link Circle's testnet faucet at faucet.circle.com (#2388) ([1907dc4](https://github.com/decdn/decdn/commit/1907dc451b9d55c221e54feac661f271946e9924))
+
+### CI/CD
+
+- **release**: Pull the image base from ECR Public, not Docker Hub (#2403) ([e67c0ae](https://github.com/decdn/decdn/commit/e67c0ae66213ca64105f514137748bcf7945f5d5))
+- **release**: Open sponsord's decdn bump PR after publishing crates (#2399) ([975b62e](https://github.com/decdn/decdn/commit/975b62e4ffe963d4eb49448f9438be92d3c7ee27))
+- **release**: Pin builds to the verified commit and tighten ordering (#2396) ([d70f911](https://github.com/decdn/decdn/commit/d70f911d0fbac2a8a88ed540ec5d2fafaa81e06b))
+- **release**: Prefer a decdn.org key from KEYS in sign-release.sh (#2393) ([8768ee9](https://github.com/decdn/decdn/commit/8768ee9425f951e4c49119675357b49914e86780))
+- **release**: Build both binaries per target and verify in parallel (#2387) ([e74a894](https://github.com/decdn/decdn/commit/e74a894668e2ad5b95e5719a4602de0494734777))
+
+### Miscellaneous
+
+- **cargo**: Add decdn keyword to published crates ([143821c](https://github.com/decdn/decdn/commit/143821c6039dcc5f76c648b73f27b99152b01b7e))
+
+## [0.0.1] - 2026-10-09
+
+### Breaking
+
+- Scope node refusals to three classes and recover funding once per fetch (#2354) ([13373c8](https://github.com/decdn/decdn/commit/13373c81e4377004e88ba41fa47a92d2bc6d848a))
+- **contracts**: Remove Balancer buyback venue, make Uniswap V3 canonical (#2043) ([db5734f](https://github.com/decdn/decdn/commit/db5734f51d62aec9f068bbf834a1e91a0d6f0049))
+- **contracts**: Renounce DEFAULT_ADMIN_ROLE, scope rotatable roles to GOVERNANCE_ROLE (#2028) (#2042) ([cb4fc40](https://github.com/decdn/decdn/commit/cb4fc4094d97c52e0060f3e9553b11cd0bc5181c))
+- **node**: Always compile OTLP span export (#2039) ([361018d](https://github.com/decdn/decdn/commit/361018d0386821b3ef08efbfa5ce61973b4cce90))
+- **contracts**: Governance hardening — bound capture, remove structural recovery holes (#2038) ([2ea70da](https://github.com/decdn/decdn/commit/2ea70da6be7ec66d5b39902827bd6b394053713d))
+- **node,common**: Drop the seller-side rate-floor quote clamp (#2037) ([17999a8](https://github.com/decdn/decdn/commit/17999a8ed52e491d13c5d6e5770188c657bacb7b))
+- **contracts,node**: Drop ContentBlacklist coupling from OriginAssignment (#2032) (#2035) ([672e372](https://github.com/decdn/decdn/commit/672e37294e73c45633ae77121c02d757dec995f5))
+- **incentive,contracts**: Pin EIP-712 type-hash digests and adopt ADR 014's poolId naming (#1860) ([acd03e4](https://github.com/decdn/decdn/commit/acd03e428fbecfdf7a5e9e4305f2bd05b9fef7dd))
+- **workspace,contracts**: Delete dead code found by the mechanism inventory sweep (#1850) ([0ae1e02](https://github.com/decdn/decdn/commit/0ae1e02b609ae58c50e8237c3323eaaaa099dd3c))
+- **protocol,incentive,contracts**: Remove the dead StreamResponse redirect field (#1838) (#1842) ([eb9d1b2](https://github.com/decdn/decdn/commit/eb9d1b291d05454d53d511ff2f9d8481fc907c8c))
+- **protocol,node**: Sender-chosen ChunkData frames and the Tier-1 extension seam (#1804) ([4c46e9b](https://github.com/decdn/decdn/commit/4c46e9b29d8c9315ab4d265784a72b731bb95edf))
+- Four protocol simplifications — rate ceiling, settlement ranking, blacklist appeals, probe-hold alerts (#1472) ([c390515](https://github.com/decdn/decdn/commit/c39051549dc1daef12c03f310f10e53dfe653ac7))
+  - config. `payment.delivery_ceiling` is removed, with `--delivery-ceiling` and `DECDN_DELIVERY_CEILING`. `[payment]` uses `deny_unknown_fields`, so a stale TOML key now fails startup and `decdn config validate`; a stale env var warns. Delete the key — nothing replaces it, because the node no longer clamps its quote downward at all.
+- Drop two dead knobs — min-reputation floor and trusted-IP rate-limit exemption (#1456) ([19a3964](https://github.com/decdn/decdn/commit/19a3964207f8f28c6481614812def5200bf6e1d0))
+  - `probe.rate_limit.trusted_ips` and `dht.rate_limit.trusted_ips` are removed. Both config structs use `#[serde(deny_unknown_fields)]`, so a node whose TOML still sets either key now fails to load at startup and under `decdn config validate` rather than ignoring it — a silent ignore would leave the operator believing an exemption is still in force. Delete the key; raise `per_ip_rate_per_sec` / `per_ip_burst` if the headroom was actually needed.  Test coverage is preserved rather than merely deleted: the probe-side exemption test was rewritten (not dropped) because it was the only guard on `decdn_probe_rate_limit_rejected_per_ip_total` against an arm swap in the hand-written metrics match, and `score_nan_reputation_clamps_to_floor` was added to pin `compute_score`'s dependence on `f32::max` ignoring NaN — a switch to `.clamp()` would propagate NaN into `total_cmp` and let a garbage candidate be swept into a tie-break group.  Follow-ups filed rather than widening a deletion PR: #1457 (From-impl transposition tests), #1458 (reputation has no upper clamp), #1459 (`Some(0)` stake outranks `None` at tie-break tier 2).
+- **reputation**: Drop the network/gossip tier, keep local-only scoring (#1418) ([4196623](https://github.com/decdn/decdn/commit/4196623ad62b26f121e784e1373d39e71d00bc49))
+- **node**: On-chain PaymentChannel seller settlement + CapacityBond rename (#327) (#743) ([2545538](https://github.com/decdn/decdn/commit/2545538d08c9ef047e909b8d147d61830d6c6f1e))
+  - renames StakingRegistry -> CapacityBond. The config TOML key `blockchain.staking_registry_address` is now `blockchain.capacity_bond_address`, the CLI flag `--staking-registry-address` is now `--capacity-bond-address`, and the env var DECDN_STAKING_REGISTRY_ADDRESS is now DECDN_CAPACITY_BOND_ADDRESS.  Out of scope (deferred): buyer-side openChannel for node-to-node pulls, the in-process dispute monitor (#324), and the live anvil e2e (no existing harness).
+- **gossip**: Drop LoadHint from NodeAnnounce — trustless tie-break only (#620) ([5b67c41](https://github.com/decdn/decdn/commit/5b67c4188b257e72cecd9788e49936cdbce4a15e))
+- **config**: Tagged [cache.origin] table replaces flat origin_url/origin_path (#437 PR1) (#463) ([ccbe7fa](https://github.com/decdn/decdn/commit/ccbe7fab0f8b676bb1541fbffbb3379ca2da9b09))
+- **node,cli**: Split decdn binary into decdn-node daemon + decdn cli (#421) (#425) ([ea01130](https://github.com/decdn/decdn/commit/ea01130215f79098461a8455c2c9b9d084dabecd))
+  - `decdn run` no longer exists. Run the daemon with `decdn-node run`. The user CLI is `decdn` and gains `node {peers,health,announce,drain,evict,reload}`, `key-gen`, `config {init,validate}`, `probe` — all moved from the old fused binary, no behaviour changes. Container image entrypoint is now `decdn-node`.  All 463 workspace tests pass; clippy clean under the workspace anti-panic policy.
+
+### Features
+
+- **client,node**: Add PoolContext::new and bind_endpoint, bind the example lanes (#2358) ([f2fc71d](https://github.com/decdn/decdn/commit/f2fc71d60c5a8d1035c917a344723260b866fac1))
+- **client,cli**: Start a fetch on its first holder and join late holders as they answer (#2298) ([4f2ef9c](https://github.com/decdn/decdn/commit/4f2ef9c28642993eaa1b2e309323fcd639e0a3b4))
+- **cli,node**: Measure time to first byte by phase (#2294) ([fb6d655](https://github.com/decdn/decdn/commit/fb6d655268c7b41862b9aa856e09791f6ebd142a))
+- **node**: Count every JSON-RPC request by method and outcome (#2246) ([769de4b](https://github.com/decdn/decdn/commit/769de4bd163ffe35a1d7d593d0365654d802c554))
+- **cli**: Tab-bar progress and graceful Ctrl-C for fetch and bundle pull (#2153) ([49c13b9](https://github.com/decdn/decdn/commit/49c13b9f6a669c3c667ba4289f27e5dff4e61f39))
+- **node**: Export probe collection latency and time-to-first-byte histograms (#2151) ([4925d7a](https://github.com/decdn/decdn/commit/4925d7a3c8af9efed4b18d750310034cdaa45b52))
+- **cli**: Build the user CLI for Windows x64 and ARM64 (#2146) ([ae78859](https://github.com/decdn/decdn/commit/ae7885904c99ee68881607c7e2004492f749a532))
+- **node**: Heartbeat the systemd watchdog from the runtime and test serve-loop starvation (#2145) ([9a4de88](https://github.com/decdn/decdn/commit/9a4de88cb8e4c3ff2015aa1f827705a092da8d0b))
+- **cli,client**: Stripe a range-dedup entry's ranges across its holders (#2143) ([763ba0d](https://github.com/decdn/decdn/commit/763ba0d985de796be4292213d72231fce358d15c))
+- **cli,node**: Prime the multi-source probe and the node's upstream handshake (#2138) ([e63443e](https://github.com/decdn/decdn/commit/e63443eae8a9318b98686cf20e3c0d0229820112))
+- **cli**: Route decdn fetch and bundle pull onto the consumption faces (#1848) (#2114) ([875e4a5](https://github.com/decdn/decdn/commit/875e4a5ce74398ee6781a5c043e116a410994d2a))
+- **client-pull**: Add Downloader and Streamer consumption faces over a unified multi-source core (#2108) ([4db4e17](https://github.com/decdn/decdn/commit/4db4e1756353bbc2d3c2f88d9b734d03553d34e5))
+- **node**: Telemetry for refuse-to-serve, load-shedding, and warming allowance (#2115) ([ae659bd](https://github.com/decdn/decdn/commit/ae659bd20ab2af5bf4056fc18da94573a43fb5a4))
+- **cli**: Allow origin import --move with --optimize (#2113) ([c77d111](https://github.com/decdn/decdn/commit/c77d1118343e09b0560f75da7d626837b6da2dbc))
+- **cli**: Interactive --select and manifest cache for bundle pull (#2109) ([67edb49](https://github.com/decdn/decdn/commit/67edb49fe54e55d7171ad8dfbd4e2d5e1163976b))
+- **cli**: Honest download-metered bundle pull progress with reconstruction + discovery states (#2097) ([94d5d54](https://github.com/decdn/decdn/commit/94d5d54fe912aa9a1355d0f0ca9d1c72c9356204))
+- **node**: Stream bounded and resumed cache-miss requests through the two-leg spine (#2064) ([4fc94b5](https://github.com/decdn/decdn/commit/4fc94b56b7518cb55475728edacd1acdc8daeb86))
+- **cli**: Coalesce shared chunks in bundle pull so each is fetched once per run (#2095) ([deea638](https://github.com/decdn/decdn/commit/deea638a2234b7d7e0f6bfc96dd8a5cea13002a8))
+- **protocol,node,client-pull**: Tell the proven pool owner its deposit is short (#2013) (#2093) ([c0df360](https://github.com/decdn/decdn/commit/c0df36068281d0d5f535ef55d4667789d9d7779d))
+- **cli**: Make `origin import --to` a bare filesystem path; document the S3 aws-sync route (#2091) ([dcf8245](https://github.com/decdn/decdn/commit/dcf8245730842ffa5f2cb5a1b4f8878495d019d8))
+- **metrics,monitoring**: Meter the serve-path cache hit rate; surface the failure residual (#2071) ([53ec098](https://github.com/decdn/decdn/commit/53ec09851fd9984bc518c7caa4ef823be7a84941))
+- **metrics**: Export stream, volume, tx and DHT health; alert on the gaps (#2059) ([fd5bc3e](https://github.com/decdn/decdn/commit/fd5bc3ebe5a717fdb0daccf163715647d0efb5fb))
+- **tracing**: Span the serve, pull, DHT and settlement paths (#2058) ([7da144d](https://github.com/decdn/decdn/commit/7da144ded8d0ab9f0452ece9d566ac9cd39ce493))
+- **logging**: Consistent fields, throttled peer warns, tx hashes, CLI -v (#2057) ([5cefb21](https://github.com/decdn/decdn/commit/5cefb21dfe6608da167bd704e544e3c4f7f46d14))
+- **monitoring**: Map active nodes by declared region on the chain dashboard (#2056) ([4a391d7](https://github.com/decdn/decdn/commit/4a391d75ac7aa0c4f7fb00047cec0acac24bfa45))
+- **node**: Reconcile lane watermarks on-chain before redeeming (#2054) ([e341b21](https://github.com/decdn/decdn/commit/e341b21dd8b1b9022b49344f60207eb920db4920))
+- **monitoring**: Four-dashboard observability suite over metrics, logs and traces (#2046) ([4f345cb](https://github.com/decdn/decdn/commit/4f345cb74bc1b09418773fc032f020a4e46e6de3))
+- **cli**: Checkpoint bundle-pull skip-cache incrementally as files land (#2026) ([3bffbaa](https://github.com/decdn/decdn/commit/3bffbaa1fc708dfd85334f54f87e3bf40df28e17))
+- **cli**: Reuse byte-identical files across bundles in bundle pull (whole-root dedup) (#2025) ([ad407cc](https://github.com/decdn/decdn/commit/ad407cc13d4446bc6692bb8fc8aa43b7a6be6d43))
+- **cli**: --subfolder for `origin import` to nest a bundle under one folder (#2024) ([774a620](https://github.com/decdn/decdn/commit/774a620e80bd29e79a35810db726d3f5b2f9fcbb))
+- **node,cli**: Expose unredeemed USDC awaiting redemption in `node top` (#2023) ([af39368](https://github.com/decdn/decdn/commit/af39368885e460865039a848b047d145b8a295c2))
+- **cli**: Incremental, chunk-aware bundle pull via .decdn-manifest.json (#2009) ([2fcda71](https://github.com/decdn/decdn/commit/2fcda71d7b2035b965b032e72fe0471d17332eae))
+- **cli**: Bundle pull via chunk-hint range dedup, dormant same-lane parallelism (#1982) ([9adc747](https://github.com/decdn/decdn/commit/9adc74700d7e6f2eff8695bbc4256accdbae2ed5))
+- **cli**: Chunked bundle generation via origin import --optimize; consolidate bundle create (#1972) ([8b437de](https://github.com/decdn/decdn/commit/8b437de550081bd0dd48b2039e06b6561ec42bc0))
+- **cli**: Per-file and total progress bars on bundle pull (#1969) ([9b236f2](https://github.com/decdn/decdn/commit/9b236f2d67ce354bcfce2a04094ed1333012dcd5))
+- **cli**: Route fetch/bundle-pull status behind opt-in logging (#1968) ([6284f5d](https://github.com/decdn/decdn/commit/6284f5d4e47c4dd76bb5a64b3f0999fe808bd73a))
+- **cli**: Report downloaded vs reconstructed bytes on bundle pull (#1967) ([90af8fe](https://github.com/decdn/decdn/commit/90af8feebcab8cd6fb3a83668c7247c235048dfb))
+- **cli**: Report imported file→hash map from origin import (#1966) ([b95a2e3](https://github.com/decdn/decdn/commit/b95a2e3dee035a6ff7e269150f065434c673f3db))
+- **cli**: Represent a bundle file as a concatenation of chunk hashes (#1965) ([a360156](https://github.com/decdn/decdn/commit/a3601564cead99627a42f412fc0733f70e223b88))
+- **cli**: Filter bundle pull entries with --include/--exclude globs (#1964) ([52eacda](https://github.com/decdn/decdn/commit/52eacda66b87bad50a86fb877ad0db2dad31b21c))
+- **node**: Stop serving when chain reads go stale (ADR 011) (#1960) ([4581dcd](https://github.com/decdn/decdn/commit/4581dcd64e05f97da10d64c7198f0f9268df55c1))
+- **cli**: `decdn pool {close,reclaim} --all` to sweep every owned pool (#1951) ([7371aa9](https://github.com/decdn/decdn/commit/7371aa9031a42987596d81d7160a81e3a35011f0))
+- **cli**: Zero eth_calls on a repeat happy-path fetch (#1950) ([cb5e110](https://github.com/decdn/decdn/commit/cb5e110ec650f10a43f5b2b10938762421302fc9))
+- **client-pull**: Dial from on-chain multiaddrs with relay fallback + peer-store caching (#1949) ([0fafcfb](https://github.com/decdn/decdn/commit/0fafcfb2251c2e128a3aef6a3ae34d3543826143))
+- **cli**: Opt-in client-side tracing for the decdn CLI (#1948) ([43ee4ef](https://github.com/decdn/decdn/commit/43ee4ef434f9531a36f2d9f1b4a2e07c840c0651))
+- **cli**: Add read-only `decdn whoami` to print local identity (#1947) ([f3a28c3](https://github.com/decdn/decdn/commit/f3a28c339c99de81d5aa391782e56740677ff0b0))
+- **client-pull**: Persisted peer knowledge base for probe-less client fetch (#1946) ([da5c90c](https://github.com/decdn/decdn/commit/da5c90c677bd4f0b7407986df5b59eab21f1baab))
+- **cli**: Compact per-node discovery listing on fetch (#1943) ([b65cf79](https://github.com/decdn/decdn/commit/b65cf79bc39d3a9a1915452b1f0b6666dea8fa07))
+- **cli**: Choose a keystore password source by presence, not emptiness (#1932) ([ef36807](https://github.com/decdn/decdn/commit/ef36807fbb097d73b1bdf498a2733b141928f1e0))
+- **node**: Select BBR3 congestion control on the QUIC endpoint (#1927) ([08c0b2f](https://github.com/decdn/decdn/commit/08c0b2fb68a09d1d108a3ba5b237e79cde7061d5))
+- **cli**: Stabilize fetch progress rate and add end-of-fetch summary (#1926) ([785f1e7](https://github.com/decdn/decdn/commit/785f1e7de59267798ba9bf039e1f2924c44246ca))
+- **cache**: Disk-space-aware eviction ceiling (#1930) (#1925) ([cf825ec](https://github.com/decdn/decdn/commit/cf825ec1fef9b0bab52a151f5d3c7248a4263a16))
+- **cli,incentive**: Decdn node update-region — re-attest region on-chain (ADR 030) (#1920) ([f02300b](https://github.com/decdn/decdn/commit/f02300b0c038cd21ecce6939f16e87b9697bebdf))
+- **cli,incentive**: Decdn node update-multiaddrs — republish dialable addresses (#1908) (#1913) ([a97c8fa](https://github.com/decdn/decdn/commit/a97c8fa2637384d7b38b2be1df3feedf664b6e41))
+- **cli**: Add decdn node doctor diagnostic subcommand (#1598) (#1910) ([f9e4152](https://github.com/decdn/decdn/commit/f9e415297248cd552c084810b5e67e6076ff1a96))
+- **node,cli**: Surface operator eth address in `decdn node status` (#1906) (#1907) ([afb7a90](https://github.com/decdn/decdn/commit/afb7a909685ff0a1f496cfd4815e66b8a9739b7a))
+- **cli,bao-range**: Decdn origin import — seed a cache origin (sharded blob + .obao4) (#1904) (#1905) ([0139899](https://github.com/decdn/decdn/commit/0139899fb4810f67893d9a2808c0e7809d1c1a57))
+- Range-keyed partial-holder discovery — consumers (#1506 PR2) (#1898) ([d0da97c](https://github.com/decdn/decdn/commit/d0da97c9a6b3d7a3624a2bfcd0e36e5c03c70d96))
+- Range-keyed partial-holder discovery — data layer (#1506 PR1) (#1894) ([e99df05](https://github.com/decdn/decdn/commit/e99df0522dc0b2346a988c988e828eac6f64d6d1))
+- **client-pull,node**: Byte-progress throughput-floor stall detection (#1797) (#1889) ([2ccd03a](https://github.com/decdn/decdn/commit/2ccd03af024685a18ca19af0c9b8b276e181dc56))
+- **node,incentive**: Per-signer floor isolation under the per-pool solvency ceiling (#1841) (#1847) ([2e54bb4](https://github.com/decdn/decdn/commit/2e54bb4b18ff764eba74f2fd6f73622d5bf19be3))
+- **contracts**: Governable minimum openPool deposit for Sybil defense (#1862) ([d331a6c](https://github.com/decdn/decdn/commit/d331a6c259149ea1ba78296141f4aa0a19ee703a))
+- **node,cli,cache**: Wire staged-but-unconnected mechanisms (#1844) (#1859) ([e2273cc](https://github.com/decdn/decdn/commit/e2273cc0e545d65f39e89790950de204a9c19dab))
+- **cli,e2e**: Wire multi-source parallel fetch into bundle pull (provider-lock → ordered lock-set) (#1825) ([edbaa35](https://github.com/decdn/decdn/commit/edbaa353b12f9717070ee637b676bd773b0328c7))
+- **cli,common**: Role-aware config init (--origin/--client), drop example configs (#1818) ([11c1f95](https://github.com/decdn/decdn/commit/11c1f95a5e84454e81b9a3160eb8216f4e35fc3c))
+- **client-pull,cli**: Multi-source parallel fetch scheduler (ADR 039, #1164) (#1773) ([60bd561](https://github.com/decdn/decdn/commit/60bd561f84e4036a26be7af23a1913ff80f7493f))
+- **payments**: Implement PayWord hash-chained per-MB meter (#1770) ([d5a18c5](https://github.com/decdn/decdn/commit/d5a18c5312dc2ca65e3c670cb62eccc90370ec3a))
+- **node**: Refuse-to-serve economics (ADR 041, closes #1755) (#1771) ([aa434a5](https://github.com/decdn/decdn/commit/aa434a502978a07782e8669390de3aec058adad0))
+- **node**: Origin-only node policy — decline foreign relay via cached backend probe (#1759) (#1766) ([27db4c6](https://github.com/decdn/decdn/commit/27db4c685ba9fa722020d23d4659482b7957cdae))
+- **node**: Load-shedding under resource pressure (#1756) (#1767) ([c9d5997](https://github.com/decdn/decdn/commit/c9d599781c0dc652c978aa37a0d555ef1fd55d53))
+- **node**: Solvency-aware redeemer — hold on drain, drop on close (#1765) ([10131af](https://github.com/decdn/decdn/commit/10131af98e47c173d56cfab11375b0326026fb72))
+- **contracts**: Cap governance vote weight by declared capacity per epoch (#1760) ([fcde998](https://github.com/decdn/decdn/commit/fcde9987ad6c5b60d313bdbbddac5e64bc5228ca))
+- **cache,node**: Pluggable admission & eviction policies (ADR 040) (#1757) ([62cffd1](https://github.com/decdn/decdn/commit/62cffd17d9401b2102157d6039556dfa9009f419))
+- **payments**: Soft delivery-rate floor — clamp credited bytes instead of reverting (#1753) ([c5a8626](https://github.com/decdn/decdn/commit/c5a8626b8089510f9594f80604776922d498664f))
+- **node**: Batch DHT re-publish by receiver; drop BatchStore fallback (#1616) (#1748) ([58aaa97](https://github.com/decdn/decdn/commit/58aaa977953d4752c020c79c1d133e95e0d2c725))
+- **payments**: Bound serve-time pool exposure with a per-pool floor-credit accumulator (#1713) ([eef7342](https://github.com/decdn/decdn/commit/eef7342cc205fa19cf8f8a0d1322b40021f94f35))
+- **payments**: Narrow wire voucher amount/bytes_delivered to u64 (#1705) (#1708) ([281dd25](https://github.com/decdn/decdn/commit/281dd25c31a4f9bc449eac3aec896fa5bae1b553))
+- **cli**: Provider-failover retry for fetch + bundle pull (#1174) (#1725) ([b6d91bd](https://github.com/decdn/decdn/commit/b6d91bde9de0abf3c194b4ffdd0b295ad0e8ce4a))
+- **payments**: Chunk voucher redemption into gas-bounded redeemMany transactions (#1704) ([b57d55e](https://github.com/decdn/decdn/commit/b57d55efdd3be8c8f2f43056b677477834eacdb2))
+- **payments**: Self-describing vouchers for concurrent same-lane settlement (#1699) (#1702) ([ea12f8c](https://github.com/decdn/decdn/commit/ea12f8c29461155e53f5dc6237a826ebaffe0a8f))
+- **payments**: Bound per-lane credit exposure with a concurrent-stream admission cap (#1700) ([9729f08](https://github.com/decdn/decdn/commit/9729f084ec5178bce6fefd590720156da469fa92))
+- Credit slow-start — ramped credit window (start at floor, ramp with paid) (#1669) (#1691) ([314f3c3](https://github.com/decdn/decdn/commit/314f3c3c310d9d9840dd989907c7a248643583c9))
+- **payments**: Delete voucher_interval_mb negotiation (#1676) (#1688) ([c81a079](https://github.com/decdn/decdn/commit/c81a0790464d0d4381289813abdc99e49c21abcf))
+- **config**: Default max_blob_size_mb to cache_size_mb, keep the knob (#1685) (#1686) ([268f9d2](https://github.com/decdn/decdn/commit/268f9d222231225ca3e754d5e9ee86d3eea82474))
+- **payments**: Shared payment pool — capped delegated signers + node-addressed cumulative vouchers (#1667) ([b82100f](https://github.com/decdn/decdn/commit/b82100fcef750c19446423be9c03bce64e561efc))
+- **node**: Coalesce partially-overlapping serve-misses onto one fill (B3, #1656) (#1666) ([c6dcf7a](https://github.com/decdn/decdn/commit/c6dcf7a3e2e99fb63a71159b61916ab5ec7b7678))
+- **e2e**: Node-to-node paid coalescing money proof (B3.5 upstream variant) (#1662) ([476db54](https://github.com/decdn/decdn/commit/476db5412864327fdf50de2cd4dd8b21a3428ff1))
+- **node**: Multi-observer coalescing for the serve-miss (B3, #1656) (#1660) ([370e5fc](https://github.com/decdn/decdn/commit/370e5fc8b69a7492f2b7413c38bc3d0e8a378ea2))
+- **reputation**: Un-saturate the speed sub-score + half-life decay for large-file selection (#1658) (#1661) ([8661260](https://github.com/decdn/decdn/commit/8661260897eb3bd18149ecb36099aab357470fa5))
+- **node**: Route own-origin serve-miss through the two-leg driver; delete window_forward_loop (#1655) ([bb043e8](https://github.com/decdn/decdn/commit/bb043e8fb4416e32ec5aec7d3fb61fe2082b82d2))
+- **cli**: Add `decdn node rotate-key` + G-NODE-07 journey (#1034) (#1614) ([09c3b44](https://github.com/decdn/decdn/commit/09c3b44f02d57bd09382599ab5246c15698373f2))
+- **node**: Decoupled serve-miss pull+serve legs (#1651) ([d4f777c](https://github.com/decdn/decdn/commit/d4f777c923c1d70da4804e0188a6531bf4a446af))
+- **client-pull,cache,node**: Node serve-miss pull-leg foundation (B2 part 1 of #1621) (#1644) ([8bf4910](https://github.com/decdn/decdn/commit/8bf49104de7e52ab0f8b8c9c0b923043cb2e7547))
+- **release**: Publish to crates.io and Docker Hub (#1646) ([e3c50f5](https://github.com/decdn/decdn/commit/e3c50f507e030b7677f95ce2259c7bab452b0059))
+- **cache**: Node-only ServeStore (observe + encode_range) for the serve-miss driver (B1 of #1621) (#1642) ([e8dacef](https://github.com/decdn/decdn/commit/e8dacef632f95023b668f24d821ddea0ef16b850))
+- **cache**: Retain range-admitted partials across GC (#1607) (#1641) ([63f9bea](https://github.com/decdn/decdn/commit/63f9beaad1c1fc9328d8127054136b2f98560318))
+- **client-pull,cli**: Range-minimized decdn fetch via gap-driven driver (P3-client of #1621) (#1631) ([afc7062](https://github.com/decdn/decdn/commit/afc7062b366cc9ae0fb93d152ba3111218bdbf80))
+- **client-pull**: Add ClientRangedStore — client RangedStore backend (P2 of #1621) (#1625) ([0d57cc4](https://github.com/decdn/decdn/commit/0d57cc4c889a7dd6713caa7179d2d92f2ad489cc))
+- **bao-range,cache**: Add RangedStore trait + node backend (P1 of #1621) (#1624) ([7211d34](https://github.com/decdn/decdn/commit/7211d34c0ccda7b1ff36cb55ccc933249f5dd350))
+- **cache**: Range-aware present_ranges / missing_ranges query (#1609) ([a85f079](https://github.com/decdn/decdn/commit/a85f079ff4c92dab7efdf940a46c539a472632b8))
+- **node**: Don't reactively top up a near-expiry channel mid-pull (#1605) ([70f7640](https://github.com/decdn/decdn/commit/70f7640eb0eceb96ced4adb3b2988d1b32cdf6b0))
+- **node**: Reactive mid-pull deposit top-up on the node-to-node buyer leg (#1530) (#1600) ([d3e13fc](https://github.com/decdn/decdn/commit/d3e13fc6fa72add7405bb381feaf679e397999dd))
+- **cli**: Bake known-chain contracts into `config init --chain` (#1597) ([092e032](https://github.com/decdn/decdn/commit/092e032c8d7b4f093409dc69181c96c5e5e78602))
+- **node**: Make redeemer self-tick interval configurable (#1585) (#1591) ([9e0a123](https://github.com/decdn/decdn/commit/9e0a123dadf96da1efa3453cad021bfa69e9f287))
+- **node**: Self-defense disputeChannel on stale channel close (#1586) (#1593) ([8fb359f](https://github.com/decdn/decdn/commit/8fb359f647cbcd480b9a29384ce74ea72c7d3c36))
+- **incentive**: Batched redemption via PaymentChannel.withdrawMany (#1587) (#1592) ([38c0d47](https://github.com/decdn/decdn/commit/38c0d47d28087e05e45836c6f63e707219c1a81e))
+- Swappable publisher vetting policy (#1403) (#1580) ([d3800c5](https://github.com/decdn/decdn/commit/d3800c555b9b6de2f00e94ecc482305f3b76b974))
+- **contracts**: Vetted-publisher instant origins (#1491) ([b2a9651](https://github.com/decdn/decdn/commit/b2a96512a119e9ec5390ad4a00889da534a6d303))
+- **buyer**: Two-tier deposit — open small, graduate to a working balance (#1531) ([35f7487](https://github.com/decdn/decdn/commit/35f7487cbb5b3f3f297e0008ffff2f46df2faaea))
+- Serve-side stream-while-store for http/s3 via publisher outboard (#1130) (#1528) ([60ae2f3](https://github.com/decdn/decdn/commit/60ae2f367334836b87183810f1e88e06f7d21916))
+- Zero-voucher cooperative close (#1539) (#1540) ([225e18f](https://github.com/decdn/decdn/commit/225e18fe6343a021fe5ffaec83789a7c87be565d))
+- **contracts**: Bootstrap-multisig governance phase + buyback deploy follow-ups (#1090, #1175) ([4b2a242](https://github.com/decdn/decdn/commit/4b2a2423cc5f1ab082c36dda747becf5f81989a7))
+- **cache**: Live http/s3 probe-HEAD discovery for non-pinned origin content (#1130) (#1523) ([b17ebe3](https://github.com/decdn/decdn/commit/b17ebe31040d6437552b59eaf6beae124e31c552))
+- Enforce the seller-side deposit floor before serving, drop the on-chain minDeposit (#1518) ([3d3bb7e](https://github.com/decdn/decdn/commit/3d3bb7ea871f813dff078c7e0198d4e67adc6406))
+- **cache**: Opt-in remote-origin prewarm, settle two deferred decisions, clear watcher-refactor drift (#1510) ([3807c0d](https://github.com/decdn/decdn/commit/3807c0d6402404d89cc26386e167d15e45d04280))
+- Origin-aware discovery — advertise origin-held content before pull-through (#1130) (#1508) ([644f4be](https://github.com/decdn/decdn/commit/644f4be5059c60964d9b933109d2a137eae57712))
+- **cli**: Decouple --provider-address (#1492) + bundle pull --channel-id / --namespace (#1503) ([9d7cd37](https://github.com/decdn/decdn/commit/9d7cd37acd12298cd090da97150b85cc7dfc0087))
+- **node**: Start the rate-bounds tail at head, resync the registry periodically (#1498) ([52b6361](https://github.com/decdn/decdn/commit/52b6361c8e9b7e795f9c5e5d477cf95e6bf7ef23))
+- **contracts**: On-chain enumeration views to eliminate event-log replay (#1497) ([d4632b8](https://github.com/decdn/decdn/commit/d4632b8ea75dc9b2ce81864395abbb76c6d9df39))
+- Publisher-pays channels — open-on-behalf + adopt-by-id + reject-bundle resume (#1481) (#1488) ([f800783](https://github.com/decdn/decdn/commit/f8007834d8ca6d6b205306a3c9b66f445ea5019c))
+- **payments**: Group-commit voucher fsyncs, ack after commit (#1483) (#1490) ([5ec81b6](https://github.com/decdn/decdn/commit/5ec81b6103d20da6265d84c6f544eb9787c02e66))
+- **payments**: Credit-window pipelined paid delivery (#1477) (#1485) ([18c6c16](https://github.com/decdn/decdn/commit/18c6c16d034374db5e63098845e6f0e935ea64ed))
+- **client-pull**: Optimistic paid-fetch loop, pipelined vouchers (#1484) (#1486) ([370157a](https://github.com/decdn/decdn/commit/370157a8214fa5d7f4d2bd3acdb7a588bd0b46a9))
+- **payments**: Delegated voucherSigner + voucher-less close (#1478) ([6c69f2b](https://github.com/decdn/decdn/commit/6c69f2b28f12466124630a54f9384c27165086c3))
+- Namespace-as-origin-addressing — drop per-hash claims + default-open allow-list (#1394) (#1401) ([a02f781](https://github.com/decdn/decdn/commit/a02f781399f4a0fd9c32c93fa8620958f052729f))
+- Remove speculative prefetch mechanism (#1396) (#1399) ([8bf4d47](https://github.com/decdn/decdn/commit/8bf4d47a662ea3529dd0ed1816f632c2ae6e1dc3))
+- **e2e,client-pull**: Real daemon responses as on-chain slash evidence (G-GOV-03) (#1367) ([7897229](https://github.com/decdn/decdn/commit/7897229e5f854cba7dc1f60aec14ac0bc068a1b8))
+- **node**: Delivery-path deny gates for ADR 011 takedowns (#1168, #1179) (#1380) ([6ab9e0a](https://github.com/decdn/decdn/commit/6ab9e0a8eb9af6767800bbf01c243cf8ae71a439))
+- **contracts**: ADR 011 takedown enforcement — emergency multisig, compliance window, regional-body lifecycle (#1167, #1169, #1178) (#1364) ([a7caac7](https://github.com/decdn/decdn/commit/a7caac7adf48ac831ac7e88498017bc5124c07b9))
+- **client-pull**: Retry + peer-cache fallback for registry bootstrap (#1341) ([6573a56](https://github.com/decdn/decdn/commit/6573a56e711aa02fa4081890c2d2fc8f9c49b7e0))
+- **cli**: Add `decdn node unbond` + G-NODE-06 journey (#1033) (#1353) ([d8739d1](https://github.com/decdn/decdn/commit/d8739d1dcd0a8ad1cfa0252532d6cd62c9ec3465))
+- **node,cli**: Wire on-chain rate bounds, cache eviction driver, client proxy warming (#1172, #1173, #1174) (#1357) ([ed9c624](https://github.com/decdn/decdn/commit/ed9c624fd54b17cca1c8afe2e10a199812dcb05b))
+- **node**: Durable blacklist deny-set, retiring the full-replay pin (#1181) (#1331) ([41fc49d](https://github.com/decdn/decdn/commit/41fc49d5be151fe03c64e5d2869e6c94ea9480f3))
+- **node**: Honor blacklist suspend/resume promptly via HashSuspensionUpdated (#1330) ([21d493a](https://github.com/decdn/decdn/commit/21d493a88930d599831e893d90eb5a2989740c28))
+- **contracts**: Carry the post-change version on ContentBlacklist hash events (#1326) ([4a527b1](https://github.com/decdn/decdn/commit/4a527b1213fb8b7ec88b1c62c947c1445bd9c9a2))
+- **node**: Uniform watcher liveness, panic, and enforcement observability (#1325) ([0b5ce92](https://github.com/decdn/decdn/commit/0b5ce92959c6b4ac9d6cbb1ed3f733ee83ca74a9))
+- **cli**: Consume DECDNMAN file manifests and reconstruct chunked files (#1293) ([b9c2b0a](https://github.com/decdn/decdn/commit/b9c2b0a15a2af62e48b88f49cca3d47ce0055f8f))
+- **contracts**: Add ContentBlacklist.getBlacklistVersion() monotonic counter (#1291) ([66eb828](https://github.com/decdn/decdn/commit/66eb8287263da6d7ed3d1f22b3cc51c16dff2b48))
+- **metrics**: Add key-rotation runbook metrics (#1277) ([b95b18c](https://github.com/decdn/decdn/commit/b95b18cf659fbad0afa1e5f3f67c7188c3232d33))
+- **node**: Lean positive probe cache (ADR 001, 15s TTL, no evidence retention) (#1165) (#1223) ([14f65a4](https://github.com/decdn/decdn/commit/14f65a476cdc2f61f47503cd39f40bd1a08dc121))
+- **node**: Application-layer 30s idle-close for client connections (ADR 005) (#1193) (#1258) ([20e92e6](https://github.com/decdn/decdn/commit/20e92e6a51a5dcc844471acc022a900f177d8d91))
+- **node**: Share one eth_blockNumber read across all chain watchers (#1110) (#1225) ([bdf1c4f](https://github.com/decdn/decdn/commit/bdf1c4f5b1b927782f7e82dc488cd044351df5e4))
+- **cli**: Add `decdn channel close`/`settle`/`clean` to reclaim channel USDC (#1136) (#1216) ([469817d](https://github.com/decdn/decdn/commit/469817d0840f5e01fad54e0ec304047fe3c27437))
+- **cli**: Add `decdn channel list`/`status` to inspect tracked buyer channels (#1133) (#1214) ([98736e0](https://github.com/decdn/decdn/commit/98736e0d95852c936cd320db5bbaaf1b7bbb162b))
+- **contracts**: Add EIP-712 vote delegation for DecdnGovernor (#1205) ([ec261d7](https://github.com/decdn/decdn/commit/ec261d7d883f9b4c60aa77e365b8bf67a258fac5))
+- **contracts**: Add ContentBlacklist reason field, appeal global-override + empty-evidence guard (#1203) ([dbf422f](https://github.com/decdn/decdn/commit/dbf422f4f139b5eb271866b92d3ac18bba152003))
+- **node**: Complete reactive origin pull-through — decouple local populate + node→node chained binding (#1116, #1117) (#1128) ([d73358a](https://github.com/decdn/decdn/commit/d73358a55f6dd699851872635aca7aa51596f6d2))
+- **cli**: Auto-topUp a reused fetch payment channel when its deposit runs low (#1103) (#1104) ([5aeeb3a](https://github.com/decdn/decdn/commit/5aeeb3a8a73182023af2d1ddee8bf82e1bc6f5a7))
+- **cli**: Show a delivery progress bar in decdn fetch (#1118) (#1121) ([6ce282b](https://github.com/decdn/decdn/commit/6ce282bcd1575698b3f11132ddda95b309af945e))
+- **node**: Eth_getLogs resumable watcher, off eth_newFilter (#1106, #1108, #1092) (#1110) ([941344d](https://github.com/decdn/decdn/commit/941344d5bd189d2e0d8ae1e4f388b87e237b28c8))
+- **examples**: Sample operator + client node configs for Arbitrum Sepolia (#1083) (#1102) ([07838a7](https://github.com/decdn/decdn/commit/07838a771685a68acdea4a55c266ace9089caae2))
+- **cli**: Decdn setup --pay-bond-with usdc — auto-swap USDC→TOKEN bond (#991) (#1091) ([e7922d8](https://github.com/decdn/decdn/commit/e7922d808cda9adc1f4554f44cb75fa1a4769bfa))
+- **node**: Blacklist compliance loop + G-NODE-04 e2e (#1031) (#1087) ([871751d](https://github.com/decdn/decdn/commit/871751df5b8b72822586012a46761c79090dbf25))
+- Operator slash detection + appeal via `decdn appeal slash` (#1089) ([512beba](https://github.com/decdn/decdn/commit/512bebaf160cafbbfa9d5d67f61fb5dbadcedeb9))
+- **contracts**: Deploy-time genesis buyback activation + venue select (#1084) (#1086) ([15ec8a3](https://github.com/decdn/decdn/commit/15ec8a32b23df3cac4c339eab405c99220e3f689))
+- **cli**: Decdn publish control plane (namespace/claim/assign) (#1029) (#1074) ([26cb7e4](https://github.com/decdn/decdn/commit/26cb7e462e45401d8c563a56d43cf1d632bba2c6))
+- **contracts**: Enforce ADR-009 pause sunset via SunsettingPausable (#976) (#1027) ([2eeff15](https://github.com/decdn/decdn/commit/2eeff1540e347f8168e90aa9fedcf06b8b6cc0c7))
+- **contracts**: Enforce Publisher and TokenHolder standing at appeal filing (audit I-3) (#1017) (#1050) ([fa61a0d](https://github.com/decdn/decdn/commit/fa61a0d59c13fd9d06c6b75529517b6e9f5e5642))
+- **cli**: Operator terms display + acceptance at registration (#1077) (#1079) ([ae78222](https://github.com/decdn/decdn/commit/ae782228dc8f7aac31fff03e517035e0e9648ee0))
+- **contracts**: Terms-hash acceptance at registration + governor-swappable currentTermsHash (#1078) ([0d73fe3](https://github.com/decdn/decdn/commit/0d73fe39aee51ce0c2f32e072134b40e33b63fcd))
+- **protocol**: Bao verified-range streaming on cdn/client/v1 (#915) (#1052) ([860d725](https://github.com/decdn/decdn/commit/860d725b531364911af69718d27a8b56fa5eb62d))
+- **e2e**: Cross-layer Rust↔contract test harness in crates/e2e (#1028) (#1053) ([db09c8f](https://github.com/decdn/decdn/commit/db09c8f8e268a22ac9b092002cba68998c03d9b2))
+- **contracts**: Add per-(filer,region) concurrent fast-track cap alongside region ceiling (#1015) (#1045) ([e9d9e28](https://github.com/decdn/decdn/commit/e9d9e2841fecbbefb49fda10dae088a0561dbd62))
+- **contracts**: Add multisig perjury denylist via rejectAppealAsPerjury (#1016) (#1026) ([bb619e4](https://github.com/decdn/decdn/commit/bb619e48fee0c43cb6d73e3ed18e1a65deac0fc5))
+- **contracts**: Venue-neutral BuybackBurner + Uniswap V3 burner (#1003) ([9406801](https://github.com/decdn/decdn/commit/9406801ae17b84514158b3bb946d22868ffd4b61))
+- **node**: Origin-tier range pull-through on cdn/client/v1 (#823, #990) (#1007) ([2dba333](https://github.com/decdn/decdn/commit/2dba333d87838f46659f6adb82cb2adf06a780a9))
+- **node**: Buyer-side unilateral close→settle for unreachable providers (#988, #989) (#1004) ([7fd14fa](https://github.com/decdn/decdn/commit/7fd14faaebbeffd55c21f737b025d7a87c9c0415))
+- **node**: Idle buyer-channel cooperative-close reconcile sweep (#987) ([f927a2c](https://github.com/decdn/decdn/commit/f927a2c423727a542896d053f95e1d1431a2df19))
+- **cache**: Add per-origin half-open circuit-breaker for pull-through (#963) (#986) ([afc513b](https://github.com/decdn/decdn/commit/afc513b7b2a87059d428a2913b625684e3c82b61))
+- **node**: Implement ADR 005 three-layer probe rate limiter (#982) (#996) ([a2d5ac2](https://github.com/decdn/decdn/commit/a2d5ac27bbb0abd806e378d014be1253a146678d))
+- **cache**: Wire range_pull helper into origin adapters and engine (#962) (#985) ([80bba95](https://github.com/decdn/decdn/commit/80bba95ca3f46662dc4ca18024db06c2fa938012))
+- **incentive**: Label channel-open failures by reason (insufficient_deposit/contract_revert/rpc_error) (#966) (#984) ([d0168d6](https://github.com/decdn/decdn/commit/d0168d632c7de6f93e92cd21e3aaedd42cdc1ca7))
+- **cli**: Surface receipt log path and rotation cap in config validate summary (#964) (#980) ([83fe3f7](https://github.com/decdn/decdn/commit/83fe3f757fc6409944577e2520339090376c2d83))
+- **client-pull,cli**: Client-initiated cooperative close (#973) ([e8923d1](https://github.com/decdn/decdn/commit/e8923d1f665394e2ef6a67ef8f2c3aec4b41d026))
+- **cache,protocol**: Range origin pull-through — ADR decision + bao verify helper (#823) (#961) ([f99ab49](https://github.com/decdn/decdn/commit/f99ab49b3c3932b04c894775a802c1b97654aaf1))
+- **cli**: Decdn setup — guided node onboarding wizard (#933) (#953) ([73563d1](https://github.com/decdn/decdn/commit/73563d1f66bb931f4c6942f35e9f5bc331ea3a46))
+- **node**: Cooperative-close provider side — sign waiver + stop serving (#957) ([1ce612a](https://github.com/decdn/decdn/commit/1ce612aaa3aa628303265d86494db973f20a13f7))
+- **protocol,incentive**: Cooperative-close wire + EIP-712 foundation (#949) ([3deff30](https://github.com/decdn/decdn/commit/3deff30cc89e1490472f6ce8b689a9a783d64e12))
+- **client-pull**: In-process voucher ledger for parallel pulls (#944) (#950) ([408eeb5](https://github.com/decdn/decdn/commit/408eeb5976383282f17b101eecd40d60a0fa9d13))
+- **contracts**: Cooperative close on PaymentChannel (fast settle, no window) (#948) ([3f0224e](https://github.com/decdn/decdn/commit/3f0224edc09289dc71975791558e38d01a87db17))
+- **cli**: Decdn bundle pull — fetch a bundle's blobs (#391) (#945) ([9c8b971](https://github.com/decdn/decdn/commit/9c8b9713bec56ab4b1b2b242f6d965d7a00ba699))
+- **cli**: Client-side node discovery for decdn fetch/probe (#936) (#943) ([6e2819f](https://github.com/decdn/decdn/commit/6e2819fb03beb27a558c5723704ae64ab86c7a8c))
+- Auto-open/track/reuse payment channels for decdn fetch (#940) (#941) ([351ad72](https://github.com/decdn/decdn/commit/351ad72db4a81f7dd494539c4bd973f0f0f11f37))
+- **cli**: Standalone client fetch (decdn fetch) + config-sourced relays (#938) ([b842846](https://github.com/decdn/decdn/commit/b84284606b3cc42b9817fb42df21fa5178af6c4b))
+- **cli**: Add `decdn node bond` — idempotent stake-to-tier (#932) (#934) ([5842086](https://github.com/decdn/decdn/commit/58420867c5a5380ea69f93f9975b19aee733b59f))
+- **cli**: Add `decdn node register` for on-chain node registration (#929) (#931) ([a084665](https://github.com/decdn/decdn/commit/a084665360f17ef8ca9eab56c2781274d9727861))
+- **node**: Gate reactive pull-through on authorized origin (#821) (#917) ([416db49](https://github.com/decdn/decdn/commit/416db49ba020d8c18c8f90a5c60e660bbc3e0c2e))
+- **contracts**: Rejection cooldown for blacklist appeals (#688 item 1, H-4) (#913) ([9e69fe2](https://github.com/decdn/decdn/commit/9e69fe2c4c35f7ddecce5047339a4b5a42bc36b3))
+- **contracts**: Enumerate deferred PaymentChannel settlements on-chain (#902) (#908) ([cc76bce](https://github.com/decdn/decdn/commit/cc76bceeb244a4008b9a57b073c512f3333ada00))
+- **node**: Window-paced pull-through for regional proxy warming (#856) (#893) ([f2b4a61](https://github.com/decdn/decdn/commit/f2b4a61e5021b9abfc7bf84c95f051cd21f992f6))
+- **contracts**: Live Balancer V3 swap binding for BuybackBurner (#686) (#898) ([d8c2d31](https://github.com/decdn/decdn/commit/d8c2d31959e66d8993ace3ee4fc26f643640c488))
+- **node**: Bootstrap reconciliation for orphaned buyer channel deposits (#763) (#903) ([71b8b89](https://github.com/decdn/decdn/commit/71b8b8918bcd604366694a86a73b35454b84121e))
+- **node**: Wire live DHT prefetch acquisition + ledger feedback (#820) (#899) ([1d92267](https://github.com/decdn/decdn/commit/1d92267624a35f9f89bdcc1df3cc81c9a3702228))
+- **node**: Meter refused serve_stream paid-delivery requests (#876) (#884) ([68d78a2](https://github.com/decdn/decdn/commit/68d78a220895747c5f95d5b1d292d6e56fb93668))
+- **node**: Node-to-node cache-miss pull-through + outbound reputation (#831) (#834) ([c602c52](https://github.com/decdn/decdn/commit/c602c521c1812f2a612af474ba2de3cfdd749b9c))
+- Network reputation gossip aggregation + settlement indexer (#326) (#832) ([359a50b](https://github.com/decdn/decdn/commit/359a50b279a69d9535ba948c71dd0abf4a394bb8))
+- **node**: Chain-backed origin directory + OriginAssignment/PublisherRegistry bindings (#651) (#830) ([f28b994](https://github.com/decdn/decdn/commit/f28b99430093deb48b9334de203d68e809714f14))
+- **node**: Operator-configurable self-hosted discovery (#818) (#829) ([d7eefe6](https://github.com/decdn/decdn/commit/d7eefe69d92d50d967067cedb18b624647ef834d))
+- **common**: Validate-time relay URL parse check (#818) (#828) ([d32660e](https://github.com/decdn/decdn/commit/d32660e6baa7e2a87673d412afce0ae4cdd54578))
+- **node**: Add DHT prefetch popularity signal + decision engine (#650) (#819) ([f41e335](https://github.com/decdn/decdn/commit/f41e3359e5fa292dd8bc43a27bc17524d3578860))
+- **node**: Multi-relay config + reachability-gated endpoint bring-up (#795) (#817) ([3400ad0](https://github.com/decdn/decdn/commit/3400ad0422de179bfa1e658e6cc857e3dc0b3a16))
+- Per-region bandwidth accounting (#750) (#816) ([de0321f](https://github.com/decdn/decdn/commit/de0321fba4ce65cb5de4ebf5b3191c70431a1f79))
+- **node**: Instrument settleChannel finalization sweep (#810) (#812) ([c0352ee](https://github.com/decdn/decdn/commit/c0352eea8d141892d65c0e2a186cd5a682c9bfe4))
+- **contracts**: Enforce maxEvidenceAgeUs↔unbondingPeriod mirror on CapacityBond (#778) (#809) ([d96e563](https://github.com/decdn/decdn/commit/d96e5633c0128a9163b27f3bcee50d757f160851))
+- **node**: Bound download-receipt log with size-based rotation (#802) (#807) ([1598c94](https://github.com/decdn/decdn/commit/1598c94030a41ce99843591e3224a4a180f599b3))
+- **cache**: Decompress Content-Encoding on the S3 origin (#804) (#806) ([b25f3c2](https://github.com/decdn/decdn/commit/b25f3c29f243f36cfa466e4e6abd155ac9d8c985))
+- **contracts**: Enforce ADR 030 region-ripening predicate in blacklist scope/slash (#761) (#800) ([fdb69b6](https://github.com/decdn/decdn/commit/fdb69b66aa8e4053ce36f30f3a04231ef1e9ea9a))
+- **node**: Cooperative gossip shutdown via CancellationToken (#805) (#808) ([6005a2c](https://github.com/decdn/decdn/commit/6005a2c95064cf6b4a2ad1190167291cd8183f1e))
+- **cli**: Add `decdn node channels` payment-channel snapshot (#749) (#791) ([ebc1100](https://github.com/decdn/decdn/commit/ebc11008889748a4b9734ee33484333b82a853d5))
+- **node**: Configurable per-channel auto-settlement trigger (#742) (#789) ([e13b6b8](https://github.com/decdn/decdn/commit/e13b6b8198611bc4d2990cc3d0b8cbeb5304258b))
+- **node**: Per-blob download receipt log (#248) (#790) ([303acc6](https://github.com/decdn/decdn/commit/303acc6d51b20e6f2fcfa5a09d753fb48cf0e636))
+- **node**: Surface ChainStakerSet watcher drift via metrics (#783) (#788) ([2826365](https://github.com/decdn/decdn/commit/28263656488e3782976a4cec8bb706c14673fb50))
+- **node**: Probe-time stake-lane probe-acceptance reservation (#757) (#782) ([dfee529](https://github.com/decdn/decdn/commit/dfee529ac94cc3a570cb77ff8956654d88970452))
+- **node**: Seller-settlement robustness follow-ups (#751) (#781) ([f528498](https://github.com/decdn/decdn/commit/f5284985555e8de766c7a8bc573b42b4972f7b34))
+- **cli**: Add `decdn node status` for DHT routing-table health (#741) (#759) ([7cbdc2a](https://github.com/decdn/decdn/commit/7cbdc2a64a983e7f5663135474dc83c63caa8729))
+- **contracts**: Enforce + govern the capacity-bond curve on-chain (#770) (#774) ([eda9452](https://github.com/decdn/decdn/commit/eda9452c3de49aecb154f9882f690a59e55b71d8))
+- **incentive**: Detect and surface payment-channel nonce gaps (#747) (#767) ([d3d8e84](https://github.com/decdn/decdn/commit/d3d8e847eff73ad996e9760be6fe2b0be17799e7))
+- **node**: Buyer-side PaymentChannel openChannel for cache-miss settlement (#744) (#753) ([255167e](https://github.com/decdn/decdn/commit/255167e727f43a901d382ef26e0ef5c1a286f447))
+- **node**: Split probe-hold refusal metric by cause — disabled vs exhausted (#739) ([3baadab](https://github.com/decdn/decdn/commit/3baadab370dda4fe2f8216c3d0182432cd18a4b8))
+- **node**: Cdn/client/v1 paid-delivery handler + node-to-node requester (#317) [3/3] (#733) ([d4c9c3f](https://github.com/decdn/decdn/commit/d4c9c3fb6644a095b5fed0f8addfe1b61f30ae5e))
+- **incentive**: Stream slash-sig, BindNodeId verify, wire-voucher bridge (#317) (#732) ([11ca234](https://github.com/decdn/decdn/commit/11ca234f402f33972f07dcbabd2ad66ad2d3a281))
+- **protocol**: Cdn/client/v1 paid-delivery wire types (#317) [1/3] (#731) ([16e400f](https://github.com/decdn/decdn/commit/16e400f3fee9bb148ed878b4e75b0e63583e0132))
+- **protocol+node**: Promote NodeId/Hash from aliases to newtypes (#653) (#726) ([eccb73f](https://github.com/decdn/decdn/commit/eccb73f6665b0b91bff74b332f9132591539f1b5))
+- **contracts**: Enforce declared-capacity band on CapacityBond.declareMbps (#722) ([b8d49c8](https://github.com/decdn/decdn/commit/b8d49c8dc9ce280b3f102e6346795250602840a8))
+- **contracts**: Extend DeployProtocol + full E2E integration (#452) (#720) ([bfca7d7](https://github.com/decdn/decdn/commit/bfca7d75c8d1842b692d4ea625c8f123fb565896))
+- **contracts**: Add OriginAssignment publisher-propose / DAO-ratify authority (#452) (#718) ([6329831](https://github.com/decdn/decdn/commit/6329831b426e15d40135688c6f2cb337b79f2a16))
+- **contracts**: Add SlashJudge evidence verification + challenge bonds (#452) (#717) ([895c457](https://github.com/decdn/decdn/commit/895c457bf21bfc774334a1d11d34c50a72566a28))
+- **contracts**: Add PaymentChannel USDC settlement gateway (#452) (#716) ([1bc5930](https://github.com/decdn/decdn/commit/1bc5930ee86cdb00204493a92127d037a0e25d36))
+- **node**: Implement DHT BatchStore handler-side admission (closes #648) (#713) ([441a676](https://github.com/decdn/decdn/commit/441a6764ad95b3a337595b8ecd615129e1d452c9))
+- **contracts**: Production Ed25519Verifier (closes #669) (#712) ([a235b2e](https://github.com/decdn/decdn/commit/a235b2ed1114a6799ac10416361e659a27705913))
+- **contracts**: Production DeployProtocol script (closes #694) (#700) ([f54e98c](https://github.com/decdn/decdn/commit/f54e98ccd367af7a61d101ade325bfa883ab26c9))
+- **node**: Bound DHT rate-limiter keyspace via lazy prune + periodic GC (#645) (#676) ([df301f7](https://github.com/decdn/decdn/commit/df301f7615dda49c8b92ebcc2558167b74f65214))
+- **node**: Iterative FindValue lookup + negative probe cache (PR 5/5 of #320) (#673) ([ed57ecf](https://github.com/decdn/decdn/commit/ed57ecf1dea43c9e6592cc3601b204707da8a310))
+- **contracts**: Implement ADR 026/028/030/031/033/036 deltas (#684) ([1c663c8](https://github.com/decdn/decdn/commit/1c663c85c2c5165bf07140e379ff021f84ae904a))
+- **cache**: Add iter_hashes + wire DHT republish cold-start (#652) (#677) ([1597283](https://github.com/decdn/decdn/commit/1597283f8cd0f42bf5dd63a8a69d610f19c644cd))
+- **contracts**: Add DecdnGovernor — ve-weighted OZ Governor finishing Partition A (#671) ([afd9e1d](https://github.com/decdn/decdn/commit/afd9e1de9c5717b67bcac09b3b0d2348fbc57b4d))
+- **node**: Chain-backed StakerSet + bootstrap + republish + bucket refresh (PR 4/5 of #320) (#647) ([1bd34cd](https://github.com/decdn/decdn/commit/1bd34cdce12cb85301ad3eb37d790d0ced3d424f))
+- **contracts**: Add bindNodeId + reclaimNodeId to StakingRegistry (#668) ([765c118](https://github.com/decdn/decdn/commit/765c1189e572af4ffec3aa93c894144130071991))
+- **contracts**: Add PublisherRegistry — namespaces and content claims (#667) ([bae7104](https://github.com/decdn/decdn/commit/bae7104a0da850b7f68f7354a45a668e1dde9f4f))
+- **node,cache**: Record store + Store/FindValue + cache hook (PR 3/4 of #320) (#646) ([90b447b](https://github.com/decdn/decdn/commit/90b447bf89e09e135ca0d7cbec4c12d08b89f33a))
+- **contracts**: Add VotingEscrow — linear-decay vote-escrow (#665) ([68a2a27](https://github.com/decdn/decdn/commit/68a2a27175e492d4511d97cef40e6421511fd574))
+- **incentive**: Bound ClientReputationLedger HashMap with LRU eviction (#664) (#666) ([e2f67d1](https://github.com/decdn/decdn/commit/e2f67d10712b650cf581a011012f68e995bde5ad))
+- **contracts**: Add node-registry surface to StakingRegistry (#641) ([71ed8b2](https://github.com/decdn/decdn/commit/71ed8b2fd39ab3493111d03d8991a5ad6dbe4f5e))
+- **node**: Cdn/dht/v1 handler + routing table + 3-layer rate limiter (PR 2/4 of #320) (#643) ([6aad5cc](https://github.com/decdn/decdn/commit/6aad5cc2385d31b0c294fb213aef5e3c8c293717))
+- **protocol**: Add cdn/dht/v1 wire types (ADR 022) (PR 1/4 of #320) (#642) ([f86676c](https://github.com/decdn/decdn/commit/f86676c59c013305aee31d60def42febb9eeeedb))
+- **contracts**: Testnet faucet for ad-hoc TOKEN distribution (#655) ([cdc6d4f](https://github.com/decdn/decdn/commit/cdc6d4f547847e5c272c67f1a0c60660ec63a5ef))
+- **cli**: Add `decdn node drain --wait` for zero-payment-loss upgrades (#604) (#662) ([2bf6052](https://github.com/decdn/decdn/commit/2bf60529b77f00dd32171287c9c453aa74283743))
+- **incentive**: Add ClientReputationLedger building block (#482) (#663) ([a1048e7](https://github.com/decdn/decdn/commit/a1048e7044afff683250dfb7880bffa265289038))
+- **contracts**: Add StakingRegistry — stake / slash / settlement core (#637) ([959ffa0](https://github.com/decdn/decdn/commit/959ffa0ca0a666f800a697f36a3685b6891ca3b7))
+- **contracts**: Add TOKEN — fixed-supply ERC20 with permit and burnable (#635) ([878e395](https://github.com/decdn/decdn/commit/878e3951c5b3a15bb40724a1419076632b24215b))
+- **config**: Aggregate all resolution problems into one error (#222) (#606) ([a274e6d](https://github.com/decdn/decdn/commit/a274e6d600a41b91de97814dc3bb4d99fc3c6418))
+- **node**: QUIC 0-RTT for cdn/probe/v1 (#325, ADR 015) (#576) ([e3a7cff](https://github.com/decdn/decdn/commit/e3a7cffe7d44f4d1be267e12fdfd10d7e0cbadb2))
+- **probe**: Cdn/probe/v1 content-availability + EIP-712 slash_sig (#318) (#569) ([912a240](https://github.com/decdn/decdn/commit/912a2402315dcdd14e2b410e81f0e21c3a3112eb))
+- **node**: Configurable minimum-reputation rejection floor (#441) (#573) ([34aa96e](https://github.com/decdn/decdn/commit/34aa96e893c681c67aded38a54791804db927ea0))
+- **cache**: Ordered multi-origin fallback chain (#284) (#564) ([bc5e912](https://github.com/decdn/decdn/commit/bc5e912d4962bf9cc1b183f154dbf06c50b1bc8d))
+- **cli**: Add `decdn node top` live metrics view (#275) (#485) ([e5998c3](https://github.com/decdn/decdn/commit/e5998c3d57414becf21464e30ebe683b28b4ca66))
+- **node**: Selection algorithm + ADR 008 §9 tie-break (#322) (#380) ([b96fca9](https://github.com/decdn/decdn/commit/b96fca93b91ca5452315d0f8754949e6cedc7e8e))
+- **cache**: Wire iroh-blobs GC into runtime (#518) (#521) ([040b1ed](https://github.com/decdn/decdn/commit/040b1ed4d26299a5e40ab53c444503dff9eb7256))
+- **cache**: Stream S3Origin via ByteStream::into_async_read (#271 PR4/4) (#516) ([11cd4e5](https://github.com/decdn/decdn/commit/11cd4e519e131b75de8d3564ecbe844cc64c2f22))
+- **cache**: Stream HttpOrigin + async-compression decode (#271 PR3/4) (#515) ([fe70c9b](https://github.com/decdn/decdn/commit/fe70c9be6ad7877e261160e1c628d9154aa5a05f))
+- **cache**: Stream FilesystemOrigin + engine.add_stream (#271 PR2/4) (#517) ([55cb245](https://github.com/decdn/decdn/commit/55cb2459b2b9efb680d9bfe06c44e29a89fa2e9c))
+- **node**: Wire ADR 005 QUIC transport defaults (#328) (#491) ([d7e8e71](https://github.com/decdn/decdn/commit/d7e8e7182d26a9206fb2a04f51324ed982d58a25))
+- **cache**: Hit/miss + bytes counters (#418) (#481) ([f536806](https://github.com/decdn/decdn/commit/f5368069d31b01077ea6e6e561d7c296b24b070c))
+- **cli**: Bundle create + appendix-bundles.md (#391) (#469) ([ea439ca](https://github.com/decdn/decdn/commit/ea439ca01e3cd2150cba9172a87482002bc31a3f))
+- Add user-agent override, per-source GC, and origin-kind tracking (#467) ([5ced852](https://github.com/decdn/decdn/commit/5ced8523c0c0b6c0f08c4dbbf22e5590bf00b74e))
+- **cache**: Add S3-compatible origin backend (#437) (#471) ([9f4c898](https://github.com/decdn/decdn/commit/9f4c89875f74503ebc9741742f48a7814fb51dc2))
+- **reputation**: Local EWMA scoring (ADR 008 §3, §14a) (#321) (#468) ([165a1d9](https://github.com/decdn/decdn/commit/165a1d9bc59782ec94dcd272b2c8ab2c8f54acf6))
+- **node,cli**: Load eth_keystore into a live PrivateKeySigner (#406) (#442) ([f502fe4](https://github.com/decdn/decdn/commit/f502fe464c7367a6c470430a893abead23fb5edb))
+- **cache**: Configurable origin retry policy with exponential backoff (#285) (#405) ([9c3d6ef](https://github.com/decdn/decdn/commit/9c3d6efea876b563a4ff0af449ee16bc1447e91f))
+- **incentive**: Add EIP-712 voucher signing, channel state, and rate enforcement (#319) (#407) ([0028a25](https://github.com/decdn/decdn/commit/0028a254162a7cc14089c4861439a0278d768be0))
+- **node**: `--dry-run` preview for `decdn node evict` (#379) (#398) ([44590dd](https://github.com/decdn/decdn/commit/44590ddc7c4e4e042d356fcc5e1378d65c83578c))
+- **dispatch**: Per-IP / per-NodeID connection rate limit (#235) (#386) ([7b41f75](https://github.com/decdn/decdn/commit/7b41f758f18dffa07f333afd89c80c92e252a276))
+- **node**: Add admin_v1_drain + decdn node drain subcommand (#244) (#382) ([2bea4c9](https://github.com/decdn/decdn/commit/2bea4c9ce0bb9ff19a8483c1ce427554e32d31c8))
+- **cache**: Gzip/zstd decompression + blob pinning list (#312, #276) (#372) ([86105e3](https://github.com/decdn/decdn/commit/86105e3c18e34d45a00af72317ca4f189b11ddb6))
+- **node**: Add admin_v1_reload alongside SIGHUP hot-reload (#373) (#381) ([5f8f703](https://github.com/decdn/decdn/commit/5f8f7036795633c8defade79fd5dce61945cc826))
+- **node**: `decdn node evict` and `decdn node announce` (#279, #280) (#371) ([212f815](https://github.com/decdn/decdn/commit/212f81584934d07ccef7d4e6ea95c1659f56b6c2))
+- **node**: Add admin_v1_health and `decdn node health` (#243) (#370) ([a7fd762](https://github.com/decdn/decdn/commit/a7fd762723ee6d573a3b2502f6ba1820ed8a9680))
+- **node**: Hot-reload mutable config fields on sighup (#367) ([166ae41](https://github.com/decdn/decdn/commit/166ae41d88715a943d411de66b941457bcc0c904))
+- **node**: Add rpc connectivity watchdog with rpc_healthy gauge (#366) ([2310ae0](https://github.com/decdn/decdn/commit/2310ae0bffb55fbec850ba4837ff1e4d8b4c51bb))
+- **node**: Make metrics HTTP bind address configurable (#314) ([6f7a5f4](https://github.com/decdn/decdn/commit/6f7a5f451ef2ba0bcdfd5bd516ce797f56bb1cbc))
+- **node**: Add decdn node peers over loopback JSON-RPC admin surface (#247) (#260) ([0b13b46](https://github.com/decdn/decdn/commit/0b13b46aaff98043d7a9b4236c091d7c365fc889))
+- **node**: Surface shutdown signal variant (SIGINT vs SIGTERM) (#265) (#289) ([dbdffcb](https://github.com/decdn/decdn/commit/dbdffcbd0ddf4dfd5a306a18a904a28569e705b8))
+- **node**: Structured startup banner at runtime-ready (#274) (#288) ([56149d8](https://github.com/decdn/decdn/commit/56149d8befddf88ec429a6d40a54c32a9e0b5d77))
+- **cache**: Add cache engine with HTTP + filesystem origin adapters (#232) ([083e85f](https://github.com/decdn/decdn/commit/083e85f8192e52774ed3e426132e18055fffd18a))
+- **gossip**: Node announce publish/subscribe with peer table (#231) ([2fb1381](https://github.com/decdn/decdn/commit/2fb1381d53e240d770e2d415ac18b96db6c2c858))
+- **node**: Add `decdn config validate` dry-run subcommand (#224) (#229) ([ac991f4](https://github.com/decdn/decdn/commit/ac991f45d09ffcf92de21c5341dc4f6ec68bcbfc))
+- **protocol**: ADR 013 varint framing + ProbeMessage enum (#225) ([3d2a2c0](https://github.com/decdn/decdn/commit/3d2a2c0b90267c6264c29e5e742a1c4c554851cc))
+- **config**: Expand ${VAR} and ~ in TOML config fields (#223) (#226) ([cfb955e](https://github.com/decdn/decdn/commit/cfb955e1b4f2ae21067e330afb42c8d5f109eaff))
+- **node**: Runtime bring-up with iroh endpoint and probe ALPN (#213) ([aa7be8d](https://github.com/decdn/decdn/commit/aa7be8d2c6fb748cf5336f8f820eb1038c00dd23))
+- Initialize Cargo workspace with 5-crate structure (#197) ([63362a1](https://github.com/decdn/decdn/commit/63362a13fc300e10b4b8c03a46b7ded0cee31594))
+- Add devcontainer for secure Claude Code sessions (#1) ([a23c23e](https://github.com/decdn/decdn/commit/a23c23e59386e8edaae3edd57cf37e8aa3eddb29))
+
+### Bug Fixes
+
+- **ci**: Run release.yml's native build under bash on Windows (#2386) ([8063835](https://github.com/decdn/decdn/commit/80638354f6865428d7b3ddc982234d5f92747633))
+- **deps**: Bump rand 0.8.5 to 0.8.6 (GHSA-cq8v-f236-94qc) ([2c5f23d](https://github.com/decdn/decdn/commit/2c5f23dfba731c3897a0d0e971709a8d54ad1970))
+- **client,cli**: Lane faults at WARN; typed RPC errors keep their failure class (#2370) ([a09720a](https://github.com/decdn/decdn/commit/a09720adcb055ef205cf0e0d83339c2e7673c498))
+- Remove pre-launch backward-compat shims and reset buyer tables to v1 (#2369) ([cdd1db5](https://github.com/decdn/decdn/commit/cdd1db5e3aa12a76d5ec8811ae6f0f744b7c9de3))
+- **contracts**: Bump http-cache-semantics to 4.3.0 (GHSA-ch52-4w7c-c8xp) (#2368) ([0b7a452](https://github.com/decdn/decdn/commit/0b7a4526b426407bf96156e5dad0bc7c4447870f))
+- **cli**: Name unreadable and corrupt bundle manifest cache files (#2365) ([f1148b4](https://github.com/decdn/decdn/commit/f1148b4a6431d5344bb1951db98034cc75f9e276))
+- **cli**: Check bundle pull --hash --dry-run filters against the cached manifest (#2360) ([20db95e](https://github.com/decdn/decdn/commit/20db95efd6832eba882edf4fb8bb2a79c01ac78b))
+- **client,node**: Steal a slow leg's tail by pull-through and time serve waits (#2348) (#2357) ([64e4e88](https://github.com/decdn/decdn/commit/64e4e884aca2b544e1b399fc0ef41b447827145b))
+- **client**: Mark a transport-failed topUp submit unconfirmed and carry its nonce (#2355) ([f4faa47](https://github.com/decdn/decdn/commit/f4faa4728e08425b92db1c29ce2780964c312315))
+- **client,cli**: Stop a fetch on a spent capability signer instead of retrying (#2349) ([2e091fe](https://github.com/decdn/decdn/commit/2e091fe186fd15b27dceef2ec44cc96ca79ae0e7))
+- **cli**: Give a freed provider permit to the lane that waited first (#2347) ([1a67935](https://github.com/decdn/decdn/commit/1a67935567ef12b04169e62c66884f52eada4280))
+- **client**: Log the holder record on lane-fault lines (#2346) ([a35e7c9](https://github.com/decdn/decdn/commit/a35e7c914243b909139a1d2fde1d789365ff5334))
+- **client,node**: Keep an answered probe when the direct-path wait outruns the timeout (#2345) ([cdf8ece](https://github.com/decdn/decdn/commit/cdf8ece3cc12f0c1c23533132f1862af5313c69d))
+- **node**: Log every voucher rejection once at info (#2344) ([9990ad4](https://github.com/decdn/decdn/commit/9990ad4abb852514365c87916e538e33da9f64c3))
+- **node**: Batch fix for #2328, #2340, #2330, #2320 (#2343) ([cb69f6f](https://github.com/decdn/decdn/commit/cb69f6f995c049c83765891aef773fdd510d1a32))
+- **node,cache,bao-range**: Keep a local store fault off the upstream's score (#2323) ([65a468d](https://github.com/decdn/decdn/commit/65a468dc97acd1e3ab979bd4c19c70bc271764c3))
+- **node**: Give an admit getPool fault a short negative-cache window (#2322) ([5f5605d](https://github.com/decdn/decdn/commit/5f5605df37fdd51589cd16a177fc44cefe5e690b))
+- **node**: Bound admit-path chain reads and keep the RPC failure class in logs (#2278) ([e2413d7](https://github.com/decdn/decdn/commit/e2413d7249cdf51dd5a45516af0e3d1d45faeb85))
+- **node**: Keep a serve miss on the lane answer it resolved (#2316) ([07fc0f8](https://github.com/decdn/decdn/commit/07fc0f8771213bdb9069addae8b71f42828cc094))
+- **node**: Log every serve-miss refusal once at info, naming its path (#2314) ([c6b4d9c](https://github.com/decdn/decdn/commit/c6b4d9c841dcc093d8f9d82650e2731ebfdf83dc))
+- **client,node**: Heal a chain-seeded lane's BytesRegression by rebasing to the seller's anchor (#2313) ([fc23654](https://github.com/decdn/decdn/commit/fc23654a16353794ba8cc0f447b09868bf0fe08e))
+- **node**: Redeem a delegated lane when its serve cutoff passes (#2312) ([de1893b](https://github.com/decdn/decdn/commit/de1893b847b41f3803967ed10608ee2746d3f327))
+- **node**: De-flake ranking, frame-read and duplicate-draw loopback tests (#2311) ([07be3bf](https://github.com/decdn/decdn/commit/07be3bff034d610f9586500407818b4ae00c8230))
+- **cache**: Run origin request sends on the node's main runtime and restore HTTP keep-alive (#2308) ([0b4f285](https://github.com/decdn/decdn/commit/0b4f2857f0148a9fd7c3f77115565c96bf072287))
+- **node**: Pin the deployment preflight ahead of the lane store, and identify the PaymentPool by getRateBounds() (#2280) ([b37bbc4](https://github.com/decdn/decdn/commit/b37bbc4a02e4363a022f20c62baec7f5554f4f62))
+- **cache**: Print the full cause chain in CacheError Display (#2276) ([66f3272](https://github.com/decdn/decdn/commit/66f3272f38db8c142e9c1e5a5a89f99174c40eec))
+- **cli,client**: Batch fixes for adopted-pool spend, tiny top-ups, stale coverage and dedup slots (#2305) ([b205382](https://github.com/decdn/decdn/commit/b20538258146713bd1b734c18bab23e044d6569d))
+- **client**: Let a partial holder steal the covered tail of a busy leg (#2303) (#2304) ([7f938e6](https://github.com/decdn/decdn/commit/7f938e6b8437eba614e54375dcbc504de108379d))
+- **client**: Stop a steal's victim at the split on its open stream and split by rate (#2299) ([2b41189](https://github.com/decdn/decdn/commit/2b41189381f60cde083c7d0d79abcffd82ceea1b))
+- **client,cli**: Grow a draining lane up to its free stream permits and free idle ones (#2252) (#2293) ([8c44072](https://github.com/decdn/decdn/commit/8c44072b3378540726249ce40ddfe2f61f5511e1))
+- **monitoring**: Chart and alert the unmonitored series; fix a duplicate refId ([41b6830](https://github.com/decdn/decdn/commit/41b6830d4bf5b82387b1bfa296688e23df5a48ac))
+- **cli,client**: Fund the buyer pool from its pool-wide spend (#2291) ([8acfcc2](https://github.com/decdn/decdn/commit/8acfcc2868f73606f35dd675fe6ac836d2a6289f))
+- **node**: Bound the proof wait on time and classify its faults (#2287) ([9f243c9](https://github.com/decdn/decdn/commit/9f243c9f0ff11debbd981da1a7aff51b4112b56c))
+- **client,cli**: Keep the bundle task polled while records and fsyncs run (#2274) ([e64368f](https://github.com/decdn/decdn/commit/e64368fc65f551e475ca78b88dd720f12426fc5c))
+- **client,cli**: Retry lane growth until a faulted remainder finds a stream (#2273) ([dc1c210](https://github.com/decdn/decdn/commit/dc1c21058d1abaa5b7bce7ba7cba96c525a12a06))
+- **node**: Wait out a proof while the stream's bytes still drain (#2272) ([3a565c1](https://github.com/decdn/decdn/commit/3a565c1d16466206afb6ece4901d984147e90dc4))
+- **node**: Log the full error chain when the capacity-bond registry resync fails (#2259) ([5539cd0](https://github.com/decdn/decdn/commit/5539cd0896e54c891d1b5d913573052e3aac1e5f))
+- **cache**: Seed eviction recency from the on-disk store at open (#2261) ([2e1a93c](https://github.com/decdn/decdn/commit/2e1a93c5bdcb05f70335662e1655e812ab882acb))
+- **node**: Batch fix for RPC URL redaction, signer-auth fallback, pull-through loop, watcher flapping (#2270) ([6a66769](https://github.com/decdn/decdn/commit/6a66769d41b3a478cd2edf6d96e5995c3b4667c0))
+- **client,node,cli**: Bar refused pull-through, refuse over-ceiling ranges, heal stale under-fold, hold expiry margins (#2263) ([cb83e28](https://github.com/decdn/decdn/commit/cb83e28bee2db5ad5fd239ef5f193fd643b35660))
+- **node**: Clamp a presented capability to the signer's on-chain registration (#2266) ([6e1f8b4](https://github.com/decdn/decdn/commit/6e1f8b417b3c67fd9e5ab375f064a0f082904241))
+- **node**: Keep the error chain when handlers return AcceptError (#2251) ([ef4bb89](https://github.com/decdn/decdn/commit/ef4bb891ea350280a7316c4339963f2da1c0cb41))
+- **node,cli,client**: Dial nodes directly via registry multiaddrs and pkarr (#2249) ([ef84c76](https://github.com/decdn/decdn/commit/ef84c76aadb6e258c4aa019e06eb10b34f216282))
+- **client**: Time probe RTT on the open connection, log lane coverage (#2248) ([4fd9b70](https://github.com/decdn/decdn/commit/4fd9b7015f0a07efbc5d32b9da77d448eefd39fb))
+- **node,cache**: Sample decdn_probe_hold_slots_used at scrape time (#2245) ([5aa68b3](https://github.com/decdn/decdn/commit/5aa68b3305fc6ddc1448d496e4ab97909b74f6d7))
+- **cli,incentive,node**: Count resumed bundle bytes apart, tag buyer rows with the chain id, flag unmatched filters (#2244) ([c040691](https://github.com/decdn/decdn/commit/c0406912864398c7e814434e3068cdcaeca93186))
+- **node**: Bind the seller store to its PaymentPool deployment (#2191) ([e90f1e3](https://github.com/decdn/decdn/commit/e90f1e39d2dda0f5ae0df6e521361f8cd0b8a672))
+- **cli**: Pre-check reclaim --pool and name the cause and deadline (#2238) ([4904d7c](https://github.com/decdn/decdn/commit/4904d7c09f36d7b3fd3d21cff3c1603f6c2c3161))
+- **client,cli**: Log each lane fault where it happens and grow a busy lane for its remainder (#2231) ([74e2cd4](https://github.com/decdn/decdn/commit/74e2cd42d973c2f6912b799639566eb87d7f60ab))
+- **node**: Stop partial holders pulling a blob from each other in a loop (#2227) ([b9e30ae](https://github.com/decdn/decdn/commit/b9e30aedf86b167672b3cde04a7fbdc13ee0436c))
+- **node**: Apply the redeem floor before the pre-redeem watermark read (#2217) (#2226) ([6f024ba](https://github.com/decdn/decdn/commit/6f024baffbe4067a7b46547db1570209c2f70b63))
+- **node,cache**: Let a serve-miss pull draw for its parked leg past a sibling's demand (#2219) ([aacaf46](https://github.com/decdn/decdn/commit/aacaf469e0defb5ae162b173c129e55d5c1ce812))
+- **cli,client**: Batch fix bundle-pull lane, watchdog and dedup bugs (#2212) ([ece7897](https://github.com/decdn/decdn/commit/ece789703e75ecb0015cf6ec1f5feea15b539f86))
+- **node**: Log the operator fee share at INFO only when it changes (#2216) ([3df5cdf](https://github.com/decdn/decdn/commit/3df5cdf23dbce87afe9fc2779a21d360d306c7c4))
+- **node,cache**: Seed a serve-miss outboard only from held ranges inside its range (#2207) ([8886c85](https://github.com/decdn/decdn/commit/8886c85c66f2f6f07db61b440e89b6e6d86be288))
+- **monitoring**: Fire DecdnFeeSharesPollFailing on repeated re-read failures (#2206) ([7bba614](https://github.com/decdn/decdn/commit/7bba614ece8b5d4c936a33c15773e3172f7258cf))
+- **client,cli**: Rank peer-store latency by probe RTT only (#2196) (#2202) ([2153388](https://github.com/decdn/decdn/commit/2153388b64484dad2a039dc3ab1347306e40e9f7))
+- **node,cache**: Reach the directory origin when DHT holders are partial-only (#2201) ([0cf9688](https://github.com/decdn/decdn/commit/0cf9688301c26fd8ed22c728186fcee63af9ec21))
+- **node,client**: End a stranded serve-miss pull instead of re-paying its range (#2200) ([8102004](https://github.com/decdn/decdn/commit/81020045f04ce43dea7d4ad827981c0a7f5d8b52))
+- **cli**: Measure bundle pull -v entry lines on downloaded bytes, not spliced ones (#2192) ([02d5151](https://github.com/decdn/decdn/commit/02d515181f708586581d0b9482d89c23fd83130f))
+- **monitoring**: Repair four dashboard panels that read zero, NaN or dead series (#2199) ([6bdd414](https://github.com/decdn/decdn/commit/6bdd414c381da2c017211056546feb74439a066e))
+- **cache,node**: Announce ranged-fill partials to the DHT (#2188) ([8d27ddf](https://github.com/decdn/decdn/commit/8d27ddf56acd7ef123d4d39f74a7acb2e50fb652))
+- **node,client**: Dial pull-leg upstreams on the main runtime so SIGTERM never hangs (#2187) ([0502e2d](https://github.com/decdn/decdn/commit/0502e2d6db6d97126bc4ebd7fb65421ebf57c8d2))
+- **node**: Batch steady-state DHT republishes with a capped look-ahead drain (#2183) ([06955a3](https://github.com/decdn/decdn/commit/06955a38f49a3358bde7b45871539a736bcb464b))
+- **node**: Wait out a backpressure refusal from the sole coverer instead of dropping it (#2180) ([e55b48d](https://github.com/decdn/decdn/commit/e55b48de808e9e95cdbd2ffc8c2d18cb3f1253e4))
+- **node,client,cli**: Keep the credit ramp across back-to-back pulls and widen bundle lanes (#2176) ([f9be65a](https://github.com/decdn/decdn/commit/f9be65af8714c591b5ce852a43ddc8525d1e45c0))
+- **node,client**: Heal a stale payer by lane headroom, not the stream count (#2175) ([e862222](https://github.com/decdn/decdn/commit/e8622220acfcbc92285f89bcd522f0f6ace2524b))
+- **incentive,node**: Reject an under-folding voucher with the resume bundle (#2170) ([1fed204](https://github.com/decdn/decdn/commit/1fed204b88cf176114fa556d6c46054fd0124bbd))
+- **node**: Attribute every inbound stream failure to one reason counter (#2166) ([74b13a5](https://github.com/decdn/decdn/commit/74b13a5c688d93444aca1782cbc60a53b09ed660))
+- **cache,node**: Close the two-leg spine residuals from the #2064 review (#2162) ([dd30114](https://github.com/decdn/decdn/commit/dd30114628ea9f5ab32b8bde303f0e7d35ad1b7a))
+- **node**: Pin boot enumeration snapshots below the reported head (#2165) ([e834ccd](https://github.com/decdn/decdn/commit/e834ccda0e8c6bcb3d37743735b5df42e71b21d8))
+- **node**: Retry a transient eth_getLogs window inside the poller tick (#2163) ([ce98e34](https://github.com/decdn/decdn/commit/ce98e346cb38cd9946820fae00bbab4fff22ad01))
+- **node**: Retry transient boot-time chain reads instead of exiting (#2160) ([88861ff](https://github.com/decdn/decdn/commit/88861ff5be984975d8bc39162012ed64957514ac))
+- **cache**: Size partial blobs by present bytes in size_snapshot (#2158) ([e229c2b](https://github.com/decdn/decdn/commit/e229c2b4071a92c395d6119eba7ebfb8713bf54f))
+- **node**: Resolve a failed receipt wait by hash before classifying a redemption (#2155) ([891196e](https://github.com/decdn/decdn/commit/891196e5ab6755cd813336670c594442516c22f5))
+- **node**: Shrink the eth_getLogs window on provider range caps; alert on never-ticked watchers (#2152) ([3ebf5f1](https://github.com/decdn/decdn/commit/3ebf5f17eec0399d43a744e6efbb997675e371d7))
+- **tracing**: Drop dependency spans from export; span each ranged pull run (#2148) ([a4eaead](https://github.com/decdn/decdn/commit/a4eaeada6f287699bff5d0b55d507916bada2b05))
+- **node**: Write node_id on every JSON log event (#2147) ([988cdfa](https://github.com/decdn/decdn/commit/988cdfa467cce02dcd15d523af479ed86949d304))
+- **node**: Bind IPv6 on the configured QUIC port (#2144) ([869141e](https://github.com/decdn/decdn/commit/869141e9996afb1bdb0622d767ee0a2f19b24163))
+- **client**: An empty ingest prefix marks nothing present (#2142) ([f34e543](https://github.com/decdn/decdn/commit/f34e543e321042bf83e49840a6ac3abb2180bb21))
+- **cli,client**: Put the entry floor on the multi-source path (#2141) ([dc4813c](https://github.com/decdn/decdn/commit/dc4813c4d6ed3491c959051acd18c9f5f29f0100))
+- **node**: Meter serve-loop payment faults by cause and deflake the hash-mismatch test (#2137) ([bdba9e6](https://github.com/decdn/decdn/commit/bdba9e60c0d51becc614bc8c23b7e4508f6418cf))
+- **node**: Keep a partly paid chunk owed so the serve loop cannot spin (#2132) (#2133) ([5ca3e7f](https://github.com/decdn/decdn/commit/5ca3e7f1c5ac84890fb5b666b29b6f384e3797ec))
+- Unstall bundle pull (runtime I/O, lane credit, ingest fsync, probe limits, boundary legs) (#2124) ([8d7c6f5](https://github.com/decdn/decdn/commit/8d7c6f55b4d7d7cf41743892f9368e0f0ead56bc))
+- **cli,client-pull**: Harden bundle pull failover, dedup complement, and data-dir guards (#2122) ([61c13b0](https://github.com/decdn/decdn/commit/61c13b04fc2634f56f09c8d47beea1ace3b38034))
+- **client-pull**: Keep ingest disk I/O off the tokio runtime (#2121) ([772e4ef](https://github.com/decdn/decdn/commit/772e4efa2cbf1556236598945d0328da99ff5ef4))
+- **cache,client-pull,node**: Stream cold two-leg misses at bandwidth (#2061) (#2116) ([8a32f7d](https://github.com/decdn/decdn/commit/8a32f7dd82547fc6bb5cf06443974c9a0716c791))
+- **protocol,node,client-pull**: Reject an underpaying voucher with the watermark and rebase the payer (#2103) ([77e8034](https://github.com/decdn/decdn/commit/77e80344d5e98a99054efb955a583453e188c5b0))
+- **cli,incentive**: Adopt the pool the wallet already owns instead of opening a second (#2098) ([1b0c4de](https://github.com/decdn/decdn/commit/1b0c4def3de7e87ddd4ac98963fa2b6501bc28c4))
+- **incentive,node**: Scope buyer pool rows to their PaymentPool deployment (#2087) ([6dd2ee7](https://github.com/decdn/decdn/commit/6dd2ee7f40d38641c4300483520533edad67644c))
+- **cli**: Batch of five CLI fixes around the node-vs-client data dir (#2085) ([730db36](https://github.com/decdn/decdn/commit/730db36a94035e89da5d23965d3fda91b2cf948f))
+- **cli,node**: Read the node's buyer pools from the node, not a store beside it (#2081) ([b377d3e](https://github.com/decdn/decdn/commit/b377d3e7f7ecbc3f271e8e11bb98dfc2a2f378b1))
+- **node,contracts**: Read pre-redeem watermarks through the contract's own batch view (#2079) ([3cc5537](https://github.com/decdn/decdn/commit/3cc5537d6d2f8e35828415ac25ce755a0c4759b5))
+- **node,incentive**: Adopt the payment pool a node already owns (#2075) ([8095370](https://github.com/decdn/decdn/commit/8095370ce418daf2d096193a7b042396f07be0b3))
+- **node**: Skip the coherent encode on the 0-byte blob (#2068) ([1a03500](https://github.com/decdn/decdn/commit/1a03500b341245c6635f74388e9e3989e5fb84b6))
+- **cache**: Window origin range pulls to bound memory (#2065) (#2066) ([c4f5ab7](https://github.com/decdn/decdn/commit/c4f5ab74e1d3d8f55ef946dfe3e4466a855ab8ef))
+- **monitoring**: Read tempo panel traceql from query, not expr ([50671d1](https://github.com/decdn/decdn/commit/50671d10ade5c1107f060afc1ddfc5cae40c30e6))
+- **node**: Persist lane paid watermark so a restart stops re-submitting redeemed vouchers (#2052) (#2053) ([af50d7a](https://github.com/decdn/decdn/commit/af50d7a782d08f6fdc40c4088cfa1ff4654a9aa6))
+- **node**: Count only claimed headroom when a reactive top-up joins an in-flight topUp (#2012) (#2018) ([40117d4](https://github.com/decdn/decdn/commit/40117d460bfe7913980dfd960a3b9235b0db5772))
+- **deps**: Bump rustls to 0.23.45 for RUSTSEC-2026-0285 (#2017) ([a37e6d4](https://github.com/decdn/decdn/commit/a37e6d463bd14304a9e5c033a6865c8db60e0ddb))
+- **node,cache,client-pull**: Unstick the fused serve-miss past the ramp floor and size node top-ups correctly (#1893) (#2010) ([f564102](https://github.com/decdn/decdn/commit/f564102a4f98330f16e12d878ba7173b0992cb1b))
+- **node**: Start a source's warming allowance full, per ADR 041 (#2003) ([f254977](https://github.com/decdn/decdn/commit/f254977ae2b63f3b06d06ab2f14c161eed6800dd))
+- **node**: Credit below-frontier reveals from lane headroom so concurrent same-lane streams don't starve (#2007) ([8698f15](https://github.com/decdn/decdn/commit/8698f15992284443107dbd425fe430b52fba32aa))
+- **cli**: Build every progress bar inside its MultiProgress before touching it (#2006) ([23a7929](https://github.com/decdn/decdn/commit/23a7929cfeb4183838f4fecc71eac79b10226c97))
+- **client-pull**: Stop the spent chain epoch overflowing on its next-index check (#2005) ([3f62dc5](https://github.com/decdn/decdn/commit/3f62dc5e9feb4c8e6c2ae2d72e8ec540fd64602f))
+- **cli**: Show bundle-pull speed and ETA on the total bar, not per file (#2004) ([2c4934d](https://github.com/decdn/decdn/commit/2c4934d0c210e681b0f46bb879afc1af431e2489))
+- **cache**: Quarantine a held blob when its serve trips a stored hash mismatch (#2002) ([7ee656c](https://github.com/decdn/decdn/commit/7ee656c979c5de100d9251bbd8be93a13bb3e4e1))
+- **node**: Attribute every reputation outcome to its peer (#1987) (#2001) ([bb53bc7](https://github.com/decdn/decdn/commit/bb53bc74a398a1ffb3b51e2f798c26aee445e9e2))
+- **client-pull**: Confirm the armed voucher on a StreamEnd read after its write failed (#1999) ([c233632](https://github.com/decdn/decdn/commit/c23363219c0d6934e7bb179b44605e55b2559a8d))
+- **client-pull**: Shuffle candidates before the region sort so the probed K is a random sample (#1997) ([3ee475d](https://github.com/decdn/decdn/commit/3ee475da340de3353d880931eb47d3209d309ab9))
+- **cli**: Resolve whoami data dir from config, not just ~/.decdn (#1998) ([4c3ddd1](https://github.com/decdn/decdn/commit/4c3ddd176416144ab193db5ca0e65272bd407e0c))
+- **node**: Read the 0x10 RATE_LIMITED close requester-side instead of scoring Unreachable (#1993) ([96636ac](https://github.com/decdn/decdn/commit/96636ac78842c0f04363ec86fb6b0d0e93a89b7c))
+- **client-pull**: One receive loop — verify every chunk group as it lands on every path (#1994) ([0b94efe](https://github.com/decdn/decdn/commit/0b94efe4ab611229b42be06518a149b3003b2d45))
+- **dht**: Size record caps for chunked catalogues; bound coverage bitmaps (#1981) ([892195f](https://github.com/decdn/decdn/commit/892195f3186c4b48fc4fa743683417b8f0c5db66))
+- **cli**: Preset chunked-file progress-bar denominator to whole-file size (#1979) ([ca29165](https://github.com/decdn/decdn/commit/ca29165c16b033c2efd0fd4c4cdd31cbbb486e69))
+- **cli**: Whoami reports the client eth keystore, not just the node key (#1980) ([4c99cb7](https://github.com/decdn/decdn/commit/4c99cb76f10c77001792ecbbb639894dda19569b))
+- **client-pull**: Surface resume base on the progress bar before the first chunk (#1978) ([b1951ef](https://github.com/decdn/decdn/commit/b1951efb424b5c8d3096d176445388a408883544))
+- **cli**: Stop bundle-pull total bar tearing and fix its denominator (#1974) ([30e05dc](https://github.com/decdn/decdn/commit/30e05dc09905a3889bab901915f5f3c05d14525a))
+- **cli**: Report keystore password source, refuse empty-env create (#1934, #1935) (#1963) ([32dac21](https://github.com/decdn/decdn/commit/32dac21ce2e4f639d717b7ab76210bfd3a6e61e3))
+- **node**: Re-check signer cap headroom mid-stream on the serve path (#1962) ([a663994](https://github.com/decdn/decdn/commit/a663994dcd8ceb621a5f0f6fbe102a54838b578b))
+- **node**: Drop the redeemer's per-voucher getAuthorizations read (#1961) ([4d99903](https://github.com/decdn/decdn/commit/4d99903956b350af447d55390d88316f9b5d500d))
+- **node**: Drop the redundant serve-side blob-size ceiling (#1959) ([4c22a4f](https://github.com/decdn/decdn/commit/4c22a4fe03a7473f56a080a52bb2490cafab76d9))
+- **node**: Confirm signer cap headroom on-chain before admitting a serve (#1958) ([6bcf51d](https://github.com/decdn/decdn/commit/6bcf51dd0adcfc26877638873e0c70d9a775ed63))
+- **node**: Confirm a pool on-chain before admitting a serve (#1956) ([166492b](https://github.com/decdn/decdn/commit/166492bd529c172a93ce7179d2c7f9eac623ed0e))
+- **cli**: One monotonic progress bar across multi-source lanes (#1955) ([330ed83](https://github.com/decdn/decdn/commit/330ed83214e640ab4a8757c5e4636551b4e0d253))
+- **node**: Heal a restarted client whose watermark fell behind (#1954) ([ca786d9](https://github.com/decdn/decdn/commit/ca786d9c4230fd6350125349ce02bc4e3c82fe9e))
+- **node**: Fold owner-signed capability material onto the lane record (#1928) ([a5ecd66](https://github.com/decdn/decdn/commit/a5ecd66ae88248b7c07e53744297509ea82f1af3))
+- **node**: Resolve cold-start pool owners so a new provider can register a lane (#1923) ([9103323](https://github.com/decdn/decdn/commit/91033239994e43f0a427fc869d7237f2bf711dfb))
+- **cli,setup**: Re-register a deregistered node whose binding survives (#1919) ([5a8ab55](https://github.com/decdn/decdn/commit/5a8ab55caeb0deebca07349d39aabdb4139c429a))
+- **cli,client-pull**: Fail when a landed on-chain effect cannot be recorded (#1903) (#1916) ([5f1e3ab](https://github.com/decdn/decdn/commit/5f1e3ab695b88536af858fbc9bc3d6e23245f3c0))
+- **common,node,cli**: Route config-resolve notices to the log stream (#1902) (#1915) ([4de327b](https://github.com/decdn/decdn/commit/4de327be86673fdbb2ac299f9d2d6a47393f1121))
+- **cli,common**: Fetch bootstraps cold content from origins instead of bailing on empty holders (#1911) (#1912) ([6f923af](https://github.com/decdn/decdn/commit/6f923af6d139ffc793713b10a7a8bb3d2dc59f9d))
+- **client-pull,node**: Survive the end-of-stream STOP_SENDING race at fetch completion (#1909) ([7d2094c](https://github.com/decdn/decdn/commit/7d2094c79514505ebe1644f64a2a76b6e747b0ed))
+- **node,client-pull**: Enforce max_blob_size on received bytes, not the peer claim (#1895) (#1899) ([adab034](https://github.com/decdn/decdn/commit/adab03425a1b48b367551069dca1154bbdc7d959))
+- **node,e2e**: Don't dead-charge a client on a pre-spend miss refusal (#1598) (#1892) ([ce8ff91](https://github.com/decdn/decdn/commit/ce8ff915d5be879c6a0decc96e7cb32610ae8c68))
+- **cli**: Stop gating client fetch on blob size by default (#1891) ([fd5ff7b](https://github.com/decdn/decdn/commit/fd5ff7b55d9e8a8d900218a0cdc7828b8fe04939))
+- **node,cache**: Correct the sharding docs, guard the sketch floor (#1803 review) (#1855) ([15de57b](https://github.com/decdn/decdn/commit/15de57b7f7816d542f27dd7a6d1d33b4345ea849))
+- **node**: Serve path converts faults into silent empty successes (#1833) (#1837) ([effd55f](https://github.com/decdn/decdn/commit/effd55fccfe4d51356ed845f4a38af7fbb9e2ac8))
+- **node,protocol**: Close the #1828 review findings on the zero-copy frame path (#1835) ([99a2e64](https://github.com/decdn/decdn/commit/99a2e64415c9b1af531bcde0a1e334402975b8ae))
+- **node,e2e**: Harden CI flakes (2b+2c+3+settlement) (#1827) ([3054c22](https://github.com/decdn/decdn/commit/3054c22fee8615f166731d79a2607c2191476a71))
+- **node,cache,dht**: Close the three #1813 review follow-ups (#1819) ([9475536](https://github.com/decdn/decdn/commit/9475536f57a9516bcda3ac17976a61c0c7806195))
+- **node,cache,dht**: Close the six #1806 review follow-ups (#1813) ([43d27e0](https://github.com/decdn/decdn/commit/43d27e019b03a0987ac1b887e76f0ca1c6daa5dd))
+- **node,dht**: Sweep the republish scheduler after a lagged commit stream (#1806) ([da1c527](https://github.com/decdn/decdn/commit/da1c52790c3beae17117495a29fdba32d07bcb72))
+- **node,payments**: Tombstone forgotten floor-loss rows, meter persist failures (#1784) ([1ece85d](https://github.com/decdn/decdn/commit/1ece85d577ab9cdaff4fe85880c518f0bc001e9d))
+- **node,client-pull**: Bound test teardown, observe the abandon drain (#1779) (#1785) ([bf45319](https://github.com/decdn/decdn/commit/bf45319e117c311f0a76015507b2551919cfe14c))
+- **deps**: Patch h2 to 0.4.16 and scope-ignore the dev-only h2 0.3 advisory (#1721) ([87dd6b8](https://github.com/decdn/decdn/commit/87dd6b8352ac8303ad84e4deb40991990faba016))
+- **ci**: Regenerate stale gas snapshot after #1711 coverage guard (#1720) ([e1d533f](https://github.com/decdn/decdn/commit/e1d533f3095da523704e761fc2dcf468698685fc))
+- **node**: Make payment.rate_per_mb restart-required, not hot-reloadable (#1684) ([ad40da7](https://github.com/decdn/decdn/commit/ad40da7c4c112dc4c776494469aef96f6280640b))
+- **node**: Window-pause lost-wakeup hang + instrument the serve-miss early-eof (#1673) (#1674) ([c202bd2](https://github.com/decdn/decdn/commit/c202bd2e8418379cb132a5659bcfb648792d369b))
+- **release**: Gitignore cargo-semver-checks scratch dir ([258d151](https://github.com/decdn/decdn/commit/258d151c82b21223dce262d47969f4538314256b))
+- **release**: Truncate oversized GitHub release notes ([320cd69](https://github.com/decdn/decdn/commit/320cd698fda36b863410fd5c0b3c290f7ee3dcd5))
+- **release**: Drop invalid [workspace] header from release.toml (#1632) ([82be5db](https://github.com/decdn/decdn/commit/82be5dbd4095af3d0066bb2fdc3f503c1461e307))
+- **cli**: Don't re-pay for an already-complete chunk-aligned partial (#1622) ([aecf783](https://github.com/decdn/decdn/commit/aecf78364505a7e465666242d2af248010867f27))
+- **cache**: Attach s3://bucket/key context to body-phase stream errors (#1618) ([2bd4878](https://github.com/decdn/decdn/commit/2bd4878b8f87ec174b4ddd2b8dc81de0c63ee796))
+- **node**: Keep the post-top-up delivery leg in the delivery-speed score (#1604) ([d62c523](https://github.com/decdn/decdn/commit/d62c523ca4d9190a0f94861b8e783b0822954138))
+- **cli**: Auto-reclaim replaced expired buyer channel on fetch (#1553) (#1588) ([0639ce2](https://github.com/decdn/decdn/commit/0639ce221d8406d1de3a1eb7d13cda09031a8230))
+- **cli**: Carry revert + lost-response outcomes into publish receipts (#1550, #1577) (#1590) ([b43bfb1](https://github.com/decdn/decdn/commit/b43bfb165517048fbb80e28ab74ed8b816333a81))
+- **cli**: Make single-tx publish receipts unrepresentable-if-contradictory (#1578) (#1589) ([85a5ebe](https://github.com/decdn/decdn/commit/85a5ebe5159546a8713b5d7dd81ab42f422f5976))
+- **cli**: Surface content_blacklist_address and all wired knobs in config init (#1554) (#1583) ([e332757](https://github.com/decdn/decdn/commit/e332757e28ef30f165e54ba0a99a22b8947b1251))
+- **node**: Set SO_REUSEADDR on admin + metrics listeners (#1582) ([08e34d4](https://github.com/decdn/decdn/commit/08e34d4bd4fb079d93507e738b4940176b6e7f9c))
+- **cli**: Print the namespace-create receipt before a post-receipt failure (#1568) ([92a241b](https://github.com/decdn/decdn/commit/92a241b784f1e4b0a17ee43788abce165468e6a8))
+- **node**: Refuse InternalError for local-fault pull failures, not NotFound (#1566) ([76165f2](https://github.com/decdn/decdn/commit/76165f2281a08c6e06d42c1d9a782f2768ccc3c6))
+- **e2e**: Fail fast on terminal fetch refusals instead of retrying 45s (#1547) ([b333476](https://github.com/decdn/decdn/commit/b333476eb32a0509bae21ee2b0c1ed9bffd754d1))
+- **e2e**: Advance past region cooldown before updateRegion (#1546) ([eb93f9f](https://github.com/decdn/decdn/commit/eb93f9fd5cdbf99d73b227b656f09ffab3714edc))
+- Close two money-path guards that had no correct branch (#1532, #1495) (#1538) ([d5dc6cf](https://github.com/decdn/decdn/commit/d5dc6cfe583d874175238c05c0c6eae4e3b392e2))
+- Make the metrics registry tell the truth (#1517, #1513) (#1527) ([c15b8d6](https://github.com/decdn/decdn/commit/c15b8d6a3057d10562c78f147242b647d965b8a7))
+- Close the three #1518 review follow-ups — pre-spend deposit floor, observability, received-delta coverage (#1526) ([ed583b7](https://github.com/decdn/decdn/commit/ed583b76362b2eb766e67479aac15ed199c206df))
+- **ci**: Repair agentic triage lock and gate it against drift (#1489) ([1edcf0d](https://github.com/decdn/decdn/commit/1edcf0d78514fcdb79bda72a1a90ba99cfa2d311))
+- **payments**: Authenticate cooperative-close requests (auth-bypass channel-freeze DoS) (#1482) ([a2778a4](https://github.com/decdn/decdn/commit/a2778a4584805b7e536ea719c957f20306810bc2))
+- **ci,test**: Un-rot the anvil bring-up e2e and gate it so it cannot rot again (#1473) ([98517d7](https://github.com/decdn/decdn/commit/98517d753a4d4c944688f2d65f737bac731af39c))
+- **rate-limit**: Pin the From<&Resolved*> mappings and make limiter wiring type-safe (#1462) ([519fba2](https://github.com/decdn/decdn/commit/519fba2fd1c39fafd0223128a09919fd8a23c64b))
+- **selection**: Bound reputation above 1.0 in compute_score (#1461) ([d2e0478](https://github.com/decdn/decdn/commit/d2e04780f3672a4d91f98afce2dbd346ec19ada4))
+- **adr**: Resolve three dangling cross-ADR anchors, and teach the guard to catch them (#1460) ([345b16f](https://github.com/decdn/decdn/commit/345b16f40f1cadb0157a855d7ec4d7d131b1effe))
+- **e2e**: Drain anvil's txpool before re-snapshotting between deploy retries (#1467) ([4271c79](https://github.com/decdn/decdn/commit/4271c795a53c4775cb50ebb2aa1faeae04b988a6))
+- **reputation**: Implement ADR 008 score decay-to-neutral in the local scorer (#1425) ([fa8f606](https://github.com/decdn/decdn/commit/fa8f606330d10da85d222defdd4325dc29ebe8c0))
+- Config single-source-of-truth doc + CI-aware anvil-e2e deploy timeout (#1428) ([b5e8b73](https://github.com/decdn/decdn/commit/b5e8b73cb2fe663679e118474530135725558230))
+- Origin deny-set & authorized-origin gate correctness (#1398, #1368) (#1426) ([3cf9883](https://github.com/decdn/decdn/commit/3cf9883a7b972130f3c89a367e3fc43aa23ade5a))
+- Buyer-side rate integrity & slash evidence on the paid-pull path (#1375, #1377, #1382) (#1420) ([4251f77](https://github.com/decdn/decdn/commit/4251f7769af55d67842a54a306323775573398b8))
+- **e2e**: Drop duplicate expect_revert breaking main (#1400) ([781dd9a](https://github.com/decdn/decdn/commit/781dd9ab7b8cde8564c7cb9e1610118e103a04ce))
+- **contracts**: Cap rate bounds at uint64 max in PaymentChannel (#1386) ([c6b8d41](https://github.com/decdn/decdn/commit/c6b8d41ea3995be5262a7d3c1be5af869fd10d86))
+- Batch six review follow-ups (#1346, #1347, #1348, #1349, #1359, #1361) (#1362) ([e73fa04](https://github.com/decdn/decdn/commit/e73fa049182148890cfa63070a2f973bb6bcc8b8))
+- **contracts,e2e**: Make deregistration a real bond exit; settle the unbond gate question (#1351, #1352, #1354) (#1360) ([98b2ebf](https://github.com/decdn/decdn/commit/98b2ebf63943898975b74863fe4f64bbd998bca0))
+- Batch seven review follow-ups (#1342, #1343, #1344, #1345, #1347, #1350, #1355) (#1358) ([71fe6a1](https://github.com/decdn/decdn/commit/71fe6a1af0207130c2eec449f7db49d17e04e5a8))
+- **cli**: Dedupe bundle-pull entries by hash + guard part dir cross-process (#1306, #1303) (#1336) ([b84a9d0](https://github.com/decdn/decdn/commit/b84a9d06687be8ca714acc43f69c134f68a68f77))
+- Batch three hygiene issues — relief-counter invariant, gossip metric docs, origin fallback (#1334) ([01996a3](https://github.com/decdn/decdn/commit/01996a38dfb655be07d35ca28acbfe247ce5fae4))
+- **cli**: Harden DECDNMAN reconstruction after review of #1293 (#1301) ([62b206d](https://github.com/decdn/decdn/commit/62b206d7717e1b256a44f40127b8f0489783a619))
+- **contracts**: No phantom blacklist version bump on removed-mid-appeal entry (#1297, #1298, #1299) (#1304) ([469e7d3](https://github.com/decdn/decdn/commit/469e7d37ddf4bdcfc695f216cafc32c29e242ba7))
+- **node**: Gate listeners on blacklist sync (#1275) ([2c919aa](https://github.com/decdn/decdn/commit/2c919aabb50f40e96410ca26ab3e4739bced5913))
+- **incentive,cli**: Surface skipped buyer channel rows (#1271) ([f32bde2](https://github.com/decdn/decdn/commit/f32bde2740edbb7186438dec5c61c15d9efeff46))
+- **node**: Restore 500ms probe timeout (#1269) ([1fe3577](https://github.com/decdn/decdn/commit/1fe3577590535bf8284890bd3288cbb0b11c7c30))
+- **node,common,cli,incentive**: Guard daemon contract addresses against the zero address (#1219) (#1256) ([a338b00](https://github.com/decdn/decdn/commit/a338b00a6b0c1a117dca860040b3dcfe4b3d528b))
+- **node**: Thread real shutdown tokens into the three orphaned watchers (#1230) (#1237) ([ac6ef63](https://github.com/decdn/decdn/commit/ac6ef632001511f959686c553fb6b4c5fb9addda))
+- **node,common**: Bound every sink-internal chain read (#1228) (#1233) ([24c38c5](https://github.com/decdn/decdn/commit/24c38c5794298056b26a0aada303b8c85d87046d))
+- **gossip,node**: Enforce rule-2 staked-node check against the live registry (#1170) (#1221) ([6a1e1a6](https://github.com/decdn/decdn/commit/6a1e1a6876ed2877497ad0fc9d95ee408db048ec))
+- **cli,incentive**: Reject zero address for all parsed contract addresses + fix bindNodeId runbook (#1213, #1195) (#1218) ([1f9f77f](https://github.com/decdn/decdn/commit/1f9f77fa8582dbc15e505590db4a1398a3c78c5d))
+- **node,cli**: Observable origin-replay range guard + zero-address guards on all resolved addresses (#1152, #1153) (#1209) ([f49b2ba](https://github.com/decdn/decdn/commit/f49b2ba57b310987ec32d20bfa96fb46389e249e))
+- **node**: Enforce ADR 008 ±0.05 reputation clamp + ADR 030 region latency penalty (#1176, #1177) (#1212) ([2760159](https://github.com/decdn/decdn/commit/2760159c5b22402b6af2faf5ea80ac25f0b31feb))
+- **node**: Top up reused buyer channels + drop redundant progressive-open timeout (#1146, #1147) (#1211) ([5c2611f](https://github.com/decdn/decdn/commit/5c2611f7f0a7fccd0059f8de098118a2fbc71027))
+- **contracts**: Tighten CapacityBond unbonding bounds to [7,60] days (#1202) ([e0f5a34](https://github.com/decdn/decdn/commit/e0f5a341802f795495778f878127ca4dc2009ed3))
+- Bound the requester's fetch loop, and classify what comes back (#1088, #1144, #1134, #1143) (#1145) ([deaab0f](https://github.com/decdn/decdn/commit/deaab0ffac685ef754eed8f4d5f7c7f15eac2ca1))
+- **cli**: Pass CommonChainArgs to resolve_appeal in tests (#1208) ([0cc683d](https://github.com/decdn/decdn/commit/0cc683d14083a4cc10f2b014d9635747deaff777))
+- **gossip**: Peer-table default + rejection observability (#1207) ([7516199](https://github.com/decdn/decdn/commit/7516199ff5fc88cc6ea9abe09e786d4a17ec5297))
+- **protocol**: Unknown enum discriminant closes stream with UNSUPPORTED_MESSAGE (#1206) ([a71c21a](https://github.com/decdn/decdn/commit/a71c21adbe4ea1bf21e6f3a49a21a7dc48fef946))
+- **bao-range**: Reject overlong range_data in encode_verified_range (#1055) (#1154) ([a54f93d](https://github.com/decdn/decdn/commit/a54f93d50dc4abec37441279d2c494388289fd62))
+- **node**: Don't sign an authoritative NotFound for a backend fault or a wedged candidate (#1129, #1141) (#1142) ([6b10e7a](https://github.com/decdn/decdn/commit/6b10e7acab99f84571810aaebaebf8d3373a2e9b))
+- **cli**: Send the ADR 005 client identity binding on decdn fetch (#1115) (#1124) ([cbe9664](https://github.com/decdn/decdn/commit/cbe9664070fd17258826a61c8403ccbaad528c0c))
+- **e2e**: Advance voucher watermark across ClientFixture::fetch retries (#1062) (#1125) ([610b0fc](https://github.com/decdn/decdn/commit/610b0fc24ff3ec90d6c962a6c9c47306e6cbc6ea))
+- **cli**: Client-appropriate defaults for decdn fetch/bundle/channel (#1123) (#1126) ([b765581](https://github.com/decdn/decdn/commit/b7655812c61198f1a193f5579864445b58276b1f))
+- **node**: Bind metrics/admin before the buyer PaymentChannel bootstrap (#1109) (#1112) ([1bbfccd](https://github.com/decdn/decdn/commit/1bbfccd0feac5d70376bc6ccd585a6bf70c62f2f))
+- **contracts**: Give Uniswap genesis-seed mint a deadline buffer (#1099) ([5df6318](https://github.com/decdn/decdn/commit/5df63189f510cf96ead1a3d12ef7e5556a3ba6c7))
+- **cache**: Serve empty (0-byte) blobs on the bao cdn/client/v1 path (#1054) (#1085) ([417d45e](https://github.com/decdn/decdn/commit/417d45eccd28b3184847a64f624bb8c5cbb0c27f))
+- **node**: Stop flooding local anvil with eth_getFilterChanges (#1011) (#1012) ([54d2895](https://github.com/decdn/decdn/commit/54d28957abf62a927aca1d6bedff6fba9ff28f9e))
+- **contracts**: Fail-fast pool-wiring validation in BuybackBurnerBalancerV3 (#968) (#992) ([43439b5](https://github.com/decdn/decdn/commit/43439b54057c4ae6a4ade430ff70c4f2f5128110))
+- **security**: Redact rpc_url from chain-RPC transport errors (#954) (#958) ([fe54032](https://github.com/decdn/decdn/commit/fe5403272b721c384373bac293db1b85617f775f))
+- **incentive**: Graceful failure on concurrent buyer-store open (#942) (#946) ([6309811](https://github.com/decdn/decdn/commit/63098118d112bc21d0cfbfbb8fd82670ecd7a36e))
+- **contracts**: Anchor region slash-eligibility window to serve-time responseTs (#801) (#927) ([90878f7](https://github.com/decdn/decdn/commit/90878f763e13671bc2d5e6cb12d05c95fc4c64ad))
+- **node**: Back the FIND_VALUE fallback with the chain origin directory (#912) (#920) ([f935ea9](https://github.com/decdn/decdn/commit/f935ea9835917f13130a387b30f12c088cd2013c))
+- **node**: Escalate persistently-failing buyer reclaim so a stranded deposit surfaces (#906) (#907) ([a622c07](https://github.com/decdn/decdn/commit/a622c07798ed74cbb1af5ae373b8da9b553fdef6))
+- **node**: Use simple nonce management so a reverting reclaimExpired can't wedge the tx lane (#904) (#905) ([c7d8e53](https://github.com/decdn/decdn/commit/c7d8e53cb7d83a24ced518cf2a65642edef58487))
+- **contracts**: Don't let a paused FeeRouter freeze the settleChannel client refund (#849) (#889) ([b14b62c](https://github.com/decdn/decdn/commit/b14b62cfeb76f798e4ef037b9d4a065cfb15fbcc))
+- **contracts**: Commit–reveal SlashJudge challenges to stop reward front-running (#854) (#901) ([f932d75](https://github.com/decdn/decdn/commit/f932d755ec7da267ed34349c73d23bc42d23574b))
+- **node**: Retry forge DeployProtocol broadcast-phase non-zero exits (#883) (#897) ([862b35f](https://github.com/decdn/decdn/commit/862b35f6673e9b599dc868c161829db1ef018ffe))
+- **node**: Feed RegionAccountant on delivered node→node pulls (#858) (#886) ([29c6698](https://github.com/decdn/decdn/commit/29c6698d6ec883c446f5e48befcda74e8c2cfc04))
+- **node**: Reconcile provider-side Closing channels into the settle set (#839) (#892) ([097eca1](https://github.com/decdn/decdn/commit/097eca1c1c052bb9f76fd3a2580d91768e7807c4))
+- **contracts**: Enforce per-byte price floor at settlement (#846) (#891) ([57a6aa9](https://github.com/decdn/decdn/commit/57a6aa94f87881bfe7db90575e3ceb937eca18ae))
+- **contracts**: Snapshot Governor vote weight to fully-elapsed epochs (#847) (#888) ([9a7b9e2](https://github.com/decdn/decdn/commit/9a7b9e2ad0588e486bf86cf09ce8fd3a9bec2e7b))
+- **cli**: Make key-gen --force rotation atomic across both key files (#844) (#887) ([aa564a7](https://github.com/decdn/decdn/commit/aa564a7c3062615b006cabfc2102df0695f4e1e1))
+- **node**: Serialize buyer-row writes to close top_up/record_progress RMW race (#838) (#885) ([1b1de87](https://github.com/decdn/decdn/commit/1b1de8724a963baf1ae1e4cd42f31f1cf2b9dbb6))
+- **node**: Don't tar honest providers' reputation for buyer-side pull failures (#857) (#882) ([0356a8b](https://github.com/decdn/decdn/commit/0356a8b67512d361d3ebf6572938ebb6f7722fbd))
+- **node**: Bound buyer-side pull to max_blob_size, reject oversized total_bytes (#840) (#881) ([a5bc8ff](https://github.com/decdn/decdn/commit/a5bc8ff36271e7d8d7b6492e87f76b38883bcd0f))
+- **node**: Recover missed origin-directory events + reorder-immunity (#855) (#880) ([f7b1294](https://github.com/decdn/decdn/commit/f7b12943ac09085af38969b471eef86bfc29aa92))
+- **node**: Derive pull-through outer deadline so multi-provider fallback survives timeout-shaped failures (#859) (#878) ([14c7c7d](https://github.com/decdn/decdn/commit/14c7c7d05e8b238b6f40e77ccdc208985e0274f9))
+- **contracts**: Separate governance blacklist ejection from slash auto-ejection (#850) (#877) ([2a931ab](https://github.com/decdn/decdn/commit/2a931ab012e6f338c22e2e0bbc379460bf321a07))
+- **node**: Reject unknown payment channel before serving any bytes (#848) (#875) ([ce4f4ec](https://github.com/decdn/decdn/commit/ce4f4ec9f5654b0815e44bef24fe7c607464922e))
+- **cache**: Separate DMCA eviction from wrong-hash rejection; reclaim disk via tag deletion (#874) ([04f7a6c](https://github.com/decdn/decdn/commit/04f7a6c00f00922c4af375e46be7586998ca314b))
+- **node**: Dispatch namespace-0 revoke/prune events to the default-open allow-list (#851) (#873) ([1d9dc58](https://github.com/decdn/decdn/commit/1d9dc58f5ca50b5b2366619711ab49e0241bbbf1))
+- **node**: Persist buyer voucher progress after pull-through (#852) (#872) ([490d3fe](https://github.com/decdn/decdn/commit/490d3fed739d3ec9026cecf6445181fe4a579427))
+- **incentive**: Reject high-s ECDSA signatures off-chain (#836) (#871) ([c5d3ce0](https://github.com/decdn/decdn/commit/c5d3ce0712ce4af8c7cf4e7df656027f23c06a39))
+- Close out remaining LOW review follow-ups (#845 #864) (#869) ([e125744](https://github.com/decdn/decdn/commit/e12574440a540875240c060c854094723e1bb7dc))
+- Batch of six quick-win review follow-ups (#845 #864) (#868) ([ba03624](https://github.com/decdn/decdn/commit/ba03624ad7757286b6803caedc6f69f14eedfdda))
+- Batch of nine quick-win review follow-ups (#845 #864) (#867) ([69af771](https://github.com/decdn/decdn/commit/69af771e6da972c489791109d8219ec648d71f87))
+- Batch of six quick-win MEDIUM bug fixes (#865) ([57a4064](https://github.com/decdn/decdn/commit/57a4064fda215348c6733e1773002bfeb65248b8))
+- **node**: Decouple download-receipt writes from the paid-delivery hot path (#803) (#811) ([feedc49](https://github.com/decdn/decdn/commit/feedc4941dd25cf534b74a1c9a383c5fad640d1b))
+- **node**: Debounce watcher checkpoint writes (#784) (#792) ([a4e3ccd](https://github.com/decdn/decdn/commit/a4e3ccdf5ed793093912f2947949665951fb6328))
+- **contracts**: Security audit pass — High + Medium findings (#777) ([a3bfb70](https://github.com/decdn/decdn/commit/a3bfb70e3544294224a80aec31348678e390f740))
+- **node**: Backfill ChannelOpened to close watcher bring-up race (#762) (#773) ([9cf3c41](https://github.com/decdn/decdn/commit/9cf3c41302465763f841fa673b5f878fd93b7070))
+- **node**: Address PR #754 review — disable-overrides-hold, drop relock, doc/test cleanups ([f88ff4d](https://github.com/decdn/decdn/commit/f88ff4d1e07888af74764699760d2659aab9461c))
+- **contracts**: Recompute slashedAtEpoch over standing slashes on granted appeal (#709) (#728) ([8f5c57d](https://github.com/decdn/decdn/commit/8f5c57d8385be68cb46c379f2af9241275621088))
+- **adr**: Drop retired ADRs 032/033 from book list; harden drift guard (#714) ([e8ba007](https://github.com/decdn/decdn/commit/e8ba007a7dae24a5973c6d5d06caaa966a008513))
+- **node**: Add missing keyspace-cap fields to dht_lookup test config ([ef755a4](https://github.com/decdn/decdn/commit/ef755a4b6ebc03de0247b439f237632ba1950c21))
+- **docs**: Align README crate-structure block with workspace (closes #704) (#705) ([45d58ba](https://github.com/decdn/decdn/commit/45d58ba5e3af8486cc86b3b7a5f3a78000935c6f))
+- **adr**: Remove PoC framing from initial rate bounds section ([c3f5226](https://github.com/decdn/decdn/commit/c3f5226bc7651927e4d363ac5a250ce380e4a144))
+- **adr**: Remove poc framing from ADR 003 ([aeca9e1](https://github.com/decdn/decdn/commit/aeca9e1932d6a3df33ebbea26c375acf652f226d))
+- **gossip**: Pin iroh-gossip frame ceiling to GOSSIP_MAX_FRAME (#660) (#661) ([3f94b97](https://github.com/decdn/decdn/commit/3f94b978a757de2dd256ba85e65989e80d92b2b2))
+- **577**: Trailing-byte padding cap (M3) + probe I/O classification (M1) (#659) ([ab0bae6](https://github.com/decdn/decdn/commit/ab0bae6a4b05eb5e6650fbd641f864aaa1315f47))
+- **gossip**: Swap publisher's sender on subscriber reconnect (#577 H2) (#657) ([73c1418](https://github.com/decdn/decdn/commit/73c1418beaf349bfa36de600bde905c56d0e5455))
+- **gossip**: Cap PeerTable to defeat fresh-keypair memory-DoS (#577 H3) (#656) ([c80667f](https://github.com/decdn/decdn/commit/c80667f661c5f58f6dc74849e0c8f381b257ac27))
+- Update status to accepted in ADR 002: Content Addressing ([826ba17](https://github.com/decdn/decdn/commit/826ba171fbadd9598fdb094c9b35594e6ae61d47))
+- Update status to accepted in ADR 001 and refine key rotation procedure details ([da01c74](https://github.com/decdn/decdn/commit/da01c7467c34e273da4d2a85e4470de18229761c))
+- Defuse HTTP origin SSRF and warn on non-loopback metrics_bind (#579) (#622) ([7cfc5a0](https://github.com/decdn/decdn/commit/7cfc5a02209d9e990299e3107afa25497f07acc6))
+- **gossip**: Validate region against ISO 3166-1 alpha-2 allowlist (#602) (#621) ([fedbf33](https://github.com/decdn/decdn/commit/fedbf33f49ffe8a5ad0fcf4ab3bf2ea47ec80b32))
+- **node**: Aggregate SIGHUP reload errors across sections (#608) (#615) ([1971758](https://github.com/decdn/decdn/commit/1971758106cc9d3a63968a116f156cee1a579132))
+- **incentive**: Persist voucher state across restart (#527) (#567) ([6fa4e84](https://github.com/decdn/decdn/commit/6fa4e84ca7c4bcee2131dde592d96e7066a065f1))
+- **cache**: Restore mid-stream retry classification (#519) (#526) ([a065482](https://github.com/decdn/decdn/commit/a065482257d0ef428cfabcb9c872acd29d48fc2b))
+- **node**: Wrap gossip ALPN with dispatch limiter (#433) (#512) ([0dbe896](https://github.com/decdn/decdn/commit/0dbe896f74a5122b9705c2b5b7fa04d53a2c0457))
+- **config**: Enforce 10s minimum on rpc_watchdog_interval_sec (#498) (#510) ([cd14374](https://github.com/decdn/decdn/commit/cd1437443048327697f2bdd02b0cbc44b51aff14))
+- **node**: Include bind addr in iroh endpoint bind error (#376) (#397) ([dd53fad](https://github.com/decdn/decdn/commit/dd53fadf78e47fee5075644b08f8f80559243947))
+- **cache**: Reject filesystem-origin symlinks that escape the base dir (#374) (#394) ([75f10bd](https://github.com/decdn/decdn/commit/75f10bd9a8af9b9e695d54568dd2b597a781e888))
+- **protocol**: Bound ProbeResponse.rate_per_mb at the wire boundary (#378) (#396) ([eb1536e](https://github.com/decdn/decdn/commit/eb1536e07a849c2d10a0f9397b0938ac3b8a2af0))
+- **config**: Validate blockchain.rpc_url at resolution time (#331) ([889d4b5](https://github.com/decdn/decdn/commit/889d4b5b0bc5a5177c1db48d78adf24f1c1c390e))
+- **cache**: Dedup concurrent origin pull-through with cancel-safe coalescing (#330) ([8f014e3](https://github.com/decdn/decdn/commit/8f014e34b6febf14b0f992ed2bb9c5fd21a2c9d3))
+- **gossip,config**: Version-first envelope check and OTLP URL validation (#316) ([212dbb7](https://github.com/decdn/decdn/commit/212dbb7b2c72d60be4b674c73b2fe293cbec5454))
+- **gossip**: Reconnect subscriber after stream drop (#313) ([266f821](https://github.com/decdn/decdn/commit/266f82147ace7a18ccc458b4115020f436da9f7f))
+- **cache**: Record per-hash access time on CacheEngine.get for LRU ordering (#302) ([34f2c34](https://github.com/decdn/decdn/commit/34f2c34a678499340a96f1241b69a2b51f96d1f8))
+- **config**: Reject bind_port == metrics_port; warn on well-known ports (#267) (#290) ([f1c4276](https://github.com/decdn/decdn/commit/f1c4276d4ec45511e563ab492dd7ff8d1b3d4594))
+- **identity**: Validate data_dir and key-file permissions at load (#238) (#261) ([c183805](https://github.com/decdn/decdn/commit/c183805bce4e5312b9429f80a23206205d0b5752))
+- **config**: Validate eth_keystore readability at startup (#239) (#259) ([544a87c](https://github.com/decdn/decdn/commit/544a87c0fd2972dbbb54f58d13e79af409426291))
+- **config**: Enforce max_blob_size_mb < cache_size_mb at startup (#221) (#256) ([2e37948](https://github.com/decdn/decdn/commit/2e37948e183e9e44a9a15ac02139db194388fd8c))
+- **config**: Reject rate_per_mb = 0 at config resolution (#234) (#251) ([345494d](https://github.com/decdn/decdn/commit/345494d8a237b632c82790579a4fd1aec8191379))
+- **config**: Validate contract addresses via EIP-55 checksum (#218) (#227) ([8e05158](https://github.com/decdn/decdn/commit/8e0515862e363454fc9f211a524f491ac6c3d860))
+- Use idiomatic if cfg!() expressions in wiring.rs examples ([aeffc4c](https://github.com/decdn/decdn/commit/aeffc4ce5e2d8204104065d8205142aca0de2907))
+- Allow DNS to any destination in container firewall ([869d892](https://github.com/decdn/decdn/commit/869d892ddf921857e5f02b727cfb84ca98bf13f5))
+- Resolve GitHub domain IPs for firewall allowlist ([c7c79f2](https://github.com/decdn/decdn/commit/c7c79f202ce84b1db4e51e2a305155a8b10da212))
+- Use --locked flag for cargo-nextest installation in devcontainer ([c9f26d6](https://github.com/decdn/decdn/commit/c9f26d6357e8ef69b38155fbb202466b993f4442))
+
+### Performance
+
+- **cli**: Skip the registry read on a bundle pull with fresh cached identities (#2353) ([f51ed97](https://github.com/decdn/decdn/commit/f51ed97b82e0790c03081f025a2600a101de2836))
+- **cache**: Capture proof nodes per leaf so a miss's first frame does not wait for the whole draw (#2335) ([58a7949](https://github.com/decdn/decdn/commit/58a7949513b1695bf214700dec2db97870062cd7))
+- **node**: Handshake against the first run's candidate so its primed pull is adopted (#2336) ([8160abb](https://github.com/decdn/decdn/commit/8160abb5e73d6092e8d1971a2c4fa9f3d3e9281c))
+- **node**: Read each signer's authorization once at admission (#2333) ([e416a1e](https://github.com/decdn/decdn/commit/e416a1e323881459031bb12ff74493795cc1575f))
+- **node**: Send a small first frame so a serve's first byte leaves early (#2302) ([418c552](https://github.com/decdn/decdn/commit/418c55228bef995a368a1329eb7e3e32515e23e7))
+- **cli**: Start a cold fetch 250 ms after the first answer (#2300) ([87916de](https://github.com/decdn/decdn/commit/87916de566aa4f1e70057aeb667f44b295b9ec97))
+- **cli**: Settle the probe round 250 ms after the first verified holder (#2297) ([2366118](https://github.com/decdn/decdn/commit/23661186d70f986036f2cb9d6c7e723de36909ec))
+- **client**: Ramp ingest checkpoints so stdout's first byte is not held for 4 MiB (#2295) ([c2fae66](https://github.com/decdn/decdn/commit/c2fae664bfc0d3543a71c65f3febf489305be9b8))
+- **client-pull**: Size QUIC receive windows to the paid-pull ceiling (#1924) ([5fe662e](https://github.com/decdn/decdn/commit/5fe662ed5df42f0b558e80e3a2e5d84c6d2aea61))
+- **cache**: Capture serve proof nodes during import, drop the export_bao read-back (#1790 item 4) (#1886) ([632c6b4](https://github.com/decdn/decdn/commit/632c6b4e0704f7cadb1b7fa0a4955dad1f62a94d))
+- **cache**: Allocate the fill outboard buffer lazily, off the registry lock (#1790 item 1) (#1884) ([cef8749](https://github.com/decdn/decdn/commit/cef87496d6326e29a11e0be027d6a7006c6c6cac))
+- **node,cache**: Answer per-leaf serve presence from the held watch (#1790 item 3) (#1883) ([61dd0c7](https://github.com/decdn/decdn/commit/61dd0c733c73383f89aea7ab8cbb057284781b81))
+- **cache**: Protect a partial once per fill, not per range admit (#1790 item 5) (#1882) ([d7bcd33](https://github.com/decdn/decdn/commit/d7bcd334c6674781a4b00dc5687829b259b5bd11))
+- **node,client-pull**: Unwedge and speed up the buyer/upstream pull leg (#1794) (#1881) ([54e17f3](https://github.com/decdn/decdn/commit/54e17f374605d8224fee9863005013f32153535a))
+- **node**: Split the lane store into per-family redb files (#1795 item 3) (#1880) ([26b3211](https://github.com/decdn/decdn/commit/26b32114278b7de193cf38c0a4ce59dc45892e1d))
+- **cache,node**: Batch admit-time outboard capture into one wake (#1790 item 7) (#1879) ([32e1823](https://github.com/decdn/decdn/commit/32e18238fd30bc7d3270c25882f466b8059da526))
+- **node,cache**: Reduce TTFB on the cdn/client stream-open path (#1789) (#1871) ([06b29d6](https://github.com/decdn/decdn/commit/06b29d683675eb2a9c2bf8e2b9911f7a18ee5056))
+- **node**: De-globalize the lane store working set (#1792 item 1) (#1876) ([677e5d0](https://github.com/decdn/decdn/commit/677e5d00cd4071dbd0344972c26bd2b4ab8caa73))
+- **node,incentive**: Run the PayWord keccak walk off the per-lane lock (#1792 item 5) (#1873) ([ded52e7](https://github.com/decdn/decdn/commit/ded52e7e17733b1806aefcb9bda401781861b86f))
+- **node**: Move the accepted LaneState into the lane instead of cloning it (#1792 item 3) (#1872) ([dbcdb65](https://github.com/decdn/decdn/commit/dbcdb65ee66a3da32ca528fc3f12d4ec61dd8081))
+- **node**: Coarse clock for the voucher-accept path's under-lock clock reads (#1792 item 4) (#1870) ([4d51282](https://github.com/decdn/decdn/commit/4d51282aee0c18596362e83911fe68bd52960c5c))
+- **node**: Move download-receipt formatting off the voucher hot path (#1792 item 2) (#1868) ([f18af9f](https://github.com/decdn/decdn/commit/f18af9ff72c5e39843eef851948613bd4576a1fb))
+- **node**: Remove head-of-line blocking and admission stalls on cdn/client/v1 (#1867) ([a208eca](https://github.com/decdn/decdn/commit/a208ecaae12a533cc5e036a0330c1da95eb14d41))
+- **node,cache**: Shard stream-end bookkeeping off global mutexes (#1803) ([08f050d](https://github.com/decdn/decdn/commit/08f050d57af488645b599395f2060ac808a64bad))
+- **node,protocol**: Zero-copy ChunkData framing via vectored QUIC writes (#1791) (#1828) ([9595aee](https://github.com/decdn/decdn/commit/9595aee5bf73cca4db33c9f17818d83661892a48))
+- **node,payments**: Flush lanes in redb key order, enforce monotonic floor loss (#1780) ([3a756a2](https://github.com/decdn/decdn/commit/3a756a258105d77b7f691184560b0473b3d5aaac))
+- **node**: Consolidate chain-event watchers into one multiplexed getLogs poller (#1747) ([7022ac6](https://github.com/decdn/decdn/commit/7022ac6c898d7b0fa82e5e9ec4e467cdbbd236d0))
+- **node**: Hoist voucher ecrecover out of the per-lane lock (#1735) (#1742) ([02b0ec6](https://github.com/decdn/decdn/commit/02b0ec6436f46a2418b14ec86dd3b5fd81fcdd0e))
+- **node**: Fold voucher-activity clock into lane state to delete a per-voucher global mutex (#1733) (#1744) ([cdf5557](https://github.com/decdn/decdn/commit/cdf5557444d0034ceb065fb8e45027436ac0c76d))
+- **node**: Coarsen the mid-stream pool-solvency re-check to a wall-clock cadence (#1734) (#1743) ([255af6d](https://github.com/decdn/decdn/commit/255af6d403dbd9b5f3a68c4ba654b08e171127eb))
+- **node**: Shard the lane registry to unblock independent admissions (#1731) (#1741) ([0420cde](https://github.com/decdn/decdn/commit/0420cde721ff3133d7c88b0558219b6cfbfe3f3b))
+- **node**: Double-buffer lane-store flush so the fsync holds no buffer lock (#1730) (#1739) ([97a1516](https://github.com/decdn/decdn/commit/97a15160ec54cb3040acfc6a3968dd341f7b89ac))
+- **node**: Arc-swap the pool-view TTL cache read path (#1732) (#1740) ([a63b914](https://github.com/decdn/decdn/commit/a63b9147e35bac6bd3ce3bb1e726bc30b8658b3e))
+- **node,incentive,contracts**: Batch redeemer auth reads + drop per-top-up allowance read (#1727) ([b5de871](https://github.com/decdn/decdn/commit/b5de871a10c54811bd1ab16da41a9b07a37545c2))
+- **payments**: In-memory vouchers with periodic + pre-redeem durable flush (#1672) (#1706) ([687b2a1](https://github.com/decdn/decdn/commit/687b2a1bcba7d3f7e332cce93f10e03942a5c5ff))
+- **payments**: Cut per-lane redemption gas 79% to bound dust-lane settlement (#1701) ([1ec9cf2](https://github.com/decdn/decdn/commit/1ec9cf253bee32bdd6da56b9cff1912e25311a65))
+- **node**: Peek in-flight fill registry before the serve-miss handshake (#1663) ([ecdde9b](https://github.com/decdn/decdn/commit/ecdde9b906898f9d935c247ebe77e945e813ec97))
+- **node**: Last-out serve-miss observer joins the pull, freeing a finished owner (#1664) ([208ae2d](https://github.com/decdn/decdn/commit/208ae2d5a2897ba37feb0e031b76bad115942b25))
+- **cache,cli,node**: Bounded-memory blob delivery + resumable decdn fetch (#1132) (#1496) ([f4a1572](https://github.com/decdn/decdn/commit/f4a1572f2ef54e0e6b9151e73ca71ff0abd359fe))
+- **cli**: Prefer manifest node for bundle chunks (#1328) ([f6a3ab6](https://github.com/decdn/decdn/commit/f6a3ab65eb32509c26d938c2bfbe3000aed71a6e))
+- **incentive**: Skip no-op buyer commits (#1270) ([cdcbe8f](https://github.com/decdn/decdn/commit/cdcbe8fefc4b95f1cc6d23d34fa30c38239a04fb))
+
+### Refactoring
+
+- **client,cli**: Build the Downloader and Streamer faces with a builder (#2356) ([41d268d](https://github.com/decdn/decdn/commit/41d268dd6994b2d5fd8101e320ea4a3076e32091))
+- **client,cli,node**: Trim the decdn-client SDK surface and mark it non_exhaustive (#2351) ([8834ff0](https://github.com/decdn/decdn/commit/8834ff084e5cfefcb148030f3e3d60583b612c8e))
+- Replace hand-written AbortOnDrop guards with AbortOnDropHandle (#2317) ([9fddf9a](https://github.com/decdn/decdn/commit/9fddf9a93eda3de92dba80fa84f2ddfe4c00f3f4))
+- **client,cli,node**: One acquire loop for fetch recovery, size as a hint (#2239) ([2dab1f5](https://github.com/decdn/decdn/commit/2dab1f5fdc2c1a5529ff1e018c9f36ff92b8817d))
+- **client**: Decdn-client SDK — rename, curated API, boundary audit, footprint guard (#1150) (#2125) ([cedf47e](https://github.com/decdn/decdn/commit/cedf47eb61167fdf3c3b401b7ec57bca2aad9509))
+- **cache,node,client-pull**: Harden serve-demand and top-up types (#2019) ([681e14f](https://github.com/decdn/decdn/commit/681e14f2f0256a440ff0740eaf0f20c6a138c97d))
+- **client-pull**: Dedup empty-claim guard; drop the CLI's ignored pull cap (#1996) ([923b172](https://github.com/decdn/decdn/commit/923b1724949f033f1b759a0879e8edba4fb405a0))
+- **node**: Cut per-signer abandonment subsystem; reduce #1697 to a heal-path counter (#1957) ([e502830](https://github.com/decdn/decdn/commit/e5028304105363602a753ee0d343a30248732adb))
+- **contracts**: Drop subSwapCount/subSwapMinBlockGap from BuybackBurner ([caf06d6](https://github.com/decdn/decdn/commit/caf06d60b3915ccb85cf6cf491ef10fb9698f6ab))
+- **contracts**: Remove the ContentBlacklist version counter ([4ef6b44](https://github.com/decdn/decdn/commit/4ef6b44ae10c41acf52eaff00befd6d163909670))
+- **cli**: Delete the --pay-bond-with usdc swap subsystem (#1945) ([fb50824](https://github.com/decdn/decdn/commit/fb5082447b43370e20d3dbe9c069e67155f961d9))
+- **incentive**: Name the keystore password use and gate key-gen's double entry (#1942) ([36df6cc](https://github.com/decdn/decdn/commit/36df6cc0249c5cc169339a267b1c8a099e156fe6))
+- **incentive**: Move keystore password source list builder into decdn-incentive (#1933) (#1940) ([64eac7c](https://github.com/decdn/decdn/commit/64eac7c5253eed42adb1f44e083b81b36d65799f))
+- **cli**: Rename key-gen password-file flag and pool ResolvedChain struct (#1936) ([2e4ddba](https://github.com/decdn/decdn/commit/2e4ddba2d70dc430e34bfaf4b9c0d17886be6012))
+- **node**: Floor credit becomes a per-signer refilling allowance (ADR 003) (#1914) ([9e554af](https://github.com/decdn/decdn/commit/9e554af7640a81aad8576bc90dda513e9deb52e2))
+- **incentive,protocol,node**: Represent capability spending_cap as u64 (redeemable by construction) (#1918) ([d5d0fa3](https://github.com/decdn/decdn/commit/d5d0fa3e5c0b61efc56557c487f781577319d996))
+- **node**: Extract FrameQueue/FrameChunks so the serve framers stop hand-maintaining the byte-count invariant (#1834) (#1888) ([27d4d4d](https://github.com/decdn/decdn/commit/27d4d4d51147426e2780439260b8aa8a776ac711))
+- **node**: Newtype warming source ids and hashes at the warming-allowance seam (#1874) ([b28e8ec](https://github.com/decdn/decdn/commit/b28e8ec11b495c1a96bf3db2ebde7618cfe74ec0))
+- **node**: Gate the Direct*Sink test fakes behind a test-support feature (#1875) ([f869e80](https://github.com/decdn/decdn/commit/f869e80cb9bf46e37974a1d90c741430f1b0ff2a))
+- **node**: Pair each stop token with its task handle in StopHandle (#1861) ([56d77fb](https://github.com/decdn/decdn/commit/56d77fbb558db93991bc9ff9ec3679896b92a180))
+- **node**: Drop PaymentPool close monitor; lean on the redeem sweep (#1761) ([bcad895](https://github.com/decdn/decdn/commit/bcad895cf9ff64133335350353832ba7f85e906e))
+- **node**: Remove per-voucher region byte-accounting; re-home ADR-030 region lookup (#1736) (#1745) ([73735f1](https://github.com/decdn/decdn/commit/73735f196d62d78991a81d04c15ddb9198c3aa59))
+- **node**: Lazy on-demand origin directory (delete whole-directory mirror + watcher) (#1737) ([3807143](https://github.com/decdn/decdn/commit/38071430c9b52a3ddcc73647ddbb04a287d8079e))
+- **node**: Feed the serve-path pool view from events, not per-serve getPool (#1724) (#1728) ([ef34394](https://github.com/decdn/decdn/commit/ef34394d9f9b21c1860eeb78474b358289a129c0))
+- **payments**: Merge buyer initial/working deposit into one working deposit (#1729) ([d6f7d53](https://github.com/decdn/decdn/commit/d6f7d5355abc4467bf89835a8b34d540115d7aa6))
+- Remove NodeAnnounce gossip, source node region from the registry (#1712) ([a11f1c4](https://github.com/decdn/decdn/commit/a11f1c4fbb43559d448d55334ff8e937993d73e6))
+- **node**: Stream node-to-node pull to disk, drop the last O(blob) ingest buffer (#1682) (#1696) ([e6149eb](https://github.com/decdn/decdn/commit/e6149ebd74cee237073e10fb368901863cc2b785))
+- **cli**: Route bundle pull through the gap-driven driver + delete the legacy fetch loop (P4 of #1621) (#1633) ([5973ab0](https://github.com/decdn/decdn/commit/5973ab0e079884537da7ed383a2184a860af5beb))
+- **registry**: Honest getRegisteredNodes with on-chain active[], drop bootstrap N+1 (#1613) ([0f1be9c](https://github.com/decdn/decdn/commit/0f1be9c7506133954dd20e932157c1bcf24ee9d8))
+- **cli**: Route bundle pull through the streaming top-up loop (#1612) ([0d00789](https://github.com/decdn/decdn/commit/0d007894e9ad9735d0675c709564c589747a6116))
+- **node**: Remove client-less background cache-warm (#1610) (#1611) ([6421881](https://github.com/decdn/decdn/commit/6421881a40f2b7d05b83d2adde9742753cf8180b))
+- **incentive**: Remove unenforceable client-reputation ledger (#1552) (#1606) ([2cafa4a](https://github.com/decdn/decdn/commit/2cafa4aed5f713829d634e748c940bac3b7e194b))
+- **admin**: Drop inert backward-compat serde defaults (#1544) ([df6639d](https://github.com/decdn/decdn/commit/df6639d5b6481ac0840cdf16c9f4b3e4a6fe39fe))
+- Drop pre-deployment backward-compat shims (#1543) ([4460f9c](https://github.com/decdn/decdn/commit/4460f9c6dd931d45c5a96dbc8853291bd058bb74))
+- Remove the residual authorized-origin content-authorization gate (#1525) ([7dcbb66](https://github.com/decdn/decdn/commit/7dcbb66958441f7f0f38322041a4b44c7e3f4ae2))
+- **slashing**: Retire the phantom-announcement offense (#1512) ([00139cc](https://github.com/decdn/decdn/commit/00139ccd7e67ea50fad4f407a112f358a5a440cd))
+- Eliminate on-chain event-log replay across every watcher (#1504) ([14abf22](https://github.com/decdn/decdn/commit/14abf22c29bdf6329ac214604bd37cd4152794c1))
+- **cli**: Retire the DECDNMAN file-manifest format (#1505) (#1507) ([4d9d27c](https://github.com/decdn/decdn/commit/4d9d27c6e7c729cff85277e2a5030aa0837cc5fd))
+- **node**: Read the origin namespace set instead of replaying for it (#1500) ([6b6820c](https://github.com/decdn/decdn/commit/6b6820cf4808bb3f0f54b3892ef8d5732550001d))
+- Two protocol simplifications — probe-hold reason label, ADR 024 scope (#1474) ([730336e](https://github.com/decdn/decdn/commit/730336e350401b1be8f24a2a83b85cff14725375))
+- Remove QUIC 0-RTT probe connection establishment (#1465) ([abde8ab](https://github.com/decdn/decdn/commit/abde8abf751690b0fcf72163d4bae30dd3fb6f9b))
+- **contracts**: Remove max voucher interval knob (#1453) ([b2b5c48](https://github.com/decdn/decdn/commit/b2b5c484296733558481575f93b08c3cb5041172))
+- **contracts**: Remove slash-appeal challenger pool (#1451) ([1f75ba9](https://github.com/decdn/decdn/commit/1f75ba939e7cf44de3227211072b9f528bcabccd))
+- **gossip**: Name the reputation-report gate's staked-membership states (#1338) (#1340) ([984a9dd](https://github.com/decdn/decdn/commit/984a9ddcd1613854d4afc69017d9ce26e67ac7ef))
+- **gossip**: Name the announce gate's disabled state (#1222) (#1335) ([e3f229a](https://github.com/decdn/decdn/commit/e3f229aa94ee915b2f4f5317ec0de8bece7819f0))
+- **node**: Remove the no-op Metrics::started() recorder (#1264) (#1324) ([358cea6](https://github.com/decdn/decdn/commit/358cea660a07737b2583d06e7b0955b90c11025d))
+- **node**: Decompose the ClientHandler mega-impl + construction-time ClientHandlerDeps (#1254) (#1323) ([11caeb7](https://github.com/decdn/decdn/commit/11caeb7223dcc23236563cc5c5c95d998392bb83))
+- **node**: Decompose the ~1,876-line run() bring-up into ordered phase functions (#1253) ([db018d4](https://github.com/decdn/decdn/commit/db018d48028c2302a18a84d690fc0458cddb68c8))
+- **node**: Drop the cosmetic requires-restart log-diff machinery in reload.rs (#1249) (#1305) ([471884b](https://github.com/decdn/decdn/commit/471884bb6a87b452b561486bd5c88723ac8860d3))
+- **node**: Dedupe runtime helpers (#1252) (#1274) ([109994c](https://github.com/decdn/decdn/commit/109994ce8790b77ff2f8ccef17dbe3e2945605b7))
+- **node**: Shared ChainProjection<T> wrapper + WatcherHandle shutdown ownership (#1255) (#1236) (#1282) ([66fde65](https://github.com/decdn/decdn/commit/66fde65a7d11c71bf06bad6f9ae68e6120f864c8))
+- **node**: WatcherConfig builder with defaults + shared metric-hook helper across the six LogSink watchers (#1251) (#1281) ([32d046e](https://github.com/decdn/decdn/commit/32d046ef517f394e6797603c22d0611d04944f5c))
+- **node**: Split watcher CursorPolicy into CursorStart + owned Checkpoint (#1238) (#1280) ([81295b3](https://github.com/decdn/decdn/commit/81295b3b9e3d7b7ec65dd88272c34d56c186acf8))
+- **node**: Shared send→receipt→status core for the on-chain tx ladders (#1248) (#1279) ([50c57fb](https://github.com/decdn/decdn/commit/50c57fb3b83718740bc1b32f8377c93313f89158))
+- **node**: Collapse the 6 watcher downtime recorders into a second macro family (#1266) (#1276) ([c574ef9](https://github.com/decdn/decdn/commit/c574ef96eebfe1edf4fec177f2144bca37bb2d00))
+- **node**: Collapse the five periodic GC/log runners into one spawn_periodic helper (#1250) (#1272) ([0fed5c7](https://github.com/decdn/decdn/commit/0fed5c7afa29d1bd4e0ac9299e10f0d7fc5f9713))
+- **node**: Generate the trivial metric recorders with a macro (#1263) ([a4ca28b](https://github.com/decdn/decdn/commit/a4ca28b500c7fcb03c7e49e1d377d5c2ddfb61ef))
+- **node,incentive**: Hoist the duplicated buyer-channel redb store into a shared table (#1246) (#1257) ([45c2ef8](https://github.com/decdn/decdn/commit/45c2ef832915ee85ff8e86363813a70447c7230e))
+- **node**: Delete the dormant confirmations knob (#1227) (#1235) ([e9b8208](https://github.com/decdn/decdn/commit/e9b8208afcec41fe75d3729f77e4ac50eaf1145d))
+- **node**: Retire dead/redundant watcher surface (#1231) (#1234) ([a559ea8](https://github.com/decdn/decdn/commit/a559ea856b747af738025d280ecb712aa6a42635))
+- **node**: One CapacityBond watcher feeding both registry projections (#1110) (#1226) ([2058622](https://github.com/decdn/decdn/commit/20586222033d8bfb55959afd20f0ad10217f591b))
+- **contracts**: Drop PaymentChannel forced-inclusion detection, raise dispute floor to 48h (#1204) ([2b42f8d](https://github.com/decdn/decdn/commit/2b42f8d81a9526398e47ef5980aad2351188e7d4))
+- **adr-001**: Trim probe machinery (cache evidence retention, outbound rate-limit, two-phase early-exit) (#1200) ([1c8a846](https://github.com/decdn/decdn/commit/1c8a84669c80cf6516fb9782bd807abd157df821))
+- **cli**: Decdn appeal slash no longer advertises 8 ignored flags (#1138) (#1155) ([a5444d8](https://github.com/decdn/decdn/commit/a5444d88ee8f3cbc2ed3f308a703848f5e6d5c69))
+- **bao**: Type-design tightenings, deferred tests, doc sweep (#1060) (#1070) ([473c57f](https://github.com/decdn/decdn/commit/473c57f323532361550de78280eaa7ab05994fe6))
+- **client-pull**: Promote discovery/probe/endpoint/provider to public modules (#1022) ([44afd1c](https://github.com/decdn/decdn/commit/44afd1cdbd1172c1cd8b70d5eb0142b417ffc0c8))
+- **cli**: De-duplicate hex encoding in register output (#939) ([29ca143](https://github.com/decdn/decdn/commit/29ca14321bd4785fe341fa1f75dd769f6c7af0bd))
+- **node**: Thread Bytes through leech-governor + window math (#910) (#923) ([74f8921](https://github.com/decdn/decdn/commit/74f89215550c8978e278545604f83bb529f4f0a5))
+- **node**: Type-encode seed-leech cap units with Bytes/Percent newtypes (#894) (#911) ([a20aa51](https://github.com/decdn/decdn/commit/a20aa51b2169e01079c5cc14ba0483b26773f163))
+- **contracts**: Remove on-chain Genesis Bond Credit; update emission schedule (#799) ([ba9759e](https://github.com/decdn/decdn/commit/ba9759e45d6d9f3996d1bd199506aa452e325319))
+- **contracts**: Rename stake→bond on CapacityBond surface (#768) ([8caa4ee](https://github.com/decdn/decdn/commit/8caa4ee4e93eaa8dba1760fbdd2105ea9faa4a2b))
+- **node**: Extract RecordStore add_entry/remove_entry helpers (closes #654) (#715) ([8b7796b](https://github.com/decdn/decdn/commit/8b7796b5e14d517bbc188a84b458472b939cdefa))
+- **contracts**: Remove SafetyReserve; escrow-on-slash + 5% bucket to burn (#708) ([b613325](https://github.com/decdn/decdn/commit/b613325b3e9005cf19e9cffd2f323481fc3f77fd))
+- **gossip**: Remove popular_hashes from NodeAnnounce wire body (#609) ([0608251](https://github.com/decdn/decdn/commit/0608251fe8e4fc255177ab2c3891b786c18a6101))
+- **crates**: Extract decdn-config-types leaf crate (#578) (#586) ([f513ad0](https://github.com/decdn/decdn/commit/f513ad0ab7b5daf026036f0727201070de393289))
+- **cache**: Make Origin trait stream-shaped (#271 PR1/4) (#513) ([c75ee78](https://github.com/decdn/decdn/commit/c75ee7878ca7aadaed01629f354ce37c460ee061))
+- **config**: Replace tuple returns with named sub-structs (#216) ([3c66a74](https://github.com/decdn/decdn/commit/3c66a740b7fcd943d3aa090566af8d866f1b998d))
+- Update ADR 023 to clarify PoC and production boundaries and remove Cargo feature flag ([7caf73e](https://github.com/decdn/decdn/commit/7caf73e14d700302c359b4630a93b9addcab4465))
+
+### Documentation
+
+- Point operators at the release and testnet TOKEN channel (#2385) ([35971f2](https://github.com/decdn/decdn/commit/35971f21230b5846caa8aa61b60fc0e0b0690dfe))
+- **adr-003**: Drop the stale capability renewal wording (#2374) ([94844ae](https://github.com/decdn/decdn/commit/94844ae199be62e0f45164df22bb9937314de201))
+- **cache**: Correct ADR 040 on segment re-observation and deny-listed eviction candidates (#2275) ([e8a4a77](https://github.com/decdn/decdn/commit/e8a4a7758025bc60d7bf2d37de9610c34bc5b8c6))
+- **adr**: Align ADR 005 voucher-reject mirror with the wire enum (#2258) ([8f3cdca](https://github.com/decdn/decdn/commit/8f3cdca0403ba3d151cd91127d64dd4f691a7639))
+- Fix minBond, command-name and contract-table drift (#2140) ([93e2af9](https://github.com/decdn/decdn/commit/93e2af9f8cfddf382d4b47025b9f2188ca1ceede))
+- **readme**: Restructure for newcomers and fix ADR drift (#2139) ([4da349f](https://github.com/decdn/decdn/commit/4da349fea0a39f62e5852963bebc563b9e82b3ff))
+- **client**: Usage guide, examples, and doctests for decdn-client (#1150) (#2127) ([cf501d4](https://github.com/decdn/decdn/commit/cf501d46c1dd4d15d26f44376fc44e0bcd8142e4))
+- Add issue forms and pull request template (#2129) ([42718a0](https://github.com/decdn/decdn/commit/42718a03899fc416dfef9d7c87966ee3755eefaf))
+- Add Alper Gundogdu release-signing key (#2128) ([bd5657e](https://github.com/decdn/decdn/commit/bd5657efc29588e42431f683988d77f152f0b3ae))
+- Replace planning labels in comments with plain descriptions (#2126) ([c8db8ad](https://github.com/decdn/decdn/commit/c8db8adcaaa3c006afbec1ea2e69187aa898bd4a))
+- **adr**: Retire ADR 024 ERC-7579 session-key production plan (#1848) (#2092) ([a9edf85](https://github.com/decdn/decdn/commit/a9edf85765f4d19424052c3751d41cf9f9754c3a))
+- **monitoring**: State the Loki log-label contract ([ab1ae81](https://github.com/decdn/decdn/commit/ab1ae815ea6c08de0cf58edcc3aa784361723be5))
+- **adr**: Record proxy-warming vs origin-only policy composition (#1990) (#2055) ([68b31c3](https://github.com/decdn/decdn/commit/68b31c3ddd8dea95428777fa6ac7c541d257b849))
+- **adr-026**: Correct gross client rate multiplier to 4-20x (#2051) ([d2ef36f](https://github.com/decdn/decdn/commit/d2ef36f70f8648259bf1b4ad9cba380e8d2cefb6))
+- **adr**: The slash ladder is fixed, not governable — align ADR 009/011/026 with CapacityBond (#2000) ([83db435](https://github.com/decdn/decdn/commit/83db4356e3fbe95b4a79d1b7d3a4c977ec971bc3))
+- **adr**: Describe the shipped client ranker in ADR 039; scope the unified score to the node pull leg (#1991) ([a86535a](https://github.com/decdn/decdn/commit/a86535aee99cde631a75faa96fbc08a3495b07b0))
+- Sync README with the tree and retarget dangling ADR citations (#1983) ([079c5cc](https://github.com/decdn/decdn/commit/079c5cc6b65f8343dd45ef28c1f36bf0a94708bb))
+- **release**: Name the crates-io team as the crate owner ([d96d6f4](https://github.com/decdn/decdn/commit/d96d6f44e3b140f8c0c51536c902821b7382a675))
+- **release**: Document the crate-ownership handoff after the first publish ([14bcfc4](https://github.com/decdn/decdn/commit/14bcfc4c8fbddd30216d30fea2352aee71dd38b8))
+- **adr**: Repoint ADR 016 buyback summary to keeper-side sub-swap cadence ([a703483](https://github.com/decdn/decdn/commit/a703483f1a6a1cb53c7790705800b7c2a927854f))
+- **adr**: Drop the ADR 028 perjury re-slash claim ([2b87611](https://github.com/decdn/decdn/commit/2b876114d2cf5bdbbcc65a23aae8913869d4a27e))
+- **adr**: Coverage means "will serve", so origins keep has_blob:true (#1506) (#1887) ([271d524](https://github.com/decdn/decdn/commit/271d5244e0ad7bd22f67eddd06be60e301d7193e))
+- **adr**: Range-keyed partial-holder discovery over obao4 (#1506) (#1885) ([881d205](https://github.com/decdn/decdn/commit/881d205e50d9cda59abeee41b7c021c9aaccd1fd))
+- Retire stale design-ahead mechanisms and sync doc claims with code (#1849) ([e159b3d](https://github.com/decdn/decdn/commit/e159b3d3598cb1ade9628a88ef1611a1f45e5059))
+- **adr**: Give ADR 003 a Capability delegation section (#1824) ([597457e](https://github.com/decdn/decdn/commit/597457e8e1f3d4f6101712f5186b1ad91c6621ad))
+- **node**: Sweep the ghost `StaleNonce` symbol and retired channel prose (#1801) ([b3fb018](https://github.com/decdn/decdn/commit/b3fb0188d3fb89906455ee9cb18e58588f66f151))
+- **node,incentive**: Correct the buffered-lane-store comments that overstate durability (#1822) ([8ddb4bb](https://github.com/decdn/decdn/commit/8ddb4bbc69b929e129ccb5e9263e748edaf49c76))
+- **node**: Describe the buffered lane store in the receipt and voucher comments (#1800) ([1004a09](https://github.com/decdn/decdn/commit/1004a096200c89678a4adbfd0907fb9486d7ac74))
+- List all five hot-reloadable sections at every enumeration site (#1805) ([e7e941f](https://github.com/decdn/decdn/commit/e7e941f71628c5a965e6da7af041467c77932a8c))
+- **node**: Correct wedged-provider docs, drop the unreachable horizon sentinel (#1601) (#1798) ([6958237](https://github.com/decdn/decdn/commit/6958237fb81c69cedf0b003df1db40c9b4deb962))
+- Capture repo conventions in CLAUDE.md ([e94b3f6](https://github.com/decdn/decdn/commit/e94b3f63f64dc41afa7d5aa993673d830afda6c8))
+- **client-pull**: Correct stale proxy_warming_order fallback docstring (#1764) ([40446de](https://github.com/decdn/decdn/commit/40446dee1f866237741ac43be4d405ff4f8f7a2a))
+- **adr**: Land PayWord (hash-chained per-MB meter) into ADR 003 (#1751) ([67a3bfd](https://github.com/decdn/decdn/commit/67a3bfd27fcaee9520950a1b85f9107269be7b8d))
+- Drop stale VoucherAck references from comments (#1709) ([a9e871a](https://github.com/decdn/decdn/commit/a9e871a9cc93d843afe3cbe09333d6567c883d45))
+- **adr**: Add cross-ADR Threat Model coverage index (#1703) ([376af49](https://github.com/decdn/decdn/commit/376af4904ecc4494786bec0c8c0f6abc3abb2641))
+- Rewrite history-voice comments and ADR prose into present-tense canon (#1687) ([16beb08](https://github.com/decdn/decdn/commit/16beb0829c553722766fb24848eab89ee8650691))
+- **adr**: Adopt shared payment pool over pairwise channels (#1650) ([6e94e3e](https://github.com/decdn/decdn/commit/6e94e3ee590225200077d0df5d44fc56c09354ec))
+- **adr-036**: Fold amendment into canonical body (#1649) ([4a109cd](https://github.com/decdn/decdn/commit/4a109cd3fcbaf2ca94d7d8b0913a11abec3411df))
+- **adr**: Reconcile rate, corruption, FeeRouter launch, and OZ claims (#1627) ([433f9b3](https://github.com/decdn/decdn/commit/433f9b36e08cab6ca9f90f73057b100d22bf7214))
+- **cache**: Correct stale retry-amplification note and pin the circuit-breaker bound (#1619) ([65722b1](https://github.com/decdn/decdn/commit/65722b1e84e9eb4ea69869a9927e64d0cdd4f218))
+- **adr**: Reconcile ADR 038/037 serve-side prose with stream-while-store (#1567) ([3ebab8d](https://github.com/decdn/decdn/commit/3ebab8d4b161e23a588426b8b5876027f03db2c7))
+- Sweep stale not-yet-wired comments orphaned by landed work (#1572) ([ab79190](https://github.com/decdn/decdn/commit/ab79190be1c28828c3a8ab58a2049a9626404dde))
+- **adr**: Align ADR 016 contract tables with shipped contracts; correct the Balancer V3 approval target (#1570) ([f6695ff](https://github.com/decdn/decdn/commit/f6695ffd1271ce969b594cebb022cbd880b68dde))
+- Slim CLAUDE.md, move Solidity CI gotchas to CONTRIBUTING (#1541) ([f764c1a](https://github.com/decdn/decdn/commit/f764c1acd3c727bdfbc18c1d98591e55f90ac066))
+- **adr-003**: Remove the "channel griefing" non-threat (#1524) ([d4caf8c](https://github.com/decdn/decdn/commit/d4caf8c6532a570e8a135a0d9a8d757b8ca00ce6))
+- **adr-016**: Document on-chain enumeration views + slash evidenceHash (#1501) ([373d8ab](https://github.com/decdn/decdn/commit/373d8ab184b077fa5202dcb1a977c040f5f1a314))
+- **adr**: Correct region-scope enforcement drift in ADRs 011/014/016/030/031 (#1446) ([85b1d58](https://github.com/decdn/decdn/commit/85b1d5890d0a87e69d8ac78c74079df24a858afa))
+- Remove the nonexistent SlashJudge counter-evidence window and two stale code comments (#1469) ([1ccec3d](https://github.com/decdn/decdn/commit/1ccec3d7e63153c649dbf9807a13309d47d1828f))
+- **adr**: Drop encrypted publishing appendix (#1454) ([f395161](https://github.com/decdn/decdn/commit/f395161c5a498d79acd55daef04017682d9f50ac))
+- **adr**: Finish the reputation-floor removal and drop a dead attack vector (#1452) ([0b112a2](https://github.com/decdn/decdn/commit/0b112a2fa8b6e1c7c1a4f82326151e97cfcf90ec))
+- **adr**: Demote client NodeId rotation (#1450) ([dc5d816](https://github.com/decdn/decdn/commit/dc5d816df4f9dd75de4426562f4682c7e0726fc0))
+- **observability**: Drop tokenomics metrics (#1449) ([d2baf50](https://github.com/decdn/decdn/commit/d2baf5032dcd32cefdb290c0b21eab0108a51464))
+- **adr**: Remove endgame hedging from multi-source fetch (#1448) ([9563458](https://github.com/decdn/decdn/commit/9563458120af83d8008378a3a8e66728e91986a5))
+- **adr**: Condense protocol evolution guidance (#1447) ([3c65287](https://github.com/decdn/decdn/commit/3c6528752a0bed1e88d8a5c23932abe03b453b87))
+- **adr**: Realign ADR 016 OZ usage & access control with shipped contracts (#1445) ([4acd662](https://github.com/decdn/decdn/commit/4acd662ae427ddbf8de92de2b9039d373b158227))
+- **adr**: Condense appendices to STE100, cut repetition (#1416) ([69f2272](https://github.com/decdn/decdn/commit/69f227281da07db022bf3ae84769f1da3d23a47d))
+- **adr**: Condense ADR 026 to STE100, cut repetition (#1415) ([e7ac9c1](https://github.com/decdn/decdn/commit/e7ac9c114aafd66e54f7f081be3f4567c84f0ea9))
+- **adr**: Condense ADR 018 to STE100, cut repetition (#1414) ([c6916b7](https://github.com/decdn/decdn/commit/c6916b7c14b21dcdbe16cedf182847c78c1992e1))
+- **adr**: Condense ADR 013 to STE100, cut repetition (#1413) ([e553e28](https://github.com/decdn/decdn/commit/e553e285037ab98b95e3ffb77d990bac60c27ded))
+- **adr**: Condense ADR 008 to STE100, cut repetition (#1412) ([5698a90](https://github.com/decdn/decdn/commit/5698a90f78579bf3c04998a22fade5fe0f08f7d0))
+- **adr**: Condense ADR 014 to STE100, cut repetition (#1411) ([f6b96fb](https://github.com/decdn/decdn/commit/f6b96fb897823a8e6187cc18237deb677b4c1d16))
+- **adr**: Condense ADR 028 to STE100, cut repetition (#1410) ([0c72ff0](https://github.com/decdn/decdn/commit/0c72ff0bc5cd258e3890c6e00510bb7eadcce025))
+- **adr**: Condense ADR 036 to STE100, cut repetition (#1409) ([0c74214](https://github.com/decdn/decdn/commit/0c74214899fdca657aa9cf7f2bc9c0f0cbbb6696))
+- **adr**: Condense ADR 012 to STE100, cut repetition (#1408) ([b4f7e80](https://github.com/decdn/decdn/commit/b4f7e80b9aa032e7eb8c5c0fb36f49d626a41aef))
+- **adr**: Condense ADR 015 to STE100, cut repetition (#1407) ([23f896e](https://github.com/decdn/decdn/commit/23f896ef558047d3026692505d4b5a9a99a1a5f8))
+- **adr**: Condense ADR 024 to STE100, cut repetition (#1406) ([79bc74b](https://github.com/decdn/decdn/commit/79bc74be6ea9aac461e1ae46e3dff5067bf2ca01))
+- **adr**: Condense ADR 039 to STE100, cut repetition (#1405) ([ed1e32f](https://github.com/decdn/decdn/commit/ed1e32f8ae90abc68c46bf936fd83544ffd98173))
+- **adr**: Namespace-as-origin-addressing, drop per-hash claims and default-open allow-list (#1395) ([ac27f69](https://github.com/decdn/decdn/commit/ac27f69ef050f01e3b58bdbf136ae425c175b62c))
+- **adr**: Address Copilot review nits on ADR 030 (#1392) ([527de80](https://github.com/decdn/decdn/commit/527de8020cddcd47abf86b6821391d0087417a5b))
+- **adr**: Condense ADR 030 to STE100, cut repetition (#1391) ([919a93d](https://github.com/decdn/decdn/commit/919a93d7d09c42c1c005440c605356e7de29938f))
+- **adr**: Condense ADR 038 to STE100, cut repetition (#1390) ([d242e2b](https://github.com/decdn/decdn/commit/d242e2bdea7f9a44c27c459780aebc4d7adfc7ae))
+- Resolve rotted ADR citations in code comments (#1317, #1318) (#1329) ([4996e44](https://github.com/decdn/decdn/commit/4996e44a0f4785fe3cc88f25213159e0dc1464c1))
+- **contracts**: Replace rotted line-number ADR citations with section names (#1314) ([44a0d7a](https://github.com/decdn/decdn/commit/44a0d7abe694b6baef8bbfc8b18bcf1d38348b41))
+- Remove plan files ([8f325d9](https://github.com/decdn/decdn/commit/8f325d9d92988a72e11267b0b3b187cd237c6c98))
+- **node**: Describe both OriginDirectory impls in dht/origin.rs (#1290) ([d9b2091](https://github.com/decdn/decdn/commit/d9b2091ef249169fb43dac513237f626389a89b1))
+- **CLAUDE.md**: Document all 12 crates and correct the dependency flow (#1284) (#1288) ([20cefcb](https://github.com/decdn/decdn/commit/20cefcb48ee8fb490b4e6443caf9dc5802b9afcb))
+- **node**: Fix ADR connection lifetime reference (#1268) ([1fd8f31](https://github.com/decdn/decdn/commit/1fd8f3123172ba5a5f2eeb5c09449881b867667e))
+- **node,common,cli**: Re-anchor event_poll_interval_ms docs to eth_getLogs (#1110) (#1224) ([e904b3e](https://github.com/decdn/decdn/commit/e904b3e695fc3b93763fdc632e492444c11d4721))
+- **adr**: Reconcile cross-ADR refs after cut-scope removals (#1201) ([1d8ed4b](https://github.com/decdn/decdn/commit/1d8ed4bb1e5d1b1be9908b18ce5912ff10ce10a5))
+- **adr-012**: Trim client spec (max-channels, gossip-leaf/eclipse, download ledger) (#1199) ([a473a0c](https://github.com/decdn/decdn/commit/a473a0c8376dd8b1922c7bf8cce44fd76aa3bbe4))
+- **adr-009,026**: Manual bootstrap-multisig transition, drop auto-trigger (#1198) ([4409fd5](https://github.com/decdn/decdn/commit/4409fd520bc1587a24a345b0a6dbe4343d6f0ffb))
+- **adr-008**: Remove cold-start bootstrap selection bonus (#1197) ([9e79076](https://github.com/decdn/decdn/commit/9e790769183c525c8c2f881c457aaec451279b6b))
+- **readme**: Correct governance and slash-signature highlights (#1114) ([a705b27](https://github.com/decdn/decdn/commit/a705b27e410504c3c5f9cef3fb0f9dc866179b2b))
+- **adr-011**: Record network-side position on one-hour removal orders (#1082) ([73ec2db](https://github.com/decdn/decdn/commit/73ec2db516d7bd436833faeb8a56cdb6de33d4e6))
+- **adr**: Fix stale cross-link anchors and broken _history paths (#1046) ([b59ee83](https://github.com/decdn/decdn/commit/b59ee839290e2ae50fea9733360318b3409fc6c0))
+- **contracts**: Document permissionless-only appeal-deadline enforcement (#1047) (#1051) ([eee9d2e](https://github.com/decdn/decdn/commit/eee9d2ec7e10203effb26826621dad1cd0d98305))
+- **adr**: Reconcile ADR-011 concurrent-relief cap to the two-tier model (#1015) (#1048) ([8f51f4b](https://github.com/decdn/decdn/commit/8f51f4b0e83a1605c32dfb4e4214f3d0f62b20f4))
+- Add draft operator terms (TERMS.md) (#825) (#1044) ([c453a86](https://github.com/decdn/decdn/commit/c453a86767f20be5613519c9c31bea70453be8ca))
+- **adr**: Record operator safety obligations at onboarding (#825) (#1023) ([9e8726b](https://github.com/decdn/decdn/commit/9e8726b9e066182cff53dd97b12b0cb7f0af8c28))
+- **contracts**: Reconcile ADR-031 mechanical drift to as-built ContentBlacklist (#1014) (#1024) ([7ee668a](https://github.com/decdn/decdn/commit/7ee668a58a7a3b978ee4ee6a22244b74376f9010))
+- **adr**: Remove phantom node-to-node FeeRouter bypass claim (#1013) ([b9a20ca](https://github.com/decdn/decdn/commit/b9a20ca0ca15a3be645e2ef031169c9a158c58f4))
+- **adr-009**: Reject permanent governance veto; split emergency-multisig sunset by capability (#977) ([220ef5b](https://github.com/decdn/decdn/commit/220ef5bb895e96f78d13b5d61db8132e9f628e12))
+- **deny**: Annotate suppressed RUSTSEC advisories with rationale and upstream status (#970) (#978) ([6a139e7](https://github.com/decdn/decdn/commit/6a139e73986da89698a86e7c18bf0ac49078d672))
+- **contracts**: Pin PaymentChannel.withdraw paused-router posture (#890) (#926) ([128df5f](https://github.com/decdn/decdn/commit/128df5f712bdd28f5020cc3bdcdf642dd44d2bd8))
+- **adr**: Add ADR 038 and 039 — verified-range streaming and multi-source fetch (#916) ([8060267](https://github.com/decdn/decdn/commit/80602675045dcc09cd031fa4df1ae02c4534d224))
+- **contracts**: Add README, dev-deploy script, and Anvil deploy guide (#797) ([f287014](https://github.com/decdn/decdn/commit/f2870147d2437f20904d512442d87f9e819b4a2f))
+- **adr**: Align ADR 016 CapacityBond genesis-credit surface with shipped contract (#771) (#787) ([c540ef7](https://github.com/decdn/decdn/commit/c540ef70bce12a53c9b11960fdaaa00bf0b84bd2))
+- **adr-003**: Correct §Admission and Priority to probe-time congestion control (#446) (#756) ([61edab7](https://github.com/decdn/decdn/commit/61edab7527181ed7eaf4c3bd00b14aa9edb8faef))
+- Reconcile ADR internal contradictions (#775) (#776) ([596c2cb](https://github.com/decdn/decdn/commit/596c2cb2c73665b15e42f690bb55fae2a04354ec))
+- **adr**: Align CapacityBond accessor names with shipped ABI (#765) (#769) ([ad9e32b](https://github.com/decdn/decdn/commit/ad9e32bcfc5e460588a941181b72f9d422ef4771))
+- **runbook**: Add ContentBlacklist compliance section (#738) (#766) ([5d0fa9c](https://github.com/decdn/decdn/commit/5d0fa9c71b044caa7e291cf750d3a840a2fb97be))
+- Refresh contract inventory in CLAUDE.md ([464738f](https://github.com/decdn/decdn/commit/464738fde35b3525c98fcbf3369616eee66bf3f9))
+- **adr**: Lower POL to 10% and route freed 5pp to App Incentives (#685) (#730) ([fcbe9fe](https://github.com/decdn/decdn/commit/fcbe9feae617e2006fd8c8b36310c2878b709eac))
+- **adr**: Replace one-chunk-ahead pull pacing with a bounded pull-ahead window (#729) ([fb03bce](https://github.com/decdn/decdn/commit/fb03bce9d656bf9378ee682ec939c09211ce6f17))
+- **adr**: Deprecate ADR 022 local cache-miss prefetch trigger (superseded by ADR 037) (#725) ([6018e2c](https://github.com/decdn/decdn/commit/6018e2c97da7dd9c46b1827669d34a21e5f2282f))
+- **adr**: Add ADR 037 — latency-driven proxy warming for regional locality (#724) ([782c4f8](https://github.com/decdn/decdn/commit/782c4f8edd50b721c4c68a8cf59fccccc7a9c52e))
+- **adr**: Minimum declared-capacity floor for CapacityBond (closes #681) (#721) ([407818e](https://github.com/decdn/decdn/commit/407818e344c64e64b2db513e9859a176b4b12bcb))
+- **adr**: Operator early withdrawal (withdraw-while-open) in ADR 003 (#710) ([0a6a49b](https://github.com/decdn/decdn/commit/0a6a49b897a99475ef18d6f94bcf9997575af068))
+- **adr-026**: Add TGE initial-unlock set + sell-pressure profile (#707) ([550152a](https://github.com/decdn/decdn/commit/550152a46f6015f2818aa08723bfa82e4cf8a634))
+- **claude**: Refresh CLAUDE.md — contracts populated, ADR note restructured ([b66d38f](https://github.com/decdn/decdn/commit/b66d38f9b858f2b8c873d22efa94933ad59572a5))
+- **adr**: Restore canonical voice, drop supersedes/changelog framing (#683) ([f43090a](https://github.com/decdn/decdn/commit/f43090a6f5f3a7664d46668df9c3c2b09ca10615))
+- **adr**: Remove capacity-shortfall slashing (ADR 036 supersedes) (#682) ([1269e9c](https://github.com/decdn/decdn/commit/1269e9ca4b0a5e5afaedce3fd9608e3d5c92792c))
+- Adopt work-token tokenomics v2.2 (no-emission variant) (#679) ([1a80f44](https://github.com/decdn/decdn/commit/1a80f447b860b45e97d7e725af3026a6612f6500))
+- **adr**: Finalize ContentBlacklist ADRs 011 + 031 (Accepted) (#674) ([df78034](https://github.com/decdn/decdn/commit/df78034332308dd37b063cd9d8b861a96712f4cc))
+- Symlink AGENTS.md to CLAUDE.md to prevent drift (#640) ([3860e23](https://github.com/decdn/decdn/commit/3860e2347f5f8eff5201a5dd5e431fa59778613b))
+- **adr-022**: Move rejected alternatives to _history, drop PoC framing ([476466c](https://github.com/decdn/decdn/commit/476466cd597ecb08bcf2ffd8bf8938a69b02072f))
+- **adr-005**: Update status to accepted and refine blob size enforcement details ([c592fd9](https://github.com/decdn/decdn/commit/c592fd92b3c6b50875de32a6292884adf0562af2))
+- **adr**: Spec BatchStoreRequest for bootstrap and dense re-publish (#632) ([29dee80](https://github.com/decdn/decdn/commit/29dee807266c5313969d6933354d9a665be18c9a))
+- **adr**: Add DHT bandwidth analysis to ADR 022, cold-start re-publish jitter MUST (#631) ([b25b07f](https://github.com/decdn/decdn/commit/b25b07fcb31e6963ad381b8138257839c531d592))
+- **adr**: Harden cdn/dht/v1 — per-publisher quota, DHT rate limit, lookup invariants, jitter, negative probe cache (#628) ([40c120e](https://github.com/decdn/decdn/commit/40c120eebf8ab4c56142697ef06a0be7586f04c5))
+- **adr-005**: Add cdn/dht/v1 to top-level ALPN table (#627) ([7490595](https://github.com/decdn/decdn/commit/749059546370d749128859529afce05d8af64738))
+- **adr-002**: Drop stale BLAKE3-mismatch on-chain slash bullets (#626) ([788deba](https://github.com/decdn/decdn/commit/788debad9ddbc4362fb50d0ca4d78e38585efb28))
+- **adr**: Drop registerPublisher; make publisher identity implicit (#619) ([025e8fe](https://github.com/decdn/decdn/commit/025e8fe561d6174d9c840eef5a3c419a852885a7))
+- **adr**: Remove lots of repeating self references ([ec8a6ed](https://github.com/decdn/decdn/commit/ec8a6edef0ca8d136711cae7ec1c44a33d13c255))
+- **adr**: Require authorized origin for prefetch, opt-in with budget cap (#618) ([f5f7628](https://github.com/decdn/decdn/commit/f5f762898f4aa6d31995cca40dd1cb2d41132f24))
+- **adr**: Trim ADR 001 to network topology only (#617) ([c751005](https://github.com/decdn/decdn/commit/c7510059e7752dfc0994afd149fbe5d4d0f4111f))
+- **adr**: Clarify node announcement interval and gossip validation details ([25a8484](https://github.com/decdn/decdn/commit/25a848417b48f3dc073d0ccb97a9cb09fcb218e7))
+- **adr**: Refine architectural decision references and improve clarity ([dfbcb86](https://github.com/decdn/decdn/commit/dfbcb86a9284c2baa517dd45df6cfe6666f696e3))
+- **adr**: Drop OriginAssignment minimum-redundancy floor (#614) ([4516303](https://github.com/decdn/decdn/commit/45163030afef312fee1567fd0a677cd75d3b0f66))
+- **adr**: Drop default-open allow-list bootstrap window (#613) ([5639a9d](https://github.com/decdn/decdn/commit/5639a9d0429895813efa71ab36582eb8053b7cca))
+- **adr**: Drop all section numbering; reference sections by name only (#610) ([a74ef07](https://github.com/decdn/decdn/commit/a74ef07a9f31f062b965b59dae367403537fbb55))
+- **adr**: Expand numeric §N to section names in cross-ref link text (#605) ([fe35b87](https://github.com/decdn/decdn/commit/fe35b8735b0869a3e8c4cc9ed18c8b22d8eff119))
+- **adr**: Anchor all cross-ADR links + enforce reference hygiene (#600) ([4b0758c](https://github.com/decdn/decdn/commit/4b0758c41846e4f9e5362d28f6212d918a62449e))
+- **adr**: Content-aware PDF table widths (fix squished columns) (#601) ([57e74ab](https://github.com/decdn/decdn/commit/57e74ab911c4441a7fbd14ab61944f0f5b9940a0))
+- **adr**: Split ADR 026 → 034/035; 026-tokenomics.md umbrella (#590) ([d37df62](https://github.com/decdn/decdn/commit/d37df62546cc6712106d11502d2ebf50cb9fd838))
+- **adr**: Link bare ADR cross-references; normalize § spacing (#599) ([65bde47](https://github.com/decdn/decdn/commit/65bde470bd441bfd3c6ded94fa79e794ac193c4c))
+- **adr**: Fix ADR/doc drift (stale ADR-007 refs, crate status, provenance) (#596) ([75792a1](https://github.com/decdn/decdn/commit/75792a168cfe0c53e6d03249cb6f1e2e27f4abcf))
+- **adr**: Split SafetyReserve out of ADR 026 into ADR 033 (#590 part 1) ([a5a56ae](https://github.com/decdn/decdn/commit/a5a56aecbead5d79eb3100710f0c5b8b9ae6f02c))
+- **adr**: Payment-token / governance-token terminology ([99bb2a2](https://github.com/decdn/decdn/commit/99bb2a2fb3c0bbd224992e1a595f3174f013def9))
+- **adr**: Single-token USDC payments; drop ADR 010 multi-token (#591) ([2ff4f6e](https://github.com/decdn/decdn/commit/2ff4f6ef3057ee7c36ab7fc0319f3dd48c061170))
+- **adr**: Drop non-existent double-settlement offense from ADR 014 (#584) ([20c8e15](https://github.com/decdn/decdn/commit/20c8e15a73bece18dc74b60988c0bb834abe3a62))
+- **adr**: Reconcile PoC framing to ADR 016 canon; slim seams appendix (#582) ([0f25c59](https://github.com/decdn/decdn/commit/0f25c598bca09ceb7f8a4009eadb1ba5215c53cc))
+- **adr**: Make adr/ self-contained and fix heading hierarchy (#581) ([be6694d](https://github.com/decdn/decdn/commit/be6694d0aa40dbb4034689a9fde17f924b255e8e))
+- **adr**: Surface-lock ADR 026/028/032 (resolve #451) (#575) ([32b543a](https://github.com/decdn/decdn/commit/32b543a2b7879a353e89ce5536256a4de487c43f))
+- **adr**: Reduce ADR book to ~250pp (taxonomy, dedup, density build) (#574) ([55fe463](https://github.com/decdn/decdn/commit/55fe46361bb5683da651083003ffc3fe8bbfe184))
+- **adr**: Unify section taxonomy so the book filter stops rotting (#571) ([364b7be](https://github.com/decdn/decdn/commit/364b7beaf2678d98934fb32fedb8a54c961972a4))
+- **adr**: Fix and enrich the ADR book PDF build (#570) ([08cae18](https://github.com/decdn/decdn/commit/08cae182702a2c1f744beec245abb1c6a3e4c94d))
+- **adr**: Add ADR 032 — SafetyReserve appeal-surface contract surface (#566) ([a0b901d](https://github.com/decdn/decdn/commit/a0b901dfe4b2e12d49d5785d22d199756f8b6278))
+- **adr**: Add ADR 030 — node region self-attestation (#565) ([82a3492](https://github.com/decdn/decdn/commit/82a34927b1205908a49adc21e8ed1c1adfde3716))
+- **adr**: Close #453 risks 1, 5, 6 — payout ordering, paired invariant, capability (4) (#522) ([06e047b](https://github.com/decdn/decdn/commit/06e047b58f377ed1befc0c1a12bd5a876878c224))
+- **adr**: Trim ADR 008 §13 — drop redundant subsections, keep load-bearing trust caveat (#563) ([e8d0daf](https://github.com/decdn/decdn/commit/e8d0daf552520cf708c1a331b0fa88b2f5fb99e7))
+- **adr**: Specify ADR 008 §13 regional-coverage reputation aggregation + taxonomy (#562) ([1af88c1](https://github.com/decdn/decdn/commit/1af88c185838ccfe53ff99420df0739c2abfba4e))
+- **adr**: Lock three-layer probe rate-limit mechanism (ADR 005, ADR 003) (#561) ([d8d6a89](https://github.com/decdn/decdn/commit/d8d6a890785667b03149ec138a2c261e35687b4f))
+- **adr**: Specify blob-cache eviction driver loop in appendix §7 (#560) ([6b0b713](https://github.com/decdn/decdn/commit/6b0b7135ff1d4c1421a5c57cfaab61b0c814b311))
+- **adr**: Follow-up #558 — split dense paragraph; fully-qualified setShares (#559) ([7410846](https://github.com/decdn/decdn/commit/74108460697b3ad3874435ca8f8ec5298eabedb4))
+- **adr**: Remove FeeRouter PoC stub allowance per production-from-day-one principle (#558) ([d3a7fca](https://github.com/decdn/decdn/commit/d3a7fca5ad9a162a3a38652775049ba80a0108d9))
+- **adr**: Close operator-key-rotation §6 deferred hot-signing alternatives (#557) ([a059bef](https://github.com/decdn/decdn/commit/a059bef054cd7367dde9ea9f7e5700a6250b5bfa))
+- **adr**: Add ADR 031 — ContentBlacklist appeal-contract surface (#556) ([bc5f737](https://github.com/decdn/decdn/commit/bc5f737fabc0a63ab7f79262b7bcb9a256d7b7c7))
+- **adr**: Lock parallel DelegatorBuyer contract with shared swap helper (ADR 016, 018, 026) (#555) ([806fefe](https://github.com/decdn/decdn/commit/806fefefc7f4f5da5c029a899c5873c1b2ef6358))
+- **adr**: Lock per-epoch liquidity cap parameter (ADR 026 §11, ADR 018) (#554) ([a8dd792](https://github.com/decdn/decdn/commit/a8dd792f6a2e070d6eebb72bc8421038d5331846))
+- **adr**: Resolve ADR 013 Open Questions (topic migration rule, MAX_MESSAGE_SIZE, ProtocolVersions registry) (#552) ([eb1f5ed](https://github.com/decdn/decdn/commit/eb1f5ede7297f806b94b0d35180e2125514f1680))
+- **adr**: Resolve ADR 012 Open Questions (gossip relay policy, mobile/web client scope) (#551) ([6e009f9](https://github.com/decdn/decdn/commit/6e009f9e8fa46b9ae27596a751b20ed1aebbf3cf))
+- **adr**: Resolve ADR 010 Open Questions (decimals validation, metadata trust, vetting checklist) (#550) ([24bb608](https://github.com/decdn/decdn/commit/24bb60894c08f6fc92a89cfd4f3741b2bb553017))
+- **claude**: Fix contracts/ path in crate tree ([6f16137](https://github.com/decdn/decdn/commit/6f161374c1312d7e1df18c57270d40ec789b0751))
+- **adr**: Drop dangling internal/ pointers in wash-trading prose (#525) ([07aeafc](https://github.com/decdn/decdn/commit/07aeafced0bf8df23330e5533054a578e437c83d))
+- **adr**: Map voucher-rejection errors to in-band StreamError (#497) (#511) ([d95d493](https://github.com/decdn/decdn/commit/d95d49317fd692e4caf2b5c8d81d22df6bef4449))
+- **adr**: Define T in ADR 022 §1.5 step 3 — STORE send time (#509) ([dcb3e8c](https://github.com/decdn/decdn/commit/dcb3e8c631a24f6968f2903247567b3515d5a70d))
+- **adr**: Drop StoreRequest.published_at_us — TTL anchors on receiver wall-clock (#502) (#507) ([8767e3b](https://github.com/decdn/decdn/commit/8767e3b32e5ade8343c05d420a23920a1d94866f))
+- **adr**: Mark cdn/dht/v1 1-RTT in ADR 015 — multiplexed Store is replay-unsafe (#506) ([5314b37](https://github.com/decdn/decdn/commit/5314b374435954110698265fb54c85e90196924f))
+- **adr**: Drop CORRELATED_ATTACK_WAIVER — coordinated griefing isn't realizable (#505) ([4de6d25](https://github.com/decdn/decdn/commit/4de6d2536748885062fb6893eec5a5a4e6c660f5))
+- **adr**: Drop StoreRequest signature — redundant with QUIC NodeId equality check (#503) ([906459f](https://github.com/decdn/decdn/commit/906459f1ae26114b3a10ca8e2903323028bafa54))
+- **adr**: Drop SlashJudge.maxActiveChallengesPerNode — synchronous resolution removed the threat (#501) ([6101354](https://github.com/decdn/decdn/commit/61013549bcef02d2fa7a89929e70bff1a42b8935))
+- **adr**: Drop stale gauge-eligibility tier bullets in ADR 008 Consequences (#500) ([5ff5fae](https://github.com/decdn/decdn/commit/5ff5faeb158407218b00707a92c7fb3bd87645ce))
+- **adr**: Drop ADR 027 — wash-trading defense is the per-operator gauge cap alone (#488) ([c2c8eeb](https://github.com/decdn/decdn/commit/c2c8eeb4d92f666517907637c8a9ead10fc5e353))
+- **adr**: Resolve corruption at the wire — drop ADR 014 §2 + OffenseType.Corruption (#480) ([70ec8cc](https://github.com/decdn/decdn/commit/70ec8ccbc76bffc3aa04619d07939fcc52ea0639))
+- **adr**: Pin gap-fix items (timing bounds, commitEpochSummary validation, ReceiptFraud offense) (#462) ([bb44c82](https://github.com/decdn/decdn/commit/bb44c821e315cfea20b8e4ac9c82657a248e94ea))
+- **adr**: OriginAssignment edge cases + PublisherRegistry setters (#450 §C.2 + §C.3) (#461) ([356a39e](https://github.com/decdn/decdn/commit/356a39eac4309d5c00f1b6d2134695136581134f))
+- **adr**: Full receipt-anchoring spec in ADR 027 §4 (#450 §B.3) (#460) ([be524f4](https://github.com/decdn/decdn/commit/be524f45c07271e5fadb830621b6e2feea09bafc))
+- **adr**: SafetyReserve + DelegatorBuyer interface blocks (#450 §A.3 + §A.4 + §B.6) (#459) ([9c06a69](https://github.com/decdn/decdn/commit/9c06a697443354c779ad4d37e378a560a8612e9d))
+- **adr**: FeeRouter interface block in ADR 016 §1 (#450 §A.2 + §B.4 + §C.1) (#458) ([a55e439](https://github.com/decdn/decdn/commit/a55e439714c11e6d276caa259ca8f041fd3ce950))
+- **adr**: VotingEscrow interface block in ADR 026 §4 (#450 §A.1) (#456) ([3d89495](https://github.com/decdn/decdn/commit/3d89495f3f88cc982d74909133bd6135c827ab7d))
+- **adr**: Split nodeIdOf, add isActive, spec setFeeRouter (#450 §B.1+§B.2+§B.5) (#455) ([6da1898](https://github.com/decdn/decdn/commit/6da18980cb91706e36d7cc84260ad6003778a758))
+- **adr**: Pin slashId, MMR, gauge-pause, advisory diversity (#453) (#457) ([3b14321](https://github.com/decdn/decdn/commit/3b1432171bc937543b2766c0e5d279f8d33f262a))
+- **adr**: Unify contract surface; drop PoC/Production phasing (#449) (#454) ([b80d442](https://github.com/decdn/decdn/commit/b80d44228ce1b596ef2ea1e2e745a512a94089a0))
+- **adr**: Add per-entry blacklist appeal mechanism to ADR 011 (#430) ([9c5724f](https://github.com/decdn/decdn/commit/9c5724f3b527a1b7bf9dbede80acba6abe7adac7))
+- **adr**: Add blob cache eviction policy as appendix (#444) ([da360c1](https://github.com/decdn/decdn/commit/da360c19a5eef252befe6d8fecc50e0d0d8cf015))
+- **adr**: Demote ADR 029 peer-table eviction to appendix (#448) ([83ce46d](https://github.com/decdn/decdn/commit/83ce46d4eef3f4df6b3f0316014415a5df589185))
+- **adr**: Remove client priority staking surface (#402) (#445) ([b944d52](https://github.com/decdn/decdn/commit/b944d5242aa3462a9b85b57fe3514aee868c0387))
+- **adr**: Add ADR 029 peer-table eviction policy (#443) ([0764180](https://github.com/decdn/decdn/commit/076418017e8386582f3ed1fa0624b44891c61af1))
+- **adr**: Pin cdn/dht/v1 stake check, provider ordering, and stream cap (#431) ([ff44444](https://github.com/decdn/decdn/commit/ff444441fdd9c2fbd4939e4c2ff059bea730ce50))
+- **adr**: Collapse receipt-commit paths; drop per-settlement, keep per-epoch (#429) ([da50f67](https://github.com/decdn/decdn/commit/da50f67f62db45199c686c7d5682d0bfc223b687))
+- **adr**: Allow client-initiated zero-voucher close (#424) ([6abd474](https://github.com/decdn/decdn/commit/6abd47437fd89bb06db58cac3c1c2e0482d26478))
+- **adr**: Add ADR 028 slashing appeals path (#419) ([60bdb76](https://github.com/decdn/decdn/commit/60bdb76f8bf98ff93b7aba3bf74f211159302355))
+- **adr**: Add ChannelOpened event so wallets can enumerate channels (#427) ([0ebfc0c](https://github.com/decdn/decdn/commit/0ebfc0c1b144ff2efd18d2ba5f0d61bad5d18677))
+- **adr**: Demote watchtower to permissionless fraud-detection appendix (#422) ([082ba21](https://github.com/decdn/decdn/commit/082ba21770c9a407bc0e9d4a5a308fe7bc1a6fdf))
+- **adr**: Drop popular_hashes from NodeAnnounce; DHT FIND_VALUE is the demand signal (#412) (#416) ([a82a659](https://github.com/decdn/decdn/commit/a82a659036eb5c955955454e1ef33460ca9283c9))
+- **adr**: Drop WatchtowerAnnounce gossip; static config is the long-term shape (#413) (#417) ([c643e50](https://github.com/decdn/decdn/commit/c643e50564ef11503e3025cc417b49ebfb203756))
+- **adr**: Drop Ed25519 wire signature on ProbeResponse/StreamResponse; consolidate on slash_sig (#408) (#409) ([4e99764](https://github.com/decdn/decdn/commit/4e99764f12c194523274f2ffc3e1de9cf50f7e55))
+- **adr**: Drop bootstrap probe fan-out; on-chain directory is fallback (#411) (#415) ([1a1268c](https://github.com/decdn/decdn/commit/1a1268ca7d56c3d472a404b9c72df069db5810c2))
+- **adr**: Drop adminReclaimNodeId; reclaimNodeId is sufficient (#410) (#414) ([b248f28](https://github.com/decdn/decdn/commit/b248f288cb1bcc320b82720cadd646e85426877b))
+- **adr**: Add DAO-governed origin assignment authority (#390) ([a3df13c](https://github.com/decdn/decdn/commit/a3df13c78f857f18353a5378755dabb3ded0dbb6))
+- **adr**: Condense hard-wrapped paragraphs to single lines (#404) ([71721fa](https://github.com/decdn/decdn/commit/71721fa091d9ff558564cec3512d5e36ea557b4b))
+- **contributing**: Add 'Adding a New ALPN Protocol Handler' section (#393) ([b6055ef](https://github.com/decdn/decdn/commit/b6055eff14dde8bbcd0c6871b56fcccbc4dfd065))
+- **architecture**: Drop two more passing PoC framings in the intro ([cef59a5](https://github.com/decdn/decdn/commit/cef59a580efb69c76505f10778df80ebdf5d0617))
+- **adr**: Use American English consistently across the ADR set ([ee6beb7](https://github.com/decdn/decdn/commit/ee6beb741e9c4149385f00826e7b7475059cd2f2))
+- **adr**: Trim PoC framing where it doesn't pull weight (#388) ([7ba0a88](https://github.com/decdn/decdn/commit/7ba0a88c9412f5976018aa992ddaf08581e63f26))
+- **adr-003**: Condense Solidity interfaces and dedupe attack vectors (#385) ([c462430](https://github.com/decdn/decdn/commit/c462430385c69c1f807135e6d186a9a8bcf15e72))
+- **adr**: Trim architecture.md and move alternatives to _history/ (#346) (#384) ([6bc76fc](https://github.com/decdn/decdn/commit/6bc76fc94a290543cf09066034d1f63b2f5e253f))
+- **adr**: Readability cleanup — book PDF, unified headings, drop redundant rows (#383) ([3b8b240](https://github.com/decdn/decdn/commit/3b8b2405c682d42f1f0b5a32845d753db97ef209))
+- **adr**: Make PDF build resilient to npm-global PATH gaps ([b12243c](https://github.com/decdn/decdn/commit/b12243c62b04b9a02edd004e70d0a98ff3d56b7e))
+- **adr**: Render mermaid diagrams in PDF build via mermaid-filter ([b6d7806](https://github.com/decdn/decdn/commit/b6d78069625aec7353ccd2806ad57a3aec1ab469))
+- **adr**: Fix two broken intra-doc anchors and add PDF build instructions ([f95a7ce](https://github.com/decdn/decdn/commit/f95a7ce00f69acb02248e15006ec7a0822ce07eb))
+- **ops**: Add operator runbook for common failures (#364) ([637a3be](https://github.com/decdn/decdn/commit/637a3bec2bcc80b45bb7fc217cf22038f94d23cb))
+- **adr**: Scope protocol ADRs to protocol — relocate watchtower side-business economics (#362) ([d5d3715](https://github.com/decdn/decdn/commit/d5d371580870182e7e6f7ea038c4a0a4407875d1))
+- **adr**: Operator protocol-upgrade runbook (#361) ([ac9a70a](https://github.com/decdn/decdn/commit/ac9a70a8eba54d9ae9ea0d0b05ac7f36854f371e))
+- **adr**: Operator key-rotation runbook (#360) ([7236c45](https://github.com/decdn/decdn/commit/7236c45113139bbc9c8e581346d63afde4d894fe))
+- **monitoring**: Reference Grafana dashboard + Prometheus alerts (#359) ([830950c](https://github.com/decdn/decdn/commit/830950c57d0440022bc055c389abf5e83798e74e))
+- **adr-026**: Condense Alternatives Considered to bulleted list (#355) ([d6597da](https://github.com/decdn/decdn/commit/d6597da701216c54a4e121d9b08c2405e3f2cb63))
+- **adr**: Drop RateChange gossip; rate manipulation becomes immediate slash (#357) ([d522ccd](https://github.com/decdn/decdn/commit/d522ccd595ba92d1bf4c3397fc887d2e2f9be193))
+- **adr**: Scope ADR set to protocol + tokenomics; reclaim 028-032 (#354) ([361bac9](https://github.com/decdn/decdn/commit/361bac9da780d3cf9580ece337407d7fd66e3704))
+- **adr**: Tier 2 — chapter intros + ADR 026 connective opener (#352) ([2302378](https://github.com/decdn/decdn/commit/2302378dcd2b6cd9318359a8fe4c2c43eff4d401))
+- **adr**: Reframe encrypted-content appendix away from "E2E encryption" (#351) ([b15deb1](https://github.com/decdn/decdn/commit/b15deb16aec920cb86fccaa757281f5ec6798626))
+- **adr**: Demote 5 implementation/deployment ADRs to appendices (#349) ([3617aa6](https://github.com/decdn/decdn/commit/3617aa66c1d05de96de6f1624531479d18acce5a))
+- **adr**: Add README preamble + thematic reading order (Tier 1) (#347) ([65fdbf5](https://github.com/decdn/decdn/commit/65fdbf53abaa622a69096ed7a779c857699e40dd))
+- **adr**: Pre-launch cleanup — anchors, framing, superseded ADR (#343) ([8f278a9](https://github.com/decdn/decdn/commit/8f278a98333a797ea75d35e6f62a477beda31017))
+- **adr**: Land canonical tokenomics design — ADRs 026-032 + 11 ripple updates ([907859c](https://github.com/decdn/decdn/commit/907859cbf4000d45ae151bcca4ff871ae41d8f86))
+- **adr-016**: Surface off-chain read API for client/node bootstrap (#333) ([6715ee7](https://github.com/decdn/decdn/commit/6715ee781effe4e3aaa634aa491d446d62761aec))
+- **adr**: Genericize incidental Arbitrum references; consolidate in ADR 021 (#335) ([8c82fb0](https://github.com/decdn/decdn/commit/8c82fb07d28c3507a649d838bac0a6c951f565e9))
+- Populate CHANGELOG.md with initial [Unreleased] state (#246) (#291) ([173d130](https://github.com/decdn/decdn/commit/173d130e7680f994dab26b9bba64c1b7026fcdb6))
+- **protocol**: MAX_MESSAGE_SIZE derivation + compile-time guards (#240) (#287) ([482e8d8](https://github.com/decdn/decdn/commit/482e8d8cd57c8ea6ba3f5f08704891669c1e84be))
+- **claude**: Refresh CLAUDE.md to match current workspace state ([39ebecd](https://github.com/decdn/decdn/commit/39ebecd1c5c80b59462519e59b68380818a4e855))
+- **architecture**: Add ADR 024 to the architectural-decisions list ([331675a](https://github.com/decdn/decdn/commit/331675a563ae632b0f43dd0abaf69c75694a48ba))
+- ADR 024 — account abstraction and Safe smart wallet support (#205) ([8c6d0db](https://github.com/decdn/decdn/commit/8c6d0dbd1a1296c4202bd98d71ad5103f681d9d4))
+- **claude**: Refresh status, bump ADR number, add command quick-ref ([60b57cc](https://github.com/decdn/decdn/commit/60b57cc86ef9f5e50a38d4e8958bc771eefe8c9f))
+- Client parallelism, download resume, and file manifests (ADR 012 amendment) (#209) ([a7793fe](https://github.com/decdn/decdn/commit/a7793fe9100a385f77ad646cb1fbc3d73ad03c0f))
+- Update ADR 023 Cargo feature example to reflect existing otlp feature ([cfb1d11](https://github.com/decdn/decdn/commit/cfb1d11d6aa14a1d0df3bd014446cac7f7731c87))
+- Correct PoC capitalization in architectural documentation ([b5834c3](https://github.com/decdn/decdn/commit/b5834c30fa0e39da058173f4ffcbcb508ee1860d))
+- Add LICENSE-MIT and LICENSE-APACHE files ([056b7ae](https://github.com/decdn/decdn/commit/056b7ae60404bf8e6ff11df88765663a8bea7123))
+- Create CONTRIBUTING.md and consolidate dev documentation (#202) ([2f4bfcc](https://github.com/decdn/decdn/commit/2f4bfcc23f7cc6c9dd01e82e3efd43d340a37491))
+- ADR 020 — observability and metrics standard (#192) ([e235b3d](https://github.com/decdn/decdn/commit/e235b3d8fa502ab1e61ac40b0fd20af131d90a00))
+- ADR 019 — node onboarding and bootstrapping flow (#191) ([41b769c](https://github.com/decdn/decdn/commit/41b769cdfc713403652e4899f30005708a68dfd3))
+- Sync README with current project state ([905b7ab](https://github.com/decdn/decdn/commit/905b7ab6a9d62bf08ea855b4f56850637407a3eb))
+- Update CLAUDE.md to reflect current project state ([3fe106e](https://github.com/decdn/decdn/commit/3fe106ea676da50f6509f53d6e7037fc6ba9bed9))
+- Add ADR 018 liquidity strategy (Balancer 80/20 POL) (#188) ([f14c376](https://github.com/decdn/decdn/commit/f14c3766c310798bb03227c3ef058ca56d9492e3))
+- Fix comprehensive ADR review findings (#187) ([b0b40fa](https://github.com/decdn/decdn/commit/b0b40fa2ab6cd598d70ab260241053206a440f81))
+- Add ADR 016/017 consistency checks to CLAUDE.md ([c9086a7](https://github.com/decdn/decdn/commit/c9086a7ac6f0805b681f0af108bc1df25de19b69))
+- Fix all cross-ADR review findings (consistency, security, design) (#186) ([2fac0d4](https://github.com/decdn/decdn/commit/2fac0d4c13fd7ccd9f126f784673d1ad83c32335))
+- Add ADR 017 privacy analysis (#185) ([adb0a6e](https://github.com/decdn/decdn/commit/adb0a6e2ebecf6c80753f5e374ac36ca0001df08))
+- Add ADR 016 smart contract interaction model (#184) ([5ec5c03](https://github.com/decdn/decdn/commit/5ec5c034318b03d557a4956c357cd0512ff2f8be))
+- Add iroh relay trust assumption to architecture overview ([020a9a8](https://github.com/decdn/decdn/commit/020a9a8c398eefc8ac9a10bf4771e1baeec86e98))
+- Add RateChange counter-evidence for timestamp manipulation disputes (#183) ([e0b1e2a](https://github.com/decdn/decdn/commit/e0b1e2a1e2ed4a430b2243e2dc8ae77e40345a98))
+- Move weight_cap parameter to Section 4.2 table (#180) (#182) ([46f1d1d](https://github.com/decdn/decdn/commit/46f1d1d77d6298940db4ecbf306af637e8bfbf55))
+- Fix false cross-reference to stablecoin tagging in ADR 010 (#179) (#181) ([fe28fcf](https://github.com/decdn/decdn/commit/fe28fcf0064329cafb232512f6459c9513eace12))
+- Add anti-wash-trading mitigations to reputation system (#155) (#178) ([d7c4a61](https://github.com/decdn/decdn/commit/d7c4a6155e0bf8ad5e5b3f94dd042a8f2fe9d002))
+- Add gossip bandwidth analysis and set 60s announce interval (#151) (#177) ([7bf6010](https://github.com/decdn/decdn/commit/7bf6010a3937e98d3ca08bd9389c4383b3969aab))
+- Add KV-CRDT content catalogs to future work in architecture overview ([02bb826](https://github.com/decdn/decdn/commit/02bb826d7159c88bd1211dc3ef8e62833f186c1b))
+- Add QUIC 0-RTT optimization for probe fan-out (#015) (#176) ([36ab622](https://github.com/decdn/decdn/commit/36ab6228abc74a57d3b701f3620642d61ca2ffe6))
+- Add permissionless forceCloseChannel for removed tokens (#158) (#175) ([3a5484e](https://github.com/decdn/decdn/commit/3a5484e0a72a10c60e8b009953b5d7a1ceee37e6))
+- Require ed25519 ownership proof for NodeId registration (#174) ([7a9f48c](https://github.com/decdn/decdn/commit/7a9f48cce457a3d11d914db2f12315d6c42c6d8f))
+- Prevent cold-start bootstrap bonus re-staking abuse (#154) (#173) ([9796768](https://github.com/decdn/decdn/commit/9796768c75b7579e00fc813c23a58ba582178f8f))
+- Define IWatchtowerEscrow contract interface (#152) (#172) ([679488f](https://github.com/decdn/decdn/commit/679488f058e5d76e3117133724980eacfae965e3))
+- Document rationale for data_correct 40% weight (#130) (#171) ([9e63656](https://github.com/decdn/decdn/commit/9e636565cb5c1b3af3ffe2ccaad35c6216777b2c))
+- Separate cdn/keys/v1 as companion protocol (#170) ([334bed0](https://github.com/decdn/decdn/commit/334bed0ed38b97d744f52a77c727bc0b8a910ce0))
+- Add slash-risk observability metrics (#169) ([b5cf096](https://github.com/decdn/decdn/commit/b5cf0968be786af81cb2baced47fbe50b3f11776))
+- Simplify reporter weight cap from 5x to 3x (#168) ([abe83c1](https://github.com/decdn/decdn/commit/abe83c1cf6556601ea04fc42ce68134a4d33a32d))
+- Add ADR 014 on-chain verification for slashing evidence (#167) ([2e5736d](https://github.com/decdn/decdn/commit/2e5736d72deacca5282a6ee91818a792917ab8e4))
+- Improve CLAUDE.md with runnable consistency checks and remove fragile ADR range ([940f81d](https://github.com/decdn/decdn/commit/940f81da41970c46a6c4f6e2ee928516ec76bb29))
+- Remove premature backward-compatibility language from ADRs ([277e550](https://github.com/decdn/decdn/commit/277e5504be89a61c009495f0a01d0f83ac74c210))
+- Add Trust Assumptions section to architecture.md (#166) ([297f719](https://github.com/decdn/decdn/commit/297f719a96facae1dacbb9fa3be9adff6d06ca88))
+- Add optional total_bytes to ProbeResponse (#165) ([b52faa7](https://github.com/decdn/decdn/commit/b52faa7326091445a5bc1c8f3b3420709c9f4da5))
+- Update README with cdn/keys/v1 protocol and ADRs 012-013 ([70cfb4b](https://github.com/decdn/decdn/commit/70cfb4b21cca92d1ca79bd42a70563cab5fe2d4f))
+- Make registerNode atomic with NodeId binding (#164) ([57fc879](https://github.com/decdn/decdn/commit/57fc879a43a94157cef0b9bc5f2480ef07964e55))
+- Add ADR 013 (schema evolution) (#163) ([7c5a7c8](https://github.com/decdn/decdn/commit/7c5a7c8bbc4a03bec97fe31836163ee42d753c5a))
+- Add ADR 012 (client architecture) and move key delivery to iroh QUIC (#162) ([b7412ab](https://github.com/decdn/decdn/commit/b7412ab3ae4eba7b634372ac066aa5420f420666))
+- Clarify origin blacklisting stake mechanics in ADR 011 (#161) ([b803176](https://github.com/decdn/decdn/commit/b803176d43f5ddce03565e68f205528eca6a20ff))
+- Add explicit nonce to voucher wire format (#160) ([1550aea](https://github.com/decdn/decdn/commit/1550aea849e26be9a99654626091471c134ddc5a))
+- Fix architecture.md token_rates description to match ADR 010 ([d88e54c](https://github.com/decdn/decdn/commit/d88e54c8b9a47310e7ee0ae18a760fbfdf3aad8f))
+- Improve CLAUDE.md with consistency checks and condensed build commands ([14ce754](https://github.com/decdn/decdn/commit/14ce754103ac2ebd89dd9a1c036ea331c61b102f))
+- Fix 56 findings from comprehensive ADR architecture review (#142) ([e42cab3](https://github.com/decdn/decdn/commit/e42cab39bd4e66dbb5fdb07affea3689aa9cd7fe))
+- Specify treasury fee splitting mechanism (#141) ([80c68f7](https://github.com/decdn/decdn/commit/80c68f7eff0a48a137f4a3fd09f5062b1032ab03))
+- Specify server_secret rotation signaling to clients (#140) ([a7eb6c7](https://github.com/decdn/decdn/commit/a7eb6c74a60c45320a199a932c0ce4262cd91a7d))
+- Specify region code source and validation (#127) (#139) ([5413612](https://github.com/decdn/decdn/commit/5413612256abd0fd6780dd48baf235006f65ed15))
+- Define rate bounds refresh interval for on-chain queries (#138) ([48d67db](https://github.com/decdn/decdn/commit/48d67dbc145dac0534379556ebcec8fffcd318a1))
+- Document gossip deduplication strategy (#137) ([3cb2519](https://github.com/decdn/decdn/commit/3cb251950a45ed7e349d2407a2ba71f16b48ad2d))
+- Acknowledge server_secret forward secrecy gap with HSM and rotation mitigations (#136) ([f0c8210](https://github.com/decdn/decdn/commit/f0c82101eead1d21736ebf64e7b81c8ed87c98ba))
+- Clarify encrypted blob content addressing in ADR 002 (#135) ([d75980f](https://github.com/decdn/decdn/commit/d75980fadadd1faca024a9a528ca7332fbb0647c))
+- Resolve watchtower fee_offer field vs fixed-rate model conflict (#134) ([faba783](https://github.com/decdn/decdn/commit/faba783b1177fe4835d3e2fb9eb145f4c1bb2d11))
+- Add early exit option for 500ms probe wait (#133) ([e46f2d4](https://github.com/decdn/decdn/commit/e46f2d49471d0ca297f86f182eba8abc132eabec))
+- Add probe-triggered eviction hold to prevent false slashing (#132) ([d317e6e](https://github.com/decdn/decdn/commit/d317e6e66d1df0acf065f975baa6211dfaded953))
+- Cross-reference probe cache TTL ↔ slashing window dependency (ADR 003, 005) (#115) ([8ccb36b](https://github.com/decdn/decdn/commit/8ccb36b55b43d16c22d1d095529cc835ff95400a))
+- Add per-node max_blob_size with BlobTooLarge error in ADR 005 (#114) ([933868e](https://github.com/decdn/decdn/commit/933868e3d7fd4b68f11e380243b9c6549aa5a906))
+- Enforce mandatory rate bounds on addToken in ADR 010 (#113) ([2111a35](https://github.com/decdn/decdn/commit/2111a35e68969f756314219c545913207562fbf3))
+- Specify XChaCha20-Poly1305 nonce storage in ADR 006 (#112) ([84ab33f](https://github.com/decdn/decdn/commit/84ab33fd90cc3abe727d2bb9bf9e505f18e0b4ba))
+- Acknowledge heartbeat proves chain liveness not voucher state in ADR 007 (#111) ([de7dd55](https://github.com/decdn/decdn/commit/de7dd5532ebdab7975e17051a379c27e94bce0be))
+- Fix offline lease sealing flow and specify encryption primitive in ADR 006 (#110) (#110) ([6ffc58e](https://github.com/decdn/decdn/commit/6ffc58e52ab1871aa0fb3ab50499fa0a35b38405))
+- Specify encryption primitive for offline lease sealing in ADR 006 (#109) ([968e893](https://github.com/decdn/decdn/commit/968e89350ebd31ce89521bacf364d0f92790f4a4))
+- Document score clamping and EWMA interaction in ADR 008 (#108) ([cda7211](https://github.com/decdn/decdn/commit/cda72118f1e11901d44d7959dc0f1aeae47a9847))
+- Add PoC Scope section to ADR 008 (reputation) (#107) ([96c37f4](https://github.com/decdn/decdn/commit/96c37f4aa3a6440e15da8ba19637284ea58b3679))
+- Document NTP clock sync requirement for gossip validation in ADR 001 (#106) ([b0ace5b](https://github.com/decdn/decdn/commit/b0ace5ba300d9cb08158680d500e90b5a5ee0646))
+- Allow provider-initiated zero-voucher channel close in ADR 003 (#105) ([eebb1a7](https://github.com/decdn/decdn/commit/eebb1a7fc556b0d06cee66e7b6c8bcf9cb76b2ef))
+- Prevent slash escalation gaming via increasing reset periods (#103) ([fe6c5e8](https://github.com/decdn/decdn/commit/fe6c5e84ca6fa376ff25700bebabc69918cd27ad))
+- Clamp cold-start bootstrap bonus to 1.0 in ADR 008 ([94b0495](https://github.com/decdn/decdn/commit/94b0495a277bb3386e271cca5c486b21c9a95dd4))
+- Use SafeERC20 in ADR 003 staking examples (fixes #95) (#102) ([fc86371](https://github.com/decdn/decdn/commit/fc86371301c93e12ffa34dc9293d24bfd75d2983))
+- Mitigate L2 sequencer censorship of dispute window (fixes #91) (#101) ([a917311](https://github.com/decdn/decdn/commit/a917311c7d7ae189d0c9f54a4bf52bd26a25d62d))
+- Update iroh baseline version from 0.35 to 0.97 ([b5accea](https://github.com/decdn/decdn/commit/b5accea89cf067b078fd191a69ffae152c5b0766))
+- Cap reporter weight and document incumbency bias (ADR 008) (#100) ([0d1ddb4](https://github.com/decdn/decdn/commit/0d1ddb40a24f45f122969c28cc6b29c414f3024f))
+- Document selection clamp in ADR 008 reputation floor (fixes #88) (#99) ([0838a60](https://github.com/decdn/decdn/commit/0838a60bd12c49b6c7e695b44006f305a57a71b3))
+- Add ADR 010/011 summaries and fix gossip description in README ([2ffb05d](https://github.com/decdn/decdn/commit/2ffb05da5bef11b93c8b0c86d344c29c500273a6))
+- Add ADR conventions to CLAUDE.md, gitignore .claude.local.md ([b34b240](https://github.com/decdn/decdn/commit/b34b240e5c36ea8c2aa585432f02f907d50d9b57))
+- Restrict closeChannel to client/provider only (ADR 003) (#98) ([a5b3635](https://github.com/decdn/decdn/commit/a5b3635c33c969c1005c170f827b819365e73d99))
+- Fix 10 cross-ADR consistency issues (#97) ([89bc75a](https://github.com/decdn/decdn/commit/89bc75acd78d7a75ce1ee466724f624fefa9e3d3))
+- Fix 7 cross-ADR consistency issues (#96) ([185a43a](https://github.com/decdn/decdn/commit/185a43a9918e99cbd5d14f44ecde640f8cb96369))
+- Add ADR 010 and 011 summaries to architecture.md (#93) ([83bab8a](https://github.com/decdn/decdn/commit/83bab8a395f78ca1473c1b584fb248e5efd4d54a))
+- Fix ADR 011 slashing schedule violating ADR 009 safety bounds (#86) ([44e17b9](https://github.com/decdn/decdn/commit/44e17b9608eb3384ea8799e8445364bb9c26a964))
+- Batch fix 30+ ADR issues, integrate separated discovery design (#85) ([c0b7db6](https://github.com/decdn/decdn/commit/c0b7db6015562bb5a5ca39f879818774cc06da28))
+- Fix cross-ADR consistency contradictions (#83) ([dc5f5f3](https://github.com/decdn/decdn/commit/dc5f5f329e180bd195374b954246c5560b383c2a))
+- Defer buyback execution to production, accumulate fees in PoC (#54) ([d8c56a3](https://github.com/decdn/decdn/commit/d8c56a377735dff3bfbed7d1a41df683f2218026))
+- Add negotiable voucher cadence for large blob transfers (#53) ([b53303f](https://github.com/decdn/decdn/commit/b53303fb0da188cbb2b7af3734eb09ca075db363))
+- Replace legacy migration path with slashing-channel interactions (#52) ([283ae5c](https://github.com/decdn/decdn/commit/283ae5c6a223b6579860e4d1886a3549a72df5cf))
+- Add deposit economics analysis and practical minimum to ADR 003 (#51) ([8ebb82c](https://github.com/decdn/decdn/commit/8ebb82c0bf0fdd3886a5d156c59a50a0651105e4))
+- Fix clock-skew vulnerability in 30-second rate manipulation window (#50) ([3eaa8fb](https://github.com/decdn/decdn/commit/3eaa8fb51d8d490f2edc8b5c34bd56d761f81637))
+- Specify fee calculation at settlement, not close (#49) ([a0a9022](https://github.com/decdn/decdn/commit/a0a9022ea429738d9423ee9b081644cb0da0e6aa))
+- Specify initial rate bounds and competitive pricing context (#48) ([8e3ae84](https://github.com/decdn/decdn/commit/8e3ae84938453ebce6530a099a539f9ca9900b69))
+- Add governance-managed token allowlist to ADR 010 (#46) ([422fd4b](https://github.com/decdn/decdn/commit/422fd4b278d9fe98f3dc58e32a7fa20737450fa6))
+- Align fee discount on stake multiplier, not hardcoded absolute, closes #12 ([5dce950](https://github.com/decdn/decdn/commit/5dce9502a8ca3db93a2439bf285696027c8ebc1a))
+- Add iroh versioning policy to ADR 000, closes #22 ([dba7a76](https://github.com/decdn/decdn/commit/dba7a7662ba5a6cb9e50ded6e6388bf923d83350))
+- Update ADR 003 to support a single token, propose multi-token support in ADR 010, add ADR 011 for content takedown (regional/non-regional) and hash blacklisting ([eef5aed](https://github.com/decdn/decdn/commit/eef5aed469cb42be91b5e6d6032438388d848142))
+- Update README with watchtower protocol, discovery, and governance ([85c5e49](https://github.com/decdn/decdn/commit/85c5e49f06ed72d07659cf000249cbcde48b15f6))
+- Add PoC-scale economic scenario to ADR 004 (#43) ([d4a648c](https://github.com/decdn/decdn/commit/d4a648ce3ec139d1f87d8ac96e7bec071aab0522))
+- Specify EIP-712 domain separator for voucher signatures (#42) ([d9ca585](https://github.com/decdn/decdn/commit/d9ca5852713c436ea1696dce8371cef8ae7c8d8e))
+- Defer DHT/Kademlia to post-PoC, document gossip-only discovery (#41) ([d79cbb8](https://github.com/decdn/decdn/commit/d79cbb838db90d2cc657482550163e766a252849))
+- Clarify voucher wire format vs on-chain format in ADR 003/005 (#40) ([2d716b3](https://github.com/decdn/decdn/commit/2d716b331eafbffce2d6d03315df4f6d1426958e))
+- Document probe responses as public information (#39) ([a74b97f](https://github.com/decdn/decdn/commit/a74b97fa152d99d22bd9f75bae8e42695a7a7e7a))
+- Separate governance into ADR 009 from ADR 004 (#38) ([2197096](https://github.com/decdn/decdn/commit/21970962d96d974e9608e9d9ff80210af27b6769))
+- Specify QUIC connection pooling and stream multiplexing in ADR 005 (#37) ([5ff60ac](https://github.com/decdn/decdn/commit/5ff60acdb9bfe23f645ecc97a90c8b9f30280c14))
+- Add cdn/watchtower/v1 ALPN to ADR 005 (#36) ([ea79903](https://github.com/decdn/decdn/commit/ea799039145ff54daa57d8b5a55d34a76d87d946))
+- Specify on-chain node registry contract interface (#35) ([334cfc4](https://github.com/decdn/decdn/commit/334cfc48dfecdae6b05fdb352961269d2b25c426))
+- Clarify CLAUDE.md reflects pre-implementation state ([3cd0ef8](https://github.com/decdn/decdn/commit/3cd0ef8b66c0683594e6fe66e4eea776637185e3))
+- Convert ASCII art schemas to Mermaid diagrams (#3) ([7a1e86c](https://github.com/decdn/decdn/commit/7a1e86c24b292b299ffad54a7078b343894a8793))
+- Rewrite README with project overview and restructured hierarchy ([ff69ee6](https://github.com/decdn/decdn/commit/ff69ee66989df5d8b184694b5cf6f5e4110cc400))
+- Add CLAUDE.md and rename storage-layer references to decdn ([720679d](https://github.com/decdn/decdn/commit/720679dd753147f79a9d0987f11a6f82172cadd2))
+- Generalize architecture to content-agnostic CDN, refocus slashing on bad edges (#2) ([4b9f10c](https://github.com/decdn/decdn/commit/4b9f10c9d0b11d5effa0b052f64c967446761c69))
+- Draft architecture overview and multiple ADRs for decentralized CDN design ([8bb3cf1](https://github.com/decdn/decdn/commit/8bb3cf1e9d7da3f8ffcbce745e06639574fc264f))
+
+### Testing
+
+- Move every inline test module into its own file and guard against inline tests (#2359) ([5a846d4](https://github.com/decdn/decdn/commit/5a846d42e847e17f35f8d96f82afd5f108ff7ee3))
+- **client,cache**: Stop two paused-clock tests relying on incidental timing (#2325) ([61f7df0](https://github.com/decdn/decdn/commit/61f7df087337412982d0f36e23968ed50bf5683a))
+- **node**: Pin that the shutdown redeem sweep applies the configured floor (#2260) ([f6de71c](https://github.com/decdn/decdn/commit/f6de71c2b231c6d5683b8f9193add163a9444fdd))
+- **node**: Wait for the owner's first voucher before the mid-blob attach open (#2247) ([e13878f](https://github.com/decdn/decdn/commit/e13878fe1a3459e4da10ac116c8855f79e81b81b))
+- **client**: Make the idle-lane surplus release test deterministic (#2241) ([a366f1a](https://github.com/decdn/decdn/commit/a366f1ac63203a102310ad92a749227a964d69a9))
+- **e2e**: Cover the PaymentPool redeploy collision against two live deployments (#2182) ([af5a682](https://github.com/decdn/decdn/commit/af5a68280a2636c09752cfb78eb26165a1e47cb1))
+- **node**: Pin the stall-loop rank and credit stale proofs in the deposit-capped fixture (#2177) ([e0b358d](https://github.com/decdn/decdn/commit/e0b358d469f039abbbf2693e28991900eedf762c))
+- **node**: Pin the racing warn-throttle invariant, not the interleaving (#2074) ([dcfdae2](https://github.com/decdn/decdn/commit/dcfdae205c2051a887c96ddff565e3b9f866f477))
+- **cli**: Cover the bundle-pull fast-skip path directly (#2022) ([0acaeee](https://github.com/decdn/decdn/commit/0acaeee9f53ce2334a6bb43f601fc959902fabd3))
+- **node,client-pull**: Pin spend bound for a connected non-paying leaf and demand convergence under payment lag (#2020) ([f76aa24](https://github.com/decdn/decdn/commit/f76aa24862480eeb751b78a2e850d181b4bcba26))
+- **e2e**: Re-scope ignored two-top-up fetch test to the money band it can verify (#1922) ([8410d9d](https://github.com/decdn/decdn/commit/8410d9d61d86b005cfa2a945808128c2e7f19bcc))
+- **e2e**: Pool floor ceiling bounds aggregate live reservation across signers (#1921) ([011b10d](https://github.com/decdn/decdn/commit/011b10ddcc948e68f511df6278458711a0ae241f))
+- **e2e,node**: Fix the two reproducible sources of CI flakiness (#1878) ([d6d169a](https://github.com/decdn/decdn/commit/d6d169a47ab16d05fc04325003bb2ebed61ea16d))
+- Calibrate the watchdog deadline and pin shutdown's teardown report (#1869) ([8d8c424](https://github.com/decdn/decdn/commit/8d8c424b40026d69a960e1659cdbf5cb3d01181f))
+- **cache**: Use full-entropy keys in tinylfu policy tests (#1854) (#1856) ([72e097a](https://github.com/decdn/decdn/commit/72e097a839c17ac52f6b9057497835d2e82c10ba))
+- **node**: Route dht_lookup teardown through the bounded support::shutdown helper (#1831) (#1846) ([4474ca6](https://github.com/decdn/decdn/commit/4474ca633f1db92e687352c59e023860c571bd19))
+- **node**: De-flake the DHT integration suite and unpin two teardown budgets (#1830) (#1832) ([5cc801e](https://github.com/decdn/decdn/commit/5cc801ecfc1c52facb94067b6eb3a6fc6b914444))
+- **node,e2e**: Close the #1562 hostile-client and blacklist coverage gaps (#1820) ([da76b4d](https://github.com/decdn/decdn/commit/da76b4d118b287d04dd4e087d52c39f190b49f93))
+- **e2e**: G-NODE-01 onboarding journey, bare to accepting delivery (#1030) (#1768) ([8425857](https://github.com/decdn/decdn/commit/84258575ea9330cc2bf8f5c774a43577f9191ffc))
+- **e2e**: Deploy the protocol once per run, replay a state snapshot per journey (#1722) ([284d73f](https://github.com/decdn/decdn/commit/284d73f7d70a633d6dec1fe07592053643a20ddc))
+- **node**: De-flake the post-top-up delivery-speed regression (#1715) ([6f2c776](https://github.com/decdn/decdn/commit/6f2c7768fd216773f4149e2a30dfcee666b2ab20))
+- **payments**: Skip redeemMany gas benchmarks under forge coverage (#1711) ([95471d6](https://github.com/decdn/decdn/commit/95471d62468e0b4990465f94d19aafc045877c62))
+- **node**: Add a timeout on shutdown to prevent hanging forever (#1710) ([0c535f5](https://github.com/decdn/decdn/commit/0c535f5d2dc3e25df91af7b7fc7ee7f99264d3a7))
+- **payments**: Pin that a skip-ahead voucher on a concurrent lane is rejected (#1698) ([515146f](https://github.com/decdn/decdn/commit/515146fa070c22a2e784a6c39ec77411e1f2c497))
+- **payments**: Exercise concurrent same-lane aggregate voucher accounting (#1689) (#1690) ([c7d5627](https://github.com/decdn/decdn/commit/c7d562770a019bb47758072da92b7e17ed6f4bd3))
+- **cache**: Eviction composes with N coalesced serve-leg readers (B3, #1656) (#1665) ([a3b8617](https://github.com/decdn/decdn/commit/a3b8617727751d7909ef61fc9c625498a3e34c01))
+- **node**: De-flake probe rate-limit reject close-code assertions (#1594) (#1595) ([a74a69a](https://github.com/decdn/decdn/commit/a74a69a1025c9bcc0a115a35adf862070af3d48e))
+- **e2e**: Cover the operator deny-list and the origin restart path (#1499) ([5bdb59b](https://github.com/decdn/decdn/commit/5bdb59b0c0673b18c152e1773ce6e7bd9bb2f34b))
+- **e2e**: Reset anvil state between deploy retries to de-flake journeys (#785) (#1427) ([4f0a839](https://github.com/decdn/decdn/commit/4f0a839423c2b53425a02c7675c77bdf8725a63d))
+- **node**: De-flake stalled-candidate fallthrough tests via seeded ranking (#1421) ([9bc8160](https://github.com/decdn/decdn/commit/9bc8160265bce123d40d1941bc607f2eabff24ad))
+- **e2e**: Harden authorized-origin & slash-evidence journeys (#1366/#1367 follow-ups) (#1404) ([6d00951](https://github.com/decdn/decdn/commit/6d009513818160d4f7d6864aa5e06c44b31bc667))
+- **e2e**: Add G-NODE-08 authorized-origin recognition (opaque backend fetch) (#1366) ([f704e4a](https://github.com/decdn/decdn/commit/f704e4a732457c7aaea8b31c09a86cf024a3bb8a))
+- **e2e**: Ratified rate bounds (G-GOV-02) reach a live daemon (#1041) (#1365) ([55e6258](https://github.com/decdn/decdn/commit/55e6258ca87b702ea2086f7ca4a1a146b426e083))
+- **node**: Keep the voucher floor on live rate bounds, not the quote (#1388) ([c0046d7](https://github.com/decdn/decdn/commit/c0046d7ff4c75ee92c5f5a9e9d9b05678f688091))
+- **e2e**: Hoist poll/expect_revert helpers into decdn-e2e, make ensure_mined pub (#1387) ([d75aee3](https://github.com/decdn/decdn/commit/d75aee39947f49b7da913ab95ff0ef14f2f03f6a))
+- **contracts**: Cover PaymentChannel.RateBoundsInvalid guards (#1385) ([562ae48](https://github.com/decdn/decdn/commit/562ae48b5eae979ed9f209c10a00e7f33e38808c))
+- **node**: Cover idle rearm across streams (#1327) ([22c717a](https://github.com/decdn/decdn/commit/22c717a270234d412c5c9c29193459cc8b7f32db))
+- **e2e**: Isolate $HOME for every spawned binary (#1332) (#1333) ([9f1c74b](https://github.com/decdn/decdn/commit/9f1c74b16ad42d2369d137aa2f87bd53c8dd1ef9))
+- **e2e**: Cover publish CLI chain writes (#1073) (#1273) ([0c92aed](https://github.com/decdn/decdn/commit/0c92aed11f7db199c848bdc5cb2ee30c3709c821))
+- **node**: Deterministic coverage for the idle-close is_empty gate + clock re-arm (#1261) (#1286) ([de1d1fc](https://github.com/decdn/decdn/commit/de1d1fc6ad8061ab65e4dfe73953ea1ea20618f2))
+- **e2e**: Cover G-ORIGIN-01 namespace publish + claim journeys (#1285) ([0de44e6](https://github.com/decdn/decdn/commit/0de44e6e47cc9c853dc9c05cb31006210b8902d7))
+- **e2e**: Cover default-open origin journey (#1278) ([893b0ed](https://github.com/decdn/decdn/commit/893b0ed91e0d61dd5c5a788e00ee466d71498f58))
+- **gossip,node**: Harden the rule-2 staked-node gate — reject-path test + Some regression guard (#1222) (#1232) ([5107fe2](https://github.com/decdn/decdn/commit/5107fe2824ef1c31faaf28013d16e01b942c6390))
+- **e2e**: Harden fixtures — retries, exact assertions, accessors (#1061, #1063, #1064, #1065, #1066) (#1127) ([4c94b32](https://github.com/decdn/decdn/commit/4c94b32b30dc2e151b596d0b59cd18b8d323489a))
+- **node**: Fix race in prefetch_acquired_blob_credits_served_through_serve_loop (#1025) ([c80fa0d](https://github.com/decdn/decdn/commit/c80fa0deccba1fe379dabfcc3308c28e4a5106e8))
+- **incentive,contracts**: Pin cooperative-close EIP-712 waiver parity vector (#1009) (#1010) ([d2c33aa](https://github.com/decdn/decdn/commit/d2c33aaa2c740377a94b8ea0dd166d14b1e0bd74))
+- **contracts**: #995 swap+burn fork test + fix V3 Permit2 swap-approval (#997) ([ad50529](https://github.com/decdn/decdn/commit/ad505293d0d0327aa0d79cae8583e2468b14e840))
+- **contracts**: Gated Balancer V3 fork tests for BuybackBurnerBalancerV3 (#994) ([a0fb467](https://github.com/decdn/decdn/commit/a0fb4673a4c1224e4a4481185dbb70eaab12b9d9))
+- **node**: Cover self-hosted discovery two-node NodeAnnounce + probe without n0 fallback (#967) (#983) ([eba7b04](https://github.com/decdn/decdn/commit/eba7b04f407e6b873cb702d2c0610ad8f526b5cc))
+- **node**: Cover DHT three-layer rate limiter order and trusted-IP exemption (#969) (#981) ([50bc885](https://github.com/decdn/decdn/commit/50bc885fb80a47fa7ff0884975e54dcc218959a4))
+- **cache**: Cover S3 origin Content-Encoding decompression over real HTTP wire (#965) (#979) ([caea351](https://github.com/decdn/decdn/commit/caea351e9360b8a2fe1cb48dfcf884a3b4da68cd))
+- **cli**: Make setup RPC-redaction test hermetic against real ~/.decdn (#975) ([ed30308](https://github.com/decdn/decdn/commit/ed303082dd186bc0ea06f3ccfdf764169f8ce792))
+- **origin-assignment**: Pin 500-element default-open rebuild gas (#780) (#959) ([8809c9b](https://github.com/decdn/decdn/commit/8809c9b8c3145620e1441b514b81888a0e82e7cc))
+- **client-pull**: Tracked-path watermark survives post-ack error (#951) ([0050c17](https://github.com/decdn/decdn/commit/0050c17456c1b16baf57b41bedcc711a8c4376bd))
+- **node**: Cover window pull-through served-but-not-cached finalize path (#896) (#925) ([0ba2ea3](https://github.com/decdn/decdn/commit/0ba2ea3486327bfc40f882483511d7fb83b9c85d))
+- **node**: Pin no-double-spend coalescing for concurrent same-hash pulls (#895) (#924) ([56733ee](https://github.com/decdn/decdn/commit/56733eeea14078f7a888c1f0c7cb1704472bf166))
+- **node**: Cover prefetch record_served through the live cdn/client/v1 serve loop (#900) (#909) ([3c82993](https://github.com/decdn/decdn/commit/3c8299307354f0c1494460d615b16c9e5391b6c9))
+- **node**: Node-to-node pull-through sad-path coverage (#746) (#827) ([f1d0574](https://github.com/decdn/decdn/commit/f1d057482747a9b799749b41f5cacdcc4e27e5df))
+- **node**: Propagate server-task JoinResult in client_loopback teardown (#814) ([37f0b9b](https://github.com/decdn/decdn/commit/37f0b9b80b36013e128199916c472b0aee892bc3))
+- **node**: Two-hop node-to-node paid pull-through integration test (#746) (#813) ([101f043](https://github.com/decdn/decdn/commit/101f0430e1277f76f9b7f18831dba8570c5861cd))
+- **node**: Bound flaky forge deploy in anvil-e2e with timeout + retry (#785) (#786) ([11f89cd](https://github.com/decdn/decdn/commit/11f89cdc0f4e0608f6b6585ff4dbab813d814121))
+- **contracts**: Full ADR 030 updateRegion e2e — EIP-712 + ed25519 registerNode signing harness (#689) (#760) ([2fd2e4f](https://github.com/decdn/decdn/commit/2fd2e4f5915fea1589050c441c949b643e017727))
+- **incentive**: Property-based EIP-712 voucher round-trip + boundary fuzzing (#740) (#764) ([4d7ffc9](https://github.com/decdn/decdn/commit/4d7ffc930761e5ba4ac4dca6e0f3557230fd366b))
+- **node**: Anvil e2e harness for on-chain PaymentChannel settlement (#745) (#752) ([8c5a2aa](https://github.com/decdn/decdn/commit/8c5a2aa0e7353263d61fc71eacc0dfdefc5f59a9))
+- **node**: Property-based tests for DHT routing-table invariants (#748) ([071bbc2](https://github.com/decdn/decdn/commit/071bbc24dcf89672db4e81509f89cc5975e6d8a1))
+- **cache**: Address PR #754 review — pin Unavailable-over-disabled, fix stale docs ([1b923c8](https://github.com/decdn/decdn/commit/1b923c853532a4bb4fcd661105f3248c33bc2b1d))
+- **protocol**: Public API stability snapshot via public_api + insta (#304) (#734) ([aaa87a2](https://github.com/decdn/decdn/commit/aaa87a22b40d6ce5b30b75a0231df1f5b5158bb9))
+- **cli**: Gate mixed-case bundle_create assertion behind case-sensitivity probe (#697) (#727) ([8538d47](https://github.com/decdn/decdn/commit/8538d475d7272ed32f137df77a953d07728a3730))
+- **node**: Integration tests for DHT FindValue lookup (closes #711) (#719) ([32a7d95](https://github.com/decdn/decdn/commit/32a7d954475bc1d1271d3aeea8c6d729da27c6d3))
+- **node**: De-flake probe rate-limit close-code test (#691) (#696) ([c03bf63](https://github.com/decdn/decdn/commit/c03bf63134be22396d84e636ae7977ab299836bd))
+- **contracts**: Close CapacityBond slashing-lifecycle coverage gaps (#706) ([6b5601f](https://github.com/decdn/decdn/commit/6b5601faa0e9ecdbe69ee7a4ddde3c47bd9b3c75))
+- **contracts**: Close access-control and ADR edge-case coverage gaps (#698) ([ec551b1](https://github.com/decdn/decdn/commit/ec551b1d359cc780ad2e0ca5678a489ec962bb76))
+- **contracts**: Add governance lifecycle suite (closes #693) (#695) ([9822c05](https://github.com/decdn/decdn/commit/9822c05e755e619153288f00aef8be1c7f6c875b))
+- **config**: Add end-to-end config-merge coverage for blockchain fields and watchdog bounds (#638) ([bf7edd3](https://github.com/decdn/decdn/commit/bf7edd3bf12a9c63fc745932a81fd7c1a226f909))
+- **node**: Cover SIGHUP rejection of restart-required config fields (#499) (#572) ([63fe8bd](https://github.com/decdn/decdn/commit/63fe8bd7d543025712760457ae8fdd2c7b9d8ffa))
+- **cache**: Pin single-pull coalescing of concurrent misses (#530) (#553) ([5bccc41](https://github.com/decdn/decdn/commit/5bccc4109ccc6dc1f123f8a63e2c13792e9041c9))
+- **cache**: Pin RetryPolicy jitter band and backoff edge cases (#528) (#538) ([0c73b4a](https://github.com/decdn/decdn/commit/0c73b4a2eeaf77e2fcdbe473b37b2da49bce6d00))
+- **cache**: Cover HttpOrigin status mapping, C-L fast-path, redirects (#375) (#395) ([145e89c](https://github.com/decdn/decdn/commit/145e89c55a8536aced7a5a2a381a3fb911603573))
+- **node**: Make config-resolution tests hermetic (#368) (#369) ([d610344](https://github.com/decdn/decdn/commit/d610344b1d72d5978693783558243923c1c316a7))
+- **node**: Cover resolve_config three-layer merge and invariants (#365) ([45070fd](https://github.com/decdn/decdn/commit/45070fdd822d3f487b4de14daa97840890d998d1))
+- **gossip**: Cover peertable eviction boundary conditions (#363) ([b916c7e](https://github.com/decdn/decdn/commit/b916c7e67e57bce49519567ac350c369cddf965a))
+- **config**: In-module unit tests for parse_contract_address and resolve_blockchain (#303) ([3286a76](https://github.com/decdn/decdn/commit/3286a7655580404bd6bfe4d599098aa638c6a067))
+- **protocol**: Proptest fuzz coverage for framing encode/decode (#315) ([e0cb889](https://github.com/decdn/decdn/commit/e0cb8892a3aafc2fa56bfdaee9976802dcbd9a7e))
+- **config**: Pin admin_port file-leg zero-disables (#300) (#301) ([e98608a](https://github.com/decdn/decdn/commit/e98608a28b4555ddf2dd2727272e59091e038471))
+- **node**: Pin ProbeHandler timeout paths with virtual-time advance (#241) (#294) ([60cf9f3](https://github.com/decdn/decdn/commit/60cf9f3eea23f4458e5f514101726e4d8dd0ee7d))
+- **config**: Pin DECDN_* env vars to run args (#268) (#292) ([ef4e3d9](https://github.com/decdn/decdn/commit/ef4e3d9c1cd4125ed8c99f63108a3d80c322f5a2))
+- **gossip**: Signature rejection tests for wrong-key and body mutation (#281) (#293) ([b943c73](https://github.com/decdn/decdn/commit/b943c73f545ec378063b6fe0776102290b7435bd))
+
+### CI/CD
+
+- Make release.yml's clippy cache restore key match ci.yml's (#2381) ([d7f359a](https://github.com/decdn/decdn/commit/d7f359ad65f6574cbf40cef9ff4022b259f9427f))
+- Exclude the remaining test-only modules from Rust coverage ([54cd9b5](https://github.com/decdn/decdn/commit/54cd9b54bb4380d091bc087917e22e9cd4976026))
+- Move CodeQL to advanced setup and skip test paths (#2131) ([5ef38d8](https://github.com/decdn/decdn/commit/5ef38d8f654ec5d2dec70861d69fb9ba90f60967))
+- Move coverage reporting to GitHub Code Quality (#2130) ([e8823a8](https://github.com/decdn/decdn/commit/e8823a825d9ebddde9dcb4a3b72f4795d0799adb))
+- Free disk space in the test job to stop llvm-cov ENOSPC (#2040) ([d3bc7da](https://github.com/decdn/decdn/commit/d3bc7da738964bc59d536179e913c9b0d6075222))
+- Warn on cargo deny findings, fail only when no check ran (#2011) ([0e506b0](https://github.com/decdn/decdn/commit/0e506b063909aa53762dd3d3af546aa166499c8f))
+- Enforce the versioning invariants the manifests only documented (#1973) ([00d9545](https://github.com/decdn/decdn/commit/00d9545662d9ce6da4acf02545f5e8d7b0af63b0))
+- Use official download-artifact, pin cargo-deny-action (#1829) ([69e9d1e](https://github.com/decdn/decdn/commit/69e9d1e9b438f202a64704e88090ca1b12563a6f))
+- Install mold via setup-mold instead of apt-get (#1746) ([e5a5c09](https://github.com/decdn/decdn/commit/e5a5c092b9762b76de8f36cdee695788c9545444))
+- Move runners back to GitHub, keep compile-cache optimizations (#1677) ([8a391ee](https://github.com/decdn/decdn/commit/8a391ee0abf5cb1250b6a99bd7887d48f255d147))
+- Right-size the anvil-e2e timeout budgets (#1657) ([40a12a4](https://github.com/decdn/decdn/commit/40a12a4a114b864d8611ab1aa81cec9a8a32b747))
+- **release**: Cut versions locally, sign with maintainer keys (#1645) ([bca4852](https://github.com/decdn/decdn/commit/bca485243613f8631f98d524fda525247a0b021c))
+- **release**: Base semver-checks on the previous tag, skip on first release (#1630) ([f31fa42](https://github.com/decdn/decdn/commit/f31fa42227e279777bfe2ad60e304fa76fcde854))
+- **release**: Sign the release chain with an org decdn.org GPG key (#1105) (#1628) ([ea9313c](https://github.com/decdn/decdn/commit/ea9313c6783066f1ecf967d152bcaef971f79354))
+- **clippy**: Lint the anvil-e2e-gated targets and fix their violations (#1569) ([9066d27](https://github.com/decdn/decdn/commit/9066d276cbe2fc234c8d0b0f61f3ecf77fe8254f))
+- Migrate workflows to Blacksmith runners (#1502) ([b1ba769](https://github.com/decdn/decdn/commit/b1ba76958c0f2f10b6791c11925ef4a68905b4c0))
+- Split anvil-e2e into parallel settlement + journeys jobs, add mold/debuginfo tuning (#1417) ([50e8306](https://github.com/decdn/decdn/commit/50e830658353a9a629eb63a269b0e38d591a2c7d))
+- Fix Solidity path filter semantics (#1267) ([1bc5102](https://github.com/decdn/decdn/commit/1bc5102c1975f59ff8c725b3a0ccd76ed421320f))
+- Pin Dependabot commit-message prefix (#1244) ([4c52b36](https://github.com/decdn/decdn/commit/4c52b3672a132fbce4a2c75df57f7b3a35fcffd1))
+- Detect changed paths with git instead of the listFiles API (#1242) ([4dc4569](https://github.com/decdn/decdn/commit/4dc45690f39ce3705c313b0b26d86af0ea360ad0))
+- Skip Solidity jobs for deployment-manifest-only changes (#1101) ([5cfbaea](https://github.com/decdn/decdn/commit/5cfbaeafc99ea3457cf2dd171650c66cfc9119ff))
+- **ed25519-vectors**: Harden splice frame check and pin-parity version parse (#1081) ([3afbc19](https://github.com/decdn/decdn/commit/3afbc19fd9fb1ce1b1ae20c1ab7ae2dd5d1b92fa))
+- **ed25519-vectors**: Guard differential-vector drift (#1008) (#1075) ([b31952a](https://github.com/decdn/decdn/commit/b31952aa035ca37b50a6e5c52d772d3916a94753))
+- **anvil-e2e**: Free disk space so the on-main cache-save stops ENOSPCing (#1069) ([6677de6](https://github.com/decdn/decdn/commit/6677de68e9136216d76be844932f62abc19505ef))
+- Stop CodeRabbit body edits from restarting CI (#1005) (#1006) ([e583154](https://github.com/decdn/decdn/commit/e5831546afb60a4901c717556ba934fb09d9959a))
+- **agentic**: Stop Agentic Triage reporting failures as issues (#1002) ([f2a4cc9](https://github.com/decdn/decdn/commit/f2a4cc9fb0a5712311bd9969054af70f6520394e))
+- **contracts**: Enforce gas-snapshot freshness on contract changes (#960) ([dda8b1c](https://github.com/decdn/decdn/commit/dda8b1cf3b8f3ed6b6f9137995efeea69c8b6479))
+- Run doctests in a dedicated parallel job (off the critical-path test job) (#870) ([55537fb](https://github.com/decdn/decdn/commit/55537fbc3cd97320ba4698e875f4a4c8097b4c5f))
+- Gate rust-cache saves to main to relieve saturated cache store (#737) ([5ccec1d](https://github.com/decdn/decdn/commit/5ccec1ddfcb17cc3f49a3c1e1c3402430bcabce4))
+- Merge gas-snapshot into build+test, gate always-on jobs (#736) ([4d7fb5f](https://github.com/decdn/decdn/commit/4d7fb5fc7f661e926de05a49f32e25e354ab5097))
+- Cache solc + forge artifacts; drop redundant MSRV job (#735) ([38f40a4](https://github.com/decdn/decdn/commit/38f40a47dddc8a5eef490f9374c0388e06c3fb7f))
+- Fold pr-title check into ci-success gate ([88735fd](https://github.com/decdn/decdn/commit/88735fd4ebad6abec2f5b8e58b53a70678038c46))
+- **contracts**: Add static analysis, security scans, coverage, gas snapshots (#644) ([1504ecb](https://github.com/decdn/decdn/commit/1504ecb45943d82fd827c3e6855399a07437348f))
+- Add agentic workflow issue-triage (#537) ([4f59c43](https://github.com/decdn/decdn/commit/4f59c4347b48e918a95cf652b643a5fafd5f86a5))
+- Speed up coverage build with mold linker + debug-info trim (#484) ([83d725e](https://github.com/decdn/decdn/commit/83d725e019e10018fbf524ce5e00169554a1cd18))
+- Remove sccache from clippy and msrv jobs (#483) ([4abe1be](https://github.com/decdn/decdn/commit/4abe1bea4b9b8562fff56cc8b26207de0e86bea3))
+- Skip rust jobs on doc-only PRs and accept skips in alls-green (#479) ([79de8f1](https://github.com/decdn/decdn/commit/79de8f1d2672bfe96b170b0310fce7a4a99281ed))
+- Merge test and coverage jobs into single instrumented run (#476) ([a2852fc](https://github.com/decdn/decdn/commit/a2852fc598ec067c61572799c0a15951dcbfa440))
+- **coverage**: Accumulate per-commit history in sticky PR comment (#475) ([9ddf339](https://github.com/decdn/decdn/commit/9ddf339bfaf9560dd75b5f4b53ad28b21d404a79))
+- **coverage**: Replace Codecov with in-CI diff comment (#470) ([4d65ad7](https://github.com/decdn/decdn/commit/4d65ad7d9775dab4599a63e30b6de47d2e855171))
+- **security**: Suppress GHSA-3v94-mw7p-v465 in Trivy fs scan (#465) (#466) ([52d6f9d](https://github.com/decdn/decdn/commit/52d6f9dd31d28e44f8156676fed8554fa43a033d))
+- Post coverage report to PRs via codecov.yml (#464) ([e761041](https://github.com/decdn/decdn/commit/e7610413cb656e1bc7b9980d9590b4f8c0d553b6))
+- Add caching, security scans, coverage, and release guards (#230) ([cb9f751](https://github.com/decdn/decdn/commit/cb9f751a4ed0f6c7998832eebaab15ed0acf3115))
+- Add GitHub Actions pipelines for PR checks and releases (#199) ([34b3c2b](https://github.com/decdn/decdn/commit/34b3c2b19112917988c0995afd32e97f5bbeb0eb))
+
+### Miscellaneous
+
+- **toolchain**: Bump Rust to 1.99.0 (#2378) ([54deb33](https://github.com/decdn/decdn/commit/54deb333933633121e88fd480e9377b7cd788f30))
+- Move Grafana dashboards and alert rules to decdn/devops (#2364) ([f8f906a](https://github.com/decdn/decdn/commit/f8f906a6495bae44a7675acdaeaf83ccb70793fe))
+- **deps**: Bump aws-smithy-json to 0.62.7 for CVE-2026-18140 (#2309) ([461e726](https://github.com/decdn/decdn/commit/461e726777c41305112ffcd3c935cd77b61eaf70))
+- **deps,node**: Bump iroh and noq to 1.3, read relay health from iroh (#2250) ([90d331d](https://github.com/decdn/decdn/commit/90d331d293e7ab1d84e82e74dfbda78e528b3475))
+- **deps-dev**: Bump brace-expansion from 5.0.9 to 5.0.12 in /contracts in the npm_and_yarn group across 1 directory (#2243) ([e4eff4e](https://github.com/decdn/decdn/commit/e4eff4e6785f8d2d3a308eb1477b71163d7f8eb8))
+- **mcp**: Drop the Grafana MCP server from the repo ([760109c](https://github.com/decdn/decdn/commit/760109c08b9c9382004f792d951c8d67df3519bb))
+- **incentive**: Run the buyer-store tests on a solo crate run (#2149) ([2647630](https://github.com/decdn/decdn/commit/2647630fcf066ce3ceba343dc7e5a6e0743b79ae))
+- **contracts**: Re-deploy contracts to Arbitrum Sepolia ([228a1dc](https://github.com/decdn/decdn/commit/228a1dce6ad74c86b067d167065e0492a5967ef7))
+- **mcp**: Wire the Grafana MCP server from the repo ([90d9010](https://github.com/decdn/decdn/commit/90d90106cfc35fd904e78ac17dd35bdb8eab0dee))
+- Scrub Balancer residue missed by #2043 (#2044) ([32f5bff](https://github.com/decdn/decdn/commit/32f5bff54a7a1b07b485cda10d532d3d9752a4d7))
+- **deps-dev**: Bump js-yaml from 4.3.1 to 4.3.2 in /contracts in the npm_and_yarn group across 1 directory (#1970) ([0663c8b](https://github.com/decdn/decdn/commit/0663c8b4438e9030526846c29c24c7e6dfb842ff))
+- **skills**: Add decdn-spec-discipline as a repo skill (#1971) ([7fd6c70](https://github.com/decdn/decdn/commit/7fd6c70664b010fd04aec814f2d7771d8c6bf786))
+- **deps-dev**: Bump fast-uri from 3.1.5 to 3.1.7 in /contracts in the npm_and_yarn group across 1 directory (#1917) ([461464e](https://github.com/decdn/decdn/commit/461464e92c4838dad1cad130467ec2fd678117fb))
+- **cargo**: Adopt resolver 3 and tighten the workspace lint posture (#1836) (#1901) ([0fa98c9](https://github.com/decdn/decdn/commit/0fa98c9335b2e21ef2786f277462b8ec47fcb280))
+- **contracts**: Re-deploy contracts to Arbitrum Sepolia ([d306cc5](https://github.com/decdn/decdn/commit/d306cc5cf9a3924a83db49a1d1882509e0aea97a))
+- **ci**: Remove GitHub Agentic Workflows scaffolding ([4111948](https://github.com/decdn/decdn/commit/41119485632e9d7cc5311bb5a449e9c2501b9bb9))
+- **dev**: Remove the devcontainer config, document native setup ([b68d4c0](https://github.com/decdn/decdn/commit/b68d4c05036eb4fcff1c727344a06caea7cb8ce7))
+- **deps-dev**: Bump js-yaml from 4.2.0 to 4.3.1 in /contracts in the npm_and_yarn group across 1 directory (#1640) ([72023f0](https://github.com/decdn/decdn/commit/72023f07837ac52e04f997e049a8602cf5e66428))
+- **examples**: Point Arbitrum Sepolia configs at redeployed contracts ([2001ea0](https://github.com/decdn/decdn/commit/2001ea09b76928f1866d8337561e28b8c054d097))
+- **deps-dev**: Bump the npm_and_yarn group across 1 directory with 2 updates (#1596) ([45ca934](https://github.com/decdn/decdn/commit/45ca934fb0e64d208f865ad09b936cbcf5880fd1))
+- Knock off six low-LOC / doc-only issues (#1555, #1558, #1559, #1563, #1576, #1579) (#1581) ([373401e](https://github.com/decdn/decdn/commit/373401e41afbd385a745b90cacaa36542761de84))
+- Tighten the release profile to fat LTO and one codegen unit (#1509) ([cd12eb0](https://github.com/decdn/decdn/commit/cd12eb092fdae4e3383a342b842f609a85aac1d3))
+- Replace non-functional tokei.toml exclude with .tokeignore ([d8beedc](https://github.com/decdn/decdn/commit/d8beedc9a4d1c68441daaa67476ad3c180ac79b3))
+- **deps-dev**: Bump brace-expansion from 5.0.7 to 5.0.8 in /contracts in the npm_and_yarn group across 1 directory (#1468) ([392e5f9](https://github.com/decdn/decdn/commit/392e5f97ffd44322d248166e931f4c7e1694f239))
+- Normalize trailing whitespace in gas snapshot and triage lock ([65172c3](https://github.com/decdn/decdn/commit/65172c307226df4002b18d909f882742bbeeca30))
+- **deps-dev**: Bump fast-uri from 3.1.2 to 3.1.4 in /contracts in the npm_and_yarn group across 1 directory (#1363) ([7299ced](https://github.com/decdn/decdn/commit/7299ced7e2a48ecf7ee3ae9f25478e801debe5d4))
+- **deps-dev**: Bump brace-expansion from 5.0.6 to 5.0.7 in /contracts in the npm_and_yarn group across 1 directory (#1339) ([a97be72](https://github.com/decdn/decdn/commit/a97be728c65309cb9c8c63e8ada8a9e605660dd0))
+- Tech-debt batch — origin-replay window unify + Resolved address typing (#1139, #1140) (#1151) ([691be45](https://github.com/decdn/decdn/commit/691be453dce196833c298a9abf8058ad6010c18f))
+- Tech-debt batch — watcher comment rot, publish CLI dedup, watcher-module boundary (#1111, #1080, #1092) ([5e75035](https://github.com/decdn/decdn/commit/5e750354c86afa33d2b3ea65a033573f02a8339a))
+- **contracts**: Record Arbitrum Sepolia v0.1.0 deployment manifest (#1083) (#1100) ([b60ac5d](https://github.com/decdn/decdn/commit/b60ac5de73d76918e1cd93ec218afb4f4d986e59))
+- **deny**: Ignore unreachable quick-xml DoS advisories (macOS-only) (#1057) ([c85bbaf](https://github.com/decdn/decdn/commit/c85bbaf48eef329cec0081827cd6f298598720c2))
+- Add CodeRabbit config with repo-accurate path instructions ([e683e98](https://github.com/decdn/decdn/commit/e683e98c032fd051d15509655afd383cd07fc9f5))
+- **deps-dev**: Bump js-yaml from 4.1.1 to 4.2.0 in /contracts in the npm_and_yarn group across 1 directory (#921) ([681ef8e](https://github.com/decdn/decdn/commit/681ef8e67921a80ea52ec35da9e45f450bebd116))
+- **docs**: Remove completed superpowers plan and spec docs ([2c10dcc](https://github.com/decdn/decdn/commit/2c10dccfe0a2886895d8b1594bff53a0d40f9521))
+- Exclude vendored submodules from tokei line counts ([97fc745](https://github.com/decdn/decdn/commit/97fc7452b352e1ef3ee4b1add58919819fecd2a8))
+- **docs**: Remove completed bond-vocabulary-rename plan and spec ([51ec534](https://github.com/decdn/decdn/commit/51ec534379b428099d41c34662232e086702db23))
+- Gitignore downloaded soljson-latest.js compiler blob ([1b6fc0e](https://github.com/decdn/decdn/commit/1b6fc0e6ad8f7f44cb9ea53f136e22c0c94f2326))
+- **contracts**: Remove 3 unused storage fields + pack NodeInfo/Incident (#699) ([e4f1a30](https://github.com/decdn/decdn/commit/e4f1a303e8506c1da655a6e484de8f349f0f5a8e))
+- **contracts**: Triage slither + aderyn findings (closes #690) (#692) ([c27395b](https://github.com/decdn/decdn/commit/c27395b4e13161d491d3a74cafff4a8170213469))
+- **claude**: Enable openzeppelin-skills plugin ([a0066c2](https://github.com/decdn/decdn/commit/a0066c2e663199371d4541b1bf7cee66074d91af))
+- **contracts**: Post-merge staking cleanup — drop IBurnableERC20, address gemini review (#639) ([be41b37](https://github.com/decdn/decdn/commit/be41b37721549d27c281054eb3b4bd6829f00e99))
+- **contracts**: Foundry scaffold with OZ v5.1 and CI pipeline (#634) ([bb3f920](https://github.com/decdn/decdn/commit/bb3f920f2fac0a798751729c8ab15f190ea4bc20))
+- Drop PoC/production framing from code comments (#623) (#624) ([36ccd3a](https://github.com/decdn/decdn/commit/36ccd3aa8da4daff7eb61a3437a9c48f16301eb3))
+- Add GitHub Copilot, MCP, and VS Code dev tooling config (#536) ([957d2a3](https://github.com/decdn/decdn/commit/957d2a335f308f4248ccbc6a3aeec8cc154c1c91))
+- **claude**: Enable rust-analyzer-lsp plugin ([4de44a1](https://github.com/decdn/decdn/commit/4de44a1daab12f59b84523bb3a60a21c8542e2ab))
+- Pin Rust toolchain to 1.95.0 and bump MSRV to match (#489) ([04655f7](https://github.com/decdn/decdn/commit/04655f7371fa271cec55340b999a99af24f0cd7b))
+- Ignore Python __pycache__ and bytecode ([f0afd0e](https://github.com/decdn/decdn/commit/f0afd0edf21336b8ace86d2c11af7f37f0d44e24))
+- Refresh Cargo.lock after removing proptest dev-dependency ([a0c8044](https://github.com/decdn/decdn/commit/a0c8044124d295842489b71b97e88627dd2d04da))
+- **pre-commit**: Add cargo doc check ([72dc664](https://github.com/decdn/decdn/commit/72dc664e2e3ea744f0a4e6c065c6964fc5002416))
+- Ignore claude worktrees ([4ed09f3](https://github.com/decdn/decdn/commit/4ed09f3ecbc30ea7207f07b5b043663178c4e9cf))
+- **gitignore**: Ignore project-local .worktrees/ directory ([2234191](https://github.com/decdn/decdn/commit/223419155afcf721c67005fd55f9c435b6130b28))
+- **claude**: Disable unused plugins in project settings ([37d4c9c](https://github.com/decdn/decdn/commit/37d4c9c21b6b22b9897ffc8e98e774f8af9fffd3))
+- **devcontainer**: Allow pypi for pre-commit hook bootstrap (#250) ([6572ad5](https://github.com/decdn/decdn/commit/6572ad52b7419d5c2a9a68fc6710822706d8ac18))
+- Added blank lines after each ### heading in the Consequences and Alternatives sections ([e9c6878](https://github.com/decdn/decdn/commit/e9c6878667f8f189ef649b5f2973f6e5789af197))
+- Ignore dtolnay/rust-toolchain in Dependabot ([7a24f0d](https://github.com/decdn/decdn/commit/7a24f0d5b442fd7d4e8e3a9e579c426dfe801571))
+- Enable systems-programming plugin in Claude settings ([01b3f3d](https://github.com/decdn/decdn/commit/01b3f3ddf9b18387acf666cd0168c603f52e9678))
+- Enable cicd-automation plugin in Claude settings ([b92dbe4](https://github.com/decdn/decdn/commit/b92dbe41e992080e043a345cdeb21913b78d95cd))
+- Integrate pre-commit framework (#198) ([e4eb78e](https://github.com/decdn/decdn/commit/e4eb78e2f48f749ffe6c7ae8065d1a36faeec28d))
+- Enable documentation-generation plugin ([3b77597](https://github.com/decdn/decdn/commit/3b77597861211e248698590cd0471d178f65eabc))
+- Enable github plugin ([5741134](https://github.com/decdn/decdn/commit/57411340e9dffbbec2c862a2c35f30ac2a906c48))
+- Enable blockchain-web3 plugin ([d2b6e6d](https://github.com/decdn/decdn/commit/d2b6e6d47930a61e02aec90b4a4be6d79e9661cb))
+- Add Claude Code plugin settings ([c5900a2](https://github.com/decdn/decdn/commit/c5900a2bcb15f590753a29e8e11af8ba8f2c4d91))
+
+### Adr
+
+- **023**: Revert to single poc feature, use #[cfg(not(feature = "poc"))] for prod ([d7e80c9](https://github.com/decdn/decdn/commit/d7e80c945e2d52ca051e1eccd35bc795dd55f74c))
+- **023**: Use #[cfg(feature)] attribute pattern with explicit poc+prod features ([d425bfa](https://github.com/decdn/decdn/commit/d425bfa0d57c3436a91cd13d7eacff64728d95f9))
+- ADR 021 — Production L2 chain selection (Arbitrum One) (#193) ([be7d3f1](https://github.com/decdn/decdn/commit/be7d3f14f9d0f949d310453a40fcf8aea738248f))
+
+### Revert
+
+- **cache**: Remove opt-in remote-origin prewarm from #1510 (#1522) ([e6c4cc3](https://github.com/decdn/decdn/commit/e6c4cc3d5f76bd547d7ce65e2cafd466bad03ae0))

@@ -1,4 +1,10 @@
-import { formatBytes, formatDuration, formatUsdc, shortUri } from "../format";
+import {
+  formatBytes,
+  formatDuration,
+  formatUsdc,
+  shortPath,
+  shortUri,
+} from "../format";
 import type { LivePullRow } from "../view";
 import { Empty, Panel, Progress } from "./Panel";
 
@@ -22,12 +28,15 @@ export function LivePulls(props: { rows: LivePullRow[] }) {
               key={p.key}
               className="flex flex-wrap items-center justify-between gap-3"
             >
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <p className="font-mono text-xs break-all" title={p.uri}>
                   {shortUri(p.uri)}
                 </p>
                 <p className="text-sm text-ink-2 tabular-nums">
-                  {p.kind} to <span className="font-mono">{p.output}</span>
+                  {p.kind} to{" "}
+                  <span className="font-mono break-all" title={p.output}>
+                    {shortPath(p.output)}
+                  </span>
                   {p.files ? ` · ${p.files}` : ""}
                   {p.resumed > 0
                     ? ` · ${formatBytes(p.resumed)} resumed`
@@ -43,7 +52,7 @@ export function LivePulls(props: { rows: LivePullRow[] }) {
                   </p>
                 ) : null}
               </div>
-              <div className="flex w-full flex-col gap-1 sm:w-64">
+              <div className="flex w-full shrink-0 flex-col gap-1 sm:w-64">
                 {p.done === null ? null : (
                   <Progress done={p.done} label={`Progress of ${p.uri}`} />
                 )}

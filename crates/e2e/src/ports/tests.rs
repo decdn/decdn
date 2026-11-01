@@ -1,6 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
-
-use socket2::{Domain, Protocol, Socket, Type};
+use std::net::{TcpListener, UdpSocket};
 
 use super::*;
 
@@ -13,7 +11,17 @@ use super::*;
 /// `connect()` even ones, so a reservation, itself a `bind(…:0)`, never meets
 /// the `connect()` search on an unexhausted range, and a test of it could not
 /// fail.
+#[cfg(target_os = "linux")]
 const EPHEMERAL_PICKS: usize = 5000;
+
+/// How many UDP `bind(…:0)` calls
+/// [`udp_bind_to_port_zero_never_lands_below_ephemeral_low`] makes. A
+/// [`UdpPortClaim`] picks a port below `ephemeral_low()` because the kernel
+/// hands out no UDP port there. Off Linux `ephemeral_low()` is a fixed 49152:
+/// on a host whose range starts 100 ports lower, a run this size lands below it
+/// about six times. On Linux `ephemeral_low()` reads the range the kernel uses,
+/// so the test checks that read.
+const ZERO_BINDS: usize = 1000;
 
 /// The bind `decdn-node`'s `net::bind_reuseaddr` makes for its admin and
 /// metrics listeners: `SO_REUSEADDR`, an explicit address, then `listen`.
@@ -39,20 +47,18 @@ fn held_reservation_is_never_an_ephemeral_bind() {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn child_binds_a_held_reservation() {
+fn child_binds_a_reservation() {
     let reservation = PortReservation::tcp().unwrap();
-    let node = node_style_listen(reservation.addr()).expect("node-style bind on a held port");
+    let node = node_style_listen(reservation.addr()).expect("node-style bind on a reserved port");
     drop(node);
     // `std` (and tokio) listeners, as the gateway and the dashboard bind them.
-    let std_listener = TcpListener::bind(reservation.addr()).expect("std bind on a held port");
+    let std_listener = TcpListener::bind(reservation.addr()).expect("std bind on a reserved port");
     assert_eq!(std_listener.local_addr().unwrap(), reservation.addr());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn held_reservation_survives_a_child_restart() {
+fn child_rebinds_a_reservation_after_a_restart() {
     let reservation = PortReservation::tcp().unwrap();
     let first = node_style_listen(reservation.addr()).unwrap();
     // A served connection leaves a `TIME_WAIT` on the port when the server
@@ -86,6 +92,19 @@ fn udp_claim_is_below_the_ephemeral_range() {
         claim.port()
     );
     assert!(claim.port() >= UDP_CLAIM_FLOOR);
+}
+
+#[test]
+fn udp_bind_to_port_zero_never_lands_below_ephemeral_low() {
+    let low = ephemeral_low().unwrap();
+    for _ in 0..ZERO_BINDS {
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = udp.local_addr().unwrap().port();
+        assert!(
+            port >= low,
+            "bind(0) got {port}, below ephemeral_low() {low}"
+        );
+    }
 }
 
 #[test]

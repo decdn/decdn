@@ -219,6 +219,25 @@ fn rejects_wrong_size() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A key file one byte too long, or far too long, is refused like a short
+/// one: only a file of exactly the key length loads.
+#[test]
+fn rejects_over_long_key_file() -> anyhow::Result<()> {
+    for len in [KEY_LEN + 1, 64 * 1024] {
+        let dir = secure_tempdir()?;
+        let path = key_path(dir.path());
+        fs::write(&path, vec![7u8; len])?;
+        #[cfg(unix)]
+        chmod(&path, 0o600)?;
+        let err = load_or_generate(dir.path()).expect_err("an over-long key file must be refused");
+        assert!(
+            err.chain().any(|c| c.to_string().contains("32 bytes")),
+            "{len} bytes: expected size error, got: {err:#}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn accepts_0700_data_dir() -> anyhow::Result<()> {

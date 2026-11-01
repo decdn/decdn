@@ -41,8 +41,9 @@ exclude = ["contracts"]
 version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-# Three parts, not two: this string, `rust-toolchain.toml`'s channel and every
-# `dtolnay/rust-toolchain@…` ref in the workflows are compared byte-for-byte by
+# Three parts, not two: this string, `rust-toolchain.toml`'s channel, the
+# `toolchain:` input of every `dtolnay/rust-toolchain` step and the
+# `rust:` tag in deploy/sponsord/Dockerfile are compared byte-for-byte by
 # check_toolchain_pin.py, so they move together or the `packaging` job says
 # which one did not.
 rust-version = "1.99.1"
