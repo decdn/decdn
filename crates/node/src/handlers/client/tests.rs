@@ -1764,17 +1764,6 @@ async fn clamp_lane_to_registration_narrows_the_live_lane_and_persists() -> anyh
     Ok(())
 }
 
-/// Read `decdn_serve_pool_recheck_skipped_total` from `metrics`.
-fn pool_recheck_skipped(metrics: &Metrics) -> anyhow::Result<u64> {
-    let encoded = metrics.encode()?;
-    encoded
-        .lines()
-        .find_map(|line| line.strip_prefix("decdn_serve_pool_recheck_skipped_total "))
-        .ok_or_else(|| anyhow::anyhow!("decdn_serve_pool_recheck_skipped_total is not exported"))?
-        .parse()
-        .map_err(Into::into)
-}
-
 /// The lane and blob a pool re-check unit test names.
 fn recheck_stream() -> (LaneKey, Hash) {
     let lane = LaneKey {
@@ -1785,52 +1774,95 @@ fn recheck_stream() -> (LaneKey, Hash) {
     (lane, Hash::new(b"pool re-check"))
 }
 
-/// A wired pool view that holds no status for the pool skips the mid-stream
-/// pool-solvency re-check, and the skip is counted.
-#[tokio::test]
-async fn pool_recheck_without_a_status_is_counted_as_skipped() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _projection, _dir) = handler_with_projection_view(&metrics).await;
-    let (lane, hash) = recheck_stream();
-    let status = handler.pool_view_status_cached(&lane, &hash).await;
-    assert!(
-        status.is_none(),
-        "the projection holds no status for an unfolded pool"
-    );
-    assert_eq!(pool_recheck_skipped(&metrics)?, 1);
-    Ok(())
+/// A [`crate::pool_view::PoolView`] holding one funded status with a set
+/// lifecycle for every pool, for the pool-close re-check tests.
+#[derive(Debug)]
+struct LifecyclePoolView {
+    lifecycle: crate::pool_view::Lifecycle,
 }
 
-/// A pool view that holds a status runs the re-check, so nothing counts as
-/// skipped.
-#[tokio::test]
-async fn pool_recheck_with_a_status_is_not_counted_as_skipped() -> anyhow::Result<()> {
+#[async_trait::async_trait]
+impl crate::pool_view::PoolView for LifecyclePoolView {
+    async fn status(&self, _pool_id: B256) -> Option<crate::pool_view::PoolStatus> {
+        Some(crate::pool_view::PoolStatus {
+            owner: Address::repeat_byte(0x11),
+            remaining: U256::MAX,
+            lifecycle: self.lifecycle,
+        })
+    }
+}
+
+/// The re-check's stop for a handler whose pool view holds `lifecycle`.
+async fn recheck_stop_for(
+    lifecycle: impl FnOnce(u64) -> crate::pool_view::Lifecycle,
+) -> Option<ServeStop> {
     let metrics = Arc::new(Metrics::new());
-    let view = Arc::new(FixedPoolView {
-        owner: Address::repeat_byte(0x11),
+    let now = crate::coarse_clock::CoarseClock::new().unix_seconds();
+    let view = Arc::new(LifecyclePoolView {
+        lifecycle: lifecycle(now),
     });
     let (handler, _dir) = handler_with_pool_view(&metrics, view).await;
     let (lane, hash) = recheck_stream();
-    let status = handler.pool_view_status_cached(&lane, &hash).await;
-    assert!(
-        status.is_some(),
-        "the fixed view holds a status for every pool"
-    );
-    assert_eq!(pool_recheck_skipped(&metrics)?, 0);
-    Ok(())
+    handler.pool_recheck_stop(&lane, &hash).await
 }
 
-/// With no pool view wired there is nothing to re-check against, so a `None`
-/// stays silent.
+/// A wired pool view that no longer holds the pool means the pool closed under
+/// the stream, so the re-check stops it as `PoolClosed`.
 #[tokio::test]
-async fn pool_recheck_with_no_view_wired_is_not_counted_as_skipped() -> anyhow::Result<()> {
+async fn pool_recheck_stops_a_pool_the_view_no_longer_holds() {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _projection, _dir) = handler_with_projection_view(&metrics).await;
+    let (lane, hash) = recheck_stream();
+    assert_eq!(
+        handler.pool_recheck_stop(&lane, &hash).await,
+        Some(ServeStop::PoolClosed)
+    );
+}
+
+/// With no pool view wired there is nothing to re-check against, so the stream
+/// fails open.
+#[tokio::test]
+async fn pool_recheck_with_no_view_wired_keeps_serving() {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await;
     let (lane, hash) = recheck_stream();
-    let status = handler.pool_view_status_cached(&lane, &hash).await;
-    assert!(status.is_none(), "no view wired reads no status");
-    assert_eq!(pool_recheck_skipped(&metrics)?, 0);
-    Ok(())
+    assert_eq!(handler.pool_recheck_stop(&lane, &hash).await, None);
+}
+
+/// An open, funded pool keeps serving.
+#[tokio::test]
+async fn pool_recheck_keeps_serving_an_open_funded_pool() {
+    let stop = recheck_stop_for(|_| crate::pool_view::Lifecycle::Open).await;
+    assert_eq!(stop, None);
+}
+
+/// A `Closing` pool whose dispute deadline has come stops as `PoolClosed`,
+/// although its `remaining` still funds the stream.
+#[tokio::test]
+async fn pool_recheck_stops_a_closing_pool_at_its_deadline() {
+    let stop = recheck_stop_for(|now| crate::pool_view::Lifecycle::Closing { deadline: now }).await;
+    assert_eq!(stop, Some(ServeStop::PoolClosed));
+}
+
+/// The cutoff is the capability expiry margin before the deadline: a deadline
+/// one second inside the margin stops, one second outside it keeps serving.
+#[tokio::test]
+async fn pool_recheck_stops_a_closing_pool_inside_the_redeem_margin() {
+    let margin = decdn_common::config::capability_expiry_margin_secs(
+        decdn_common::config::DEFAULT_REDEEM_INTERVAL_SECS,
+    );
+    let inside = recheck_stop_for(|now| crate::pool_view::Lifecycle::Closing {
+        deadline: now + margin - 1,
+    })
+    .await;
+    assert_eq!(inside, Some(ServeStop::PoolClosed));
+    // A wide gap outside the margin, so a coarse-clock tick between the two
+    // reads cannot move the deadline inside it.
+    let outside = recheck_stop_for(|now| crate::pool_view::Lifecycle::Closing {
+        deadline: now + margin + 60,
+    })
+    .await;
+    assert_eq!(outside, None);
 }
 
 /// The mid-stream signer cap-headroom re-check stops a live stream once the

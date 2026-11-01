@@ -61,6 +61,7 @@ use crate::metrics::Metrics;
 use crate::node_origin::NodeOrigin;
 use crate::receipt_log::{RawReceipt, ReceiptSink};
 use crate::warn_throttle::WarnThrottle;
+use outcome::ServeStop;
 
 // The paid-delivery methods are split across concern-focused submodules, each
 // a bare `impl ClientHandler` block over the fields defined here. Support
@@ -1488,11 +1489,6 @@ pub struct ClientHandler {
     /// Throttle for the serve-miss refusal line on a request with no lane here
     /// ([`MissPath::NoLane`]). A remote peer triggers it at will.
     no_lane_miss_log: WarnThrottle,
-    /// Throttle for the `warn!` on a mid-stream pool re-check that finds no
-    /// status: the pool closed under a live stream. Its own window, because the
-    /// cause and remedy differ from every refusal above. Each event also counts
-    /// into `decdn_serve_pool_recheck_skipped_total`.
-    pool_recheck_skip_warn: WarnThrottle,
     /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
     /// `None` (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
     /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
@@ -1613,7 +1609,6 @@ impl ClientHandler {
             unbound_request_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unknown_lane_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             no_lane_miss_log: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
-            pool_recheck_skip_warn: WarnThrottle::new(Self::POOL_RECHECK_SKIP_WARN_INTERVAL),
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
             warming_credit: deps.warming_credit,
@@ -1666,7 +1661,7 @@ impl ClientHandler {
     /// `None` result makes the caller fail open — a transient RPC blip must not stop
     /// a paying stream, and the on-chain `redeem` is the backstop. MAY block on a
     /// `getPool` fetch on a cache miss, so it is NOT for the voucher-boundary path
-    /// — the mid-stream re-check uses [`Self::pool_view_status_cached`].
+    /// — the mid-stream re-check uses [`Self::pool_recheck_stop`].
     pub(super) async fn pool_view_status(
         &self,
         pool_id: B256,
@@ -1674,52 +1669,74 @@ impl ClientHandler {
         self.pool_view.as_ref()?.status(pool_id).await
     }
 
-    /// Non-blocking pool status for the mid-stream pool-solvency re-check, which
-    /// runs at a voucher boundary at most once per [`Self::pool_recheck_interval`].
-    /// It reads [`crate::pool_view::PoolView::cached_status`], which must not
+    /// The mid-stream pool re-check (ADR 003 §Pool solvency): the stop a live
+    /// stream on `lane_key`'s pool must take now, or `None` to keep serving. It
+    /// runs at a voucher boundary at most once per [`Self::pool_recheck_interval`]
+    /// and reads [`crate::pool_view::PoolView::cached_status`], which must not
     /// block: every view in the tree answers it from memory and never issues a
     /// `getPool` `eth_call`, so it cannot stall the serve loop when the RPC is
     /// slow.
     ///
-    /// Returns `None` when no pool-view is wired (dev/test, no chain) or the view
-    /// holds no status for the pool, and the caller then fails open. Admission
-    /// puts every admitted stream's pool in the view, and the view drops a pool
-    /// only once it is closed, so a `None` with a view wired means the pool closed
-    /// under this live stream: `redeemMany` reverts on it, and the node is not
-    /// paid for the bytes it serves after the close. That case counts
-    /// `decdn_serve_pool_recheck_skipped_total` and logs a throttled `warn!`
-    /// naming the stream, so only the re-check calls this.
-    pub(super) async fn pool_view_status_cached(
-        &self,
-        lane_key: &LaneKey,
-        hash: &Hash,
-    ) -> Option<crate::pool_view::PoolStatus> {
+    /// - No pool view wired (dev/test, no chain): `None`. There is nothing to
+    ///   check, so the stream fails open.
+    /// - The view holds no status for the pool: [`ServeStop::PoolClosed`].
+    ///   Admission puts every admitted stream's pool in the view, and the view
+    ///   drops a pool only once it is reclaimed or a re-anchor read finds it
+    ///   closed, so the pool closed under this stream. `redeemMany` reverts on a
+    ///   closed pool.
+    /// - The pool is `Closing` and its dispute deadline falls inside the
+    ///   capability expiry margin ([`Self::inside_expiry_margin`]):
+    ///   [`ServeStop::PoolClosed`]. `redeemMany` reverts past the deadline, and
+    ///   the margin leaves the redeemer one redeem interval to sweep the last
+    ///   voucher and the landing slack to land it.
+    /// - The pool can no longer fund the floor credit committed across its
+    ///   signers ([`Self::pool_funds_committed`]): [`ServeStop::PoolExhausted`].
+    ///
+    /// The closed checks run first, because a closed pool's `remaining` pays
+    /// nothing. The caller sends `PoolExhausted` on the wire for either stop: the
+    /// client's recovery is the same funding step, and the stop keeps its own
+    /// counter. The re-check logs a `warn!` for each stop, which names the
+    /// stream. Each stream stops once, so the line needs no throttle.
+    async fn pool_recheck_stop(&self, lane_key: &LaneKey, hash: &Hash) -> Option<ServeStop> {
         let view = self.pool_view.as_ref()?;
-        let status = view.cached_status(lane_key.pool_id).await;
-        if status.is_none() {
-            self.metrics.serve_pool_recheck_skipped();
-            if let Some(suppressed) = self.pool_recheck_skip_warn.admit() {
-                tracing::warn!(
-                    pool_id = %lane_key.pool_id,
-                    signer = %lane_key.signer,
-                    %hash,
-                    suppressed,
-                    interval = ?self.pool_recheck_skip_warn.interval(),
-                    "mid-stream pool-solvency re-check skipped: the pool view no longer holds \
-                     this pool, which closed under a live stream; redeemMany reverts on a \
-                     closed pool, so the node is not paid for these bytes"
-                );
-            }
+        let Some(status) = view.cached_status(lane_key.pool_id).await else {
+            tracing::warn!(
+                pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
+                "mid-stream pool closed: the pool view no longer holds this pool, which closed under a live stream; redeemMany reverts on a closed pool, so the node stops serving. The owner opens a new pool"
+            );
+            return Some(ServeStop::PoolClosed);
+        };
+        if let crate::pool_view::Lifecycle::Closing { deadline } = status.lifecycle
+            && self.inside_expiry_margin(deadline)
+        {
+            tracing::warn!(
+                pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
+                dispute_deadline = deadline,
+                "mid-stream pool closing: the pool's dispute deadline falls inside the node's redeem margin; redeemMany reverts past the deadline, so the node stops serving. The owner opens a new pool"
+            );
+            return Some(ServeStop::PoolClosed);
         }
-        status
+        if !self.pool_funds_committed(lane_key.pool_id, status.remaining) {
+            // A paying in-flight download is being terminated, and the pool
+            // solvency bound only grows — an accumulator bug here is permanent per
+            // pool, so make the stop observable rather than silent.
+            tracing::warn!(
+                pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
+                "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer gate refusal never reaches here"
+            );
+            return Some(ServeStop::PoolExhausted);
+        }
+        None
     }
 
     /// The signer's total on-chain `spent` across every provider in `pool_id`, read
     /// from what the pool view already holds (never a fresh `getAuthorization`),
     /// for the mid-stream signer cap-headroom re-check. `None` when no pool-view is wired
     /// (dev/test, no chain) or the view holds no projection — the re-check then skips
-    /// and delivery continues, matching how [`Self::pool_view_status_cached`] fails
-    /// open. See [`crate::pool_view::PoolView::signer_spent_cached`].
+    /// and delivery continues. The signer re-check runs only after
+    /// [`Self::pool_recheck_stop`] returns `None`, so with a view wired the view
+    /// still holds the pool and this `spent` is not the `0` of a forgotten pool.
+    /// See [`crate::pool_view::PoolView::signer_spent_cached`].
     pub(super) async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
         self.pool_view
             .as_ref()?
@@ -2114,11 +2131,6 @@ impl ClientHandler {
     /// binding, a request with no binding, a request on an unknown lane. Each
     /// line carries the offending `peer` and the `suppressed` count.
     pub(super) const PEER_FAULT_WARN_INTERVAL: Duration = Duration::from_mins(1);
-
-    /// Minimum gap between `warn!` lines for a mid-stream pool re-check that
-    /// finds no status. Each live stream on a closed pool fires once per
-    /// re-check interval, so the line carries the `suppressed` count.
-    pub(super) const POOL_RECHECK_SKIP_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
     /// Emit the observable side of a floor-admission refusal, picking the message
     /// the refusing gate actually justifies.

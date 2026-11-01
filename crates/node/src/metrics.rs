@@ -90,6 +90,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_unknown_lane_total",
     "decdn_serve_stream_request_unreadable_total",
     "decdn_serve_stream_midstream_pool_exhausted_total",
+    "decdn_serve_stream_midstream_pool_closed_total",
     "decdn_serve_stream_midstream_signer_cap_exhausted_total",
     "decdn_serve_stream_midstream_blob_too_large_total",
     "decdn_serve_stream_terminated_takedown_total",
@@ -2450,14 +2451,12 @@ pub struct DecdnMetrics {
     /// floor credit committed across its signers. The pool-level sibling of
     /// `serve_stream_midstream_signer_cap_exhausted`.
     pub serve_stream_midstream_pool_exhausted: Counter,
-    /// `decdn_serve_pool_recheck_skipped_total`: mid-stream pool-solvency
-    /// re-checks that did not run because the wired pool view holds no status
-    /// for the pool. The view drops a pool only once it is closed, so a skip
-    /// means the pool closed under a live stream: the stream continues, and
-    /// `redeemMany` reverts on a closed pool, so the node is not paid for the
-    /// bytes after the close. Counted per re-check, so one affected stream adds
-    /// one count per re-check interval.
-    pub serve_pool_recheck_skipped: Counter,
+    /// `decdn_serve_stream_midstream_pool_closed_total`: paying streams stopped
+    /// mid-delivery because their pool closed, or is `Closing` with its dispute
+    /// deadline inside the node's redeem margin. `redeemMany` reverts on such a
+    /// pool. The wire reason is `PoolExhausted`; this counter separates the
+    /// close from a drained pool (`serve_stream_midstream_pool_exhausted`).
+    pub serve_stream_midstream_pool_closed: Counter,
 }
 
 /// Per-request JSON-RPC metrics for the node's chain provider, registered under
@@ -3971,8 +3970,8 @@ recorders! {
     receipt_write_failure => receipt_write_failures.inc();
     /// A paying stream stopped mid-delivery on `PoolExhausted`.
     serve_stream_midstream_pool_exhausted => serve_stream_midstream_pool_exhausted.inc();
-    /// A mid-stream pool-solvency re-check skipped: the pool view holds no status.
-    serve_pool_recheck_skipped => serve_pool_recheck_skipped.inc();
+    /// A paying stream stopped mid-delivery because its pool closed.
+    serve_stream_midstream_pool_closed => serve_stream_midstream_pool_closed.inc();
 }
 
 watcher_downtime_recorders! {

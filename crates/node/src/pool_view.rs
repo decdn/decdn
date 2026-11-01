@@ -28,10 +28,9 @@
 //!   projection only. An admitted stream's pool was seeded at admission and a
 //!   projection entry persists until the pool is forgotten (a `PoolReclaimed`, or
 //!   a re-anchor read that finds it `Closed`, removes it), so a `None` here
-//!   means the pool closed under a live stream. The re-check then fails open,
-//!   because a chain read at a voucher boundary would stall delivery, and counts
-//!   `decdn_serve_pool_recheck_skipped_total`. `redeemMany` reverts on a closed
-//!   pool, so the node is not paid for the bytes it serves after the close.
+//!   means the pool closed under a live stream. `redeemMany` reverts on a closed
+//!   pool, so the re-check stops the stream rather than read the chain at a
+//!   voucher boundary, which would stall delivery.
 //!
 //! The bare [`PoolProjection`] is the projection itself: its `status` returns
 //! `None` for a pool it has not folded and never touches the network. Tests wire

@@ -622,30 +622,26 @@ impl ClientHandler {
             // voucher.
             let done = done_delivering && pending.is_empty() && unvouchered == 0;
 
-            // Mid-stream pool-solvency re-check (ADR 003 §Pool solvency),
+            // Mid-stream pool re-check (ADR 003 §Pool solvency),
             // symmetric with the takedown re-check below: re-read the cached pool
-            // status and stop once the pool can no longer fund the delivery in
+            // status and stop once the pool can no longer pay for the delivery in
             // flight. A pool drains mid-flight — other lanes redeem `remaining`
-            // down — so a long stream must catch that; the credit window bounds
-            // delivery ahead of the last COLLECTED voucher, not ahead of the last
-            // SOLVENCY-verified point, so nothing else notices a shared pool going
-            // unredeemable. `pool_funds_committed` asks two things: `remaining`
-            // still sits above the refundable floor `M`, and `remaining − M` still
+            // down — and it can close under a live stream, so a long stream must
+            // catch both; the credit window bounds delivery ahead of the last
+            // COLLECTED voucher, not ahead of the last SOLVENCY-verified point, so
+            // nothing else notices a shared pool going unredeemable.
+            // `pool_recheck_stop` stops on a pool the view no longer holds (it
+            // closed), on a `Closing` pool whose dispute deadline falls inside the
+            // node's redeem margin, and on a pool whose `remaining − M` no longer
             // covers the floor credit ALREADY committed across the pool (this
-            // stream included while its floor is un-repaid). A pool whose streams
-            // have all repaid has an empty committed ledger, so only the
-            // `remaining > M` bound then separates a funded pool from a drained
-            // one. On `false` the pool can no longer fund further delivery, so
-            // stop IN-BAND with a clean
-            // `PoolExhausted` (not a QUIC reset, unlike a takedown) so the owner
-            // learns to top up — `PoolExhausted` is post-auth, so naming the
-            // condition leaks nothing an open-time refusal must hide, and it is not
-            // watermark-gated (no bundle). A `None` status fails OPEN: with no pool
-            // view wired there is nothing to check, and with a view wired the pool
-            // closed under this stream, which `pool_view_status_cached` counts and
-            // warns on. The caller drops the concurrent
-            // pull leg when this returns, bounding the upstream spend just as the
-            // takedown and no-progress exits do.
+            // stream included while its floor is un-repaid). Every stop is IN-BAND
+            // with a clean `PoolExhausted` (not a QUIC reset, unlike a takedown) so
+            // the owner learns to fund a pool — `PoolExhausted` is post-auth, so
+            // naming the condition leaks nothing an open-time refusal must hide,
+            // and it is not watermark-gated (no bundle). With no pool view wired
+            // there is nothing to check, and the stream fails open.
+            // The caller drops the concurrent pull leg when this returns, bounding
+            // the upstream spend just as the takedown and no-progress exits do.
             //
             // The check runs on a WALL-CLOCK cadence, not at every chunk
             // boundary: the projection only advances as the settlement watcher
@@ -657,19 +653,11 @@ impl ClientHandler {
             // and the on-chain redeem backstop are unchanged.
             if collected_any && !done && last_pool_check.elapsed() >= pool_recheck_interval {
                 last_pool_check = std::time::Instant::now();
-                if let Some(status) = self.pool_view_status_cached(&lane_key, &hash).await
-                    && !self.pool_funds_committed(lane_key.pool_id, status.remaining)
-                {
+                if let Some(stop) = self.pool_recheck_stop(&lane_key, &hash).await {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                         .await?;
-                    // Observable stop (symmetric with the takedown re-check below): this
-                    // terminates a paying miss-leg delivery.
-                    tracing::warn!(
-                        pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
-                        "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer gate refusal never reaches here"
-                    );
                     return Ok(ServeEnd::Stopped {
-                        stop: ServeStop::PoolExhausted,
+                        stop,
                         bytes: delivered,
                     });
                 }

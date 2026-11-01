@@ -1324,7 +1324,8 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
 ///
 /// The mid-stream re-check calls [`cached_status`](crate::pool_view::PoolView::cached_status), which reads the
 /// projection ONLY and never blocks on a `getPool` — a chain read at a voucher
-/// boundary would stall delivery.
+/// boundary would stall delivery. A pool the projection no longer holds has
+/// closed, so the re-check stops the stream.
 ///
 /// A short-TTL negative cache suppresses a repeat `getPool` for a pool just
 /// found not-servable (`RESOLVE_VERDICT_TTL`) or whose read faulted (the far
