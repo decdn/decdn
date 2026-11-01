@@ -105,10 +105,11 @@ repos:
 
       # --- workspace shape ---------------------------------------------
       # The Rust version lives in rust-toolchain.toml, Cargo.toml's
-      # rust-version and every dtolnay/rust-toolchain@… ref in the workflows,
-      # each read by a different tool. Dependabot bumps only the action refs,
-      # so without this CI quietly compiles on a different compiler from every
-      # developer. The `packaging` CI job is authoritative.
+      # rust-version, the `toolchain:` input of every dtolnay/rust-toolchain
+      # step and deploy/sponsord/Dockerfile's `rust:` tag, each read by a
+      # different tool. A Rust release arrives as Dependabot's bump of that
+      # `rust:` tag alone, and this holds the PR red until the other sites move
+      # with it. The `packaging` CI job is authoritative.
       - id: toolchain-pin
         name: rust version agrees across toolchain, manifest and workflows
         entry: .github/scripts/check-toolchain-pin.sh

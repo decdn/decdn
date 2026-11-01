@@ -669,30 +669,42 @@ jobs:
           path: artifacts
 
       # An archive leaves its artifact's directory only if its name carries
-      # the target the artifact is named for, and no two artifacts may carry
-      # one name. An extra artifact therefore either holds a file naming
-      # another target, which fails here, or adds an archive the exact count
-      # below refuses. A step holding the run's artifact token can still
+      # the version and the target the artifact is named for, and no two
+      # artifacts may carry one name. An extra artifact therefore either holds
+      # a file naming another target, which fails here, or adds an archive the
+      # exact count below refuses. The check reads one directory per artifact,
+      # so it refuses a flat download (download-artifact extracts flat when one
+      # artifact matches, or with `merge-multiple`), an empty artifact, and
+      # any hidden entry. A step holding the run's artifact token can still
       # replace a same-named artifact outright; only keeping untrusted code
-      # out of the run closes that, which is why the jobs that build hold a
-      # read-only token.
+      # out of the run closes that.
+      # .github/scripts/tests/test_release_upload_assets.py runs this step.
       - name: Each archive comes from its own target's artifact
         working-directory: artifacts
         shell: bash
         env:
           VERSION: ${{ needs.tag.outputs.version }}
         run: |
-          shopt -s nullglob
-          for dir in */; do
-            dir=${dir%/}
+          shopt -s nullglob dotglob
+          dirs=()
+          for entry in *; do
+            [ -d "$entry" ] || {
+              echo "::error::$entry is not an artifact directory; a flat download skips this check"
+              exit 1; }
+            dirs+=("$entry")
+          done
+          (( ${#dirs[@]} > 0 )) || { echo "::error::no artifact directory was downloaded"; exit 1; }
+          for dir in "${dirs[@]}"; do
             target=${dir#binaries-}
             [ "$target" != "$dir" ] || {
               echo "::error::artifact $dir is not named binaries-<target>"; exit 1; }
-            for f in "$dir"/*; do
+            files=( "$dir"/* )
+            (( ${#files[@]} > 0 )) || { echo "::error::artifact $dir is empty"; exit 1; }
+            for f in "${files[@]}"; do
               name=${f#"$dir"/}
               case "$name" in
                 *-"$VERSION"-"$target".tar.gz | *-"$VERSION"-"$target".zip) ;;
-                *) echo "::error::$name in artifact $dir does not name target $target"
+                *) echo "::error::$name in artifact $dir does not name version $VERSION and target $target"
                    exit 1 ;;
               esac
               [ ! -e "$name" ] || { echo "::error::two artifacts carry $name"; exit 1; }

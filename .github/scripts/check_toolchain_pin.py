@@ -7,20 +7,22 @@ and none derivable from another:
     rust-toolchain.toml   [toolchain] channel        what rustup installs locally
     Cargo.toml            [workspace.package]        what cargo refuses to build
                           rust-version               with (the MSRV)
-    .github/workflows/*   dtolnay/rust-toolchain@X   what CI actually compiles on
-    .github/actions/*/    (or its `with: toolchain:`
-      action.y*ml         input, which overrides the @ref)
+    .github/workflows/*   dtolnay/rust-toolchain     what CI actually compiles on
+    .github/actions/*/    `with: toolchain:` input
+      action.y*ml         (or the @X ref, without one)
     deploy/sponsord/      FROM rust:X.Y.Z-…          what a source build of the
       Dockerfile                                     sponsord images compiles on
 
-Without this check nothing compares them. Dependabot's docker ecosystem bumps
-the sponsord Dockerfile's `rust:` tag on its own and touches no other site, so
-one merged Dependabot PR leaves the image building on a different compiler
-from CI and every developer — which is exactly the drift `rust-toolchain.toml`
-is pinned to prevent. This check turns that PR red until the other sites move
-in the same change. The workflows pin `dtolnay/rust-toolchain` by commit SHA
-and name the version in its `toolchain:` input, which Dependabot does not
-read.
+Without this check nothing compares them. The workflows pin
+`dtolnay/rust-toolchain` by commit SHA and name the version in its
+`toolchain:` input, which Dependabot does not read, so a Rust release arrives
+only as the docker ecosystem's bump of the sponsord Dockerfile's `rust:` tag,
+which touches no other site. The image still compiles on the pinned version
+after that bump alone: `COPY . .` brings `rust-toolchain.toml` in, and the
+image's rustup proxy installs that channel. The bump instead leaves the base
+image's toolchain unused and the Dockerfile's "The toolchain tag is the
+workspace's pinned toolchain" false. This check turns that PR red until the
+other sites move in the same change.
 
 All sites must carry the identical `X.Y.Z` string. A two-part `rust-version`
 ("X.Y") satisfies cargo but is not the string the other sites carry, and
@@ -239,8 +241,9 @@ def main() -> int:
         for e in errors:
             print(f"  {e}", file=sys.stderr)
         print(
-            "\nrust-toolchain.toml, Cargo.toml's rust-version and every\n"
-            "dtolnay/rust-toolchain step under .github/ must carry the same X.Y.Z.\n"
+            "\nrust-toolchain.toml, Cargo.toml's rust-version, the `toolchain:` input of\n"
+            "every dtolnay/rust-toolchain step under .github/ and the `rust:` tag in\n"
+            "deploy/sponsord/Dockerfile must carry the same X.Y.Z.\n"
             "Move them together in one change (see CONTRIBUTING.md § Rust Toolchain).",
             file=sys.stderr,
         )

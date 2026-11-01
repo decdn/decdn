@@ -811,10 +811,6 @@ jobs:
       needs.changes.outputs.rust == 'true' || needs.changes.outputs.solidity == 'true' ||
       github.event_name != 'pull_request'
     steps:
-      # This job only checks out to regenerate + diff vectors locally; it never
-      # pushes, and releases are not automated from CI (no auto-release), so the
-      # GITHUB_TOKEN need not persist in .git/config. Dropping it satisfies
-      # zizmor's `artipacked` check and keeps the token off disk for later steps.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -1379,11 +1375,13 @@ jobs:
         run: .github/scripts/check-image-name.sh
 
       # The Rust version is written in rust-toolchain.toml, Cargo.toml's
-      # rust-version and every dtolnay/rust-toolchain step in this file and
-      # release.yml; each is read by a different tool. Dependabot bumps only the
-      # action refs, so this is what turns that PR red until the two TOML sites
-      # move with it. Runs before the toolchain install on purpose: it needs no
-      # cargo, and a drifted pin is the one thing that should fail first.
+      # rust-version, the `toolchain:` input of every dtolnay/rust-toolchain
+      # step in the workflows and local actions, and deploy/sponsord/Dockerfile's
+      # `rust:` tag; each is read by a different tool. A Rust release arrives as
+      # Dependabot's bump of that `rust:` tag alone, so this is what turns that
+      # PR red until the other sites move with it. Runs before the toolchain
+      # install on purpose: it needs no cargo, and a drifted pin is the one
+      # thing that should fail first.
       - name: Rust version agrees across toolchain, manifest and workflows
         run: .github/scripts/check-toolchain-pin.sh
 

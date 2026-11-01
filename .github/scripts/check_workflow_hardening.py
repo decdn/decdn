@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Fail if a workflow widens its token or floats an action, an image or a tool.
+"""Fail if a workflow widens its token, floats an action, or floats an image or
+tool this check reads.
 
 Every step under .github/workflows runs with its job's `GITHUB_TOKEN`, so an
 action fetched from a moved tag, a tool installed at whatever version is
 newest, or a token left in `.git/config` for a later step to read, hands that
 token to code nobody reviewed. In `release.yml` that token can push an image
 tag (`packages: write`) or replace release assets (`contents: write`); in
-`ci.yml` it writes PR comments and code-quality results, and the `clippy`
-cache a CI job saves is restored by the release's `verify`. Six rules keep
-every token narrow and the code fixed:
+`ci.yml` it writes PR comments and code-quality results. The `clippy` cache
+is a further path: CI saves it on `main` only, with the Actions runtime token
+rather than the job's `GITHUB_TOKEN`, and the release's `verify` restores it.
+Six rules keep every token narrow and the code fixed:
 
 1. Every remote `uses:` names a full 40-hex commit SHA. A tag or branch can be
    moved to other code; a SHA cannot. A `docker://` ref names an
    `@sha256:` digest for the same reason. A local `./…` action is checked
-   in, and its own `action.yml` is held to rules 1 and 2.
+   in, and its own `action.yml` is held to rules 1, 2, 5 and 6.
 2. Every `actions/checkout` step sets `persist-credentials: false` under its
    `with:`, so no later step finds the token in the checkout's git config.
 3. The workflow-level `permissions:` exists and grants no `write`, so a job
@@ -27,20 +29,28 @@ every token narrow and the code fixed:
    input in IMAGE_INPUTS, since a SHA-pinned action still pulls a floating
    image by default. A job `container:` or `services:` key is an error:
    this check does not read those images.
-6. A `taiki-e/install-action` step names every tool as `name@X.Y.Z` and sets
-   `fallback: none`. install-action checks the sha256 of a version its
-   manifest lists; for any other it falls back to cargo-binstall, which
-   installs unchecked.
+6. A `taiki-e/install-action` step names every tool as `name@X.Y.Z`, sets
+   `fallback: none` and leaves `checksum` unset or `true`. install-action
+   checks the sha256 of a version its manifest lists; for any other it falls
+   back to cargo-binstall, which installs unchecked, and `checksum: false`
+   turns the check off.
 
 Out of scope: `run:` steps, which this check does not read, and where a SHA
 comes from. Rule 1 proves a ref cannot move, not that the commit belongs to
-the named repository or matches its `# vX.Y.Z` comment.
+the named repository or matches its `# vX.Y.Z` comment. Rules 5 and 6 read
+only the IMAGE_INPUTS actions and install-action. A SHA-pinned action that
+installs code of its own can still float it: crytic/slither-action builds
+`FROM python:3.10` and installs the newest slither, astral-sh/setup-uv with
+no `version` installs the newest uv, Cyfrin/aderyn-ci installs
+`@cyfrin/aderyn@0.6`, and cargo-semver-checks-action installs the newest
+cargo-semver-checks. Each runs under a read-only token.
 
 Text, not YAML: the files are read with the standard library only, line by
 line with comments stripped, so a commented-out step is not a site. The shapes
 a workflow here is written in are read, and the near misses this reader knows
 of — a `permissions:` value it cannot read, a line under `jobs:` that is not a
-job, a `uses` key it cannot read, a step with no dash — are errors, not skips.
+job, a `uses` key it cannot read, and a checkout, install-action or
+IMAGE_INPUTS step with no dash — are errors, not skips.
 A workflow with no `uses:` at all is an error too, so a pattern that matches
 nothing cannot report a pass. The check catches drift, not a hostile author:
 YAML that hides a key from a text reader (an escaped or explicit `?` key, an
@@ -168,8 +178,9 @@ def step_block(lines: list[str], i: int) -> tuple[int, list[str]] | None:
 def with_input(key: int, block: list[str], name: str) -> str | None:
     """The value of input `name` under the step's `with:` mapping, unquoted.
 
-    A `|` or `>` block scalar is read as its lines joined by newlines. None
-    when the step sets no such input.
+    A `|` or `>` block scalar is read as its lines joined by newlines, and a
+    plain or quoted scalar wrapped onto deeper lines as those lines joined by
+    spaces. None when the step sets no such input.
     """
     in_with = False
     child: int | None = None
@@ -189,7 +200,16 @@ def with_input(key: int, block: list[str], name: str) -> str | None:
             continue
         value = found[2].strip()
         if value[:1] not in ("|", ">"):
-            return value.strip("'\"")
+            # A plain or quoted scalar continues on every deeper line, which
+            # YAML folds into the value with a space.
+            parts = [value]
+            for follow in block[n + 1 :]:
+                if not follow.strip():
+                    continue
+                if indent_of(follow) <= child:
+                    break
+                parts.append(follow.strip())
+            return " ".join(parts).strip("'\"")
         rest = []
         for follow in block[n + 1 :]:
             if follow.strip() and indent_of(follow) <= child:
@@ -214,7 +234,8 @@ def uses_sites(lines: list[str]) -> tuple[list[tuple[int, str]], list[int]]:
 
 
 def check_actions(lines: list[str], label: str) -> tuple[list[str], list[str], int]:
-    """Rules 1 and 2 over one file: (errors, local action paths, `uses` count)."""
+    """Rules 1, 2, 5 (action inputs) and 6 over one file: (errors, local action
+    paths, `uses` count)."""
     errors: list[str] = []
     local: list[str] = []
     sites, unread = uses_sites(lines)
@@ -258,6 +279,12 @@ def check_actions(lines: list[str], label: str) -> tuple[list[str], list[str], i
                 errors.append(
                     f"{where}: install-action does not set `fallback: none`, so a version "
                     "its manifest lacks installs unchecked"
+                )
+            checksum = with_input(*step, "checksum")
+            if checksum not in (None, "true"):
+                errors.append(
+                    f"{where}: install-action sets `checksum: {checksum}`, which skips the "
+                    "sha256 check of the download"
                 )
         else:
             name, pinned = IMAGE_INPUTS[action]
@@ -483,10 +510,10 @@ def main() -> int:
         for e in errors:
             print(f"  {e}", file=sys.stderr)
         print(
-            "\nEvery action is pinned by commit SHA, every image by digest and every tool\n"
-            "by version, no checkout keeps its token, and write access goes only to the\n"
-            "jobs WRITE_JOBS names (see the docstring of\n"
-            ".github/scripts/check_workflow_hardening.py).",
+            "\nEvery action is pinned by commit SHA, every image an IMAGE_INPUTS action\n"
+            "runs by digest and every install-action tool by version, no checkout keeps\n"
+            "its token, and write access goes only to the jobs WRITE_JOBS names (see the\n"
+            "docstring of .github/scripts/check_workflow_hardening.py).",
             file=sys.stderr,
         )
         return 1
