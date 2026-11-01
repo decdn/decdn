@@ -90,6 +90,7 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
         ServeRejectReason::PoolUnconfirmed => "pool_unconfirmed",
         ServeRejectReason::PoolClosing { .. } => "pool_closing",
         ServeRejectReason::SignerCapExhausted => "signer_cap_exhausted",
+        ServeRejectReason::CapabilityExpired => "capability_expired",
         ServeRejectReason::SignerFloorAtCap => "signer_floor_at_cap",
         ServeRejectReason::PullLoopGuard => "pull_loop_guard",
         ServeRejectReason::LoadShedHit => "load_shed_hit",
@@ -227,6 +228,9 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
         ServeRejectReason::PoolClosing { .. } => metrics.serve_stream_rejected_pool_closing(),
         ServeRejectReason::SignerCapExhausted => {
             metrics.serve_stream_rejected_signer_cap_exhausted();
+        }
+        ServeRejectReason::CapabilityExpired => {
+            metrics.serve_stream_rejected_capability_expired();
         }
         ServeRejectReason::SignerFloorAtCap => {
             metrics.serve_stream_rejected_signer_floor_at_cap();

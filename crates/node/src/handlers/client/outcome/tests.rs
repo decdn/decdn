@@ -115,6 +115,24 @@ fn stopped_and_refused_streams_record_their_reason() {
     assert_eq!(budget["bytes"], "64");
 }
 
+/// An expired capability and a spent signer cap share the wire class
+/// `Unfunded`, but not the span reason or the counter: the two have different
+/// remedies (#2631).
+#[test]
+fn an_expired_capability_has_its_own_reason_and_counter() {
+    let expired = export_one(ServeEnd::Refused(ServeRejectReason::CapabilityExpired));
+    assert_eq!(expired["outcome"], "refused");
+    assert_eq!(expired["reason"], "capability_expired");
+    let spent = export_one(ServeEnd::Refused(ServeRejectReason::SignerCapExhausted));
+    assert_eq!(spent["reason"], "signer_cap_exhausted");
+
+    let end = ServeEnd::Refused(ServeRejectReason::CapabilityExpired);
+    assert_eq!(
+        only_reason(|m| assert!(!end.meter(m))),
+        "decdn_serve_stream_rejected_capability_expired_total"
+    );
+}
+
 /// The one listed reason counter `meter` moves, asserting it moves exactly
 /// one and leaves every other listed counter at zero.
 fn only_reason(meter: impl FnOnce(&Metrics)) -> &'static str {
@@ -148,6 +166,7 @@ const fn refusal_is_listed(reason: ServeRejectReason) {
         | ServeRejectReason::InsufficientDeposit
         | ServeRejectReason::PoolUnconfirmed
         | ServeRejectReason::SignerCapExhausted
+        | ServeRejectReason::CapabilityExpired
         | ServeRejectReason::SignerFloorAtCap
         | ServeRejectReason::PullLoopGuard
         | ServeRejectReason::LoadShedHit
@@ -178,6 +197,7 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
         ServeRejectReason::InsufficientDeposit,
         ServeRejectReason::PoolUnconfirmed,
         ServeRejectReason::SignerCapExhausted,
+        ServeRejectReason::CapabilityExpired,
         ServeRejectReason::SignerFloorAtCap,
         ServeRejectReason::PullLoopGuard,
         ServeRejectReason::LoadShedHit,
