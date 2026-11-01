@@ -859,14 +859,14 @@ async fn handler_with_pool_view(
     metrics: &Arc<Metrics>,
     view: Arc<dyn crate::pool_view::PoolView>,
 ) -> (Arc<ClientHandler>, tempfile::TempDir) {
-    handler_with_pool_view_and_freshness(metrics, view, None).await
+    handler_with_pool_view_and_freshness(metrics, Some(view), None).await
 }
 
-/// A handler whose pool view is `view` and whose chain freshness is
-/// `freshness`.
+/// A handler whose pool view is `view` (`None` leaves it unwired) and whose
+/// chain freshness is `freshness` (likewise).
 async fn handler_with_pool_view_and_freshness(
     metrics: &Arc<Metrics>,
-    view: Arc<dyn crate::pool_view::PoolView>,
+    view: Option<Arc<dyn crate::pool_view::PoolView>>,
     freshness: Option<crate::chain_freshness::ChainFreshness>,
 ) -> (Arc<ClientHandler>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -901,7 +901,7 @@ async fn handler_with_pool_view_and_freshness(
         U256::ZERO,
         always_admit_shed(),
     );
-    deps.pool_view = Some(view);
+    deps.pool_view = view;
     deps.chain_freshness = freshness;
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
@@ -1775,15 +1775,21 @@ async fn clamp_lane_to_registration_narrows_the_live_lane_and_persists() -> anyh
     Ok(())
 }
 
-/// Read `decdn_serve_pool_recheck_skipped_total` from `metrics`.
-fn pool_recheck_skipped(metrics: &Metrics) -> anyhow::Result<u64> {
+/// Read the exported counter `name` from `metrics`, as an operator does.
+fn counter_total(metrics: &Metrics, name: &str) -> anyhow::Result<u64> {
     let encoded = metrics.encode()?;
+    let prefix = format!("{name} ");
     encoded
         .lines()
-        .find_map(|line| line.strip_prefix("decdn_serve_pool_recheck_skipped_total "))
-        .ok_or_else(|| anyhow::anyhow!("decdn_serve_pool_recheck_skipped_total is not exported"))?
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("{name} is not exported"))?
         .parse()
         .map_err(Into::into)
+}
+
+/// Read `decdn_serve_pool_recheck_skipped_total` from `metrics`.
+fn pool_recheck_skipped(metrics: &Metrics) -> anyhow::Result<u64> {
+    counter_total(metrics, "decdn_serve_pool_recheck_skipped_total")
 }
 
 /// The lane and blob a pool re-check unit test names.
@@ -1846,17 +1852,12 @@ async fn pool_recheck_with_no_view_wired_is_not_counted_as_skipped() -> anyhow::
 
 /// Read `decdn_serve_pool_recheck_stale_total` from `metrics`.
 fn pool_recheck_stale(metrics: &Metrics) -> anyhow::Result<u64> {
-    let encoded = metrics.encode()?;
-    encoded
-        .lines()
-        .find_map(|line| line.strip_prefix("decdn_serve_pool_recheck_stale_total "))
-        .ok_or_else(|| anyhow::anyhow!("decdn_serve_pool_recheck_stale_total is not exported"))?
-        .parse()
-        .map_err(Into::into)
+    counter_total(metrics, "decdn_serve_pool_recheck_stale_total")
 }
 
-/// The re-check against a pool view that holds a status for every pool,
-/// with `freshness` wired: the stale-re-check count it leaves.
+/// The re-check against a pool view that holds a status for every pool, with
+/// `freshness` as the handler's chain freshness (`None` leaves it unwired):
+/// the stale-re-check count it leaves.
 async fn recheck_stale_count(
     freshness: Option<crate::chain_freshness::ChainFreshness>,
 ) -> anyhow::Result<u64> {
@@ -1864,7 +1865,8 @@ async fn recheck_stale_count(
     let view = Arc::new(FixedPoolView {
         owner: Address::repeat_byte(0x11),
     });
-    let (handler, _dir) = handler_with_pool_view_and_freshness(&metrics, view, freshness).await;
+    let (handler, _dir) =
+        handler_with_pool_view_and_freshness(&metrics, Some(view), freshness).await;
     let (lane, hash) = recheck_stream();
     let status = handler.pool_view_status_cached(&lane, &hash).await;
     assert!(
@@ -1899,6 +1901,45 @@ async fn pool_recheck_on_fresh_chain_reads_is_not_counted_as_stale() -> anyhow::
 #[tokio::test]
 async fn pool_recheck_with_no_freshness_wired_is_not_counted_as_stale() -> anyhow::Result<()> {
     assert_eq!(recheck_stale_count(None).await?, 0);
+    Ok(())
+}
+
+/// A stale re-check that also finds no status counts in both counters: the
+/// chain reads are stale, and the pool view no longer holds the pool. The
+/// two branches are independent.
+#[tokio::test]
+async fn pool_recheck_stale_with_no_status_counts_stale_and_skipped() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let freshness = crate::chain_freshness::ChainFreshness::new(std::time::Duration::from_mins(5));
+    let view = Arc::new(crate::pool_view::PoolProjection::new());
+    let (handler, _dir) =
+        handler_with_pool_view_and_freshness(&metrics, Some(view), Some(freshness)).await;
+    let (lane, hash) = recheck_stream();
+    let status = handler.pool_view_status_cached(&lane, &hash).await;
+    assert!(
+        status.is_none(),
+        "the projection holds no status for an unfolded pool"
+    );
+    assert_eq!(pool_recheck_stale(&metrics)?, 1);
+    assert_eq!(pool_recheck_skipped(&metrics)?, 1);
+    Ok(())
+}
+
+/// With no pool view wired there is no projection to read, so a stale chain
+/// freshness counts nothing: the helper returns before the staleness check,
+/// which is what keeps the counter's "read the pool view while stale"
+/// meaning.
+#[tokio::test]
+async fn pool_recheck_stale_with_no_view_wired_counts_nothing() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let freshness = crate::chain_freshness::ChainFreshness::new(std::time::Duration::from_mins(5));
+    let (handler, _dir) =
+        handler_with_pool_view_and_freshness(&metrics, None, Some(freshness)).await;
+    let (lane, hash) = recheck_stream();
+    let status = handler.pool_view_status_cached(&lane, &hash).await;
+    assert!(status.is_none(), "no view wired reads no status");
+    assert_eq!(pool_recheck_stale(&metrics)?, 0);
+    assert_eq!(pool_recheck_skipped(&metrics)?, 0);
     Ok(())
 }
 

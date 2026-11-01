@@ -2462,7 +2462,8 @@ pub struct DecdnMetrics {
     /// re-checks that read the wired pool view while the node's chain reads
     /// are stale (ADR 011 § Serving while chain-stale). The node cannot reach
     /// the chain, so the projection may be frozen and a drain that landed
-    /// on-chain since does not show. The stream continues. Counted per
+    /// on-chain since does not show. The staleness itself stops no stream;
+    /// the re-check's usual verdict on the frozen data applies. Counted per
     /// re-check, so one affected stream adds one count per re-check interval.
     pub serve_pool_recheck_stale: Counter,
 }

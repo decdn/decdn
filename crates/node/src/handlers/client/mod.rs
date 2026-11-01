@@ -1700,8 +1700,9 @@ impl ClientHandler {
     /// [`Self::chain_freshness`] reads stale counts
     /// `decdn_serve_pool_recheck_stale_total` and logs a throttled `warn!`
     /// naming the stream. The node cannot reach the chain, so the projection
-    /// may be frozen and a drain that landed on-chain since does not show. The
-    /// re-check still reads the projection, and the stream continues.
+    /// may be frozen and a drain that landed on-chain since does not show.
+    /// The staleness itself ends nothing: the re-check still reads the
+    /// projection, and its usual verdict on that data applies.
     pub(super) async fn pool_view_status_cached(
         &self,
         lane_key: &LaneKey,

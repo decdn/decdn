@@ -34,8 +34,8 @@
 //!   pool, so the node is not paid for the bytes it serves after the close.
 //!   While the node cannot reach the chain past its grace window
 //!   ([`crate::chain_freshness`]), the projection may be frozen. The re-check
-//!   still reads it, and the stream continues, but each such re-check counts
-//!   `decdn_serve_pool_recheck_stale_total`.
+//!   still reads it and applies its usual verdict to what it holds, but each
+//!   such re-check counts `decdn_serve_pool_recheck_stale_total`.
 //!
 //! The bare [`PoolProjection`] is the projection itself: its `status` returns
 //! `None` for a pool it has not folded and never touches the network. Tests wire
