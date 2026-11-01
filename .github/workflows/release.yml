@@ -178,7 +178,7 @@ jobs:
       # artifact, so the job that holds `contents: write` runs no git-cliff.
       # This job already has the full history `--latest` needs.
       - name: Install git-cliff
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: git-cliff@2.14.2
           fallback: none
@@ -260,7 +260,7 @@ jobs:
       # fails the step for a version the manifest lacks, rather than handing it
       # to cargo-binstall, which installs it unchecked.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@0.9.149
           fallback: none
@@ -504,7 +504,7 @@ jobs:
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cross@0.2.5
           fallback: none
