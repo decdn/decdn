@@ -12,7 +12,7 @@
 # - the release is published, not a draft;
 # - SHA256SUMS.asc is a good signature over SHA256SUMS by a key in the
 #   <KEYS file> keyring, and nothing else, that has neither expired nor been
-#   revoked. The caller passes the KEYS from origin/main, never the tag's own,
+#   revoked. The caller passes the KEYS from main, never the tag's own,
 #   so the tag cannot supply its own trust root;
 # - every archive SHA256SUMS names carries this release's version, so the
 #   signed manifest of another release does not pass for this one;

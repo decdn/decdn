@@ -75,6 +75,9 @@ case "$1 $2" in
       esac
     done ;;
   "release edit") exit 0 ;;
+  "workflow run")
+    [ "${GH_DISPATCH:-}" = fail ] && { echo "gh shim: dispatch refused" >&2; exit 1; }
+    exit 0 ;;
   "repo clone")
     # A devops clone whose bump script logs the tag it was given and, with
     # $BUMP_ENV, its environment. $GH_CLONE=fail fails the clone, and
@@ -349,7 +352,36 @@ def test_a_stable_release_opens_the_devops_bump(release):
     assert result.returncode == 0, output(result)
     assert release.calls(release.gh_log, "repo clone decdn/devops"), output(result)
     assert bump_log.read_text().splitlines() == ["v0.0.0"]
-    assert "publish-crates.yml" in result.stdout
+
+
+@pytest.mark.parametrize("tag", ["v0.0.0", "v0.0.0-rc1"])
+def test_publishing_dispatches_the_crates_io_upload_on_main(release, tag):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag(tag, fpr)
+
+    result = release.publish(tag)
+
+    assert result.returncode == 0, output(result)
+    calls = release.calls(release.gh_log, "workflow run")
+    assert calls == [f"workflow run publish-crates.yml --repo decdn/decdn --ref main -f tag={tag}"]
+    # The release is out of draft before the upload starts.
+    log = release.gh_log.read_text().splitlines()
+    edit = next(i for i, line in enumerate(log) if line.startswith("release edit"))
+    assert log.index(calls[0]) > edit
+
+
+def test_a_failed_dispatch_only_warns_and_says_how_to_retry(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", GH_DISPATCH="fail")
+
+    assert result.returncode == 0, output(result)
+    retry = "gh workflow run publish-crates.yml --repo decdn/decdn --ref main -f tag=v0.0.0"
+    assert "the crates.io upload did NOT start" in result.stderr, output(result)
+    # Said at the failure, and again last.
+    assert result.stderr.count(retry) == 2
+    assert result.stderr.rstrip().endswith(retry)
 
 
 def test_the_skip_switch_opens_no_devops_bump(release):

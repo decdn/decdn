@@ -41,9 +41,10 @@
 #                         set to 1 to not open decdn/devops's decdn bump PR
 #                         after the release is published
 #
-# Publishing the release starts .github/workflows/publish-crates.yml, which
-# uploads the crates to crates.io through trusted publishing. This script
-# prints the command that finds that run.
+# Once the release is published, the script dispatches
+# .github/workflows/publish-crates.yml on main, which uploads the crates to
+# crates.io through trusted publishing, and prints the command that finds the
+# run.
 #
 # Re-running is safe at any point before the release is published: signatures
 # are re-uploaded with --clobber and the tag promotion is idempotent. Once the
@@ -806,13 +807,22 @@ gh release edit $TAG --repo $REPO --draft=false ${PRERELEASE_FLAG[*]+"${PRERELEA
 
 # ---- crates.io -------------------------------------------------------------
 
-# Publishing the release fired `release: published`, which starts
-# publish-crates.yml. It checks this release's signatures again and uploads
-# the crates through crates.io trusted publishing, with no crates.io token here.
-# Its errors show in the run, not in this terminal.
+# publish-crates.yml checks this release's signatures again and uploads the
+# crates through crates.io trusted publishing, with no crates.io token here. It
+# runs on `main`, never on the tag: the `release` environment hands out the
+# crates.io token only to a run from `main`. Its errors show in the run, not in
+# this terminal. A failed dispatch only warns: the release is already out.
 echo
-echo "==> crates.io: publish-crates.yml uploads the crates. Follow its run with:"
-echo "    gh run list --repo $REPO --workflow publish-crates.yml --event release --limit 1"
+echo "==> Starting the crates.io upload"
+CRATES_CMD="gh workflow run publish-crates.yml --repo $REPO --ref main -f tag=$TAG"
+if gh workflow run publish-crates.yml --repo "$REPO" --ref main -f tag="$TAG"; then
+  echo "    publish-crates.yml runs on main against $TAG. Follow it with:"
+  echo "    gh run list --repo $REPO --workflow publish-crates.yml --limit 1"
+else
+  echo "warning: could not start publish-crates.yml; the crates are NOT on crates.io." >&2
+  echo "         Start it with: $CRATES_CMD" >&2
+  CRATES_FAILED=1
+fi
 
 # ---- downstream ------------------------------------------------------------
 
@@ -914,4 +924,8 @@ if [[ -n "${OVERVIEW_FAILED:-}" ]]; then
   echo "         ${OVERVIEW_FAILED}" >&2
 elif [[ -n "${OVERVIEW_NOTE:-}" ]]; then
   echo "Docker Hub overviews: ${OVERVIEW_NOTE}"
+fi
+if [[ -n "${CRATES_FAILED:-}" ]]; then
+  echo "warning: the crates.io upload did NOT start. Run:" >&2
+  echo "         $CRATES_CMD" >&2
 fi

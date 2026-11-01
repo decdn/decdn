@@ -238,10 +238,10 @@ names that archive; uploads the nine `.asc` files,
 `SHA256SUMS.minisig` and the archives' `.minisig` files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
 signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
 release, pushes each Docker Hub overview; checks that every promoted repository
-is pullable without credentials; and flips the release out of draft. That
-starts the crates.io upload ([Publishing to crates.io](#publishing-to-cratesio)),
-and the script prints the command that finds the run. It then opens the
-devops bump PR
+is pullable without credentials; and flips the release out of draft. It then
+dispatches the crates.io upload on `main`
+([Publishing to crates.io](#publishing-to-cratesio)), prints the command that
+finds the run, and opens the devops bump PR
 ([The devops bump](#the-devops-bump)).
 
 The mirror is a manifest copy, not a rebuild: `docker buildx imagetools create`
@@ -402,12 +402,25 @@ and no override carries a `signing` table of its own.
 ## Publishing to crates.io
 
 [`.github/workflows/publish-crates.yml`](.github/workflows/publish-crates.yml)
-uploads the fourteen publishable crates. `sign-release.sh` publishes the
-release with your `gh` login, and that `release: published` event starts the
-workflow. Nobody runs a command for it, and no crates.io token exists outside
-the run: crates.io [trusted publishing](https://crates.io/docs/trusted-publishing)
+uploads the fourteen publishable crates. Once the release is out of draft,
+`sign-release.sh` dispatches it on `main` with the tag as its input, using your
+`gh` login. No crates.io token exists outside the run: crates.io [trusted publishing](https://crates.io/docs/trusted-publishing)
 trades the job's GitHub OIDC token for a crates.io token that lasts 30 minutes,
 and the auth action revokes it when the job ends.
+
+The checks below hold only if the workflow that runs them is the reviewed one,
+since the workflow is what holds the crates.io token:
+
+- The `release` environment allows deployments from `main` only. A run from a
+  tag or another branch runs that ref's copy of `publish-crates.yml`, and never
+  gets the token: crates.io matches the workflow by file name and environment,
+  not by ref.
+- The workflow, `KEYS` and every script and action it calls come from the
+  `main` commit the run started on. The tag is checked out beside it, in
+  `src/`, and only packaged.
+
+`main` itself is guarded by the `Protect Main` ruleset, which org admins
+bypass.
 
 `decdn-e2e` (test fixtures) and `sponsord-e2e` (the sponsord stack tests) are
 `publish = false` and cargo skips them. The workspace has sixteen members, and
@@ -415,8 +428,8 @@ the CI version check covers all sixteen — only the upload is fourteen.
 
 The `prepare` job uploads nothing. It:
 
-1. checks the tag is strict semver, and verifies its signature against `KEYS`
-   **from `origin/main`**, as `release.yml` does;
+1. checks the run is on `main`, that the tag is strict semver, and verifies the
+   tag's signature against `KEYS` **from `main`**, as `release.yml` does;
 2. runs `.github/scripts/check-release-signed.sh`. The release must be out of
    draft. `SHA256SUMS.asc` must be a good signature, against that same `KEYS`,
    by a key that has neither expired nor been revoked. Every archive
@@ -436,7 +449,7 @@ The `prepare` job uploads nothing. It:
    runs `cargo publish --workspace --dry-run`, the verify build, on what is
    left.
 
-The `publish` job alone holds `id-token: write`, in the `crates-io` environment.
+The `publish` job alone holds `id-token: write`, in the `release` environment.
 Any step in that job could ask for an OIDC token, so it runs no build script,
 proc macro or package install: past the pinned toolchain and auth actions, it
 takes the dashboard build from `prepare` and runs
@@ -445,21 +458,20 @@ and waits for each crate to reach the index before its dependents. It then
 asks crates.io for every crate, for up to five minutes, and warns about any it
 does not serve yet (normally index lag) or could not ask about.
 
-Pre-releases go to crates.io too: `release: published` fires for a release
-marked pre-release, so `v1.2.0-rc1` is uploaded as `1.2.0-rc1`. cargo resolves a
+Pre-releases go to crates.io too: `sign-release.sh` dispatches the upload for
+every release, so `v1.2.0-rc1` is uploaded as `1.2.0-rc1`. cargo resolves a
 pre-release version only for a requirement that names a pre-release, but the
 version is as immutable as any other.
 
 **Re-running is safe.** A crates.io version is immutable, so a run that fails
 partway leaves the crates it uploaded published. Re-run all jobs: the run
 excludes those crates and uploads the rest. (Re-running only `publish` works
-for seven days, while `prepare`'s dashboard build is kept.) If the workflow in
-the tag's tree cannot run at all, run the copy on `main` against the tag. Only
-the workflow file comes from `main`; every script and action it calls still
-comes from the tag's tree, so this cannot rescue a broken script:
+for seven days, while `prepare`'s dashboard build is kept.) To start it again
+from scratch — after a fix to the workflow lands on `main`, or when
+`sign-release.sh` could not dispatch it — dispatch it on `main`:
 
 ```bash
-gh workflow run publish-crates.yml -f tag=v0.1.2
+gh workflow run publish-crates.yml --ref main -f tag=v0.1.2
 ```
 
 A failure here does not invalidate the release. The GitHub Release, the
@@ -472,25 +484,23 @@ to finish the remaining crates, not to re-cut the version.
 crates.io trusts `publish-crates.yml` per crate. Set this up once, and again
 for each new crate:
 
-1. **The `crates-io` environment.** Under *Settings → Environments*, it
-   allows deployments from the `v*` tag pattern and the `main` branch only,
-   with no required reviewers: your signature on the release is the human
-   gate. crates.io matches the workflow by file name only, so this list of
-   refs is what limits which refs can publish.
+1. **The `release` environment.** Under *Settings → Environments*, it allows
+   deployments from the `main` branch only, with no required reviewers: your
+   signature on the release is the human gate. crates.io matches the workflow
+   by file name only, so this one ref is what keeps a tag's or a branch's copy
+   of the workflow from publishing. Add no tag pattern.
 
    ```bash
-   gh api -X PUT repos/decdn/decdn/environments/crates-io \
+   gh api -X PUT repos/decdn/decdn/environments/release \
      -F 'deployment_branch_policy[protected_branches]=false' \
      -F 'deployment_branch_policy[custom_branch_policies]=true'
-   gh api repos/decdn/decdn/environments/crates-io/deployment-branch-policies \
-     -f name='v*' -f type=tag
-   gh api repos/decdn/decdn/environments/crates-io/deployment-branch-policies \
+   gh api repos/decdn/decdn/environments/release/deployment-branch-policies \
      -f name=main -f type=branch
    ```
 
 2. **A trusted publisher on each crate.** On crates.io, under each crate's
    *Settings → Trusted Publishing*, add GitHub with owner `decdn`, repository
-   `decdn`, workflow `publish-crates.yml` and environment `crates-io`. An
+   `decdn`, workflow `publish-crates.yml` and environment `release`. An
    individual owner of the crate does this; see
    [Crate ownership](#crate-ownership).
 
