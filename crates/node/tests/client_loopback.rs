@@ -6899,10 +6899,14 @@ impl decdn_node::pool_view::PoolView for DrainingPoolView {
 /// pool but holds no cached status for it: the production view after the pool
 /// closes under a live stream (the projection forgets a reclaimed pool). The
 /// first mid-stream re-check finds no status, so it stops the stream.
+/// `signer_spent` is the signer fold's read: `Some(0)` is what the production
+/// projection reads for a signer of a forgotten pool, and `None` is a view with
+/// no signer fold.
 #[derive(Debug)]
 struct ForgottenPoolView {
     owner: Address,
     remaining: U256,
+    signer_spent: Option<u64>,
 }
 
 #[async_trait]
@@ -6917,6 +6921,10 @@ impl decdn_node::pool_view::PoolView for ForgottenPoolView {
 
     async fn cached_status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
         None
+    }
+
+    async fn signer_spent_cached(&self, _pool_id: B256, _signer: Address) -> Option<u64> {
+        self.signer_spent
     }
 }
 
@@ -7499,6 +7507,7 @@ fn forgotten_pool_view() -> Arc<dyn decdn_node::pool_view::PoolView> {
     Arc::new(ForgottenPoolView {
         owner: operator_addr(),
         remaining: closing_pool_remaining(),
+        signer_spent: None,
     })
 }
 
@@ -7543,6 +7552,30 @@ async fn forgotten_pool_stops_a_cache_hit_stream() -> anyhow::Result<()> {
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let signer = Arc::new(PrivateKeySigner::random());
     closed_pool_stops_the_stream(cache, hash, signer, forgotten_pool_view(), || {}).await?;
+    Ok(())
+}
+
+/// A forgotten pool's signer reads `spent = 0` in the production projection, so
+/// the signer re-check alone sees full headroom and keeps serving. The pool
+/// re-check runs first and stops the stream as a pool close.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgotten_signer_stops_a_cache_hit_stream_as_pool_closed() -> anyhow::Result<()> {
+    let payload = vec![0xCAu8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let view = Arc::new(ForgottenPoolView {
+        owner: operator_addr(),
+        remaining: closing_pool_remaining(),
+        signer_spent: Some(0),
+    });
+    let metrics = closed_pool_stops_the_stream(cache, hash, signer, view, || {}).await?;
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_midstream_signer_cap_exhausted_total"
+        )? == 0,
+        "a forgotten signer is not counted as a drained signer cap"
+    );
     Ok(())
 }
 
