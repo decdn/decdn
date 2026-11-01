@@ -511,6 +511,13 @@ pub struct DecdnMetrics {
     pub otlp_export_failures: Counter,
     /// Seconds since node start.
     pub node_uptime_seconds: Gauge,
+    /// `0` from process start until bring-up finishes, then `1`. The metrics
+    /// listener serves before bring-up, so a node that stays at `0` is still in
+    /// bring-up (most often retrying a boot chain read) or is about to exit on
+    /// a failed step. Set once, just before the `node runtime ready` banner;
+    /// it stays `1` through drain and shutdown. Operator-visible name:
+    /// `decdn_node_boot_ready`.
+    pub node_boot_ready: Gauge,
     /// JSON-RPC endpoint reachability per the watchdog task. `1` =
     /// reachable, `0` = unreachable. `adr/appendix-observability.md` names operational gauges in
     /// the `decdn_*` family; this is the per-tick mirror of the startup
@@ -1462,8 +1469,8 @@ pub struct DecdnMetrics {
     /// transport rate-limit), no other candidate covered the
     /// still-missing gap, and the assembly waited to ask the same upstream again
     /// instead of dropping it. The common cause is this node's own other pulls
-    /// filling the upstream's per-signer live cap: the refusal clears as those
-    /// pulls pay.
+    /// filling the upstream's per-signer floor cap: the live part of it clears as
+    /// those pulls pay.
     ///
     /// Each tick is one completed wait, and each wait follows one refusal already
     /// counted in `node_pull_refused_unattributable` or
@@ -1929,14 +1936,15 @@ pub struct DecdnMetrics {
     /// rising value means clients ask this node for more of a blob than its cap
     /// lets it hold. Visible name: `decdn_serve_stream_midstream_blob_too_large_total`.
     pub serve_stream_midstream_blob_too_large: Counter,
-    /// Delivery refused because ONE capability signer hit its per-signer live
-    /// concurrency cap of un-vouchered reservation, while the pool itself can still
+    /// Delivery refused because ONE capability signer hit its per-signer cap of
+    /// un-vouchered reservation plus floor debt, while the pool itself can still
     /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
-    /// Signed as `NotFound`, because it clears by waiting rather than by funding
-    /// (ADR 005 §Open-time refusal classes), so this counter is the only place
-    /// the reason survives — a rising value means one signer runs
-    /// more concurrent un-vouchered streams than its share covers while the pool as a
-    /// whole is solvent. The two remedies differ: a pool shortfall clears with a
+    /// Signed as `NotFound`, because it clears by the signer's own payment, or for a
+    /// cap that floor debt alone fills by a restart or a pool reclaim, rather than
+    /// by funding the pool (ADR 005 §Open-time refusal classes), so this counter
+    /// is the only place the reason survives — a rising value means one signer runs
+    /// or abandons more un-vouchered streams than its share covers while the pool as
+    /// a whole is solvent. The two remedies differ: a pool shortfall clears with a
     /// top-up, a signer at its share does not. Visible name:
     /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
     pub serve_stream_rejected_signer_floor_at_cap: Counter,
@@ -2248,11 +2256,12 @@ pub struct DecdnMetrics {
     /// head for the stall budget (2 min).
     pub chain_get_logs_deferred: Counter,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
-    /// chain read (the registry, slash, `usdc()` self-check and blacklist
-    /// bootstraps, and the best-effort fee-share reads) after a transient
-    /// error; one read can retry many times. The metrics
-    /// listener binds after these reads, so the value becomes visible once boot
-    /// completes. A rise after a restart points at the RPC provider.
+    /// chain read (the `PaymentPool` deployment preflight, the registry, slash,
+    /// `usdc()` self-check and blacklist bootstraps, and the best-effort
+    /// fee-share reads) after a transient error; one read can retry many
+    /// times. The metrics listener serves before these reads, so the value
+    /// rises while they retry. A rise after a restart points at the RPC
+    /// provider.
     pub chain_boot_read_retries: Counter,
 
     // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
@@ -3464,7 +3473,7 @@ recorders! {
     serve_stream_midstream_blob_too_large => serve_stream_midstream_blob_too_large.inc();
 
     /// Record a `serve_stream` delivery refused because this capability signer hit its
-    /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
+    /// per-signer cap of un-vouchered reservation plus floor debt, while the pool as a
     /// whole can still pay.
     serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
 
@@ -3710,6 +3719,10 @@ recorders! {
     /// (unreachable). Driven by the watchdog task spawned in
     /// `runtime::run`.
     rpc_healthy(ok: bool) => rpc_healthy.set(i64::from(ok));
+
+    /// Bring-up finished: set `decdn_node_boot_ready` to `1`. Called once by
+    /// `runtime::run`, just before the startup banner.
+    node_boot_ready => node_boot_ready.set(1);
 
     /// Record a connection rejected by the global concurrency semaphore.
     dispatch_rejected_global => dispatch_rejected_global.inc();

@@ -133,28 +133,35 @@ impl ClientHandler {
         // rank oldest for eviction while it streams. Recency only: the frequency
         // sighting waits for `StreamEnd`.
         self.cache.touch_recency(hash);
-        self.serve_leg_loop(
-            conn,
-            send,
-            recv,
-            store,
-            session,
-            also_pace,
-            lane,
-            carry,
-            hash,
-            lane_key,
-            client_node_id,
-            rate_per_mb,
-            offset,
-            len,
-            total_bytes,
-            floor_reservation,
-            first_byte,
-            &mut paid,
-        )
-        .await
-        .map_err(|e| super::wire::tag_paid_progress(e, paid))
+        let end = self
+            .serve_leg_loop(
+                conn,
+                send,
+                recv,
+                store,
+                session,
+                also_pace,
+                lane,
+                carry,
+                hash,
+                lane_key,
+                client_node_id,
+                rate_per_mb,
+                offset,
+                len,
+                total_bytes,
+                floor_reservation,
+                first_byte,
+                &mut paid,
+            )
+            .await
+            .map_err(|e| super::wire::tag_paid_progress(e, paid));
+        // Judge how the stream ended before the caller drops the guard: a fill
+        // fault, a held-bytes cap or a node stop forgives the unpaid floor.
+        if let Some(res) = floor_reservation {
+            res.settle_end(&end);
+        }
+        end
     }
 
     /// Await `frame`, the encoder's next frame, unless the stream ends first.
@@ -397,6 +404,12 @@ impl ClientHandler {
                 // fault here is the node's own bug, and metering it as a client
                 // abandon would file it under the peer's behaviour.
                 let bufs = chunk_frame_bufs(&frame).map_err(|e| self.meter_frame_fault(e))?;
+                // Count the frame as unpaid before the write: a client that reads
+                // part of it and then stops the stream fails the write, and those
+                // bytes still left the node.
+                if let Some(res) = floor_reservation {
+                    res.track_unpaid(delivered.saturating_add(clen_u64).saturating_sub(*paid));
+                }
                 // A downstream drop surfaces here as a peer-attributable `Err` (#856
                 // client-disconnect shape) and meters the client abandon. A write to
                 // a stream this node already closed carries no marker: the dispatch
@@ -536,6 +549,12 @@ impl ClientHandler {
                                 credited_this_iter =
                                     credited_this_iter.saturating_add(credited_bytes);
                                 *paid = paid.saturating_add(credited_bytes);
+                                // Reconcile the floor reservation now, before a
+                                // later proof in this batch can fail and end the
+                                // stream.
+                                if let Some(res) = floor_reservation {
+                                    res.reconcile_paid(delivered, *paid);
+                                }
                                 // Publish the PAID CONTENT frontier for the pull leg's
                                 // `WindowPacer`, mapping paid WIRE back into content
                                 // space (the largest chunk-group boundary provably
@@ -602,19 +621,6 @@ impl ClientHandler {
                 }
             }
             ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered, &pending)?;
-
-            // Reconcile the floor reservation against this stream's live balance now
-            // that `paid` has advanced (mirrors `deliver`). `paid`/`delivered` are BYTE
-            // counters; the reservation accounts in µUSDC, so every byte quantity
-            // crosses over through `min_payment` — never compared directly.
-            if let Some(res) = floor_reservation {
-                // Free the pool's live reservation once cumulative payment reaches the
-                // amount reserved (the ramp-floor credit this stream fronts). Matching
-                // release to the reserved µUSDC keeps it correct at any
-                // `credit_ramp_divisor` — with the ramp disabled the reservation is the
-                // full `credit_max`, so release waits for that much paid, not one chunk.
-                res.release_if_repaid(decdn_incentive::min_payment(*paid, rate_per_mb));
-            }
 
             // Done when the whole range is on the wire and every interval — closing
             // partial included — has been paid. Gating on PAID (not delivered) is

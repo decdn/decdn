@@ -3,8 +3,8 @@
 //! across DISTINCT signers, so the hard money envelope cannot be beaten by
 //! spraying signer identities (ADR 003 § Pool solvency, stateful-B). THIS ceiling
 //! is the on-chain-solvency bound that no fan-out of fresh signer keys can escape,
-//! the complement to the per-signer live cap (which bounds one signer's concurrent
-//! un-vouchered reservation).
+//! the complement to the per-signer floor cap (which bounds one signer's
+//! un-vouchered reservation plus floor debt).
 //!
 //! `crates/node/src/handlers/client/mod.rs` proves the invariant against fakes
 //! (`pool_ceiling_still_bounds_the_aggregate_across_signers`: four signers each
@@ -13,10 +13,9 @@
 //! chain, a real `decdn-node` daemon reading a real `getPool` `remaining`, and
 //! the real paid `cdn/client/v1` wire.
 //!
-//! **The ceiling only binds under CONCURRENCY.** A sequential withhold-then-
-//! disconnect releases its reservation on the disconnect, so it never grows the
-//! pool's live total past one window — the reservation the pool ceiling bounds is
-//! the LIVE, in-flight one. The journey therefore holds N streams OPEN at once,
+//! **This journey tests the concurrent case.** A sequential withhold-then-
+//! disconnect fills the ceiling too, through floor debt (`client_loopback.rs`,
+//! #2767); here the reservations are LIVE. The journey holds N streams OPEN at once,
 //! each on its own distinct delegate signer, each parked mid-delivery awaiting a
 //! voucher that never comes, so their reservations coexist on the pool's floor
 //! accumulator. The pool is funded so `remaining − M` covers exactly
@@ -24,13 +23,13 @@
 //!
 //! 1. **Admit up to the envelope.** Each of the [`HELD_STREAMS`] held streams, on
 //!    a DISTINCT signer, is admitted and streamed its free floor. Every one sits
-//!    at exactly its own one-window live reservation, so no per-signer live cap is
+//!    at exactly its own one-window live reservation, so no per-signer floor cap is
 //!    exceeded — what admits them is pool headroom, and together they fill the
 //!    envelope to the brim.
 //!
 //! 2. **Refuse the overflow across a fresh identity.** With all [`HELD_STREAMS`]
 //!    reservations still live, one MORE stream on YET ANOTHER distinct signer is
-//!    refused. Its own per-signer live cap is pristine (a fresh key, zero live), so
+//!    refused. Its own per-signer floor cap is pristine (a fresh key, nothing held), so
 //!    the ONLY thing that can refuse it is the pool ceiling: the
 //!    aggregate would exceed `remaining − M`. The refusal is `PoolExhausted`,
 //!    which `FloorRefusal`→`ServeRejectReason` maps to `InsufficientDeposit`, and
@@ -144,7 +143,7 @@ const READY_RETRY_BUDGET: Duration = Duration::from_secs(45);
 /// transport progress), leaving the whole set live at the instant the overflow
 /// stream is refused.
 const HELD_STREAMS: u64 = 2;
-/// Per-signer LIVE concurrency cap, in windows, frozen far above anything this
+/// Per-signer floor cap, in windows, frozen far above anything this
 /// journey draws. Each held stream is on its OWN signer and holds exactly one
 /// window, so the per-signer cap is made deliberately non-binding: the ONLY gate
 /// that can refuse the overflow stream is the pool ceiling, which is the whole
@@ -155,7 +154,7 @@ const SIGNER_WINDOWS: u64 = 64;
 /// (which the authenticated owner sees on the wire as `Unfunded`). A
 /// `0→1` delta across the overflow request pins the refusal to the pool ceiling.
 const INSUFFICIENT_DEPOSIT_METRIC: &str = "decdn_serve_stream_rejected_insufficient_deposit_total";
-/// The per-signer live-cap reject counter. It must stay FLAT across the overflow
+/// The per-signer floor-cap reject counter. It must stay FLAT across the overflow
 /// request: the refusal is the pool ceiling, not the per-signer cap, so spraying a
 /// fresh identity cannot be what refused it.
 const SIGNER_FLOOR_REJECT_METRIC: &str = "decdn_serve_stream_rejected_signer_floor_at_cap_total";
@@ -211,13 +210,13 @@ async fn run() -> anyhow::Result<()> {
     let hit_blob = deterministic_blob(BLOB_BYTES, 0x5eed_0003);
     let (node, hit_hash) = NodeFixture::launch(&chain, "US", &hit_blob).await?;
 
-    // Make the per-signer live cap deliberately non-binding: a large cap, and each
+    // Make the per-signer floor cap deliberately non-binding: a large cap, and each
     // held stream on its own signer holding exactly one window. The ONLY gate left
     // able to refuse the overflow stream is the pool ceiling. Applied before any
     // pool activity; the restart reopens the same warm cache.
     node.set_pool_floor_signer(SIGNER_WINDOWS)
         .await
-        .context("relax the per-signer live cap so only the pool ceiling binds")?;
+        .context("relax the per-signer floor cap so only the pool ceiling binds")?;
 
     // The pool OWNER: funded via `ClientFixture` for its ETH/USDC/allowance
     // plumbing and its loopback iroh endpoint, reused directly (not through

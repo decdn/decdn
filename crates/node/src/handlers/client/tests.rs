@@ -243,8 +243,8 @@ async fn handler_for_tests(metrics: &Arc<Metrics>) -> (Arc<ClientHandler>, tempf
 
 /// [`handler_for_tests`] with an explicit floor-`M` so the floor-`M` guard can
 /// be exercised with a non-zero minimum-remaining-deposit. The per-signer gates
-/// are no-ops (unbounded live cap, bottomless bucket), so the pool ceiling is the
-/// only floor bound that bites.
+/// is a no-op (an unbounded floor cap), so the pool ceiling is the only floor
+/// bound that bites.
 async fn handler_for_tests_with_floor(
     metrics: &Arc<Metrics>,
     pool_min_remaining_deposit: U256,
@@ -252,8 +252,8 @@ async fn handler_for_tests_with_floor(
     handler_for_tests_with_signer_policy(metrics, pool_min_remaining_deposit, u64::MAX).await
 }
 
-/// [`handler_for_tests_with_floor`] plus an explicit per-signer live concurrency
-/// cap `k` (in windows). `u64::MAX` leaves that gate a no-op.
+/// [`handler_for_tests_with_floor`] plus an explicit per-signer floor cap `k` (in
+/// windows). `u64::MAX` leaves that gate a no-op.
 async fn handler_for_tests_with_signer_policy(
     metrics: &Arc<Metrics>,
     pool_min_remaining_deposit: U256,
@@ -1267,7 +1267,7 @@ fn floor_reservation_refused_unspent_releases_the_live_floor() -> anyhow::Result
     let pool = B256::repeat_byte(0x5C);
     let floor = floor_micro(1000);
     {
-        let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor);
+        let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor, TEST_RATE);
         let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
         anyhow::ensure!(
             live == Some(floor),
@@ -1305,7 +1305,7 @@ async fn pool_budget_covers_reserve_accounts_committed_floor() -> anyhow::Result
     );
     // A live reservation consumes the budget: the same remaining no longer
     // covers a second identical reserve.
-    let _guard = handler.reserve_floor(pool, TEST_SIGNER, floor);
+    let _guard = handler.reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE);
     anyhow::ensure!(
         !handler.pool_budget_covers_reserve(pool, floor, floor),
         "an in-flight floor reservation is committed against the budget"
@@ -1347,7 +1347,7 @@ async fn pool_funds_committed_stops_at_floor_with_empty_ledger() -> anyhow::Resu
     // A live reservation narrows the bound further: the headroom above M must
     // still cover it, exactly as the covers-check always required.
     let floor = floor_micro(1_000_000);
-    let _guard = handler.reserve_floor(pool, TEST_SIGNER, floor);
+    let _guard = handler.reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE);
     anyhow::ensure!(
         handler.pool_funds_committed(pool, m.saturating_add(floor)),
         "headroom above M covering the committed floor funds delivery"
@@ -1396,7 +1396,7 @@ async fn try_reserve_floor_charges_only_when_budget_covers() -> anyhow::Result<(
     Ok(())
 }
 
-/// The per-signer live cap isolates co-tenants of one shared pool: a signer that
+/// The per-signer floor cap isolates co-tenants of one shared pool: a signer that
 /// holds its `k`-window cap of live reservation is refused `SignerAtCap` while the
 /// pool can still pay, and a SECOND signer is admitted from its own cap at the same
 /// instant. Without the signer dimension the first signer's reservations would be
@@ -1404,7 +1404,7 @@ async fn try_reserve_floor_charges_only_when_budget_covers() -> anyhow::Result<(
 #[tokio::test]
 async fn signer_live_cap_refuses_one_signer_and_admits_a_co_tenant() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
-    // k = 1 window each, a bottomless bucket, M = 0.
+    // k = 1 window each, M = 0.
     let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1).await;
     let pool = B256::repeat_byte(0x31);
     let window = handler.one_window(TEST_RATE);
@@ -1547,12 +1547,12 @@ fn a_stale_guard_does_not_reconcile_against_a_re_entered_pool() -> anyhow::Resul
     let pool = B256::repeat_byte(0x39);
     let floor = floor_micro(1000);
 
-    let stale = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor);
+    let stale = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor, TEST_RATE);
     // The pool is reclaimed on-chain: its whole entry goes, signer rows and all.
     lock_floor(&map)?.remove(&pool);
     // A later admission re-enters the same key — the cached `getPool` view can
     // still show headroom for a moment after the reclaim lands.
-    let fresh = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER_B, floor);
+    let fresh = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER_B, floor, TEST_RATE);
     drop(stale);
 
     let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
@@ -1573,6 +1573,489 @@ fn a_stale_guard_does_not_reconcile_against_a_re_entered_pool() -> anyhow::Resul
         "the pool live total stays the sum of its signer rows"
     );
     drop(fresh);
+    Ok(())
+}
+
+/// Abandon `guard` the way a serve loop does: report `unpaid` delivered bytes,
+/// then drop it unrepaid.
+fn abandon(guard: FloorReservation, unpaid: u64) {
+    guard.track_unpaid(unpaid);
+    drop(guard);
+}
+
+/// The pool's and `signer`'s floor debt, or zeros when no row is left.
+fn floor_debt(
+    map: &Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
+    pool: B256,
+    signer: Address,
+) -> anyhow::Result<(U256, U256)> {
+    let guard = lock_floor(map)?;
+    let pool_debt = guard.get(&pool).map_or(U256::ZERO, |st| st.debt);
+    let signer_debt = guard
+        .get(&pool)
+        .and_then(|st| st.signers.get(&signer))
+        .map_or(U256::ZERO, |row| row.debt);
+    Ok((pool_debt, signer_debt))
+}
+
+/// #2767: an unrepaid drop that left bytes unpaid charges them as floor debt at
+/// both levels, capped at the reservation. A drop with nothing delivered, and a
+/// pre-spend refusal, charge nothing.
+#[test]
+fn an_abandoned_stream_charges_its_unpaid_floor_as_debt() -> anyhow::Result<()> {
+    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pool = B256::repeat_byte(0x61);
+    let floor = floor_micro(TEST_RATE);
+
+    let half = CHUNK_BYTES / 2;
+    abandon(
+        FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor, TEST_RATE),
+        half,
+    );
+    let owed = decdn_incentive::min_payment(half, TEST_RATE);
+    anyhow::ensure!(
+        floor_debt(&map, pool, TEST_SIGNER)? == (owed, owed),
+        "the unpaid half chunk is owed at the pool and the signer"
+    );
+    anyhow::ensure!(
+        lock_floor(&map)?
+            .get(&pool)
+            .is_some_and(|st| st.live_reservation.is_zero()),
+        "the live reservation is still released"
+    );
+
+    abandon(
+        FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor, TEST_RATE),
+        CHUNK_BYTES.saturating_mul(8),
+    );
+    let capped = owed.saturating_add(floor);
+    anyhow::ensure!(
+        floor_debt(&map, pool, TEST_SIGNER)? == (capped, capped),
+        "unpaid bytes past the floor add no more than the reservation"
+    );
+
+    drop(FloorReservation::reserve(
+        Arc::clone(&map),
+        pool,
+        TEST_SIGNER_B,
+        floor,
+        TEST_RATE,
+    ));
+    let refused =
+        FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER_B, floor, TEST_RATE);
+    refused.release_unspent();
+    drop(refused);
+    anyhow::ensure!(
+        floor_debt(&map, pool, TEST_SIGNER_B)? == (capped, U256::ZERO),
+        "no delivery and a pre-spend refusal charge nothing"
+    );
+    anyhow::ensure!(
+        !lock_floor(&map)?
+            .get(&pool)
+            .is_some_and(|st| st.signers.contains_key(&TEST_SIGNER_B)),
+        "a signer that owes nothing keeps no row"
+    );
+    Ok(())
+}
+
+/// #2767: floor debt counts against the per-signer cap, so a signer that loops
+/// through free floors is refused `SignerAtCap` once its debt fills the cap. A
+/// co-tenant on the same pool is admitted from its own cap.
+#[tokio::test]
+async fn floor_debt_fills_the_signer_cap_and_spares_a_co_tenant() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 2).await;
+    let pool = B256::repeat_byte(0x62);
+    let window = handler.one_window(TEST_RATE);
+    let remaining = window.saturating_mul(U256::from(8u64));
+    let unpaid = CHUNK_BYTES.saturating_mul(4);
+
+    for _ in 0..2 {
+        let guard = handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("a window within the cap is admitted: {e:?}"))?;
+        abandon(guard, unpaid);
+    }
+    anyhow::ensure!(
+        handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .err()
+            .is_some_and(|e| matches!(e, FloorRefusal::SignerAtCap { .. })),
+        "two windows of debt fill a two-window cap with nothing live"
+    );
+    anyhow::ensure!(
+        handler
+            .try_reserve_floor(pool, TEST_SIGNER_B, remaining, TEST_RATE, window)
+            .is_ok(),
+        "a co-tenant is admitted from its own cap"
+    );
+    Ok(())
+}
+
+/// #2767: rotating signer keys does not escape the pool ceiling. Every signer's
+/// floor debt sums under the pool, so fresh keys are refused `PoolExhausted`
+/// once the pool's debt fills `remaining − M`.
+#[tokio::test]
+async fn rotated_signers_floor_debt_meets_the_pool_ceiling() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 8).await;
+    let pool = B256::repeat_byte(0x63);
+    let window = handler.one_window(TEST_RATE);
+    let remaining = window.saturating_mul(U256::from(3u64));
+
+    for i in 0u8..3 {
+        let guard = handler
+            .try_reserve_floor(pool, Address::new([i; 20]), remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("signer {i} fits the pool: {e:?}"))?;
+        abandon(guard, CHUNK_BYTES.saturating_mul(4));
+    }
+    anyhow::ensure!(
+        handler
+            .try_reserve_floor(pool, Address::new([0xee; 20]), remaining, TEST_RATE, window)
+            .err()
+            == Some(FloorRefusal::PoolExhausted),
+        "a fresh signer is refused once the pool's debt fills remaining − M"
+    );
+    Ok(())
+}
+
+/// #2767: payment past a stream's own floor clears the signer's floor debt at
+/// both levels, a little at a time as the payment grows, and the row prunes once
+/// it owes nothing. Payment up to the floor clears nothing.
+#[tokio::test]
+async fn payment_past_the_floor_clears_floor_debt() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 2).await;
+    let pool = B256::repeat_byte(0x64);
+    let window = handler.one_window(TEST_RATE);
+    let remaining = window.saturating_mul(U256::from(8u64));
+
+    let abandoned = handler
+        .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+        .map_err(|e| anyhow::anyhow!("first window: {e:?}"))?;
+    abandon(abandoned, CHUNK_BYTES.saturating_mul(4));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (window, window),
+        "the abandoned window is owed"
+    );
+
+    let paying = handler
+        .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+        .map_err(|e| anyhow::anyhow!("live + debt fits a two-window cap: {e:?}"))?;
+    paying.release_if_repaid(window);
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (window, window),
+        "payment up to the stream's own floor clears no debt"
+    );
+    let third = window / U256::from(3u64);
+    paying.release_if_repaid(window.saturating_add(third));
+    let left = window.saturating_sub(third);
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (left, left),
+        "the surplus past the floor clears that much debt"
+    );
+    paying.release_if_repaid(window.saturating_add(third));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (left, left),
+        "a repeated reconcile at the same payment offers no new surplus"
+    );
+    paying.release_if_repaid(window.saturating_add(third).saturating_add(third));
+    let left = left.saturating_sub(third);
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (left, left),
+        "a later reconcile applies only the new surplus"
+    );
+    paying.release_if_repaid(window.saturating_add(window));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (U256::ZERO, U256::ZERO),
+        "the rest of the surplus clears the rest"
+    );
+    drop(paying);
+    anyhow::ensure!(
+        lock_floor(&handler.pool_floor)?
+            .get(&pool)
+            .is_none_or(|st| !st.signers.contains_key(&TEST_SIGNER)),
+        "a signer that owes nothing is pruned"
+    );
+    Ok(())
+}
+
+/// #2767: a stream whose surplus met no debt still clears a sibling's debt
+/// from the surplus it pays afterwards. A paying stream keeps no "owes nothing"
+/// latch, because a sibling can abandon while it is live.
+#[tokio::test]
+async fn a_paying_stream_clears_a_sibling_debt_that_arrives_later() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 3).await;
+    let pool = B256::repeat_byte(0x67);
+    let window = handler.one_window(TEST_RATE);
+    let remaining = window.saturating_mul(U256::from(8u64));
+    let reserve = || {
+        handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("window within the cap: {e:?}"))
+    };
+
+    let paying = reserve()?;
+    let sibling = reserve()?;
+    let half = window / U256::from(2u64);
+    paying.release_if_repaid(window.saturating_add(half));
+    abandon(sibling, CHUNK_BYTES.saturating_mul(4));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (window, window),
+        "the sibling's abandoned window is owed"
+    );
+    let quarter = window / U256::from(4u64);
+    paying.release_if_repaid(window.saturating_add(half).saturating_add(quarter));
+    let left = window.saturating_sub(quarter);
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (left, left),
+        "only surplus paid after the abandon clears it; the earlier surplus is spent"
+    );
+    paying.release_if_repaid(window.saturating_add(half).saturating_add(window));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (U256::ZERO, U256::ZERO),
+        "the surplus paid after the abandon clears the sibling's debt"
+    );
+    drop(paying);
+    Ok(())
+}
+
+/// #2767: the drop charges a stream's unpaid bytes, capped at its reservation,
+/// whether or not the stream paid its floor first: a stream that pays its floor
+/// and then leaves with a window unpaid still took that window free. A stream
+/// whose every sent byte is paid owes nothing, even below its floor, and an
+/// unpaid half chunk owes exactly its price.
+#[test]
+fn the_drop_charges_unpaid_bytes_whether_or_not_the_floor_was_paid() -> anyhow::Result<()> {
+    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pool = B256::repeat_byte(0x68);
+    let floor = floor_micro(TEST_RATE);
+    let floor_bytes = CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES;
+    let reserve =
+        |signer| FloorReservation::reserve(Arc::clone(&map), pool, signer, floor, TEST_RATE);
+
+    let paid_floor = reserve(TEST_SIGNER);
+    paid_floor.reconcile_paid(CHUNK_BYTES.saturating_mul(4), floor_bytes);
+    anyhow::ensure!(
+        lock_floor(&map)?
+            .get(&pool)
+            .is_none_or(|st| st.live_reservation.is_zero()),
+        "paying the floor releases the live reservation at once"
+    );
+    drop(paid_floor);
+    anyhow::ensure!(
+        floor_debt(&map, pool, TEST_SIGNER)? == (floor, floor),
+        "a stream that paid its floor and left with a window unpaid owes a floor"
+    );
+
+    let small = reserve(TEST_SIGNER_B);
+    small.reconcile_paid(CHUNK_BYTES / 2, CHUNK_BYTES / 2);
+    drop(small);
+    anyhow::ensure!(
+        floor_debt(&map, pool, TEST_SIGNER_B)? == (floor, U256::ZERO),
+        "a fully paid stream below its floor owes nothing"
+    );
+
+    let half = reserve(TEST_SIGNER_B);
+    half.reconcile_paid(CHUNK_BYTES, CHUNK_BYTES / 2);
+    drop(half);
+    let owed = decdn_incentive::min_payment(CHUNK_BYTES / 2, TEST_RATE);
+    anyhow::ensure!(
+        floor_debt(&map, pool, TEST_SIGNER_B)? == (floor.saturating_add(owed), owed),
+        "an unpaid half chunk owes exactly its price"
+    );
+    Ok(())
+}
+
+/// #2767: floor debt is the price of the client's own conduct. A stream the
+/// client left, or ended with a rejected voucher or a spent proof budget, owes
+/// its unpaid floor; a stream that a node fault, a takedown, a held-bytes cap or
+/// a funding stop ended owes nothing.
+#[test]
+fn only_the_clients_own_conduct_leaves_floor_debt() -> anyhow::Result<()> {
+    use super::outcome::{ServeEnd, ServeStop};
+    let stopped = |stop| Ok::<_, anyhow::Error>(ServeEnd::Stopped { stop, bytes: 1 });
+    let cases = vec![
+        (
+            "peer left",
+            Err(anyhow::Error::new(super::wire::PeerFault)),
+            true,
+        ),
+        (
+            "payment fault",
+            Err(anyhow::Error::new(super::wire::ClientPaymentFault)),
+            true,
+        ),
+        (
+            "node fault",
+            Err(anyhow::anyhow!("store read failed")),
+            false,
+        ),
+        (
+            "voucher rejected",
+            stopped(ServeStop::VoucherRejected),
+            true,
+        ),
+        (
+            "proof budget",
+            stopped(ServeStop::ProofBudgetExhausted),
+            true,
+        ),
+        ("takedown", stopped(ServeStop::Takedown), false),
+        ("pool exhausted", stopped(ServeStop::PoolExhausted), false),
+        ("blob too large", stopped(ServeStop::BlobTooLarge), false),
+    ];
+    let floor = floor_micro(TEST_RATE);
+    for (i, (name, end, owes)) in cases.into_iter().enumerate() {
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pool = B256::repeat_byte(u8::try_from(i).unwrap_or(0));
+        let res = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor, TEST_RATE);
+        res.track_unpaid(CHUNK_BYTES.saturating_mul(4));
+        res.settle_end(&end);
+        drop(res);
+        let want = if owes { floor } else { U256::ZERO };
+        anyhow::ensure!(
+            floor_debt(&map, pool, TEST_SIGNER)? == (want, want),
+            "{name}: expected debt {want}"
+        );
+    }
+    Ok(())
+}
+
+/// #2767: one signer's payment clears only its own debt, and the pool total by
+/// exactly the amount cleared. A large surplus from one key must not wipe the
+/// pool debt that other, rotated keys left.
+#[tokio::test]
+async fn one_signers_payment_clears_only_its_own_debt() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 3).await;
+    let pool = B256::repeat_byte(0x69);
+    let window = handler.one_window(TEST_RATE);
+    let remaining = window.saturating_mul(U256::from(8u64));
+    for signer in [TEST_SIGNER, TEST_SIGNER_B] {
+        let guard = handler
+            .try_reserve_floor(pool, signer, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("window within the cap: {e:?}"))?;
+        abandon(guard, CHUNK_BYTES.saturating_mul(4));
+    }
+    let paying = handler
+        .try_reserve_floor(pool, TEST_SIGNER_B, remaining, TEST_RATE, window)
+        .map_err(|e| anyhow::anyhow!("B's paying stream: {e:?}"))?;
+    paying.release_if_repaid(window.saturating_mul(U256::from(4u64)));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (window, window),
+        "B's surplus leaves A's debt, and the pool's share of it, in place"
+    );
+    drop(paying);
+    anyhow::ensure!(
+        lock_floor(&handler.pool_floor)?
+            .get(&pool)
+            .is_some_and(|st| !st.signers.contains_key(&TEST_SIGNER_B)),
+        "B owes nothing, so its row is pruned"
+    );
+    Ok(())
+}
+
+/// #2767: a guard whose pool was reclaimed clears no debt in a later generation
+/// under the same `pool_id`, however much it pays.
+#[test]
+fn a_stale_guard_clears_no_debt_in_a_re_entered_pool() -> anyhow::Result<()> {
+    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pool = B256::repeat_byte(0x6A);
+    let floor = floor_micro(TEST_RATE);
+    let stale = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor, TEST_RATE);
+    lock_floor(&map)?.remove(&pool);
+    abandon(
+        FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor, TEST_RATE),
+        CHUNK_BYTES.saturating_mul(4),
+    );
+    stale.release_if_repaid(floor.saturating_mul(U256::from(3u64)));
+    drop(stale);
+    anyhow::ensure!(
+        floor_debt(&map, pool, TEST_SIGNER)? == (floor, floor),
+        "the new generation's debt is untouched by a stale guard's payment"
+    );
+    Ok(())
+}
+
+/// #2767: floor debt counts at admission only. The in-flight re-checks read the
+/// live reservation, so a stream already under way is never slowed by another
+/// stream's abandonment.
+#[tokio::test]
+async fn floor_debt_leaves_the_in_flight_rechecks_live_only() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
+    let pool = B256::repeat_byte(0x65);
+    let floor = floor_micro(TEST_RATE);
+    abandon(
+        handler.reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE),
+        CHUNK_BYTES.saturating_mul(4),
+    );
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (floor, floor),
+        "the abandon left a floor of debt"
+    );
+    anyhow::ensure!(
+        handler.pool_budget_covers_reserve(pool, floor, floor),
+        "the pool-level re-check does not count debt"
+    );
+    anyhow::ensure!(
+        handler.pool_funds_committed(pool, floor),
+        "the mid-stream re-check does not count debt"
+    );
+    Ok(())
+}
+
+/// #2767: a guard whose pool was reclaimed charges no debt to a later pool
+/// generation under the same `pool_id`, and `forget_pool_floor` drops the debt
+/// with the entry.
+#[tokio::test]
+async fn floor_debt_follows_the_pool_generation() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1).await;
+    let pool = B256::repeat_byte(0x66);
+    let window = handler.one_window(TEST_RATE);
+    let remaining = window.saturating_mul(U256::from(4u64));
+
+    let stale = handler
+        .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+        .map_err(|e| anyhow::anyhow!("first window: {e:?}"))?;
+    handler.forget_pool_floor(pool);
+    let fresh = handler
+        .try_reserve_floor(pool, TEST_SIGNER_B, remaining, TEST_RATE, window)
+        .map_err(|e| anyhow::anyhow!("re-entered pool: {e:?}"))?;
+    abandon(stale, CHUNK_BYTES.saturating_mul(4));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (U256::ZERO, U256::ZERO),
+        "a stale guard charges no debt to the new generation"
+    );
+    drop(fresh);
+
+    abandon(
+        handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("current generation: {e:?}"))?,
+        CHUNK_BYTES.saturating_mul(4),
+    );
+    anyhow::ensure!(
+        handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .err()
+            .is_some_and(|e| matches!(e, FloorRefusal::SignerAtCap { .. })),
+        "the owed window fills a one-window cap"
+    );
+    handler.forget_pool_floor(pool);
+    anyhow::ensure!(
+        handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .is_ok(),
+        "a reclaim drops the debt with the entry"
+    );
     Ok(())
 }
 
@@ -2168,7 +2651,7 @@ fn repaid_release_after_forget_does_not_resurrect_entry() -> anyhow::Result<()> 
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pool = B256::repeat_byte(0x5F);
     let floor = floor_micro(1000);
-    let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor);
+    let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor, TEST_RATE);
     // The pool closes mid-stream: the same in-memory remove
     // `forget_pool_floor` performs.
     lock_floor(&map)?.remove(&pool);
