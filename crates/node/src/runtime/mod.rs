@@ -466,9 +466,11 @@ async fn build_infra(
     reload_state: &RuntimeReloadState,
     node_metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<Infra> {
-    // Preflight: verify RPC endpoint is reachable before committing to
-    // port binding. A 5-second timeout keeps startup responsive on flaky
-    // networks while still catching typos and dead endpoints early.
+    // Preflight: verify RPC endpoint is reachable before the iroh endpoint
+    // and the admin listener bind. The metrics listener is already up, so the
+    // retries below are scrapeable. A 5-second timeout keeps startup
+    // responsive on flaky networks while still catching typos and dead
+    // endpoints early.
     check_rpc_reachability(&cfg.blockchain.rpc_url).await?;
 
     // Registry-mandatory `decdn_probe_hold_slots_max` (ADR
@@ -1657,9 +1659,10 @@ async fn build_chain_and_handlers(
 /// stop signals, task handles, and drain trigger that flow into
 /// [`serve_until_shutdown`] and [`ShutdownHandles`]. Non-generic: the buyer
 /// provider is consumed inside the region and the settlement indexer stores a
-/// concrete watcher handle, so no opaque provider type escapes.
+/// concrete watcher handle, so no opaque provider type escapes. The metrics
+/// server is not here: [`run`] starts it before bring-up and keeps its stop
+/// signal.
 struct Background {
-    metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,
     egress_ewma_stop_tx: oneshot::Sender<()>,
     /// Origin-held-index periodic rescan (#1130). `None` when
@@ -1681,12 +1684,14 @@ struct Background {
 }
 
 /// Background-tasks phase of [`run`] (#1253): construct the buyer-side
-/// provider/stores, spawn every periodic GC / DHT / metrics / admin task, and
-/// emit the startup banner. Borrows [`Infra`] and [`ChainHandlers`]; the buyer
-/// provider is built from `ch.providers`, and the three EIP-712 domains are
-/// cloned out of the shared `ch` reference,
-/// and each clone is consumed exactly once. Returns the [`Background`] handles
-/// [`run`] threads into the serve call and [`ShutdownHandles`].
+/// provider/stores, spawn every periodic GC / DHT / admin task into `tasks`,
+/// mark boot ready on `decdn_node_boot_ready`, and emit the startup banner.
+/// `tasks` already holds the metrics server that [`run`] started before
+/// bring-up. Borrows [`Infra`] and [`ChainHandlers`]; the buyer provider is
+/// built from `ch.providers`, and the three EIP-712 domains are cloned out of
+/// the shared `ch` reference, and each clone is consumed exactly once. Returns
+/// the [`Background`] handles [`run`] threads into the serve call and
+/// [`ShutdownHandles`].
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     cfg: &ResolvedConfig,
@@ -1695,6 +1700,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     infra: &Infra,
     ch: &ChainHandlers<P>,
     started_at: std::time::Instant,
+    mut tasks: JoinSet<()>,
 ) -> anyhow::Result<Background> {
     // On-chain buyer-side service (#744). When this node pulls content from an
     // upstream provider on a cache miss it pays via the same pool mechanism,
@@ -1741,26 +1747,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // notably the one-time USDC `approve` receipt — can block for up to
     // `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) on a stuck tx) and
     // the node-origin pull-through provisioning it feeds are BOTH deferred to a
-    // background task spawned below (#1109), so the metrics/admin listeners and
-    // the "node runtime ready" banner come up independent of any chain RPC. The
-    // provider/store/pending handles built just above are moved into that task.
-
-    let metrics_addr = std::net::SocketAddr::new(
-        cfg.observability.metrics_bind,
-        cfg.observability.metrics_port,
-    );
-    let metrics_listener =
-        metrics::bind(metrics_addr).context("failed to bind metrics listener")?;
-
-    let (metrics_stop_tx, metrics_stop_rx) = oneshot::channel::<()>();
-
-    let metrics_handle = Arc::clone(&infra.node_metrics);
-    let mut tasks = JoinSet::new();
-    tasks.spawn(async move {
-        if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
-            tracing::error!(error = %err, "metrics server exited with error");
-        }
-    });
+    // background task spawned below (#1109), so the admin listener and the
+    // "node runtime ready" banner come up independent of any buyer-side chain
+    // round-trip. The provider/store/pending handles built just above are moved
+    // into that task.
 
     // Periodic dispatch-limiter GC (#440). The acquire path only prunes
     // under flood (when the keyspace exceeds `cap + cap/10`); a node
@@ -2439,6 +2429,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         None
     };
 
+    // Bring-up is done: every boot read succeeded and every listener is up.
+    // `decdn_node_boot_ready` reads `0` from process start until this point.
+    infra.node_metrics.node_boot_ready();
+
     // Startup banner (#274). One structured INFO event per restart lets
     // operators correlate log streams across a fleet and across restarts
     // without stitching multiple lines together. Field names are stable —
@@ -2449,7 +2443,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         version = env!("CARGO_PKG_VERSION"),
         region = cfg.identity.region.as_deref().unwrap_or(""),
         bind_port = cfg.network.bind_port,
-        metrics_addr = %metrics_addr,
+        metrics_addr = %SocketAddr::new(
+            cfg.observability.metrics_bind,
+            cfg.observability.metrics_port,
+        ),
         admin_port = ?cfg.observability.admin_port,
         rate_per_mb = cfg.payment.rate_per_mb,
         cache_dir = %cfg.cache.cache_dir.display(),
@@ -2460,7 +2457,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     );
 
     Ok(Background {
-        metrics_stop_tx,
         dispatch_gc_stop_tx,
         egress_ewma_stop_tx,
         origin_rescan_stop_tx,
@@ -2480,9 +2476,14 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     })
 }
 
-/// Build the endpoint, register handlers on a `Router`, spawn the metrics
-/// server and other background tasks, and run until a shutdown signal is
-/// received.
+/// Serve `/metrics`, build the endpoint, register handlers on a `Router`,
+/// spawn the background tasks, and run until a shutdown signal is received.
+///
+/// The metrics listener binds first, before the RPC preflight and the boot
+/// chain reads, so a node that retries those reads still answers scrapes:
+/// `decdn_node_boot_ready` reads `0` and `decdn_chain_boot_read_retries_total`
+/// counts the retries. A bring-up error drops the task set, which stops the
+/// server and frees the port.
 ///
 /// SIGHUP triggers a hot-reload of mutable config fields via
 /// [`RuntimeReloadState`] (see issue #236). Other signals
@@ -2525,6 +2526,23 @@ pub async fn run(
     // test or embedder may call `run` directly.
     decdn_common::tls::install_crypto_provider();
 
+    let metrics_addr = SocketAddr::new(
+        cfg.observability.metrics_bind,
+        cfg.observability.metrics_port,
+    );
+    let metrics_listener =
+        metrics::bind(metrics_addr).context("failed to bind metrics listener")?;
+    let (metrics_stop_tx, metrics_stop_rx) = oneshot::channel::<()>();
+    let metrics_handle = Arc::clone(&node_metrics);
+    // A `JoinSet`, not a detached spawn: when bring-up fails, `run` returns and
+    // the dropped set aborts the server, so the port does not outlive `run`.
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async move {
+        if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
+            tracing::error!(error = %err, "metrics server exited with error");
+        }
+    });
+
     let infra = build_infra(&cfg, secret_key, &reload_state, node_metrics).await?;
 
     let ch = build_chain_and_handlers(&cfg, &reload_state, &infra).await?;
@@ -2536,6 +2554,7 @@ pub async fn run(
         &infra,
         &ch,
         started_at,
+        tasks,
     )
     .await?;
 
@@ -2554,7 +2573,7 @@ pub async fn run(
     .await?;
 
     let handles = ShutdownHandles {
-        metrics_stop_tx: bg.metrics_stop_tx,
+        metrics_stop_tx,
         dispatch_gc_stop_tx: bg.dispatch_gc_stop_tx,
         egress_ewma_stop_tx: bg.egress_ewma_stop_tx,
         buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,

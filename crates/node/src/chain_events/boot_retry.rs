@@ -28,9 +28,10 @@
 //!   for half the poll interval. Retries inside that window replay the cached
 //!   error — the first two at the default 7 s poll interval — so the cost is at
 //!   most one cache TTL of the budget.
-//! - The metrics listener binds after these reads, so
-//!   `decdn_chain_boot_read_retries_total` is scrapeable only once boot
-//!   completes. The per-attempt `WARN` is the live signal during boot.
+//! - The metrics listener serves from the start of `runtime::run`, before
+//!   these reads, so `decdn_chain_boot_read_retries_total` rises while they
+//!   retry. `decdn_node_boot_ready` stays `0` until bring-up finishes. The
+//!   per-attempt `WARN` names the read that retries.
 
 use std::future::Future;
 use std::sync::Arc;

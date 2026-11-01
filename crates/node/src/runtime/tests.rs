@@ -1683,3 +1683,72 @@ async fn a_transient_rpc_error_is_retried_by_the_preflight() {
         .await
         .expect("a transient fault must be retried to success");
 }
+
+/// `/metrics` answers while bring-up is still retrying its boot RPC reads
+/// (#2819). The RPC URL points at a closed port, so the reachability preflight
+/// keeps retrying for about 15 s. Within that window a scrape returns the
+/// registry, and `decdn_node_boot_ready` reads `0`.
+#[tokio::test]
+async fn metrics_listener_serves_during_boot() {
+    let dead_rpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_rpc_port = dead_rpc.local_addr().unwrap().port();
+    drop(dead_rpc);
+    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_port = free.local_addr().unwrap().port();
+    drop(free);
+
+    let (_tmp, mut cfg) = cfg_with_origins(Vec::new());
+    cfg.blockchain.rpc_url = format!("http://127.0.0.1:{dead_rpc_port}");
+    cfg.observability.metrics_port = metrics_port;
+    cfg.observability.admin_port = None;
+
+    let reload_state = Arc::new(RuntimeReloadState::new(
+        decdn_common::cli::run::ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        &cfg,
+        Box::new(|_| Ok(LogLevelApply::Installed)) as LogLevelSetter,
+    ));
+    let handle = tokio::spawn(run(
+        cfg,
+        SecretKey::generate(),
+        None,
+        reload_state,
+        Arc::new(metrics::Metrics::new()),
+    ));
+
+    decdn_common::tls::install_crypto_provider();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{metrics_port}/metrics");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let body = loop {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+        {
+            break resp.text().await.unwrap();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "/metrics did not answer while the RPC preflight was retrying"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert!(
+        !handle.is_finished(),
+        "run must still be in its boot preflight when the scrape lands"
+    );
+    assert!(
+        body.lines().any(|l| l == "decdn_node_boot_ready 0"),
+        "a booting node exports decdn_node_boot_ready 0; body:\n{body}"
+    );
+    handle.abort();
+}

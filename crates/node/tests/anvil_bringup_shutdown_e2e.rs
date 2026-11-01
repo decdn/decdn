@@ -600,12 +600,13 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     // fallback that pins such a young contract at head. It mirrors a
     // `contracts/dev-deploy.sh` local chain.
     let secret_key = decdn_common::identity::load_or_generate(&cfg.identity.data_dir)?;
+    let metrics = Arc::new(decdn_node::metrics::Metrics::new());
     let handle = tokio::spawn(decdn_node::runtime::run(
         cfg,
         secret_key,
         None,
         reload_state,
-        Arc::new(decdn_node::metrics::Metrics::new()),
+        Arc::clone(&metrics),
     ));
 
     // ---- 6. Poll the admin health endpoint until the runtime answers — the
@@ -639,6 +640,24 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
         }
         anyhow::bail!("admin health never became ready within {READY_TIMEOUT:?}");
     }
+
+    // A finished bring-up flips `decdn_node_boot_ready` to `1`. The runtime sets
+    // it just after it spawns the admin server, so poll briefly rather than
+    // read once.
+    let boot_ready = poll_until(Duration::from_secs(5), || {
+        let metrics = &metrics;
+        async move {
+            metrics
+                .encode()
+                .ok()
+                .filter(|body| body.lines().any(|l| l == "decdn_node_boot_ready 1"))
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        boot_ready.is_some(),
+        "decdn_node_boot_ready must read 1 once the admin server answers"
+    );
 
     // ---- 7. Trigger graceful shutdown via `admin_v1_drain` (fire-and-forget,
     // the `decdn node drain` path). NOT a process signal — that would hit the

@@ -510,6 +510,12 @@ pub struct DecdnMetrics {
     pub otlp_export_failures: Counter,
     /// Seconds since node start.
     pub node_uptime_seconds: Gauge,
+    /// `0` from process start until bring-up finishes, then `1`. The metrics
+    /// listener serves before bring-up, so a node that stays at `0` is still
+    /// retrying a boot read, or is about to exit on a failed one. Set once,
+    /// just before the `node runtime ready` banner. Operator-visible name:
+    /// `decdn_node_boot_ready`.
+    pub node_boot_ready: Gauge,
     /// JSON-RPC endpoint reachability per the watchdog task. `1` =
     /// reachable, `0` = unreachable. `adr/appendix-observability.md` names operational gauges in
     /// the `decdn_*` family; this is the per-tick mirror of the startup
@@ -3710,6 +3716,10 @@ recorders! {
     /// (unreachable). Driven by the watchdog task spawned in
     /// `runtime::run`.
     rpc_healthy(ok: bool) => rpc_healthy.set(i64::from(ok));
+
+    /// Bring-up finished: set `decdn_node_boot_ready` to `1`. Called once by
+    /// `runtime::run`, just before the startup banner.
+    node_boot_ready => node_boot_ready.set(1);
 
     /// Record a connection rejected by the global concurrency semaphore.
     dispatch_rejected_global => dispatch_rejected_global.inc();
