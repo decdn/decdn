@@ -1493,6 +1493,11 @@ pub struct ClientHandler {
     /// cause and remedy differ from every refusal above. Each event also counts
     /// into `decdn_serve_pool_recheck_skipped_total`.
     pool_recheck_skip_warn: WarnThrottle,
+    /// Throttle for the `warn!` on a mid-stream pool re-check that reads the
+    /// pool view while [`Self::chain_freshness`] is stale: the node cannot reach
+    /// the chain, so the projection may be frozen. Each event also counts into
+    /// `decdn_serve_pool_recheck_stale_total`.
+    pool_recheck_stale_warn: WarnThrottle,
     /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
     /// `None` (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
     /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
@@ -1614,6 +1619,7 @@ impl ClientHandler {
             unknown_lane_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             no_lane_miss_log: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             pool_recheck_skip_warn: WarnThrottle::new(Self::POOL_RECHECK_SKIP_WARN_INTERVAL),
+            pool_recheck_stale_warn: WarnThrottle::new(Self::POOL_RECHECK_STALE_WARN_INTERVAL),
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
             warming_credit: deps.warming_credit,
@@ -1689,12 +1695,38 @@ impl ClientHandler {
     /// paid for the bytes it serves after the close. That case counts
     /// `decdn_serve_pool_recheck_skipped_total` and logs a throttled `warn!`
     /// naming the stream, so only the re-check calls this.
+    ///
+    /// With a view wired, a re-check that runs while
+    /// [`Self::chain_freshness`] reads stale counts
+    /// `decdn_serve_pool_recheck_stale_total` and logs a throttled `warn!`
+    /// naming the stream. The node cannot reach the chain, so the projection
+    /// may be frozen and a drain that landed on-chain since does not show. The
+    /// re-check still reads the projection, and the stream continues.
     pub(super) async fn pool_view_status_cached(
         &self,
         lane_key: &LaneKey,
         hash: &Hash,
     ) -> Option<crate::pool_view::PoolStatus> {
         let view = self.pool_view.as_ref()?;
+        if self
+            .chain_freshness
+            .as_ref()
+            .is_some_and(crate::chain_freshness::ChainFreshness::is_stale)
+        {
+            self.metrics.serve_pool_recheck_stale();
+            if let Some(suppressed) = self.pool_recheck_stale_warn.admit() {
+                tracing::warn!(
+                    pool_id = %lane_key.pool_id,
+                    signer = %lane_key.signer,
+                    %hash,
+                    suppressed,
+                    interval = ?self.pool_recheck_stale_warn.interval(),
+                    "mid-stream pool-solvency re-check read a projection that may be frozen: \
+                     the node has not reached the chain within its staleness grace window, so \
+                     a pool drained on-chain since then still passes and the stream continues"
+                );
+            }
+        }
         let status = view.cached_status(lane_key.pool_id).await;
         if status.is_none() {
             self.metrics.serve_pool_recheck_skipped();
@@ -2119,6 +2151,12 @@ impl ClientHandler {
     /// finds no status. Each live stream on a closed pool fires once per
     /// re-check interval, so the line carries the `suppressed` count.
     pub(super) const POOL_RECHECK_SKIP_WARN_INTERVAL: Duration = Duration::from_mins(1);
+
+    /// Minimum gap between `warn!` lines for a mid-stream pool re-check that
+    /// reads a possibly frozen projection. Each live stream fires once per
+    /// re-check interval while the chain reads are stale, so the line carries
+    /// the `suppressed` count.
+    pub(super) const POOL_RECHECK_STALE_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
     /// Emit the observable side of a floor-admission refusal, picking the message
     /// the refusing gate actually justifies.

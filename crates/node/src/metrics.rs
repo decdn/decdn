@@ -2458,6 +2458,13 @@ pub struct DecdnMetrics {
     /// bytes after the close. Counted per re-check, so one affected stream adds
     /// one count per re-check interval.
     pub serve_pool_recheck_skipped: Counter,
+    /// `decdn_serve_pool_recheck_stale_total`: mid-stream pool-solvency
+    /// re-checks that read the wired pool view while the node's chain reads
+    /// are stale (ADR 011 § Serving while chain-stale). The node cannot reach
+    /// the chain, so the projection may be frozen and a drain that landed
+    /// on-chain since does not show. The stream continues. Counted per
+    /// re-check, so one affected stream adds one count per re-check interval.
+    pub serve_pool_recheck_stale: Counter,
 }
 
 /// Per-request JSON-RPC metrics for the node's chain provider, registered under
@@ -3973,6 +3980,9 @@ recorders! {
     serve_stream_midstream_pool_exhausted => serve_stream_midstream_pool_exhausted.inc();
     /// A mid-stream pool-solvency re-check skipped: the pool view holds no status.
     serve_pool_recheck_skipped => serve_pool_recheck_skipped.inc();
+    /// A mid-stream pool-solvency re-check read a projection while the chain
+    /// reads are stale.
+    serve_pool_recheck_stale => serve_pool_recheck_stale.inc();
 }
 
 watcher_downtime_recorders! {

@@ -859,6 +859,16 @@ async fn handler_with_pool_view(
     metrics: &Arc<Metrics>,
     view: Arc<dyn crate::pool_view::PoolView>,
 ) -> (Arc<ClientHandler>, tempfile::TempDir) {
+    handler_with_pool_view_and_freshness(metrics, view, None).await
+}
+
+/// A handler whose pool view is `view` and whose chain freshness is
+/// `freshness`.
+async fn handler_with_pool_view_and_freshness(
+    metrics: &Arc<Metrics>,
+    view: Arc<dyn crate::pool_view::PoolView>,
+    freshness: Option<crate::chain_freshness::ChainFreshness>,
+) -> (Arc<ClientHandler>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
         .await
@@ -892,6 +902,7 @@ async fn handler_with_pool_view(
         always_admit_shed(),
     );
     deps.pool_view = Some(view);
+    deps.chain_freshness = freshness;
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
 }
@@ -1830,6 +1841,64 @@ async fn pool_recheck_with_no_view_wired_is_not_counted_as_skipped() -> anyhow::
     let status = handler.pool_view_status_cached(&lane, &hash).await;
     assert!(status.is_none(), "no view wired reads no status");
     assert_eq!(pool_recheck_skipped(&metrics)?, 0);
+    Ok(())
+}
+
+/// Read `decdn_serve_pool_recheck_stale_total` from `metrics`.
+fn pool_recheck_stale(metrics: &Metrics) -> anyhow::Result<u64> {
+    let encoded = metrics.encode()?;
+    encoded
+        .lines()
+        .find_map(|line| line.strip_prefix("decdn_serve_pool_recheck_stale_total "))
+        .ok_or_else(|| anyhow::anyhow!("decdn_serve_pool_recheck_stale_total is not exported"))?
+        .parse()
+        .map_err(Into::into)
+}
+
+/// The re-check against a pool view that holds a status for every pool,
+/// with `freshness` wired: the stale-re-check count it leaves.
+async fn recheck_stale_count(
+    freshness: Option<crate::chain_freshness::ChainFreshness>,
+) -> anyhow::Result<u64> {
+    let metrics = Arc::new(Metrics::new());
+    let view = Arc::new(FixedPoolView {
+        owner: Address::repeat_byte(0x11),
+    });
+    let (handler, _dir) = handler_with_pool_view_and_freshness(&metrics, view, freshness).await;
+    let (lane, hash) = recheck_stream();
+    let status = handler.pool_view_status_cached(&lane, &hash).await;
+    assert!(
+        status.is_some(),
+        "the fixed view holds a status for every pool"
+    );
+    assert_eq!(pool_recheck_skipped(&metrics)?, 0);
+    pool_recheck_stale(&metrics)
+}
+
+/// A freshness cell no poll tick stamped reads stale, so a re-check on the
+/// projection counts as stale, and still returns the status it read.
+#[tokio::test]
+async fn pool_recheck_on_stale_chain_reads_is_counted_as_stale() -> anyhow::Result<()> {
+    let freshness = crate::chain_freshness::ChainFreshness::new(std::time::Duration::from_mins(5));
+    assert_eq!(recheck_stale_count(Some(freshness)).await?, 1);
+    Ok(())
+}
+
+/// A freshness cell a poll tick just stamped is fresh, so the re-check is
+/// not counted as stale.
+#[tokio::test]
+async fn pool_recheck_on_fresh_chain_reads_is_not_counted_as_stale() -> anyhow::Result<()> {
+    let freshness = crate::chain_freshness::ChainFreshness::new(std::time::Duration::from_mins(5));
+    freshness.stamp();
+    assert_eq!(recheck_stale_count(Some(freshness)).await?, 0);
+    Ok(())
+}
+
+/// With no chain freshness wired (dev/test, no chain) there is no staleness
+/// to read, so the re-check is not counted as stale.
+#[tokio::test]
+async fn pool_recheck_with_no_freshness_wired_is_not_counted_as_stale() -> anyhow::Result<()> {
+    assert_eq!(recheck_stale_count(None).await?, 0);
     Ok(())
 }
 
