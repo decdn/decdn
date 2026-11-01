@@ -703,6 +703,9 @@ jobs:
             for f in "${files[@]}"; do
               name=${f#"$dir"/}
               case "$name" in
+                # Before the suffix match: a hidden archive would pass it, then
+                # slip past the count and the upload, whose globs skip dotfiles.
+                .*) echo "::error::$name in artifact $dir is hidden"; exit 1 ;;
                 *-"$VERSION"-"$target".tar.gz | *-"$VERSION"-"$target".zip) ;;
                 *) echo "::error::$name in artifact $dir does not name version $VERSION and target $target"
                    exit 1 ;;

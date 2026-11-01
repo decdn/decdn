@@ -1,10 +1,10 @@
 """Regression tests for the workflow-hardening checker.
 
 The checker holds every workflow to SHA-pinned actions, digest-pinned
-IMAGE_INPUTS images, version-pinned install-action tools, checkouts that keep no token, and write grants only on
-the jobs its table names. Each rule is read from text, not YAML, so a bug degrades to a quiet
-false pass: the check reports a hardened workflow while a step runs a moved
-tag under a write token.
+IMAGE_INPUTS images, version-pinned install-action tools, checkouts that keep
+no token, and write grants only on the jobs its table names. Each rule is read
+from text, not YAML, so a bug degrades to a quiet false pass: the check
+reports a hardened workflow while a step runs a moved tag under a write token.
 """
 
 from __future__ import annotations
@@ -464,6 +464,12 @@ def test_persist_false_outside_with_does_not_count(tmp_path: Path) -> None:
     assert len(errors) == 1 and "under `with:`" in errors[0], errors
 
 
+def test_value_on_the_line_after_its_key_counts(tmp_path: Path) -> None:
+    security = swap(SECURITY, "persist-credentials: false",
+                    "persist-credentials:\n            false")
+    assert errors_for(tmp_path, security=security) == []
+
+
 def test_quoted_false_counts(tmp_path: Path) -> None:
     security = swap(SECURITY, "persist-credentials: false", "persist-credentials: 'false'")
     assert errors_for(tmp_path, security=security) == []
@@ -707,6 +713,14 @@ INSTALL = f"      - uses: taiki-e/install-action@{OTHER_SHA} # v2.87.32\n"
         (INSTALL + "        with:\n          tool: \"cargo-nextest@0.9.149,\n"
          "            cargo-llvm-cov\"\n          fallback: none\n",
          "install-action tool cargo-llvm-cov is not pinned"),
+        # A quote continued at its key's column: this reader stops before the
+        # closing quote, so the value keeps its opening quote and fails.
+        (INSTALL + "        with:\n          tool: \"cargo-nextest@0.9.149,\n"
+         "          cargo-llvm-cov\"\n          fallback: none\n",
+         "install-action tool \"cargo-nextest@0.9.149 is not pinned"),
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: none\n          checksum: \"false\n          \"\n",
+         "install-action sets `checksum: \"false`"),
         (f"      - uses: Taiki-E/Install-Action@{OTHER_SHA} # v2.87.32\n"
          "        with:\n          tool: cargo-nextest\n          fallback: none\n",
          "install-action tool cargo-nextest is not pinned"),

@@ -115,7 +115,16 @@ def test_a_hidden_file_in_an_artifact_is_refused(tmp_path: Path) -> None:
     layout = real_layout()
     layout["binaries-x86_64-apple-darwin"].append(".hidden")
     result = run_check(materialize(tmp_path, layout), tmp_path)
-    assert_refused(result, ".hidden in artifact binaries-x86_64-apple-darwin does not name")
+    assert_refused(result, ".hidden in artifact binaries-x86_64-apple-darwin is hidden")
+
+
+def test_a_hidden_archive_with_a_matching_suffix_is_refused(tmp_path: Path) -> None:
+    # It would pass the suffix match, and the count and upload globs skip it.
+    layout = real_layout()
+    name = f".extra-{VERSION}-x86_64-apple-darwin.tar.gz"
+    layout["binaries-x86_64-apple-darwin"].append(name)
+    result = run_check(materialize(tmp_path, layout), tmp_path)
+    assert_refused(result, f"{name} in artifact binaries-x86_64-apple-darwin is hidden")
 
 
 def test_a_hidden_top_level_file_is_refused(tmp_path: Path) -> None:

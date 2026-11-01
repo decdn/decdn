@@ -180,7 +180,9 @@ def with_input(key: int, block: list[str], name: str) -> str | None:
 
     A `|` or `>` block scalar is read as its lines joined by newlines, and a
     plain or quoted scalar wrapped onto deeper lines as those lines joined by
-    spaces. None when the step sets no such input.
+    spaces. A quoted value whose closing quote this reader does not find is
+    returned with its opening quote, which matches no expected value. None
+    when the step sets no such input.
     """
     in_with = False
     child: int | None = None
@@ -209,7 +211,12 @@ def with_input(key: int, block: list[str], name: str) -> str | None:
                 if indent_of(follow) <= child:
                     break
                 parts.append(follow.strip())
-            return " ".join(parts).strip("'\"")
+            folded = " ".join(parts).strip()
+            # A quote this reader did not see close keeps its quote mark, so
+            # every comparison against an expected value fails.
+            if len(folded) >= 2 and folded[0] in "'\"" and folded[-1] == folded[0]:
+                return folded[1:-1]
+            return folded
         rest = []
         for follow in block[n + 1 :]:
             if follow.strip() and indent_of(follow) <= child:
