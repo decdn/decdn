@@ -479,7 +479,14 @@ impl ClientHandler {
             // remainder stays owed. `MAX_PROOFS_PER_CHUNK` bounds how many proofs
             // may leave a chunk unsettled — see the twin loop in `deliver` for the
             // full reasoning.
+            //
+            // The pool re-check also runs between proofs, once a batch outlasts
+            // one re-check interval (see the twin loop in `deliver`). Here each
+            // credited proof also lifts the pull leg's paid frontier, so a slow
+            // batch on a closing pool would keep the upstream spend going.
             let mut collected_any = false;
+            let mut batch_pool_check = std::time::Instant::now();
+            let mut batch_proof_read = false;
             'chunk: while let Some(mut owed) =
                 pop_payable(&mut pending, unvouchered, done_delivering)
             {
@@ -488,6 +495,17 @@ impl ClientHandler {
                 // this chunk takes.
                 let mut proofs = ChunkProofs::start();
                 loop {
+                    if batch_proof_read && batch_pool_check.elapsed() >= pool_recheck_interval {
+                        batch_pool_check = std::time::Instant::now();
+                        if let Some(stop) = self.pool_recheck_stop(&lane_key, &hash).await {
+                            self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
+                                .await?;
+                            return Ok(ServeEnd::Stopped {
+                                stop,
+                                bytes: delivered,
+                            });
+                        }
+                    }
                     let attempt = proofs.next_attempt();
                     // Timed by hand, as in `deliver_loop`: the wait ends before
                     // the error arm, so a proof that times out still counts.
@@ -509,6 +527,7 @@ impl ClientHandler {
                         )
                         .await;
                     waits.end();
+                    batch_proof_read = true;
                     let stop = match committed {
                         Ok(stop) => stop,
                         Err(e) => {

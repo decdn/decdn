@@ -7445,6 +7445,23 @@ async fn closed_pool_stops_the_stream(
     view: Arc<dyn decdn_node::pool_view::PoolView>,
     close: impl FnOnce(),
 ) -> anyhow::Result<Arc<Metrics>> {
+    closed_pool_stops_the_stream_after(cache, hash, signer, view, close, HARNESS_INTERVAL_BYTES)
+        .await
+}
+
+/// [`closed_pool_stops_the_stream`] with the payer's one voucher paying
+/// `paid_bytes` cumulative. Below [`HARNESS_INTERVAL_BYTES`] the voucher pays a
+/// sliver of interval 1 and the payer holds the rest. The rest of the chunk
+/// stays owed, so the stop comes from the re-check between proofs, before the
+/// node waits for the next proof.
+async fn closed_pool_stops_the_stream_after(
+    cache: CacheEngine,
+    hash: decdn_cache::Hash,
+    signer: Arc<PrivateKeySigner>,
+    view: Arc<dyn decdn_node::pool_view::PoolView>,
+    close: impl FnOnce(),
+    paid_bytes: u64,
+) -> anyhow::Result<Arc<Metrics>> {
     let store = closing_pool_store(&signer)?;
     let m = U256::from(HARNESS_FLOOR_COST);
     let (target, server_ep, server_task, metrics) =
@@ -7465,7 +7482,7 @@ async fn closed_pool_stops_the_stream(
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     close();
-    pay_cumulative(&mut send, &signer, HARNESS_INTERVAL_BYTES).await?;
+    pay_cumulative(&mut send, &signer, paid_bytes).await?;
 
     match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut recv)).await?? {
         ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
@@ -7625,6 +7642,36 @@ async fn closing_pool_past_its_cutoff_stops_a_serve_miss_stream() -> anyhow::Res
     assert_own_origin_spine(&metrics, &cache_metrics)
 }
 
+/// A slow payer pays a sliver of the owed chunk after the pool's close cutoff
+/// passes, and holds the rest. The `deliver` loop stops the stream between
+/// proofs. It does not wait for the payer to settle the chunk.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_pool_stops_a_slow_payers_cache_hit_batch_between_proofs() -> anyhow::Result<()> {
+    let payload = vec![0xCBu8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let (view, closing) = closing_pool_view(unix_now()?);
+    let close = || closing.store(true, std::sync::atomic::Ordering::Relaxed);
+    closed_pool_stops_the_stream_after(cache, hash, signer, view, close, SLIVER_BYTES).await?;
+    Ok(())
+}
+
+/// The serve-miss twin of
+/// [`closing_pool_stops_a_slow_payers_cache_hit_batch_between_proofs`]: the
+/// own-origin `serve_leg` loop stops the stream between proofs.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_pool_stops_a_slow_payers_serve_miss_batch_between_proofs() -> anyhow::Result<()> {
+    let payload = vec![0xCCu8; 16 * 1024 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let (view, closing) = closing_pool_view(unix_now()?);
+    let close = || closing.store(true, std::sync::atomic::Ordering::Relaxed);
+    let metrics =
+        closed_pool_stops_the_stream_after(cache, hash, signer, view, close, SLIVER_BYTES).await?;
+    assert_own_origin_spine(&metrics, &cache_metrics)
+}
+
 /// A pool that turns `Closing` mid-stream with its dispute deadline a day out
 /// still pays for the stream, so the stream runs to a clean `StreamEnd`.
 #[tokio::test(flavor = "multi_thread")]
@@ -7720,13 +7767,16 @@ async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> any
         )
     };
 
-    // Drain the pool once the client has paid: the node admitted the stream,
-    // so its next re-check runs at a boundary where it collected a proof.
+    // Drain the pool once the client has paid two intervals. The node delivers
+    // interval 2 only after it credits interval 1, so it holds a claim when the
+    // next re-check stops the stream. An earlier drain can land between the
+    // epoch's root voucher and its first reveal, and the re-check between
+    // proofs then stops the stream before the node holds any claim.
     let drain = tokio::spawn({
         let ledger = Arc::clone(&ledger);
         let drained = Arc::clone(&drained);
         async move {
-            while ledger.committed().amount.is_zero() {
+            while ledger.committed().bytes < U256::from(2 * HARNESS_INTERVAL_BYTES) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             drained.store(true, std::sync::atomic::Ordering::Relaxed);

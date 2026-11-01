@@ -486,13 +486,35 @@ impl ClientHandler {
             // watermark by a sliver. Hence the loop reads proofs for a chunk until
             // they have credited all of it, and `MAX_PROOFS_PER_CHUNK` bounds how
             // many proofs a payer may send without settling it.
+            //
+            // The pool re-check below also runs between proofs, once a batch
+            // outlasts one re-check interval. A slow payer can hold a batch open
+            // across many proof waits, and the pool can close, or cross into its
+            // redeem margin, while the batch keeps crediting. The check waits for
+            // the batch's first proof, because the post-batch check of the last
+            // iteration already covers the batch start. The batch's own clock
+            // starts with the batch, so a batch that settles inside one interval
+            // never reads the pool here.
             let mut collected_any = false;
+            let mut batch_pool_check = std::time::Instant::now();
+            let mut batch_proof_read = false;
             while let Some(mut owed) = pop_payable(&mut pending, unvouchered, done_delivering) {
                 collected_any = true;
                 // One proof budget and one proof-wait ceiling for every proof
                 // this chunk takes.
                 let mut proofs = ChunkProofs::start();
                 loop {
+                    if batch_proof_read && batch_pool_check.elapsed() >= pool_recheck_interval {
+                        batch_pool_check = std::time::Instant::now();
+                        if let Some(stop) = self.pool_recheck_stop(&lane_key, &hash).await {
+                            self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
+                                .await?;
+                            return Ok(ServeEnd::Stopped {
+                                stop,
+                                bytes: delivered,
+                            });
+                        }
+                    }
                     let attempt = proofs.next_attempt();
                     // Timed by hand, not through `ServeWaits::time`: nesting
                     // this large future in another trips `large_futures`. The
@@ -516,6 +538,7 @@ impl ClientHandler {
                         )
                         .await;
                     waits.end();
+                    batch_proof_read = true;
                     let stop = committed.map_err(|e| {
                         e.context(format!(
                             "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
