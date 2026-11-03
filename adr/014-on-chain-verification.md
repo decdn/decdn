@@ -280,6 +280,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Universal on-chain accountability is the protocol's single stance — there is no opt-out and no validation-mode difference between PoC and production for this field.
 - The unified `SlashJudge` contract provides a single audit surface for all slashing logic.
 - The [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal) commit–reveal makes the 50% challenger reward un-front-runnable: the incentive for off-path witnesses survives independently of any transaction-ordering trust assumption (Arbitrum's sequencer today, decentralized sequencing or Timeboost later).
+- An offender can report itself. It holds its own signed evidence from the moment of the offense, so it can commit that evidence from a second address before any witness and collect the 50% challenger share. The effective penalty for a self-reported offense is therefore half the slash. The offense count, the tier ladder and the vote zero-out still apply in full. Slash sizes are set with this halved penalty in mind; the contract does not try to link a challenger to the operator.
 
 ### Negative
 
