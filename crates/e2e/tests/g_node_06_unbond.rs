@@ -3,9 +3,8 @@
 //!
 //! Drives the production CLI binary through all three phases of the window —
 //! request, maturing, withdraw — and asserts the on-chain consequences the
-//! command promises the operator, in particular that a request in flight makes
-//! the node INACTIVE for the whole window (`isActive` has "no unbonding
-//! request" as a conjunct, independent of the remaining bond).
+//! command promises the operator, in particular that a request whose retained
+//! bond covers minBond keeps the node active for the whole window.
 //!
 //! The CLI wiring mirrors `cli_publish.rs`: a `NodeFixture` supplies the
 //! rendered `node.toml` (`[blockchain]` coordinates + keystore path) and the
@@ -139,7 +138,7 @@ async fn run() -> anyhow::Result<()> {
     );
     let stderr = String::from_utf8_lossy(&unconfirmed.stderr);
     assert!(
-        stderr.contains("INACTIVE"),
+        stderr.contains("unbonding window") && stderr.contains("stays active"),
         "the consequence must be disclosed even when refusing: {stderr}"
     );
     assert!(
@@ -203,16 +202,15 @@ async fn run() -> anyhow::Result<()> {
         "unlock_at ({unlock_at}) must be one unbonding period ({period}s) out from {head}"
     );
 
-    // The operator-facing surprise the command warns about: the node leaves the
-    // active set for the whole window even though the retained bond still
-    // covers minBond and the reduced tier.
+    // The retained bond still covers minBond and the reduced tier, so the node
+    // keeps serving through the window.
     assert!(
         reduced_target >= chain.min_bond().await?,
         "retained bond still covers minBond"
     );
     assert!(
-        !chain.is_active(operator).await?,
-        "a request in flight must make the node inactive for the whole window"
+        chain.is_active(operator).await?,
+        "a request that retains the floor must keep the node active"
     );
 
     // ---- 2. Re-running while it matures submits nothing and exits non-zero.
@@ -262,7 +260,7 @@ async fn run() -> anyhow::Result<()> {
     );
     assert!(
         chain.is_active(operator).await?,
-        "with the request cleared and the bond above minBond, the node is active again"
+        "with the bond above minBond, the node stays active after the withdrawal"
     );
 
     // ---- 5. Negative: an --amount below the curve is rejected before any
@@ -409,6 +407,10 @@ async fn run() -> anyhow::Result<()> {
         "`--all` never moves the declared tier: {receipt}"
     );
     assert_eq!(chain.active_bond(operator).await?, floor_curve);
+    assert!(
+        !chain.is_active(operator).await?,
+        "a request that drops the retained bond below minBond deactivates the node at once"
+    );
 
     let (pending, unlock_at) = chain.unbonding_of(operator).await?;
     assert_eq!(pending, min_bond - floor_curve);

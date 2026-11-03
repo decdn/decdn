@@ -1474,12 +1474,11 @@ contract CapacityBond is
     function isActive(address operator) public view returns (bool) {
         // Ongoing active status tests the grandfathered `bondFloorAtActivation`,
         // not the live `minBond`: a `minBond` raise never de-activates an
-        // already-active operator (ADR 026 § Operator bond). A partial unbond
-        // below the operator's own floor still de-activates once the unbonding
-        // request clears — the floor binds the operator's own bond reductions.
-        // slither-disable-next-line incorrect-equality
-        return _nodes[operator].active && activeBond[operator] >= bondFloorAtActivation[operator]
-            && unbondingOf[operator].amount == 0 && !ejected[operator];
+        // already-active operator (ADR 026 § Operator bond). `requestUnbond`
+        // moves the released amount out of `activeBond` at once, so a partial
+        // unbond that retains the floor keeps the operator active, and one that
+        // drops below the floor de-activates it.
+        return _nodes[operator].active && activeBond[operator] >= bondFloorAtActivation[operator] && !ejected[operator];
     }
 
     /// @inheritdoc ICapacityBond
@@ -1583,8 +1582,8 @@ contract CapacityBond is
     /// @dev    Returns the raw `_registeredAddrs` page (every operator whose node
     ///         record is registered, regardless of bond/unbonding/ejection) plus
     ///         a parallel `active[]` where `active[i] == isActive(page[i].ethAddress)`.
-    ///         The two projections diverge on purpose: an operator mid-unbonding is
-    ///         `active[i] == false` but still present in `page` because it remains
+    ///         The two projections diverge on purpose: an operator whose bond sits
+    ///         below its floor is `active[i] == false` but still present in `page` because it remains
     ///         payable, so the off-chain node→address bindings must survive. Computing
     ///         `active` here lets callers derive the true active-membership set from a
     ///         single call, with no per-entry `isActive` round-trip (issue #1565).

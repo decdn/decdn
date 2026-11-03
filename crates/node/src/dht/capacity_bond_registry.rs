@@ -32,10 +32,10 @@
 //! At bootstrap `active` and `bindings` genuinely diverge:
 //!
 //! - `active` takes the per-entry `active[i]` that `getRegisteredNodes` computes
-//!   on-chain (`isActive(operator)`: registered AND bond ≥ minBond AND no
-//!   unbonding AND not ejected) alongside the `_registeredAddrs` page.
-//! - `bindings` applies no filter: an operator mid-unbonding has `isActive =
-//!   false` but is still payable, so its binding must survive.
+//!   on-chain (`isActive(operator)`: registered AND active bond ≥ the
+//!   operator's floor AND not ejected) alongside the `_registeredAddrs` page.
+//! - `bindings` applies no filter: an operator below its bond floor has
+//!   `isActive = false` but is still payable, so its binding must survive.
 //! - `regions`, the reverse map, and the dial-address directory are likewise
 //!   unfiltered: liveness is applied separately at read time via the shared
 //!   `StakerSet`, and an inactive node stays dialable for lane settlement.
@@ -487,11 +487,9 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                 }
             }
             // The blacklist-ejection twin of `Reinstated` (#1030). `ejected` is a
-            // conjunct of `isActive`, so an ejection deactivates the operator
-            // exactly as an unbonding request does — but the event was missing
-            // from this OR-set, so an ejection only landed at the next
-            // `REGISTRY_RESYNC_INTERVAL` re-enumeration. Every consumer of the
-            // staker set was wrong for up to 15 minutes, DHT admission included.
+            // conjunct of `isActive`, so an ejection deactivates the operator;
+            // without this arm an ejection would land only at the next
+            // `REGISTRY_RESYNC_INTERVAL` re-enumeration.
             Some(sig) if sig == CapacityBond::EjectedByBlacklist::SIGNATURE_HASH => {
                 match CapacityBond::EjectedByBlacklist::decode_log_data(&log.inner.data) {
                     Ok(event) => self.on_operator_change(event.operator, false).await,
@@ -712,7 +710,7 @@ where
         let page_len = resp.page.len() as u64;
         // `active[i]` is `isActive(page[i])`, computed on-chain and index-aligned
         // with `page` by the contract. `bindings` takes every entry (unfiltered):
-        // an operator mid-unbonding is inactive but still payable.
+        // an operator below its bond floor is inactive but still payable.
         for (node, &is_active) in resp.page.iter().zip(resp.active.iter()) {
             let node_id = NodeId::from_bytes(node.nodeId.0);
             snap.bindings.insert(node_id, node.ethAddress);

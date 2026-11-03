@@ -860,25 +860,40 @@ contract CapacityBondTest is Test {
         vm.stopPrank();
     }
 
+    /// @notice A partial unbond that retains the operator's floor keeps it
+    ///         active for the whole unbonding window.
+    function test_isActive_partialUnbondAboveFloorStaysActive() public {
+        vm.warp(1_000_000);
+        address b = _registerFreshOperator(0xB2, bytes32(uint256(0xB2)), 2 * MIN_BOND);
+
+        vm.prank(b);
+        bond.requestUnbond(MIN_BOND);
+        assertEq(bond.activeBond(b), MIN_BOND, "B retains exactly its floor");
+        assertTrue(bond.isActive(b), "a partial unbond above the floor keeps B active");
+
+        vm.warp(block.timestamp + bond.unbondingPeriod());
+        vm.prank(b);
+        bond.unbond();
+        assertTrue(bond.isActive(b), "withdrawing the released part keeps B active");
+    }
+
     /// @notice `getRegisteredNodes` returns the full registered page and a
     ///         parallel `active[]` computed on-chain via `isActive`. An operator
-    ///         mid-unbonding is `isActive == false` but MUST stay in the page —
-    ///         it is inactive yet still payable, so the off-chain bindings
-    ///         projection depends on it not vanishing. This is the exact
-    ///         asymmetry the rename preserves (issue #1565).
-    function test_getRegisteredNodes_marksUnbondingOperatorInactiveButPresent() public {
+    ///         whose bond sits below its floor is `isActive == false` but MUST
+    ///         stay in the page — it is inactive yet still payable, so the
+    ///         off-chain bindings projection depends on it not vanishing
+    ///         (issue #1565).
+    function test_getRegisteredNodes_marksSubFloorOperatorInactiveButPresent() public {
         vm.warp(1_000_000);
         address a = _registerFreshOperator(0xA1, bytes32(uint256(0xA1)), MIN_BOND);
-        // B bonds 2x so requestUnbond keeps activeBond >= minBond: the ONLY
-        // reason isActive flips false is the pending unbonding.
-        address b = _registerFreshOperator(0xB2, bytes32(uint256(0xB2)), 2 * MIN_BOND);
+        address b = _registerFreshOperator(0xB2, bytes32(uint256(0xB2)), MIN_BOND);
         assertTrue(bond.isActive(a));
         assertTrue(bond.isActive(b));
 
         vm.prank(b);
         bond.requestUnbond(1);
-        assertGe(bond.activeBond(b), MIN_BOND, "B still above minBond");
-        assertFalse(bond.isActive(b), "unbonding alone flips isActive false");
+        assertLt(bond.activeBond(b), MIN_BOND, "B drops below its floor");
+        assertFalse(bond.isActive(b), "a sub-floor bond flips isActive false");
 
         (CapacityBond.NodeInfo[] memory page, bool[] memory active) = bond.getRegisteredNodes(0, 100);
 
@@ -893,7 +908,7 @@ contract CapacityBondTest is Test {
                 assertTrue(active[i], "active operator flagged active");
             } else if (page[i].ethAddress == b) {
                 sawB = true;
-                assertFalse(active[i], "unbonding operator present but flagged inactive");
+                assertFalse(active[i], "sub-floor operator present but flagged inactive");
             } else {
                 revert("unexpected operator in page");
             }

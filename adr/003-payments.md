@@ -1168,15 +1168,16 @@ mapping(address => uint64) public bindingNonce;
 // Bundled per-operator binding + activity view (off-chain origin discovery;
 // ADR 016 § Off-Chain Read API, ADR 022 § Origin discovery). `nodeId` is
 // `bytes32(0)` if the operator never registered or cleared their binding via
-// rebinding; `active` is `false` if the operator is unbound, in unbonding,
-// auto-ejected, or below the tier minimum bond.
+// rebinding; `active` is `false` if the operator is unbound, auto-ejected,
+// or holds an active bond below its floor.
 function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 
 // Single-purpose per-operator activity check. Returns `true` iff `operator` is
-// currently registered with an active (non-unbonding) bond at or above
-// `bond_required(declared_capacity)`; `false` for unregistered addresses,
-// bond below the tier minimum, bond fully or partially in unbonding,
-// and auto-ejected operators.
+// currently registered with an active bond at or above its floor; `false`
+// for unregistered addresses, an active bond below the floor, and
+// auto-ejected operators. Bond queued for unbonding is not active bond, so
+// a partial unbond keeps the operator active while the retained bond covers
+// the floor.
 // SECURITY: operator-level blacklist status (ADR 011) is intentionally NOT
 // consulted — this is a pure single-contract storage read; callers needing the
 // combined "authorized origin" predicate filter against

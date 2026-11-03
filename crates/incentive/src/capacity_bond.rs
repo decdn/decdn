@@ -11,11 +11,11 @@
 //! - `getRegisteredNodes` returns the `_registeredAddrs` page (every
 //!   registered operator, unfiltered for bond / unbonding / ejection)
 //!   alongside a parallel `active[]` that the contract computes with
-//!   `isActive(operator)` per entry — the strict "registered AND bond ≥
-//!   minBond AND no unbonding AND not ejected" predicate. Callers take
+//!   `isActive(operator)` per entry — the strict "registered AND active
+//!   bond ≥ the operator's floor AND not ejected" predicate. Callers take
 //!   the membership set from `active[]` and keep the full page for the
-//!   payout bindings (an unbonding operator is `active == false` but
-//!   still payable), with no per-entry round-trip.
+//!   payout bindings (an operator below its floor is `active == false`
+//!   but still payable), with no per-entry round-trip.
 //! - `nodeIdOf` returns `(bytes32 nodeId, bool active)` where the bool
 //!   is the full `isActive` predicate, not a separate "registered"
 //!   flag.
@@ -62,8 +62,8 @@ mod sol_types {
             // -----------------------------------------------------------------
 
             /// Full active-bonder predicate: registered AND
-            /// `activeBond ≥ minBond` AND no unbonding request in
-            /// flight AND not ejected.
+            /// `activeBond ≥ bondFloorAtActivation` AND not ejected.
+            /// Bond queued for unbonding is not `activeBond`.
             function isActive(address operator) external view returns (bool);
 
             /// `nodeId`-keyed convenience over `isActive`.
@@ -122,8 +122,8 @@ mod sol_types {
             /// unbonding / ejection — paired with a parallel `active[]`
             /// where `active[i] == isActive(page[i].ethAddress)`, computed
             /// on-chain. Take membership from `active`; keep `page` for the
-            /// payout bindings (an unbonding operator is `active == false`
-            /// but still present and payable).
+            /// payout bindings (an operator below its floor is
+            /// `active == false` but still present and payable).
             function getRegisteredNodes(uint256 offset, uint256 limit)
                 external
                 view
@@ -171,8 +171,8 @@ mod sol_types {
             /// The operator's raw registration record. `active` here is
             /// `_nodes[operator].active` alone — the flag `deregisterNode`
             /// gates on — NOT the composite `isActive`, which additionally
-            /// requires bond over `minBond` and no unbonding request. An
-            /// operator mid-unbonding is `isActive == false` yet still
+            /// requires active bond over the operator's floor. An operator
+            /// below its floor is `isActive == false` yet still
             /// deregisterable, so `decdn node deregister` reads this (#1359).
             /// Zero-valued for a never-registered address.
             function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
@@ -434,7 +434,8 @@ mod sol_types {
             event Reinstated(address indexed operator);
 
             /// Operator requested unbonding; flips `isActive` to
-            /// `false` immediately even though the operator stays in
+            /// `false` at once when the retained active bond is below
+            /// the operator's floor, while the operator stays in
             /// `_registeredAddrs`. **Operator-indexed** — translate
             /// via `nodeIdOf`.
             event UnbondingRequested(

@@ -147,8 +147,8 @@ pub enum NodeCommand {
     /// State-aware: with no request in flight it declares the tier down (if
     /// needed) and starts the unbonding window; while one is maturing it
     /// reports the unlock time and exits non-zero; once matured it withdraws.
-    /// Note that a request in flight makes the node INACTIVE for the whole
-    /// window. Pass `--dry-run` to print the plan without submitting.
+    /// The node goes INACTIVE only when the retained bond drops below minBond.
+    /// Pass `--dry-run` to print the plan without submitting.
     Unbond(UnbondArgs),
     /// Leave the active node set on-chain via `CapacityBond.deregisterNode`
     /// (ADR 003 § Node Registry) — the reverse of `decdn node register`, and

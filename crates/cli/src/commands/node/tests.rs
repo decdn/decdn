@@ -53,8 +53,8 @@ fn health_names_the_bound_id_on_a_mismatch() {
 /// `binding` does: a script grepping for the failure has to be able to tell
 /// "checked, and this node cannot sell" from "the line is missing" (#1030).
 /// The two fields are independent — a node can be correctly `bound` and
-/// still be out of the active set (deregistered, ejected, unbonding, or
-/// bond below `minBond`), which is exactly the case an operator misreads
+/// still be out of the active set (deregistered, ejected, or active bond
+/// below its floor), which is exactly the case an operator misreads
 /// without this line.
 #[test]
 fn health_prints_registry_active_in_both_states() {

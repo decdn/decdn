@@ -9,9 +9,9 @@ pragma solidity 0.8.28;
 ///         reads the same predicate for origin authorization. Kept focused —
 ///         mirroring `ICapacityBondEpoch` / `ICapacityBondEjector` — so
 ///         consumers link only the read they need.
-/// @dev    Returns `true` iff `operator` is registered with an active
-///         (non-unbonding) bond at or above the tier minimum; `false` for
-///         unregistered, sub-minimum, unbonding, or auto-ejected operators.
+/// @dev    Returns `true` iff `operator` is registered with an active bond
+///         at or above its floor; `false` for unregistered, sub-floor, or
+///         auto-ejected operators. Bond queued for unbonding does not count.
 ///         Operator-level blacklist status (ADR 011) is intentionally NOT
 ///         consulted here — callers needing the combined "authorized origin"
 ///         predicate filter against `ContentBlacklist.isOriginBlacklisted`.

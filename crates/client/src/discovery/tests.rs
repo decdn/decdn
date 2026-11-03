@@ -73,8 +73,9 @@ fn with_dial_addrs_is_noop_without_registry_addresses() {
 
 /// The filter keys on the on-chain `isActive` (the `active[]` column of
 /// `getRegisteredNodes`), NOT the raw `NodeInfo.active` registration flag. A
-/// node mid-unbonding is still `NodeInfo.active == true` but `isActive ==
-/// false`, and the client must drop it up front rather than defer to probing.
+/// node whose bond sits below its floor is still `NodeInfo.active == true` but
+/// `isActive == false`, and the client must drop it up front rather than defer
+/// to probing.
 #[test]
 fn excludes_stale_active_node_when_isactive_false() {
     let key = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
