@@ -314,7 +314,8 @@ contract CapacityBond is
     // Storage — region attestation (ADR 030)
     // -----------------------------------------------------------------
 
-    /// @notice Previous-region snapshot taken on each `updateRegion` call.
+    /// @notice Previous-region snapshot taken on each region change, by
+    ///         `updateRegion` or by a re-registration into a new region.
     ///         Consulted by the ADR 030 § Region-stability window blacklist-scope
     ///         ripening predicate (*"a node is in scope iff the entry is global,
     ///         OR entry.region == regionHint, OR (block.timestamp -
@@ -816,12 +817,23 @@ contract CapacityBond is
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < readyAt) revert RegionCooldownActive(readyAt);
 
-        string memory oldRegion = info.regionHint;
-        regionPrev[msg.sender] = oldRegion;
-        info.regionHint = newRegion;
-        regionLastChanged[msg.sender] = uint64(block.timestamp);
+        emit RegionUpdated(info.nodeId, _setRegion(info, newRegion), newRegion);
+    }
 
-        emit RegionUpdated(info.nodeId, oldRegion, newRegion);
+    /// @dev ADR 030 § Region-stability window: a region change snapshots the
+    ///      old region into `regionPrev`, so its entries keep applying until the
+    ///      change ripens; an unchanged region keeps the existing snapshot.
+    ///      `regionLastChanged` is stamped on every call, so it is never 0 for an
+    ///      active node, and both the ripening window and the `updateRegion`
+    ///      cooldown run from it. A re-registration restarts the window.
+    function _setRegion(NodeInfo storage info, string calldata newRegion) internal returns (string memory oldRegion) {
+        oldRegion = info.regionHint;
+        if (keccak256(bytes(oldRegion)) != keccak256(bytes(newRegion))) {
+            regionPrev[msg.sender] = oldRegion;
+            info.regionHint = newRegion;
+        }
+        // forge-lint: disable-next-line(block-timestamp)
+        regionLastChanged[msg.sender] = uint64(block.timestamp);
     }
 
     // -----------------------------------------------------------------
@@ -941,13 +953,7 @@ contract CapacityBond is
         info.active = true;
         info.lastMultiaddrUpdate = uint64(block.timestamp);
         info.multiaddrs = multiaddrs;
-        info.regionHint = regionHint;
-        // ADR 030 § Region-stability window: stamp when the current region took
-        // effect so it is never 0 for an active node. The ripening window and
-        // the `updateRegion` cooldown both run from this stamp; a re-registration
-        // (re-onboarding) restarts the window, which is correct.
-        // forge-lint: disable-next-line(block-timestamp)
-        regionLastChanged[msg.sender] = uint64(block.timestamp);
+        _setRegion(info, regionHint);
     }
 
     /// @notice Leave the active set. Deactivates the node without touching the

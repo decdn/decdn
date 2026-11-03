@@ -1099,6 +1099,34 @@ contract CapacityBondTest is Test {
         assertEq(bond.escrowedTotal(), expectedSlash, "the slashed amount stays escrowed, unreachable by exit");
     }
 
+    /// @notice A re-registration into a new region snapshots the old region in
+    ///         `regionPrev`, so the old region's blacklist entries keep applying
+    ///         through the stability window (ADR 030). Re-registering into the
+    ///         same region keeps the snapshot.
+    function test_reRegisterIntoNewRegion_recordsRegionPrev() public {
+        uint256 opPk = 0x8EE9;
+        bytes32 nodeId = bytes32(uint256(0x8EE9));
+        address opAddr = _onboardAtTier(opPk, 1000, nodeId);
+
+        vm.prank(opAddr);
+        bond.deregisterNode();
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+
+        (string memory region, string memory prev,,) = bond.regionScopeData(opAddr);
+        assertEq(region, "eu-west");
+        assertEq(prev, "us-east", "the old region is snapshotted");
+
+        vm.prank(opAddr);
+        bond.deregisterNode();
+        sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+        (, prev,,) = bond.regionScopeData(opAddr);
+        assertEq(prev, "us-east", "an unchanged region keeps the snapshot");
+    }
+
     function test_reRegisterAfterDeregister_keepsBondAndNeedsFreshDeclare() public {
         uint256 opPk = 0x8EE8;
         bytes32 nodeId = bytes32(uint256(0x8EE8));
