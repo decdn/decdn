@@ -630,12 +630,6 @@ contract CapacityBond is
         uint256 newBalance = oldBalance + amount;
         activeBond[msg.sender] = newBalance;
 
-        // First-bond timestamp is set the moment the operator's `activeBond`
-        // becomes non-zero, never overwritten (ADR 036 § Formula).
-        if (oldBalance == 0 && _firstBondedAt[msg.sender] == 0) {
-            _firstBondedAt[msg.sender] = uint64(block.timestamp);
-        }
-
         // Grandfather the entry floor: capture the live `minBond` each time the
         // operator crosses UP through it (ADR 026 § Minimum bond is
         // non-retroactive). This is the entry transition — `registerNode` and
@@ -644,9 +638,12 @@ contract CapacityBond is
         // Ongoing active status (`isActive`) and slash auto-ejection read this
         // floor, never the live `minBond`, so a later `minBond` raise is
         // non-retroactive. Re-crossing after a full ejection re-grandfathers at
-        // the then-current `minBond`.
+        // the then-current `minBond`. The first crossing also starts the
+        // operator's tenure, never overwritten (ADR 036 § Behaviors that follow
+        // from the formula), so a dust bond cannot pre-age an address.
         if (oldBalance < minBond && newBalance >= minBond) {
             bondFloorAtActivation[msg.sender] = minBond;
+            if (_firstBondedAt[msg.sender] == 0) _firstBondedAt[msg.sender] = uint64(block.timestamp);
         }
 
         // Slash auto-ejection (ADR 026) is recoverable by re-bonding, but a

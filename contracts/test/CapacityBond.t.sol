@@ -108,6 +108,20 @@ contract CapacityBondTest is Test {
         assertEq(bond.firstBondedAt(operator), 1_000_000);
     }
 
+    /// @notice A dust bond below `minBond` does not start the tenure ramp; the
+    ///         bond that reaches `minBond` does.
+    function test_firstBondedAt_setsAtMinBondCrossingNotDust() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(1);
+        assertEq(bond.firstBondedAt(operator), 0, "a dust bond stamps no tenure");
+
+        vm.warp(2_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND - 1);
+        assertEq(bond.firstBondedAt(operator), 2_000_000, "the minBond crossing stamps tenure");
+    }
+
     function test_firstBondedAt_immutableAcrossReBonds() public {
         vm.warp(1_000_000);
         vm.prank(operator);
