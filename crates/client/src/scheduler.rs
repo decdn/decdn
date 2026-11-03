@@ -99,7 +99,7 @@
 //!   the victim's end to `split`, both under the `Work` lock. The split lies at
 //!   least `MIN_VICTIM_KEEP` past the victim's verified frontier, durable or
 //!   not. The victim's leg stops on its open stream once its verified prefix
-//!   reaches `split` ([`fill_gap`]): it pays for every byte it received,
+//!   reaches `split` ([`fill_gap`]): it pays for every byte it verified,
 //!   closes the stream, and ends its unit as complete, with nothing to
 //!   re-queue. So the stolen tail is fetched (and paid for) by ONE source,
 //!   apart from the frames past the split the victim's stream already carried
