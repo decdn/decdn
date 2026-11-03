@@ -27,6 +27,7 @@ import { INonfungiblePositionManager } from "./interfaces/IUniswapV3PoolCreation
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
+import { IUniswapV3Pool } from "../src/interfaces/IUniswapV3Pool.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondEpoch } from "../src/interfaces/ICapacityBondEpoch.sol";
 import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
@@ -164,6 +165,10 @@ abstract contract BaseProtocolDeploy is Script {
     ///      helper fail-fasts against them instead.
     uint160 internal constant UNIV3_MIN_SQRT_RATIO = 4_295_128_739;
     uint160 internal constant UNIV3_MAX_SQRT_RATIO = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
+    /// @dev Share of each seed leg the genesis mint must consume (99%). A
+    ///      full-range mint at the seed price consumes both legs up to rounding,
+    ///      so only a price moved before the mint lands can trip it.
+    uint256 internal constant SEED_MIN_BPS = 9900;
 
     /// @notice Pool seed amounts (raw). The script creates + seeds the 50/50
     ///         Uniswap V3 pool in-script, so `_deriveTokenSeed` pairs `usdcSeed`
@@ -372,6 +377,9 @@ abstract contract BaseProtocolDeploy is Script {
     ///         cap denominator (`usdc.balanceOf(pool)`) would be zero, so the
     ///         "seed the pool before wiring" guard fails the deploy loudly.
     error PoolNotSeeded(address pool);
+    /// @notice The TOKEN/USDC pool already existed at a price other than the
+    ///         seed price, so seeding into it would sell at that price.
+    error PoolPreInitialized(address pool, uint160 current, uint160 expected);
     /// @notice The deployer lacks the TOKEN/USDC balance the venue seed pulls.
     error InsufficientSeedBalance(address token, uint256 have, uint256 need);
     /// @notice Fee tier has no known Uniswap V3 tick spacing.
@@ -1007,6 +1015,7 @@ abstract contract BaseProtocolDeploy is Script {
 
         INonfungiblePositionManager npm = INonfungiblePositionManager(act.uni.positionManager);
         pool = npm.createAndInitializePoolIfNecessary(token0, token1, act.uni.poolFee, sqrtPriceX96);
+        _requirePoolAtPrice(pool, sqrtPriceX96);
 
         // Scoped approvals for the seed pull (the manager pulls via a standard ERC20
         // allowance); `forceApprove` handles non-standard return-less USDC.
@@ -1023,16 +1032,19 @@ abstract contract BaseProtocolDeploy is Script {
                 tickUpper: tickUpper,
                 amount0Desired: amount0,
                 amount1Desired: amount1,
-                // Genesis seed into a fresh pool at a price we set — no adversarial
-                // slippage to guard, and any unconsumed leg returns to the deployer.
-                amount0Min: 0,
-                amount1Min: 0,
+                // The `slot0` check above runs at simulation time; these minimums
+                // hold on-chain, so a price moved between the create and the mint
+                // transactions reverts the mint instead of seeding at that price.
+                // A full-range mint at the seed price uses both legs in full up to
+                // rounding; any unconsumed leg returns to the deployer.
+                amount0Min: amount0 * SEED_MIN_BPS / 10_000,
+                amount1Min: amount1 * SEED_MIN_BPS / 10_000,
                 recipient: address(d.timelock),
                 // Buffer, not `block.timestamp`: under `forge script` the deadline is
                 // encoded during the execution phase, but the tx mines a later block
                 // (on-chain simulation / broadcast) whose timestamp would already be
-                // past a zero-margin deadline — `Transaction too old`. The seed has no
-                // slippage to guard (amounts-min are 0), so a wide window is safe.
+                // past a zero-margin deadline — `Transaction too old`. The
+                // amounts-min guard the price, so a wide window is safe.
                 deadline: block.timestamp + 1 hours
             })
         );
@@ -1040,6 +1052,14 @@ abstract contract BaseProtocolDeploy is Script {
         // Reset any residual allowance the manager did not consume.
         IERC20(token0).forceApprove(address(npm), 0);
         IERC20(token1).forceApprove(address(npm), 0);
+    }
+
+    /// @dev A pool someone else initialized first keeps their price; seeding into
+    ///      it would sell the TOKEN leg at that price.
+    function _requirePoolAtPrice(address pool, uint160 sqrtPriceX96) internal view {
+        // slither-disable-next-line unused-return
+        (uint160 current,,,,,,) = IUniswapV3Pool(pool).slot0();
+        if (current != sqrtPriceX96) revert PoolPreInitialized(pool, current, sqrtPriceX96);
     }
 
     function _requireSeedBalance(IERC20 t, address holder, uint256 need) internal view {
