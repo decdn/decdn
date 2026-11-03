@@ -401,8 +401,9 @@ contract CapacityBondRegionE2ETest is Test {
         // would otherwise consume the prank, leaving `msg.sender` as the test.
         bytes memory sig = _signStream(judge, s);
 
-        bytes32 evidenceHash =
-            keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), _streamStructHash(judge, s), true));
+        bytes32 evidenceHash = keccak256(
+            abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), REG_OPERATOR, _streamStructHash(judge, s), true)
+        );
         vm.prank(challenger);
         judge.commitChallenge(keccak256(abi.encode(evidenceHash, SALT, challenger)));
         // A 1-minute maturation is negligible against the 5-day evidence window.

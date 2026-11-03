@@ -1646,12 +1646,12 @@ impl ChainFixture {
             .to_vec();
 
         // evidenceHash = keccak256(abi.encode(uint8(RateManipulation),
-        // probeStructHash, streamStructHash)); commitment binds it to (salt,
+        // challengedNode, streamStructHash)); commitment binds it to (salt,
         // challenger). `abi.encode(uint8 v)` right-aligns `v` in a 32-byte word
         // — byte-identical to `uint256(v)`, which alloy's `SolValue` encodes.
         let offense = U256::from(Offense::RateManipulation.discriminant());
         let evidence_hash =
-            keccak256((offense, probe.struct_hash(), stream.struct_hash()).abi_encode());
+            keccak256((offense, operator.address(), stream.struct_hash()).abi_encode());
         let salt = B256::repeat_byte(0x99);
         let commitment = keccak256((evidence_hash, salt, challenger.address()).abi_encode());
 
@@ -1846,10 +1846,12 @@ impl ChainFixture {
             timestamp_us: probe.body.timestamp_us,
         };
         let stream_data = StreamSlashData::from_response_body(&stream.body);
+        // Keyed on the challenged operator and the stream alone, mirroring
+        // `SlashJudge._verifyPair`.
         let evidence_hash = keccak256(
             (
                 U256::from(offense.discriminant()),
-                probe_data.struct_hash(),
+                operator,
                 stream_data.struct_hash(),
             )
                 .abi_encode(),

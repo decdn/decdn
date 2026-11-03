@@ -328,7 +328,10 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         _checkStaleness(responseTsUs);
         _checkBlacklistedBefore(challengedNode, blobHash, responseTsUs);
 
-        bytes32 evidenceHash = keccak256(abi.encode(uint8(OffenseType.Blacklist), structHash, isStreamResponse));
+        // Keyed on the challenged address: another signer's identical response
+        // is separate evidence and cannot spend this operator's.
+        bytes32 evidenceHash =
+            keccak256(abi.encode(uint8(OffenseType.Blacklist), challengedNode, structHash, isStreamResponse));
         _resolve(challengedNode, OffenseType.Blacklist, evidenceHash, salt);
     }
 
@@ -412,7 +415,10 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         // manipulation, and the node may sign `ok:false` freely.
         if (!s.ok || s.ratePerMb <= p.ratePerMb) revert NotRateManipulation();
 
-        evidenceHash = keccak256(abi.encode(uint8(offense), probeHash, streamHash));
+        // Keyed on the challenged address and the overcharged stream alone: one
+        // overcharge is one offense, however many probes it pairs with, and
+        // another signer's identical stream cannot spend this operator's.
+        evidenceHash = keccak256(abi.encode(uint8(offense), challengedNode, streamHash));
     }
 
     function _probeStructHash(ProbeMsg memory p) internal pure returns (bytes32) {

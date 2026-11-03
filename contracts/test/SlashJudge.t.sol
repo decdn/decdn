@@ -259,16 +259,16 @@ contract SlashJudgeTest is Test {
     // Commit–reveal helpers (#854)
     // -----------------------------------------------------------------
 
-    function _pairHash(SlashJudge.ProbeMsg memory p, SlashJudge.StreamMsg memory s, ISlashJudge.OffenseType offense)
+    function _pairHash(SlashJudge.ProbeMsg memory, SlashJudge.StreamMsg memory s, ISlashJudge.OffenseType offense)
         internal
-        pure
+        view
         returns (bytes32)
     {
-        return keccak256(abi.encode(uint8(offense), _probeStructHash(p), _streamStructHash(s)));
+        return keccak256(abi.encode(uint8(offense), node, _streamStructHash(s)));
     }
 
-    function _blacklistHash(bytes32 structHash, bool isStream) internal pure returns (bytes32) {
-        return keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), structHash, isStream));
+    function _blacklistHash(bytes32 structHash, bool isStream) internal view returns (bytes32) {
+        return keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), node, structHash, isStream));
     }
 
     /// @dev Commit `evidenceHash` as `who` (salt `SALT`) without advancing time.
@@ -436,6 +436,25 @@ contract SlashJudgeTest is Test {
 
         assertEq(slasher.slashCount(), 1);
         assertTrue(judge.usedEvidenceHash(evidenceHash));
+    }
+
+    /// @notice One overcharged stream is one offense: pairing it with a second
+    ///         probe yields the same evidence hash, so it cannot escalate tiers.
+    function test_rate_sameStreamWithAnotherProbeIsReplay() public {
+        SlashJudge.ProbeMsg memory p1 = _probe(true, 10, probeTs);
+        SlashJudge.ProbeMsg memory p2 = _probe(true, 9, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 evidenceHash = _pairHash(p1, s, ISlashJudge.OffenseType.RateManipulation);
+
+        _commitAndMature(evidenceHash);
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p1), _signProbe(p1), abi.encode(s), _signStream(s), SALT);
+
+        _commitAndMature(evidenceHash);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceAlreadyUsed.selector, evidenceHash));
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p2), _signProbe(p2), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1);
     }
 
     // -----------------------------------------------------------------
