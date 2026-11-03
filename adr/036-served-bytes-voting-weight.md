@@ -29,8 +29,10 @@ DAO vote weight is the trailing-window sum of an operator's served bytes, multip
 ```
 vote_weight(op, t) = min(
     capped_served_window(op, t),
-    voteCapBps × total_bytes_window(t) / 10_000
+    voteCapBps × others_bytes_window(op, t) / (10_000 − voteCapBps)
 ) × age_ramp(op, t)
+
+others_bytes_window(op, t) = total_bytes_window(t) − Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} FeeRouter.bytesPerEpoch[op][e]
 
 capped_served_window(op, t) = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} min(
     FeeRouter.bytesPerEpoch[op][e],
@@ -111,7 +113,8 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
     }
     uint256 served = feeRouter.bytesInWindow(op, endEpoch, windowEpochs);
     uint256 total  = feeRouter.totalBytesInWindow(endEpoch, windowEpochs);
-    uint256 cap    = (total * voteCapBps) / 10_000;
+    uint256 others = total - feeRouter.bytesInWindow(op, endEpoch, windowEpochs);
+    uint256 cap    = (others * voteCapBps) / (10_000 - voteCapBps);
     uint256 capped = served < cap ? served : cap;
     uint256 ramp   = ageRampScaled(capacityBond.firstBondedAt(op), timepoint, ageRampMonths);
     return (capped * ramp) / 1e18;
@@ -148,7 +151,7 @@ This figure is an **upper bound on a naive attacker**. A cost-minimizing attacke
 
 Cost scales linearly with network revenue and with the cap. Defenses:
 
-1. **10% per-operator cap (`voteCapBps`).** Bounds the maximum vote any single attacker can buy. The cap launches at 10% and is decrease-only within `[1%, 10%]`; lowering it toward 1% is the first tightening lever if attacks materialize.
+1. **10% per-operator cap (`voteCapBps`).** Bounds the maximum vote any single attacker can buy. The cap is sized from the other operators' bytes, so an operator's own bytes, self-dealt or not, never raise its own cap: at the cap its weight is exactly `voteCapBps` of (others + cap). The cap launches at 10% and is decrease-only within `[1%, 10%]`; lowering it toward 1% is the first tightening lever if attacks materialize.
 2. **`age_ramp` floor.** A brand-new bonded operator who wash-trades heavily still votes at a fraction of their bytes-weighted share for the first `age_ramp_months` months. Combined with the cap, this limits the speed-to-influence of a fresh attacker.
 3. **Rolling-window decay.** Sustained wash trading is required across the full window to maintain the cap; a stopping attacker decays out over N epochs.
 

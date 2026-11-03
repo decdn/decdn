@@ -279,12 +279,22 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
             served += epochBytes < epochCap ? epochBytes : epochCap;
         }
 
-        // Per-operator share cap (ADR 036) reads at the proposal snapshot, not
-        // live, so a setter change mid-vote does not shift weights.
-        uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
-        uint256 capBps = voteCapBpsAt(timepoint.toUint48());
-        uint256 cap = (total * capBps) / BPS_DENOMINATOR;
+        uint256 cap = _shareCap(account, endEpoch, n, timepoint);
         return served < cap ? served : cap;
+    }
+
+    /// @dev Per-operator share cap (ADR 036), read at the proposal snapshot, not
+    ///      live, so a setter change mid-vote does not shift weights. The cap is
+    ///      sized from the OTHER operators' bytes, so an operator's own bytes
+    ///      (self-dealt or not) never raise its own cap: at the cap its weight is
+    ///      exactly `capBps` of (others + cap). `capBps` is bounded below
+    ///      `BPS_DENOMINATOR`, so the divisor is non-zero.
+    function _shareCap(address account, uint64 endEpoch, uint64 n, uint256 timepoint) internal view returns (uint256) {
+        uint256 own = feeRouter.bytesInWindow(account, endEpoch, n);
+        uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
+        uint256 others = total > own ? total - own : 0;
+        uint256 capBps = voteCapBpsAt(timepoint.toUint48());
+        return (others * capBps) / (BPS_DENOMINATOR - capBps);
     }
 
     /// @dev Last fully-elapsed epoch as of `timepoint`. Returns

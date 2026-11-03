@@ -109,6 +109,17 @@ contract DecdnGovernorTest is Test {
         assertEq(gov.getVotes(operator, tp), 100_000);
     }
 
+    /// @notice The share cap is sized from the other operators' bytes, so an
+    ///         operator's own (possibly self-dealt) bytes never raise its cap.
+    function test_getVotes_ownBytesDoNotRaiseTheCap() public {
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 180 days));
+        _setBytesAtTimepoint(operator, 500_000, 1_000_000);
+        // others = 500k; cap = 500k × 1000 / 9000 = 55_555, which is 10% of
+        // (others + cap). A total-based cap would have allowed 100k.
+        assertEq(gov.getVotes(operator, tp), 55_555);
+    }
+
     function test_getVotes_uncappedWhenBelowCap() public {
         vm.warp(BASE + 2);
         bond.setFirstBondedAt(operator, uint64(BASE - 180 days));
