@@ -137,9 +137,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     IERC20 public immutable usdc;
 
     /// @notice Operator registry. A pool names no provider and runs no
-    ///         `isActive` gate at `openPool` (ADR 016 line 670); kept as a
-    ///         validated non-zero immutable for the governance surface later
-    ///         tasks build on the same registry.
+    ///         `isActive` gate at `openPool` (ADR 016). `redeemMany` reads it
+    ///         to pay only bound operators and to count bytes only for active
+    ///         ones.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICapacityBondActivity public immutable capacityBond;
 
@@ -279,6 +279,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error NotPoolOwner();
     error InvalidVoucherSignature();
     error InvalidCapabilitySignature();
+    error ProviderNotBound(address provider);
     error PoolClosed();
     error PoolNotClosing();
     error GraceWindowActive();
@@ -637,7 +638,14 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
         // A call that paid nothing moves nothing: the router rejects a zero
         // amount, and there is nothing to settle.
-        if (totalPaid != 0) _route(msg.sender, totalBytes, totalPaid);
+        if (totalPaid != 0) {
+            // Only a bound operator is a payee, so a capability holder cannot
+            // sign vouchers to itself and draw its cap as USDC. Its bytes count
+            // toward the governance window only while it is active.
+            (bytes32 nodeId, bool active) = capacityBond.nodeIdOf(msg.sender);
+            if (nodeId == bytes32(0)) revert ProviderNotBound(msg.sender);
+            _route(msg.sender, active ? totalBytes : 0, totalPaid);
+        }
     }
 
     // -----------------------------------------------------------------

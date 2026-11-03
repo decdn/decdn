@@ -28,6 +28,10 @@ contract MockBondActivity is ICapacityBondActivity {
     function isActive(address op) external view override returns (bool) {
         return _active[op];
     }
+
+    function nodeIdOf(address op) external view override returns (bytes32, bool) {
+        return (bytes32(0), _active[op]);
+    }
 }
 
 contract MockPublisherRegistry is IPublisherRegistryOwnership {

@@ -17,4 +17,10 @@ pragma solidity 0.8.28;
 ///         predicate filter against `ContentBlacklist.isOriginBlacklisted`.
 interface ICapacityBondActivity {
     function isActive(address operator) external view returns (bool);
+
+    /// @notice The operator's bound NodeId (`bytes32(0)` when it holds no
+    ///         binding) and its `isActive` status, in one read.
+    ///         `PaymentPool.redeemMany` uses it to pay only bound operators
+    ///         and to count bytes only for active ones.
+    function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 }

@@ -35,8 +35,18 @@ contract MockActiveBond is ICapacityBondActivity {
         _active[operator] = a;
     }
 
+    mapping(address => bytes32) public boundNodeId;
+
     function isActive(address operator) external view override returns (bool) {
         return _active[operator];
+    }
+
+    function setBound(address operator, bytes32 nodeId) external {
+        boundNodeId[operator] = nodeId;
+    }
+
+    function nodeIdOf(address operator) external view override returns (bytes32, bool) {
+        return (boundNodeId[operator], _active[operator]);
     }
 }
 
@@ -245,6 +255,10 @@ contract PaymentPoolTest is Test {
 
         vm.prank(admin);
         pool.grantRole(PAUSER_ROLE, pauser);
+
+        // The fixture payee is a bound, active operator.
+        bond.setBound(provider, bytes32(uint256(0xB0D)));
+        bond.setActive(provider, true);
 
         usdc.transfer(owner, 100_000e6);
         vm.prank(owner);
@@ -1866,9 +1880,36 @@ contract PaymentPoolTest is Test {
     // redeemMany — register-batch then redeem-batch (ADR 003 § Batch redemption)
     // -----------------------------------------------------------------
 
+    /// @notice Only a bound operator is a payee: a capability holder that signs
+    ///         a voucher to its own unbound address cannot draw the cap as USDC.
+    function test_redeemMany_revertsForUnboundPayee() public {
+        bytes32 id = _open();
+        address self = address(0x5E1F);
+        Sig memory sig = _signVoucherFor(address(pool), id, signer, self, 300e6, 30_000_000, SIGNER_PK);
+        vm.prank(self);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotBound.selector, self));
+        _redeemOne(id, signer, self, 300e6, 30_000_000, sig, _cap(id, SPENDING_CAP, expiry));
+    }
+
+    /// @notice A bound but inactive operator is still paid what it is owed, but
+    ///         its bytes do not reach the governance window.
+    function test_redeemMany_inactivePayeeRoutesNoBytes() public {
+        bytes32 id = _open();
+        bond.setActive(provider, false);
+        vm.prank(provider);
+        uint256 paid = _redeemOne(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+        assertEq(paid, 300e6, "an inactive bound operator is still paid");
+        (, uint256 routedBytes, uint256 routedAmount) = router.calls(0);
+        assertEq(routedAmount, 300e6);
+        assertEq(routedBytes, 0, "no governance bytes for an inactive operator");
+    }
+
     function test_redeemMany_registersCapabilitiesThenRedeemsVouchers() public {
         bytes32 id = _open();
         address provider2 = address(0xCAFE);
+        bond.setBound(provider2, bytes32(uint256(0xCAFE)));
 
         PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
         caps[0] = PaymentPool.CapabilityReg({
@@ -2458,7 +2499,7 @@ contract PaymentPoolTest is Test {
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, N vouchers", gasUsed);
         // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
-        // doc comment (crates/common/src/config/mod.rs): N = 515,619 gas.
+        // doc comment (crates/common/src/config/mod.rs): N = 524,767 gas.
         // Tolerance covers toolchain/compiler-version gas drift without
         // masking a real regression.
         //
@@ -2466,7 +2507,7 @@ contract PaymentPoolTest is Test {
         // These lanes are all SEALED vouchers — zero root, zero preimage, zero
         // meter — so the walk is empty and the three words are pure zero bytes,
         // which is the cooperative path a finalized delivery actually redeems.
-        assertApproxEqAbs(gasUsed, 515_619, 5000, "redeemMany gas for N vouchers drifted from the pinned figure");
+        assertApproxEqAbs(gasUsed, 524_767, 5000, "redeemMany gas for N vouchers drifted from the pinned figure");
     }
 
     /// @notice Companion to `test_redeemMany_gas_NVouchers` — same setup,
@@ -2478,11 +2519,11 @@ contract PaymentPoolTest is Test {
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, N+1 vouchers", gasUsed);
         // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
-        // doc comment (crates/common/src/config/mod.rs): N+1 = 550,993 gas.
+        // doc comment (crates/common/src/config/mod.rs): N+1 = 560,516 gas.
         // Tolerance covers toolchain/compiler-version gas drift without
         // masking a real regression. See `test_redeemMany_gas_NVouchers` for
         // what the per-lane figure covers.
-        assertApproxEqAbs(gasUsed, 550_993, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
+        assertApproxEqAbs(gasUsed, 560_516, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
     }
 
     /// @dev Opens a fresh pool and, unlike `_redeemFreshLanesAndSnapshotGas`,
@@ -2540,7 +2581,7 @@ contract PaymentPoolTest is Test {
         // N owner-signed capability registrations plus N cold voucher
         // settlements in one call.
         assertApproxEqAbs(
-            gasUsed, 804_352, 8000, "redeemMany gas for first-time N vouchers drifted from the pinned figure"
+            gasUsed, 812_750, 8000, "redeemMany gas for first-time N vouchers drifted from the pinned figure"
         );
     }
 
@@ -2558,7 +2599,7 @@ contract PaymentPoolTest is Test {
         emit log_named_uint("redeemMany gas, first-time N+1 vouchers", gasUsed);
         // Pinned from an actual `forge test -vv` run on this branch.
         assertApproxEqAbs(
-            gasUsed, 868_611, 8000, "redeemMany gas for first-time N+1 vouchers drifted from the pinned figure"
+            gasUsed, 877_309, 8000, "redeemMany gas for first-time N+1 vouchers drifted from the pinned figure"
         );
     }
 
