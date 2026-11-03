@@ -147,7 +147,8 @@ pub enum NodeCommand {
     /// State-aware: with no request in flight it declares the tier down (if
     /// needed) and starts the unbonding window; while one is maturing it
     /// reports the unlock time and exits non-zero; once matured it withdraws.
-    /// The node goes INACTIVE only when the retained bond drops below minBond.
+    /// The node goes INACTIVE only when the retained bond drops below the
+    /// operator's bond floor (the minBond in force when it activated).
     /// Pass `--dry-run` to print the plan without submitting.
     Unbond(UnbondArgs),
     /// Leave the active node set on-chain via `CapacityBond.deregisterNode`
@@ -823,8 +824,8 @@ pub struct UnbondArgs {
     /// Release everything the bond curve permits, retaining only
     /// `bondRequired(declaredMbps)`. Unlike `--to-mbps` this ignores the
     /// `minBond` floor, so at low declared tiers the retained bond can land
-    /// below `minBond` and the node stays inactive until it re-bonds. Whether
-    /// it does is tier-dependent; the command reports `below_min_bond` before
+    /// below the operator's bond floor and the node stays inactive until it
+    /// re-bonds. Whether it does is tier-dependent; the command reports `below_floor` before
     /// submitting.
     ///
     /// For an operator that is NOT in the registered set — ejected, or bonded

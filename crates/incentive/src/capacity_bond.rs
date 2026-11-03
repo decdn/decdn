@@ -202,6 +202,11 @@ mod sol_types {
             /// `registerNode`, independent of the capacity curve.
             function minBond() external view returns (uint256);
 
+            /// The operator's grandfathered entry floor: the `minBond` in
+            /// force when it last activated, 0 if it never has. `isActive`
+            /// tests `activeBond` against this, not the live `minBond`.
+            function bondFloorAtActivation(address operator) external view returns (uint256);
+
             /// Governable lower bound of the declarable-capacity band (Mbps).
             /// Read so `decdn node bond` can reject an out-of-band tier before
             /// bonding, rather than stranding a bond behind a `declareMbps`

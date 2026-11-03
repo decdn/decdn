@@ -399,7 +399,7 @@ async fn run() -> anyhow::Result<()> {
         Some(floor_curve.to_string().as_str()),
         "`--all` retains the bare curve floor, not minBond"
     );
-    assert_eq!(json_bool(&receipt, "below_min_bond"), Some(true));
+    assert_eq!(json_bool(&receipt, "below_floor"), Some(true));
     assert!(
         receipt
             .get("declare_to_mbps")
