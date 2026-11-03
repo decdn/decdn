@@ -148,6 +148,14 @@ contract MockERC1271Wallet {
     }
 }
 
+/// @dev Code an EOA owner could attach to its address (e.g. an EIP-7702
+///      delegate) that refuses every ERC-1271 check.
+contract RejectingWallet {
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return 0xffffffff;
+    }
+}
+
 contract PaymentPoolTest is Test {
     MockUSDC internal usdc;
     MockActiveBond internal bond;
@@ -1254,6 +1262,20 @@ contract PaymentPoolTest is Test {
         (uint64 cap2, uint64 exp2,) = pool.authorized(id, signer);
         assertEq(cap2, SPENDING_CAP, "ERC-1271 capability owner accepted");
         assertEq(uint256(exp2), uint256(expiry));
+    }
+
+    /// @notice A capability the owner's key signed stays valid when the owner
+    ///         later attaches code that rejects ERC-1271 checks, so the owner
+    ///         cannot revoke it after nodes served against it.
+    function test_redeem_ownerCodeCannotRevokeEcdsaCapability() public {
+        bytes32 id = _open();
+        vm.etch(owner, address(new RejectingWallet()).code);
+
+        vm.prank(provider);
+        uint256 paid = _redeemOne(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+        assertEq(paid, 300e6);
     }
 
     // -----------------------------------------------------------------

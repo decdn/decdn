@@ -40,7 +40,7 @@ The EIP-712 domain separators, typed data hashes, and voucher formats are the sa
 | Function | Verification |
 | --- | --- |
 | `redeem` — voucher signature | `SignatureChecker.isValidSignatureNow(signer, voucherDigest, voucherSig)` |
-| `redeem` — capability signature (first redemption per signer) | `SignatureChecker.isValidSignatureNow(pool.owner, capabilityDigest, capability)` |
+| `redeem` — capability signature (first redemption per signer) | `ECDSA.tryRecover(capabilityDigest, capability) == pool.owner`, else `SignatureChecker.isValidERC1271SignatureNow(pool.owner, capabilityDigest, capability)` |
 
 `signer` is the capability-authorized voucher key; `pool.owner` is the address that signs the capability ([ADR 003 § PaymentPool](003-payments.md#paymentpool)). A pool has no single pinned `voucherSigner` — it authorizes many capped signers off-chain, registered lazily on first redemption.
 

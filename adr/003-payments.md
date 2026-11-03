@@ -933,7 +933,7 @@ bytes32 capabilityDigest = keccak256(abi.encodePacked(
 ));
 ```
 
-**Verification:** The **capability** is verified with OpenZeppelin's `SignatureChecker.isValidSignatureNow(pool.owner, ...)`, which transparently supports both EOA owners (via hardened `ECDSA.recover` that rejects non-canonical `s` values and restricts `v` to `27`/`28`) and smart-account owners (via ERC-1271 `isValidSignature`), at whatever signature length the wallet uses. Registration happens once per signer, so its width costs nothing at scale.
+**Verification:** The **capability** is verified by ECDSA recovery against `pool.owner` first (hardened `ECDSA.tryRecover`, which rejects non-canonical `s` values and restricts `v` to `27`/`28`), then by ERC-1271 `isValidSignature` on the owner, at whatever signature length the wallet uses. ECDSA comes first so that code an EOA owner later attaches to its address (an EIP-7702 delegate) cannot revoke a capability its key signed after nodes served against it. Registration happens once per signer, so its width costs nothing at scale.
 
 #### Voucher signatures are compact, and their signers are EOAs
 

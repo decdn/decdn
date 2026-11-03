@@ -827,9 +827,17 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
         bytes32 structHash = keccak256(abi.encode(CAPABILITY_TYPEHASH, signer, spendingCap, poolId, expiry));
         bytes32 digest = _hashTypedDataV4(structHash);
-        if (!SignatureChecker.isValidSignatureNow(pools[poolId].owner, digest, ownerSig)) {
-            revert InvalidCapabilitySignature();
-        }
+        // ECDSA first: a capability the owner's key signed stays valid even if
+        // the owner later attaches code to its address (an EIP-7702 delegate),
+        // so the owner cannot revoke it after nodes served against it. A
+        // smart-account owner falls through to ERC-1271.
+        address owner = pools[poolId].owner;
+        // slither-disable-next-line unused-return
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, ownerSig);
+        if (
+            !(err == ECDSA.RecoverError.NoError && recovered == owner)
+                && !SignatureChecker.isValidERC1271SignatureNow(owner, digest, ownerSig)
+        ) revert InvalidCapabilitySignature();
         a.cap = spendingCap;
         a.expiry = expiry;
     }
@@ -1028,9 +1036,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///      calldata layout (see `LaneVoucher`) and skips a cold
     ///      `EXTCODESIZE` on every lane — both of which lower the smallest
     ///      lane balance a node can profitably redeem. A pool *owner* is
-    ///      unaffected: `_registerCapability` still verifies through
-    ///      `SignatureChecker`, so a Safe or other smart account can own a
-    ///      pool and delegate to EOA voucher signers.
+    ///      unaffected: `_registerCapability` falls back to ERC-1271 after
+    ///      ECDSA, so a Safe or other smart account can own a pool and
+    ///      delegate to EOA voucher signers.
     function _verifyVoucher(bytes32 poolId, LaneVoucher calldata v, uint256 chunkPrice) internal view {
         bytes32 structHash = keccak256(
             abi.encode(
