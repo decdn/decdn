@@ -975,7 +975,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
-# pool_floor_signer_live_windows = 8              # per-signer LIVE concurrency cap k, in ramp-start credit windows: the most live un-vouchered floor reservation one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as streams pay; lower-clamped to one window; default 8
+# pool_floor_signer_live_windows = 8              # per-signer floor cap k, in ramp-start credit windows: the most live un-vouchered floor reservation plus floor debt one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as the signer pays; lower-clamped to one window; default 8
 # CLI-only [blockchain] keys — consumed by `decdn appeal` / the client, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.

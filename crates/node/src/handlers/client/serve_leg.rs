@@ -133,28 +133,35 @@ impl ClientHandler {
         // rank oldest for eviction while it streams. Recency only: the frequency
         // sighting waits for `StreamEnd`.
         self.cache.touch_recency(hash);
-        self.serve_leg_loop(
-            conn,
-            send,
-            recv,
-            store,
-            session,
-            also_pace,
-            lane,
-            carry,
-            hash,
-            lane_key,
-            client_node_id,
-            rate_per_mb,
-            offset,
-            len,
-            total_bytes,
-            floor_reservation,
-            first_byte,
-            &mut paid,
-        )
-        .await
-        .map_err(|e| super::wire::tag_paid_progress(e, paid))
+        let end = self
+            .serve_leg_loop(
+                conn,
+                send,
+                recv,
+                store,
+                session,
+                also_pace,
+                lane,
+                carry,
+                hash,
+                lane_key,
+                client_node_id,
+                rate_per_mb,
+                offset,
+                len,
+                total_bytes,
+                floor_reservation,
+                first_byte,
+                &mut paid,
+            )
+            .await
+            .map_err(|e| super::wire::tag_paid_progress(e, paid));
+        // Judge how the stream ended before the caller drops the guard: a fill
+        // fault, a held-bytes cap or a node stop forgives the unpaid floor.
+        if let Some(res) = floor_reservation {
+            res.settle_end(&end);
+        }
+        end
     }
 
     /// Await `frame`, the encoder's next frame, unless the stream ends first.
@@ -397,6 +404,12 @@ impl ClientHandler {
                 // fault here is the node's own bug, and metering it as a client
                 // abandon would file it under the peer's behaviour.
                 let bufs = chunk_frame_bufs(&frame).map_err(|e| self.meter_frame_fault(e))?;
+                // Count the frame as unpaid before the write: a client that reads
+                // part of it and then stops the stream fails the write, and those
+                // bytes still left the node.
+                if let Some(res) = floor_reservation {
+                    res.track_unpaid(delivered.saturating_add(clen_u64).saturating_sub(*paid));
+                }
                 // A downstream drop surfaces here as a peer-attributable `Err` (#856
                 // client-disconnect shape) and meters the client abandon. A write to
                 // a stream this node already closed carries no marker: the dispatch
@@ -466,7 +479,14 @@ impl ClientHandler {
             // remainder stays owed. `MAX_PROOFS_PER_CHUNK` bounds how many proofs
             // may leave a chunk unsettled — see the twin loop in `deliver` for the
             // full reasoning.
+            //
+            // The pool re-check also runs between proofs, once a batch outlasts
+            // one re-check interval (see the twin loop in `deliver`). Here each
+            // credited proof also lifts the pull leg's paid frontier, so a slow
+            // batch on a closing pool would keep the upstream spend going.
             let mut collected_any = false;
+            let mut batch_pool_check = std::time::Instant::now();
+            let mut batch_proof_read = false;
             'chunk: while let Some(mut owed) =
                 pop_payable(&mut pending, unvouchered, done_delivering)
             {
@@ -475,6 +495,17 @@ impl ClientHandler {
                 // this chunk takes.
                 let mut proofs = ChunkProofs::start();
                 loop {
+                    if batch_proof_read && batch_pool_check.elapsed() >= pool_recheck_interval {
+                        batch_pool_check = std::time::Instant::now();
+                        if let Some(stop) = self.pool_recheck_stop(&lane_key, &hash).await {
+                            self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
+                                .await?;
+                            return Ok(ServeEnd::Stopped {
+                                stop,
+                                bytes: delivered,
+                            });
+                        }
+                    }
                     let attempt = proofs.next_attempt();
                     // Timed by hand, as in `deliver_loop`: the wait ends before
                     // the error arm, so a proof that times out still counts.
@@ -496,6 +527,7 @@ impl ClientHandler {
                         )
                         .await;
                     waits.end();
+                    batch_proof_read = true;
                     let stop = match committed {
                         Ok(stop) => stop,
                         Err(e) => {
@@ -536,6 +568,12 @@ impl ClientHandler {
                                 credited_this_iter =
                                     credited_this_iter.saturating_add(credited_bytes);
                                 *paid = paid.saturating_add(credited_bytes);
+                                // Reconcile the floor reservation now, before a
+                                // later proof in this batch can fail and end the
+                                // stream.
+                                if let Some(res) = floor_reservation {
+                                    res.reconcile_paid(delivered, *paid);
+                                }
                                 // Publish the PAID CONTENT frontier for the pull leg's
                                 // `WindowPacer`, mapping paid WIRE back into content
                                 // space (the largest chunk-group boundary provably
@@ -603,47 +641,34 @@ impl ClientHandler {
             }
             ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered, &pending)?;
 
-            // Reconcile the floor reservation against this stream's live balance now
-            // that `paid` has advanced (mirrors `deliver`). `paid`/`delivered` are BYTE
-            // counters; the reservation accounts in µUSDC, so every byte quantity
-            // crosses over through `min_payment` — never compared directly.
-            if let Some(res) = floor_reservation {
-                // Free the pool's live reservation once cumulative payment reaches the
-                // amount reserved (the ramp-floor credit this stream fronts). Matching
-                // release to the reserved µUSDC keeps it correct at any
-                // `credit_ramp_divisor` — with the ramp disabled the reservation is the
-                // full `credit_max`, so release waits for that much paid, not one chunk.
-                res.release_if_repaid(decdn_incentive::min_payment(*paid, rate_per_mb));
-            }
-
             // Done when the whole range is on the wire and every interval — closing
             // partial included — has been paid. Gating on PAID (not delivered) is
             // what bills the credit-window tail the client received ahead of its
             // voucher.
             let done = done_delivering && pending.is_empty() && unvouchered == 0;
 
-            // Mid-stream pool-solvency re-check (ADR 003 §Pool solvency),
+            // Mid-stream pool re-check (ADR 003 §Pool solvency),
             // symmetric with the takedown re-check below: re-read the cached pool
-            // status and stop once the pool can no longer fund the delivery in
+            // status and stop once the pool can no longer pay for the delivery in
             // flight. A pool drains mid-flight — other lanes redeem `remaining`
-            // down — so a long stream must catch that; the credit window bounds
-            // delivery ahead of the last COLLECTED voucher, not ahead of the last
-            // SOLVENCY-verified point, so nothing else notices a shared pool going
-            // unredeemable. `pool_funds_committed` asks two things: `remaining`
-            // still sits above the refundable floor `M`, and `remaining − M` still
+            // down — and it can close under a live stream, so a long stream must
+            // catch both; the credit window bounds delivery ahead of the last
+            // COLLECTED voucher, not ahead of the last SOLVENCY-verified point, so
+            // nothing else notices a shared pool going unredeemable.
+            // `pool_recheck_stop` stops on a pool the view no longer holds (it
+            // closed), on a `Closing` pool whose dispute deadline falls inside the
+            // node's redeem margin, and on a pool whose `remaining − M` no longer
             // covers the floor credit ALREADY committed across the pool (this
-            // stream included while its floor is un-repaid). A pool whose streams
-            // have all repaid has an empty committed ledger, so only the
-            // `remaining > M` bound then separates a funded pool from a drained
-            // one. On `false` the pool can no longer fund further delivery, so
-            // stop IN-BAND with a clean
-            // `PoolExhausted` (not a QUIC reset, unlike a takedown) so the owner
-            // learns to top up — `PoolExhausted` is post-auth, so naming the
-            // condition leaks nothing an open-time refusal must hide, and it is not
-            // watermark-gated (no bundle). A `None` pool view fails OPEN (the
-            // on-chain redeem is the backstop). The caller drops the concurrent
-            // pull leg when this returns, bounding the upstream spend just as the
-            // takedown and no-progress exits do.
+            // stream included while its floor is un-repaid; with every floor
+            // repaid, the `remaining > M` bound alone separates a funded pool
+            // from a drained one). Every stop is IN-BAND
+            // with a clean `PoolExhausted` (not a QUIC reset, unlike a takedown) so
+            // the owner learns to fund a pool — `PoolExhausted` is post-auth, so
+            // naming the condition leaks nothing an open-time refusal must hide,
+            // and it is not watermark-gated (no bundle). With no pool view wired
+            // there is nothing to check, and the stream fails open.
+            // The caller drops the concurrent pull leg when this returns, bounding
+            // the upstream spend just as the takedown and no-progress exits do.
             //
             // The check runs on a WALL-CLOCK cadence, not at every chunk
             // boundary: the projection only advances as the settlement watcher
@@ -655,19 +680,11 @@ impl ClientHandler {
             // and the on-chain redeem backstop are unchanged.
             if collected_any && !done && last_pool_check.elapsed() >= pool_recheck_interval {
                 last_pool_check = std::time::Instant::now();
-                if let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
-                    && !self.pool_funds_committed(lane_key.pool_id, status.remaining)
-                {
+                if let Some(stop) = self.pool_recheck_stop(&lane_key, &hash).await {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                         .await?;
-                    // Observable stop (symmetric with the takedown re-check below): this
-                    // terminates a paying miss-leg delivery.
-                    tracing::warn!(
-                        pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
-                        "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer gate refusal never reaches here"
-                    );
                     return Ok(ServeEnd::Stopped {
-                        stop: ServeStop::PoolExhausted,
+                        stop,
                         bytes: delivered,
                     });
                 }

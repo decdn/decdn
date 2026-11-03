@@ -1370,3 +1370,41 @@ async fn paid_bytes_gives_back_a_rejected_reveal() -> anyhow::Result<()> {
     assert_eq!(ledger.paid_bytes(), U256::ZERO);
     Ok(())
 }
+
+/// `wire_bytes` counts every byte the lane's streams take in, from zero on
+/// a fresh ledger, whatever its seed.
+#[test]
+fn wire_bytes_counts_what_arrives_from_zero() {
+    let ledger = PoolLedger::new(Cumulative {
+        bytes: U256::from(7_000u64),
+        amount: U256::from(70u64),
+    });
+    assert_eq!(ledger.wire_bytes(), 0, "the seed is not wire bytes");
+    ledger.note_wire(1_000);
+    ledger.note_wire(500);
+    assert_eq!(ledger.wire_bytes(), 1_500);
+}
+
+/// The wire count saturates rather than wrapping.
+#[test]
+fn wire_bytes_saturates() {
+    let ledger = PoolLedger::new(Cumulative::default());
+    ledger.note_wire(u64::MAX - 1);
+    ledger.note_wire(10);
+    assert_eq!(ledger.wire_bytes(), u64::MAX);
+}
+
+/// Wire bytes are arrival, not payment: they grow with no proof, and a
+/// voucher grows `paid_bytes` without moving them.
+#[tokio::test]
+async fn wire_bytes_are_independent_of_paid_bytes() -> anyhow::Result<()> {
+    let ledger = PoolLedger::new(Cumulative::default());
+    ledger.note_wire(2_000);
+    assert_eq!(ledger.paid_bytes(), U256::ZERO, "arrival pays nothing");
+    ledger
+        .issue(1_000, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+        .await?;
+    assert_eq!(ledger.paid_bytes(), U256::from(1_000u64));
+    assert_eq!(ledger.wire_bytes(), 2_000, "payment moves no wire bytes");
+    Ok(())
+}

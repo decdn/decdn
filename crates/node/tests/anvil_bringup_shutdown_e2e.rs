@@ -640,6 +640,38 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
         anyhow::bail!("admin health never became ready within {READY_TIMEOUT:?}");
     }
 
+    // A finished bring-up flips `decdn_node_boot_ready` to `1`, and the metrics
+    // listener `run` bound before bring-up still serves. Scrape over HTTP, not
+    // through `Metrics::encode`, so a server that stopped after boot fails here.
+    // The runtime sets the gauge just after it spawns the admin server, so poll
+    // briefly rather than read once.
+    let scraper = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build the metrics scrape client")?;
+    let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
+    let boot_ready = poll_until(Duration::from_secs(5), || {
+        let (scraper, metrics_url) = (&scraper, &metrics_url);
+        async move {
+            let body = scraper
+                .get(metrics_url)
+                .send()
+                .await
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            body.lines()
+                .any(|l| l == "decdn_node_boot_ready 1")
+                .then_some(())
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        boot_ready.is_some(),
+        "GET {metrics_url} must serve decdn_node_boot_ready 1 once the admin server answers"
+    );
+
     // ---- 7. Trigger graceful shutdown via `admin_v1_drain` (fire-and-forget,
     // the `decdn node drain` path). NOT a process signal — that would hit the
     // test harness. `wait_admin=false` returns as soon as the drain trigger is

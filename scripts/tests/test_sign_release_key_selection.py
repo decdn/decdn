@@ -67,6 +67,8 @@ class Keyring:
             GIT_CONFIG_NOSYSTEM="1",
             PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             DECDN_SKIP_IMAGE_TAGS="1",
+            # The devops bump clones decdn/devops; a test that runs it says so.
+            DECDN_SKIP_DEVOPS_BUMP="1",
             DECDN_MINISIGN_KEY=str(self.root / "minisign.key"),
         )
         return env

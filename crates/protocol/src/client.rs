@@ -1224,9 +1224,12 @@ pub enum VoucherRejectReason {
     CapabilityExpired,
     /// The pool's on-chain remaining deposit, minus the refundable floor `M` and
     /// the pool's already-committed concurrent floor credit, can no longer fund
-    /// further credit for this stream (ADR 003 §Pool solvency). A pool-wide
-    /// condition, not this signer's. Recovery: the pool **owner tops up the
-    /// deposit**. Emitted mid-stream by the serve loop after the client has proved
+    /// further credit for this stream (ADR 003 §Pool solvency). The node also
+    /// sends it when the pool closed under the stream, or is `Closing` with its
+    /// dispute deadline inside the node's redeem margin. A pool-wide condition,
+    /// not this signer's. Recovery: the pool **owner tops up the deposit**, or
+    /// opens a new pool when the old one is closing or closed (`topUp` reverts
+    /// `PoolNotOpen`). Emitted mid-stream by the serve loop after the client has proved
     /// capability ownership; the open-time equivalent is [`StreamError::Unfunded`],
     /// spoken only to a proven requester. Not watermark-gated.
     PoolExhausted,

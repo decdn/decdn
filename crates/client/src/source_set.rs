@@ -629,7 +629,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// and a `Declined` refusal or an unhealed voucher rejection declines it
     /// at once, as on its own stream. The scheduler passes only uncovered
     /// ranges here: an extra stream's covered `NotFound` is most often the
-    /// node's per-signer live cap.
+    /// node's per-signer floor cap.
     pub(crate) fn record_extra_refusal(
         &mut self,
         provider: Address,

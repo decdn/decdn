@@ -205,6 +205,7 @@ fn the_summary_counts_reused_and_excluded_entries() {
     rep.reused_bytes = 7;
     rep.downloaded = 4;
     rep.paid_bytes = 5;
+    rep.wire_bytes = 8;
     rep.reconstructed = 20;
     rep.resumed_bytes = 6;
     let rep = pull_report(&rep, 3, Path::new("/out"));
@@ -221,6 +222,7 @@ fn the_summary_counts_reused_and_excluded_entries() {
     assert_eq!(json["resumed_bytes"], 6);
     assert_eq!(json["downloaded"], 4);
     assert_eq!(json["paid_bytes"], 5);
+    assert_eq!(json["wire_bytes"], 8);
     assert!(json.get("deduped").is_none(), "{json}");
 }
 
@@ -279,6 +281,19 @@ fn transfer_line_shows_paid_unless_nothing_moved() {
     assert_eq!(transfer_line(0, 0, 0), "downloaded 0 B");
     // A run whose every fetch failed after paying still shows what it paid.
     assert_eq!(transfer_line(0, 2_000, 0), "downloaded 0 B (paid 2.0 KB)");
+}
+
+/// #2444: the wire bytes received beyond those paid for get their own line,
+/// only when wire bytes exceed paid bytes.
+#[test]
+fn unpaid_wire_line_shows_only_wire_bytes_above_paid() {
+    assert_eq!(unpaid_wire_line(2_000, 2_000), None);
+    assert_eq!(unpaid_wire_line(1_000, 2_000), None);
+    assert_eq!(unpaid_wire_line(0, 0), None);
+    assert_eq!(
+        unpaid_wire_line(3_500, 2_000).as_deref(),
+        Some("received 3.5 KB on the wire, 1.5 KB more than paid for")
+    );
 }
 
 fn filtered_paths(include: &[&str], exclude: &[&str], entries: Vec<ManifestEntry>) -> Vec<String> {
@@ -1677,7 +1692,9 @@ async fn a_run_with_nothing_to_fetch_records_its_excluded_entries() {
     let activity =
         ActivityRecorder::start_in(records.path(), &uri, &text, out.path(), &evidence).unwrap();
     let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
-    observer.nothing_to_fetch(NothingReason::Filtered, 9, out.path(), uri.hash);
+    observer
+        .nothing_to_fetch(NothingReason::Filtered, 9, out.path(), uri.hash)
+        .unwrap();
     activity.finish(&Ok(()), None).await;
 
     let (records, _) = crate::commands::activity::read_records(records.path()).unwrap();

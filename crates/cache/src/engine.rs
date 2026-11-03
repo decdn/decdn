@@ -3245,11 +3245,11 @@ impl CacheEngine {
     /// budget and gate it on `expected_len`. A copy of that exact length is
     /// cached, tagged with `origin_ix`. Meters every outboard byte the origin
     /// sends as `pull_through_bytes`, before the gate, because that egress is
-    /// paid either way. Logs a transport fault or timeout at `warn`.
+    /// paid either way. Logs an origin fault or timeout at `warn`.
     ///
     /// # Errors
     ///
-    /// [`CacheError::OriginError`] for a transport fault or a read past the
+    /// [`CacheError::OriginError`] for an origin fault or a read past the
     /// budget.
     async fn fetch_gated_outboard(
         &self,

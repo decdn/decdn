@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run pnpm with these arguments: from PATH, else through corepack, which
 # Node 24 ships, so `corepack enable` is not a precondition. Used by the
-# dashboard-lint hook and by scripts/publish-crates.sh.
+# dashboard-lint hook.
 set -euo pipefail
 
 if command -v pnpm >/dev/null; then

@@ -57,10 +57,12 @@ case "$1 $2" in
       echo "signed-with:keyA" > "$dir/decdn-$version-aarch64-apple-darwin.tar.gz.minisig"
     fi
     zeros=$(printf '0%.0s' $(seq 64))
-    echo "ghcr.io/decdn/decdn-node@sha256:$zeros" > "$dir/decdn-node-image-digest.txt"
-    echo "ghcr.io/decdn/decdn@sha256:$zeros" > "$dir/decdn-image-digest.txt"
-    echo "ghcr.io/decdn/sponsord@sha256:$zeros" > "$dir/sponsord-image-digest.txt"
-    echo "ghcr.io/decdn/sponsord-onramp@sha256:$zeros" > "$dir/sponsord-onramp-image-digest.txt"
+    # The images live under the owner of $DECDN_REPO, as release.yml pushes them.
+    owner="${DECDN_REPO:-decdn/decdn}"; owner="${owner%%/*}"
+    echo "ghcr.io/$owner/decdn-node@sha256:$zeros" > "$dir/decdn-node-image-digest.txt"
+    echo "ghcr.io/$owner/decdn@sha256:$zeros" > "$dir/decdn-image-digest.txt"
+    echo "ghcr.io/$owner/sponsord@sha256:$zeros" > "$dir/sponsord-image-digest.txt"
+    echo "ghcr.io/$owner/sponsord-onramp@sha256:$zeros" > "$dir/sponsord-onramp-image-digest.txt"
     for img in decdn-node decdn sponsord sponsord-onramp; do
       echo '{}' > "$dir/$img-$version-sbom.spdx.json"
     done ;;
@@ -73,6 +75,19 @@ case "$1 $2" in
       esac
     done ;;
   "release edit") exit 0 ;;
+  "workflow run")
+    [ "${GH_DISPATCH:-}" = fail ] && { echo "gh shim: dispatch refused" >&2; exit 1; }
+    exit 0 ;;
+  "repo clone")
+    # A devops clone whose bump script logs the tag it was given and, with
+    # $BUMP_ENV, its environment. $GH_CLONE=fail fails the clone, and
+    # $GH_CLONE=empty clones no bump script.
+    [ "${GH_CLONE:-}" = fail ] && { echo "gh shim: clone failed" >&2; exit 1; }
+    mkdir -p "$4/scripts"
+    [ "${GH_CLONE:-}" = empty ] && exit 0
+    printf '#!/bin/sh\n[ -n "${BUMP_ENV:-}" ] && env > "$BUMP_ENV"\necho "$1" >> "%s"\n' \
+      "$BUMP_LOG" > "$4/scripts/open-decdn-bump.sh"
+    chmod +x "$4/scripts/open-decdn-bump.sh" ;;
   *) echo "gh shim: unexpected call: $*" >&2; exit 9 ;;
 esac
 """
@@ -325,6 +340,135 @@ def test_a_prerelease_is_published_as_one(release):
     assert result.returncode == 0, output(result)
     edits = release.calls(release.gh_log, "release edit")
     assert len(edits) == 1 and "--prerelease" in edits[0], edits
+
+
+def test_a_stable_release_opens_the_devops_bump(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+    bump_log = release.root / "bump.log"
+
+    result = release.publish("v0.0.0", DECDN_SKIP_DEVOPS_BUMP="0", BUMP_LOG=str(bump_log))
+
+    assert result.returncode == 0, output(result)
+    assert release.calls(release.gh_log, "repo clone decdn/devops"), output(result)
+    assert bump_log.read_text().splitlines() == ["v0.0.0"]
+
+
+@pytest.mark.parametrize("tag", ["v0.0.0", "v0.0.0-rc1"])
+def test_publishing_dispatches_the_crates_io_upload_on_main(release, tag):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag(tag, fpr)
+
+    result = release.publish(tag)
+
+    assert result.returncode == 0, output(result)
+    calls = release.calls(release.gh_log, "workflow run")
+    assert calls == [f"workflow run publish-crates.yml --repo decdn/decdn --ref main -f tag={tag}"]
+    # The release is out of draft before the upload starts.
+    log = release.gh_log.read_text().splitlines()
+    edit = next(i for i, line in enumerate(log) if line.startswith("release edit"))
+    assert log.index(calls[0]) > edit
+
+
+def test_a_failed_dispatch_only_warns_and_says_how_to_retry(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", GH_DISPATCH="fail")
+
+    assert result.returncode == 0, output(result)
+    retry = "gh workflow run publish-crates.yml --repo decdn/decdn --ref main -f tag=v0.0.0"
+    assert "the crates.io upload did NOT start" in result.stderr, output(result)
+    # Said at the failure, and again last.
+    assert result.stderr.count(retry) == 2
+    assert result.stderr.rstrip().endswith(retry)
+
+
+def test_the_skip_switch_opens_no_devops_bump(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", DECDN_SKIP_DEVOPS_BUMP="1")
+
+    assert result.returncode == 0, output(result)
+    assert not release.calls(release.gh_log, "repo clone")
+    assert "Skipping devops's decdn bump (DECDN_SKIP_DEVOPS_BUMP is set)" in result.stdout
+
+
+def test_a_fork_opens_no_devops_bump(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", DECDN_SKIP_DEVOPS_BUMP="0", DECDN_REPO="fork/decdn")
+
+    assert result.returncode == 0, output(result)
+    assert not release.calls(release.gh_log, "repo clone")
+    assert "fork/decdn is not decdn/decdn" in result.stdout
+
+
+def test_the_bump_runs_without_registry_tokens_and_leaves_no_clone(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+    tmp = release.root / "tmp"
+    tmp.mkdir()
+    bump_env = release.root / "bump.env"
+
+    result = release.publish(
+        "v0.0.0",
+        DECDN_SKIP_DEVOPS_BUMP="0",
+        BUMP_LOG=str(release.root / "bump.log"),
+        BUMP_ENV=str(bump_env),
+        CARGO_REGISTRY_TOKEN="secret-a",
+        CARGO_REGISTRIES_PRIVATE_TOKEN="secret-b",
+        UNRELATED_CONTROL="kept",
+        TMPDIR=str(tmp),
+    )
+
+    assert result.returncode == 0, output(result)
+    env = bump_env.read_text()
+    assert "secret-a" not in env and "secret-b" not in env
+    assert "UNRELATED_CONTROL=kept" in env
+    assert list(tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("clone", "message"),
+    [
+        ("fail", "could not clone decdn/devops"),
+        ("empty", "has no executable scripts/open-decdn-bump.sh"),
+    ],
+)
+def test_a_devops_clone_without_a_bump_only_warns(release, clone, message):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", DECDN_SKIP_DEVOPS_BUMP="0", GH_CLONE=clone)
+
+    assert result.returncode == 0, output(result)
+    assert message in result.stderr, output(result)
+
+
+def test_a_failed_devops_bump_only_warns(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+    # A bump script that cannot log its tag exits non-zero.
+    result = release.publish(
+        "v0.0.0", DECDN_SKIP_DEVOPS_BUMP="0", BUMP_LOG=str(release.root / "no" / "bump.log")
+    )
+
+    assert result.returncode == 0, output(result)
+    assert "devops's scripts/open-decdn-bump.sh exited" in result.stderr, output(result)
+
+
+def test_a_prerelease_opens_no_devops_bump(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0-rc1", fpr)
+
+    result = release.publish("v0.0.0-rc1", DECDN_SKIP_DEVOPS_BUMP="0")
+
+    assert result.returncode == 0, output(result)
+    assert not release.calls(release.gh_log, "repo clone")
+    assert "v0.0.0-rc1 is a pre-release" in result.stdout
 
 
 def test_a_manifest_signature_no_committed_key_verifies_is_refused(release):

@@ -62,7 +62,9 @@ enum Planned {
     /// The kept entries.
     Pull(Kept),
     /// No entry is left: the bundle is empty, or the filter or `--select`
-    /// dropped every entry. [`PullObserver::nothing_to_fetch`] ends the run.
+    /// dropped every entry. [`PullObserver::nothing_to_fetch`] ends the run
+    /// with a prose line, or under `--json` with the run's [`PullReport`]:
+    /// `fetched` 0 and the `excluded` count.
     Nothing {
         /// Why no entry is left.
         reason: NothingReason,
@@ -723,6 +725,14 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// interrupted counts here but not in `downloaded`; a later run resumes its
 /// `.partial` and reports it as `resumed_bytes`.
 ///
+/// `wire_bytes` is the `ChunkData` wire bytes this run's lanes read, verified
+/// or not, bao proof overhead included. Payment follows verification, so it
+/// holds bytes that no proof pays for: for example, frames past a steal split,
+/// or past a stream's verified frontier before a fault. Those cost bandwidth
+/// and time, not USDC. A leg that ends early can also leave verified bytes
+/// unpaid. The figure is net against `paid_bytes`: a voucher armed before the
+/// pull can confirm during it, so `paid_bytes` can come out above it.
+///
 /// `resumed_bytes` is the content bytes of a `.partial` prefix that an earlier,
 /// interrupted run fetched and paid for, which this run resumed rather than
 /// fetched again. It is never part of `downloaded`. A byte that this run also
@@ -764,6 +774,9 @@ struct PullReport {
     /// Wire bytes this run's vouchers and hash-chain reveals paid for, over
     /// every lane.
     paid_bytes: u64,
+    /// `ChunkData` wire bytes this run's lanes read, verified or not, over
+    /// every lane.
+    wire_bytes: u64,
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
@@ -1117,9 +1130,9 @@ async fn pull_manifest(
     let Kept { manifest, excluded } = match selected.inspect_err(|_| warn_shortfall(puller))? {
         Planned::Pull(kept) => kept,
         Planned::Nothing { reason, excluded } => {
-            observer.nothing_to_fetch(reason, excluded, out, uri.hash);
+            let reported = observer.nothing_to_fetch(reason, excluded, out, uri.hash);
             warn_shortfall(puller);
-            return Ok(());
+            return reported;
         }
     };
 
@@ -1256,16 +1269,28 @@ impl PullObserver {
     /// End a run that has nothing to fetch, for `reason`: say so, warn of
     /// the `.partial` files earlier runs left under `out`, and record the
     /// `excluded` entries, so the run's record shows how many it dropped.
+    /// Under `--json`, the run says so with its [`PullReport`], the same
+    /// object every real run prints: no entry fetched, the `excluded` count,
+    /// and no byte paid by the pull, which leaves out the manifest fetch as
+    /// every run's report does. Otherwise it prints one prose line for
+    /// `reason`.
     fn nothing_to_fetch(
         &self,
         reason: NothingReason,
         excluded: u64,
         out: &Path,
         bundle_hash: [u8; 32],
-    ) {
-        report_nothing_to_fetch(reason);
+    ) -> anyhow::Result<()> {
+        let empty = BundleReport::default();
+        let reported = if self.json {
+            report(&empty, excluded, out, true)
+        } else {
+            report_nothing_to_fetch(reason);
+            Ok(())
+        };
         warn_leftover_partials(out, &[], bundle_hash);
-        self.record_counts(&BundleReport::default(), excluded);
+        self.record_counts(&empty, excluded);
+        reported
     }
 
     /// Clear the bars at the end of the run; the command then prints its
@@ -1643,6 +1668,11 @@ fn report(rep: &BundleReport, excluded: u64, output: &Path, json: bool) -> anyho
             "{}",
             transfer_line(rep.downloaded, rep.paid_bytes, rep.reconstructed)
         );
+        // The wire bytes received beyond those paid for, shown only when
+        // `wire_bytes` is above `paid_bytes`.
+        if let Some(line) = unpaid_wire_line(rep.wire_bytes, rep.paid_bytes) {
+            println!("{line}");
+        }
         // The bytes earlier, interrupted runs fetched and this run resumed, shown
         // only when a run resumed any: they are not in `downloaded` or `paid`.
         if rep.resumed_bytes > 0 {
@@ -1693,6 +1723,7 @@ fn pull_report(rep: &BundleReport, excluded: u64, output: &Path) -> PullReport {
         not_run: rep.not_run,
         downloaded: rep.downloaded,
         paid_bytes: rep.paid_bytes,
+        wire_bytes: rep.wire_bytes,
         reconstructed: rep.reconstructed,
         spliced_bytes: rep.spliced_bytes,
         hints_ignored: rep.hints_ignored,
@@ -1861,6 +1892,21 @@ fn transfer_line(downloaded: u64, paid: u64, reconstructed: u64) -> String {
         format!(" → reconstructed {}", human_bytes(reconstructed))
     };
     format!("downloaded {}{paid}{rebuilt}", human_bytes(downloaded))
+}
+
+/// The end-of-pull line for the wire bytes received beyond those paid for:
+/// `received W on the wire, U more than paid for`. `U` is net: it holds frames
+/// no decoder verified and verified bytes a leg left unpaid, less any payment
+/// this pull made for bytes that arrived before it. `None` unless `wire` is
+/// above `paid`.
+fn unpaid_wire_line(wire: u64, paid: u64) -> Option<String> {
+    (wire > paid).then(|| {
+        format!(
+            "received {} on the wire, {} more than paid for",
+            human_bytes(wire),
+            human_bytes(wire - paid)
+        )
+    })
 }
 
 #[cfg(test)]

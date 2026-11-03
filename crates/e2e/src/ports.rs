@@ -3,10 +3,13 @@
 //! Nextest runs the journeys as parallel processes, and the kernel's ephemeral
 //! range serves every `bind(…:0)` and every outbound source port on the host. A
 //! port a fixture picks and then releases can go to another process before the
-//! child binds it. So a fixture never releases a port it hands to a child:
+//! child binds it. So a fixture keeps every port it hands to a child, except a
+//! TCP port off Linux:
 //!
-//! - [`PortReservation`] holds a TCP port for as long as the child uses it. The
-//!   child binds the same address with `SO_REUSEADDR`.
+//! - [`PortReservation`] holds a TCP port on Linux for as long as the child uses
+//!   it. The child binds the same address with `SO_REUSEADDR`. On macOS a held
+//!   socket blocks that bind, so off Linux the reservation releases the port
+//!   when it is made.
 //! - [`UdpPortClaim`] picks a UDP port below the ephemeral range, where the
 //!   kernel never hands a port out, and claims the number across fixture
 //!   processes.
@@ -40,8 +43,9 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// Keep the reservation for as long as the child may bind the port, a restart
 /// included. Dropping it releases the port.
 ///
-/// Other platforms do not give these guarantees: there the reservation releases
-/// its socket when it is made, and the port is only a number that was free.
+/// On macOS a held socket blocks the child's `SO_REUSEADDR` bind, and other
+/// platforms make no promise either. So off Linux the reservation releases its
+/// socket when it is made, and the port is only a number that was free.
 #[derive(Debug)]
 pub struct PortReservation {
     /// The held socket. `None` off Linux.

@@ -1683,3 +1683,178 @@ async fn a_transient_rpc_error_is_retried_by_the_preflight() {
         .await
         .expect("a transient fault must be retried to success");
 }
+
+/// Reserve a free loopback port: bind `127.0.0.1:0`, read the port, release it.
+async fn free_loopback_port() -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// Spawn `run` against `rpc_url` with `/metrics` on `metrics_port` and no
+/// admin listener. Returns the task and the registry `run` serves.
+fn spawn_boot(
+    cfg: ResolvedConfig,
+    rpc_url: String,
+    metrics_port: u16,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    Arc<metrics::Metrics>,
+) {
+    let mut cfg = cfg;
+    cfg.blockchain.rpc_url = rpc_url;
+    cfg.observability.metrics_port = metrics_port;
+    cfg.observability.admin_port = None;
+    let reload_state = Arc::new(RuntimeReloadState::new(
+        decdn_common::cli::run::ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        &cfg,
+        Box::new(|_| Ok(LogLevelApply::Installed)) as LogLevelSetter,
+    ));
+    let node_metrics = Arc::new(metrics::Metrics::new());
+    let handle = tokio::spawn(run(
+        cfg,
+        SecretKey::generate(),
+        None,
+        reload_state,
+        Arc::clone(&node_metrics),
+    ));
+    (handle, node_metrics)
+}
+
+/// Scrape `/metrics` on `port` until it answers 200, for up to 5 s. Fails at
+/// once with `run`'s own error if `run` returns first.
+async fn scrape_during_boot(
+    port: u16,
+    handle: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> String {
+    decdn_common::tls::install_crypto_provider();
+    // No connection pool: each poll opens a fresh connection, so a success
+    // proves the listener accepts, not that an old connection lives on.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}/metrics");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+        {
+            return resp.text().await.unwrap();
+        }
+        if handle.is_finished() {
+            let outcome = handle.await;
+            panic!("run returned before /metrics answered: {outcome:?}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "/metrics did not answer while bring-up was in progress"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `/metrics` answers while bring-up is still retrying its boot RPC reads
+/// (#2819). The RPC URL points at a closed port, so the reachability preflight
+/// keeps retrying for about 15 s. Within that window a scrape returns the
+/// registry, and `decdn_node_boot_ready` reads `0`.
+#[tokio::test]
+async fn metrics_listener_serves_during_boot() {
+    let dead_rpc_port = free_loopback_port().await;
+    let metrics_port = free_loopback_port().await;
+    let (_tmp, cfg) = cfg_with_origins(Vec::new());
+    let (mut handle, _metrics) = spawn_boot(
+        cfg,
+        format!("http://127.0.0.1:{dead_rpc_port}"),
+        metrics_port,
+    );
+
+    let body = scrape_during_boot(metrics_port, &mut handle).await;
+
+    assert!(
+        !handle.is_finished(),
+        "run must still be in its boot preflight when the scrape lands"
+    );
+    assert!(
+        body.lines().any(|l| l == "decdn_node_boot_ready 0"),
+        "a booting node exports decdn_node_boot_ready 0; body:\n{body}"
+    );
+    handle.abort();
+}
+
+/// A bring-up error closes the metrics listening socket (#2819). The RPC
+/// answers the preflight with a delayed fatal `400`: `/metrics` serves during
+/// the delay, `run` then returns the preflight error, and a fresh connect to
+/// the metrics port is refused.
+#[tokio::test]
+async fn metrics_listener_closes_after_bring_up_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_delay(Duration::from_secs(2)))
+        .mount(&server)
+        .await;
+    let metrics_port = free_loopback_port().await;
+    let (_tmp, cfg) = cfg_with_origins(Vec::new());
+    let (mut handle, _metrics) = spawn_boot(cfg, server.uri(), metrics_port);
+
+    scrape_during_boot(metrics_port, &mut handle).await;
+
+    let err = handle
+        .await
+        .expect("run task must not panic")
+        .expect_err("a fatal preflight must fail bring-up");
+    assert!(
+        err.to_string().contains("unexpected status"),
+        "run must return the preflight error: {err}"
+    );
+    // The dropped stop sender ends the accept loop; the socket closes once the
+    // runtime polls that task again, so poll briefly.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::net::TcpStream::connect(("127.0.0.1", metrics_port))
+        .await
+        .is_ok()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the metrics port still accepts connections after run returned"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `decdn_rpc_healthy` reads `1` as soon as the RPC preflight passes, before
+/// the boot chain reads (#2819). `/metrics` serves during boot, and a `0`
+/// there would page the RPC alert on every slow boot. The keystore path does
+/// not exist, so bring-up fails on the step right after the preflight.
+#[tokio::test]
+async fn rpc_healthy_is_seeded_once_the_preflight_passes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let metrics_port = free_loopback_port().await;
+    let (tmp, mut cfg) = cfg_with_origins(Vec::new());
+    let password_file = tmp.path().join("keystore.pass");
+    std::fs::write(&password_file, "unused").unwrap();
+    cfg.blockchain.keystore_password_file = Some(password_file);
+    cfg.blockchain.eth_keystore = tmp.path().join("missing-keystore.json");
+    let (handle, node_metrics) = spawn_boot(cfg, server.uri(), metrics_port);
+
+    let err = handle
+        .await
+        .expect("run task must not panic")
+        .expect_err("a missing keystore must fail bring-up");
+    assert!(
+        !format!("{err:#}").contains("rpc_url"),
+        "bring-up must fail after the preflight, not in it: {err:#}"
+    );
+    assert_eq!(node_metrics.rpc_healthy_value(), 1);
+}

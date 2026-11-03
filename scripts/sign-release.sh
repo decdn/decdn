@@ -37,6 +37,14 @@
 #                         a Docker Hub personal access token for the overview
 #                         push, when the `docker login` credential is not one
 #                         the Hub API accepts (see dockerhub-description.py)
+#   DECDN_SKIP_DEVOPS_BUMP
+#                         set to 1 to not open decdn/devops's decdn bump PR
+#                         after the release is published
+#
+# Once the release is published, the script dispatches
+# .github/workflows/publish-crates.yml on main, which uploads the crates to
+# crates.io through trusted publishing, and prints the command that finds the
+# run.
 #
 # Re-running is safe at any point before the release is published: signatures
 # are re-uploaded with --clobber and the tag promotion is idempotent. Once the
@@ -149,6 +157,12 @@ SKIP_DOCKERHUB="$SKIP_IMAGE_TAGS"
 if enabled DECDN_SKIP_DOCKERHUB "${DECDN_SKIP_DOCKERHUB:-}"; then
   SKIP_DOCKERHUB=1
 fi
+# Parsed here, before anything is signed: the bump runs after the release is
+# published and must not exit non-zero.
+SKIP_DEVOPS_BUMP=""
+if enabled DECDN_SKIP_DEVOPS_BUMP "${DECDN_SKIP_DEVOPS_BUMP:-}"; then
+  SKIP_DEVOPS_BUMP=1
+fi
 
 # ---- preconditions -------------------------------------------------------
 
@@ -216,10 +230,12 @@ KEYS_HOME=$(mktemp -d)
 chmod 700 "$KEYS_HOME"
 # Single EXIT trap for the whole script — a second `trap ... EXIT` later would
 # replace this one and leak the key home. WORKDIR does not exist yet, hence the
-# :- guard.
+# :- guard. BUMP_DIRS holds only directories this script made with mktemp.
+BUMP_DIRS=()
 cleanup() {
-  local rc=$?
+  local rc=$? dir
   rm -rf "$KEYS_HOME"
+  for dir in ${BUMP_DIRS[@]+"${BUMP_DIRS[@]}"}; do rm -rf "$dir"; done
   if [[ -n "${WORKDIR:-}" ]]; then
     if (( rc == 0 )); then
       rm -rf "$WORKDIR"
@@ -510,7 +526,7 @@ done < <(git -C "$REPO_ROOT" ls-tree --name-only "$TAG" -- crates/cli/ | grep -E
 # for this version, so the key is read from the TAG's tree. sed reads every
 # crates/*/Cargo.toml there and all of them must agree;
 # check-binstall-metadata.sh holds each binstall crate to that one-line form,
-# and publish-crates.sh runs it at the tag before anything reaches crates.io.
+# and publish-crates.yml runs it at the tag before anything reaches crates.io.
 # Whether $MINISIGN_KEY is this key is known only once the archives are signed
 # (the verify loop below).
 BINSTALL_PUBS=()
@@ -789,6 +805,118 @@ gh release edit "$TAG" --repo "$REPO" --draft=false ${PRERELEASE_FLAG[@]+"${PRER
 Re-run this script, or publish manually:
 gh release edit $TAG --repo $REPO --draft=false ${PRERELEASE_FLAG[*]+"${PRERELEASE_FLAG[*]}"}"
 
+# ---- crates.io -------------------------------------------------------------
+
+# publish-crates.yml checks this release's signatures again and uploads the
+# crates through crates.io trusted publishing, with no crates.io token here. It
+# runs on `main`, never on the tag: the `release` environment hands out the
+# crates.io token only to a run from `main`. Its errors show in the run, not in
+# this terminal. A failed dispatch only warns: the release is already out.
+echo
+echo "==> Starting the crates.io upload"
+CRATES_CMD="gh workflow run publish-crates.yml --repo $REPO --ref main -f tag=$TAG"
+if gh workflow run publish-crates.yml --repo "$REPO" --ref main -f tag="$TAG"; then
+  echo "    publish-crates.yml runs on main against $TAG. Follow it with:"
+  echo "    gh run list --repo $REPO --workflow publish-crates.yml --limit 1"
+else
+  echo "warning: could not start publish-crates.yml; the crates are NOT on crates.io." >&2
+  echo "         Start it with: $CRATES_CMD" >&2
+  CRATES_FAILED=1
+fi
+
+# ---- downstream ------------------------------------------------------------
+
+# decdn/devops pins decdn at a release tag (the role, chart, Compose and onramp
+# pins; the digests come from the release's signed assets) and carries the
+# script that opens the PR moving its pin to this release. It pins vX.Y.Z
+# releases only, so a pre-release opens no devops PR.
+# The script runs from a fresh clone of devops's main: it commits as your git
+# identity, pushes with your git credentials for github.com and opens the PR
+# with your gh login. A run with DECDN_REPO set to anything but decdn/decdn,
+# such as a fork or a test run, opens nothing.
+#
+# This runs devops's main as you, so it trusts that branch the way running the
+# script by hand would. Its ruleset requires a PR with one approving review for
+# a change to main, though org admins can bypass it. The registry tokens cargo
+# reads from the environment are unset first; every other variable stays set.
+# Skip it with DECDN_SKIP_DEVOPS_BUMP=1 to run the script and its helpers from
+# a checkout you have reviewed.
+#
+# Every failure here is a warning with the command to run later; none of them
+# changes the exit code: the release is already published. Ctrl-C included:
+# the shell ignores SIGINT for the whole bump, so an interrupted clone or bump
+# script stops that command, not this script.
+
+# open_bump <name> <owner/repo> <script> <skip>: run <repo>'s <script> <tag>
+# from a temporary clone, unless <skip> is set.
+open_bump() {
+  local name="$1" repo="$2" script="$3" skip="$4" dir rc=0
+  local hint="(cd <a $repo checkout> && $script $TAG)"
+  echo
+  if [[ -n "$skip" ]]; then
+    echo "==> Skipping ${name}'s decdn bump (DECDN_SKIP_${name^^}_BUMP is set)"
+    return
+  fi
+  if [[ "$REPO" != "decdn/decdn" ]]; then
+    echo "==> Skipping ${name}'s decdn bump ($REPO is not decdn/decdn)"
+    return
+  fi
+  echo "==> Opening ${name}'s decdn bump PR"
+  if ! dir=$(mktemp -d); then
+    echo "warning: could not create a temporary directory for $repo." >&2
+    echo "Open the bump PR with:" >&2
+    echo "  $hint" >&2
+    return
+  fi
+  BUMP_DIRS+=("$dir")
+  if ! gh repo clone "$repo" "$dir" -- --quiet; then
+    echo "warning: could not clone $repo. Open the bump PR with:" >&2
+    echo "  $hint" >&2
+    return
+  fi
+  if [[ ! -x "$dir/$script" ]]; then
+    echo "warning: $repo main has no executable $script;" >&2
+    echo "open the bump PR by hand (see that repo's decdn bump checklist)." >&2
+    return
+  fi
+  # The registry tokens cargo reads from the environment stay out of devops's
+  # code: no step of a release uses them.
+  (
+    unset CARGO_REGISTRY_TOKEN
+    while read -r var; do
+      [[ "$var" == CARGO_REGISTRIES_*_TOKEN ]] && unset "$var"
+    done < <(compgen -e)
+    cd "$dir" && "./$script" "$TAG"
+  ) || rc=$?
+  case "$rc" in
+    0) ;;
+    130)
+      echo "warning: ${name}'s bump was interrupted; no PR is open unless its output" >&2
+      echo "above ends with \"==> Opened <url>\". Open it later with:" >&2
+      echo "  $hint" >&2
+      ;;
+    *)
+      echo "warning: ${name}'s $script exited $rc. If its output above includes" >&2
+      echo "\"==> Opened <url>\", the PR is open but needs work, which its output and" >&2
+      echo "its body name: push the fix to that PR's branch. Otherwise no PR is open;" >&2
+      echo "once the cause above is fixed, open it with:" >&2
+      echo "  $hint" >&2
+      ;;
+  esac
+}
+
+if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  # `:` rather than an empty trap: children such as gh and the bump script
+  # still take the default SIGINT action, so Ctrl-C stops them.
+  trap ':' INT
+  open_bump devops decdn/devops scripts/open-decdn-bump.sh "$SKIP_DEVOPS_BUMP"
+  trap - INT
+else
+  echo
+  echo "==> Skipping devops's decdn bump ($TAG is a pre-release)"
+fi
+
+# Last, so a failed overview push is the final thing on screen.
 echo
 echo "Published: https://github.com/${REPO}/releases/tag/${TAG}"
 if [[ -n "${OVERVIEW_FAILED:-}" ]]; then
@@ -796,4 +924,8 @@ if [[ -n "${OVERVIEW_FAILED:-}" ]]; then
   echo "         ${OVERVIEW_FAILED}" >&2
 elif [[ -n "${OVERVIEW_NOTE:-}" ]]; then
   echo "Docker Hub overviews: ${OVERVIEW_NOTE}"
+fi
+if [[ -n "${CRATES_FAILED:-}" ]]; then
+  echo "warning: the crates.io upload did NOT start. Run:" >&2
+  echo "         $CRATES_CMD" >&2
 fi

@@ -228,31 +228,39 @@ impl ClientHandler {
         // §Credit window). The loop returns it only when the stream ends fully
         // paid.
         let carry = self.take_ramp_carry(lane).await;
-        self.deliver_loop(
-            conn,
-            send,
-            recv,
-            hash,
-            byte_offset,
-            byte_len,
-            total_bytes,
-            lane_key,
-            lane,
-            carry,
-            client_node_id,
-            rate_per_mb,
-            floor_reservation,
-            first_byte,
-            &mut paid,
-        )
-        .await
-        .map_err(|e| super::wire::tag_paid_progress(e, paid))
+        // The guard stays owned here, so it drops on every exit — success, `?`,
+        // disconnect, panic — after `settle_end` has judged how the stream ended.
+        let end = self
+            .deliver_loop(
+                conn,
+                send,
+                recv,
+                hash,
+                byte_offset,
+                byte_len,
+                total_bytes,
+                lane_key,
+                lane,
+                carry,
+                client_node_id,
+                rate_per_mb,
+                floor_reservation.as_ref(),
+                first_byte,
+                &mut paid,
+            )
+            .await
+            .map_err(|e| super::wire::tag_paid_progress(e, paid));
+        if let Some(res) = floor_reservation.as_ref() {
+            res.settle_end(&end);
+        }
+        end
     }
 
     /// The body of [`Self::deliver`]. `paid` counts the bytes accepted vouchers
     /// credited; the caller reads it when the loop ends.
-    // One linear, ADR-ordered serve loop (deliver → recoup → floor/takedown/pool
-    // re-checks); splitting it would scatter the ordering invariants across helpers.
+    // One linear, ADR-ordered serve loop (deliver → recoup, reconciling the floor at
+    // each credit → pool/signer-cap/takedown re-checks); splitting it would scatter
+    // the ordering invariants across helpers.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -272,15 +280,10 @@ impl ClientHandler {
         mut carry: RampCarry,
         client_node_id: B256,
         rate_per_mb: u64,
-        floor_reservation: Option<FloorReservation>,
+        floor_reservation: Option<&FloorReservation>,
         first_byte: FirstByteClock,
         paid: &mut u64,
     ) -> anyhow::Result<ServeEnd> {
-        // Owned here so the pool floor reservation reconciles at every exit —
-        // success, `?`, disconnect, panic. The serve loop
-        // below releases it once the stream repays a floor; on any other exit the
-        // guard's `Drop` frees the pool's live floor headroom.
-        let floor_reservation = floor_reservation;
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
         // side, AC#4). `export_bao_range_stream` reads the persisted outboard and
@@ -426,6 +429,12 @@ impl ClientHandler {
                     break;
                 };
                 let len = frame.total() as u64;
+                // Count the frame as unpaid before the write: a client that reads
+                // part of it and then stops the stream fails the write, and those
+                // bytes still left the node.
+                if let Some(res) = floor_reservation {
+                    res.track_unpaid(delivered.saturating_add(len).saturating_sub(*paid));
+                }
                 waits
                     .time(Wait::Send, self.write_chunk_payload_multi(send, &frame))
                     .await?;
@@ -477,13 +486,35 @@ impl ClientHandler {
             // watermark by a sliver. Hence the loop reads proofs for a chunk until
             // they have credited all of it, and `MAX_PROOFS_PER_CHUNK` bounds how
             // many proofs a payer may send without settling it.
+            //
+            // The pool re-check below also runs between proofs, once a batch
+            // outlasts one re-check interval. A slow payer can hold a batch open
+            // across many proof waits, and the pool can close, or cross into its
+            // redeem margin, while the batch keeps crediting. The check waits for
+            // the batch's first proof, because the post-batch check of the last
+            // iteration already covers the batch start. The batch's own clock
+            // starts with the batch, so a batch that settles inside one interval
+            // never reads the pool here.
             let mut collected_any = false;
+            let mut batch_pool_check = std::time::Instant::now();
+            let mut batch_proof_read = false;
             while let Some(mut owed) = pop_payable(&mut pending, unvouchered, done_delivering) {
                 collected_any = true;
                 // One proof budget and one proof-wait ceiling for every proof
                 // this chunk takes.
                 let mut proofs = ChunkProofs::start();
                 loop {
+                    if batch_proof_read && batch_pool_check.elapsed() >= pool_recheck_interval {
+                        batch_pool_check = std::time::Instant::now();
+                        if let Some(stop) = self.pool_recheck_stop(&lane_key, &hash).await {
+                            self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
+                                .await?;
+                            return Ok(ServeEnd::Stopped {
+                                stop,
+                                bytes: delivered,
+                            });
+                        }
+                    }
                     let attempt = proofs.next_attempt();
                     // Timed by hand, not through `ServeWaits::time`: nesting
                     // this large future in another trips `large_futures`. The
@@ -507,6 +538,7 @@ impl ClientHandler {
                         )
                         .await;
                     waits.end();
+                    batch_proof_read = true;
                     let stop = committed.map_err(|e| {
                         e.context(format!(
                             "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
@@ -523,6 +555,11 @@ impl ClientHandler {
                         // window for unsettled bytes.
                         VoucherStop::Continue { credited_bytes } => {
                             *paid = paid.saturating_add(credited_bytes);
+                            // Reconcile the floor reservation now, before a later
+                            // proof in this batch can fail and end the stream.
+                            if let Some(res) = floor_reservation {
+                                res.reconcile_paid(delivered, *paid);
+                            }
                             if owed.settle(credited_bytes)? {
                                 break;
                             }
@@ -560,46 +597,30 @@ impl ClientHandler {
             }
             ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered, &pending)?;
 
-            // Reconcile the pool floor reservation against this stream's live
-            // balance (ADR 003 §Pool solvency). `paid` and `delivered` are BYTE
-            // counters (see their declaration above); the reservation accounts in
-            // µUSDC, so every byte quantity crosses over through `min_payment` —
-            // the two units are never compared directly.
-            if let Some(res) = floor_reservation.as_ref() {
-                // Free the pool's live reservation once cumulative payment reaches the
-                // amount that was reserved (the ramp-floor credit this stream fronts).
-                // Everything above it is self-funded. Matching release to the reserved
-                // µUSDC keeps it correct at any `credit_ramp_divisor` — with the ramp
-                // disabled the reservation is the full `credit_max`, so release waits
-                // for that much paid, not a single interval.
-                res.release_if_repaid(decdn_incentive::min_payment(*paid, rate_per_mb));
-            }
-
             // Done when the whole blob is on the wire and every interval, closing
             // partial included, has been paid.
             let done = done_delivering && pending.is_empty() && unvouchered == 0;
 
-            // Mid-stream pool-solvency re-check (ADR 003 §Pool solvency),
+            // Mid-stream pool re-check (ADR 003 §Pool solvency),
             // symmetric with the takedown re-check below: re-read the cached pool
-            // status and stop once the pool can no longer fund the delivery in
+            // status and stop once the pool can no longer pay for the delivery in
             // flight. A pool drains mid-flight — other lanes redeem `remaining`
-            // down — so a long stream must catch that; the credit window bounds
-            // delivery ahead of the last COLLECTED voucher, not ahead of the last
-            // SOLVENCY-verified point, so nothing else notices a shared pool going
-            // unredeemable. `pool_funds_committed` asks two things: `remaining`
-            // still sits above the refundable floor `M`, and `remaining − M` still
+            // down — and it can close under a live stream, so a long stream must
+            // catch both; the credit window bounds delivery ahead of the last
+            // COLLECTED voucher, not ahead of the last SOLVENCY-verified point, so
+            // nothing else notices a shared pool going unredeemable.
+            // `pool_recheck_stop` stops on a pool the view no longer holds (it
+            // closed), on a `Closing` pool whose dispute deadline falls inside the
+            // node's redeem margin, and on a pool whose `remaining − M` no longer
             // covers the floor credit ALREADY committed across the pool (this
-            // stream included while its floor is un-repaid). A pool whose streams
-            // have all repaid has an empty committed ledger, so only the
-            // `remaining > M` bound then separates a funded pool from a drained
-            // one. On `false` the pool can no longer fund further delivery, so
-            // stop IN-BAND with a clean
-            // `PoolExhausted` (not a QUIC reset, unlike a takedown) so the owner
-            // learns to top up — `PoolExhausted` is post-auth, so naming the
-            // condition leaks nothing an open-time refusal must hide, and it is not
-            // watermark-gated (no bundle). A `None` pool view fails OPEN (the
-            // on-chain redeem is the backstop), exactly like the admission gate and
-            // the takedown funder resolution.
+            // stream included while its floor is un-repaid; with every floor
+            // repaid, the `remaining > M` bound alone separates a funded pool
+            // from a drained one). Every stop is IN-BAND
+            // with a clean `PoolExhausted` (not a QUIC reset, unlike a takedown) so
+            // the owner learns to fund a pool — `PoolExhausted` is post-auth, so
+            // naming the condition leaks nothing an open-time refusal must hide,
+            // and it is not watermark-gated (no bundle). With no pool view wired
+            // there is nothing to check, and the stream fails open.
             //
             // The check runs on a WALL-CLOCK cadence, not at every chunk
             // boundary: the projection only advances as the settlement watcher
@@ -611,21 +632,11 @@ impl ClientHandler {
             // and the on-chain redeem backstop are unchanged.
             if collected_any && !done && last_pool_check.elapsed() >= pool_recheck_interval {
                 last_pool_check = std::time::Instant::now();
-                if let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
-                    && !self.pool_funds_committed(lane_key.pool_id, status.remaining)
-                {
+                if let Some(stop) = self.pool_recheck_stop(&lane_key, &hash).await {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                         .await?;
-                    // A paying in-flight download is being terminated, and the pool solvency bound
-                    // only grows — an accumulator bug here is permanent per pool, so make
-                    // the stop observable rather than a silent `Ok(())` (symmetric with the
-                    // takedown re-check below, which also logs).
-                    tracing::warn!(
-                        pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
-                        "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer gate refusal never reaches here"
-                    );
                     return Ok(ServeEnd::Stopped {
-                        stop: ServeStop::PoolExhausted,
+                        stop,
                         bytes: delivered,
                     });
                 }

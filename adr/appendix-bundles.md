@@ -558,7 +558,7 @@ Range-dedup holds within one pull. Reuse across separate pulls — v2 of a
 model skipping the ranges it already fetched for v1 — needs a persistent
 range-addressed cache and is a follow-up.
 
-At the end of a pull, the report states three totals. `downloaded` is the
+At the end of a pull, the report states these totals. `downloaded` is the
 content bytes that this pull fetched and paid for. `reconstructed` is the
 bytes that this pull wrote to disk. The totals differ when one blob goes to
 several paths, or when range-dedup splices part of a blob from disk. The
@@ -571,10 +571,27 @@ pull pays a little more than `downloaded`. Content that a lane delivers two
 times counts two times. An entry that fails counts in `paid_bytes` but not
 in `downloaded`.
 
+`wire_bytes` is the sum, over all lanes of this pull, of the `ChunkData`
+wire bytes that the streams read. It includes the bao proof overhead. A
+stream counts each frame when it reads the frame, before the client
+verifies it. The client pays only for the bytes that it verifies
+([ADR 038 § Payment metering](038-bao-verified-range-streaming.md#payment-metering)). Thus
+`wire_bytes` also counts bytes that the client reads but does not verify.
+Examples are frames past a steal split
+([ADR 039 § Dynamic segmentation and tail-stealing](039-multi-source-parallel-fetch.md#dynamic-segmentation-and-tail-stealing))
+and frames past the verified bytes of a stream that faults. These bytes
+cost bandwidth and time, not USDC. A leg that ends early can also leave
+verified bytes unpaid. A voucher from before the pull can confirm during
+the pull. Thus `paid_bytes` is not always less than `wire_bytes`.
+
 The report shows `downloaded X (paid P) → reconstructed Y`. When
 `downloaded` and `reconstructed` are equal, the report omits the
 `→ reconstructed Y` part. When the pull downloads and pays nothing, the
 report omits the `(paid P)` part.
+
+When `wire_bytes` is more than `paid_bytes`, the report adds the line
+`received W on the wire, U more than paid for`. `U` is `wire_bytes` minus
+`paid_bytes`.
 
 A pull can resume a `.partial` prefix that an earlier, interrupted pull
 fetched. The earlier pull paid for those bytes, so they are not in

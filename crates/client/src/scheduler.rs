@@ -4311,7 +4311,7 @@ where
                                 return Err(err);
                             }
                             log_extra_fault(provider, hash, range, &err);
-                            // Only an uncovered range: a node's per-signer live
+                            // Only an uncovered range: a node's per-signer floor
                             // cap, which extra streams hit, refuses as a plain
                             // `NotFound` too, and inside the coverage that says
                             // nothing about the blocks it holds.

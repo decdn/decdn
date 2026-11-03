@@ -31,6 +31,8 @@ rustls = { workspace = true }
 # Free-space probing (`disk.rs`): `statvfs` on Unix, `GetDiskFreeSpaceExW` on
 # Windows, behind one safe API (the workspace forbids `unsafe`).
 fs4 = { workspace = true }
+# Node key buffers (`identity.rs`) are wiped on drop.
+zeroize = { workspace = true }
 
 [features]
 # The admin RPC's server half (`AdminRpcServer`): only `decdn-node` serves it,

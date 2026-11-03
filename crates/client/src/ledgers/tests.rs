@@ -135,6 +135,22 @@ async fn paid_bytes_sums_what_every_lane_paid_past_its_seed() -> anyhow::Result<
     Ok(())
 }
 
+#[test]
+fn wire_bytes_sums_every_lane() {
+    let reg = LaneLedgers::new();
+    let h1 = reg.get_or_insert(lane(1), || {
+        LaneHandle::for_test(Cumulative {
+            bytes: U256::from(4_000u64),
+            amount: U256::from(40u64),
+        })
+    });
+    let h2 = reg.get_or_insert(lane(2), || LaneHandle::for_test(Cumulative::default()));
+    assert_eq!(reg.wire_bytes(), 0);
+    h1.ledger.note_wire(300);
+    h2.ledger.note_wire(200);
+    assert_eq!(reg.wire_bytes(), 500);
+}
+
 /// `committed_lanes` lists every registered lane with its own ledger's
 /// committed cumulative: the seed until a voucher lands, and what the ledger
 /// says after.

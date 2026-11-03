@@ -60,7 +60,8 @@ That is why:
 ## Contracts with deployed software
 
 Published commands and downloads in progress read these, so a change to any
-of them is called out as contract-breaking in the changelog:
+of them is contract-breaking and ships with `!` in its PR title, which puts it
+under Breaking in the changelog and the release notes:
 
 - the installers' arguments (`get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>]
   [<decdn get flags>]` and `get decdn:<hash>[?ns=<id>] -o <file>

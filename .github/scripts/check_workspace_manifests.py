@@ -107,7 +107,7 @@ def check(repo_root: Path) -> list[str]:
         name = package.get("name", str(rel))
         name_by_dir[crate_root.resolve()] = name
         # `publish = false` and `publish = []` both mean "never published";
-        # cargo metadata renders both as `[]`, which publish-crates.sh reads.
+        # cargo metadata renders both as `[]`, which crates_to_publish.py reads.
         if package.get("publish") is False or package.get("publish") == []:
             unpublished.add(name)
 

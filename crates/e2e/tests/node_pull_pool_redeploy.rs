@@ -194,7 +194,7 @@ async fn a_provider_repointed_at_a_redeploy_drops_its_stale_lane_and_serves_the_
 }
 
 async fn run_empty_redeploy() -> anyhow::Result<()> {
-    let r = stale_row_from_first_deployment(LegTwoProvider::Fresh).await?;
+    let r = Box::pin(stale_row_from_first_deployment(LegTwoProvider::Fresh)).await?;
     let pool2 = r.pool_on(r.pool2);
 
     r.server
@@ -273,7 +273,7 @@ async fn run_empty_redeploy() -> anyhow::Result<()> {
 }
 
 async fn run_reissued_id() -> anyhow::Result<()> {
-    let r = stale_row_from_first_deployment(LegTwoProvider::Fresh).await?;
+    let r = Box::pin(stale_row_from_first_deployment(LegTwoProvider::Fresh)).await?;
     let pool2 = r.pool_on(r.pool2);
 
     // Open pools on #2 under the SERVER's own key, while its daemon is down,
@@ -361,7 +361,10 @@ async fn run_reissued_id() -> anyhow::Result<()> {
 }
 
 async fn run_repointed_provider() -> anyhow::Result<()> {
-    let r = stale_row_from_first_deployment(LegTwoProvider::RepointedFirst).await?;
+    let r = Box::pin(stale_row_from_first_deployment(
+        LegTwoProvider::RepointedFirst,
+    ))
+    .await?;
 
     // The operator's side of the redeploy, on the seller: same data dir, new
     // `PaymentPool`. Its #1 lane — the leg-1 lane key, which leg 2 reissues —

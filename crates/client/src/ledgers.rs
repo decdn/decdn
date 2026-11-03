@@ -117,6 +117,21 @@ impl LaneLedgers {
             .fold(U256::ZERO, U256::saturating_add)
     }
 
+    /// Σ over every registered lane of the wire bytes that arrived on its
+    /// streams, verified or not ([`PoolLedger::wire_bytes`]). It covers only
+    /// the lanes this registry holds, each from the moment it was built; a
+    /// caller that measures one pull takes the growth across it.
+    #[must_use]
+    pub fn wire_bytes(&self) -> u64 {
+        let map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.values()
+            .map(|h| h.ledger.wire_bytes())
+            .fold(0, u64::saturating_add)
+    }
+
     /// Σ over every registered lane `signer` signs of what it committed past
     /// its recorded prior: what the run signed under `signer`'s capability
     /// beyond the application's local records. The handles are cloned out

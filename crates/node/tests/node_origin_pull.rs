@@ -10696,6 +10696,85 @@ async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline
     Ok(())
 }
 
+/// #2767: a leaf that never pays cannot make B front upstream egress stream
+/// after stream. The leaf pool holds one and a half floors. The leaf takes the
+/// first interval of a pull-through and leaves; that floor stays behind as floor
+/// debt, so B refuses the leaf's next stream on the pool ceiling although no
+/// stream is live.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_never_paying_leaf_is_refused_after_its_floor() -> Result<()> {
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
+    let payload = vec![0x6Du8; payload_len];
+    let hash = Hash::new(&payload);
+
+    let ab_pool_id = B256::repeat_byte(0x6D);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
+
+    let floor = min_payment(CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES, RATE);
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_pool_id = B256::repeat_byte(0x6E);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, _b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_pool_id,
+            &b_buyer,
+            leaf_pool_id,
+            leaf_eth.address(),
+            floor + floor / U256::from(2u64),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let leaf = leaf_reads_first_interval(
+        &leaf_ep,
+        b_target.clone(),
+        leaf_node_id,
+        &leaf_eth,
+        leaf_pool_id,
+        hash,
+    )
+    .await?;
+    leaf.conn.close(0u32.into(), b"gone");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1).is_err()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1)?;
+
+    let again = leaf_opens_paid_stream(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_pool_id,
+        hash,
+    )
+    .await;
+    anyhow::ensure!(
+        again.is_err(),
+        "B admitted a second free floor to a leaf that never paid"
+    );
+    assert_counter(
+        &b_metrics,
+        "serve_stream_rejected_insufficient_deposit_total",
+        1,
+    )?;
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
 /// #2194: a leaf that leaves while B's serve leg waits on the pull for its first
 /// byte ends that serve at once, and the serve's lease release cancels the pull. A
 /// answers and then sends nothing, and B's pull budgets run a minute, so only the
@@ -17026,7 +17105,7 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
 }
 
 /// #2178: a holder that refuses a leg with a signed `NotFound` — the wire shape
-/// of a seller's per-signer live-cap refusal — is waited on and asked again when
+/// of a seller's per-signer floor-cap refusal — is waited on and asked again when
 /// no other candidate covers its range, and is not suppressed for the hash. Every
 /// leaf stream on the hash completes; none ends short after payment.
 ///

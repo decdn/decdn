@@ -1343,6 +1343,11 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
         "the pull must report its own payment ({pull_paid}), without the manifest fetch \
          ({wire_manifest}): {report}"
     );
+    anyhow::ensure!(
+        report["wire_bytes"].as_u64() == Some(pull_paid),
+        "a clean one-lane pull reads exactly the wire it pays for ({pull_paid}), without the \
+         manifest fetch: {report}"
+    );
 
     drop(node);
     Ok(())
@@ -1469,6 +1474,7 @@ async fn run_delta_update() -> anyhow::Result<()> {
         report1["paid_bytes"].as_u64() == Some(paid_v1),
         "first pull must report the bytes it paid for ({paid_v1}): {report1}"
     );
+    assert_received_what_it_paid(&report1)?;
 
     // (1) Both files landed, byte-exact, and the skip-cache exists.
     let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin (first pull)")?;
@@ -1607,6 +1613,7 @@ async fn run_delta_update() -> anyhow::Result<()> {
         report2["paid_bytes"].as_u64() == Some(paid_v2),
         "second pull must report the bytes it paid for ({paid_v2}): {report2}"
     );
+    assert_received_what_it_paid(&report2)?;
 
     // (5) The changed file on disk now hashes to the NEW manifest hash.
     let got_a2 = std::fs::read(out_dir.join("a.bin")).context("read a.bin (second pull)")?;
@@ -1750,6 +1757,7 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
         report1["paid_bytes"].as_u64() == Some(paid1),
         "first pull must report the bytes it paid for ({paid1}): {report1}"
     );
+    assert_received_what_it_paid(&report1)?;
     anyhow::ensure!(
         report1["fetched"].as_u64() == Some(1),
         "first pull must fetch game1/lib/dup.bin fresh: {report1}"
@@ -1833,12 +1841,26 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
         "second pull must report zero paid bytes: {report2}"
     );
     anyhow::ensure!(
+        report2["wire_bytes"].as_u64() == Some(0),
+        "second pull must read no wire bytes: {report2}"
+    );
+    anyhow::ensure!(
         paid2 == 0,
         "second pull must bill ZERO bytes — dup.bin is deduped from the on-disk game1 copy, not \
          downloaded: got {paid2}"
     );
 
     drop(node);
+    Ok(())
+}
+
+/// A clean pull receives at least the wire bytes it pays for: payment follows
+/// verification, and every verified byte arrives first.
+fn assert_received_what_it_paid(report: &serde_json::Value) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        report["wire_bytes"].as_u64() >= report["paid_bytes"].as_u64(),
+        "a clean pull receives at least the wire bytes it pays for: {report}"
+    );
     Ok(())
 }
 

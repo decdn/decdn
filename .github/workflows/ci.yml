@@ -129,7 +129,7 @@ jobs:
           toolchain: 1.99.1
       # cargo-deny pinned to an exact version so a release can't silently
       # change the check's behavior.
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-deny@0.20.2
@@ -232,7 +232,7 @@ jobs:
           shared-key: public-api
           # Restore-only except on `main`; only `main` writes it (see clippy job).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -313,7 +313,6 @@ jobs:
               - 'docs/**/*.md'
               - 'CONTRIBUTING.md'
               - 'CLAUDE.md'
-              - 'CHANGELOG.md'
               - 'README.md'
               - '.github/workflows/ci.yml'
             solidity_dependencies:
@@ -442,7 +441,7 @@ jobs:
           # job). This is the largest partition (~1.2 GiB instrumented target),
           # so gating its save is what most relieves the saturated cache store.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.149
@@ -568,7 +567,7 @@ jobs:
         with:
           shared-key: anvil-e2e-settlement
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -659,7 +658,7 @@ jobs:
         with:
           shared-key: anvil-e2e-journeys
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -729,7 +728,7 @@ jobs:
         with:
           shared-key: anvil-e2e-sponsord
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -812,10 +811,6 @@ jobs:
       needs.changes.outputs.rust == 'true' || needs.changes.outputs.solidity == 'true' ||
       github.event_name != 'pull_request'
     steps:
-      # This job only checks out to regenerate + diff vectors locally; it never
-      # pushes, and releases are not automated from CI (no auto-release), so the
-      # GITHUB_TOKEN need not persist in .git/config. Dropping it satisfies
-      # zizmor's `artipacked` check and keeps the token off disk for later steps.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -1250,6 +1245,7 @@ jobs:
           globs: |
             **/*.md
             !adr/_build/**
+            !CHANGELOG.md
           config: ".markdownlint.yaml"
 
   adr-book-list:
@@ -1295,6 +1291,14 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
+      # scripts/tests/test_release_changelog.py renders a small repository
+      # through the real git-cliff and skips without it; the version matches
+      # the release workflow's, so the test sees the binary a release uses.
+      - name: Install git-cliff
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: git-cliff@2.14.2
+          fallback: none
       - name: Test CI tooling
         run: |
           python3 -m pip install 'pytest==8.*' 'pyyaml==6.*'
@@ -1371,11 +1375,13 @@ jobs:
         run: .github/scripts/check-image-name.sh
 
       # The Rust version is written in rust-toolchain.toml, Cargo.toml's
-      # rust-version and every dtolnay/rust-toolchain step in this file and
-      # release.yml; each is read by a different tool. Dependabot bumps only the
-      # action refs, so this is what turns that PR red until the two TOML sites
-      # move with it. Runs before the toolchain install on purpose: it needs no
-      # cargo, and a drifted pin is the one thing that should fail first.
+      # rust-version, the `toolchain:` input of every dtolnay/rust-toolchain
+      # step in the workflows and local actions, and deploy/sponsord/Dockerfile's
+      # `rust:` tag; each is read by a different tool. A Rust release arrives as
+      # Dependabot's bump of that `rust:` tag alone, so this is what turns that
+      # PR red until the other sites move with it. Runs before the toolchain
+      # install on purpose: it needs no cargo, and a drifted pin is the one
+      # thing that should fail first.
       - name: Rust version agrees across toolchain, manifest and workflows
         run: .github/scripts/check-toolchain-pin.sh
 

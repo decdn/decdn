@@ -383,9 +383,8 @@ contract OriginAssignmentTest is Test {
     // -----------------------------------------------------------------
 
     /// ADR 011 § Contract promises each governance setter emits its own update
-    /// event, and the CHANGELOG tells indexers to map those topics. Nothing
-    /// asserted the payloads, so a swapped old/new argument — the classic slip
-    /// in a two-value update event — would ship silently.
+    /// event. Nothing asserted the payloads, so a swapped old/new argument — the
+    /// classic slip in a two-value update event — would ship silently.
     function test_governanceSetters_emitOldThenNew() public {
         RejectAllVettingPolicy rejectAll = new RejectAllVettingPolicy();
         vm.expectEmit(true, true, true, true);

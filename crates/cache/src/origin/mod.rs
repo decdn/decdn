@@ -384,8 +384,9 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     ///
     /// Returning [`OriginRangeFetch::Unsupported`] is the correct, expected
     /// answer whenever the optimization can't apply (no `Range`/`206`, a short
-    /// object) — it is not an error. Only genuine transport / permission
-    /// failures surface as [`OriginPullError`].
+    /// object) — it is not an error. A transport or permission failure, or
+    /// an object the origin refuses to read (the filesystem origin's symlink
+    /// escape or non-regular file), surfaces as [`OriginPullError`].
     fn fetch_range_data(
         &self,
         _hash: Hash,
@@ -411,8 +412,10 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// shipped adapters override it.
     ///
     /// Like [`Self::fetch_range_data`], returning [`OutboardFetch::Unsupported`]
-    /// or [`OutboardFetch::NotFound`] is never an error — only a genuine
-    /// transport / permission failure surfaces as [`OriginPullError`].
+    /// or [`OutboardFetch::NotFound`] is never an error. A transport or
+    /// permission failure, or an object the origin refuses to read (the
+    /// filesystem origin's symlink escape or non-regular file), surfaces as
+    /// [`OriginPullError`].
     fn fetch_outboard(
         &self,
         _hash: Hash,

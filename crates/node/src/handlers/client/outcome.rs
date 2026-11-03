@@ -111,6 +111,10 @@ pub(super) enum ServeStop {
     VoucherRejected,
     /// The pool can no longer fund the floor credit (`PoolExhausted`).
     PoolExhausted,
+    /// The pool closed under the stream, or it is `Closing` and its dispute
+    /// deadline falls inside the node's redeem margin. The wire reason is
+    /// `PoolExhausted`.
+    PoolClosed,
     /// The signer's shared cap drained at other nodes (`SignerCapExhausted`).
     SignerCapExhausted,
     /// A blacklist takedown landed for the hash.
@@ -129,11 +133,30 @@ impl ServeStop {
         match self {
             Self::VoucherRejected => "voucher_rejected",
             Self::PoolExhausted => "pool_exhausted",
+            Self::PoolClosed => "pool_closed",
             Self::SignerCapExhausted => "signer_cap_exhausted",
             Self::Takedown => "takedown",
             Self::ProofBudgetExhausted => "proof_budget_exhausted",
             Self::BlobTooLarge => "blob_too_large",
         }
+    }
+}
+
+/// Whether a serve that ended as `end` leaves its unpaid bytes as floor debt
+/// (ADR 003 §Pool solvency, floor debt). Debt is the price of the client's own
+/// conduct: it left ([`is_peer_attributable`]), sent a voucher the node rejected,
+/// or spent its proof budget. Every other end owes nothing — a node or upstream
+/// fault, a takedown, a held-bytes cap, and the funding stops the node takes for a
+/// drained pool or signer cap. An end with nothing unpaid (completed, refused,
+/// reset before delivery) owes nothing either way.
+pub(super) fn owes_floor_debt(end: &anyhow::Result<ServeEnd>) -> bool {
+    match end {
+        Err(e) => is_peer_attributable(e),
+        Ok(ServeEnd::Stopped { stop, .. }) => matches!(
+            stop,
+            ServeStop::VoucherRejected | ServeStop::ProofBudgetExhausted
+        ),
+        Ok(ServeEnd::Completed { .. } | ServeEnd::Refused(_) | ServeEnd::Reset(_)) => false,
     }
 }
 
@@ -158,6 +181,7 @@ impl ServeEnd {
             Self::Stopped { stop, .. } => match stop {
                 ServeStop::VoucherRejected => metrics.serve_stream_voucher_rejected(),
                 ServeStop::PoolExhausted => metrics.serve_stream_midstream_pool_exhausted(),
+                ServeStop::PoolClosed => metrics.serve_stream_midstream_pool_closed(),
                 ServeStop::SignerCapExhausted => {
                     metrics.serve_stream_midstream_signer_cap_exhausted();
                 }

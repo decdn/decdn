@@ -322,18 +322,17 @@ pub struct BlockchainConfig {
     /// scale; sizing this precisely per ADR 003 is governance/ops policy, not a
     /// build-time constant.
     pub pool_min_remaining_deposit_micro_usdc: Option<u64>,
-    /// Per-signer LIVE concurrency cap `k`, counted in ramp-start credit windows
-    /// (ADR 003 § Pool solvency, per-signer floor isolation): the most live
-    /// un-vouchered floor reservation any ONE capability signer may hold against a
-    /// pool, `k · one credit window`, underneath the pool-wide `remaining − M`
-    /// ceiling. The credit window is its floor (one chunk plus one chunk group)
-    /// normally, and at `credit_ramp_divisor == 0` it is `credit_max` raised to
-    /// that floor.
+    /// Per-signer floor cap `k`, counted in ramp-start credit windows (ADR 003
+    /// § Pool solvency, per-signer floor isolation): the most live un-vouchered floor
+    /// reservation plus floor debt any ONE capability signer may hold against a pool,
+    /// `k · one credit window`, underneath the pool-wide `remaining − M` ceiling.
+    /// The credit window is its floor (one chunk plus one chunk group) normally,
+    /// and at `credit_ramp_divisor == 0` it is `credit_max` raised to that floor.
     ///
-    /// This bounds concurrency, not paid throughput: a signer that pays its vouchers
+    /// This bounds unpaid credit, not paid throughput: a signer that pays its vouchers
     /// releases that stream's reservation, so its cap recycles and a stream already
-    /// under way is never slowed. It carries no permanent memory and never penalizes a
-    /// signer for quitting.
+    /// under way is never slowed. A stream that ends unpaid leaves its floor as floor
+    /// debt, which only the signer's later payment clears.
     ///
     /// The window is the unit actually being rationed: honest need is `concurrent
     /// un-vouchered streams × one window` regardless of the pool's size, so an absolute
