@@ -1002,6 +1002,26 @@ contract PaymentPoolTest is Test {
         _redeemOne(id, signer, provider, 301e6, 30_000_000, sig, _cap(id, SPENDING_CAP, expiry));
     }
 
+    /// @notice A zero-cap or already-expired capability is never recorded, so
+    ///         it cannot take the signer's one registration slot ahead of the
+    ///         live capability the node served against.
+    function test_redeem_deadCapabilityDoesNotClaimTheSlot() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 0, expiry));
+        uint64 past = uint64(block.timestamp);
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, past));
+        (uint64 cap,,) = pool.authorized(id, signer);
+        assertEq(cap, 0, "neither dead capability was recorded");
+
+        vm.prank(provider);
+        uint256 paid = _redeemOne(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry)
+        );
+        assertEq(paid, 300e6, "the live capability still registers and pays");
+    }
+
     function test_redeem_expiredCapabilityPaysNothing() public {
         bytes32 id = _open();
         uint64 nearExpiry = uint64(block.timestamp + 1 days);

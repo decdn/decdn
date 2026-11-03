@@ -820,6 +820,10 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ) internal {
         Authorization storage a = authorized[poolId][signer];
         if (a.cap != 0 || a.expiry != 0) return;
+        // A capability that can pay nothing is never recorded, so it cannot
+        // claim the signer's one registration slot ahead of a live one.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (spendingCap == 0 || expiry <= block.timestamp) return;
 
         bytes32 structHash = keccak256(abi.encode(CAPABILITY_TYPEHASH, signer, spendingCap, poolId, expiry));
         bytes32 digest = _hashTypedDataV4(structHash);
