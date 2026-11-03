@@ -776,18 +776,25 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     {
         if (hash == bytes32(0)) revert ZeroHash();
         HashEntry storage e = _hashEntries[region][hash];
-        // Re-adding refreshes `addedAt` (resets the filing window) and overwrites
-        // the audit-trail reason with the current notice's.
-        e.addedAt = uint64(block.timestamp);
-        // ADR 011 § Compliance Window. Stamped, not derived — see the `HashEntry`
-        // doc. A re-add restamps, which is correct: a fresh notice restarts the
-        // grace, and re-adding under governance is exactly how an emergency
-        // entry is ratified into a permanent one (`emergency` back to false).
-        e.effectiveAt = uint64(block.timestamp) + (emergency ? emergencyComplianceWindow : complianceWindow);
-        e.emergency = emergency;
-        e.category = uint8(category);
+        if (_isLive(region, hash)) {
+            // A live entry keeps `addedAt` and `effectiveAt`: moving
+            // `effectiveAt` later would void slash evidence for serves made
+            // after the entry took effect. Re-adding under governance ratifies an
+            // emergency entry into a permanent one (`emergency` back to false);
+            // an emergency re-add may only escalate the category.
+            if (!emergency) e.emergency = false;
+            else if (uint8(category) > e.category) e.category = uint8(category);
+        } else {
+            e.addedAt = uint64(block.timestamp);
+            // ADR 011 § Compliance Window. Stamped, not derived — see the
+            // `HashEntry` doc.
+            e.effectiveAt = uint64(block.timestamp) + (emergency ? emergencyComplianceWindow : complianceWindow);
+            e.emergency = emergency;
+            e.category = uint8(category);
+        }
+        // The audit-trail reason always takes the current notice's.
         hashReason[region][hash] = reason;
-        // Idempotent: a re-add restamps the entry and leaves the index alone.
+        // Idempotent: a re-add leaves the index alone.
         // slither-disable-next-line unused-return
         _regionHashes[region].add(hash);
         emit HashBlacklisted(region, hash, reason);
