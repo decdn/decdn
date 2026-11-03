@@ -51,7 +51,7 @@ Before any on-chain or protocol activity:
    payment. To be recognised as an *authorized origin* for a registered namespace, the
    namespace's publisher must seat the operator via `OriginAssignment.addOrigin`, which
    requires the publisher itself to have been vetted by governance ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)).
-   Content served under namespace 0 (`namespaceId == 0`) has no origin role — no operator can be an
+   Namespace 0 (`namespaceId == 0`) has no origin role — no operator can be an
    authorized origin for it (see
    [ADR 011 § Namespace 0](011-content-takedown.md#namespace-0)).
    These steps run on the publisher's or governance's timeline, independent of node

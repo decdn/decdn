@@ -248,7 +248,7 @@ The publisher and namespace primitives are defined in [ADR 002 § Publisher Iden
 
 - A **publisher** is an Ethereum address that owns at least one namespace in `PublisherRegistry` (acquired implicitly on the first successful `createNamespace()` call; no separate registration step).
 - A **namespace** is a publisher-owned `uint256` identifier for a content set and the unit of origin addressing; a request names the namespace its content is published under.
-- **Namespace 0** (`namespaceId == 0`) has no publisher and no authorized origins; content served under it is best-effort from cache/DHT ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)). Origin assignment applies only to registered namespaces.
+- **Namespace 0** (`namespaceId == 0`) has no publisher and no authorized origins. On a request it means only that the requester does not name the namespace ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)). Origin assignment applies only to registered namespaces.
 
 ### Two planes: vetting and seating
 
@@ -388,7 +388,7 @@ The backstops are reactive, not preventive. Governance removes a bad origin, un-
 
 ### Namespace 0
 
-`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. `addOrigin(0, op)` reverts for every caller, because `ownerOf(0)` is the zero address. Namespace-0 content is served best-effort from cache or DHT-discovered holders ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)); the origin role does not apply to it.
+`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. `addOrigin(0, op)` reverts for every caller, because `ownerOf(0)` is the zero address. No content lives under namespace 0: content enters the network only through a seated origin of a registered namespace, whose origin attestation every DHT record carries ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0), [ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)).
 
 ### Unassigned namespaces
 
@@ -418,7 +418,7 @@ Net: blacklisting an operator is O(1) on-chain (one ejection call), consumers en
 
 ### Permissionless property
 
-This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for registered namespaces. Cache-only serving remains permissionless — any bonded operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership; only the *origin* role becomes DAO-gated, via the publisher-vetting plane. Namespace 0 has no authorized origins at all. See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the updated permissionless-role model.
+This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for registered namespaces. Cache-only serving remains permissionless — any bonded operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership; only the *origin* role becomes DAO-gated, via the publisher-vetting plane. Discovery follows the origin role: a cached copy is discoverable only with the attestation of the seated origin that served it ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). Namespace 0 has no authorized origins at all. See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the updated permissionless-role model.
 
 ## Node Behavior
 
@@ -532,7 +532,7 @@ A slash requires an active challenger submitting evidence of a post-window deliv
 - Local denylist preserves operator autonomy for direct legal notices
 - Origin assignment authority gives publishers a protocol-level way to commit specific operators to serving their content; the operator-set size is a publisher/governance decision, not a contract-enforced floor
 - Symmetric blacklist/assignment infrastructure: a blacklisted operator is treated as unauthorized at every runtime check across every namespace they were authorized to serve, with lazy storage cleanup (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist))
-- Namespace 0 (`namespaceId == 0`) has no authorized origins and its content is served best-effort from cache/DHT; only registered namespaces carry a DAO-authorized origin set, so on-chain state is bounded by the number of namespaces rather than by content volume
+- Namespace 0 (`namespaceId == 0`) has no authorized origins and holds no content; only registered namespaces carry a DAO-authorized origin set, so on-chain state is bounded by the number of namespaces rather than by content volume
 
 ### Negative
 
