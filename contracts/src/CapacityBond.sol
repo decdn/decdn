@@ -1233,18 +1233,6 @@ contract CapacityBond is
         if (refund != 0) IERC20(address(token)).safeTransfer(operator, refund);
     }
 
-    /// @notice Emergency: force-resolve an `AppealOpen` slash on the upheld path
-    ///         (50% challenger / 50% burn) when the normal `SlashAppeal` flow
-    ///         cannot — e.g. `SLASH_APPEAL_ROLE` was revoked mid-migration,
-    ///         wedging the record's escrow with no caller able to drive the
-    ///         settle hooks. Governance-gated escape hatch (ADR 028); resolves a
-    ///         stuck record exactly as `finalizeUnappealedSlash` would have.
-    /// @dev Reuses `SlashEscrowLib.settleUpheld`, so it can only act on an
-    ///      `AppealOpen` record and produces an identical 50/50 distribution.
-    function forceResolveStuckAppeal(uint256 slashId) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
-        escrowedTotal -= SlashEscrowLib.settleUpheld(_slashRecords, token, slashId, slashCounter);
-    }
-
     // The multi-slash zero-out recompute lives in
     // [`SlashEscrowLib._recomputeSlashedAtEpoch`](SlashEscrowLib.sol), invoked
     // by `settleAppealGranted` via `SlashEscrowLib.settleGranted`.
