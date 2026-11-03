@@ -84,6 +84,8 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     uint256 internal constant AGE_RAMP_MONTHS_CEILING = 24;
     uint256 internal constant SECONDS_PER_MONTH = 30 days;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
+    /// @dev `TimelockController.PROPOSER_ROLE`.
+    bytes32 internal constant PROPOSER_ROLE = keccak256("PROPOSER_ROLE");
     uint256 internal constant RAMP_SCALE = 1e18;
 
     /// @dev Mbps (megabits/s) → bytes/s: `1e6 / 8`. Exact.
@@ -101,6 +103,8 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
 
     error ZeroFeeRouter();
     error ZeroCapacityBond();
+    /// @notice `propose` before this Governor holds the timelock's `PROPOSER_ROLE`.
+    error GovernorNotProposer();
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     /// @notice `setVoteCapBps` rejects any value that does not strictly
     ///         decrease the current cap. The cap is decrease-only.
@@ -494,6 +498,23 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
 
     function _requireDelegatee(address delegator, address caller) private view {
         if (_delegatee[delegator] != caller) revert NotDelegatee(delegator, caller);
+    }
+
+    /// @notice Proposals open only once this Governor holds the timelock's
+    ///         `PROPOSER_ROLE`. During the ADR 009 bootstrap-multisig phase the
+    ///         Governor cannot queue, and an unqueued `Succeeded` proposal never
+    ///         expires, so a proposal passed by a thin early electorate would
+    ///         otherwise become executable once the roles move to the Governor.
+    function propose(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        string memory description
+    ) public override returns (uint256) {
+        if (!TimelockController(payable(timelock())).hasRole(PROPOSER_ROLE, address(this))) {
+            revert GovernorNotProposer();
+        }
+        return super.propose(targets, values, calldatas, description);
     }
 
     // -----------------------------------------------------------------

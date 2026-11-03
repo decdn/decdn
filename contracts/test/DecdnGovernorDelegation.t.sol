@@ -82,6 +82,8 @@ contract DecdnGovernorDelegationTest is Test {
         timelock = new TimelockController(2 days, empty, exec, address(this));
 
         gov = new DecdnGovernor(IFeeRouter(address(feeRouter)), ICapacityBond(address(bond)), timelock);
+        // Production wiring: proposals open once the Governor proposes on the timelock.
+        timelock.grantRole(timelock.PROPOSER_ROLE(), address(gov));
 
         (proposer, proposerKey) = makeAddrAndKey("proposer");
         (opA, opAKey) = makeAddrAndKey("opA");
@@ -394,6 +396,23 @@ contract DecdnGovernorDelegationTest is Test {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(DecdnGovernor.InvalidDelegationNonce.selector, opA, nonce + 1, nonce));
         gov.delegateBySig(opA, hot, nonce, expiry, sig);
+    }
+
+    /// @notice Proposals open only while the Governor holds the timelock's
+    ///         PROPOSER_ROLE, so nothing passed during the bootstrap phase can
+    ///         execute after the hand-off.
+    function test_propose_revertsUntilGovernorIsProposer() public {
+        timelock.revokeRole(timelock.PROPOSER_ROLE(), address(gov));
+        vm.expectRevert(DecdnGovernor.GovernorNotProposer.selector);
+        this.openProposal();
+
+        timelock.grantRole(timelock.PROPOSER_ROLE(), address(gov));
+        this.openProposal();
+    }
+
+    /// @dev External wrapper so `expectRevert` targets the propose call.
+    function openProposal() external {
+        _activeProposal();
     }
 
     function test_delegateBySig_tamperedSignatureReverts() public {
