@@ -113,10 +113,10 @@ pub(crate) struct Plan {
 
 /// Read the operator's registry state.
 ///
-/// `isActive` is the contract's own composite predicate (registered, bonded
-/// over `minBond`, no unbonding request in flight), so it is NOT what
+/// `isActive` is the contract's own composite predicate (registered, active
+/// bond over the operator's floor, not ejected), so it is NOT what
 /// `deregisterNode` gates on — that reads `_nodes[operator].active` alone. An
-/// operator mid-unbonding is `isActive == false` yet still deregisterable. The
+/// operator below its floor is `isActive == false` yet still deregisterable. The
 /// registered-set membership read below is the precise signal; `isActive` is
 /// not consulted.
 async fn build_plan<P: alloy::providers::Provider + Clone>(

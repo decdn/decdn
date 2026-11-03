@@ -314,7 +314,8 @@ contract CapacityBond is
     // Storage — region attestation (ADR 030)
     // -----------------------------------------------------------------
 
-    /// @notice Previous-region snapshot taken on each `updateRegion` call.
+    /// @notice Previous-region snapshot taken on each region change, by
+    ///         `updateRegion` or by a re-registration into a new region.
     ///         Consulted by the ADR 030 § Region-stability window blacklist-scope
     ///         ripening predicate (*"a node is in scope iff the entry is global,
     ///         OR entry.region == regionHint, OR (block.timestamp -
@@ -629,12 +630,6 @@ contract CapacityBond is
         uint256 newBalance = oldBalance + amount;
         activeBond[msg.sender] = newBalance;
 
-        // First-bond timestamp is set the moment the operator's `activeBond`
-        // becomes non-zero, never overwritten (ADR 036 § Formula).
-        if (oldBalance == 0 && _firstBondedAt[msg.sender] == 0) {
-            _firstBondedAt[msg.sender] = uint64(block.timestamp);
-        }
-
         // Grandfather the entry floor: capture the live `minBond` each time the
         // operator crosses UP through it (ADR 026 § Minimum bond is
         // non-retroactive). This is the entry transition — `registerNode` and
@@ -643,9 +638,12 @@ contract CapacityBond is
         // Ongoing active status (`isActive`) and slash auto-ejection read this
         // floor, never the live `minBond`, so a later `minBond` raise is
         // non-retroactive. Re-crossing after a full ejection re-grandfathers at
-        // the then-current `minBond`.
+        // the then-current `minBond`. The first crossing also starts the
+        // operator's tenure, never overwritten (ADR 036 § Behaviors that follow
+        // from the formula), so a dust bond cannot pre-age an address.
         if (oldBalance < minBond && newBalance >= minBond) {
             bondFloorAtActivation[msg.sender] = minBond;
+            if (_firstBondedAt[msg.sender] == 0) _firstBondedAt[msg.sender] = uint64(block.timestamp);
         }
 
         // Slash auto-ejection (ADR 026) is recoverable by re-bonding, but a
@@ -747,15 +745,17 @@ contract CapacityBond is
     ///         The bond released this way is exposed for the same unbonding
     ///         window as any other exit — `_reduceBondAtTier` reaches bond
     ///         sitting in the queue — so this shortens no exposure.
-    function declareMbps(uint256 mbps) external whenNotPaused {
+    function declareMbps(uint256 mbps) external {
         // Checked before the band so a zero declaration from an inactive
         // operator skips BOTH gates: the band floor (bounded to
         // `[MIN_CAPACITY_FLOOR_MBPS, MIN_CAPACITY_CEILING_MBPS]` by
         // `_enforceMinCapacityBounds`, so governance can never lower it to 0 and
         // collapse this branch into the normal one) and the curve check, which a
-        // slashed operator can no longer meet.
+        // slashed operator can no longer meet. The release is an exit step, so
+        // like `requestUnbond` and `deregisterNode` it is not pausable.
         bool release = mbps == 0 && !_nodes[msg.sender].active;
         if (!release) {
+            _requireNotPaused();
             if (mbps < minCapacityMbps || mbps > maxCapacityMbps) {
                 revert DeclaredCapacityOutOfBand({ mbps: mbps, floor: minCapacityMbps, ceiling: maxCapacityMbps });
             }
@@ -816,12 +816,23 @@ contract CapacityBond is
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < readyAt) revert RegionCooldownActive(readyAt);
 
-        string memory oldRegion = info.regionHint;
-        regionPrev[msg.sender] = oldRegion;
-        info.regionHint = newRegion;
-        regionLastChanged[msg.sender] = uint64(block.timestamp);
+        emit RegionUpdated(info.nodeId, _setRegion(info, newRegion), newRegion);
+    }
 
-        emit RegionUpdated(info.nodeId, oldRegion, newRegion);
+    /// @dev ADR 030 § Region-stability window: a region change snapshots the
+    ///      old region into `regionPrev`, so its entries keep applying until the
+    ///      change ripens; an unchanged region keeps the existing snapshot.
+    ///      `regionLastChanged` is stamped on every call, so it is never 0 for an
+    ///      active node, and both the ripening window and the `updateRegion`
+    ///      cooldown run from it. A re-registration restarts the window.
+    function _setRegion(NodeInfo storage info, string calldata newRegion) internal returns (string memory oldRegion) {
+        oldRegion = info.regionHint;
+        if (keccak256(bytes(oldRegion)) != keccak256(bytes(newRegion))) {
+            regionPrev[msg.sender] = oldRegion;
+            info.regionHint = newRegion;
+        }
+        // forge-lint: disable-next-line(block-timestamp)
+        regionLastChanged[msg.sender] = uint64(block.timestamp);
     }
 
     // -----------------------------------------------------------------
@@ -851,16 +862,11 @@ contract CapacityBond is
         nodeIdToAddress[nodeId] = msg.sender;
         addressToNodeId[msg.sender] = nodeId;
         bindingNonce[msg.sender] = usedBindingNonce + 1;
-        // Capture the grandfathered entry floor if `bond()` did not. An operator
-        // can satisfy the `activeBond >= minBond` precondition without a `bond()`
-        // up-crossing — when governance lowered `minBond` after the operator
-        // bonded — which would otherwise leave the floor at 0 and let `isActive`
-        // treat them as always above it (`activeBond >= 0`). registerNode is an
-        // activation transition gated on `activeBond >= minBond`, so the live
-        // `minBond` is the correct entry floor.
-        if (bondFloorAtActivation[msg.sender] == 0) {
-            bondFloorAtActivation[msg.sender] = minBond;
-        }
+        // registerNode is an activation transition gated on `activeBond >=
+        // minBond`, so the live `minBond` is the entry floor. A floor left by an
+        // earlier `bond()` crossing may sit above or below it after a `minBond`
+        // change; registration always records the live value.
+        bondFloorAtActivation[msg.sender] = minBond;
         _writeNodeInfo(nodeId, multiaddrs, regionHint);
         _addToRegisteredSet(msg.sender);
 
@@ -946,13 +952,7 @@ contract CapacityBond is
         info.active = true;
         info.lastMultiaddrUpdate = uint64(block.timestamp);
         info.multiaddrs = multiaddrs;
-        info.regionHint = regionHint;
-        // ADR 030 § Region-stability window: stamp when the current region took
-        // effect so it is never 0 for an active node. The ripening window and
-        // the `updateRegion` cooldown both run from this stamp; a re-registration
-        // (re-onboarding) restarts the window, which is correct.
-        // forge-lint: disable-next-line(block-timestamp)
-        regionLastChanged[msg.sender] = uint64(block.timestamp);
+        _setRegion(info, regionHint);
     }
 
     /// @notice Leave the active set. Deactivates the node without touching the
@@ -1233,18 +1233,6 @@ contract CapacityBond is
         if (refund != 0) IERC20(address(token)).safeTransfer(operator, refund);
     }
 
-    /// @notice Emergency: force-resolve an `AppealOpen` slash on the upheld path
-    ///         (50% challenger / 50% burn) when the normal `SlashAppeal` flow
-    ///         cannot — e.g. `SLASH_APPEAL_ROLE` was revoked mid-migration,
-    ///         wedging the record's escrow with no caller able to drive the
-    ///         settle hooks. Governance-gated escape hatch (ADR 028); resolves a
-    ///         stuck record exactly as `finalizeUnappealedSlash` would have.
-    /// @dev Reuses `SlashEscrowLib.settleUpheld`, so it can only act on an
-    ///      `AppealOpen` record and produces an identical 50/50 distribution.
-    function forceResolveStuckAppeal(uint256 slashId) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
-        escrowedTotal -= SlashEscrowLib.settleUpheld(_slashRecords, token, slashId, slashCounter);
-    }
-
     // The multi-slash zero-out recompute lives in
     // [`SlashEscrowLib._recomputeSlashedAtEpoch`](SlashEscrowLib.sol), invoked
     // by `settleAppealGranted` via `SlashEscrowLib.settleGranted`.
@@ -1486,12 +1474,11 @@ contract CapacityBond is
     function isActive(address operator) public view returns (bool) {
         // Ongoing active status tests the grandfathered `bondFloorAtActivation`,
         // not the live `minBond`: a `minBond` raise never de-activates an
-        // already-active operator (ADR 026 § Operator bond). A partial unbond
-        // below the operator's own floor still de-activates once the unbonding
-        // request clears — the floor binds the operator's own bond reductions.
-        // slither-disable-next-line incorrect-equality
-        return _nodes[operator].active && activeBond[operator] >= bondFloorAtActivation[operator]
-            && unbondingOf[operator].amount == 0 && !ejected[operator];
+        // already-active operator (ADR 026 § Operator bond). `requestUnbond`
+        // moves the released amount out of `activeBond` at once, so a partial
+        // unbond that retains the floor keeps the operator active, and one that
+        // drops below the floor de-activates it.
+        return _nodes[operator].active && activeBond[operator] >= bondFloorAtActivation[operator] && !ejected[operator];
     }
 
     /// @inheritdoc ICapacityBond
@@ -1499,8 +1486,12 @@ contract CapacityBond is
         return _firstBondedAt[operator];
     }
 
-    /// @inheritdoc ICapacityBond
-    function slashedAtEpoch(address operator) external view override returns (uint64) {
+    /// @notice The max epoch among the operator's standing slashes plus one,
+    ///         or 0 when none stands (the +1 keeps an epoch-0 slash distinct
+    ///         from "unslashed"). Set by `slash()`, recomputed by
+    ///         `settleAppealGranted`. An indexer read; `DecdnGovernor` reads the
+    ///         slash records instead (ADR 036 § Slashing zero-out).
+    function slashedAtEpoch(address operator) external view returns (uint64) {
         return _slashedAtEpoch[operator];
     }
 
@@ -1595,8 +1586,8 @@ contract CapacityBond is
     /// @dev    Returns the raw `_registeredAddrs` page (every operator whose node
     ///         record is registered, regardless of bond/unbonding/ejection) plus
     ///         a parallel `active[]` where `active[i] == isActive(page[i].ethAddress)`.
-    ///         The two projections diverge on purpose: an operator mid-unbonding is
-    ///         `active[i] == false` but still present in `page` because it remains
+    ///         The two projections diverge on purpose: an operator whose bond sits
+    ///         below its floor is `active[i] == false` but still present in `page` because it remains
     ///         payable, so the off-chain node→address bindings must survive. Computing
     ///         `active` here lets callers derive the true active-membership set from a
     ///         single call, with no per-entry `isActive` round-trip (issue #1565).

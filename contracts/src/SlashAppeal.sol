@@ -98,6 +98,12 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     /// @notice Timestamp of the operator's last GRANTED appeal (frequency cap).
     mapping(address operator => uint64) public lastAcceptedAppealAt;
 
+    /// @notice Whether the operator has an unresolved appeal. One appeal is open
+    ///         per operator at a time, so a grant always lands before the next
+    ///         appeal's frequency-cap check (ADR 028 § Hard caps and frequency
+    ///         limits).
+    mapping(address operator => bool) public hasOpenAppeal;
+
     /// @notice `block.timestamp` at which the current pause began; 0 when not
     ///         paused. The pause duration is not accumulated locally — on
     ///         unpause it is credited to `CapacityBond.pausedTotal` (the single
@@ -135,6 +141,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     error CallerNotOperator(address operator);
     error FrequencyCapHit(uint64 nextAvailableAt);
     error AppealAlreadyExists(uint256 slashId);
+    error AppealPending(address operator);
     error AppealNotOpen(uint256 slashId);
     error AppealNotFastTracked(uint256 slashId);
     error ReviewWindowOpen(uint64 readyAt);
@@ -191,8 +198,11 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     ///      notably the challenger, who earns 50% of an upheld slash — burn the
     ///      operator's only chance at recourse with a junk appeal. Requiring the
     ///      operator closes that griefing/front-running vector (ADR 028 § Contract surface).
+    ///      Not pausable: filing is the operator's recourse, and the filing
+    ///      window keeps running for `finalizeUnappealedSlash` while this
+    ///      contract is paused, so a pause here must not bar the filing.
     // slither-disable-next-line reentrancy-no-eth,unused-return
-    function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external override nonReentrant whenNotPaused {
+    function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external override nonReentrant {
         // `slashRecords` is a view on the trusted, immutable `CapacityBond`;
         // the subsequent state writes are guarded by `nonReentrant`.
         // aderyn-ignore-next-line(reentrancy-state-change)
@@ -200,6 +210,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
         if (operator == address(0)) revert UnknownSlash(slashId);
         if (msg.sender != operator) revert CallerNotOperator(operator);
         if (_appeals[slashId].status != AppealStatus.None) revert AppealAlreadyExists(slashId);
+        if (hasOpenAppeal[operator]) revert AppealPending(operator);
 
         uint64 last = lastAcceptedAppealAt[operator];
         if (last != 0) {
@@ -219,6 +230,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
             fastTrackedAt: 0,
             status: AppealStatus.Open
         });
+        hasOpenAppeal[operator] = true;
 
         IERC20(address(token)).safeTransferFrom(msg.sender, address(this), bond);
         // Locks the escrow + enforces the filing-window deadline on CapacityBond.
@@ -254,7 +266,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
         if (a.status != AppealStatus.Open) revert AppealNotOpen(slashId);
         uint256 bondBurned = a.bond;
         a.bond = 0;
-        a.status = AppealStatus.Resolved;
+        _markResolved(a);
 
         ICapacityBondSlashEscrow(address(capacityBond)).settleAppealUpheld(slashId);
         if (bondBurned != 0) token.burn(bondBurned);
@@ -272,7 +284,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
         address appellant = a.appellant;
         address operator = a.operator;
         a.bond = 0;
-        a.status = AppealStatus.Resolved;
+        _markResolved(a);
         lastAcceptedAppealAt[operator] = uint64(block.timestamp);
 
         ICapacityBondSlashEscrow(address(capacityBond)).settleAppealGranted(slashId);
@@ -289,7 +301,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
         if (a.status != AppealStatus.FastTracked) revert AppealNotFastTracked(slashId);
         uint256 bondBurned = a.bond;
         a.bond = 0;
-        a.status = AppealStatus.Resolved;
+        _markResolved(a);
 
         ICapacityBondSlashEscrow(address(capacityBond)).settleAppealUpheld(slashId);
         if (bondBurned != 0) token.burn(bondBurned);
@@ -314,7 +326,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
             if (block.timestamp < readyAt) revert ReviewWindowOpen(readyAt);
             uint256 bondBurned = a.bond;
             a.bond = 0;
-            a.status = AppealStatus.Resolved;
+            _markResolved(a);
             ICapacityBondSlashEscrow(address(capacityBond)).settleAppealUpheld(slashId);
             if (bondBurned != 0) token.burn(bondBurned);
             emit AppealLapsed(slashId, 1);
@@ -329,7 +341,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
             address appellant = a.appellant;
             address operator = a.operator;
             a.bond = 0;
-            a.status = AppealStatus.Resolved;
+            _markResolved(a);
             lastAcceptedAppealAt[operator] = uint64(block.timestamp);
             ICapacityBondSlashEscrow(address(capacityBond)).settleAppealGranted(slashId);
             if (bondRefund != 0) IERC20(address(token)).safeTransfer(appellant, bondRefund);
@@ -337,6 +349,12 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
             return;
         }
         revert AppealNotOpen(slashId);
+    }
+
+    /// @dev Close `a` and free its operator's appeal slot.
+    function _markResolved(Appeal storage a) internal {
+        a.status = AppealStatus.Resolved;
+        delete hasOpenAppeal[a.operator];
     }
 
     // -----------------------------------------------------------------

@@ -29,8 +29,10 @@ DAO vote weight is the trailing-window sum of an operator's served bytes, multip
 ```
 vote_weight(op, t) = min(
     capped_served_window(op, t),
-    voteCapBps × total_bytes_window(t) / 10_000
+    voteCapBps × others_bytes_window(op, t) / (10_000 − voteCapBps)
 ) × age_ramp(op, t)
+
+others_bytes_window(op, t) = total_bytes_window(t) − Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} FeeRouter.bytesPerEpoch[op][e]
 
 capped_served_window(op, t) = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} min(
     FeeRouter.bytesPerEpoch[op][e],
@@ -58,18 +60,20 @@ Each epoch's counted bytes are capped at what the tier the operator declared at 
 - **A registered operator with zero served bytes in the trailing window has zero vote.** The bond gates eligibility to vote; it does not directly grant weight.
 - **Declared capacity caps vote weight per epoch; it never grants weight.** An operator's counted bytes for epoch `e` cannot exceed what `declaredMbpsAtEpoch(op, e)` could physically deliver over that epoch. This is a deliberate consequence: an operator that declared zero capacity in an epoch contributes zero vote weight for that epoch, however many bytes it served.
 - **A fresh operator who serves heavily on day 1 still ramps in over `age_ramp_months`.** `age_ramp` is the tenure-buy-in defense; it stays defense-in-depth on top of bytes.
+- **Only active operators add served bytes.** `PaymentPool.redeemMany` pays only an operator with a NodeId binding, and routes the redeemed bytes into `FeeRouter`'s counters only while that operator `isActive`. An unbonded or unregistered address cannot raise the quorum total with self-paid bytes.
+- **Tenure starts at the first `minBond` crossing.** `firstBondedAt` records the first time the operator's active bond reached `minBond`. A dust bond below `minBond` does not start the ramp, so an operator cannot pre-age an address for the cost of one base unit.
 - **Per-operator cap is computed against the bytes-weighted total at the same timepoint**, not against any historical or capacity-derived total. The cap clamp applies pre-multiplication by `age_ramp`.
 - **`quorum(t)` and `proposalThreshold(t)` use `FeeRouter.totalBytesInWindow(endEpoch(t), N)` as the denominator — an *upper-bound proxy* for `Σ_op vote_weight(op, t)`, not the exact sum.** The exact sum applies the per-operator cap and the `age_ramp` multiplier (both `≤ 1`), so `Σ_op vote_weight ≤ totalBytesInWindow` always. Calibrating quorum against the proxy is intentionally conservative — it makes quorum strictly harder to reach than against the true Σ — and avoids the gas of summing per-operator capped contributions on every `castVote`. The proxy is exact when no operator is above the cap and all operators are past `age_ramp_months` of tenure (the steady state).
 
 ### Slashing zero-out
 
-On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp) + 1` (the `+1` reserves 0 for "unslashed" so an epoch-0 slash is not collapsed with the sentinel; the getter returns this raw, and `_getVotes` decodes `slashed = slashStamp - 1` before comparing). The Governor's `_getVotes(op, t)` returns zero whenever `endEpoch(t) - N + 1 <= slashed <= endEpoch(t)` — i.e. whenever the slash falls inside the trailing window of fully-elapsed epochs. A slash in the in-progress epoch `epoch(t)` is above `endEpoch(t)`, so it zeroes the vote only once that epoch elapses (it tracks the byte window). Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
+Every `CapacityBond.slash` appends a `SlashRecord` (with its `slashedAt` timestamp and escrow `status`) to the operator's slash list. The Governor's `_getVotes(op, t)` returns zero whenever the operator has a **standing** slash — one NOT in the `Reversed` state (`Escrowed` / `AppealOpen` / `Upheld` all still stand) — with `slashedAt` in `[(endEpoch(t) - N + 1) × epochLength, t]`. The lower edge is the start of the trailing byte window. The upper edge is the timepoint itself, so a slash in the in-progress epoch zeroes every snapshot taken after it, and a slash after `t` never zeroes that snapshot. Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
 
-On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path (the path that determines the operator was wrongly slashed), `SlashAppeal` calls `CapacityBond.settleAppealGranted`, which refunds the escrowed TOKEN and **recomputes** `slashedAtEpoch[op]` (the internal `_recomputeSlashedAtEpoch`), clearing it to zero only when no slash stands. An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the field stamped — the slash stands.
+The Governor walks the operator's slash list newest first through `operatorSlashCount`, `operatorSlashIdAt` and `getSlashRecord`, and stops at the first slash before the window. Every record counts, so a later slash cannot hide an earlier in-window one. On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path, `CapacityBond.settleAppealGranted` marks that record `Reversed`, so it no longer zeroes the vote while any other standing slash still does. An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the record standing. The walk is bounded in practice because a slashed operator auto-ejects below `minBond / 2`.
 
-**Multi-slash watermark semantics.** `slashedAtEpoch[op]` is a single scalar but represents the **max epoch among the operator's still-standing slashes** — those NOT in the `Reversed` state (`Escrowed` / `AppealOpen` / `Upheld` all still stand). Because slashes are minted in non-decreasing epoch order, a new slash always raises the watermark to its own epoch. A granted appeal marks one record `Reversed` and re-derives the watermark as the max epoch over the operator's remaining non-`Reversed` records, clearing to zero only if none remain. This closes the multi-outstanding-slash hole where granting the appeal of one slash (e.g. the most recent) would otherwise clear the watermark while an *earlier* slash still stands — wrongly restoring vote weight for the unresolved slash. The re-derivation scans the operator's own slash records; the per-operator record list is bounded in practice because a slashed operator auto-ejects below `minBond / 2`.
+`CapacityBond` also keeps `slashedAtEpoch[op]`, the max epoch among the operator's standing slashes plus one (0 for "unslashed"), as an indexer read. The Governor does not read it.
 
-This is one storage slot per operator on `CapacityBond` and one read on every vote-cast. It restores the immediate-vote-removal-on-slash signal that the bytes window alone cannot deliver (an active operator who is slashed today would otherwise continue voting with their accumulated window bytes for up to N weeks).
+This restores the immediate-vote-removal-on-slash signal that the bytes window alone cannot deliver (an active operator who is slashed today would otherwise continue voting with their accumulated window bytes for up to N weeks).
 
 ### Contracts and surface
 
@@ -86,9 +90,9 @@ The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-
 
 **`CapacityBond` additions:**
 
-- `mapping(address => uint64) slashedAtEpoch;` — set by `slash()` to the max epoch among the operator's still-standing slashes, recomputed by the `grantAppeal` flow (`settleAppealGranted` → `_recomputeSlashedAtEpoch`) per [ADR 028](028-slashing-appeals.md#contract-surface); cleared to zero only when no slash stands.
-- `mapping(address => uint256[]) _operatorSlashIds;` — internal per-operator slash index backing the watermark re-derivation above.
-- `function slashedAtEpoch(address op) external view returns (uint64);` — public getter for the Governor.
+- `mapping(address => uint256[]) _operatorSlashIds;` — per-operator slash index, read through `operatorSlashCount(op)` / `operatorSlashIdAt(op, i)`.
+- `function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory);` — the record with its `slashedAt` and `status`, read by the Governor's slash walk.
+- `mapping(address => uint64) slashedAtEpoch;` and its getter — the max epoch among the operator's standing slashes plus one, recomputed by the `grantAppeal` flow (`settleAppealGranted` → `_recomputeSlashedAtEpoch`) per [ADR 028](028-slashing-appeals.md#contract-surface). An indexer read; the Governor does not use it.
 
 **`DecdnGovernor._getVotes`** (pseudocode):
 
@@ -99,21 +103,18 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
     if (cur == 0) return 0;
     uint64 endEpoch = cur - 1;
     uint64 windowStart = endEpoch + 1 > windowEpochs ? endEpoch + 1 - windowEpochs : 0;
-    // `slashedAtEpoch` returns `actualEpoch + 1`, with 0 reserved for "unslashed"
-    // (so an epoch-0 slash isn't collapsed with the sentinel). Decode the +1
-    // before comparing. The decoded epoch is bounded above by `endEpoch` so a
-    // future / in-progress-epoch slash does not retroactively zero an earlier
-    // snapshot (the slash window tracks the byte window).
-    uint64 slashStamp = capacityBond.slashedAtEpoch(op);
-    if (slashStamp != 0) {
-        uint64 slashed = slashStamp - 1;
-        if (slashed >= windowStart && slashed <= endEpoch) {
-            return 0;
-        }
+    // Any standing slash in [window start, timepoint] zeroes the vote. Walk
+    // newest first; stop at the first slash before the window.
+    uint256 windowStartTime = windowStart * EPOCH_LENGTH;
+    for (uint256 i = capacityBond.operatorSlashCount(op); i > 0; i--) {
+        SlashRecord memory r = capacityBond.getSlashRecord(capacityBond.operatorSlashIdAt(op, i - 1));
+        if (r.slashedAt < windowStartTime) break;
+        if (r.slashedAt <= timepoint && r.status != SlashStatus.Reversed) return 0;
     }
     uint256 served = feeRouter.bytesInWindow(op, endEpoch, windowEpochs);
     uint256 total  = feeRouter.totalBytesInWindow(endEpoch, windowEpochs);
-    uint256 cap    = (total * voteCapBps) / 10_000;
+    uint256 others = total - feeRouter.bytesInWindow(op, endEpoch, windowEpochs);
+    uint256 cap    = (others * voteCapBps) / (10_000 - voteCapBps);
     uint256 capped = served < cap ? served : cap;
     uint256 ramp   = ageRampScaled(capacityBond.firstBondedAt(op), timepoint, ageRampMonths);
     return (capped * ramp) / 1e18;
@@ -150,7 +151,7 @@ This figure is an **upper bound on a naive attacker**. A cost-minimizing attacke
 
 Cost scales linearly with network revenue and with the cap. Defenses:
 
-1. **10% per-operator cap (`voteCapBps`).** Bounds the maximum vote any single attacker can buy. The cap launches at 10% and is decrease-only within `[1%, 10%]`; lowering it toward 1% is the first tightening lever if attacks materialize.
+1. **10% per-operator cap (`voteCapBps`).** Bounds the maximum vote any single attacker can buy. The cap is sized from the other operators' bytes, so an operator's own bytes, self-dealt or not, never raise its own cap: at the cap its weight is exactly `voteCapBps` of (others + cap). The cap launches at 10% and is decrease-only within `[1%, 10%]`; lowering it toward 1% is the first tightening lever if attacks materialize.
 2. **`age_ramp` floor.** A brand-new bonded operator who wash-trades heavily still votes at a fraction of their bytes-weighted share for the first `age_ramp_months` months. Combined with the cap, this limits the speed-to-influence of a fresh attacker.
 3. **Rolling-window decay.** Sustained wash trading is required across the full window to maintain the cap; a stopping attacker decays out over N epochs.
 

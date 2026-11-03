@@ -638,7 +638,7 @@ async fn drive_blacklist_slash(
     let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
     let slash_sig = probe.sign(node.operator(), &domain)?.as_bytes().to_vec();
 
-    // evidenceHash = keccak(abi.encode(uint8(Blacklist), structHash, isStream)),
+    // evidenceHash = keccak(abi.encode(uint8(Blacklist), challengedNode, structHash, isStream)),
     // structHash = keccak(abi.encode(PROBE_TYPEHASH, fields)) — mirrors SlashJudge.
     let struct_hash = keccak256(
         (
@@ -651,7 +651,15 @@ async fn drive_blacklist_slash(
             .abi_encode(),
     );
     // `uint8(Blacklist)` and `uint256(2)` abi-encode to the same 32-byte word.
-    let evidence_hash = keccak256((U256::from(OFFENSE_BLACKLIST), struct_hash, false).abi_encode());
+    let evidence_hash = keccak256(
+        (
+            U256::from(OFFENSE_BLACKLIST),
+            node.operator().address(),
+            struct_hash,
+            false,
+        )
+            .abi_encode(),
+    );
 
     // A funded challenger holding the challenge bond (refunded on success).
     let challenger = PrivateKeySigner::random();

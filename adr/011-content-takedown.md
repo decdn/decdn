@@ -204,7 +204,7 @@ The 24-hour window accounts for nodes that are offline or have a long poll inter
 
 Both windows are governable parameters sharing one set of hardcoded bounds: minimum 1 hour, maximum 7 days. The floor is what keeps the emergency path honest — governance cannot compress the window below a single default poll cycle and slash nodes for content they had no opportunity to learn about.
 
-`effectiveAt` is stamped onto the entry at add time from the window then in force. Changing a window therefore affects only subsequent adds; it can neither retroactively expose already-served deliveries to a slash nor retroactively immunize them. `SlashJudge` anchors its slash-eligibility comparison to `effectiveAt`, not `addedAt`.
+`effectiveAt` is stamped onto the entry at add time from the window then in force. Changing a window therefore affects only subsequent adds; it can neither retroactively expose already-served deliveries to a slash nor retroactively immunize them. A re-add of a live entry is idempotent for the stamps: it keeps `addedAt` and `effectiveAt`, updates the reason, and either ratifies an emergency entry (clears `emergency`) or escalates its category. Only an entry that is absent or has lapsed is stamped afresh. `SlashJudge` anchors its slash-eligibility comparison to `effectiveAt`, not `addedAt`.
 
 ### One-hour removal orders
 

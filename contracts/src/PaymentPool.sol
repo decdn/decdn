@@ -137,9 +137,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     IERC20 public immutable usdc;
 
     /// @notice Operator registry. A pool names no provider and runs no
-    ///         `isActive` gate at `openPool` (ADR 016 line 670); kept as a
-    ///         validated non-zero immutable for the governance surface later
-    ///         tasks build on the same registry.
+    ///         `isActive` gate at `openPool` (ADR 016). `redeemMany` reads it
+    ///         to pay only bound operators and to count bytes only for active
+    ///         ones.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICapacityBondActivity public immutable capacityBond;
 
@@ -279,6 +279,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error NotPoolOwner();
     error InvalidVoucherSignature();
     error InvalidCapabilitySignature();
+    error ProviderNotBound(address provider);
     error PoolClosed();
     error PoolNotClosing();
     error GraceWindowActive();
@@ -637,7 +638,14 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
         // A call that paid nothing moves nothing: the router rejects a zero
         // amount, and there is nothing to settle.
-        if (totalPaid != 0) _route(msg.sender, totalBytes, totalPaid);
+        if (totalPaid != 0) {
+            // Only a bound operator is a payee, so a capability holder cannot
+            // sign vouchers to itself and draw its cap as USDC. Its bytes count
+            // toward the governance window only while it is active.
+            (bytes32 nodeId, bool active) = capacityBond.nodeIdOf(msg.sender);
+            if (nodeId == bytes32(0)) revert ProviderNotBound(msg.sender);
+            _route(msg.sender, active ? totalBytes : 0, totalPaid);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -820,12 +828,24 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ) internal {
         Authorization storage a = authorized[poolId][signer];
         if (a.cap != 0 || a.expiry != 0) return;
+        // A capability that can pay nothing is never recorded, so it cannot
+        // claim the signer's one registration slot ahead of a live one.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (spendingCap == 0 || expiry <= block.timestamp) return;
 
         bytes32 structHash = keccak256(abi.encode(CAPABILITY_TYPEHASH, signer, spendingCap, poolId, expiry));
         bytes32 digest = _hashTypedDataV4(structHash);
-        if (!SignatureChecker.isValidSignatureNow(pools[poolId].owner, digest, ownerSig)) {
-            revert InvalidCapabilitySignature();
-        }
+        // ECDSA first: a capability the owner's key signed stays valid even if
+        // the owner later attaches code to its address (an EIP-7702 delegate),
+        // so the owner cannot revoke it after nodes served against it. A
+        // smart-account owner falls through to ERC-1271.
+        address owner = pools[poolId].owner;
+        // slither-disable-next-line unused-return
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, ownerSig);
+        if (
+            !(err == ECDSA.RecoverError.NoError && recovered == owner)
+                && !SignatureChecker.isValidERC1271SignatureNow(owner, digest, ownerSig)
+        ) revert InvalidCapabilitySignature();
         a.cap = spendingCap;
         a.expiry = expiry;
     }
@@ -922,9 +942,12 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // when a later voucher advances it (including after a floor raise, which
         // lowers the ceiling but never claws back already-credited bytes).
         uint64 bytesDelta = creditedBytes > w.bytesDelivered ? creditedBytes - w.bytesDelivered : 0;
-        // `bytesPaid <= bytesDelta` (paid <= desired), so the result is a
-        // `uint64` by construction.
-        bytesPaid = uint64(Math.mulDiv(bytesDelta, paid, desired));
+        // The floor also bounds THIS call's credit by THIS call's payment, so
+        // byte headroom left by earlier zero-byte payments cannot be released
+        // in bulk by a dust payment. `bytesPaid <= bytesDelta` (paid <= desired),
+        // so the result is a `uint64` by construction.
+        bytesPaid =
+            uint64(Math.min(Math.mulDiv(bytesDelta, paid, desired), Math.mulDiv(paid, BYTES_PER_MB, deliveryFloor)));
 
         // Effects only; the caller settles.
         w.amount += paid;
@@ -1024,9 +1047,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///      calldata layout (see `LaneVoucher`) and skips a cold
     ///      `EXTCODESIZE` on every lane — both of which lower the smallest
     ///      lane balance a node can profitably redeem. A pool *owner* is
-    ///      unaffected: `_registerCapability` still verifies through
-    ///      `SignatureChecker`, so a Safe or other smart account can own a
-    ///      pool and delegate to EOA voucher signers.
+    ///      unaffected: `_registerCapability` falls back to ERC-1271 after
+    ///      ECDSA, so a Safe or other smart account can own a pool and
+    ///      delegate to EOA voucher signers.
     function _verifyVoucher(bytes32 poolId, LaneVoucher calldata v, uint256 chunkPrice) internal view {
         bytes32 structHash = keccak256(
             abi.encode(

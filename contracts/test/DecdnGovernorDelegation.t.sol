@@ -82,6 +82,8 @@ contract DecdnGovernorDelegationTest is Test {
         timelock = new TimelockController(2 days, empty, exec, address(this));
 
         gov = new DecdnGovernor(IFeeRouter(address(feeRouter)), ICapacityBond(address(bond)), timelock);
+        // Production wiring: proposals open once the Governor proposes on the timelock.
+        timelock.grantRole(timelock.PROPOSER_ROLE(), address(gov));
 
         (proposer, proposerKey) = makeAddrAndKey("proposer");
         (opA, opAKey) = makeAddrAndKey("opA");
@@ -377,6 +379,40 @@ contract DecdnGovernorDelegationTest is Test {
         // Same signature again: nonce was consumed → now expects nonce+1.
         vm.expectRevert(abi.encodeWithSelector(DecdnGovernor.InvalidDelegationNonce.selector, opA, nonce + 1, nonce));
         gov.delegateBySig(opA, hot, nonce, expiry, sig);
+    }
+
+    /// @notice A direct `delegate` consumes the nonce, so a signed but
+    ///         unredeemed delegation cannot later override the operator's
+    ///         revocation.
+    function test_delegate_voidsAnUnredeemedSignature() public {
+        uint256 nonce = gov.delegationNonces(opA);
+        uint256 expiry = block.timestamp + 1 hours;
+        bytes memory sig = _sign(opAKey, _delegationDigest(opA, hot, nonce, expiry));
+
+        vm.prank(opA);
+        gov.delegate(address(0));
+        assertEq(gov.delegationNonces(opA), nonce + 1, "delegate consumes the nonce");
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(DecdnGovernor.InvalidDelegationNonce.selector, opA, nonce + 1, nonce));
+        gov.delegateBySig(opA, hot, nonce, expiry, sig);
+    }
+
+    /// @notice Proposals open only while the Governor holds the timelock's
+    ///         PROPOSER_ROLE, so nothing passed during the bootstrap phase can
+    ///         execute after the hand-off.
+    function test_propose_revertsUntilGovernorIsProposer() public {
+        timelock.revokeRole(timelock.PROPOSER_ROLE(), address(gov));
+        vm.expectRevert(DecdnGovernor.GovernorNotProposer.selector);
+        this.openProposal();
+
+        timelock.grantRole(timelock.PROPOSER_ROLE(), address(gov));
+        this.openProposal();
+    }
+
+    /// @dev External wrapper so `expectRevert` targets the propose call.
+    function openProposal() external {
+        _activeProposal();
     }
 
     function test_delegateBySig_tamperedSignatureReverts() public {

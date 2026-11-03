@@ -15,7 +15,7 @@ Three independent design pressures bear on wallet choice and signature verificat
 
 deCDN resolves these as follows:
 
-- **On-chain (problems 2 and 3):** every contract verifies signatures through OpenZeppelin's `SignatureChecker`, so a Safe — or any ERC-1271 account — works as `msg.sender`, a pool `owner`, or a voucher `signer` on every on-chain path with no further feature work. This is the one piece whose omission would force a coordinated retrofit of every deployed contract later.
+- **On-chain (problems 2 and 3):** every contract verifies call-time signatures through OpenZeppelin's `SignatureChecker`, so a Safe — or any ERC-1271 account — works as `msg.sender`, a pool `owner`, or a voucher `signer` on every on-chain path with no further feature work. This is the one piece whose omission would force a coordinated retrofit of every deployed contract later.
 - **Off-chain hot signing (problem 1):** the signing host holds a software EOA (the same trust posture as an `eth_keystore` today) and signs `slash_sig`, vouchers, and `BindNodeId` bindings with it. Off-chain verifiers recover the signer from the fixed 65-byte secp256k1 form and compare it against the expected address.
 
 The buyer side needs nothing more. A pool owner — EOA or Safe — funds a pool and issues a capped, expiring capability to a hot EOA `signer` ([ADR 003 § PaymentPool](003-payments.md#paymentpool)); only that EOA is ever recovered, so a Safe funder is servable today with no account-abstraction machinery. What remains open is one operator-side residual — a node whose *serving* identity is a smart account — recorded in [§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving).
@@ -40,7 +40,7 @@ The EIP-712 domain separators, typed data hashes, and voucher formats are the sa
 | Function | Verification |
 | --- | --- |
 | `redeem` — voucher signature | `SignatureChecker.isValidSignatureNow(signer, voucherDigest, voucherSig)` |
-| `redeem` — capability signature (first redemption per signer) | `SignatureChecker.isValidSignatureNow(pool.owner, capabilityDigest, capability)` |
+| `redeem` — capability signature (first redemption per signer) | `ECDSA.tryRecover(capabilityDigest, capability) == pool.owner`, else `SignatureChecker.isValidERC1271SignatureNow(pool.owner, capabilityDigest, capability)` |
 
 `signer` is the capability-authorized voucher key; `pool.owner` is the address that signs the capability ([ADR 003 § PaymentPool](003-payments.md#paymentpool)). A pool has no single pinned `voucherSigner` — it authorizes many capped signers off-chain, registered lazily on first redemption.
 
@@ -57,10 +57,10 @@ The EIP-712 domain separators, typed data hashes, and voucher formats are the sa
 
 | Function | Verification |
 | --- | --- |
-| `submitRateChallenge` | `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSig)` + `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSig)` |
-| `submitBlacklistChallenge` | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
+| `submitRateChallenge` | ECDSA recovery of `probeDigest` and `streamDigest`, each compared against `challengedNode` |
+| `submitBlacklistChallenge` | ECDSA recovery of `digest`, compared against `challengedNode` |
 
-The challenger supplies the `challengedNode` address (the node's Ethereum / Safe address); the contract verifies the signature against that address, then confirms the address is registered. This avoids a recover-then-lookup pattern, which does not work for ERC-1271: a smart-account signature has no recovery, only validation. The consequences of that difference for slash-critical signing are the subject of [§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving).
+The challenger supplies the `challengedNode` address; the contract recovers the signer of each evidence digest and compares it against that address, then confirms the address is slashable. `SlashJudge` is the one contract that does not use `SignatureChecker`: `slash_sig` is re-verified later as evidence, so its validity must not depend on code at the operator's address. Code an operator attaches to an EOA (an EIP-7702 delegate) is never consulted, and a smart-account operator cannot serve ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)).
 
 #### Gas Impact
 

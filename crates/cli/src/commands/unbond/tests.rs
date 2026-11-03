@@ -1,13 +1,13 @@
 use super::*;
 
-fn plan(action: Action, below_min_bond: bool) -> Plan {
+fn plan(action: Action, below_floor: bool) -> Plan {
     Plan {
         capacity_bond: Address::repeat_byte(0x22),
         action,
         prior: U256::from(60_000u64),
         declared_mbps: 100,
         unbonding_period: 14 * 24 * 3600,
-        below_min_bond,
+        below_floor,
     }
 }
 
@@ -37,14 +37,14 @@ fn request_phase_reports_release_retained_and_declare() {
     assert!(s.contains("retained_bond_base=20000"), "{s}");
     assert!(s.contains("declare_to_mbps=50"), "{s}");
     assert!(s.contains("unbonding_period=14d 0h"), "{s}");
-    assert!(s.contains("below_min_bond=false"), "{s}");
+    assert!(s.contains("below_floor=false"), "{s}");
     assert!(s.contains("submitted=false"), "{s}");
 }
 
 /// Rendering only — the `--all` floor arithmetic itself lives in
 /// `plan_computation::all_retains_the_bare_curve_floor_not_min_bond`.
 #[test]
-fn write_plan_reports_a_below_min_bond_residual() {
+fn write_plan_reports_a_below_floor_residual() {
     // The operator has to be able to see, in the receipt, that the node
     // won't come back without re-bonding.
     let p = plan(
@@ -57,7 +57,7 @@ fn write_plan_reports_a_below_min_bond_residual() {
     );
     let s = rendered(&p, false, &Outcome::default());
     assert!(s.contains("declare_to_mbps=none"), "{s}");
-    assert!(s.contains("below_min_bond=true"), "{s}");
+    assert!(s.contains("below_floor=true"), "{s}");
 }
 
 #[test]

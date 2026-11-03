@@ -24,7 +24,7 @@ import { BuybackBurner } from "./BuybackBurner.sol";
 ///
 ///         TWAP source: a self-maintained cumulative-price accumulator
 ///         (Uniswap-V2 `price0CumulativeLast` style) over the venue's marginal
-///         spot, sampled BEFORE each swap and advanceable permissionlessly via
+///         spot, sampled BEFORE each swap and advanceable by the keeper via
 ///         `poke()`. Fail-closed: `executeBuyback` reverts `TwapNotReady` until
 ///         the accumulator spans `twapMinWindow`. Sparse updates weaken the
 ///         average, so per ADR 018 this floor is layered under mandatory
@@ -223,13 +223,15 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
         tokenOut = _swap(amountIn, minOut);
     }
 
-    /// @notice Permissionlessly advance the TWAP accumulator with the current
-    ///         venue spot. A buyback never moves its own floor regardless of
-    ///         `poke` — the accumulator gives the just-sampled spot zero weight
-    ///         in the same call (`elapsed == 0`). `poke` densifies historical
-    ///         samples between buybacks so the floor isn't dominated by a single
-    ///         stale observation across a long gap.
-    function poke() external {
+    /// @notice Advance the TWAP accumulator with the current venue spot. A
+    ///         buyback never moves its own floor regardless of `poke` — the
+    ///         accumulator gives the just-sampled spot zero weight in the same
+    ///         call (`elapsed == 0`). `poke` densifies historical samples between
+    ///         buybacks so the floor isn't dominated by a single stale
+    ///         observation across a long gap. Keeper-only: a permissionless
+    ///         poke would let anyone move the pool spot, sample it, and move it
+    ///         back in one transaction, pinning a false sample until the next.
+    function poke() external onlyRole(KEEPER_ROLE) {
         _requireWired();
         _updateTwapAccumulator();
     }

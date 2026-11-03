@@ -143,8 +143,10 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
         Deployment memory d = _runFullDeploy(_config(), _activation());
         BuybackBurnerUniswapV3 burner = BuybackBurnerUniswapV3(address(d.buybackBurner));
 
+        vm.prank(keeper);
         burner.poke();
         vm.warp(block.timestamp + 1800);
+        vm.prank(keeper);
         burner.poke();
 
         // ~100 TOKEN per USDC at the $0.01 anchor (1e18 fixed point). Loose bound:

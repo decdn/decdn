@@ -67,6 +67,19 @@ contract MockV3Pool {
     }
 }
 
+/// @notice Position manager whose pool someone already initialized at another
+///         price: `createAndInitialize…` returns that pool unchanged, as the real
+///         manager does for an existing pool.
+contract PreinitializedPositionManager {
+    function createAndInitializePoolIfNecessary(address token0, address token1, uint24 fee, uint160 sqrtPriceX96)
+        external
+        payable
+        returns (address)
+    {
+        return address(new MockV3Pool(sqrtPriceX96 / 2, token0, token1, fee));
+    }
+}
+
 /// @notice `NonfungiblePositionManager` stand-in: `createAndInitialize…` deploys a
 ///         `MockV3Pool` at the given price; `mint` pulls both legs from the caller
 ///         into the pool (simulating a seeded position). `seed=false` skips the
@@ -359,6 +372,26 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     ///         `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`. `GuardedBuybackBurner`
     ///         rejects it too since #1532 (`BuybackBandDead`); this pins the
     ///         activation path's pre-broadcast fail-fast.
+    /// @notice A pool someone initialized first at another price fails the
+    ///         deploy rather than taking the seed at that price.
+    function test_revertsWhenPoolPreInitializedAtAnotherPrice() public {
+        PreinitializedPositionManager npm = new PreinitializedPositionManager();
+        BuybackActivation memory act = _uniswapActivation(address(npm));
+        vm.expectPartialRevert(BaseProtocolDeploy.PoolPreInitialized.selector);
+        this.externalRunFullDeploy(_config(), act);
+    }
+
+    /// @notice A minimum buyback above the per-epoch cap at the seeded depth
+    ///         would make every buyback revert, so the deploy refuses it.
+    function test_revertsWhenMinBuybackExceedsEpochCap() public {
+        MockPositionManager npm = new MockPositionManager(true);
+        usdc.approve(address(npm), type(uint256).max);
+        BuybackActivation memory act = _uniswapActivation(address(npm));
+        act.seed = _derivePoolSeed(100e6, TARGET_PRICE); // cap = 10% of 100 USDC = 10 USDC
+        vm.expectRevert(abi.encodeWithSelector(BaseProtocolDeploy.BuybackBandBelowEpochCap.selector, 100e6, 10e6));
+        this.externalRunFullDeploy(_config(), act);
+    }
+
     function test_revertsWhenGuardBandIsDead() public {
         MockPositionManager npm = new MockPositionManager(true);
         usdc.approve(address(npm), type(uint256).max);

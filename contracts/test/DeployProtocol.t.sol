@@ -745,6 +745,27 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(bad);
     }
 
+    /// @notice On Arbitrum One the deployer key cannot be the emergency
+    ///         multisig, which holds every pause and emergency role.
+    function test_mainnet_revertsWhenEmergencyMultisigIsDeployer() public {
+        vm.chainId(42_161);
+        DeployConfig memory bad = _testConfig();
+        bad.emergencyMultisig = bad.deployer;
+        vm.expectRevert(abi.encodeWithSelector(BaseProtocolDeploy.EmergencyMultisigIsDeployer.selector, bad.deployer));
+        this.externalRunFullDeploy(bad);
+    }
+
+    /// @notice On Arbitrum One the emergency multisig must hold code.
+    function test_mainnet_revertsWhenEmergencyMultisigIsNotAContract() public {
+        vm.chainId(42_161);
+        DeployConfig memory bad = _testConfig();
+        bad.emergencyMultisig = address(0xDEAD);
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.EmergencyMultisigNotAContract.selector, address(0xDEAD))
+        );
+        this.externalRunFullDeploy(bad);
+    }
+
     function externalRunFullDeploy(DeployConfig calldata cfgIn) external returns (Deployment memory) {
         return _runFullDeploy(cfgIn);
     }

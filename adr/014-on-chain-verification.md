@@ -22,7 +22,7 @@ Rate and blacklist both require verifying cryptographic signatures from protocol
 
 Each slashing-participating message (`ProbeResponse`, `StreamResponse`) carries a single message-body signature, `slash_sig`, produced with the node's Ethereum key. Connection-level peer identity is authenticated separately by the iroh QUIC handshake against the registered Ed25519 NodeId; the body signature makes message contents portable evidence verifiable both off-chain and on-chain.
 
-The Ethereum key is the same secp256k1 key the node already holds for staking and pools. `CapacityBond.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` plus a `CapacityBond.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; verifying an Ed25519 wire signature in a Solidity library would cost ~500k–1M gas.
+The Ethereum key is the same secp256k1 key the node already holds for staking and pools. `CapacityBond.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` plus a `CapacityBond.nodeIdOf(recovered)` lookup attributes the message to a NodeId. `SlashJudge` slashes a bound operator only when the challenger names its bound NodeId. An operator with no binding stays slashable while it has active or unbonding bond. Clearing its own binding with `reclaimNodeId` therefore does not shield an offender. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; verifying an Ed25519 wire signature in a Solidity library would cost ~500k–1M gas.
 
 ##### Wire protocol
 
@@ -64,7 +64,7 @@ EIP712Domain({
 #### On-Chain Verification Flow
 
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
-2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)).
+2. The contract reconstructs the EIP-712 typed data hash, recovers the signer of `slash_sig` by ECDSA, and compares it against `challengedNode` — **~3,000 gas**. ERC-1271 is never consulted: evidence is re-verified after the paid action, so its validity must not depend on code at the operator's address, such as an EIP-7702 delegate ([ADR 024 § The signature partition](024-account-abstraction.md#the-signature-partition)).
 3. The challenger-provided address is looked up in `CapacityBond` to confirm it maps to a registered node.
 4. For the two-message offense (rate manipulation), the signatures must both validate against the **same** node address.
 
@@ -162,9 +162,9 @@ The check applies at initialization too — neither contract may be deployed wit
 
 ##### Rate manipulation
 
-1. Challenger provides `challengedNode` address (the node's Ethereum address or Safe address)
-2. `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSlashSig)` — must pass
-3. `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSlashSig)` — must pass
+1. Challenger provides `challengedNode` address (the node's Ethereum address)
+2. ECDSA recovery of `probeDigest` from `probeSlashSig` equals `challengedNode` — must pass
+3. ECDSA recovery of `streamDigest` from `streamSlashSig` equals `challengedNode` — must pass
 4. Verify `streamResponse.ok == true` — the stream must be a delivery, not a refusal
 5. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
 6. Verify `probeResponse.hash == streamResponse.hash` (same blob)
@@ -176,7 +176,7 @@ The check applies at initialization too — neither contract may be deployed wit
 ##### Blacklist violation
 
 1. Challenger provides `challengedNode` address
-2. `SignatureChecker.isValidSignatureNow(challengedNode, responseDigest, slashSig)` — must pass
+2. ECDSA recovery of `responseDigest` from `slashSig` equals `challengedNode` — must pass
 3. Look up `challengedNode` in `CapacityBond` — must be a registered node
 4. Decode `hash` from the response; verify it matches `blobHash`
 5. If `ProbeResponse`: verify `has_blob == true`. If `StreamResponse`: verify `ok == true`
@@ -225,8 +225,10 @@ Every slash that reduces operator stake emits `Slashed(slashId, operator, offens
 - **`slashId`** is a globally monotonic `uint256` (single counter across all offense types, not per-operator and not per-offense-type), allocated from a `nextSlashId` storage slot incremented inline in the same transaction as the `CapacityBond.slash(...)` call. `slashId` values are stable, non-reusable, and non-zero — `slashId == 0` is reserved as the "no slash" sentinel.
 - **`offenseType`** is the `OffenseType` enum from the interface above.
 - **`evidenceHash`** is `keccak256` over a per-offense canonical preimage that uniquely identifies the (offenseType, evidence) pair the slash relied on. The preimage uses `abi.encode(...)` (not `abi.encodePacked`) so field encoding is unambiguous across implementers. Every preimage is prefixed by `uint8(offenseType)` so two distinct offenses against the same operator on overlapping evidence produce distinct `evidenceHash` values, not just distinct `slashId`s. Signatures are **excluded** — the [§ Slash Signatures — secp256k1 EIP-712](#slash-signatures--secp256k1-eip-712) EIP-712 typed-data digests they sign already uniquely identify the message contents, so a successful slash trivially fixes the digest set; including the variable-length signature blobs would add an `abi.encode` vs `abi.encodePacked` field-length ambiguity without adding evidentiary content. The `blobHash` parameter passed to the immediate-execution `submit*Challenge` paths is similarly excluded — the [§ SlashJudge Contract](#slashjudge-contract) evidence-verification flow already binds it via the `responseData.hash == blobHash` check, and the EIP-712 `*Response` struct hash commits to `hash` directly. The per-offense preimages are:
-  - **Rate manipulation:** `keccak256(abi.encode(uint8(OffenseType.RateManipulation), probeStructHash, streamStructHash))`. The `OffenseType` prefix keeps this preimage distinct from a blacklist preimage built over the same response on overlapping evidence.
-  - **Blacklist:** `keccak256(abi.encode(uint8(OffenseType.Blacklist), responseStructHash, isStreamResponse))`. The boolean is required because it is a `submitBlacklistChallenge` parameter, not part of any `*Response` struct.
+  - **Rate manipulation:** `keccak256(abi.encode(uint8(OffenseType.RateManipulation), challengedNode, streamStructHash))`. The `OffenseType` prefix keeps this preimage distinct from a blacklist preimage built over the same response on overlapping evidence. The probe is left out: one overcharged stream is one offense, so pairing it with another probe gives the same hash and cannot escalate the slash tier.
+  - **Blacklist:** `keccak256(abi.encode(uint8(OffenseType.Blacklist), challengedNode, responseStructHash, isStreamResponse))`. The boolean is required because it is a `submitBlacklistChallenge` parameter, not part of any `*Response` struct.
+
+  Both preimages carry `challengedNode`. Without it, an offender could have a zero-bond address sign the same response, slash that address first, and so spend the evidence against itself.
   Each `*StructHash` is the EIP-712 struct hash of the corresponding `*Response` per [§ Slash Signatures — secp256k1 EIP-712](#slash-signatures--secp256k1-eip-712) (head-only `bytes32` — `abi.encode` adds no padding to a fixed-width 32-byte value). Appeals reference `evidenceHash` to prove they challenge the same evidence the slash relied on; [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` requires `evidenceBundleHash == evidenceHash` of the referenced `Slashed` event.
 - **Emission sites.** Both offenses are immediate: `Slashed` is emitted from the synchronous `submit*Challenge` paths immediately after the inline `CapacityBond.slash()` returns. The "`CapacityBond.slash()` then `emit Slashed`" sequence is contract-enforced atomic (single transaction); a slash without a matching event is impossible.
 
@@ -236,8 +238,8 @@ The companion `SlashAppeal` events (`AppealOpened`, `AppealGranted`, etc.) are s
 
 | Operation | Estimated Gas | Notes |
 | --- | --- | --- |
-| `submitRateChallenge` | ~65k–90k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage for pending challenge + bond transfer + `Slashed` emit on success |
-| `submitBlacklistChallenge` | ~75k–95k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + up to three `ContentBlacklist` entry reads (global, current region, unripened previous region) + one `CapacityBond` region-scope read (~15k: two `string` fields plus four timestamps) + bond transfer + `Slashed` emit on success. The scope resolution in [§ Blacklist violation](#blacklist-violation) item 7 makes this the more read-heavy of the two challenge paths, though it still verifies only one signature. A challenge that resolves on the global leg short-circuits before the region reads. |
+| `submitRateChallenge` | ~65k–90k | 2× ECDSA recovery (~6k) + calldata + storage for pending challenge + bond transfer + `Slashed` emit on success |
+| `submitBlacklistChallenge` | ~75k–95k | 1× ECDSA recovery (~3k) + up to three `ContentBlacklist` entry reads (global, current region, unripened previous region) + one `CapacityBond` region-scope read (~15k: two `string` fields plus four timestamps) + bond transfer + `Slashed` emit on success. The scope resolution in [§ Blacklist violation](#blacklist-violation) item 7 makes this the more read-heavy of the two challenge paths, though it still verifies only one signature. A challenge that resolves on the global leg short-circuits before the region reads. |
 | `Slashed` event emit | ~5k–7k | `nextSlashId++` (cold SLOAD + non-zero→non-zero SSTORE on first emit per tx, ~5k post-EIP-2929) + LOG3 base + 3 stack topics (event signature + 2 indexed) + 96 bytes non-indexed data (~2k); negligible vs the surrounding `CapacityBond.slash()`. The very first `Slashed` ever emitted on a fresh deployment pays an additional ~17k for the 0→non-zero `nextSlashId` SSTORE. |
 
 #### Governable Parameters with Safety Bounds
@@ -278,6 +280,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Universal on-chain accountability is the protocol's single stance — there is no opt-out and no validation-mode difference between PoC and production for this field.
 - The unified `SlashJudge` contract provides a single audit surface for all slashing logic.
 - The [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal) commit–reveal makes the 50% challenger reward un-front-runnable: the incentive for off-path witnesses survives independently of any transaction-ordering trust assumption (Arbitrum's sequencer today, decentralized sequencing or Timeboost later).
+- An offender can report itself. It holds its own signed evidence from the moment of the offense, so it can commit that evidence from a second address before any witness and collect the 50% challenger share. The effective penalty for a self-reported offense is therefore half the slash. The offense count, the tier ladder and the vote zero-out still apply in full. Slash sizes are set with this halved penalty in mind; the contract does not try to link a challenger to the operator.
 
 ### Negative
 

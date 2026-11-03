@@ -5,7 +5,7 @@ import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol"
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { SunsettingPausable } from "./SunsettingPausable.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -23,8 +23,9 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         first `commitChallenge`s an opaque
 ///         `keccak256(abi.encode(evidenceHash, salt, challenger))`, then reveals via a
 ///         `submit*Challenge` once the commitment has matured. Each reveal
-///         verifies secp256k1 EIP-712 `slash_sig` evidence with `SignatureChecker`
-///         (EOA + ERC-1271), confirms the challenged address is a registered
+///         verifies secp256k1 EIP-712 `slash_sig` evidence by ECDSA recovery
+///         alone — never ERC-1271, so code the operator attaches to its address
+///         (e.g. an EIP-7702 delegate) cannot reject a proof — confirms the challenged address is a registered
 ///         operator, enforces the evidence-age window, then calls
 ///         `CapacityBond.slash` and emits the canonical `Slashed` event with no
 ///         counter-evidence window. The challenger is recorded by `slash` for the
@@ -318,15 +319,16 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
             servedClaim = p.hasBlob;
         }
 
-        if (!SignatureChecker.isValidSignatureNow(challengedNode, _hashTypedDataV4(structHash), slashSig)) {
-            revert InvalidResponseSignature();
-        }
+        if (!_signedBy(challengedNode, structHash, slashSig)) revert InvalidResponseSignature();
         if (responseHash != blobHash) revert HashMismatch(blobHash, responseHash);
         if (!servedClaim) revert NotBlacklistViolation();
         _checkStaleness(responseTsUs);
         _checkBlacklistedBefore(challengedNode, blobHash, responseTsUs);
 
-        bytes32 evidenceHash = keccak256(abi.encode(uint8(OffenseType.Blacklist), structHash, isStreamResponse));
+        // Keyed on the challenged address: another signer's identical response
+        // is separate evidence and cannot spend this operator's.
+        bytes32 evidenceHash =
+            keccak256(abi.encode(uint8(OffenseType.Blacklist), challengedNode, structHash, isStreamResponse));
         _resolve(challengedNode, OffenseType.Blacklist, evidenceHash, salt);
     }
 
@@ -389,12 +391,8 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         bytes32 probeHash = _probeStructHash(p);
         bytes32 streamHash = _streamStructHash(s);
 
-        if (!SignatureChecker.isValidSignatureNow(challengedNode, _hashTypedDataV4(probeHash), probeSig)) {
-            revert InvalidProbeSignature();
-        }
-        if (!SignatureChecker.isValidSignatureNow(challengedNode, _hashTypedDataV4(streamHash), streamSig)) {
-            revert InvalidStreamSignature();
-        }
+        if (!_signedBy(challengedNode, probeHash, probeSig)) revert InvalidProbeSignature();
+        if (!_signedBy(challengedNode, streamHash, streamSig)) revert InvalidStreamSignature();
 
         if (p.hash != s.hash) revert HashMismatch(p.hash, s.hash);
         // 30s requester-anchored window: stream at/after probe, delta < 30s.
@@ -410,7 +408,22 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         // manipulation, and the node may sign `ok:false` freely.
         if (!s.ok || s.ratePerMb <= p.ratePerMb) revert NotRateManipulation();
 
-        evidenceHash = keccak256(abi.encode(uint8(offense), probeHash, streamHash));
+        // Keyed on the challenged address and the overcharged stream alone: one
+        // overcharge is one offense, however many probes it pairs with, and
+        // another signer's identical stream cannot spend this operator's.
+        evidenceHash = keccak256(abi.encode(uint8(offense), challengedNode, streamHash));
+    }
+
+    /// @dev ECDSA recovery of the EIP-712 digest of `structHash`. The operator
+    ///      signs evidence with its EOA key; ERC-1271 is not consulted, so code
+    ///      attached to the operator's address (e.g. an EIP-7702 delegate)
+    ///      cannot refuse a proof against it.
+    function _signedBy(address signer, bytes32 structHash, bytes calldata sig) internal view returns (bool) {
+        // The dropped third return is the recovery-error argument; `err` alone
+        // decides the outcome.
+        // slither-disable-next-line unused-return
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(_hashTypedDataV4(structHash), sig);
+        return err == ECDSA.RecoverError.NoError && recovered == signer;
     }
 
     function _probeStructHash(ProbeMsg memory p) internal pure returns (bytes32) {
@@ -421,16 +434,22 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         return keccak256(abi.encode(STREAM_RESPONSE_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.timestampUs));
     }
 
-    /// @dev Confirm the challenged address is a registered operator and that the
-    ///      challenger-supplied `nodeId` matches its on-chain binding. The binding
+    /// @dev Confirm the challenged address is a slashable operator. A bound
+    ///      operator must match the challenger-supplied `nodeId`; the binding
     ///      survives deregistration, so a deregistered-but-bonded offender stays
-    ///      slashable. The `active` flag is intentionally unused (ADR 014 — the
-    ///      `nodeId != 0` binding, not liveness, is the registration gate).
+    ///      slashable. An operator with no binding stays slashable while it has
+    ///      bond at risk, so clearing its own binding through `reclaimNodeId`
+    ///      does not shield an offender. The `active` flag is intentionally
+    ///      unused (ADR 014 — liveness is not the registration gate).
     // slither-disable-next-line unused-return
     function _checkRegistered(address challengedNode, bytes32 nodeId) internal view {
         (bytes32 bound,) = capacityBond.nodeIdOf(challengedNode);
-        if (bound == bytes32(0)) revert NodeNotRegistered(challengedNode);
-        if (bound != nodeId) revert NodeIdMismatch(nodeId, bound);
+        if (bound == bytes32(0)) {
+            (uint256 queued,) = capacityBond.unbondingOf(challengedNode);
+            if (capacityBond.activeBond(challengedNode) + queued == 0) revert NodeNotRegistered(challengedNode);
+        } else if (bound != nodeId) {
+            revert NodeIdMismatch(nodeId, bound);
+        }
     }
 
     /// @dev Confirm `blobHash` was an enforceable blacklist entry IN SCOPE for

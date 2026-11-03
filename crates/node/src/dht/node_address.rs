@@ -21,8 +21,8 @@
 //! `isActive`, which the *staker set* tracks separately). So the registry's
 //! bindings arms follow only `NodeRegistered` (insert) and `NodeDeregistered`
 //! (remove) — notably `NodeAutoEjected` deactivates without clearing a binding —
-//! and the enumeration applies no `isActive` filter: an operator mid-unbonding is
-//! momentarily inactive but still payable.
+//! and the enumeration applies no `isActive` filter: an operator below its bond
+//! floor is inactive but still payable.
 //!
 //! # Failure model
 //!

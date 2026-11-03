@@ -35,8 +35,18 @@ contract MockActiveBond is ICapacityBondActivity {
         _active[operator] = a;
     }
 
+    mapping(address => bytes32) public boundNodeId;
+
     function isActive(address operator) external view override returns (bool) {
         return _active[operator];
+    }
+
+    function setBound(address operator, bytes32 nodeId) external {
+        boundNodeId[operator] = nodeId;
+    }
+
+    function nodeIdOf(address operator) external view override returns (bytes32, bool) {
+        return (boundNodeId[operator], _active[operator]);
     }
 }
 
@@ -148,6 +158,14 @@ contract MockERC1271Wallet {
     }
 }
 
+/// @dev Code an EOA owner could attach to its address (e.g. an EIP-7702
+///      delegate) that refuses every ERC-1271 check.
+contract RejectingWallet {
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return 0xffffffff;
+    }
+}
+
 contract PaymentPoolTest is Test {
     MockUSDC internal usdc;
     MockActiveBond internal bond;
@@ -237,6 +255,10 @@ contract PaymentPoolTest is Test {
 
         vm.prank(admin);
         pool.grantRole(PAUSER_ROLE, pauser);
+
+        // The fixture payee is a bound, active operator.
+        bond.setBound(provider, bytes32(uint256(0xB0D)));
+        bond.setActive(provider, true);
 
         usdc.transfer(owner, 100_000e6);
         vm.prank(owner);
@@ -1002,6 +1024,26 @@ contract PaymentPoolTest is Test {
         _redeemOne(id, signer, provider, 301e6, 30_000_000, sig, _cap(id, SPENDING_CAP, expiry));
     }
 
+    /// @notice A zero-cap or already-expired capability is never recorded, so
+    ///         it cannot take the signer's one registration slot ahead of the
+    ///         live capability the node served against.
+    function test_redeem_deadCapabilityDoesNotClaimTheSlot() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 0, expiry));
+        uint64 past = uint64(block.timestamp);
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, past));
+        (uint64 cap,,) = pool.authorized(id, signer);
+        assertEq(cap, 0, "neither dead capability was recorded");
+
+        vm.prank(provider);
+        uint256 paid = _redeemOne(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry)
+        );
+        assertEq(paid, 300e6, "the live capability still registers and pays");
+    }
+
     function test_redeem_expiredCapabilityPaysNothing() public {
         bytes32 id = _open();
         uint64 nearExpiry = uint64(block.timestamp + 1 days);
@@ -1236,6 +1278,20 @@ contract PaymentPoolTest is Test {
         assertEq(uint256(exp2), uint256(expiry));
     }
 
+    /// @notice A capability the owner's key signed stays valid when the owner
+    ///         later attaches code that rejects ERC-1271 checks, so the owner
+    ///         cannot revoke it after nodes served against it.
+    function test_redeem_ownerCodeCannotRevokeEcdsaCapability() public {
+        bytes32 id = _open();
+        vm.etch(owner, address(new RejectingWallet()).code);
+
+        vm.prank(provider);
+        uint256 paid = _redeemOne(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+        assertEq(paid, 300e6);
+    }
+
     // -----------------------------------------------------------------
     // redeem — soft rate floor (ADR 003 § Rate-floor enforcement)
     //
@@ -1289,6 +1345,21 @@ contract PaymentPoolTest is Test {
         (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
         assertEq(wAmount, 1, "settles the cumulative");
         assertEq(wBytes, ceiling, "credits only floor-justified bytes");
+    }
+
+    /// @notice Byte headroom banked by an earlier zero-byte payment is not
+    ///         released in bulk by a dust payment: each call's credit is
+    ///         bounded by what that call pays at the floor.
+    function test_redeem_softFloor_boundsCreditByThisCallsPayment() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 1000, 0, _voucher(id, 1000, 0), _cap(id, 1000e6, expiry));
+
+        uint64 fullBytes = uint64(uint256(1001) * BYTES_PER_MB / DELIVERY_FLOOR);
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 1001, fullBytes, _voucher(id, 1001, fullBytes), "");
+        (, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wBytes, uint64(BYTES_PER_MB / DELIVERY_FLOOR), "a 1-unit payment credits at most 1 unit of bytes");
     }
 
     function test_redeem_softFloor_honestPathUnaffected() public {
@@ -1809,9 +1880,36 @@ contract PaymentPoolTest is Test {
     // redeemMany — register-batch then redeem-batch (ADR 003 § Batch redemption)
     // -----------------------------------------------------------------
 
+    /// @notice Only a bound operator is a payee: a capability holder that signs
+    ///         a voucher to its own unbound address cannot draw the cap as USDC.
+    function test_redeemMany_revertsForUnboundPayee() public {
+        bytes32 id = _open();
+        address self = address(0x5E1F);
+        Sig memory sig = _signVoucherFor(address(pool), id, signer, self, 300e6, 30_000_000, SIGNER_PK);
+        vm.prank(self);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotBound.selector, self));
+        _redeemOne(id, signer, self, 300e6, 30_000_000, sig, _cap(id, SPENDING_CAP, expiry));
+    }
+
+    /// @notice A bound but inactive operator is still paid what it is owed, but
+    ///         its bytes do not reach the governance window.
+    function test_redeemMany_inactivePayeeRoutesNoBytes() public {
+        bytes32 id = _open();
+        bond.setActive(provider, false);
+        vm.prank(provider);
+        uint256 paid = _redeemOne(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+        assertEq(paid, 300e6, "an inactive bound operator is still paid");
+        (, uint256 routedBytes, uint256 routedAmount) = router.calls(0);
+        assertEq(routedAmount, 300e6);
+        assertEq(routedBytes, 0, "no governance bytes for an inactive operator");
+    }
+
     function test_redeemMany_registersCapabilitiesThenRedeemsVouchers() public {
         bytes32 id = _open();
         address provider2 = address(0xCAFE);
+        bond.setBound(provider2, bytes32(uint256(0xCAFE)));
 
         PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
         caps[0] = PaymentPool.CapabilityReg({
@@ -2401,7 +2499,7 @@ contract PaymentPoolTest is Test {
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, N vouchers", gasUsed);
         // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
-        // doc comment (crates/common/src/config/mod.rs): N = 515,619 gas.
+        // doc comment (crates/common/src/config/mod.rs): N = 524,767 gas.
         // Tolerance covers toolchain/compiler-version gas drift without
         // masking a real regression.
         //
@@ -2409,7 +2507,7 @@ contract PaymentPoolTest is Test {
         // These lanes are all SEALED vouchers — zero root, zero preimage, zero
         // meter — so the walk is empty and the three words are pure zero bytes,
         // which is the cooperative path a finalized delivery actually redeems.
-        assertApproxEqAbs(gasUsed, 515_619, 5000, "redeemMany gas for N vouchers drifted from the pinned figure");
+        assertApproxEqAbs(gasUsed, 524_767, 5000, "redeemMany gas for N vouchers drifted from the pinned figure");
     }
 
     /// @notice Companion to `test_redeemMany_gas_NVouchers` — same setup,
@@ -2421,11 +2519,11 @@ contract PaymentPoolTest is Test {
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, N+1 vouchers", gasUsed);
         // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
-        // doc comment (crates/common/src/config/mod.rs): N+1 = 550,993 gas.
+        // doc comment (crates/common/src/config/mod.rs): N+1 = 560,516 gas.
         // Tolerance covers toolchain/compiler-version gas drift without
         // masking a real regression. See `test_redeemMany_gas_NVouchers` for
         // what the per-lane figure covers.
-        assertApproxEqAbs(gasUsed, 550_993, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
+        assertApproxEqAbs(gasUsed, 560_516, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
     }
 
     /// @dev Opens a fresh pool and, unlike `_redeemFreshLanesAndSnapshotGas`,
@@ -2483,7 +2581,7 @@ contract PaymentPoolTest is Test {
         // N owner-signed capability registrations plus N cold voucher
         // settlements in one call.
         assertApproxEqAbs(
-            gasUsed, 804_352, 8000, "redeemMany gas for first-time N vouchers drifted from the pinned figure"
+            gasUsed, 812_750, 8000, "redeemMany gas for first-time N vouchers drifted from the pinned figure"
         );
     }
 
@@ -2501,7 +2599,7 @@ contract PaymentPoolTest is Test {
         emit log_named_uint("redeemMany gas, first-time N+1 vouchers", gasUsed);
         // Pinned from an actual `forge test -vv` run on this branch.
         assertApproxEqAbs(
-            gasUsed, 868_611, 8000, "redeemMany gas for first-time N+1 vouchers drifted from the pinned figure"
+            gasUsed, 877_309, 8000, "redeemMany gas for first-time N+1 vouchers drifted from the pinned figure"
         );
     }
 

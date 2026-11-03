@@ -361,7 +361,7 @@ See [ADR 005 — Payment lanes and concurrent streams](005-protocol.md#payment-l
 
 **Redemption is the settlement primitive.** A node redeems its vouchers on-chain whenever it chooses, while the pool is `Open` or in the grace window. Redemption pays `msg.sender` and is final — it needs no dispute window, because a voucher is a signed, cumulative, monotone claim by a capped signer and a node redeems only its own lane. `redeemMany(batches[])` is the only entry point — one `{poolId, capabilities[], vouchers[]}` group per pool, and a single lane is a one-pool batch of one. Per voucher:
 
-1. **Register the signer once.** On the first redemption for `(poolId, signer)`, verify the owner's signature on `capability` and store `authorized[poolId][signer] = {cap, expiry, spent: 0}`. Every later redemption for that signer omits `capability` and rides the stored registration; a node reads `authorized[...]` by `eth_call` to confirm a signer and its cap without ever holding the capability. The owner-signature check happens once per signer, not per voucher.
+1. **Register the signer once.** On the first redemption for `(poolId, signer)`, verify the owner's signature on `capability` and store `authorized[poolId][signer] = {cap, expiry, spent: 0}`. A capability with a zero `cap`, or an `expiry` at or before the redemption block, can pay nothing and is not recorded, so it cannot take the signer's registration ahead of a live capability. Every later redemption for that signer omits `capability` and rides the stored registration; a node reads `authorized[...]` by `eth_call` to confirm a signer and its cap without ever holding the capability. The owner-signature check happens once per signer, not per voucher.
 2. **Check expiry.** Reject if `block.timestamp >= authorized[poolId][signer].expiry`. This is the only time bound that gates settlement, and it is safe because the node holds `expiry` in advance and stops serving before it (see [Revocation](#revocation)).
 3. **Bind the payee, then resolve the claim.** The voucher entry carries no payee field. The contract rebuilds the EIP-712 hash with `msg.sender` as the `provider`, so a voucher signed for another node recovers the wrong signer and reverts `InvalidVoucherSignature`. It then resolves the chain: split `chainMeter` into `chunkPrice` and `chainIndex`, require its reserved 23 bytes to be zero, apply `keccak256` to `preimage` exactly `chainIndex` times, and require the result to equal `chainRoot`, reverting `BadPreimage` otherwise. `chainIndex` needs no range check — it is extracted as a `uint8`, so it cannot exceed `MAX_CHAIN_LENGTH` (255) by construction. The claim is `claimed = cumulative + chainIndex × chunkPrice` over `claimedBytes = bytesDelivered + chainIndex × CHUNK_BYTES`. There is no branch and no optional field here: a sealed voucher (`chainRoot = 0`) at `chainIndex = 0` with a zero preimage satisfies the same check with zeros and resolves to exactly `cumulative`, and a real-root voucher at index 0 does the same with the root as its own preimage. Redemption is cumulative — the voucher carries no nonce.
 4. **Compute the payable amount.** With `w = watermark[poolId][signer][provider]`: `desired = claimed − w.amount` (the still-unpaid portion this voucher and preimage authorize), `capRoom = cap − spent`, and `remaining = deposit − totalRedeemed`. Then `paid = min(desired, capRoom, remaining)`. The floor clamp ([Rate-floor enforcement](#rate-floor-enforcement)) applies to `claimed` / `claimedBytes` here — the chain-extended values — and caps the credited byte count without blocking the payment, so bytes proved by preimage carry the same per-byte price obligation as bytes proved by signature.
@@ -818,7 +818,7 @@ The lane's byte watermark advances by the credited delta, and only the credited 
 
 This binds credited bytes to real USDC: crediting `B` bytes requires cumulatively paying `>= B / 1_048_576` base units at the floor price. That restores the proportional-cost assumption [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) relies on. A voucher cannot decouple a large `bytesDelivered` from a tiny `amount`: the excess bytes earn no credit. The bound holds at the one place it matters — the served-bytes counter that feeds governance vote weight — while a voucher priced below the floor still pays for the bytes the node served.
 
-The cumulative `amount` needs no separate bound. Credit is proportional to the USDC actually routed (`bytesPaid = mulDiv(bytesDelta, paid, desired)`), so a partial-drain payment credits only the bytes its money buys at the floor price. Overpaying for few bytes credits the honest, sub-ceiling byte count and moves only the payer's own USDC through the fee split; it inflates nothing. The floor is a price on vote weight, not a gate.
+Each redemption's credit is also bounded by that redemption's own payment: `bytesPaid = min(mulDiv(bytesDelta, paid, desired), mulDiv(paid, BYTES_PER_MB, deliveryFloor))`. The first term keeps credit proportional to the USDC actually routed, so a partial-drain payment credits only the bytes its money buys. The second stops byte headroom banked by earlier zero-byte payments from being released in bulk by a dust payment. Overpaying for few bytes credits the honest, sub-ceiling byte count and moves only the payer's own USDC through the fee split; it inflates nothing. The floor is a price on vote weight, not a gate.
 
 The node never mirrors the floor on the wire. It advertises its configured `rate_per_mb` verbatim and never raises its own quote to the floor. It checks each voucher pays that advertised rate for the bytes the voucher covers, which protects its own per-delta revenue. It does **not** gate a voucher on the floor. The floor is redemption-time contract state; the node reads it for no wire decision. A voucher whose cumulative dips below the floor still settles its cumulative, and redemption clamps only its byte credit. So a node that quotes below the floor keeps serving and keeps its money; it loses only vote-weight credit on the sub-floor bytes. Raising the floor never obliges a node to raise its price.
 
@@ -933,7 +933,7 @@ bytes32 capabilityDigest = keccak256(abi.encodePacked(
 ));
 ```
 
-**Verification:** The **capability** is verified with OpenZeppelin's `SignatureChecker.isValidSignatureNow(pool.owner, ...)`, which transparently supports both EOA owners (via hardened `ECDSA.recover` that rejects non-canonical `s` values and restricts `v` to `27`/`28`) and smart-account owners (via ERC-1271 `isValidSignature`), at whatever signature length the wallet uses. Registration happens once per signer, so its width costs nothing at scale.
+**Verification:** The **capability** is verified by ECDSA recovery against `pool.owner` first (hardened `ECDSA.tryRecover`, which rejects non-canonical `s` values and restricts `v` to `27`/`28`), then by ERC-1271 `isValidSignature` on the owner, at whatever signature length the wallet uses. ECDSA comes first so that code an EOA owner later attaches to its address (an EIP-7702 delegate) cannot revoke a capability its key signed after nodes served against it. Registration happens once per signer, so its width costs nothing at scale.
 
 #### Voucher signatures are compact, and their signers are EOAs
 
@@ -1168,15 +1168,16 @@ mapping(address => uint64) public bindingNonce;
 // Bundled per-operator binding + activity view (off-chain origin discovery;
 // ADR 016 § Off-Chain Read API, ADR 022 § Origin discovery). `nodeId` is
 // `bytes32(0)` if the operator never registered or cleared their binding via
-// rebinding; `active` is `false` if the operator is unbound, in unbonding,
-// auto-ejected, or below the tier minimum bond.
+// rebinding; `active` is `false` if the operator is unbound, auto-ejected,
+// or holds an active bond below its floor.
 function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 
 // Single-purpose per-operator activity check. Returns `true` iff `operator` is
-// currently registered with an active (non-unbonding) bond at or above
-// `bond_required(declared_capacity)`; `false` for unregistered addresses,
-// bond below the tier minimum, bond fully or partially in unbonding,
-// and auto-ejected operators.
+// currently registered with an active bond at or above its floor; `false`
+// for unregistered addresses, an active bond below the floor, and
+// auto-ejected operators. Bond queued for unbonding is not active bond, so
+// a partial unbond keeps the operator active while the retained bond covers
+// the floor.
 // SECURITY: operator-level blacklist status (ADR 011) is intentionally NOT
 // consulted — this is a pure single-contract storage read; callers needing the
 // combined "authorized origin" predicate filter against

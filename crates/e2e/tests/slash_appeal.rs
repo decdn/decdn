@@ -6,7 +6,8 @@
 //!    (voter). Age the chain ~185 days and have B serve real bytes so B has
 //!    nonzero Governor vote weight (ADR-036 served bytes × age ramp) at the
 //!    proposal snapshot — A's own weight is zeroed by the slash, so a second
-//!    operator must carry the grant vote.
+//!    operator must carry the grant vote. A serves bytes too: B's vote cap is
+//!    sized from the other operators' bytes, so B needs A's in the window.
 //! 2. Slash A through a **real** `SlashJudge` rate-manipulation commit-reveal
 //!    challenge.
 //! 3. Assert A's daemon surfaces the slash over `admin_v1_slashes`.
@@ -101,7 +102,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- Two operators: A (appellant, its daemon must surface the slash) and
     // B (voter, serves bytes to earn Governor vote weight). Both bond at ~T0.
     let payload = vec![0xABu8; 2 * MIB];
-    let (node_a, _hash_a) = NodeFixture::launch(&chain, "US", &payload).await?;
+    let (node_a, hash_a) = NodeFixture::launch(&chain, "US", &payload).await?;
     let (node_b, hash_b) = NodeFixture::launch(&chain, "US", &payload).await?;
 
     // ---- Declare a capacity tier for B so it carries Governor vote weight.
@@ -143,6 +144,23 @@ async fn run() -> anyhow::Result<()> {
     })
     .await?;
     assert!(served.is_some(), "B's on-chain served-bytes never advanced");
+
+    // ---- A serves bytes too. The per-operator vote cap is sized from the
+    // OTHER operators' bytes in the window (ADR 036), so B's weight needs bytes
+    // from someone else; a lone serving operator has a zero cap.
+    let outcome = client
+        .fetch(&chain, &node_a, hash_a, alloy::primitives::U256::ZERO)
+        .await?;
+    assert_eq!(outcome.bytes, payload, "A must deliver the blob");
+    let served_a = poll(Duration::from_secs(120), || async {
+        let a = chain.served_bytes(node_a.operator_addr()).await?;
+        Ok((a > U256::ZERO).then_some(a))
+    })
+    .await?;
+    assert!(
+        served_a.is_some(),
+        "A's on-chain served-bytes never advanced"
+    );
 
     // ---- Cross an epoch boundary so those bytes sit in a fully-elapsed epoch
     // inside the trailing window at the proposal snapshot.

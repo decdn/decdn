@@ -12,10 +12,10 @@
 //! Two contract facts drive the shape of this command, and both are surfaced
 //! to the operator rather than left to a revert:
 //!
-//! - A request in flight makes `isActive` false for the WHOLE window (it is a
-//!   conjunct of the predicate, independent of the remaining bond). Starting
-//!   one therefore takes the node out of the active set for ~14 days, which is
-//!   why a terminal run confirms first.
+//! - `requestUnbond` moves the released amount out of `activeBond` at once and
+//!   locks it for the ~14-day window. The node stays active while the retained
+//!   bond covers its floor and leaves the active set at once when it does not,
+//!   which is why a terminal run confirms first.
 //! - `requestUnbond`'s floor is `bondRequired(declaredMbps)` — the curve, NOT
 //!   `minBond`. So the contract permits unbonding into an inactive state. The
 //!   three amount flags pick deliberately different floors: `--to-mbps` keeps
@@ -174,9 +174,11 @@ pub(crate) struct Plan {
     pub(crate) declared_mbps: u64,
     /// Governable unbonding window (seconds), for the unlock-time report.
     pub(crate) unbonding_period: u64,
-    /// True when the post-request bond would sit below `minBond`, i.e. the
-    /// node cannot return to the active set without re-bonding.
-    pub(crate) below_min_bond: bool,
+    /// True when the post-request bond would sit below the operator's floor
+    /// (`bondFloorAtActivation`, or the live `minBond` for an operator that
+    /// never activated), i.e. the node leaves the active set and cannot return
+    /// without re-bonding.
+    pub(crate) below_floor: bool,
 }
 
 impl Plan {
@@ -215,6 +217,19 @@ pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
     let prior = bond.activeBond(operator).call().await.with_context(ctx)?;
     let declared = bond.declaredMbps(operator).call().await.with_context(ctx)?;
     let min_bond = bond.minBond().call().await.with_context(ctx)?;
+    // `isActive` tests the grandfathered floor, which a `minBond` change since
+    // activation leaves in place; an operator that never activated would
+    // record the live `minBond` on registering.
+    let recorded_floor = bond
+        .bondFloorAtActivation(operator)
+        .call()
+        .await
+        .with_context(ctx)?;
+    let floor = if recorded_floor == U256::ZERO {
+        min_bond
+    } else {
+        recorded_floor
+    };
     let unbonding_period = bond.unbondingPeriod().call().await.with_context(ctx)?;
     // Loud, not saturating: `declared_mbps` gates `tier_step`, so a silent
     // clamp to `u64::MAX` would make that guard accept ANY `--to-mbps`. The
@@ -262,7 +277,7 @@ pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
             prior,
             declared_mbps,
             unbonding_period: period_secs,
-            below_min_bond: prior < min_bond,
+            below_floor: prior < floor,
         });
     }
 
@@ -275,7 +290,7 @@ pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
     anyhow::ensure!(prior > U256::ZERO, "no active bond to unbond");
 
     // `_nodes[operator].active`, NOT the composite `isActive`: the latter also
-    // requires bond over `minBond` and no request in flight, so it would report
+    // requires active bond over the operator's floor, so it would report
     // a merely-under-bonded operator as inactive and let `--all` send a
     // `declareMbps(0)` the contract rejects. Registered-set membership is the
     // exact flag `declareMbps`'s release branch gates on.
@@ -299,7 +314,7 @@ pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
         prior,
         declared_mbps,
         unbonding_period: period_secs,
-        below_min_bond: retained < min_bond,
+        below_floor: retained < floor,
     })
 }
 
@@ -407,7 +422,7 @@ async fn resolve_release<P: Provider + Clone>(
             // That is independent of `minBond`, not below it — with the deployed
             // `k`/`α` the curve crosses above `minBond` around 1000 Mbps, so
             // whether this leaves the operator inactive is tier-dependent and is
-            // what `below_min_bond` reports.
+            // what `below_floor` reports.
             let retained = curve_floor(target).await?;
             let release = prior.saturating_sub(retained);
             anyhow::ensure!(
@@ -545,9 +560,10 @@ pub(crate) const fn decide_confirmation(
     }
 }
 
-/// Confirm before the first send on a `Request`. Starting a request costs the
-/// operator active-set membership for the whole window, which is not obvious
-/// from the flags alone — so the consequences are always disclosed, and a
+/// Confirm before the first send on a `Request`. Starting a request locks the
+/// released TOKEN for the whole window and, when the retained bond is below
+/// the operator's floor, costs the operator active-set membership — neither is obvious
+/// from the flags alone, so the consequences are always disclosed, and a
 /// terminal run additionally waits for `y`. `Withdraw` needs no confirmation:
 /// it only returns TOKEN.
 ///
@@ -575,16 +591,20 @@ fn confirm_or_bail(plan: &Plan, yes: bool) -> anyhow::Result<()> {
     let mut err = io::stderr().lock();
     writeln!(
         err,
-        "About to release {release} base units (retaining {retained}). Your node will be \
-         INACTIVE for the full {} unbonding window, and the TOKEN is only withdrawable \
-         after it.",
+        "About to release {release} base units (retaining {retained}). The released TOKEN \
+         is only withdrawable after the {} unbonding window.",
         format_remaining(plan.unbonding_period),
     )?;
-    if plan.below_min_bond {
+    if plan.below_floor {
         writeln!(
             err,
-            "The retained bond is below minBond, so the node stays inactive after the \
-             withdrawal until it re-bonds."
+            "The retained bond is below this operator's bond floor, so the node becomes \
+             INACTIVE now and stays inactive until it re-bonds."
+        )?;
+    } else {
+        writeln!(
+            err,
+            "The retained bond covers this operator's bond floor, so the node stays active."
         )?;
     }
 
@@ -642,7 +662,7 @@ pub(crate) fn write_plan(
             "prior_bond_base": p.prior.to_string(),
             "declared_mbps": p.declared_mbps,
             "unbonding_period_secs": p.unbonding_period,
-            "below_min_bond": p.below_min_bond,
+            "below_floor": p.below_floor,
             "declare_tx": tx_hex(o.declare.as_ref()),
             "request_tx": tx_hex(o.request.as_ref()),
             "withdraw_tx": tx_hex(o.withdraw.as_ref()),
@@ -694,7 +714,7 @@ pub(crate) fn write_plan(
                 "unbonding_period={}",
                 format_remaining(p.unbonding_period)
             )?;
-            writeln!(w, "below_min_bond={}", p.below_min_bond)?;
+            writeln!(w, "below_floor={}", p.below_floor)?;
         }
         Action::Waiting {
             amount, unlock_at, ..

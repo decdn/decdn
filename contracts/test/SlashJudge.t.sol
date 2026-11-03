@@ -13,6 +13,14 @@ import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol
 import { ICapacityBondRegionView } from "../src/interfaces/ICapacityBondRegionView.sol";
 import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
 
+/// @dev Code an operator could attach to its address (e.g. an EIP-7702
+///      delegate) that refuses every ERC-1271 signature check.
+contract RejectingSigner {
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return 0xffffffff;
+    }
+}
+
 contract MockToken is ERC20 {
     constructor() ERC20("TOKEN", "TKN") {
         _mint(msg.sender, 1_000_000_000e18);
@@ -43,8 +51,20 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
         unbondingPeriodValue = unbonding_;
     }
 
+    mapping(address => uint256) public activeBond;
+    mapping(address => uint256) internal _queued;
+
     function setBound(address operator, bytes32 nodeId) external {
         boundNodeId[operator] = nodeId;
+    }
+
+    function setBond(address operator, uint256 active, uint256 queued) external {
+        activeBond[operator] = active;
+        _queued[operator] = queued;
+    }
+
+    function unbondingOf(address operator) external view override returns (uint256, uint256) {
+        return (_queued[operator], 0);
     }
 
     function setRegion(address op, string memory current, string memory prev, uint64 lastChanged) external {
@@ -240,16 +260,16 @@ contract SlashJudgeTest is Test {
     // Commit–reveal helpers (#854)
     // -----------------------------------------------------------------
 
-    function _pairHash(SlashJudge.ProbeMsg memory p, SlashJudge.StreamMsg memory s, ISlashJudge.OffenseType offense)
+    function _pairHash(SlashJudge.ProbeMsg memory, SlashJudge.StreamMsg memory s, ISlashJudge.OffenseType offense)
         internal
-        pure
+        view
         returns (bytes32)
     {
-        return keccak256(abi.encode(uint8(offense), _probeStructHash(p), _streamStructHash(s)));
+        return keccak256(abi.encode(uint8(offense), node, _streamStructHash(s)));
     }
 
-    function _blacklistHash(bytes32 structHash, bool isStream) internal pure returns (bytes32) {
-        return keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), structHash, isStream));
+    function _blacklistHash(bytes32 structHash, bool isStream) internal view returns (bytes32) {
+        return keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), node, structHash, isStream));
     }
 
     /// @dev Commit `evidenceHash` as `who` (salt `SALT`) without advancing time.
@@ -332,6 +352,22 @@ contract SlashJudgeTest is Test {
         judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
+    /// @notice An offender that cleared its own binding (e.g. via
+    ///         `reclaimNodeId`) stays slashable while it has bond at risk, in
+    ///         either the active or the unbonding leg.
+    function test_rate_slashesUnboundOperatorWithBondAtRisk() public {
+        slasher.setBound(node, bytes32(0));
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+
+        slasher.setBond(node, 0, 1);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1, "queued bond keeps the unbound offender slashable");
+        assertEq(slasher.lastOperator(), node);
+    }
+
     function test_rate_revertsOnNodeIdMismatch() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
         SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
@@ -401,6 +437,38 @@ contract SlashJudgeTest is Test {
 
         assertEq(slasher.slashCount(), 1);
         assertTrue(judge.usedEvidenceHash(evidenceHash));
+    }
+
+    /// @notice Evidence is checked by ECDSA recovery alone, so code on the
+    ///         operator's address that rejects ERC-1271 checks does not shield it.
+    function test_rate_slashesOperatorWithRejectingCode() public {
+        vm.etch(node, address(new RejectingSigner()).code);
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    /// @notice One overcharged stream is one offense: pairing it with a second
+    ///         probe yields the same evidence hash, so it cannot escalate tiers.
+    function test_rate_sameStreamWithAnotherProbeIsReplay() public {
+        SlashJudge.ProbeMsg memory p1 = _probe(true, 10, probeTs);
+        SlashJudge.ProbeMsg memory p2 = _probe(true, 9, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 evidenceHash = _pairHash(p1, s, ISlashJudge.OffenseType.RateManipulation);
+
+        _commitAndMature(evidenceHash);
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p1), _signProbe(p1), abi.encode(s), _signStream(s), SALT);
+
+        _commitAndMature(evidenceHash);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceAlreadyUsed.selector, evidenceHash));
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p2), _signProbe(p2), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1);
     }
 
     // -----------------------------------------------------------------

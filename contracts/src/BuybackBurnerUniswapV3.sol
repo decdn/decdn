@@ -26,7 +26,7 @@ import { IUniswapV3Pool } from "./interfaces/IUniswapV3Pool.sol";
 ///
 ///         TWAP source: the inherited hand-rolled accumulator (NOT the pool's
 ///         native `observe()` oracle) — it samples `_spotPrice` from
-///         `slot0.sqrtPriceX96`, advanceable permissionlessly via `poke()`,
+///         `slot0.sqrtPriceX96`, advanceable by the keeper via `poke()`,
 ///         fail-closed until `twapMinWindow` matures. This works on a
 ///         freshly-seeded pool whose observation cardinality is still 1.
 ///

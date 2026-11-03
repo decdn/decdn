@@ -11,6 +11,7 @@ import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
+import { SlashRecord, SlashStatus } from "./SlashEscrowLib.sol";
 import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
 
 /// @title DecdnGovernor
@@ -83,6 +84,8 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     uint256 internal constant AGE_RAMP_MONTHS_CEILING = 24;
     uint256 internal constant SECONDS_PER_MONTH = 30 days;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
+    /// @dev `TimelockController.PROPOSER_ROLE`.
+    bytes32 internal constant PROPOSER_ROLE = keccak256("PROPOSER_ROLE");
     uint256 internal constant RAMP_SCALE = 1e18;
 
     /// @dev Mbps (megabits/s) → bytes/s: `1e6 / 8`. Exact.
@@ -100,6 +103,8 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
 
     error ZeroFeeRouter();
     error ZeroCapacityBond();
+    /// @notice `propose` before this Governor holds the timelock's `PROPOSER_ROLE`.
+    error GovernorNotProposer();
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     /// @notice `setVoteCapBps` rejects any value that does not strictly
     ///         decrease the current cap. The cap is decrease-only.
@@ -233,27 +238,31 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         return (capped * ramp) / RAMP_SCALE;
     }
 
+    /// @dev True iff `account` has a standing (not appeal-reversed) slash with
+    ///      `slashedAt` in `[start of the byte window, timepoint]`. Every slash
+    ///      record is checked, so a later slash cannot hide an earlier one, and
+    ///      a slash in the in-progress epoch zeroes snapshots taken after it. A
+    ///      slash after `timepoint` never zeroes that snapshot (#847).
     function _slashedInWindow(address account, uint256 timepoint) internal view returns (bool) {
-        uint64 slashStamp = capacityBond.slashedAtEpoch(account);
-        if (slashStamp == 0) return false;
         (uint64 endEpoch, bool hasElapsed) = _endEpoch(timepoint);
         // No fully-elapsed epoch yet ⇒ the byte window is empty, so there is
         // nothing to zero. Keeps the slash window aligned with the byte window.
         if (!hasElapsed) return false;
-        // `slashedAtEpoch` returns `actualEpoch + 1` (or 0 if unslashed) so
-        // an epoch-0 slash isn't collapsed with the unslashed sentinel.
-        uint64 slashed = slashStamp - 1;
         uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
         // Clamp identically to `_cappedServed` and `FeeRouter.bytesInWindow` so
         // the slash window can never span more epochs than the byte window it
         // must track, even if `windowEpochsAt` returns an out-of-bound value.
         if (n > MAX_WINDOW_EPOCHS) n = MAX_WINDOW_EPOCHS;
         uint64 windowStart = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
-        // Upper-bound the slash epoch at `endEpoch` (the last fully-elapsed
-        // epoch). A slash that happened AFTER the snapshot timepoint — or in the
-        // in-progress epoch — must NOT retroactively zero historical votes for
-        // that proposal (#847: the slash window tracks the byte window).
-        return slashed >= windowStart && slashed <= endEpoch;
+        uint256 windowStartTime = uint256(windowStart) * feeRouter.epochLength();
+        // Newest first. Records are appended in slash order, so the walk stops
+        // at the first slash before the window.
+        for (uint256 i = capacityBond.operatorSlashCount(account); i > 0; i--) {
+            SlashRecord memory r = capacityBond.getSlashRecord(capacityBond.operatorSlashIdAt(account, i - 1));
+            if (r.slashedAt < windowStartTime) return false;
+            if (r.slashedAt <= timepoint && r.status != SlashStatus.Reversed) return true;
+        }
+        return false;
     }
 
     function _cappedServed(address account, uint256 timepoint) internal view returns (uint256) {
@@ -274,12 +283,22 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
             served += epochBytes < epochCap ? epochBytes : epochCap;
         }
 
-        // Per-operator share cap (ADR 036) reads at the proposal snapshot, not
-        // live, so a setter change mid-vote does not shift weights.
-        uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
-        uint256 capBps = voteCapBpsAt(timepoint.toUint48());
-        uint256 cap = (total * capBps) / BPS_DENOMINATOR;
+        uint256 cap = _shareCap(account, endEpoch, n, timepoint);
         return served < cap ? served : cap;
+    }
+
+    /// @dev Per-operator share cap (ADR 036), read at the proposal snapshot, not
+    ///      live, so a setter change mid-vote does not shift weights. The cap is
+    ///      sized from the OTHER operators' bytes, so an operator's own bytes
+    ///      (self-dealt or not) never raise its own cap: at the cap its weight is
+    ///      exactly `capBps` of (others + cap). `capBps` is bounded below
+    ///      `BPS_DENOMINATOR`, so the divisor is non-zero.
+    function _shareCap(address account, uint64 endEpoch, uint64 n, uint256 timepoint) internal view returns (uint256) {
+        uint256 own = feeRouter.bytesInWindow(account, endEpoch, n);
+        uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
+        uint256 others = total > own ? total - own : 0;
+        uint256 capBps = voteCapBpsAt(timepoint.toUint48());
+        return (others * capBps) / (BPS_DENOMINATOR - capBps);
     }
 
     /// @dev Last fully-elapsed epoch as of `timepoint`. Returns
@@ -398,9 +417,13 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     }
 
     /// @notice Delegate the caller's vote-casting right to `delegatee`. Pass
-    ///         `address(0)` to revoke. Overwrites any prior delegation.
+    ///         `address(0)` to revoke. Overwrites any prior delegation and
+    ///         consumes the caller's `delegationNonces` value, so a signed
+    ///         `delegateBySig` the caller never redeemed cannot later replace it.
     function delegate(address delegatee) external {
-        _delegate(_msgSender(), delegatee);
+        address operator = _msgSender();
+        _delegationNonces[operator] += 1;
+        _delegate(operator, delegatee);
     }
 
     /// @notice Delegate `delegator`'s vote-casting right to `delegatee` from an
@@ -475,6 +498,23 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
 
     function _requireDelegatee(address delegator, address caller) private view {
         if (_delegatee[delegator] != caller) revert NotDelegatee(delegator, caller);
+    }
+
+    /// @notice Proposals open only once this Governor holds the timelock's
+    ///         `PROPOSER_ROLE`. During the ADR 009 bootstrap-multisig phase the
+    ///         Governor cannot queue, and an unqueued `Succeeded` proposal never
+    ///         expires, so a proposal passed by a thin early electorate would
+    ///         otherwise become executable once the roles move to the Governor.
+    function propose(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        string memory description
+    ) public override returns (uint256) {
+        if (!TimelockController(payable(timelock())).hasRole(PROPOSER_ROLE, address(this))) {
+            revert GovernorNotProposer();
+        }
+        return super.propose(targets, values, calldatas, description);
     }
 
     // -----------------------------------------------------------------

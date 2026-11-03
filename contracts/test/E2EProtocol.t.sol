@@ -144,6 +144,14 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         PaymentPool.LaneSettled[] memory expected = new PaymentPool.LaneSettled[](1);
         expected[0] =
             PaymentPool.LaneSettled({ signer: signer, newPaidCumulative: SETTLE_AMOUNT, bytesPaid: SETTLE_BYTES });
+        // Redemption pays only a bound operator and stamps bytes only for an
+        // active one; stand the operator up as both without a full onboarding.
+        vm.mockCall(
+            address(d.bond),
+            abi.encodeWithSignature("nodeIdOf(address)", operator),
+            abi.encode(bytes32(uint256(0x0FE1)), true)
+        );
+
         vm.expectEmit(true, true, true, true, address(d.paymentPool));
         emit PoolRedeemed(poolId, operator, expected);
 

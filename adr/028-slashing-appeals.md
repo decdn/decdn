@@ -60,7 +60,7 @@ sequenceDiagram
     end
 ```
 
-The operator action — `openSlashAppeal(slashId, evidenceBundleHash)` — is the entry point on `SlashAppeal`. It reads the slash record from `CapacityBond`, requires `msg.sender` to be that recorded operator (operator-only filing — see § Decision), enforces the 30-day filing window and the 365-day frequency cap, and calls `markAppealOpen` to lock the escrow. The fast-track / ratification structure is the same pattern [ADR 011 § Regional Governance Bodies](011-content-takedown.md#regional-governance-bodies) uses for regional-body suspension.
+The operator action — `openSlashAppeal(slashId, evidenceBundleHash)` — is the entry point on `SlashAppeal`. It reads the slash record from `CapacityBond`, requires `msg.sender` to be that recorded operator (operator-only filing — see § Decision), enforces the 30-day filing window and the 365-day frequency cap, and calls `markAppealOpen` to lock the escrow. An operator has at most one open appeal at a time, so a grant always lands before the next appeal's frequency-cap check; concurrent appeals cannot all pass the cap. The fast-track / ratification structure is the same pattern [ADR 011 § Regional Governance Bodies](011-content-takedown.md#regional-governance-bodies) uses for regional-body suspension.
 
 **Escrow-on-slash eliminates clawback exposure structurally.** The slashed TOKEN sits in `CapacityBond` escrow from the moment of the slash — nothing is paid to the challenger or burned until finality. So a successful appeal simply refunds the operator's own escrowed TOKEN, and a failed appeal distributes it. There is no separate restitution pool, no USDC↔TOKEN conversion, and no clawback of already-distributed funds. The only trade-off is that the challenger's 50% reward waits until finality (≤30 days with no appeal, longer if an appeal runs) rather than being paid at slash time — a Negative consequence below.
 
@@ -129,7 +129,7 @@ function settleAppealGranted(uint256 slashId) external;   // escrow refunded to 
 function finalizeUnappealedSlash(uint256 slashId) external; // after the filing window: escrow 50/50
 ```
 
-`openSlashAppeal` reads the slash record from `CapacityBond`, requires the caller to be the recorded operator (operator-only filing), enforces the 30-day filing window and 365-day frequency cap, pulls `APPEAL_BOND` (`TOKEN.transferFrom`), records the appeal, and calls `markAppealOpen` to lock the escrow. No USDC and no `payout()` machinery are involved — a granted appeal refunds the operator's escrowed TOKEN directly via `settleAppealGranted`.
+`openSlashAppeal` reads the slash record from `CapacityBond`, requires the caller to be the recorded operator (operator-only filing), enforces the 30-day filing window, the 365-day frequency cap and one open appeal per operator, pulls `APPEAL_BOND` (`TOKEN.transferFrom`), records the appeal, and calls `markAppealOpen` to lock the escrow. No USDC and no `payout()` machinery are involved — a granted appeal refunds the operator's escrowed TOKEN directly via `settleAppealGranted`.
 
 **Multisig capability scope.** `fastTrackAppeal` and `rejectAppeal` are gated by `SlashAppeal.EMERGENCY_MULTISIG_ROLE`, the same 3-of-5 emergency multisig as [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig). The threshold and signing semantics are unchanged from [ADR 009](009-governance.md#emergency-multisig).
 

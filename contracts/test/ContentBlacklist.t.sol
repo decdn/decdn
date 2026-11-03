@@ -432,6 +432,30 @@ contract ContentBlacklistTest is Test {
 
     /// @notice Governance ratification: re-adding under `addHashGlobal` clears
     ///         `emergency`, so the entry stops self-expiring.
+    /// @notice Re-adding or ratifying a live entry keeps `addedAt` and
+    ///         `effectiveAt`, so evidence of a serve made after the entry took
+    ///         effect stays valid. Only the reason and the emergency flag move.
+    function test_reAddLiveEntry_keepsStamps() public {
+        vm.prank(multisig);
+        blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.GENERAL), "DMCA");
+        ContentBlacklist.HashEntry memory before = blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH);
+
+        vm.warp(block.timestamp + 3 days);
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-RATIFIED");
+
+        ContentBlacklist.HashEntry memory afterRatify = blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH);
+        assertEq(afterRatify.addedAt, before.addedAt, "addedAt kept");
+        assertEq(afterRatify.effectiveAt, before.effectiveAt, "effectiveAt kept");
+        assertFalse(afterRatify.emergency, "ratification clears the emergency flag");
+        assertEq(blacklist.hashReason(GLOBAL_REGION, SAMPLE_HASH), "DMCA-RATIFIED");
+
+        vm.warp(block.timestamp + 3 days);
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-AGAIN");
+        assertEq(blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH).effectiveAt, before.effectiveAt);
+    }
+
     function test_emergencyAdd_ratifiedByGovernanceSurvivesExpiry() public {
         vm.prank(multisig);
         blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.GENERAL), "DMCA");

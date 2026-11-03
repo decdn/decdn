@@ -11,6 +11,7 @@ import { BondMath } from "../src/BondMath.sol";
 import { Token } from "../src/Token.sol";
 
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
@@ -106,6 +107,20 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         assertEq(bond.firstBondedAt(operator), 1_000_000);
+    }
+
+    /// @notice A dust bond below `minBond` does not start the tenure ramp; the
+    ///         bond that reaches `minBond` does.
+    function test_firstBondedAt_setsAtMinBondCrossingNotDust() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(1);
+        assertEq(bond.firstBondedAt(operator), 0, "a dust bond stamps no tenure");
+
+        vm.warp(2_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND - 1);
+        assertEq(bond.firstBondedAt(operator), 2_000_000, "the minBond crossing stamps tenure");
     }
 
     function test_firstBondedAt_immutableAcrossReBonds() public {
@@ -611,6 +626,27 @@ contract CapacityBondTest is Test {
         assertEq(bond.declaredMbps(operator), 0, "and it clears the tier rather than reverting");
     }
 
+    /// @notice The tier release is an exit step, so a pause does not block it;
+    ///         a normal declaration still reverts while paused.
+    function test_declareMbps_releaseWorksWhilePaused() public {
+        _bondForMbps(10);
+        vm.prank(operator);
+        bond.declareMbps(10);
+
+        vm.startPrank(admin);
+        bond.grantRole(bond.PAUSER_ROLE(), admin);
+        bond.pause();
+        vm.stopPrank();
+
+        vm.prank(operator);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        bond.declareMbps(20);
+
+        vm.prank(operator);
+        bond.declareMbps(0);
+        assertEq(bond.declaredMbps(operator), 0, "the release lands during a pause");
+    }
+
     function test_declareMbps_revertsAboveCeiling() public {
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 200_001, 10, 200_000));
@@ -860,25 +896,40 @@ contract CapacityBondTest is Test {
         vm.stopPrank();
     }
 
+    /// @notice A partial unbond that retains the operator's floor keeps it
+    ///         active for the whole unbonding window.
+    function test_isActive_partialUnbondAboveFloorStaysActive() public {
+        vm.warp(1_000_000);
+        address b = _registerFreshOperator(0xB2, bytes32(uint256(0xB2)), 2 * MIN_BOND);
+
+        vm.prank(b);
+        bond.requestUnbond(MIN_BOND);
+        assertEq(bond.activeBond(b), MIN_BOND, "B retains exactly its floor");
+        assertTrue(bond.isActive(b), "a partial unbond above the floor keeps B active");
+
+        vm.warp(block.timestamp + bond.unbondingPeriod());
+        vm.prank(b);
+        bond.unbond();
+        assertTrue(bond.isActive(b), "withdrawing the released part keeps B active");
+    }
+
     /// @notice `getRegisteredNodes` returns the full registered page and a
     ///         parallel `active[]` computed on-chain via `isActive`. An operator
-    ///         mid-unbonding is `isActive == false` but MUST stay in the page —
-    ///         it is inactive yet still payable, so the off-chain bindings
-    ///         projection depends on it not vanishing. This is the exact
-    ///         asymmetry the rename preserves (issue #1565).
-    function test_getRegisteredNodes_marksUnbondingOperatorInactiveButPresent() public {
+    ///         whose bond sits below its floor is `isActive == false` but MUST
+    ///         stay in the page — it is inactive yet still payable, so the
+    ///         off-chain bindings projection depends on it not vanishing
+    ///         (issue #1565).
+    function test_getRegisteredNodes_marksSubFloorOperatorInactiveButPresent() public {
         vm.warp(1_000_000);
         address a = _registerFreshOperator(0xA1, bytes32(uint256(0xA1)), MIN_BOND);
-        // B bonds 2x so requestUnbond keeps activeBond >= minBond: the ONLY
-        // reason isActive flips false is the pending unbonding.
-        address b = _registerFreshOperator(0xB2, bytes32(uint256(0xB2)), 2 * MIN_BOND);
+        address b = _registerFreshOperator(0xB2, bytes32(uint256(0xB2)), MIN_BOND);
         assertTrue(bond.isActive(a));
         assertTrue(bond.isActive(b));
 
         vm.prank(b);
         bond.requestUnbond(1);
-        assertGe(bond.activeBond(b), MIN_BOND, "B still above minBond");
-        assertFalse(bond.isActive(b), "unbonding alone flips isActive false");
+        assertLt(bond.activeBond(b), MIN_BOND, "B drops below its floor");
+        assertFalse(bond.isActive(b), "a sub-floor bond flips isActive false");
 
         (CapacityBond.NodeInfo[] memory page, bool[] memory active) = bond.getRegisteredNodes(0, 100);
 
@@ -893,7 +944,7 @@ contract CapacityBondTest is Test {
                 assertTrue(active[i], "active operator flagged active");
             } else if (page[i].ethAddress == b) {
                 sawB = true;
-                assertFalse(active[i], "unbonding operator present but flagged inactive");
+                assertFalse(active[i], "sub-floor operator present but flagged inactive");
             } else {
                 revert("unexpected operator in page");
             }
@@ -1082,6 +1133,34 @@ contract CapacityBondTest is Test {
         uint256 recovered = token.balanceOf(operator) - balBefore;
         assertEq(recovered, MIN_BOND - expectedSlash, "only the un-slashed remainder is withdrawn");
         assertEq(bond.escrowedTotal(), expectedSlash, "the slashed amount stays escrowed, unreachable by exit");
+    }
+
+    /// @notice A re-registration into a new region snapshots the old region in
+    ///         `regionPrev`, so the old region's blacklist entries keep applying
+    ///         through the stability window (ADR 030). Re-registering into the
+    ///         same region keeps the snapshot.
+    function test_reRegisterIntoNewRegion_recordsRegionPrev() public {
+        uint256 opPk = 0x8EE9;
+        bytes32 nodeId = bytes32(uint256(0x8EE9));
+        address opAddr = _onboardAtTier(opPk, 1000, nodeId);
+
+        vm.prank(opAddr);
+        bond.deregisterNode();
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+
+        (string memory region, string memory prev,,) = bond.regionScopeData(opAddr);
+        assertEq(region, "eu-west");
+        assertEq(prev, "us-east", "the old region is snapshotted");
+
+        vm.prank(opAddr);
+        bond.deregisterNode();
+        sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+        (, prev,,) = bond.regionScopeData(opAddr);
+        assertEq(prev, "us-east", "an unchanged region keeps the snapshot");
     }
 
     function test_reRegisterAfterDeregister_keepsBondAndNeedsFreshDeclare() public {
@@ -1974,6 +2053,37 @@ contract CapacityBondTest is Test {
         bond.setMinBond(100_000e18);
         assertTrue(bond.isActive(opAddr), "grandfathered at 50k floor, stays active");
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "floor unchanged by later raise");
+    }
+
+    /// @notice A floor left by an earlier `bond()` crossing above the live
+    ///         `minBond` is replaced at registration, so an operator that clears
+    ///         the live `minBond` is active once registered.
+    function test_minBond_registerAfterDecrease_replacesStaleHigherFloor() public {
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        uint256 opPk = 0xF1009A;
+        address opAddr = vm.addr(opPk);
+        bytes32 nodeId = bytes32(uint256(0xF1009A));
+        vm.prank(admin);
+        token.transfer(opAddr, 100_000e18);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(100_000e18); // crosses the 100k minBond → floor 100k
+        bond.requestUnbond(40_000e18); // 60k active
+        vm.stopPrank();
+        assertEq(bond.bondFloorAtActivation(opAddr), 100_000e18);
+
+        vm.prank(admin);
+        bond.setMinBond(50_000e18);
+
+        vm.startPrank(opAddr);
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        vm.stopPrank();
+
+        assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registration records the live minBond");
+        assertTrue(bond.isActive(opAddr), "60k clears the 50k entry floor");
     }
 
     /// @notice A NEW operator bonding below the raised `minBond` cannot activate:
