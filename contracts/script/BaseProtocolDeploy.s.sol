@@ -377,6 +377,9 @@ abstract contract BaseProtocolDeploy is Script {
     ///         cap denominator (`usdc.balanceOf(pool)`) would be zero, so the
     ///         "seed the pool before wiring" guard fails the deploy loudly.
     error PoolNotSeeded(address pool);
+    /// @notice The minimum buyback exceeds the per-epoch cap at the seeded pool
+    ///         depth, so every buyback would revert.
+    error BuybackBandBelowEpochCap(uint256 minBuybackAmount, uint256 epochCap);
     /// @notice The TOKEN/USDC pool already existed at a price other than the
     ///         seed price, so seeding into it would sell at that price.
     error PoolPreInitialized(address pool, uint160 current, uint160 expected);
@@ -977,7 +980,15 @@ abstract contract BaseProtocolDeploy is Script {
         address pool = _createAndSeedUniswapPool(cfg, act, d);
         // "Seed before wire" guard: a live pool must custody USDC, or the burner's
         // per-epoch cap denominator (`usdc.balanceOf(pool)`) is zero.
-        if (cfg.usdc.balanceOf(pool) == 0) revert PoolNotSeeded(pool);
+        uint256 depth = cfg.usdc.balanceOf(pool);
+        if (depth == 0) revert PoolNotSeeded(pool);
+        // The per-epoch cap at the seeded depth must admit at least one
+        // minimum-size buyback; otherwise every keeper buyback reverts
+        // `EpochCapExceeded` and nothing burns.
+        uint256 epochCap = depth * act.guard.epochLiquidityCapFraction_ / 10_000;
+        if (epochCap < act.guard.minBuybackAmount_) {
+            revert BuybackBandBelowEpochCap(act.guard.minBuybackAmount_, epochCap);
+        }
 
         return BuybackVenueLib.deployUniswapBurner(
             cfg.usdc,

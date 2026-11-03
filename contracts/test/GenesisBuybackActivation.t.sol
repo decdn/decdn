@@ -381,6 +381,17 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(_config(), act);
     }
 
+    /// @notice A minimum buyback above the per-epoch cap at the seeded depth
+    ///         would make every buyback revert, so the deploy refuses it.
+    function test_revertsWhenMinBuybackExceedsEpochCap() public {
+        MockPositionManager npm = new MockPositionManager(true);
+        usdc.approve(address(npm), type(uint256).max);
+        BuybackActivation memory act = _uniswapActivation(address(npm));
+        act.seed = _derivePoolSeed(100e6, TARGET_PRICE); // cap = 10% of 100 USDC = 10 USDC
+        vm.expectRevert(abi.encodeWithSelector(BaseProtocolDeploy.BuybackBandBelowEpochCap.selector, 100e6, 10e6));
+        this.externalRunFullDeploy(_config(), act);
+    }
+
     function test_revertsWhenGuardBandIsDead() public {
         MockPositionManager npm = new MockPositionManager(true);
         usdc.approve(address(npm), type(uint256).max);

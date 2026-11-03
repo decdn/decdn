@@ -245,7 +245,10 @@ contract DeployProtocol is BaseProtocolDeploy {
     //   deployer must hold the seed TOKEN + USDC — set `INITIAL_TOKEN_HOLDER` to the
     //   deployer or fund it). Pick a USDC amount you hold and a target price; the
     //   paired TOKEN seed is derived so the 50/50 pool initializes at that price:
-    //     - `BUYBACK_USDC_SEED`          (default 100e6 = 100 USDC)
+    //     - `BUYBACK_USDC_SEED`          (default 1_000e6 = 1,000 USDC; the seeded
+    //                                      depth × `EPOCH_CAP_FRACTION_BPS` must admit
+    //                                      one `MIN_BUYBACK_AMOUNT` buyback, or the
+    //                                      deploy reverts `BuybackBandBelowEpochCap`)
     //     - `BUYBACK_TARGET_PRICE`       (default 10_000 — the price of one TOKEN in
     //                                      USDC base units; 6-dec USDC → $0.01/TOKEN)
     error PoolFeeOutOfRange(uint256 fee);
@@ -268,7 +271,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         // price (no need to hand-compute the ratio). `BUYBACK_TARGET_PRICE` is the
         // price of one whole TOKEN in USDC base units (6-dec USDC → `$0.01/TOKEN`
         // is `10_000`).
-        uint256 usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(100e6));
+        uint256 usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(1000e6));
         uint256 targetPrice = vm.envOr("BUYBACK_TARGET_PRICE", uint256(10_000)); // $0.01/TOKEN
         // Built through the derivation helper so the seed records the price it was
         // sized for; `_assertPoolSeedDerived` re-derives to prove `tokenSeed`.
