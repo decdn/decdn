@@ -31,7 +31,7 @@ A **namespace** is a publisher-owned `uint256` identifier for a content set, and
 
 ### Hash-to-namespace association
 
-Every hash in the network belongs to at least one namespace: it enters the network only through a seated origin of a registered namespace ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). One hash can belong to several namespaces, and one origin can serve several namespaces. A request can pair the hash with a namespace that its content is published under. The requester supplies this pair at fetch time when it knows it (e.g. a music app fetches a track with `namespaceId 3`). The chain stores namespace ownership and each namespace's authorized origin set, so on-chain state is bounded by the number of namespaces, independent of how much content each one serves.
+A hash is discoverable only with the origin attestation of an operator that holds an origin seat in at least one namespace ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). The attestation names no namespace, and neither the protocol nor the chain records which namespace a hash is published under. One origin can serve several namespaces. A request can pair the hash with a namespace that its content is published under. The requester supplies this pair at fetch time when it knows it (e.g. a music app fetches a track with `namespaceId 3`). The chain stores namespace ownership and each namespace's authorized origin set, so on-chain state is bounded by the number of namespaces, independent of how much content each one serves.
 
 The namespace on a request is a **routing hint, not a trust anchor.** A node uses it only to decide which origins to ask; BLAKE3 verification of the returned bytes is independent, so a wrong or hostile namespace hint can only cause a *failed fetch*, never corrupt or mis-attributed delivery.
 
@@ -48,7 +48,7 @@ Whether a node relays a miss it cannot serve from itself — a blob it neither h
 
 ### Namespace 0
 
-`namespaceId == 0` is not a namespace. It has no publisher and no authorized origins; `PublisherRegistry` allocates namespace ids from 1. On a request, `0` means that the requester does not name the namespace (above). There is no content without a namespace: a hash that no seated origin served has no valid DHT record, so no node discovers it or relays it. A publisher creates a namespace and seats an origin to put content into the network.
+`namespaceId == 0` is not a namespace. It has no publisher and no authorized origins; `PublisherRegistry` allocates namespace ids from 1. On a request, `0` means that the requester does not name the namespace (above). A hash that no seated origin served has no valid DHT record, so no node discovers it or relays it. A publisher creates a namespace and seats an origin to put content into the network.
 
 ### Contract: PublisherRegistry
 

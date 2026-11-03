@@ -388,7 +388,7 @@ The backstops are reactive, not preventive. Governance removes a bad origin, un-
 
 ### Namespace 0
 
-`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. `addOrigin(0, op)` reverts for every caller, because `ownerOf(0)` is the zero address. No content lives under namespace 0: content enters the network only through a seated origin of a registered namespace, whose origin attestation every DHT record carries ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0), [ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)).
+`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. `addOrigin(0, op)` reverts for every caller, because `ownerOf(0)` is the zero address. A hash becomes discoverable only through an operator that holds an origin seat in a registered namespace, whose origin attestation every DHT record carries ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0), [ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)).
 
 ### Unassigned namespaces
 
@@ -532,7 +532,7 @@ A slash requires an active challenger submitting evidence of a post-window deliv
 - Local denylist preserves operator autonomy for direct legal notices
 - Origin assignment authority gives publishers a protocol-level way to commit specific operators to serving their content; the operator-set size is a publisher/governance decision, not a contract-enforced floor
 - Symmetric blacklist/assignment infrastructure: a blacklisted operator is treated as unauthorized at every runtime check across every namespace they were authorized to serve, with lazy storage cleanup (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist))
-- Namespace 0 (`namespaceId == 0`) has no authorized origins and holds no content; only registered namespaces carry a DAO-authorized origin set, so on-chain state is bounded by the number of namespaces rather than by content volume
+- Namespace 0 (`namespaceId == 0`) has no authorized origins; only registered namespaces carry a DAO-authorized origin set, so on-chain state is bounded by the number of namespaces rather than by content volume
 
 ### Negative
 
