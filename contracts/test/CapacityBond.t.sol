@@ -1991,6 +1991,37 @@ contract CapacityBondTest is Test {
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "floor unchanged by later raise");
     }
 
+    /// @notice A floor left by an earlier `bond()` crossing above the live
+    ///         `minBond` is replaced at registration, so an operator that clears
+    ///         the live `minBond` is active once registered.
+    function test_minBond_registerAfterDecrease_replacesStaleHigherFloor() public {
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        uint256 opPk = 0xF1009A;
+        address opAddr = vm.addr(opPk);
+        bytes32 nodeId = bytes32(uint256(0xF1009A));
+        vm.prank(admin);
+        token.transfer(opAddr, 100_000e18);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(100_000e18); // crosses the 100k minBond → floor 100k
+        bond.requestUnbond(40_000e18); // 60k active
+        vm.stopPrank();
+        assertEq(bond.bondFloorAtActivation(opAddr), 100_000e18);
+
+        vm.prank(admin);
+        bond.setMinBond(50_000e18);
+
+        vm.startPrank(opAddr);
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        vm.stopPrank();
+
+        assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registration records the live minBond");
+        assertTrue(bond.isActive(opAddr), "60k clears the 50k entry floor");
+    }
+
     /// @notice A NEW operator bonding below the raised `minBond` cannot activate:
     ///         entry is gated on the live `minBond`, and no floor is recorded.
     function test_minBond_raise_barsNewEntrantBelowFloor() public {
