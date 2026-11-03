@@ -145,6 +145,17 @@ contract BuybackBurnerUniswapV3Test is Test {
         usdc.mint(address(pool), 1_000_000e6); // cap = 10% = 100_000e6
     }
 
+    /// @dev `poke` is keeper-only; grant the role on a fresh burner first.
+    function _poke(BuybackBurnerUniswapV3 b) internal {
+        if (!b.hasRole(b.KEEPER_ROLE(), keeper)) {
+            bytes32 role = b.KEEPER_ROLE();
+            vm.prank(admin);
+            b.grantRole(role, keeper);
+        }
+        vm.prank(keeper);
+        b.poke();
+    }
+
     function _deploy(address pool_) internal returns (BuybackBurnerUniswapV3) {
         return new BuybackBurnerUniswapV3(
             IERC20(address(usdc)),
@@ -166,9 +177,9 @@ contract BuybackBurnerUniswapV3Test is Test {
     /// @dev Mature the inherited TWAP accumulator to a constant spot: poke,
     ///      advance one full window, poke again → `twapPrice == spot`.
     function _matureTwap() internal {
-        bb.poke();
+        _poke(bb);
         vm.warp(block.timestamp + TWAP_WINDOW);
-        bb.poke();
+        _poke(bb);
     }
 
     function _expectedFloor(uint256 amountIn, uint256 spot1e18) internal pure returns (uint256) {
@@ -232,15 +243,15 @@ contract BuybackBurnerUniswapV3Test is Test {
         MockV3Pool rev = new MockV3Pool(uint160(uint256(1 << 96) / 1_000_000), address(token), address(usdc), FEE);
         BuybackBurnerUniswapV3 b2 = _deploy(address(rev));
         // mature b2's TWAP
-        b2.poke();
+        _poke(b2);
         vm.warp(block.timestamp + TWAP_WINDOW);
-        b2.poke();
+        _poke(b2);
         // Same 1.0 human price regardless of leg ordering.
         assertApproxEqRel(b2.twapPrice(), 1e18, 1e15);
     }
 
     function test_twapPrice_revertsBeforeWindow() public {
-        bb.poke();
+        _poke(bb);
         vm.expectRevert(GuardedBuybackBurner.TwapNotReady.selector);
         bb.twapPrice();
     }
@@ -350,9 +361,9 @@ contract BuybackBurnerUniswapV3Test is Test {
         usdc.transfer(address(bb2), 1_000_000e6);
         usdc.mint(address(lowPool), 50_000e6); // cap = 10% = 5_000e6
 
-        bb2.poke();
+        _poke(bb2);
         vm.warp(block.timestamp + TWAP_WINDOW);
-        bb2.poke();
+        _poke(bb2);
 
         uint256 amountIn = 6000e6; // in band [100e6, 10_000e6], over the 5_000e6 cap
         uint256 floor = _expectedFloor(amountIn, 1e18);
