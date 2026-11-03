@@ -31,7 +31,7 @@ A **namespace** is a publisher-owned `uint256` identifier for a content set, and
 
 ### Hash-to-namespace association
 
-A request pairs the hash with the namespace its content is published under. The requester supplies this pair at fetch time — the application already knows its namespace (e.g. a music app fetches a track with `namespaceId 3`). The chain stores namespace ownership and each namespace's authorized origin set, so on-chain state is bounded by the number of namespaces, independent of how much content each one serves.
+A hash is discoverable only with the origin attestation of an operator that holds an origin seat in at least one namespace ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). The attestation names no namespace, and neither the protocol nor the chain records which namespace a hash is published under. One origin can serve several namespaces. A request can pair the hash with a namespace that its content is published under. The requester supplies this pair at fetch time when it knows it (e.g. a music app fetches a track with `namespaceId 3`). The chain stores namespace ownership and each namespace's authorized origin set, so on-chain state is bounded by the number of namespaces, independent of how much content each one serves.
 
 The namespace on a request is a **routing hint, not a trust anchor.** A node uses it only to decide which origins to ask; BLAKE3 verification of the returned bytes is independent, so a wrong or hostile namespace hint can only cause a *failed fetch*, never corrupt or mis-attributed delivery.
 
@@ -40,7 +40,7 @@ The namespace on a request is a **routing hint, not a trust anchor.** A node use
 A `cdn/client/v1` request carries a `namespaceId` alongside the hash (see [ADR 005](005-protocol.md#cdnclientv1--paid-delivery-protocol)). The node routes on it:
 
 - **`namespaceId != 0`** — the node routes to the namespace's authorized origins (`OriginAssignment`, [ADR 011](011-content-takedown.md#origin-assignment-authority)). If none hold the bytes, or the origin fetch fails, the fetch fails.
-- **`namespaceId == 0`** — the request names no namespace, so there are no authorized origins. The node serves only from its local cache or from peers discovered via the DHT ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). If no peer advertises the hash, the fetch fails. Namespace-0 content therefore has no durability or availability guarantee — reliable retrieval wants a namespace.
+- **`namespaceId == 0`** — the request does not name the namespace. The node serves from its local cache, from peers discovered via the DHT, or from the origins that those peers' origin attestations name ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). If no valid DHT record exists for the hash, the fetch fails. The namespace is the only route to an origin for content that no node caches, so a request for cold content names its namespace.
 
 Cache-only serving stays permissionless: any staked operator may re-serve bytes it already holds, for any hash, regardless of namespace. Only the **origin** role is namespace-gated.
 
@@ -48,7 +48,7 @@ Whether a node relays a miss it cannot serve from itself — a blob it neither h
 
 ### Namespace 0
 
-`namespaceId == 0` is the default namespace, for content published without one. It has no publisher and no authorized origins; the DAO authorizes origins only for registered (non-zero) namespaces. Namespace-0 content is served best-effort from cache or DHT-discovered holders (the path above) and carries no availability guarantee. A publisher wanting durable origins, takedown accountability, or a stable origin set creates a non-zero namespace and has the DAO authorize origins for it.
+`namespaceId == 0` is not a namespace. It has no publisher and no authorized origins; `PublisherRegistry` allocates namespace ids from 1. On a request, `0` means that the requester does not name the namespace (above). A hash that no seated origin served has no valid DHT record, so no node discovers it or relays it. A publisher creates a namespace and seats an origin to put content into the network.
 
 ### Contract: PublisherRegistry
 
@@ -107,6 +107,7 @@ The per-publisher namespace cap and the ownership-transfer timelock are governab
 ### Negative
 
 - Content is immutable: updating a blob produces a new hash and a new identity. Applications that need mutable references (e.g. "latest version of X") must manage their own indirection layer above the protocol.
-- Reliable retrieval requires knowing the namespace. A bare hash with no namespace (`namespaceId == 0`) is served only best-effort from cache/DHT and has no guaranteed origin; applications are expected to carry the namespace for content they publish.
+- Retrieval of cold content requires knowing the namespace. A request that does not name it (`namespaceId == 0`) reaches only cached copies and the origins that their attestations name; applications are expected to carry the namespace for content they publish.
+- Content that no seated origin served cannot spread through the network. A publisher must be vetted and seat an origin before its content is discoverable.
 - If a namespace's authorized origins all lose their backing data (disk failure, misconfiguration), the content is gone from the network unless another node caches it. Redundancy is the publisher's responsibility, met by having the DAO authorize multiple origins for the namespace.
 - The protocol imposes no inherent size limit on content addressing — any byte sequence produces a valid BLAKE3 hash regardless of length. Individual nodes may enforce a configurable `max_blob_size` for operational reasons (cache management, connection resource limits). This is a node-level resource policy, not a content-addressing constraint — see [ADR 005](005-protocol.md#error-handling-and-retry-semantics) for the `max_blob_size` enforcement mechanism.

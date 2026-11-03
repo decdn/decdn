@@ -34,9 +34,9 @@ StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {e
 ```
 
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
-- **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, pool_id, timestamp_us}`
+- **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, timestamp_us}`
 
-`hash` and `pool_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
+`hash` is a request-context field (from `ProbeRequest` and `StreamRequest`), not transmitted in the response body — implementers must include it when building and verifying the EIP-712 typed data. The signed `StreamResponse` names no pool or payer. It is a statement by the node about its own serve of a hash, so a third party can verify it without the request. A seated origin's `StreamResponse` with `ok: true` is therefore also the origin attestation that a DHT record carries ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
 
 #### EIP-712 Type Definitions
 
@@ -46,7 +46,7 @@ bytes32 constant PROBE_RESPONSE_TYPEHASH = keccak256(
 );
 
 bytes32 constant STREAM_RESPONSE_TYPEHASH = keccak256(
-    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 poolId,uint64 timestampUs)"
+    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,uint64 timestampUs)"
 );
 ```
 
