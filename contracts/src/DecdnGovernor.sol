@@ -413,9 +413,13 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     }
 
     /// @notice Delegate the caller's vote-casting right to `delegatee`. Pass
-    ///         `address(0)` to revoke. Overwrites any prior delegation.
+    ///         `address(0)` to revoke. Overwrites any prior delegation and
+    ///         consumes the caller's `delegationNonces` value, so a signed
+    ///         `delegateBySig` the caller never redeemed cannot later replace it.
     function delegate(address delegatee) external {
-        _delegate(_msgSender(), delegatee);
+        address operator = _msgSender();
+        _delegationNonces[operator] += 1;
+        _delegate(operator, delegatee);
     }
 
     /// @notice Delegate `delegator`'s vote-casting right to `delegatee` from an

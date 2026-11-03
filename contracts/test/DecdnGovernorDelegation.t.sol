@@ -379,6 +379,23 @@ contract DecdnGovernorDelegationTest is Test {
         gov.delegateBySig(opA, hot, nonce, expiry, sig);
     }
 
+    /// @notice A direct `delegate` consumes the nonce, so a signed but
+    ///         unredeemed delegation cannot later override the operator's
+    ///         revocation.
+    function test_delegate_voidsAnUnredeemedSignature() public {
+        uint256 nonce = gov.delegationNonces(opA);
+        uint256 expiry = block.timestamp + 1 hours;
+        bytes memory sig = _sign(opAKey, _delegationDigest(opA, hot, nonce, expiry));
+
+        vm.prank(opA);
+        gov.delegate(address(0));
+        assertEq(gov.delegationNonces(opA), nonce + 1, "delegate consumes the nonce");
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(DecdnGovernor.InvalidDelegationNonce.selector, opA, nonce + 1, nonce));
+        gov.delegateBySig(opA, hot, nonce, expiry, sig);
+    }
+
     function test_delegateBySig_tamperedSignatureReverts() public {
         uint256 nonce = gov.delegationNonces(opA);
         uint256 expiry = block.timestamp + 1 hours;
