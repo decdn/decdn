@@ -421,6 +421,9 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     ///      attached to the operator's address (e.g. an EIP-7702 delegate)
     ///      cannot refuse a proof against it.
     function _signedBy(address signer, bytes32 structHash, bytes calldata sig) internal view returns (bool) {
+        // The dropped third return is the recovery-error argument; `err` alone
+        // decides the outcome.
+        // slither-disable-next-line unused-return
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(_hashTypedDataV4(structHash), sig);
         return err == ECDSA.RecoverError.NoError && recovered == signer;
     }
