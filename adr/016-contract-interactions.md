@@ -728,7 +728,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `openSlashAppeal(slashId, evidenceBundleHash)` | `CapacityBond.slashRecords()` (read), `IERC20.safeTransferFrom()` (APPEAL_BOND), `CapacityBond.markAppealOpen()` | `nonReentrant`, `whenNotPaused`; filing window + frequency cap + one-shot guard |
+| `openSlashAppeal(slashId, evidenceBundleHash)` | `CapacityBond.slashRecords()` (read), `IERC20.safeTransferFrom()` (APPEAL_BOND), `CapacityBond.markAppealOpen()` | `nonReentrant`; not pausable on `SlashAppeal` (filing is the operator's recourse, and `markAppealOpen` still follows `CapacityBond`'s pause); filing window + frequency cap + one open appeal per operator + one-shot guard |
 | `fastTrackAppeal(slashId)` / `rejectAppeal(slashId)` | `rejectAppeal`: `CapacityBond.settleAppealUpheld()`, `token.burn()` | `EMERGENCY_MULTISIG_ROLE` |
 | `grantAppeal(slashId)` | `CapacityBond.settleAppealGranted()`, `IERC20.safeTransfer()` (bond refund) | `nonReentrant`, `GOVERNANCE_ROLE` |
 | `upholdAppeal(slashId)` | `CapacityBond.settleAppealUpheld()` (slash escrow 50% challenger / 50% burn), `token.burn()` (full appeal bond) | `nonReentrant`, `GOVERNANCE_ROLE` |

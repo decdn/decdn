@@ -490,9 +490,9 @@ contract SlashAppealTest is Test {
     // -----------------------------------------------------------------
 
     function test_slashAppealPause_extendsCapacityBondFilingWindow() public {
-        // Pausing SlashAppeal blocks `openSlashAppeal`, so the filing deadline
-        // (enforced on CapacityBond) must move by the paused duration even
-        // though CapacityBond itself never paused — the combined-counter fix.
+        // A SlashAppeal pause still moves the filing deadline (enforced on
+        // CapacityBond) by the paused duration, even though CapacityBond itself
+        // never paused — the combined counter only ever favors the operator.
         uint256 slashId = _bondAndSlash();
         uint64 slashTime = uint64(block.timestamp);
 
@@ -514,6 +514,20 @@ contract SlashAppealTest is Test {
         bond.finalizeUnappealedSlash(slashId);
 
         // The operator can still file inside the extended window.
+        _open(slashId);
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.AppealOpen));
+    }
+
+    /// @notice Filing is the operator's recourse, so a SlashAppeal pause does
+    ///         not bar it; otherwise `finalizeUnappealedSlash` could close the
+    ///         window while the operator was locked out.
+    function test_open_worksWhileSlashAppealPaused() public {
+        uint256 slashId = _bondAndSlash();
+        vm.startPrank(admin);
+        appeal.grantRole(appeal.PAUSER_ROLE(), admin);
+        appeal.pause();
+        vm.stopPrank();
+
         _open(slashId);
         assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.AppealOpen));
     }

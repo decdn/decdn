@@ -198,8 +198,11 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     ///      notably the challenger, who earns 50% of an upheld slash — burn the
     ///      operator's only chance at recourse with a junk appeal. Requiring the
     ///      operator closes that griefing/front-running vector (ADR 028 § Contract surface).
+    ///      Not pausable: filing is the operator's recourse, and the filing
+    ///      window keeps running for `finalizeUnappealedSlash` while this
+    ///      contract is paused, so a pause here must not bar the filing.
     // slither-disable-next-line reentrancy-no-eth,unused-return
-    function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external override nonReentrant whenNotPaused {
+    function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external override nonReentrant {
         // `slashRecords` is a view on the trusted, immutable `CapacityBond`;
         // the subsequent state writes are guarded by `nonReentrant`.
         // aderyn-ignore-next-line(reentrancy-state-change)
