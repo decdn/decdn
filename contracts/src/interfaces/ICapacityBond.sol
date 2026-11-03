@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import { SlashRecord } from "../SlashEscrowLib.sol";
+
 /// @title ICapacityBond
 /// @notice Read surface of `CapacityBond` consumed by `DecdnGovernor` (for
 ///         vote weight per ADR 036) and `SlashAppeal` (to validate appeals
@@ -17,17 +19,6 @@ interface ICapacityBond {
     ///         `age_ramp` numerator on `DecdnGovernor` per ADR 036 § Formula.
     ///         Returns 0 if the operator has never reached `minBond`.
     function firstBondedAt(address operator) external view returns (uint64);
-
-    /// @notice Encoded slash-epoch stamp: returns `0` when the operator is
-    ///         not currently in the slash-zero-out window; otherwise returns
-    ///         `actualEpoch + 1`. The +1 offset exists so a slash in epoch 0
-    ///         (the first `EPOCH_LENGTH` after deploy) is not collapsed with
-    ///         the unslashed sentinel. Consumers MUST decode (`value - 1`)
-    ///         before doing epoch arithmetic. Set by `slash()`; cleared to 0
-    ///         by the `settleAppealGranted` escrow hook on a successful appeal
-    ///         (ADR 028 § Contract surface). Consumed by
-    ///         `DecdnGovernor._getVotes` per ADR 036 § Slashing zero-out.
-    function slashedAtEpoch(address operator) external view returns (uint64);
 
     /// @notice `declaredMbps` in effect at the END of `epoch`
     ///         (`(epoch + 1) × EPOCH_LENGTH − 1`). `DecdnGovernor` caps each
@@ -50,4 +41,15 @@ interface ICapacityBond {
         external
         view
         returns (address operator, uint64 slashedAt, uint256 slashAmount);
+
+    /// @notice Number of slashes ever recorded against `operator`.
+    function operatorSlashCount(address operator) external view returns (uint256);
+
+    /// @notice The `index`-th slash against `operator`, in slash order.
+    function operatorSlashIdAt(address operator, uint256 index) external view returns (uint256);
+
+    /// @notice The full slash record, including its escrow status. Read by
+    ///         `DecdnGovernor` to find a standing slash inside a vote window
+    ///         (ADR 036 § Slashing zero-out).
+    function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory);
 }

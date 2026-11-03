@@ -11,6 +11,7 @@ import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
+import { SlashRecord, SlashStatus } from "./SlashEscrowLib.sol";
 import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
 
 /// @title DecdnGovernor
@@ -233,27 +234,31 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         return (capped * ramp) / RAMP_SCALE;
     }
 
+    /// @dev True iff `account` has a standing (not appeal-reversed) slash with
+    ///      `slashedAt` in `[start of the byte window, timepoint]`. Every slash
+    ///      record is checked, so a later slash cannot hide an earlier one, and
+    ///      a slash in the in-progress epoch zeroes snapshots taken after it. A
+    ///      slash after `timepoint` never zeroes that snapshot (#847).
     function _slashedInWindow(address account, uint256 timepoint) internal view returns (bool) {
-        uint64 slashStamp = capacityBond.slashedAtEpoch(account);
-        if (slashStamp == 0) return false;
         (uint64 endEpoch, bool hasElapsed) = _endEpoch(timepoint);
         // No fully-elapsed epoch yet ⇒ the byte window is empty, so there is
         // nothing to zero. Keeps the slash window aligned with the byte window.
         if (!hasElapsed) return false;
-        // `slashedAtEpoch` returns `actualEpoch + 1` (or 0 if unslashed) so
-        // an epoch-0 slash isn't collapsed with the unslashed sentinel.
-        uint64 slashed = slashStamp - 1;
         uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
         // Clamp identically to `_cappedServed` and `FeeRouter.bytesInWindow` so
         // the slash window can never span more epochs than the byte window it
         // must track, even if `windowEpochsAt` returns an out-of-bound value.
         if (n > MAX_WINDOW_EPOCHS) n = MAX_WINDOW_EPOCHS;
         uint64 windowStart = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
-        // Upper-bound the slash epoch at `endEpoch` (the last fully-elapsed
-        // epoch). A slash that happened AFTER the snapshot timepoint — or in the
-        // in-progress epoch — must NOT retroactively zero historical votes for
-        // that proposal (#847: the slash window tracks the byte window).
-        return slashed >= windowStart && slashed <= endEpoch;
+        uint256 windowStartTime = uint256(windowStart) * feeRouter.epochLength();
+        // Newest first. Records are appended in slash order, so the walk stops
+        // at the first slash before the window.
+        for (uint256 i = capacityBond.operatorSlashCount(account); i > 0; i--) {
+            SlashRecord memory r = capacityBond.getSlashRecord(capacityBond.operatorSlashIdAt(account, i - 1));
+            if (r.slashedAt < windowStartTime) return false;
+            if (r.slashedAt <= timepoint && r.status != SlashStatus.Reversed) return true;
+        }
+        return false;
     }
 
     function _cappedServed(address account, uint256 timepoint) internal view returns (uint256) {

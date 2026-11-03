@@ -65,13 +65,13 @@ Each epoch's counted bytes are capped at what the tier the operator declared at 
 
 ### Slashing zero-out
 
-On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp) + 1` (the `+1` reserves 0 for "unslashed" so an epoch-0 slash is not collapsed with the sentinel; the getter returns this raw, and `_getVotes` decodes `slashed = slashStamp - 1` before comparing). The Governor's `_getVotes(op, t)` returns zero whenever `endEpoch(t) - N + 1 <= slashed <= endEpoch(t)` — i.e. whenever the slash falls inside the trailing window of fully-elapsed epochs. A slash in the in-progress epoch `epoch(t)` is above `endEpoch(t)`, so it zeroes the vote only once that epoch elapses (it tracks the byte window). Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
+Every `CapacityBond.slash` appends a `SlashRecord` (with its `slashedAt` timestamp and escrow `status`) to the operator's slash list. The Governor's `_getVotes(op, t)` returns zero whenever the operator has a **standing** slash — one NOT in the `Reversed` state (`Escrowed` / `AppealOpen` / `Upheld` all still stand) — with `slashedAt` in `[(endEpoch(t) - N + 1) × epochLength, t]`. The lower edge is the start of the trailing byte window. The upper edge is the timepoint itself, so a slash in the in-progress epoch zeroes every snapshot taken after it, and a slash after `t` never zeroes that snapshot. Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
 
-On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path (the path that determines the operator was wrongly slashed), `SlashAppeal` calls `CapacityBond.settleAppealGranted`, which refunds the escrowed TOKEN and **recomputes** `slashedAtEpoch[op]` (the internal `_recomputeSlashedAtEpoch`), clearing it to zero only when no slash stands. An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the field stamped — the slash stands.
+The Governor walks the operator's slash list newest first through `operatorSlashCount`, `operatorSlashIdAt` and `getSlashRecord`, and stops at the first slash before the window. Every record counts, so a later slash cannot hide an earlier in-window one. On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path, `CapacityBond.settleAppealGranted` marks that record `Reversed`, so it no longer zeroes the vote while any other standing slash still does. An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the record standing. The walk is bounded in practice because a slashed operator auto-ejects below `minBond / 2`.
 
-**Multi-slash watermark semantics.** `slashedAtEpoch[op]` is a single scalar but represents the **max epoch among the operator's still-standing slashes** — those NOT in the `Reversed` state (`Escrowed` / `AppealOpen` / `Upheld` all still stand). Because slashes are minted in non-decreasing epoch order, a new slash always raises the watermark to its own epoch. A granted appeal marks one record `Reversed` and re-derives the watermark as the max epoch over the operator's remaining non-`Reversed` records, clearing to zero only if none remain. This closes the multi-outstanding-slash hole where granting the appeal of one slash (e.g. the most recent) would otherwise clear the watermark while an *earlier* slash still stands — wrongly restoring vote weight for the unresolved slash. The re-derivation scans the operator's own slash records; the per-operator record list is bounded in practice because a slashed operator auto-ejects below `minBond / 2`.
+`CapacityBond` also keeps `slashedAtEpoch[op]`, the max epoch among the operator's standing slashes plus one (0 for "unslashed"), as an indexer read. The Governor does not read it.
 
-This is one storage slot per operator on `CapacityBond` and one read on every vote-cast. It restores the immediate-vote-removal-on-slash signal that the bytes window alone cannot deliver (an active operator who is slashed today would otherwise continue voting with their accumulated window bytes for up to N weeks).
+This restores the immediate-vote-removal-on-slash signal that the bytes window alone cannot deliver (an active operator who is slashed today would otherwise continue voting with their accumulated window bytes for up to N weeks).
 
 ### Contracts and surface
 
@@ -88,9 +88,9 @@ The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-
 
 **`CapacityBond` additions:**
 
-- `mapping(address => uint64) slashedAtEpoch;` — set by `slash()` to the max epoch among the operator's still-standing slashes, recomputed by the `grantAppeal` flow (`settleAppealGranted` → `_recomputeSlashedAtEpoch`) per [ADR 028](028-slashing-appeals.md#contract-surface); cleared to zero only when no slash stands.
-- `mapping(address => uint256[]) _operatorSlashIds;` — internal per-operator slash index backing the watermark re-derivation above.
-- `function slashedAtEpoch(address op) external view returns (uint64);` — public getter for the Governor.
+- `mapping(address => uint256[]) _operatorSlashIds;` — per-operator slash index, read through `operatorSlashCount(op)` / `operatorSlashIdAt(op, i)`.
+- `function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory);` — the record with its `slashedAt` and `status`, read by the Governor's slash walk.
+- `mapping(address => uint64) slashedAtEpoch;` and its getter — the max epoch among the operator's standing slashes plus one, recomputed by the `grantAppeal` flow (`settleAppealGranted` → `_recomputeSlashedAtEpoch`) per [ADR 028](028-slashing-appeals.md#contract-surface). An indexer read; the Governor does not use it.
 
 **`DecdnGovernor._getVotes`** (pseudocode):
 
@@ -101,17 +101,13 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
     if (cur == 0) return 0;
     uint64 endEpoch = cur - 1;
     uint64 windowStart = endEpoch + 1 > windowEpochs ? endEpoch + 1 - windowEpochs : 0;
-    // `slashedAtEpoch` returns `actualEpoch + 1`, with 0 reserved for "unslashed"
-    // (so an epoch-0 slash isn't collapsed with the sentinel). Decode the +1
-    // before comparing. The decoded epoch is bounded above by `endEpoch` so a
-    // future / in-progress-epoch slash does not retroactively zero an earlier
-    // snapshot (the slash window tracks the byte window).
-    uint64 slashStamp = capacityBond.slashedAtEpoch(op);
-    if (slashStamp != 0) {
-        uint64 slashed = slashStamp - 1;
-        if (slashed >= windowStart && slashed <= endEpoch) {
-            return 0;
-        }
+    // Any standing slash in [window start, timepoint] zeroes the vote. Walk
+    // newest first; stop at the first slash before the window.
+    uint256 windowStartTime = windowStart * EPOCH_LENGTH;
+    for (uint256 i = capacityBond.operatorSlashCount(op); i > 0; i--) {
+        SlashRecord memory r = capacityBond.getSlashRecord(capacityBond.operatorSlashIdAt(op, i - 1));
+        if (r.slashedAt < windowStartTime) break;
+        if (r.slashedAt <= timepoint && r.status != SlashStatus.Reversed) return 0;
     }
     uint256 served = feeRouter.bytesInWindow(op, endEpoch, windowEpochs);
     uint256 total  = feeRouter.totalBytesInWindow(endEpoch, windowEpochs);

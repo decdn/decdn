@@ -2,28 +2,20 @@
 pragma solidity 0.8.28;
 
 import { ICapacityBond } from "../../src/interfaces/ICapacityBond.sol";
+import { SlashRecord, SlashStatus } from "../../src/SlashEscrowLib.sol";
 
 /// @notice Test-only stand-in for `CapacityBond`. Lets tests inject the
-///         exact `firstBondedAt` and `slashedAtEpoch` values consumed by
+///         exact `firstBondedAt` values and slash records consumed by
 ///         `DecdnGovernor._getVotes` per ADR 036.
 contract MockCapacityBond is ICapacityBond {
     mapping(address => uint64) public firstBondedAtOf;
-    mapping(address => uint64) public slashedAtEpochOf;
 
     function setFirstBondedAt(address operator, uint64 t) external {
         firstBondedAtOf[operator] = t;
     }
 
-    function setSlashedAtEpoch(address operator, uint64 epoch) external {
-        slashedAtEpochOf[operator] = epoch;
-    }
-
     function firstBondedAt(address operator) external view override returns (uint64) {
         return firstBondedAtOf[operator];
-    }
-
-    function slashedAtEpoch(address operator) external view override returns (uint64) {
-        return slashedAtEpochOf[operator];
     }
 
     mapping(address => mapping(uint64 => uint256)) public declaredMbpsAtEpochOf;
@@ -36,18 +28,31 @@ contract MockCapacityBond is ICapacityBond {
         return declaredMbpsAtEpochOf[operator][epoch];
     }
 
-    /// @notice Per-slashId record. Tests configure via `setSlashRecord` then
-    ///         pass `slashId` to `SlashAppeal.openSlashAppeal`.
-    struct SlashRecord {
-        address operator;
-        uint64 slashedAt;
-        uint256 slashAmount;
+    /// @notice Per-slashId records and the per-operator slash list, in slash
+    ///         order. Tests append with `addSlash` and flip a record's status
+    ///         with `setSlashStatus`.
+    SlashRecord[] internal _slashRecords;
+    mapping(address => uint256[]) internal _operatorSlashIds;
+
+    function addSlash(address operator, uint64 slashedAt, SlashStatus status) external returns (uint256 slashId) {
+        slashId = _slashRecords.length;
+        _slashRecords.push(
+            SlashRecord({
+                operator: operator,
+                slashedAt: slashedAt,
+                status: status,
+                offenseType: 0,
+                challenger: address(0),
+                appealWindowClose: 0,
+                slashAmount: 0,
+                evidenceHash: bytes32(0)
+            })
+        );
+        _operatorSlashIds[operator].push(slashId);
     }
 
-    mapping(uint256 => SlashRecord) internal _slashRecords;
-
-    function setSlashRecord(uint256 slashId, address op, uint64 slashedAt_, uint256 amount) external {
-        _slashRecords[slashId] = SlashRecord(op, slashedAt_, amount);
+    function setSlashStatus(uint256 slashId, SlashStatus status) external {
+        _slashRecords[slashId].status = status;
     }
 
     function slashRecords(uint256 slashId)
@@ -58,5 +63,17 @@ contract MockCapacityBond is ICapacityBond {
     {
         SlashRecord memory r = _slashRecords[slashId];
         return (r.operator, r.slashedAt, r.slashAmount);
+    }
+
+    function operatorSlashCount(address operator) external view override returns (uint256) {
+        return _operatorSlashIds[operator].length;
+    }
+
+    function operatorSlashIdAt(address operator, uint256 index) external view override returns (uint256) {
+        return _operatorSlashIds[operator][index];
+    }
+
+    function getSlashRecord(uint256 slashId) external view override returns (SlashRecord memory) {
+        return _slashRecords[slashId];
     }
 }

@@ -1486,8 +1486,12 @@ contract CapacityBond is
         return _firstBondedAt[operator];
     }
 
-    /// @inheritdoc ICapacityBond
-    function slashedAtEpoch(address operator) external view override returns (uint64) {
+    /// @notice The max epoch among the operator's standing slashes plus one,
+    ///         or 0 when none stands (the +1 keeps an epoch-0 slash distinct
+    ///         from "unslashed"). Set by `slash()`, recomputed by
+    ///         `settleAppealGranted`. An indexer read; `DecdnGovernor` reads the
+    ///         slash records instead (ADR 036 § Slashing zero-out).
+    function slashedAtEpoch(address operator) external view returns (uint64) {
         return _slashedAtEpoch[operator];
     }
 
