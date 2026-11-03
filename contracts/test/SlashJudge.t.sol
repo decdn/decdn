@@ -43,8 +43,20 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
         unbondingPeriodValue = unbonding_;
     }
 
+    mapping(address => uint256) public activeBond;
+    mapping(address => uint256) internal _queued;
+
     function setBound(address operator, bytes32 nodeId) external {
         boundNodeId[operator] = nodeId;
+    }
+
+    function setBond(address operator, uint256 active, uint256 queued) external {
+        activeBond[operator] = active;
+        _queued[operator] = queued;
+    }
+
+    function unbondingOf(address operator) external view override returns (uint256, uint256) {
+        return (_queued[operator], 0);
     }
 
     function setRegion(address op, string memory current, string memory prev, uint64 lastChanged) external {
@@ -337,6 +349,22 @@ contract SlashJudgeTest is Test {
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.NodeNotRegistered.selector, node));
         judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    /// @notice An offender that cleared its own binding (e.g. via
+    ///         `reclaimNodeId`) stays slashable while it has bond at risk, in
+    ///         either the active or the unbonding leg.
+    function test_rate_slashesUnboundOperatorWithBondAtRisk() public {
+        slasher.setBound(node, bytes32(0));
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+
+        slasher.setBond(node, 0, 1);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1, "queued bond keeps the unbound offender slashable");
+        assertEq(slasher.lastOperator(), node);
     }
 
     function test_rate_revertsOnNodeIdMismatch() public {

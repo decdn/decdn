@@ -23,10 +23,16 @@ interface ICapacityBondSlasher {
         returns (uint256 slashId, uint256 slashAmount);
 
     /// @notice The operator's bound NodeId and active flag. `nodeId == bytes32(0)`
-    ///         means the address never registered (the binding survives
-    ///         deregistration, so a deregistered-but-still-bonded offender stays
-    ///         slashable — `active` is not relied on for the registration gate).
+    ///         means the address holds no binding: it never registered, or
+    ///         `reclaimNodeId` cleared the binding. The binding survives
+    ///         deregistration; `active` is not relied on for the registration gate.
     function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
+
+    /// @notice The operator's active bond, the first slashable leg.
+    function activeBond(address operator) external view returns (uint256);
+
+    /// @notice The operator's queued unbonding request, the second slashable leg.
+    function unbondingOf(address operator) external view returns (uint256 amount, uint256 unlockAt);
 
     /// @notice Unbonding window in seconds. Read by `setMaxEvidenceAge` and the
     ///         constructor to enforce `maxEvidenceAgeUs < unbondingPeriod * 1e6`.

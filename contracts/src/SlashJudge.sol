@@ -425,16 +425,22 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         );
     }
 
-    /// @dev Confirm the challenged address is a registered operator and that the
-    ///      challenger-supplied `nodeId` matches its on-chain binding. The binding
+    /// @dev Confirm the challenged address is a slashable operator. A bound
+    ///      operator must match the challenger-supplied `nodeId`; the binding
     ///      survives deregistration, so a deregistered-but-bonded offender stays
-    ///      slashable. The `active` flag is intentionally unused (ADR 014 — the
-    ///      `nodeId != 0` binding, not liveness, is the registration gate).
+    ///      slashable. An operator with no binding stays slashable while it has
+    ///      bond at risk, so clearing its own binding through `reclaimNodeId`
+    ///      does not shield an offender. The `active` flag is intentionally
+    ///      unused (ADR 014 — liveness is not the registration gate).
     // slither-disable-next-line unused-return
     function _checkRegistered(address challengedNode, bytes32 nodeId) internal view {
         (bytes32 bound,) = capacityBond.nodeIdOf(challengedNode);
-        if (bound == bytes32(0)) revert NodeNotRegistered(challengedNode);
-        if (bound != nodeId) revert NodeIdMismatch(nodeId, bound);
+        if (bound == bytes32(0)) {
+            (uint256 queued,) = capacityBond.unbondingOf(challengedNode);
+            if (capacityBond.activeBond(challengedNode) + queued == 0) revert NodeNotRegistered(challengedNode);
+        } else if (bound != nodeId) {
+            revert NodeIdMismatch(nodeId, bound);
+        }
     }
 
     /// @dev Confirm `blobHash` was an enforceable blacklist entry IN SCOPE for
