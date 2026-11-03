@@ -95,6 +95,8 @@ aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 # Wire-form pinning tests for `OriginKind` and any other operator-visible
 # JSON serialised by this crate (#439).
 serde_json = { workspace = true }
+# Log-capture tests assert that an operator-visible `warn!` names its cause.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

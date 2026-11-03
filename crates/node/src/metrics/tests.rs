@@ -456,6 +456,51 @@ fn probe_hold_unavailable_increments_only_the_named_reason() {
     }
 }
 
+/// Every `reason` of `decdn_capability_intake_dropped_total` exports at zero
+/// from a fresh registry, renders in `snake_case`, and moves only when its own
+/// drop is recorded (#2631).
+#[test]
+fn capability_intake_dropped_exports_every_reason_and_moves_only_the_named_one() {
+    let labels = [
+        (CapabilityIntakeDropReason::ExpiryZero, "expiry_zero"),
+        (
+            CapabilityIntakeDropReason::NotEoaSignature,
+            "not_eoa_signature",
+        ),
+        (
+            CapabilityIntakeDropReason::MalformedSignature,
+            "malformed_signature",
+        ),
+        (CapabilityIntakeDropReason::WrongOwner, "wrong_owner"),
+        (
+            CapabilityIntakeDropReason::InvalidSignature,
+            "invalid_signature",
+        ),
+    ];
+    assert_eq!(labels.len(), CapabilityIntakeDropReason::ALL.len());
+    let series =
+        |label: &str| format!("decdn_capability_intake_dropped_total{{reason=\"{label}\"}}");
+    let text = Metrics::new().encode().unwrap();
+    for (_, label) in labels {
+        assert!(
+            has_metric_line(&text, &series(label), 0),
+            "{label} must export at zero:\n{text}"
+        );
+    }
+    for (reason, label) in labels {
+        let metrics = Metrics::new();
+        metrics.capability_intake_dropped(reason);
+        let text = metrics.encode().unwrap();
+        for (_, other) in labels {
+            let want = u64::from(other == label);
+            assert!(
+                has_metric_line(&text, &series(other), want),
+                "after {label}, {other} must read {want}:\n{text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn uptime_counts_from_construction_without_any_bring_up_hook() {
     // Regression guard (#1264): `decdn_node_uptime_seconds` derives solely
@@ -681,6 +726,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
         "decdn_serve_stream_rejected_pool_unconfirmed_total",
         "decdn_serve_stream_rejected_pool_closing_total",
         "decdn_serve_stream_rejected_signer_cap_exhausted_total",
+        "decdn_serve_stream_rejected_capability_expired_total",
         "decdn_serve_stream_midstream_signer_cap_exhausted_total",
         "decdn_serve_stream_midstream_blob_too_large_total",
         "decdn_serve_stream_rejected_signer_floor_at_cap_total",
@@ -714,6 +760,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
     metrics.serve_stream_rejected_pool_unconfirmed();
     metrics.serve_stream_rejected_pool_closing();
     metrics.serve_stream_rejected_signer_cap_exhausted();
+    metrics.serve_stream_rejected_capability_expired();
     metrics.serve_stream_midstream_signer_cap_exhausted();
     metrics.serve_stream_midstream_blob_too_large();
     metrics.serve_stream_rejected_signer_floor_at_cap();

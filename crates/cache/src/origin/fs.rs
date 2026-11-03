@@ -117,19 +117,32 @@ impl FilesystemOrigin {
     /// block.
     ///
     /// A path swapped between this stat and the caller's open is not
-    /// covered here. `fetch` and `fetch_outboard` re-check the type on the
-    /// opened file, which catches a device but not a FIFO: the open blocks
-    /// on a FIFO first. `fetch_range_data` and `size` do not re-check.
+    /// covered here. `fetch`, `fetch_outboard` and `size` re-check the type
+    /// on the opened file, which catches a device but not a FIFO: the open
+    /// blocks on a FIFO first. `fetch_range_data` does not re-check.
     ///
-    /// `Ok(None)` means the path (or its symlink target) does not exist.
-    /// Each caller maps that to its own "absent" answer.
+    /// `Ok(None)` means nothing exists at the path: no leaf, or no shard
+    /// directory. Each caller maps that to its own "absent" answer. A
+    /// dangling symlink — a leaf or a shard directory whose target does not
+    /// exist — is not an absence: it is an operator mistake, for example an
+    /// origin tree bind-mounted into a container with absolute links, so it
+    /// is a permanent failure. As an absence, `size` would report it as an
+    /// authoritative `Ok(None)` with no log at any level.
     async fn resolve_regular(
         &self,
         path: &Path,
     ) -> Result<Option<(PathBuf, std::fs::Metadata)>, OriginPullError> {
         let canonical = match tokio::fs::canonicalize(path).await {
             Ok(p) => p,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return match dangling_link(path).await {
+                    Some(link) => Err(OriginPullError::Permanent(anyhow::anyhow!(
+                        "cache.origin.path entry {} is a symlink whose target does not exist",
+                        link.display()
+                    ))),
+                    None => Ok(None),
+                };
+            }
             Err(err) => {
                 let msg = format!(
                     "cache.origin.path canonicalize failed for {}",
@@ -164,25 +177,72 @@ impl FilesystemOrigin {
     }
 }
 
+/// The dangling symlink that makes `path` fail to resolve, if one does: the
+/// leaf `path` itself, or its shard directory. `None` when neither is a
+/// symlink whose target is missing, so the path is genuinely absent.
+///
+/// The shard directory is the only other component that can be a link: the
+/// base is canonical. A component counts only when `symlink_metadata` sees a
+/// link and `metadata` cannot follow it. Thus a valid symlinked shard
+/// directory with no leaf under it stays an absence. An error from either
+/// call reads as "not dangling" — the caller then keeps the absent answer it
+/// would have given before this probe ran — and logs at debug, so a probe
+/// failure (an ESTALE or a permission flip mid-check) leaves a trace.
+async fn dangling_link(path: &Path) -> Option<&Path> {
+    for candidate in [Some(path), path.parent()].into_iter().flatten() {
+        let is_link = match tokio::fs::symlink_metadata(candidate).await {
+            Ok(m) => m.file_type().is_symlink(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                tracing::debug!(
+                    path = %candidate.display(),
+                    error = %err,
+                    "dangling-link probe lstat failed; keeping the absent answer",
+                );
+                false
+            }
+        };
+        if !is_link {
+            continue;
+        }
+        match tokio::fs::metadata(candidate).await {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(candidate),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!(
+                    path = %candidate.display(),
+                    error = %err,
+                    "dangling-link probe stat failed; keeping the absent answer",
+                );
+            }
+        }
+    }
+    None
+}
+
 /// Classify a filesystem `io::Error` as transient or permanent. Most FS
 /// failures (`PermissionDenied`, "not a directory", read errors on a
 /// closed file handle) are deterministic — retry won't change the
 /// answer. The handful of error kinds the kernel uses for "the syscall
-/// got interrupted, try again" are retriable.
+/// got interrupted, try again" are retriable, and so is `ESTALE`
+/// (`StaleNetworkFileHandle`): on an NFS-backed base it usually clears on
+/// the next path lookup, which `canonicalize` does on every read.
 ///
 /// `NotFound` is intentionally not handled here: a `NotFound` path lookup
 /// is `Ok(None)` from [`FilesystemOrigin::resolve_regular`], and each read
 /// maps that, and a `NotFound` open, to its own absent answer. A symlink
-/// escape and a non-regular file are not `io::Error`s either:
-/// `resolve_regular`, and the re-checks on the opened file in `fetch` and
-/// `fetch_outboard`, emit `OriginPullError::Permanent` directly.
+/// escape, a dangling symlink and a non-regular file are not `io::Error`s
+/// either: `resolve_regular`, and the re-checks on the opened file in
+/// `fetch`, `fetch_outboard` and `size`, emit `OriginPullError::Permanent`
+/// directly.
 fn classify_io_error(err: std::io::Error) -> OriginPullError {
     use std::io::ErrorKind;
     match err.kind() {
         ErrorKind::Interrupted
         | ErrorKind::TimedOut
         | ErrorKind::ResourceBusy
-        | ErrorKind::WouldBlock => OriginPullError::Transient(err.into()),
+        | ErrorKind::WouldBlock
+        | ErrorKind::StaleNetworkFileHandle => OriginPullError::Transient(err.into()),
         _ => OriginPullError::Permanent(err.into()),
     }
 }
@@ -288,17 +348,16 @@ impl Origin for FilesystemOrigin {
             // the same inode our fd is pinning) is bounded by the
             // kernel's read syscall. The wrapper in
             // [`cap_at_max_bytes`] catches the one-byte overrun and
-            // converts it to a typed `io::Error` ("grew past max
-            // during read") that the engine surfaces as
-            // `CacheError::OriginError`.
+            // yields it as an `io::Error` carrying a typed
+            // `BlobTooLargeMarker`, which the engine surfaces as
+            // `CacheError::BlobTooLarge`.
             //
             // `saturating_add(1)` preserves correctness for
             // `max_bytes == u64::MAX`: saturating rather than
             // wrapping to `0`.
-            let path_for_log = canonical.clone();
             let reader = file.take(max_bytes.saturating_add(1));
             let raw = ReaderStream::new(reader);
-            let stream = cap_at_max_bytes(raw, max_bytes, path_for_log);
+            let stream = cap_at_max_bytes(raw, max_bytes);
             Ok(OriginFetch::Found {
                 stream: Box::pin(stream),
                 size_hint: Some(len),
@@ -376,10 +435,18 @@ impl Origin for FilesystemOrigin {
             // `.obao4` is malformed/foreign, and reading it first would buffer
             // the whole thing into memory only to reject it (an OOM lever for
             // a hostile sibling). An outboard over the cap degrades to
-            // `Unsupported`, not an error, and the engine never sees it; the
+            // `Unsupported`, not an error, so the engine never sees it; the
             // engine's exact-length check rejects a wrong-length outboard
-            // that fits under the cap.
+            // that fits under the cap. The warn is the only record of an
+            // oversize outboard, for example a chunk-level outboard from a
+            // foreign tool, which costs every range pull of the blob.
             if meta.len() > outboard_max_bytes {
+                tracing::warn!(
+                    path = %canonical.display(),
+                    len = meta.len(),
+                    cap = outboard_max_bytes,
+                    "origin outboard is larger than its cap; range pulls of this blob fall back to whole-blob",
+                );
                 return Ok(OutboardFetch::Unsupported);
             }
             let file = match tokio::fs::File::open(&canonical).await {
@@ -413,11 +480,25 @@ impl Origin for FilesystemOrigin {
                 )));
             }
             if meta.len() > outboard_max_bytes {
+                tracing::warn!(
+                    path = %canonical.display(),
+                    len = meta.len(),
+                    cap = outboard_max_bytes,
+                    "origin outboard is larger than its cap; range pulls of this blob fall back to whole-blob",
+                );
                 return Ok(OutboardFetch::Unsupported);
             }
             match read_capped(file, meta.len(), outboard_max_bytes).await {
                 Ok(Some(outboard)) => Ok(OutboardFetch::Found(Bytes::from(outboard))),
-                Ok(None) => Ok(OutboardFetch::Unsupported),
+                Ok(None) => {
+                    tracing::warn!(
+                        path = %canonical.display(),
+                        stat_len = meta.len(),
+                        cap = outboard_max_bytes,
+                        "origin outboard grew past its cap during the read; range pulls of this blob fall back to whole-blob",
+                    );
+                    Ok(OutboardFetch::Unsupported)
+                }
                 Err(err) => {
                     let msg = format!(
                         "cache.origin.path outboard read failed for {}",
@@ -435,14 +516,40 @@ impl Origin for FilesystemOrigin {
     ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             // The local data object's on-disk length IS the canonical blob size
-            // (filesystem origins never compress), so the resolve's stat is an
-            // exact, body-free answer. A missing data object is an unknown
-            // size: degrade to whole-blob, which then surfaces the real
-            // `NotFound`.
-            Ok(self
-                .resolve_regular(&self.path_for(hash))
-                .await?
-                .map(|(_, meta)| meta.len()))
+            // (filesystem origins never compress), so a stat is an exact,
+            // body-free answer. A missing data object is `Ok(None)`, which the
+            // trait contract reads as an authoritative absence; a dangling
+            // symlink is a permanent fault from `resolve_regular`, never an
+            // absence.
+            let Some((canonical, _)) = self.resolve_regular(&self.path_for(hash)).await? else {
+                return Ok(None);
+            };
+            // Open the file once, and drop it, so an object the process cannot
+            // read (mode 0600 under another user) is a fault here rather than
+            // a size that every serve then fails on at `open`. The resolve
+            // rules out a FIFO that is already in place; a FIFO swapped in
+            // after the stat can still block this open, as it can block the
+            // other reads' opens (#2802). The fstat re-checks the type of what
+            // was opened and gives the size of that inode.
+            let file = match tokio::fs::File::open(&canonical).await {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    let msg = format!("cache.origin.path open failed for {}", canonical.display());
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+            let meta = file.metadata().await.map_err(|err| {
+                let msg = format!("cache.origin.path stat failed for {}", canonical.display());
+                classify_io_error(err).map_inner(|e| e.context(msg))
+            })?;
+            if !meta.is_file() {
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "cache.origin.path entry {} is not a regular file",
+                    canonical.display()
+                )));
+            }
+            Ok(Some(meta.len()))
         })
     }
 
@@ -550,21 +657,19 @@ async fn read_capped<R: AsyncRead + Unpin>(
 /// inner `take(max_bytes + 1)` bounds the I/O-layer read at one byte
 /// past the cap, so a file that grew during read produces a stream
 /// whose chunks sum to at most `max_bytes + 1`. This wrapper trips on
-/// the cumulative byte count and yields the overrun as an
-/// `io::Error`. The engine's outer wrapper (`count_and_cap_stream`)
-/// captures the error into its side channel and yields `None` to
-/// `iroh_blobs::Blobs::add_stream`, so this error never reaches
-/// iroh-blobs directly — it surfaces back to the caller as
-/// `CacheError::OriginError` once `temp_tag().await` completes and
-/// the engine inspects the side channel.
+/// the cumulative byte count and yields the overrun as an `io::Error`
+/// carrying a typed `BlobTooLargeMarker`. The engine's outer wrapper
+/// (`count_and_cap_stream`) captures the error into its side channel
+/// and yields `None` to `iroh_blobs::Blobs::add_stream`, so this error
+/// never reaches iroh-blobs directly — the engine reads the marker from
+/// the side channel once `temp_tag().await` completes and surfaces
+/// `CacheError::BlobTooLarge` to the caller.
 ///
-/// `path_for_log` is captured for the error message so the operator
-/// log surfaces the offending file path. The path is the canonicalized
-/// form (already resolved, so no symlink trickery in logs).
+/// The error carries no file path: the typed marker is the
+/// operator-visible signal.
 fn cap_at_max_bytes<S>(
     stream: S,
     max_bytes: u64,
-    path_for_log: PathBuf,
 ) -> impl Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
@@ -575,37 +680,29 @@ where
     // (some impls error again, some hang); the sentinel makes the
     // wrapper deterministic and prevents iroh-blobs' `add_stream` from
     // hanging when the upstream errors.
-    futures_util::stream::unfold(
-        (Some(stream), 0u64, path_for_log),
-        move |(maybe_s, total, path)| async move {
-            let mut s = maybe_s?;
-            let next = s.next().await?;
-            match next {
-                Err(e) => Some((Err(e), (None, total, path))),
-                Ok(chunk) => {
-                    let new_total = total.saturating_add(chunk.len() as u64);
-                    if new_total > max_bytes {
-                        // Pack a typed `BlobTooLargeMarker` so the engine
-                        // surfaces `CacheError::BlobTooLarge` rather than
-                        // routing through `classify_io_error`, which
-                        // defaults `ErrorKind::Other` to Transient and
-                        // would burn the retry budget on a cap breach.
-                        // Matches `http.rs::response_chunk_stream`'s
-                        // typed-marker symmetry. The file path is
-                        // intentionally dropped from the error — the
-                        // typed marker is the operator-visible signal;
-                        // adding path context would require a wider
-                        // typed variant that `classify_io_error`
-                        // doesn't recognise.
-                        let err = std::io::Error::other(super::BlobTooLargeMarker { max_bytes });
-                        Some((Err(err), (None, total, path)))
-                    } else {
-                        Some((Ok(chunk), (Some(s), new_total, path)))
-                    }
+    futures_util::stream::unfold((Some(stream), 0u64), move |(maybe_s, total)| async move {
+        let mut s = maybe_s?;
+        let next = s.next().await?;
+        match next {
+            Err(e) => Some((Err(e), (None, total))),
+            Ok(chunk) => {
+                let new_total = total.saturating_add(chunk.len() as u64);
+                if new_total > max_bytes {
+                    // Pack a typed `BlobTooLargeMarker` so the engine
+                    // surfaces `CacheError::BlobTooLarge`. A bare
+                    // `ErrorKind::Other` would classify as Transient
+                    // (`retry::classify_io_error`) and burn the retry
+                    // budget on a cap breach. Matches
+                    // `http.rs::response_chunk_stream`'s typed-marker
+                    // symmetry.
+                    let err = std::io::Error::other(super::BlobTooLargeMarker { max_bytes });
+                    Some((Err(err), (None, total)))
+                } else {
+                    Some((Ok(chunk), (Some(s), new_total)))
                 }
             }
-        },
-    )
+        }
+    })
 }
 
 #[cfg(test)]

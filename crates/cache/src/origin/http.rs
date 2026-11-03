@@ -564,15 +564,33 @@ impl HttpOrigin {
         if !resp.status().is_success() {
             return Ok(OutboardFetch::Unsupported);
         }
+        // An outboard over the cap degrades rather than errors, so the engine
+        // never sees it. The warn is the only record of it, for example a
+        // chunk-level outboard from a foreign tool, which costs every range
+        // pull of the blob.
         if let Some(len) = resp.content_length()
             && len > max_bytes
         {
+            tracing::warn!(
+                url = %url_log,
+                len,
+                cap = max_bytes,
+                "origin outboard is larger than its cap; range pulls of this blob fall back to whole-blob",
+            );
             return Ok(OutboardFetch::Unsupported);
         }
-        match self.collect_capped(resp, max_bytes, url_log).await? {
-            Some(bytes) => Ok(OutboardFetch::Found(bytes)),
-            None => Ok(OutboardFetch::Unsupported),
-        }
+        let Some(bytes) = self
+            .collect_capped(resp, max_bytes, url_log.clone())
+            .await?
+        else {
+            tracing::warn!(
+                url = %url_log,
+                cap = max_bytes,
+                "origin outboard body ran past its cap; range pulls of this blob fall back to whole-blob",
+            );
+            return Ok(OutboardFetch::Unsupported);
+        };
+        Ok(OutboardFetch::Found(bytes))
     }
 
     /// GET `url` with a `Range` header and buffer the partial body. Returns

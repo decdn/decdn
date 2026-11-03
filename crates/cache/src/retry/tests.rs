@@ -128,3 +128,11 @@ fn delay_for_zero_initial_backoff_is_zero_regardless_of_jitter() {
         assert_eq!(delay_for(p, attempt), Duration::ZERO);
     }
 }
+
+/// `ESTALE` usually clears on the next path lookup of an NFS-backed file,
+/// so it is retry-eligible, not a permanent fault.
+#[test]
+fn a_stale_file_handle_is_transient() {
+    let err = io::Error::from(io::ErrorKind::StaleNetworkFileHandle);
+    assert!(classify_io_error(err).is_transient());
+}

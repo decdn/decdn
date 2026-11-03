@@ -260,8 +260,10 @@ pub(crate) async fn drain_to_bytes(
 /// 2. Otherwise dispatch on `io::ErrorKind`. The Transient set:
 ///    `Interrupted`, `TimedOut`, `WouldBlock`, `ResourceBusy`,
 ///    `BrokenPipe`, `ConnectionReset`, `ConnectionAborted`,
-///    `ConnectionRefused`, `NotConnected`, `UnexpectedEof`, and the
-///    catch-all `Other`. `UnexpectedEof` is the load-bearing kind
+///    `ConnectionRefused`, `NotConnected`, `UnexpectedEof`,
+///    `StaleNetworkFileHandle`, and the catch-all `Other`.
+///    `StaleNetworkFileHandle` (`ESTALE`) usually clears on the next
+///    path lookup of an NFS-backed file. `UnexpectedEof` is the load-bearing kind
 ///    for mid-body resets behind a flaky LB — reqwest surfaces
 ///    truncated Content-Length responses through it. `Other`
 ///    defaults to Transient because the HTTP and S3 origin adapters
@@ -327,6 +329,7 @@ fn classify_by_kind(kind: io::ErrorKind, e: io::Error) -> OriginPullError {
         | io::ErrorKind::ConnectionRefused
         | io::ErrorKind::NotConnected
         | io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::StaleNetworkFileHandle
         | io::ErrorKind::Other => OriginPullError::Transient(err),
         _ => OriginPullError::Permanent(err),
     }

@@ -757,6 +757,7 @@ fn the_funding_refusals_are_unfunded() {
     for reason in [
         ServeRejectReason::InsufficientDeposit,
         ServeRejectReason::SignerCapExhausted,
+        ServeRejectReason::CapabilityExpired,
         ServeRejectReason::PoolClosing { proven: true },
     ] {
         assert_eq!(
@@ -1029,6 +1030,136 @@ async fn intake_rejects_zero_expiry_capability() {
         handler.lanes.contains_key(&lane_key),
         "a future-expiry capability registers its lane"
     );
+}
+
+/// Every `reason` label of `decdn_capability_intake_dropped_total`.
+const INTAKE_DROP_LABELS: [&str; 5] = [
+    "expiry_zero",
+    "not_eoa_signature",
+    "malformed_signature",
+    "wrong_owner",
+    "invalid_signature",
+];
+
+/// The wire form of `capability`, with its owner signature from `key`.
+fn signed_wire(
+    key: &PrivateKeySigner,
+    capability: Capability,
+) -> decdn_protocol::client::WireCapability {
+    let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+    let signed = capability.sign(key, &domain).expect("sign capability");
+    decdn_protocol::client::WireCapability {
+        spending_cap: signed.capability.spending_cap,
+        expiry: signed.capability.expiry,
+        owner_signature: signed.signature.as_bytes().to_vec(),
+    }
+}
+
+/// Present the capability that `make` builds from a valid grant to an intake
+/// whose pool owner is `owner`. Assert that intake drops it: no lane in the map
+/// or the store, one count on `label`, and none on any other `reason` (#2631).
+async fn assert_intake_drop(
+    label: &str,
+    make: impl FnOnce(&PrivateKeySigner, Capability) -> decdn_protocol::client::WireCapability,
+) {
+    let metrics = Arc::new(Metrics::new());
+    let owner = PrivateKeySigner::random();
+    let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
+    let pool_id = B256::repeat_byte(0x5A);
+    let signer = Address::repeat_byte(0x5B);
+    let wire = make(
+        &owner,
+        Capability {
+            signer,
+            spending_cap: 1_000_000,
+            pool_id,
+            expiry: 1_900_000_000,
+        },
+    );
+    handler.intake_capability(pool_id, signer, owner.address(), &wire);
+
+    let lane_key = LaneKey {
+        pool_id,
+        signer,
+        provider: handler.eth_signer.address(),
+    };
+    assert!(
+        !handler.lanes.contains_key(&lane_key),
+        "a {label} drop registers no lane"
+    );
+    assert!(
+        matches!(handler.pool_state_store.get(lane_key), Ok(None)),
+        "a {label} drop never reaches the lane store"
+    );
+    let text = metrics.encode().expect("metrics encode");
+    for other in INTAKE_DROP_LABELS {
+        let want = u64::from(other == label);
+        let line = format!("decdn_capability_intake_dropped_total{{reason=\"{other}\"}} {want}");
+        assert!(
+            text.lines().any(|l| l == line),
+            "after a {label} drop, expected `{line}`:\n{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn intake_counts_a_zero_expiry_drop() {
+    assert_intake_drop("expiry_zero", |owner, capability| {
+        signed_wire(
+            owner,
+            Capability {
+                expiry: 0,
+                ..capability
+            },
+        )
+    })
+    .await;
+}
+
+/// A 64-byte owner signature is not an EOA signature the node can recover.
+#[tokio::test]
+async fn intake_counts_a_non_eoa_signature_drop() {
+    assert_intake_drop("not_eoa_signature", |owner, capability| {
+        let mut wire = signed_wire(owner, capability);
+        wire.owner_signature.truncate(64);
+        wire
+    })
+    .await;
+}
+
+/// A recovery byte outside `{0, 1, 27, 28, 35..}` does not parse.
+#[tokio::test]
+async fn intake_counts_a_malformed_signature_drop() {
+    assert_intake_drop("malformed_signature", |owner, capability| {
+        let mut wire = signed_wire(owner, capability);
+        if let Some(v) = wire.owner_signature.last_mut() {
+            *v = 5;
+        }
+        wire
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn intake_counts_a_wrong_owner_drop() {
+    assert_intake_drop("wrong_owner", |_, capability| {
+        signed_wire(&PrivateKeySigner::random(), capability)
+    })
+    .await;
+}
+
+/// A signature with `r = s = 0` parses but recovers to no address.
+#[tokio::test]
+async fn intake_counts_an_invalid_signature_drop() {
+    assert_intake_drop("invalid_signature", |owner, capability| {
+        let mut wire = signed_wire(owner, capability);
+        if let Some((v, rs)) = wire.owner_signature.split_last_mut() {
+            rs.fill(0);
+            *v = 27;
+        }
+        wire
+    })
+    .await;
 }
 
 /// #1789 item 2: the verification cache returns the cached recovery for an

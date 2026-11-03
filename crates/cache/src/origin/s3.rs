@@ -882,16 +882,33 @@ impl Origin for S3Origin {
                     }
                 },
             };
+            // An outboard over the cap degrades rather than errors, so the
+            // engine never sees it. The warn is the only record of it, for
+            // example a chunk-level outboard from a foreign tool, which costs
+            // every range pull of the blob.
             if let Some(len) = resp.content_length()
                 && (len < 0 || u64::try_from(len).unwrap_or(u64::MAX) > outboard_max_bytes)
             {
+                tracing::warn!(
+                    target: "decdn_cache::origin::s3",
+                    log_target = %log_target,
+                    len,
+                    cap = outboard_max_bytes,
+                    "origin outboard is larger than its cap; range pulls of this blob fall back to whole-blob",
+                );
                 return Ok(OutboardFetch::Unsupported);
             }
             let cap = usize::try_from(outboard_max_bytes).unwrap_or(usize::MAX);
-            match collect_bounded(resp.body, cap).await? {
-                Some(bytes) => Ok(OutboardFetch::Found(bytes)),
-                None => Ok(OutboardFetch::Unsupported),
-            }
+            let Some(bytes) = collect_bounded(resp.body, cap).await? else {
+                tracing::warn!(
+                    target: "decdn_cache::origin::s3",
+                    log_target = %log_target,
+                    cap = outboard_max_bytes,
+                    "origin outboard body ran past its cap; range pulls of this blob fall back to whole-blob",
+                );
+                return Ok(OutboardFetch::Unsupported);
+            };
+            Ok(OutboardFetch::Found(bytes))
         })
     }
 

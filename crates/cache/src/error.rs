@@ -256,14 +256,16 @@ pub type CacheResult<T> = std::result::Result<T, CacheError>;
 pub enum OriginPullError {
     /// A retry-eligible failure: HTTP 5xx/408/429, connect/headers/chunk
     /// timeouts, transport-level connection resets, or transient I/O on the
-    /// filesystem origin (`Interrupted`, `TimedOut`, `ResourceBusy`, `WouldBlock`).
+    /// filesystem origin (`Interrupted`, `TimedOut`, `ResourceBusy`,
+    /// `WouldBlock`, `StaleNetworkFileHandle`).
     #[error(transparent)]
     Transient(anyhow::Error),
 
     /// A failure that won't be cured by retrying: HTTP 4xx (other than 404,
     /// which maps to [`crate::origin::OriginFetch::NotFound`]),
-    /// encoding/decompression problems, size-cap breaches, symlink-escape
-    /// or permission-denied on the filesystem origin.
+    /// encoding/decompression problems, size-cap breaches, or a
+    /// symlink escape, a dangling symlink or a permission denied on the
+    /// filesystem origin.
     #[error(transparent)]
     Permanent(anyhow::Error),
 }
