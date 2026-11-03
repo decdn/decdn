@@ -169,6 +169,8 @@ abstract contract BaseProtocolDeploy is Script {
     ///      full-range mint at the seed price consumes both legs up to rounding,
     ///      so only a price moved before the mint lands can trip it.
     uint256 internal constant SEED_MIN_BPS = 9900;
+    /// @dev Arbitrum One, the mainnet chain the emergency-multisig checks apply to.
+    uint256 internal constant ARBITRUM_ONE_CHAIN_ID = 42_161;
 
     /// @notice Pool seed amounts (raw). The script creates + seeds the 50/50
     ///         Uniswap V3 pool in-script, so `_deriveTokenSeed` pairs `usdcSeed`
@@ -343,6 +345,12 @@ abstract contract BaseProtocolDeploy is Script {
     ///         deployer renounced — permanently ungovernable, with no on-chain
     ///         recovery and a green deploy.
     error BootstrapMultisigNotAContract(address account);
+    /// @notice On Arbitrum One, `DeployConfig.emergencyMultisig` is the deployer
+    ///         EOA, so one key would hold every pause and emergency role.
+    error EmergencyMultisigIsDeployer(address account);
+    /// @notice On Arbitrum One, `DeployConfig.emergencyMultisig` holds no code, so
+    ///         it cannot be the multisig ADR 009 § Emergency Multisig specifies.
+    error EmergencyMultisigNotAContract(address account);
     /// @notice Post-deploy invariant — a phase-4 peer role (e.g. `SLASH_ROLE`,
     ///         `ROUTER_CALLER_ROLE`, `PAUSER_ROLE`) was not actually granted to
     ///         `grantee` on `target`. OZ `grantRole` does not revert when the
@@ -464,6 +472,13 @@ abstract contract BaseProtocolDeploy is Script {
         if (address(cfg.ed25519Verifier) == address(0)) revert ZeroAddress("ed25519Verifier");
         if (cfg.deployer == address(0)) revert ZeroAddress("deployer");
         if (cfg.emergencyMultisig == address(0)) revert ZeroAddress("emergencyMultisig");
+        // On mainnet the emergency multisig holds every PAUSER_ROLE and the
+        // blacklist/appeal emergency roles, so it must be a real multisig, never
+        // the deployer key. Testnet and e2e deploys seat the deployer on purpose.
+        if (block.chainid == ARBITRUM_ONE_CHAIN_ID) {
+            if (cfg.emergencyMultisig == cfg.deployer) revert EmergencyMultisigIsDeployer(cfg.deployer);
+            if (cfg.emergencyMultisig.code.length == 0) revert EmergencyMultisigNotAContract(cfg.emergencyMultisig);
+        }
         if (cfg.initialTokenHolder == address(0)) revert ZeroAddress("initialTokenHolder");
 
         d.token = new Token(cfg.initialTokenHolder);
