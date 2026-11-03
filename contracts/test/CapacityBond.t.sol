@@ -11,6 +11,7 @@ import { BondMath } from "../src/BondMath.sol";
 import { Token } from "../src/Token.sol";
 
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
@@ -623,6 +624,27 @@ contract CapacityBondTest is Test {
 
         assertFalse(bond.isActive(operator), "the release path is gated on being inactive");
         assertEq(bond.declaredMbps(operator), 0, "and it clears the tier rather than reverting");
+    }
+
+    /// @notice The tier release is an exit step, so a pause does not block it;
+    ///         a normal declaration still reverts while paused.
+    function test_declareMbps_releaseWorksWhilePaused() public {
+        _bondForMbps(10);
+        vm.prank(operator);
+        bond.declareMbps(10);
+
+        vm.startPrank(admin);
+        bond.grantRole(bond.PAUSER_ROLE(), admin);
+        bond.pause();
+        vm.stopPrank();
+
+        vm.prank(operator);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        bond.declareMbps(20);
+
+        vm.prank(operator);
+        bond.declareMbps(0);
+        assertEq(bond.declaredMbps(operator), 0, "the release lands during a pause");
     }
 
     function test_declareMbps_revertsAboveCeiling() public {

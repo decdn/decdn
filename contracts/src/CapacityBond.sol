@@ -745,15 +745,17 @@ contract CapacityBond is
     ///         The bond released this way is exposed for the same unbonding
     ///         window as any other exit — `_reduceBondAtTier` reaches bond
     ///         sitting in the queue — so this shortens no exposure.
-    function declareMbps(uint256 mbps) external whenNotPaused {
+    function declareMbps(uint256 mbps) external {
         // Checked before the band so a zero declaration from an inactive
         // operator skips BOTH gates: the band floor (bounded to
         // `[MIN_CAPACITY_FLOOR_MBPS, MIN_CAPACITY_CEILING_MBPS]` by
         // `_enforceMinCapacityBounds`, so governance can never lower it to 0 and
         // collapse this branch into the normal one) and the curve check, which a
-        // slashed operator can no longer meet.
+        // slashed operator can no longer meet. The release is an exit step, so
+        // like `requestUnbond` and `deregisterNode` it is not pausable.
         bool release = mbps == 0 && !_nodes[msg.sender].active;
         if (!release) {
+            _requireNotPaused();
             if (mbps < minCapacityMbps || mbps > maxCapacityMbps) {
                 revert DeclaredCapacityOutOfBand({ mbps: mbps, floor: minCapacityMbps, ceiling: maxCapacityMbps });
             }
