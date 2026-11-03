@@ -253,6 +253,27 @@ contract SlashAppealTest is Test {
         appeal.openSlashAppeal(slashId2, keccak256("e"));
     }
 
+    /// @notice One appeal is open per operator at a time, so concurrent appeals
+    ///         cannot all pass the frequency-cap check before any is granted.
+    function test_open_revertsWhileAnotherAppealIsOpen() public {
+        uint256 slashId = _bondAndSlash();
+        _open(slashId);
+        assertTrue(appeal.hasOpenAppeal(operator));
+
+        vm.prank(admin);
+        (uint256 slashId2,) = bond.slash(operator, challenger, 1, bytes32(0));
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(SlashAppeal.AppealPending.selector, operator));
+        appeal.openSlashAppeal(slashId2, keccak256("e"));
+
+        // A rejected appeal frees the slot; no grant landed, so the cap is clear.
+        vm.prank(multisig);
+        appeal.rejectAppeal(slashId);
+        assertFalse(appeal.hasOpenAppeal(operator));
+        _open(slashId2);
+        assertTrue(appeal.hasOpenAppeal(operator));
+    }
+
     // -----------------------------------------------------------------
     // uphold / reject (slash stands)
     // -----------------------------------------------------------------
