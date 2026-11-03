@@ -418,9 +418,6 @@ pub decdn_client::receipt::ReceiptFault::ResponseMalformed
 pub decdn_client::receipt::ReceiptFault::ResponseMalformed::hash: alloy_primitives::aliases::B256
 pub decdn_client::receipt::ReceiptFault::ResponseMalformed::provider: alloy_primitives::bits::address::Address
 pub decdn_client::receipt::ReceiptFault::ResponseMalformed::reason: alloc::string::String
-pub decdn_client::receipt::ReceiptFault::ResponsePool
-pub decdn_client::receipt::ReceiptFault::ResponsePool::hash: alloy_primitives::aliases::B256
-pub decdn_client::receipt::ReceiptFault::ResponsePool::provider: alloy_primitives::bits::address::Address
 pub decdn_client::receipt::ReceiptFault::ResponseRefused
 pub decdn_client::receipt::ReceiptFault::ResponseRefused::hash: alloy_primitives::aliases::B256
 pub decdn_client::receipt::ReceiptFault::ResponseRefused::provider: alloy_primitives::bits::address::Address
@@ -495,7 +492,6 @@ pub decdn_client::receipt::ReceiptProof::voucher: decdn_client::receipt::Receipt
 pub struct decdn_client::receipt::ReceiptResponse
 pub decdn_client::receipt::ReceiptResponse::hash: alloy_primitives::aliases::B256
 pub decdn_client::receipt::ReceiptResponse::ok: bool
-pub decdn_client::receipt::ReceiptResponse::pool_id: alloy_primitives::aliases::B256
 pub decdn_client::receipt::ReceiptResponse::rate_per_mb: u64
 pub decdn_client::receipt::ReceiptResponse::slash_sig: alloy_primitives::bytes_::Bytes
 pub decdn_client::receipt::ReceiptResponse::timestamp_us: u64

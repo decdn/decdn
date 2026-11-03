@@ -24,6 +24,7 @@ use decdn_client::sink::StashedFault;
 use decdn_client::source::SourceFuture;
 use decdn_client::{BlobSource, UpstreamPullHeader, VoucherProgress};
 
+use crate::attestations::Attestations;
 use crate::metrics::Metrics;
 
 /// Drive `open` to its header and wrap its reader in a [`TimedReader`] whose
@@ -45,16 +46,28 @@ pub(crate) async fn timed_open<R>(
 }
 
 /// A [`BlobSource`] that wraps each reader of `S` in a [`TimedReader`] whose
-/// clock starts before `S` opens the pull.
+/// clock starts before `S` opens the pull. Each leg's upstream also offers an
+/// origin attestation for the hash, which this keeps when it is valid (ADR 022
+/// § Origin Attestation).
 pub(crate) struct TimedSource<S> {
     inner: S,
     metrics: Arc<Metrics>,
+    attestations: Option<Arc<Attestations>>,
 }
 
 impl<S> TimedSource<S> {
-    /// Wrap `inner`. The legs it opens record into `metrics`.
-    pub(crate) const fn new(inner: S, metrics: Arc<Metrics>) -> Self {
-        Self { inner, metrics }
+    /// Wrap `inner`. The legs it opens record into `metrics` and offer their
+    /// attestations to `attestations`.
+    pub(crate) const fn new(
+        inner: S,
+        metrics: Arc<Metrics>,
+        attestations: Option<Arc<Attestations>>,
+    ) -> Self {
+        Self {
+            inner,
+            metrics,
+            attestations,
+        }
     }
 }
 
@@ -66,10 +79,14 @@ impl<S: BlobSource> BlobSource for TimedSource<S> {
         hash: [u8; 32],
         range: AlignedRange,
     ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
-        Box::pin(timed_open(
-            self.inner.open(hash, range),
-            Arc::clone(&self.metrics),
-        ))
+        Box::pin(async move {
+            let opened =
+                timed_open(self.inner.open(hash, range), Arc::clone(&self.metrics)).await?;
+            if let Some(attestations) = &self.attestations {
+                attestations.keep_offered(hash, opened.0.origin_attestation.as_ref());
+            }
+            Ok(opened)
+        })
     }
 
     fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {

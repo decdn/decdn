@@ -1,4 +1,5 @@
 use super::*;
+use crate::dht::attestation::test_support::{ORIGIN, attest, verifier};
 use crate::dht::staker_set::{AllStaked, ConfigStakerSet};
 use std::collections::HashSet as StdHashSet;
 
@@ -21,11 +22,13 @@ fn nz(n: usize) -> NonZeroUsize {
 fn cov() -> Coverage {
     Coverage::full(1)
 }
-/// A wire `Provider` for `node` with `cov()`.
+/// A wire `Provider` for `node` with `cov()` and a valid attestation for
+/// `h(0)`, the target every fold test looks up.
 fn provider(node: NodeId) -> decdn_protocol::dht::Provider {
     decdn_protocol::dht::Provider {
         node,
         coverage: cov(),
+        attestation: attest([0; 32]),
     }
 }
 
@@ -135,7 +138,7 @@ fn into_randomised_providers_truncates_to_k_and_shuffles() {
         for &p in &canonical {
             state.record_provider(p, cov());
         }
-        let out = state.into_randomised_providers();
+        let out = state.into_lookup().providers;
         assert_eq!(out.len(), 10);
         assert!(
             out.iter().all(|(p, _)| canonical.contains(p)),
@@ -183,6 +186,7 @@ fn fold_response_negative_cache_does_not_drop_closer_nodes() {
     fold_response(
         &target,
         staker_set.as_ref(),
+        &verifier(),
         &cache,
         resp,
         nid(0x20),
@@ -194,6 +198,49 @@ fn fold_response_negative_cache_does_not_drop_closer_nodes() {
     // Closer_nodes survived — they appear as candidates.
     assert!(state.candidates.values().any(|v| v == &nid(0x05)));
     assert!(state.candidates.values().any(|v| v == &nid(0x10)));
+}
+
+/// Filter 4: a provider whose attestation does not recover to a seated
+/// origin is dropped, and the drop is counted. A valid attestation names its
+/// origin even when filter 3 drops the provider, so a stale record still
+/// routes the fallback to its origin.
+#[test]
+fn fold_response_drops_unattested_providers_and_keeps_their_origins() {
+    let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+    let target = h(0);
+    let mut state = LookupState::new(
+        &routing,
+        &AllStaked,
+        &target,
+        nid(0xFF),
+        LookupConfig::default(),
+    );
+    let cache = NegativeProbeCache::new();
+    cache.record_failure(nid(0x03), target);
+
+    let unattested = decdn_protocol::dht::Provider {
+        attestation: attest([9; 32]),
+        ..provider(nid(0x02))
+    };
+    let resp = decdn_protocol::dht::FindValueResponse {
+        hash: target,
+        providers: vec![provider(nid(0x01)), unattested, provider(nid(0x03))],
+        closer_nodes: closer(Vec::new()),
+    };
+    let folded = fold_response(
+        &target,
+        &AllStaked,
+        &verifier(),
+        &cache,
+        resp,
+        nid(0x40),
+        &mut state,
+    );
+
+    assert_eq!(folded.dropped, 1, "one attestation signs another hash");
+    let providers: Vec<NodeId> = state.providers.keys().copied().collect();
+    assert_eq!(providers, vec![nid(0x01)], "0x03 is negative-cached");
+    assert_eq!(state.into_lookup().origins, vec![ORIGIN.address()]);
 }
 
 /// A round can surface providers while no candidate is strictly
@@ -222,11 +269,13 @@ fn fold_response_records_providers_even_when_no_closer_node() {
     let observed_closer = fold_response(
         &target,
         staker_set.as_ref(),
+        &verifier(),
         &cache,
         resp,
         nid(0x05),
         &mut state,
-    );
+    )
+    .observed_closer;
 
     assert!(!observed_closer, "no candidate was strictly closer");
     assert_eq!(state.providers.len(), 1, "provider must still be folded");
@@ -279,6 +328,7 @@ fn fold_response_all_filters_compose() {
     fold_response(
         &target,
         staker_set.as_ref(),
+        &verifier(),
         &cache,
         resp,
         responder,

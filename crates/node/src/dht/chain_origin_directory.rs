@@ -19,8 +19,8 @@
 //!
 //! The bare hash carries no origin information (ADR 002 § Retrieval by
 //! namespace): the request supplies the namespace its content is published
-//! under. `namespaceId == 0` has no authorized origins, so it resolves to no
-//! origins here and is never fetched or cached.
+//! under. `namespaceId == 0` names no namespace, so it resolves to no origins
+//! here and is never fetched or cached.
 //!
 //! Namespace creation is permissionless and free, so this directory does not
 //! mirror the whole chain-side namespace set up front: it resolves each
@@ -200,6 +200,10 @@ impl OriginDirectory for ChainOriginDirectory {
         self.cache.insert(namespace_id, operators.clone());
         self.metrics.origin_directory_cache_size(self.cache.len());
         self.resolve(&operators)
+    }
+
+    fn origin_nodes(&self, operators: &[Address]) -> Vec<NodeId> {
+        self.resolve(operators)
     }
 }
 

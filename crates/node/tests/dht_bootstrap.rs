@@ -26,6 +26,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 
 use decdn_common::config::ResolvedSecurity;
+use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::{
     ConfigStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, RoutingTable, StakerSet,
     bootstrap, client, rate_limit::DhtRateLimitConfig,
@@ -132,6 +133,7 @@ async fn spin_up_server(staked: HashSet<[u8; 32]>) -> anyhow::Result<TestServer>
         limiter,
         Arc::clone(&metrics),
         staker_set,
+        test_support::verifier(),
         Arc::clone(&records),
     ));
     let (endpoint, addr) = local_endpoint(secret, vec![ALPN_DHT.to_vec()]).await?;
@@ -377,6 +379,7 @@ async fn client_store_lands_record_at_server() -> anyhow::Result<()> {
         hash,
         NodeId::from_bytes(*client_id.as_bytes()),
         Coverage::full(1),
+        test_support::attest(*hash.as_bytes()),
     )
     .await?;
     assert!(ack.accepted, "staked publisher's Store must be accepted");
@@ -391,6 +394,37 @@ async fn client_store_lands_record_at_server() -> anyhow::Result<()> {
         );
         assert_eq!(r.len(), 1);
     }
+
+    client_ep.close().await;
+    server.endpoint.close().await;
+    server.accept_task.abort();
+    Ok(())
+}
+
+/// ADR 022 § Origin Attestation: a staked holder whose record carries an
+/// attestation that does not verify for the hash is refused, and nothing is
+/// stored — a bonded node cannot advertise content no seated origin served.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_store_with_an_unverified_attestation_is_refused() -> anyhow::Result<()> {
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let server = spin_up_server(HashSet::from([*client_id.as_bytes()])).await?;
+
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
+    let hash = ContentHash::from_bytes([0x78u8; 32]);
+    let ack = client::store(
+        &dht_conns(&client_ep),
+        target,
+        hash,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        Coverage::full(1),
+        // A seated origin's signature, but over another hash.
+        test_support::attest([0x79u8; 32]),
+    )
+    .await?;
+    assert!(!ack.accepted, "an unverified attestation must be refused");
+    assert_eq!(server.records.lock().unwrap().len(), 0);
 
     client_ep.close().await;
     server.endpoint.close().await;
@@ -463,6 +497,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         )]))),
         Arc::clone(&scheduler),
         cache,
+        test_support::self_signing(),
         true,
         Arc::new(decdn_node::metrics::Metrics::new()),
         inserts_rx,
@@ -493,7 +528,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
             .records
             .lock()
             .unwrap()
-            .providers_at(&ContentHash::from_bytes(*h.as_bytes()), now_us)
+            .providers_at(&ContentHash::from_bytes(*h.as_bytes()), now_us, |_| true)
             .into_iter()
             .filter(|p| p.node == holder)
             .count()
@@ -583,6 +618,7 @@ async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow:
         Arc::new(ConfigStakerSet::empty()),
         Arc::clone(&scheduler),
         cache,
+        test_support::self_signing(),
         true,
         Arc::clone(&metrics),
         inserts_rx,
@@ -699,6 +735,7 @@ async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result
         Arc::new(ConfigStakerSet::empty()),
         Arc::clone(&scheduler),
         cache,
+        test_support::self_signing(),
         relay_foreign_namespaces,
         Arc::new(Metrics::new()),
         inserts_rx,
@@ -959,6 +996,7 @@ impl Publisher {
             )]))),
             Arc::clone(&scheduler),
             cache.clone(),
+            test_support::self_signing(),
             true,
             Arc::new(Metrics::new()),
             inserts,
@@ -986,7 +1024,7 @@ impl Publisher {
         .unwrap();
         let mut records = self.server.records.lock().unwrap();
         records
-            .providers_at(&ContentHash::from_bytes(*hash.as_bytes()), now_us)
+            .providers_at(&ContentHash::from_bytes(*hash.as_bytes()), now_us, |_| true)
             .into_iter()
             .find(|p| p.node == self.holder)
             .map(|p| p.coverage)

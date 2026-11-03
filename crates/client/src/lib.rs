@@ -2048,7 +2048,6 @@ async fn open_stream(
             slash_domain,
             expected_signer,
             hash,
-            ctx.pool_id,
             timestamp_us,
         )?;
         Ok((conn, send, recv, resp, resp_ext))
@@ -2889,7 +2888,7 @@ fn log_proof_stall(
 /// [`open_progressive_pull`] before the first chunk so the fused serve path
 /// (#856) knows `total_bytes` up front — it must sign its OWN downstream
 /// `StreamResponse` (which commits to a `total_bytes`) before forwarding a byte.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct UpstreamPullHeader {
     /// Whole-blob size the upstream promised (echoed into our downstream
@@ -2903,6 +2902,13 @@ pub struct UpstreamPullHeader {
     /// upstream — it is a protocol constant, not a negotiated value — and `0`
     /// on an unpaid source, which is the only reason it is carried at all.
     pub interval_bytes: u64,
+    /// The origin attestation this upstream offers for the hash (ADR 022
+    /// § Origin Attestation): the one it forwarded in its
+    /// `StreamResponseExt`, else its own signed response, which is an
+    /// attestation when the upstream is itself a seated origin. Unverified
+    /// here; a relay checks it against its seated-origin set before keeping
+    /// it. `None` on an unpaid source.
+    pub origin_attestation: Option<decdn_protocol::OriginAttestation>,
 }
 
 /// A live, progressive `cdn/client/v1` pull (#856) — the ONE receive loop for
@@ -3276,6 +3282,10 @@ async fn open_progressive_pull_impl(
             total_bytes,
             rate_per_mb,
             interval_bytes: CHUNK_BYTES,
+            origin_attestation: resp_ext
+                .origin_attestation
+                .clone()
+                .or_else(|| decdn_protocol::OriginAttestation::from_response(&resp)),
         };
         let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let floor = progress::ThroughputFloor::new(
@@ -4339,7 +4349,6 @@ fn verify_response(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
-    pool_id: B256,
     timestamp_us: u64,
 ) -> anyhow::Result<()> {
     // #252 + slash_sig length/upper-bound checks on the frozen base...
@@ -4352,9 +4361,6 @@ fn verify_response(
     // Echoed-field correlation (ADR 005).
     if resp.body.hash != hash {
         anyhow::bail!("response hash does not match request");
-    }
-    if resp.body.pool_id != pool_id.as_slice() {
-        anyhow::bail!("response pool_id does not match request");
     }
     if resp.body.timestamp_us != timestamp_us {
         anyhow::bail!("response timestamp_us not echoed");

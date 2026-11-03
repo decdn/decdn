@@ -698,6 +698,7 @@ impl BlobSource for TamperTailSource {
                 total_bytes: self.total,
                 rate_per_mb: 0,
                 interval_bytes: decdn_protocol::client::CHUNK_BYTES,
+                origin_attestation: None,
             };
             Ok((header, Bytes::from(w)))
         })

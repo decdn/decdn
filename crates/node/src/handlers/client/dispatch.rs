@@ -1527,7 +1527,6 @@ impl ClientHandler {
             ok: true,
             rate_per_mb,
             total_bytes,
-            pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
         };
         let (resp, resp_ext) = self.sign_response(body, None)?;

@@ -2893,7 +2893,6 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
         ok: true,
         rate_per_mb: 1,
         total_bytes: 1024,
-        pool_id: [9; 32],
         timestamp_us: an_hour_ago,
     };
     let (resp, _ext) = handler.sign_response(body.clone(), None)?;

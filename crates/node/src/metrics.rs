@@ -728,6 +728,21 @@ pub struct DecdnMetrics {
     /// growth is a Sybil-attempt indicator. Operator-visible name:
     /// `decdn_dht_store_rejected_non_staked_total`.
     pub dht_store_rejected_non_staked: Counter,
+    /// `Store` rejected because its origin attestation does not recover to a
+    /// seated origin (ADR 022 § Origin Attestation): a holder advertising
+    /// content no vetted origin served, or a record whose origin lost its
+    /// seat. Operator-visible name:
+    /// `decdn_dht_store_rejected_unattested_total`.
+    pub dht_store_rejected_unattested: Counter,
+    /// DHT providers a lookup dropped because their origin attestation was
+    /// not valid (ADR 022 § Lookup integrity, invariant 4). Operator-visible
+    /// name: `decdn_dht_lookup_provider_unattested_total`.
+    pub dht_lookup_provider_unattested: Counter,
+    /// Operators that hold at least one origin seat, as this node's
+    /// seated-origin set reads it (ADR 022 § Origin Attestation). `0` means
+    /// no DHT record is valid here. Operator-visible name:
+    /// `decdn_seated_origins`.
+    pub seated_origins: Gauge,
     /// `Store` rejected because the publisher is at the per-publisher
     /// quota (ADR 022 §Content Records and TTL — 200-record hard cap).
     /// Normal load shouldn't trip this. Operator-visible name:
@@ -3843,6 +3858,16 @@ recorders! {
     /// Record a `Store` rejected by the active-staker filter (ADR 022
     /// §STORE Flow line 140 — non-staked publisher).
     dht_store_rejected_non_staked => dht_store_rejected_non_staked.inc();
+
+    /// Record a `Store` whose origin attestation is not valid (ADR 022
+    /// § Origin Attestation).
+    dht_store_rejected_unattested => dht_store_rejected_unattested.inc();
+
+    /// Record a lookup provider dropped for an invalid origin attestation.
+    dht_lookup_provider_unattested => dht_lookup_provider_unattested.inc();
+
+    /// Publish how many operators hold an origin seat.
+    seated_origins(n: usize) => seated_origins.set(sat(n));
 
     /// Record a `Store` rejected by the per-publisher quota (ADR 022
     /// §Content Records and TTL — 200-record hard cap).

@@ -81,7 +81,6 @@ pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::re
 pub struct decdn_protocol::client::StreamResponseBody
 pub decdn_protocol::client::StreamResponseBody::hash: [u8; 32]
 pub decdn_protocol::client::StreamResponseBody::ok: bool
-pub decdn_protocol::client::StreamResponseBody::pool_id: [u8; 32]
 pub decdn_protocol::client::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::client::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::client::StreamResponseBody::total_bytes: u64
@@ -557,7 +556,6 @@ pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::re
 pub struct decdn_protocol::StreamResponseBody
 pub decdn_protocol::StreamResponseBody::hash: [u8; 32]
 pub decdn_protocol::StreamResponseBody::ok: bool
-pub decdn_protocol::StreamResponseBody::pool_id: [u8; 32]
 pub decdn_protocol::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::StreamResponseBody::total_bytes: u64

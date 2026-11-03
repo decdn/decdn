@@ -5,6 +5,7 @@
 //! table, rate limiter, record store, republish scheduler, and the
 //! requester-side iterative lookup that surround the handler.
 
+pub mod attestation;
 pub mod auth;
 pub mod bootstrap;
 pub mod bucket_refresh;
@@ -24,13 +25,15 @@ pub mod publish;
 pub mod rate_limit;
 pub mod records;
 pub mod routing;
+pub mod seated_origins;
 pub mod staker_set;
 
+pub use attestation::AttestationVerifier;
 pub use auth::AuthenticatedNodeId;
 pub use bootstrap::{BootstrapOutcome, bootstrap};
 pub use chain_origin_directory::ChainOriginDirectory;
 pub use chain_staker_set::ChainStakerSet;
-pub use lookup::{LookupConfig, find_providers};
+pub use lookup::{Lookup, LookupConfig, find_providers};
 pub use negative_cache::NegativeProbeCache;
 pub use node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, StaticNodeAddressDirectory,
@@ -39,6 +42,7 @@ pub use origin::{EmptyOriginDirectory, OriginDirectory, StaticOriginDirectory};
 pub use probe_cache::{PositiveProbeCache, ProbedProvider};
 pub use publish::RepublishScheduler;
 pub use rate_limit::{DhtRateLimiter, DhtRejectLayer};
-pub use records::{InsertOutcome, RecordStore, RecordStoreConfig};
+pub use records::{AttestedBy, InsertOutcome, RecordStore, RecordStoreConfig};
 pub use routing::{NODE_ID_LEN, NodeId, RoutingTable, xor_distance};
+pub use seated_origins::{SeatedOriginSet, SeatedOrigins};
 pub use staker_set::{ConfigStakerSet, StakerSet};

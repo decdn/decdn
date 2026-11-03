@@ -643,6 +643,10 @@ pub struct NodeOriginDeps {
     pub routing_table: Arc<Mutex<RoutingTable>>,
     /// Active-staker set (lookup integrity filter).
     pub staker_set: Arc<dyn StakerSet>,
+    /// The origin attestations this node holds and the verifier the lookup
+    /// checks providers with (ADR 022 § Origin Attestation). A pull leg keeps
+    /// the attestation its upstream offers.
+    pub attestations: Arc<crate::attestations::Attestations>,
     /// On-chain origin directory: the fallback when the DHT returns no providers,
     /// and the supplement when a ranged pull's probed holders do not span the blob.
     pub origin_directory: Arc<dyn OriginDirectory>,
@@ -1023,9 +1027,8 @@ impl Origin for NodeOrigin {
                 // origin-directory fallback (`NO_NAMESPACE`), and no requester to
                 // drop. The namespace-aware client-serve serve-miss path is
                 // `open_pull_leg`.
-                let providers = discover(deps, hash_bytes, U256::ZERO, None)
-                    .await
-                    .providers;
+                let discovered = discover(deps, hash_bytes, U256::ZERO, None).await;
+                let providers = discovered.providers;
                 if providers.is_empty() {
                     // `node_pull_no_providers` means "the blob is unavailable on the
                     // network, NOT a pull failure" — mutually exclusive with
@@ -1050,6 +1053,7 @@ impl Origin for NodeOrigin {
                 let ranked = probe_and_rank(
                     deps,
                     providers,
+                    &discovered.attested,
                     hash_bytes,
                     ProbeGather::EarlyExit,
                     U256::ZERO,
@@ -1141,6 +1145,9 @@ fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
 struct Discovered {
     /// The providers to probe.
     providers: Vec<DhtNodeId>,
+    /// The seated origins the lookup's valid attestations name, for the
+    /// coverage supplement in [`probe_and_rank`].
+    attested: Vec<DhtNodeId>,
     /// [`CandidateSource::Dht`] for a lookup answer that is non-empty once the
     /// requester is dropped, [`CandidateSource::Directory`] for a non-empty
     /// directory fallback, [`CandidateSource::None`] when both are empty.
@@ -1184,28 +1191,36 @@ async fn discover(
     // instead (`probe_candidate`, #1506). A later task may use this hint to
     // skip probing a candidate whose stale coverage already misses the whole
     // pull range; today every discovered candidate is still probed.
-    let providers: Vec<DhtNodeId> = crate::dht::find_providers(
+    let lookup = crate::dht::find_providers(
         &deps.dht_connections,
         &deps.routing_table,
         &deps.staker_set,
+        deps.attestations.verifier(),
         &deps.negative_cache,
         deps.self_id,
         target,
         deps.config.lookup,
         Some(&deps.metrics),
     )
-    .await
-    .into_iter()
-    .map(|(node, _coverage)| node)
-    .filter(|node| Some(*node) != requester)
-    .collect();
+    .await;
+    // The seated origins the answer's attestations name: the first fallback,
+    // ahead of the namespace directory (ADR 022 § FIND_VALUE Flow), so a stale
+    // record still routes to the origin its content came from.
+    let attested = deps.origin_directory.origin_nodes(&lookup.origins);
+    let providers: Vec<DhtNodeId> = lookup
+        .providers
+        .into_iter()
+        .map(|(node, _coverage)| node)
+        .filter(|node| Some(*node) != requester)
+        .collect();
     if !providers.is_empty() {
         return Discovered {
             providers,
+            attested,
             source: CandidateSource::Dht,
         };
     }
-    let origins = directory_origins(deps, namespace_id, requester).await;
+    let origins = fallback_origins(deps, namespace_id, &attested, requester).await;
     let source = if origins.is_empty() {
         CandidateSource::None
     } else {
@@ -1213,22 +1228,30 @@ async fn discover(
     };
     Discovered {
         providers: origins,
+        attested,
         source,
     }
 }
 
-/// The origin directory's candidates for `namespace_id`, without this node and
-/// without the `requester`. The DHT lookup drops this node by `self_id`; the
-/// directory lists every active origin operator, this node included, and the
-/// requester can be one. A node never pulls from itself or from the node it
-/// answers.
-async fn directory_origins(
+/// The origin candidates of the fallback, without this node and without the
+/// `requester`: the attesting origins first, then the origin directory for
+/// `namespace_id`, each listed once. The DHT lookup drops this node by
+/// `self_id`; the directory lists every active origin operator, this node
+/// included, and the requester can be one. A node never pulls from itself or
+/// from the node it answers.
+async fn fallback_origins(
     deps: &NodeOriginDeps,
     namespace_id: U256,
+    attested: &[DhtNodeId],
     requester: Option<DhtNodeId>,
 ) -> Vec<DhtNodeId> {
-    let mut origins = deps.origin_directory.lookup_origins(namespace_id).await;
-    origins.retain(|origin| *origin != deps.self_id && Some(*origin) != requester);
+    let directory = deps.origin_directory.lookup_origins(namespace_id).await;
+    let mut origins: Vec<DhtNodeId> = Vec::with_capacity(attested.len() + directory.len());
+    for origin in attested.iter().copied().chain(directory) {
+        if origin != deps.self_id && Some(origin) != requester && !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
     origins
 }
 
@@ -1310,8 +1333,9 @@ fn count_u16(len: usize) -> u16 {
 /// reputation-weighted selection score. `tally` receives what the rounds saw.
 ///
 /// Under [`ProbeGather::CoverageUnion`], a round whose holders cannot span the
-/// blob also probes the origin directory's candidates for `namespace_id` that the
-/// first round did not resolve (ADR 022 §`FIND_VALUE` Flow, #2195). A DHT answer can
+/// blob also probes the `attested` origins and the origin directory's
+/// candidates for `namespace_id` that the first round did not resolve (ADR 022
+/// §`FIND_VALUE` Flow, #2195). A DHT answer can
 /// hold only partial holders, and the ranged assembly needs a candidate set that
 /// covers every block. An origin past the first round's `probe_fanout` cut is
 /// probed here even when `providers` named it; an origin the first round skipped
@@ -1319,6 +1343,7 @@ fn count_u16(len: usize) -> u16 {
 async fn probe_and_rank(
     deps: &NodeOriginDeps,
     providers: Vec<DhtNodeId>,
+    attested: &[DhtNodeId],
     hash_bytes: [u8; 32],
     gather: ProbeGather,
     namespace_id: U256,
@@ -1330,7 +1355,7 @@ async fn probe_and_rank(
     if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
         // The supplement can list the requester; the pull leg drops it from the
         // ranked list after this round.
-        let directory = directory_origins(deps, namespace_id, None).await;
+        let directory = fallback_origins(deps, namespace_id, attested, None).await;
         let listed = directory.len();
         let origins: Vec<DhtNodeId> = directory
             .into_iter()
@@ -2522,7 +2547,11 @@ async fn pull_from_candidate_in_span(
         Arc::clone(&deps.metrics),
     );
     let (header, whole) = match handshake.await {
-        Ok(pair) => pair,
+        Ok(pair) => {
+            deps.attestations
+                .keep_offered(hash_bytes, pair.0.origin_attestation.as_ref());
+            pair
+        }
         Err(err) => {
             // No bytes pulled, no voucher paid — nothing to settle.
             return Err(candidate_miss(
@@ -2577,6 +2606,7 @@ async fn pull_from_candidate_in_span(
     let slash_domain = deps.slash_domain.clone();
     let engine = deps.engine.clone();
     let metrics = Arc::clone(&deps.metrics);
+    let attestations = Arc::clone(&deps.attestations);
     let ledger_for_drive = Arc::clone(&ledger);
     let deps_for_thread = Arc::clone(deps_lock);
     let max_blob_size_bytes = deps.config.max_blob_size_bytes;
@@ -2629,7 +2659,11 @@ async fn pull_from_candidate_in_span(
                 // whose driver runs on the main runtime.
                 Some(connections),
             );
-            let source = PrimedSource::new(TimedSource::new(source, Arc::clone(&metrics)));
+            let source = PrimedSource::new(TimedSource::new(
+                source,
+                Arc::clone(&metrics),
+                Some(attestations),
+            ));
             // The handshake's pull is the drive's first leg only when that leg is
             // the whole blob: this node holds none of it.
             let whole_range = align_range(0, 0, total_bytes).ok();

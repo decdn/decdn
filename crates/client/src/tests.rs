@@ -1221,7 +1221,6 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         ok: false,
         rate_per_mb: 10,
         total_bytes: 0,
-        pool_id: [0x77u8; 32],
         timestamp_us: 1_700_000_000_000_000,
     };
     let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
@@ -1231,6 +1230,7 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
     };
     let response_ext = decdn_protocol::StreamResponseExt {
         error: Some(StreamError::Declined),
+        origin_attestation: None,
     };
     // Preconditions the real open stage enforces before ever calling `open`.
     response.validate()?;
@@ -1287,7 +1287,6 @@ fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {
             ok: false,
             rate_per_mb: 10,
             total_bytes: 0,
-            pool_id: [0x77u8; 32],
             timestamp_us: 1_700_000_000_000_000,
         },
         slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
