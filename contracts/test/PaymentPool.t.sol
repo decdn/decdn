@@ -1333,6 +1333,21 @@ contract PaymentPoolTest is Test {
         assertEq(wBytes, ceiling, "credits only floor-justified bytes");
     }
 
+    /// @notice Byte headroom banked by an earlier zero-byte payment is not
+    ///         released in bulk by a dust payment: each call's credit is
+    ///         bounded by what that call pays at the floor.
+    function test_redeem_softFloor_boundsCreditByThisCallsPayment() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 1000, 0, _voucher(id, 1000, 0), _cap(id, 1000e6, expiry));
+
+        uint64 fullBytes = uint64(uint256(1001) * BYTES_PER_MB / DELIVERY_FLOOR);
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 1001, fullBytes, _voucher(id, 1001, fullBytes), "");
+        (, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wBytes, uint64(BYTES_PER_MB / DELIVERY_FLOOR), "a 1-unit payment credits at most 1 unit of bytes");
+    }
+
     function test_redeem_softFloor_honestPathUnaffected() public {
         bytes32 id = _open();
         // ~38 MB for 390 base units at the $0.01/GB market rate clears the floor by ~10x.

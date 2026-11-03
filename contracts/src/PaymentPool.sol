@@ -934,9 +934,12 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // when a later voucher advances it (including after a floor raise, which
         // lowers the ceiling but never claws back already-credited bytes).
         uint64 bytesDelta = creditedBytes > w.bytesDelivered ? creditedBytes - w.bytesDelivered : 0;
-        // `bytesPaid <= bytesDelta` (paid <= desired), so the result is a
-        // `uint64` by construction.
-        bytesPaid = uint64(Math.mulDiv(bytesDelta, paid, desired));
+        // The floor also bounds THIS call's credit by THIS call's payment, so
+        // byte headroom left by earlier zero-byte payments cannot be released
+        // in bulk by a dust payment. `bytesPaid <= bytesDelta` (paid <= desired),
+        // so the result is a `uint64` by construction.
+        bytesPaid =
+            uint64(Math.min(Math.mulDiv(bytesDelta, paid, desired), Math.mulDiv(paid, BYTES_PER_MB, deliveryFloor)));
 
         // Effects only; the caller settles.
         w.amount += paid;
