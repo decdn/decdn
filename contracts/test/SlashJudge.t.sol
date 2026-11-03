@@ -13,6 +13,14 @@ import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol
 import { ICapacityBondRegionView } from "../src/interfaces/ICapacityBondRegionView.sol";
 import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
 
+/// @dev Code an operator could attach to its address (e.g. an EIP-7702
+///      delegate) that refuses every ERC-1271 signature check.
+contract RejectingSigner {
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return 0xffffffff;
+    }
+}
+
 contract MockToken is ERC20 {
     constructor() ERC20("TOKEN", "TKN") {
         _mint(msg.sender, 1_000_000_000e18);
@@ -436,6 +444,19 @@ contract SlashJudgeTest is Test {
 
         assertEq(slasher.slashCount(), 1);
         assertTrue(judge.usedEvidenceHash(evidenceHash));
+    }
+
+    /// @notice Evidence is checked by ECDSA recovery alone, so code on the
+    ///         operator's address that rejects ERC-1271 checks does not shield it.
+    function test_rate_slashesOperatorWithRejectingCode() public {
+        vm.etch(node, address(new RejectingSigner()).code);
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1);
     }
 
     /// @notice One overcharged stream is one offense: pairing it with a second

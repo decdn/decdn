@@ -64,7 +64,7 @@ EIP712Domain({
 #### On-Chain Verification Flow
 
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
-2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)).
+2. The contract reconstructs the EIP-712 typed data hash, recovers the signer of `slash_sig` by ECDSA, and compares it against `challengedNode` — **~3,000 gas**. ERC-1271 is never consulted: evidence is re-verified after the paid action, so its validity must not depend on code at the operator's address, such as an EIP-7702 delegate ([ADR 024 § The signature partition](024-account-abstraction.md#the-signature-partition)).
 3. The challenger-provided address is looked up in `CapacityBond` to confirm it maps to a registered node.
 4. For the two-message offense (rate manipulation), the signatures must both validate against the **same** node address.
 
@@ -162,9 +162,9 @@ The check applies at initialization too — neither contract may be deployed wit
 
 ##### Rate manipulation
 
-1. Challenger provides `challengedNode` address (the node's Ethereum address or Safe address)
-2. `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSlashSig)` — must pass
-3. `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSlashSig)` — must pass
+1. Challenger provides `challengedNode` address (the node's Ethereum address)
+2. ECDSA recovery of `probeDigest` from `probeSlashSig` equals `challengedNode` — must pass
+3. ECDSA recovery of `streamDigest` from `streamSlashSig` equals `challengedNode` — must pass
 4. Verify `streamResponse.ok == true` — the stream must be a delivery, not a refusal
 5. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
 6. Verify `probeResponse.hash == streamResponse.hash` (same blob)
@@ -176,7 +176,7 @@ The check applies at initialization too — neither contract may be deployed wit
 ##### Blacklist violation
 
 1. Challenger provides `challengedNode` address
-2. `SignatureChecker.isValidSignatureNow(challengedNode, responseDigest, slashSig)` — must pass
+2. ECDSA recovery of `responseDigest` from `slashSig` equals `challengedNode` — must pass
 3. Look up `challengedNode` in `CapacityBond` — must be a registered node
 4. Decode `hash` from the response; verify it matches `blobHash`
 5. If `ProbeResponse`: verify `has_blob == true`. If `StreamResponse`: verify `ok == true`
@@ -238,8 +238,8 @@ The companion `SlashAppeal` events (`AppealOpened`, `AppealGranted`, etc.) are s
 
 | Operation | Estimated Gas | Notes |
 | --- | --- | --- |
-| `submitRateChallenge` | ~65k–90k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage for pending challenge + bond transfer + `Slashed` emit on success |
-| `submitBlacklistChallenge` | ~75k–95k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + up to three `ContentBlacklist` entry reads (global, current region, unripened previous region) + one `CapacityBond` region-scope read (~15k: two `string` fields plus four timestamps) + bond transfer + `Slashed` emit on success. The scope resolution in [§ Blacklist violation](#blacklist-violation) item 7 makes this the more read-heavy of the two challenge paths, though it still verifies only one signature. A challenge that resolves on the global leg short-circuits before the region reads. |
+| `submitRateChallenge` | ~65k–90k | 2× ECDSA recovery (~6k) + calldata + storage for pending challenge + bond transfer + `Slashed` emit on success |
+| `submitBlacklistChallenge` | ~75k–95k | 1× ECDSA recovery (~3k) + up to three `ContentBlacklist` entry reads (global, current region, unripened previous region) + one `CapacityBond` region-scope read (~15k: two `string` fields plus four timestamps) + bond transfer + `Slashed` emit on success. The scope resolution in [§ Blacklist violation](#blacklist-violation) item 7 makes this the more read-heavy of the two challenge paths, though it still verifies only one signature. A challenge that resolves on the global leg short-circuits before the region reads. |
 | `Slashed` event emit | ~5k–7k | `nextSlashId++` (cold SLOAD + non-zero→non-zero SSTORE on first emit per tx, ~5k post-EIP-2929) + LOG3 base + 3 stack topics (event signature + 2 indexed) + 96 bytes non-indexed data (~2k); negligible vs the surrounding `CapacityBond.slash()`. The very first `Slashed` ever emitted on a fresh deployment pays an additional ~17k for the 0→non-zero `nextSlashId` SSTORE. |
 
 #### Governable Parameters with Safety Bounds
