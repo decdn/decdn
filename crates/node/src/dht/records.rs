@@ -35,12 +35,24 @@
 //! decremented then re-incremented for the same holder. Per ADR 022
 //! §Content Records and TTL this is what extends record lifetime ahead of
 //! the previous expiry while the holder still has the blob.
+//!
+//! # Origin attestation
+//!
+//! Each record keeps its origin attestation and the operator it recovered to
+//! (ADR 022 § Origin Attestation). The handler verifies an attestation before
+//! [`RecordStore::insert_at`]; a re-publish carrying the same attestation
+//! reuses the stored signer ([`RecordStore::stored_signer`]) instead of
+//! recovering it again. [`RecordStore::providers_at`] leaves out a record whose
+//! signer no longer holds a seat.
 
 use std::collections::{BTreeSet, HashMap};
+
+use alloy::primitives::Address;
 
 use crate::dht::routing::NodeId;
 use decdn_protocol::Coverage;
 use decdn_protocol::MAX_PROVIDERS_PER_HASH;
+use decdn_protocol::OriginAttestation;
 use decdn_protocol::dht::Provider;
 
 /// 32-byte content hash. Re-exported from the protocol crate's
@@ -84,6 +96,19 @@ struct HolderEntry {
     sequence: u64,
     expiry_us: u64,
     coverage: Coverage,
+    attestation: OriginAttestation,
+    /// The operator `attestation` recovered to at admission.
+    signer: Address,
+}
+
+/// A verified origin attestation and the operator it recovered to, as the
+/// handler admits it into a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestedBy {
+    /// The attestation as the holder sent it.
+    pub attestation: OriginAttestation,
+    /// The seated operator it recovered to.
+    pub signer: Address,
 }
 
 /// Configuration for the record store (ADR 022 §Content Records and TTL).
@@ -185,19 +210,36 @@ impl RecordStore {
         self.by_publisher_count.get(holder).copied().unwrap_or(0)
     }
 
+    /// The signer stored for `(holder, hash)` when the stored record carries
+    /// exactly `attestation`, so a re-publish skips the signature recovery.
+    #[must_use]
+    pub fn stored_signer(
+        &self,
+        holder: &NodeId,
+        hash: &Hash,
+        attestation: &OriginAttestation,
+    ) -> Option<Address> {
+        self.by_hash
+            .get(hash)?
+            .iter()
+            .find(|e| e.holder == *holder && e.attestation == *attestation)
+            .map(|e| e.signer)
+    }
+
     /// Insert or refresh `(holder, hash)` with `receive_us` as the
     /// receiver-anchored wall-clock at acceptance. Returns the outcome.
     ///
     /// The caller is responsible for the upstream admission checks (rate
-    /// limit, `holder == authenticated NodeId`, `StakerSet::is_active`).
-    /// This method enforces only the storage-level invariants (per-publisher
-    /// quota with hard reject, global LRU with eviction, per-hash provider
-    /// cap with oldest-provider eviction).
+    /// limit, `holder == authenticated NodeId`, `StakerSet::is_active`, a
+    /// valid origin attestation). This method enforces only the
+    /// storage-level invariants (per-publisher quota with hard reject, global
+    /// LRU with eviction, per-hash provider cap with oldest-provider eviction).
     pub fn insert_at(
         &mut self,
         holder: NodeId,
         hash: Hash,
         coverage: Coverage,
+        attested: AttestedBy,
         receive_us: u64,
     ) -> InsertOutcome {
         // Allocate one monotonic sequence per call. Stored on the entry
@@ -216,7 +258,7 @@ impl RecordStore {
         // update atomic, so there is no hand-rolled in-place mutation (and
         // no `get_mut` corruption branch) to keep in sync.
         if self.remove_entry(holder, hash).is_some() {
-            self.add_entry(holder, hash, coverage, receive_us, sequence);
+            self.add_entry(holder, hash, coverage, attested, receive_us, sequence);
             return InsertOutcome::Refreshed;
         }
 
@@ -260,13 +302,14 @@ impl RecordStore {
             self.evict_globally_oldest();
         }
 
-        self.add_entry(holder, hash, coverage, receive_us, sequence);
+        self.add_entry(holder, hash, coverage, attested, receive_us, sequence);
         InsertOutcome::Inserted
     }
 
     /// Return the current holders for `hash`, dropping any whose
-    /// `expiry_us <= now_us`. The result is capped at the configured
-    /// per-hash provider count (which equals the wire
+    /// `expiry_us <= now_us` and leaving out any whose attestation signer
+    /// `admits` rejects (it lost its seat since admission). The result is
+    /// capped at the configured per-hash provider count (which equals the wire
     /// [`MAX_PROVIDERS_PER_HASH`] in production), so the handler can
     /// serialise the return value directly into a
     /// [`decdn_protocol::FindValueResponse`].
@@ -274,7 +317,12 @@ impl RecordStore {
     /// `now_us` is the requester-side wall-clock — passed in rather
     /// than read inline so the same store can be exercised under a
     /// mock clock in tests.
-    pub fn providers_at(&mut self, hash: &Hash, now_us: u64) -> Vec<Provider> {
+    pub fn providers_at(
+        &mut self,
+        hash: &Hash,
+        now_us: u64,
+        admits: impl Fn(&Address) -> bool,
+    ) -> Vec<Provider> {
         // Scrub expired entries for this hash before returning.
         self.scrub_hash_expired(hash, now_us);
         self.by_hash
@@ -282,9 +330,11 @@ impl RecordStore {
             .map(|entries| {
                 entries
                     .iter()
+                    .filter(|e| admits(&e.signer))
                     .map(|e| Provider {
                         node: e.holder,
                         coverage: e.coverage.clone(),
+                        attestation: e.attestation.clone(),
                     })
                     .collect()
             })
@@ -370,6 +420,7 @@ impl RecordStore {
         holder: NodeId,
         hash: Hash,
         coverage: Coverage,
+        attested: AttestedBy,
         receive_us: u64,
         sequence: u64,
     ) {
@@ -380,6 +431,8 @@ impl RecordStore {
             sequence,
             expiry_us,
             coverage,
+            attestation: attested.attestation,
+            signer: attested.signer,
         });
         self.global_lru.insert((receive_us, sequence, hash, holder));
         *self.by_publisher_count.entry(holder).or_insert(0) += 1;

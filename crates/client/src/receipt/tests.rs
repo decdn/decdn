@@ -63,7 +63,6 @@ impl Keys {
             ok: true,
             rate_per_mb: RATE,
             total_bytes,
-            pool_id: self.pool_id.into(),
             timestamp_us: 1_700_000_000_000_000,
         };
         let c = chain();
@@ -669,10 +668,7 @@ async fn tampering_with_each_signed_field_is_named() {
     lane0(&mut r).pool_id = B256::repeat_byte(0x57);
     assert_eq!(
         r.verify(),
-        vec![
-            ReceiptFault::ResponsePool { provider, hash },
-            ReceiptFault::VoucherSignature { provider },
-        ]
+        vec![ReceiptFault::VoucherSignature { provider }]
     );
 
     let mut r = good.clone();
@@ -959,7 +955,6 @@ fn the_json_schema_is_pinned() {
             ok: true,
             rate_per_mb: 10,
             total_bytes: 20,
-            pool_id: B256::repeat_byte(0x01),
             timestamp_us: 30,
             slash_sig: Bytes::from_static(&[0xaa]),
         }],
@@ -1032,7 +1027,6 @@ fn the_json_schema_is_pinned() {
                 "ok": true,
                 "rate_per_mb": 10,
                 "total_bytes": 20,
-                "pool_id": b("01"),
                 "timestamp_us": 30,
                 "slash_sig": "0xaa",
             }],

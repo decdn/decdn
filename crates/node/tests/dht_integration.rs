@@ -66,12 +66,49 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use decdn_common::config::ResolvedSecurity;
+use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::routing::K_BUCKET_SIZE;
 use decdn_node::dht::{
-    ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig, NegativeProbeCache, RecordStore,
-    RecordStoreConfig, RoutingTable, StakerSet, client, find_providers,
+    AttestedBy, ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig, NegativeProbeCache,
+    RecordStore, RecordStoreConfig, RoutingTable, StakerSet, client,
     rate_limit::DhtRateLimitConfig,
 };
+
+/// [`decdn_node::dht::find_providers`] checking attestations against the
+/// fixture origin, keeping only the providers.
+#[allow(clippy::too_many_arguments)]
+async fn find_providers(
+    conns: &decdn_client::Connections,
+    routing: &Arc<Mutex<RoutingTable>>,
+    staker_set: &Arc<dyn StakerSet>,
+    neg: &NegativeProbeCache,
+    requester: NodeId,
+    target: ContentHash,
+    cfg: LookupConfig,
+    metrics: Option<&Metrics>,
+) -> Vec<(NodeId, Coverage)> {
+    decdn_node::dht::find_providers(
+        conns,
+        routing,
+        staker_set,
+        &test_support::verifier(),
+        neg,
+        requester,
+        target,
+        cfg,
+        metrics,
+    )
+    .await
+    .providers
+}
+
+/// A record's attestation for `hash`, signed by the fixture origin.
+fn attested(hash: [u8; 32]) -> AttestedBy {
+    AttestedBy {
+        attestation: test_support::attest(hash),
+        signer: test_support::ORIGIN.address(),
+    }
+}
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
@@ -209,6 +246,7 @@ async fn spin_up_server(staked: HashSet<[u8; 32]>) -> anyhow::Result<TestServer>
         limiter,
         Arc::clone(&metrics),
         staker_set,
+        test_support::verifier(),
         Arc::clone(&records),
     ));
     let (endpoint, addr) = local_endpoint(secret, vec![ALPN_DHT.to_vec()]).await?;
@@ -340,6 +378,7 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
         NodeId::from_bytes(holder),
         ContentHash::from_bytes(hash),
         Coverage::full(1),
+        attested(hash),
         receive_us,
     );
     assert_matches!(

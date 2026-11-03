@@ -77,9 +77,10 @@ pub use coverage::{TestBlockSizeGuard, override_discovery_block_bytes_for_test};
 pub use dht::{
     BatchStoreAck, BatchStoreRequest, CloserNodes, CloserNodesError, DhtMessage, FindNodeRequest,
     FindNodeResponse, FindValueRequest, FindValueResponse, FindValueResponseExt,
-    MAX_BATCH_STORE_HASHES, MAX_CLOSER_NODES, MAX_DHT_FRAME, MAX_PROVIDERS_PER_HASH, StoreAck,
-    StoreRequest, StoreRequestExt, encode_find_value_response, encode_store_request,
-    parse_find_value_response_ext, parse_store_request_ext,
+    MAX_BATCH_STORE_HASHES, MAX_CLOSER_NODES, MAX_DHT_FRAME, MAX_PROVIDERS_PER_HASH,
+    OriginAttestation, Provider, StoreAck, StoreRequest, StoreRequestExt,
+    encode_find_value_response, encode_store_request, parse_find_value_response_ext,
+    parse_store_request_ext,
 };
 pub use framing::{
     FrameError, TopLevelEnum, decode_message, encode_message, is_unknown_variant, read_frame,

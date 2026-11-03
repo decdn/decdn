@@ -11,12 +11,13 @@
 //!
 //! The signed payload follows ADR 014 §EIP-712 Type Definitions exactly so an
 //! off-chain Rust signature byte-matches what the on-chain `SlashJudge`
-//! contract recovers signatures against. `hash` and `pool_id` are
-//! request-context fields (from the `StreamRequest`); in this implementation's
-//! wire shape they are echoed back in
-//! `decdn_protocol::StreamResponseBody.{hash,pool_id}` and are part of the
+//! contract recovers signatures against. `hash` is a request-context field
+//! (from the `StreamRequest`); in this implementation's wire shape it is
+//! echoed back in `decdn_protocol::StreamResponseBody.hash` and is part of the
 //! EIP-712 signed set: a verifier reconstructs the typed data from the
-//! response body's own fields.
+//! response body's own fields. The signed set names no pool or payer, so a
+//! seated origin's `ok: true` response doubles as the origin attestation a DHT
+//! record carries (ADR 022 § Origin Attestation).
 //!
 //! # Domain
 //!
@@ -29,7 +30,7 @@
 //!
 //! ```text
 //! StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,
-//!                bytes32 poolId,uint64 timestampUs)
+//!                uint64 timestampUs)
 //! ```
 
 use alloy::dyn_abi::Eip712Domain;
@@ -58,7 +59,6 @@ mod sol_types {
             bool ok;
             uint64 ratePerMb;
             uint64 totalBytes;
-            bytes32 poolId;
             uint64 timestampUs;
         }
     }
@@ -70,19 +70,19 @@ use sol_types::StreamResponse as StreamResponseSol;
 /// string (ADR 014 §EIP-712 Type Definitions):
 ///
 /// ```text
-/// StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 poolId,uint64 timestampUs)
+/// StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,uint64 timestampUs)
 /// ```
 ///
 /// The Solidity suite pins `SlashJudge.STREAM_RESPONSE_TYPEHASH` to the same
 /// digest (`contracts/test/SlashJudge.t.sol`), so a one-sided edit of either
 /// side's type string fails default CI on both sides (#1843).
 pub const STREAM_RESPONSE_TYPEHASH: B256 =
-    alloy::primitives::b256!("0xc6d9e65c3527b52698988cae3aea61d5d8df64b415de933cc7e9762bc600eb3e");
+    alloy::primitives::b256!("0x6d6dc23d742a8f37702eadc9d0b75cf937e8ec82c6c6ff0d5d2a83527ffbaa2d");
 
 /// The signed field set of a `StreamResponse` (ADR 014 §1).
 ///
-/// `hash` and `pool_id` are request-context fields echoed back in the
-/// response body; `timestamp_us` is the requester-generated timestamp echoed
+/// `hash` is a request-context field echoed back in the response body;
+/// `timestamp_us` is the requester-generated timestamp echoed
 /// from the `StreamRequest`. Together with `ok`, `rate_per_mb`, and
 /// `total_bytes`, these are exactly the fields the on-chain `SlashJudge`
 /// reconstructs to verify rate-manipulation and blacklist-violation evidence.
@@ -96,8 +96,6 @@ pub struct StreamSlashData {
     pub rate_per_mb: u64,
     /// Total blob size in bytes.
     pub total_bytes: u64,
-    /// The shared payment pool this response is bound to.
-    pub pool_id: B256,
     /// Requester-generated microsecond timestamp echoed from the request.
     pub timestamp_us: u64,
 }
@@ -111,7 +109,6 @@ impl StreamSlashData {
             ok: body.ok,
             rate_per_mb: body.rate_per_mb,
             total_bytes: body.total_bytes,
-            pool_id: B256::from(body.pool_id),
             timestamp_us: body.timestamp_us,
         }
     }
@@ -122,7 +119,6 @@ impl StreamSlashData {
             ok: self.ok,
             ratePerMb: self.rate_per_mb,
             totalBytes: self.total_bytes,
-            poolId: self.pool_id,
             timestampUs: self.timestamp_us,
         }
     }
@@ -157,6 +153,24 @@ impl StreamSlashData {
     ) -> Result<Signature, alloy::signers::Error> {
         let hash = self.signing_hash(domain);
         signer.sign_hash_sync(&hash)
+    }
+
+    /// Recover the operator that signed `attestation` for `hash` (ADR 022
+    /// § Origin Attestation). The caller decides validity by checking the
+    /// returned address against its seated-origin set.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamSlashError::InvalidSignature`] if the signature does not parse
+    /// or does not recover.
+    pub fn recover_attestation_signer(
+        hash: [u8; 32],
+        attestation: &decdn_protocol::OriginAttestation,
+        domain: &Eip712Domain,
+    ) -> Result<Address, StreamSlashError> {
+        let sig = Signature::try_from(attestation.slash_sig.as_slice())
+            .map_err(|_| StreamSlashError::InvalidSignature)?;
+        Self::from_response_body(&attestation.signed_body(hash)).recover_signer(&sig, domain)
     }
 
     /// Recover the address that produced `signature` over this data under

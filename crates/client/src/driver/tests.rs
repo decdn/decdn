@@ -946,6 +946,7 @@ impl BlobSource for FailFirstOpen {
                     total_bytes: self.inner.total_bytes(),
                     rate_per_mb: 1,
                     interval_bytes: 1024 * 1024,
+                    origin_attestation: None,
                 };
                 let fault = UpstreamVoucherRejected {
                     reason: VoucherRejectReason::SpendingCapExhausted,
@@ -1015,6 +1016,7 @@ impl BlobSource for FaultingOpens {
                     total_bytes: self.inner.total_bytes(),
                     rate_per_mb: 1,
                     interval_bytes: 1024 * 1024,
+                    origin_attestation: None,
                 };
                 return Ok((header, MaybeFaultReader::Fault(Some(fault))));
             }
@@ -1510,7 +1512,6 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     ok: false,
                     rate_per_mb: 1,
                     total_bytes: self.inner.total_bytes(),
-                    pool_id: [0u8; 32],
                     timestamp_us: 0,
                 };
                 // `open` retains the response as-is without re-validating the
@@ -1523,6 +1524,7 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                 };
                 let ext = StreamResponseExt {
                     error: Some(StreamError::Unfunded),
+                    origin_attestation: None,
                 };
                 return Err(UpstreamRefused::open(resp, &ext));
             }

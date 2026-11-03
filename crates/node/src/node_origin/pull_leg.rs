@@ -751,6 +751,7 @@ impl NodeOrigin {
         // `discover` drops the requester before it judges the directory fallback.
         let requester_id = Some(DhtNodeId::from_bytes(requester));
         let discovered = discover(deps, hash_bytes, namespace_id, requester_id).await;
+        let attested = discovered.attested;
         let providers = discovered.providers;
         // The trail now describes this list; the cached walk keeps only its
         // handshake count and fault.
@@ -778,6 +779,7 @@ impl NodeOrigin {
         let mut ranked = probe_and_rank(
             deps,
             providers,
+            &attested,
             hash_bytes,
             ProbeGather::CoverageUnion,
             namespace_id,
@@ -1000,6 +1002,8 @@ impl NodeOrigin {
             match handshake.await {
                 Ok((header, reader)) => {
                     drop(stream_guard);
+                    deps.attestations
+                        .keep_offered(hash_bytes, header.origin_attestation.as_ref());
                     let total_bytes = header.total_bytes;
                     if hint != Some(total_bytes) {
                         warn!(
@@ -1723,6 +1727,7 @@ impl PeerRunSink<'_> {
         let peer_source = PrimedSource::new(TimedSource::new(
             peer_source,
             Arc::clone(&self.deps.metrics),
+            Some(Arc::clone(&self.deps.attestations)),
         ));
         self.adopt_primed(&peer_source, &run, pool_id, &ledger)
             .await;

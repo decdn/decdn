@@ -8,7 +8,6 @@ fn sample_body() -> StreamResponseBody {
         ok: true,
         rate_per_mb: 10,
         total_bytes: 4096,
-        pool_id: [9u8; 32],
         timestamp_us: 1_700_000_000_000_000,
     }
 }
@@ -197,6 +196,7 @@ fn stream_response_error_roundtrip() -> Result<(), postcard::Error> {
     };
     let ext = StreamResponseExt {
         error: Some(StreamError::Declined),
+        origin_attestation: None,
     };
     let buf = encode_stream_response(&resp, Some(&ext))?;
     let (decoded, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
@@ -503,7 +503,6 @@ fn stream_response_wire_format_is_stable() -> Result<(), postcard::Error> {
             ok: true,
             rate_per_mb: 4,
             total_bytes: 5,
-            pool_id: [6u8; 32],
             timestamp_us: 7,
         },
         slash_sig: vec![0xABu8; SLASH_SIG_LEN],
@@ -514,7 +513,6 @@ fn stream_response_wire_format_is_stable() -> Result<(), postcard::Error> {
     expected.push(1u8); // body.ok = true
     expected.push(4u8); // body.rate_per_mb varint
     expected.push(5u8); // body.total_bytes varint
-    expected.extend_from_slice(&[6u8; 32]); // body.pool_id
     expected.push(7u8); // body.timestamp_us varint
     expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
     expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
@@ -527,12 +525,14 @@ fn stream_response_wire_format_is_stable() -> Result<(), postcard::Error> {
         &resp,
         Some(&StreamResponseExt {
             error: Some(StreamError::NotFound),
+            origin_attestation: None,
         }),
     )?;
     let mut expected_framed = vec![1u8]; // ClientMessage::StreamResponse discriminant
     expected_framed.extend_from_slice(&expected);
     expected_framed.push(1u8); // error = Some
     expected_framed.push(0u8); // StreamError::NotFound discriminant
+    expected_framed.push(0u8); // origin_attestation = None
     assert_eq!(framed, expected_framed);
     Ok(())
 }
@@ -1023,6 +1023,7 @@ fn client_binding_validate_rejects_wrong_len() {
 fn stream_response_ext_validate_rejects_error_with_ok() {
     let ext = StreamResponseExt {
         error: Some(StreamError::NotFound),
+        origin_attestation: None,
     };
     assert_eq!(
         ext.validate(true),
@@ -1042,6 +1043,7 @@ fn stream_response_ext_validate_rejects_failure_without_error() {
 fn stream_response_ext_validate_accepts_failure_with_delivery_error() {
     let ext = StreamResponseExt {
         error: Some(StreamError::Unfunded),
+        origin_attestation: None,
     };
     assert_eq!(ext.validate(false), Ok(()));
 }
@@ -1054,6 +1056,7 @@ fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
             reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         }),
+        origin_attestation: None,
     };
     assert_eq!(
         ext.validate(false),
@@ -1070,6 +1073,7 @@ fn stream_response_base_validate_cannot_see_the_ext() -> Result<(), MessageValid
     sample_response().validate()?;
     let stray = StreamResponseExt {
         error: Some(StreamError::NotFound),
+        origin_attestation: None,
     };
     assert_eq!(
         stray.validate(sample_response().body.ok),
@@ -1107,6 +1111,7 @@ fn stream_response_two_phase_no_ext() -> Result<(), postcard::Error> {
 fn stream_response_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::Error> {
     let ext = StreamResponseExt {
         error: Some(StreamError::Declined),
+        origin_attestation: None,
     };
     let mut bytes = postcard::to_allocvec(&ext)?;
     bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
@@ -1268,7 +1273,6 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), FrameE
             ok: false,
             rate_per_mb: MAX_RATE_PER_MB,
             total_bytes: u64::MAX,
-            pool_id: [0x08; 32],
             timestamp_us: u64::MAX,
         },
         slash_sig: vec![0x09; SLASH_SIG_LEN],
@@ -1281,6 +1285,12 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), FrameE
         &response,
         Some(&StreamResponseExt {
             error: Some(rejected.clone()),
+            origin_attestation: Some(crate::dht::OriginAttestation {
+                rate_per_mb: u64::MAX,
+                total_bytes: u64::MAX,
+                timestamp_us: u64::MAX,
+                slash_sig: vec![0x0D; SLASH_SIG_LEN],
+            }),
         }),
     )?
     .len();

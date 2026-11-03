@@ -95,6 +95,15 @@ fn seeded_dht_handles() -> DhtStatusHandles {
         NodeId::from_bytes([5u8; 32]),
         ContentHash::from_bytes([7u8; 32]),
         Coverage::full(1),
+        decdn_node::dht::AttestedBy {
+            attestation: decdn_protocol::OriginAttestation {
+                rate_per_mb: 1,
+                total_bytes: 1,
+                timestamp_us: 1,
+                slash_sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
+            },
+            signer: alloy::primitives::Address::ZERO,
+        },
         1_000,
     );
 

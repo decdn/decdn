@@ -28,6 +28,7 @@
 //! [Local Admin HTTP]: https://github.com/decdn/decdn/blob/main/adr/appendix-local-admin-http.md
 
 pub mod admin;
+pub mod attestations;
 pub mod binding_check;
 pub mod blacklist_watcher;
 pub mod buyer_ledgers;
@@ -47,6 +48,7 @@ pub mod metrics;
 pub(crate) mod net;
 pub mod node_origin;
 pub mod onchain_tx;
+pub mod origin_seat_watcher;
 pub mod payment_settlement;
 pub mod pool_store;
 pub mod pool_view;

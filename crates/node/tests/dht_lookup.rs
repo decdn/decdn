@@ -32,11 +32,48 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use decdn_common::config::ResolvedSecurity;
+use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::{
-    ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig, NegativeProbeCache, RecordStore,
-    RecordStoreConfig, RoutingTable, StakerSet, client, find_providers, lookup::MAX_LOOKUP_ROUNDS,
+    AttestedBy, ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig, NegativeProbeCache,
+    RecordStore, RecordStoreConfig, RoutingTable, StakerSet, client, lookup::MAX_LOOKUP_ROUNDS,
     rate_limit::DhtRateLimitConfig,
 };
+
+/// [`decdn_node::dht::find_providers`] checking attestations against the
+/// fixture origin, keeping only the providers.
+#[allow(clippy::too_many_arguments)]
+async fn find_providers(
+    conns: &decdn_client::Connections,
+    routing: &Arc<Mutex<RoutingTable>>,
+    staker_set: &Arc<dyn StakerSet>,
+    neg: &NegativeProbeCache,
+    requester: NodeId,
+    target: ContentHash,
+    cfg: LookupConfig,
+    metrics: Option<&Metrics>,
+) -> Vec<(NodeId, Coverage)> {
+    decdn_node::dht::find_providers(
+        conns,
+        routing,
+        staker_set,
+        &test_support::verifier(),
+        neg,
+        requester,
+        target,
+        cfg,
+        metrics,
+    )
+    .await
+    .providers
+}
+
+/// A record's attestation for `hash`, signed by the fixture origin.
+fn attested(hash: [u8; 32]) -> AttestedBy {
+    AttestedBy {
+        attestation: test_support::attest(hash),
+        signer: test_support::ORIGIN.address(),
+    }
+}
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
@@ -163,6 +200,7 @@ async fn spin_up_server_with_key(
         limiter,
         Arc::clone(&metrics),
         staker_set,
+        test_support::verifier(),
         Arc::clone(&records),
     ));
     let (endpoint, addr) = local_endpoint(secret, vec![ALPN_DHT.to_vec()]).await?;
@@ -235,6 +273,7 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
         NodeId::from_bytes(holder),
         ContentHash::from_bytes(hash),
         Coverage::full(1),
+        attested(hash),
         receive_us,
     );
     assert_matches!(
@@ -402,6 +441,74 @@ async fn find_providers_drops_non_staked_provider() -> anyhow::Result<()> {
     assert!(
         providers.is_empty(),
         "non-staked provider must be dropped: got {providers:?}"
+    );
+
+    let (provider_task, provider_ep) = provider.into_teardown_parts();
+    shutdown([provider_task], [&client_ep, &provider_ep]).await?;
+    Ok(())
+}
+
+/// Filter 4 (ADR 022 § Origin Attestation): a receiver that serves a record
+/// whose attestation does not verify for the hash cannot make the requester
+/// pull from its holder. The responder here stores the record without
+/// checking it, as a hostile receiver would; the requester's own check drops
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_providers_drops_a_provider_whose_attestation_does_not_verify() -> anyhow::Result<()> {
+    let target: [u8; 32] = [0xAA; 32];
+
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+
+    let provider = spin_up_server(HashSet::new()).await?;
+    let receive_us = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros()),
+    )
+    .unwrap_or(u64::MAX);
+    // Signed by the seated fixture origin, but for another hash.
+    provider
+        .records
+        .lock()
+        .expect("record store mutex poisoned")
+        .insert_at(
+            NodeId::from_bytes(*provider.id.as_bytes()),
+            ContentHash::from_bytes(target),
+            Coverage::full(1),
+            attested([0xBB; 32]),
+            receive_us,
+        );
+
+    prime_iroh_cache(&client_ep, client_id.as_bytes(), &provider).await?;
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    routing
+        .lock()
+        .unwrap()
+        .insert(NodeId::from_bytes(*provider.id.as_bytes()));
+    let staker_set: Arc<dyn StakerSet> =
+        Arc::new(ConfigStakerSet::new(HashSet::from([NodeId::from_bytes(
+            *provider.id.as_bytes(),
+        )])));
+
+    let providers = find_providers(
+        &support::dht_conns(&client_ep),
+        &routing,
+        &staker_set,
+        &NegativeProbeCache::new(),
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
+        lookup_cfg_for_test(),
+        None,
+    )
+    .await;
+    assert!(
+        providers.is_empty(),
+        "a record whose attestation signs another hash must not surface its holder: \
+         {providers:?}"
     );
 
     let (provider_task, provider_ep) = provider.into_teardown_parts();

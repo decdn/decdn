@@ -509,8 +509,6 @@ pub struct ReceiptResponse {
     pub rate_per_mb: u64,
     /// The blob size the node signed.
     pub total_bytes: u64,
-    /// The pool the request named.
-    pub pool_id: B256,
     /// The requester's timestamp, echoed and signed by the node.
     pub timestamp_us: u64,
     /// The node's 65-byte EIP-712 signature.
@@ -524,7 +522,6 @@ impl From<&StreamResponse> for ReceiptResponse {
             ok: r.body.ok,
             rate_per_mb: r.body.rate_per_mb,
             total_bytes: r.body.total_bytes,
-            pool_id: B256::from(r.body.pool_id),
             timestamp_us: r.body.timestamp_us,
             slash_sig: Bytes::copy_from_slice(&r.slash_sig),
         }
@@ -539,7 +536,6 @@ impl ReceiptResponse {
                 ok: self.ok,
                 rate_per_mb: self.rate_per_mb,
                 total_bytes: self.total_bytes,
-                pool_id: self.pool_id.into(),
                 timestamp_us: self.timestamp_us,
             },
             slash_sig: self.slash_sig.to_vec(),
@@ -668,13 +664,6 @@ pub enum ReceiptFault {
         /// The hash.
         hash: B256,
     },
-    /// A response names a pool other than its lane's.
-    ResponsePool {
-        /// The node.
-        provider: Address,
-        /// The hash.
-        hash: B256,
-    },
     /// A response answers for a hash the receipt does not list.
     ResponseHash {
         /// The node.
@@ -756,9 +745,6 @@ impl std::fmt::Display for ReceiptFault {
                     f,
                     "node {provider}: response for {hash} refuses (ok = false)"
                 )
-            }
-            Self::ResponsePool { provider, hash } => {
-                write!(f, "node {provider}: response for {hash} names another pool")
             }
             Self::ResponseHash { provider, hash } => {
                 write!(
@@ -943,9 +929,6 @@ fn verify_response(
     let mut faults = Vec::new();
     if !r.ok {
         faults.push(ReceiptFault::ResponseRefused { provider, hash });
-    }
-    if r.pool_id != lane.pool_id {
-        faults.push(ReceiptFault::ResponsePool { provider, hash });
     }
     if !listed(&hash) {
         faults.push(ReceiptFault::ResponseHash { provider, hash });

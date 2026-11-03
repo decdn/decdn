@@ -1267,6 +1267,11 @@ pub struct ClientHandlerDeps {
     /// serve once this reads stale. `None` (dev/test, no chain) disables the
     /// gate — the same fail-open shape as an unwired [`Self::pool_view`].
     pub chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
+    /// The origin attestations this node holds (ADR 022 § Origin
+    /// Attestation). An `ok: true` response forwards the one held for its hash
+    /// in `StreamResponseExt.origin_attestation`, so a pulling relay can
+    /// advertise what it pulls. `None` (tests without a DHT) forwards none.
+    pub attestations: Option<Arc<crate::attestations::Attestations>>,
     // Optional wiring — `None` unless the deployment enables the feature.
     /// Best-effort nudge to the settlement service that a lane's accrued
     /// claim advanced; sent on every accepted voucher, against no threshold.
@@ -1407,6 +1412,7 @@ impl ClientHandlerDeps {
             max_concurrent_streams,
             content_deny,
             chain_freshness: None,
+            attestations: None,
             redeem_hint: None,
             pull_through: None,
             local_populate: None,
@@ -1555,6 +1561,8 @@ pub struct ClientHandler {
     eth_signer: Arc<PrivateKeySigner>,
     /// `SlashJudge` EIP-712 domain for `StreamResponse.slash_sig`.
     slash_domain: Eip712Domain,
+    /// Held origin attestations, forwarded on `ok: true` responses.
+    attestations: Option<Arc<crate::attestations::Attestations>>,
     /// `PaymentPool` EIP-712 domain for voucher verification.
     voucher_domain: Eip712Domain,
     /// `CapacityBond` EIP-712 domain for ephemeral `BindNodeId` verification.
@@ -1817,6 +1825,7 @@ impl ClientHandler {
             pool_view: deps.pool_view,
             request_limiter: deps.request_limiter,
             chain_freshness: deps.chain_freshness,
+            attestations: deps.attestations,
             lanes: Arc::new(map),
             lane_count,
             #[cfg(any(test, feature = "test-support"))]

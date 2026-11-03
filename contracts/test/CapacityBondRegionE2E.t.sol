@@ -414,18 +414,14 @@ contract CapacityBondRegionE2ETest is Test {
     }
 
     function _stream(uint64 tsUs) internal pure returns (SlashJudge.StreamMsg memory) {
-        return SlashJudge.StreamMsg({
-            hash: BLOB, ok: true, ratePerMb: 10, totalBytes: 1_048_576, poolId: bytes32(uint256(1)), timestampUs: tsUs
-        });
+        return SlashJudge.StreamMsg({ hash: BLOB, ok: true, ratePerMb: 10, totalBytes: 1_048_576, timestampUs: tsUs });
     }
 
     /// @dev The EIP-712 `StreamResponse` struct hash (the blacklist evidence
     ///      preimage component) over `SlashJudge`'s typehash.
     function _streamStructHash(SlashJudge judge, SlashJudge.StreamMsg memory s) internal view returns (bytes32) {
         return keccak256(
-            abi.encode(
-                judge.STREAM_RESPONSE_TYPEHASH(), s.hash, s.ok, s.ratePerMb, s.totalBytes, s.poolId, s.timestampUs
-            )
+            abi.encode(judge.STREAM_RESPONSE_TYPEHASH(), s.hash, s.ok, s.ratePerMb, s.totalBytes, s.timestampUs)
         );
     }
 

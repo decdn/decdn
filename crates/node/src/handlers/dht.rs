@@ -4,11 +4,12 @@
 //!
 //! - `FindNode` honored against the in-memory routing table.
 //! - `Store` admission runs the full ADR 022 pipeline: holder ==
-//!   authenticated `NodeId`, active-staker filter, per-publisher quota
-//!   (200), global LRU (100k), per-hash provider cap (50), receiver-
-//!   anchored TTL (1 h).
+//!   authenticated `NodeId`, active-staker filter, origin attestation
+//!   (ADR 022 § Origin Attestation), per-publisher quota (200), global LRU
+//!   (100k), per-hash provider cap (50), receiver-anchored TTL (1 h).
 //! - `FindValue` consults the record store + the routing table. Its
-//!   `closer_nodes` name only bonded peers (ADR 022 §Routing Table); per
+//!   `providers` leave out a record whose attesting origin lost its seat;
+//!   its `closer_nodes` name only bonded peers (ADR 022 §Routing Table); per
 //!   ADR 022 §Lookup integrity the requester-side filters (XOR-distance,
 //!   active-staker, negative-probe-cache, randomisation) stay the
 //!   requester's job and live in the iterative-lookup module
@@ -41,8 +42,8 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 
 use crate::dht::chain_projection::with_lock;
 use crate::dht::{
-    AuthenticatedNodeId, DhtRateLimiter, DhtRejectLayer, NodeId, RecordStore, RoutingTable,
-    StakerSet,
+    AttestationVerifier, AttestedBy, AuthenticatedNodeId, DhtRateLimiter, DhtRejectLayer, NodeId,
+    RecordStore, RoutingTable, StakerSet,
 };
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
@@ -122,6 +123,10 @@ pub struct DhtHandler {
     /// chain-backed projection of `CapacityBond`, tests inject an
     /// in-memory set.
     staker_set: Arc<dyn StakerSet>,
+    /// Checks each record's origin attestation on `Store` admission and
+    /// re-checks the signer's seat on every `FindValue` answer (ADR 022
+    /// § Origin Attestation).
+    verifier: AttestationVerifier,
     rate_limiter: Arc<DhtRateLimiter>,
     dispatch_limiter: Arc<ConnectionLimiter>,
     metrics: Arc<Metrics>,
@@ -152,6 +157,7 @@ impl DhtHandler {
         dispatch_limiter: Arc<ConnectionLimiter>,
         metrics: Arc<Metrics>,
         staker_set: Arc<dyn StakerSet>,
+        verifier: AttestationVerifier,
         records: Arc<Mutex<RecordStore>>,
     ) -> Self {
         let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
@@ -162,6 +168,7 @@ impl DhtHandler {
             routing,
             records,
             staker_set,
+            verifier,
             rate_limiter,
             dispatch_limiter,
             metrics,
@@ -180,6 +187,7 @@ impl DhtHandler {
         dispatch_limiter: Arc<ConnectionLimiter>,
         metrics: Arc<Metrics>,
         staker_set: Arc<dyn StakerSet>,
+        verifier: AttestationVerifier,
         records: Arc<Mutex<RecordStore>>,
     ) -> Self {
         Self {
@@ -187,6 +195,7 @@ impl DhtHandler {
             routing,
             records,
             staker_set,
+            verifier,
             rate_limiter,
             dispatch_limiter,
             metrics,
@@ -563,8 +572,24 @@ impl DhtHandler {
             );
         }
         let now_us = now_us();
+        let mut entries = req.entries;
+        entries.truncate(k);
+        // Origin attestations, outside the record-store lock: a re-publish
+        // reuses the stored signer, and only a new attestation pays a
+        // signature recovery, so a full batch never holds the lock through
+        // `k` recoveries.
+        let attested: Vec<Option<AttestedBy>> = if active {
+            let known = self.known_signers(req.holder, &entries);
+            entries
+                .iter()
+                .zip(known)
+                .map(|((hash, _, attestation), known)| self.attested_by(*hash, attestation, known))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Lock the record store once for the whole batch: the loop has no
-        // `.await`, so per-hash locking would just add 256× lock/unlock
+        // `.await`, so per-hash locking would just add 192× lock/unlock
         // churn and, on a poisoned mutex, log the error once per hash.
         // Only the active path inserts, so don't acquire the lock at all
         // when the staker filter already rejected the batch. A poisoned
@@ -582,36 +607,81 @@ impl DhtHandler {
             None
         };
         let mut results = Vec::with_capacity(n);
-        for (i, (hash, coverage)) in req.entries.into_iter().enumerate() {
-            // Tail beyond the rate-limit budget: deferred, no processing.
-            if i >= k {
-                results.push(false);
-                continue;
-            }
-            let accepted = if let Some(store) = store_guard.as_mut() {
-                let outcome = store.insert_at(req.holder, hash, coverage, now_us);
-                if outcome.accepted() {
-                    self.metrics.dht_store_accepted();
-                    true
-                } else {
-                    self.metrics.dht_store_rejected_quota();
+        for ((hash, coverage, _), attested) in entries
+            .into_iter()
+            .zip(attested.into_iter().chain(std::iter::repeat(None)))
+        {
+            let accepted = match (store_guard.as_mut(), attested) {
+                (Some(store), Some(attested)) => {
+                    let outcome = store.insert_at(req.holder, hash, coverage, attested, now_us);
+                    if outcome.accepted() {
+                        self.metrics.dht_store_accepted();
+                        true
+                    } else {
+                        self.metrics.dht_store_rejected_quota();
+                        false
+                    }
+                }
+                (Some(_), None) => {
+                    self.metrics.dht_store_rejected_unattested();
                     false
                 }
-            } else {
                 // Either the staker filter rejected the batch (`!active`)
                 // or the record-store mutex is poisoned — both ack `false`.
-                false
+                (None, _) => false,
             };
             results.push(accepted);
         }
+        // Tail beyond the rate-limit budget: deferred, no processing.
+        results.resize(n, false);
         Ok(wire::BatchStoreAck { results })
+    }
+
+    /// The signer each stored record of `holder` carries for an entry whose
+    /// attestation it already holds, in entry order; `None` where the entry's
+    /// attestation is new to this store.
+    fn known_signers(
+        &self,
+        holder: NodeId,
+        entries: &[(
+            decdn_protocol::ContentHash,
+            decdn_protocol::Coverage,
+            wire::OriginAttestation,
+        )],
+    ) -> Vec<Option<alloy::primitives::Address>> {
+        let Ok(store) = self.records.lock() else {
+            return vec![None; entries.len()];
+        };
+        entries
+            .iter()
+            .map(|(hash, _, attestation)| store.stored_signer(&holder, hash, attestation))
+            .collect()
+    }
+
+    /// Admit `attestation` for `hash` when its signer holds an origin seat
+    /// now. `known` is the signer a stored record already recovered for the
+    /// same attestation bytes; without it the signature is recovered here.
+    fn attested_by(
+        &self,
+        hash: decdn_protocol::ContentHash,
+        attestation: &wire::OriginAttestation,
+        known: Option<alloy::primitives::Address>,
+    ) -> Option<AttestedBy> {
+        let signer = known.or_else(|| self.verifier.recover(*hash.as_bytes(), attestation))?;
+        self.verifier.admits(&signer).then(|| AttestedBy {
+            attestation: attestation.clone(),
+            signer,
+        })
     }
 
     /// `Store` admission (ADR 022 §STORE Flow):
     /// 1. `holder == authenticated NodeId` (caller invariant; rejects with
     ///    `accepted: false` on mismatch, never inserts).
     /// 2. `StakerSet::is_active(holder)` (caller's cached set).
-    /// 3. Record-store insert under per-publisher quota + global LRU +
+    /// 3. The origin attestation recovers to a seated origin (ADR 022
+    ///    § Origin Attestation); a re-publish of the same attestation reuses
+    ///    the stored signer.
+    /// 4. Record-store insert under per-publisher quota + global LRU +
     ///    per-hash provider cap. The store returns whether the record
     ///    was newly inserted, refreshed, or hard-rejected at the
     ///    publisher cap — all of which map to `accepted` (refresh +
@@ -658,10 +728,32 @@ impl DhtHandler {
             };
         }
 
-        // Step 3: receiver-anchored insert with all the cap rules.
+        // Step 3: origin attestation (ADR 022 § Origin Attestation). The
+        // record must trace to an origin that holds a seat now.
+        let known = self
+            .known_signers(
+                req.holder,
+                &[(req.hash, req.coverage.clone(), req.attestation.clone())],
+            )
+            .pop()
+            .flatten();
+        let Some(attested) = self.attested_by(req.hash, &req.attestation, known) else {
+            self.metrics.dht_store_rejected_unattested();
+            tracing::debug!(
+                holder = ?req.holder,
+                hash = %req.hash,
+                "dht Store rejected: origin attestation is not valid"
+            );
+            return wire::StoreAck {
+                hash: req.hash,
+                accepted: false,
+            };
+        };
+
+        // Step 4: receiver-anchored insert with all the cap rules.
         let now_us = now_us();
         let outcome = if let Ok(mut store) = self.records.lock() {
-            Some(store.insert_at(req.holder, req.hash, req.coverage, now_us))
+            Some(store.insert_at(req.holder, req.hash, req.coverage, attested, now_us))
         } else {
             // Poisoned record-store mutex: respond `accepted: false`
             // so the publisher backs off rather than retrying into a
@@ -699,7 +791,7 @@ impl DhtHandler {
     fn handle_find_value(&self, req: wire::FindValueRequest) -> wire::FindValueResponse {
         let now_us = now_us();
         let providers = if let Ok(mut store) = self.records.lock() {
-            store.providers_at(&req.hash, now_us)
+            store.providers_at(&req.hash, now_us, |signer| self.verifier.admits(signer))
         } else {
             tracing::error!("dht FindValue: record-store mutex poisoned; returning empty");
             Vec::new()

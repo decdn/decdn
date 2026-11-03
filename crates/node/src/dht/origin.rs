@@ -13,7 +13,9 @@
 //! The bare hash carries no origin information (ADR 002 §Retrieval by
 //! namespace): a request supplies the namespace its content is published under,
 //! and origin authorization is a namespace-level property. `namespaceId == 0`
-//! has no authorized origins, so the directory resolves nothing for it.
+//! names no namespace, so the directory resolves nothing for it. The origins a
+//! DHT answer's attestations name resolve through
+//! [`OriginDirectory::origin_nodes`] instead (ADR 022 § Origin Attestation).
 //!
 //! This trait abstracts the directory so callers consume a single
 //! `lookup_origins(namespace_id) -> Vec<NodeId>` call without caring whether the
@@ -45,7 +47,7 @@
 
 use std::collections::HashMap;
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 
 use crate::dht::routing::NodeId;
 
@@ -69,9 +71,15 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     /// discovery").
     ///
     /// Returns an empty vector when the namespace has no authorized origins —
-    /// including `namespace_id == 0` (no namespace: cache/DHT-only, no origins
-    /// per ADR 002 §Namespace 0).
+    /// including `namespace_id == 0` (the request names no namespace, ADR 002
+    /// §Namespace 0).
     async fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId>;
+
+    /// Resolve origin `operators` — the signers a DHT answer's attestations
+    /// name — to the `NodeId`s of those that are active stakers and not
+    /// denied. No RPC: it reads the same projections [`Self::lookup_origins`]
+    /// resolves against.
+    fn origin_nodes(&self, operators: &[Address]) -> Vec<NodeId>;
 }
 
 /// [`OriginDirectory`] that resolves nothing.
@@ -94,6 +102,10 @@ impl OriginDirectory for EmptyOriginDirectory {
     async fn lookup_origins(&self, _namespace_id: U256) -> Vec<NodeId> {
         Vec::new()
     }
+
+    fn origin_nodes(&self, _operators: &[Address]) -> Vec<NodeId> {
+        Vec::new()
+    }
 }
 
 /// Static, in-memory [`OriginDirectory`] over a fixed namespace → origin-`NodeId`
@@ -111,13 +123,25 @@ pub struct StaticOriginDirectory {
     /// Taken as-is from the caller, so `lookup_origins` is a single
     /// `HashMap::get` clone-and-return.
     origins: HashMap<U256, Vec<NodeId>>,
+    /// Operator address → `NodeId`, for [`OriginDirectory::origin_nodes`].
+    operators: HashMap<Address, NodeId>,
 }
 
 impl StaticOriginDirectory {
     /// Build from a `namespace → origins` map.
     #[must_use]
-    pub const fn new(origins: HashMap<U256, Vec<NodeId>>) -> Self {
-        Self { origins }
+    pub fn new(origins: HashMap<U256, Vec<NodeId>>) -> Self {
+        Self {
+            origins,
+            operators: HashMap::new(),
+        }
+    }
+
+    /// Also resolve these origin operators to their `NodeId`s.
+    #[must_use]
+    pub fn with_operators(mut self, operators: HashMap<Address, NodeId>) -> Self {
+        self.operators = operators;
+        self
     }
 }
 
@@ -125,6 +149,13 @@ impl StaticOriginDirectory {
 impl OriginDirectory for StaticOriginDirectory {
     async fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId> {
         self.origins.get(&namespace_id).cloned().unwrap_or_default()
+    }
+
+    fn origin_nodes(&self, operators: &[Address]) -> Vec<NodeId> {
+        operators
+            .iter()
+            .filter_map(|op| self.operators.get(op).copied())
+            .collect()
     }
 }
 

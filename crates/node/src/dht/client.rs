@@ -124,11 +124,13 @@ pub async fn store(
     hash: ContentHash,
     holder: NodeId,
     coverage: Coverage,
+    attestation: wire::OriginAttestation,
 ) -> anyhow::Result<wire::StoreAck> {
     let request = wire::StoreRequest {
         hash,
         holder,
         coverage,
+        attestation,
     };
     // Encode through the typed two-phase helper (ADR 013 §Tier 1) so the
     // client half mirrors the server's `parse_store_request_ext` seam: the
@@ -160,7 +162,7 @@ pub async fn store(
 pub async fn batch_store(
     conns: &Connections,
     target: EndpointAddr,
-    entries: Vec<(ContentHash, Coverage)>,
+    entries: Vec<(ContentHash, Coverage, wire::OriginAttestation)>,
     holder: NodeId,
 ) -> anyhow::Result<wire::BatchStoreAck> {
     let n = entries.len();

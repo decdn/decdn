@@ -67,12 +67,14 @@ use rand::RngExt;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::attestations::Attestations;
 use crate::dht::chain_projection::with_lock;
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
 use crate::dht::staker_set::StakerSet;
 use decdn_protocol::ContentHash;
 use decdn_protocol::Coverage;
+use decdn_protocol::OriginAttestation;
 use decdn_protocol::dht::MAX_BATCH_STORE_HASHES;
 
 /// Number of receivers per republish (ADR 022 §STORE Flow step 1:
@@ -893,7 +895,11 @@ async fn run_sweep_worker(
 // Linear "shutdown? new commit? tick?" select loop. Splitting would
 // scatter the three-way priority across helpers; the function body
 // is a flat dispatcher.
-#[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub async fn run_republish(
     conns: Connections,
     self_id: PublicKey,
@@ -901,6 +907,7 @@ pub async fn run_republish(
     staker_set: Arc<dyn StakerSet>,
     scheduler: Arc<RepublishScheduler>,
     cache: decdn_cache::CacheEngine,
+    attestations: Arc<Attestations>,
     relay_foreign_namespaces: bool,
     metrics: Arc<crate::metrics::Metrics>,
     mut cache_inserts: broadcast::Receiver<iroh_blobs::Hash>,
@@ -946,9 +953,16 @@ pub async fn run_republish(
                         // its next event retries.
                         scheduler.schedule_steady_if_absent(hash_bytes);
                         if !scheduler.is_announced(&hash_bytes) {
-                            let accepted =
-                                publish_hash(&conns, self_node_id, &routing, &*staker_set, &cache, hash_bytes)
-                                    .await;
+                            let accepted = publish_hash(
+                                &conns,
+                                self_node_id,
+                                &routing,
+                                &*staker_set,
+                                &cache,
+                                &attestations,
+                                hash_bytes,
+                            )
+                            .await;
                             metrics.dht_store_published(accepted);
                             if accepted > 0 {
                                 scheduler.mark_announced(hash_bytes);
@@ -1003,7 +1017,10 @@ pub async fn run_republish(
                 for hash in due {
                     match cache_still_holds(&cache, &hash).await {
                         Some(true) => held.push(hash),
-                        Some(false) => scheduler.unschedule(&hash),
+                        Some(false) => {
+                            scheduler.unschedule(&hash);
+                            attestations.forget(hash.as_bytes());
+                        }
                         // A store fault is not eviction evidence: keep the
                         // hash scheduled with a fresh steady-state draw and
                         // skip this cycle's publish, rather than advertising
@@ -1051,11 +1068,18 @@ pub async fn run_republish(
                     let groups = budget.into_groups(&held.into_iter().collect());
                     let conns = conns.clone();
                     let cache_cloned = cache.clone();
+                    let attestations = Arc::clone(&attestations);
                     let metrics = Arc::clone(&metrics);
                     let scheduler = Arc::clone(&scheduler);
                     tokio::spawn(async move {
-                        let outcome =
-                            publish_batch(&conns, self_node_id, &cache_cloned, groups).await;
+                        let outcome = publish_batch(
+                            &conns,
+                            self_node_id,
+                            &cache_cloned,
+                            &attestations,
+                            groups,
+                        )
+                        .await;
                         metrics.dht_store_published(outcome.accepted);
                         for hash in outcome.announced {
                             scheduler.mark_announced(hash);
@@ -1172,6 +1196,10 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 /// whole block, a coverage query that faulted, and the empty blob, which spans
 /// no block and is discoverable by probe alone (ADR 022 § Consistency rule).
 ///
+/// A hash with no valid origin attestation sends nothing either (ADR 022
+/// § Origin Attestation): it stays scheduled, and publishes once the node
+/// pulls it from an attested upstream or its operator takes an origin seat.
+///
 /// Returns how many peers accepted the record.
 async fn publish_hash(
     conns: &Connections,
@@ -1179,12 +1207,16 @@ async fn publish_hash(
     routing: &Arc<Mutex<RoutingTable>>,
     staker_set: &dyn StakerSet,
     cache: &decdn_cache::CacheEngine,
+    attestations: &Attestations,
     hash: ContentHash,
 ) -> u64 {
-    let coverage = fetch_coverage(cache, hash).await;
+    let (coverage, size) = fetch_coverage(cache, hash).await;
     if coverage.is_empty() {
         return 0;
     }
+    let Some(attestation) = attestation_for(cache, attestations, hash, size) else {
+        return 0;
+    };
     let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
         // ADR 022 §STORE Flow step 1 specifies K+3 (= 23) closest
         // nodes — the three positions beyond K are overflow targets
@@ -1204,6 +1236,7 @@ async fn publish_hash(
     for peer in targets {
         let conns = conns.clone();
         let coverage_cloned = coverage.clone();
+        let attestation = attestation.clone();
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
                 Ok(k) => k,
@@ -1217,7 +1250,16 @@ async fn publish_hash(
                 }
             };
             let addr = EndpointAddr::new(target_pk);
-            match client::store(&conns, addr, hash, self_node_id, coverage_cloned).await {
+            match client::store(
+                &conns,
+                addr,
+                hash,
+                self_node_id,
+                coverage_cloned,
+                attestation,
+            )
+            .await
+            {
                 Ok(ack) if ack.accepted => 1,
                 Ok(_) => {
                     tracing::debug!(
@@ -1246,24 +1288,48 @@ async fn publish_hash(
     accepted
 }
 
-/// Derive `hash`'s current [`Coverage`] from the cache, folding any store
-/// fault into [`Coverage::empty`] — a republish that can't answer the
+/// Derive `hash`'s current [`Coverage`] and blob size from the cache, folding
+/// any store fault into [`Coverage::empty`] — a republish that can't answer the
 /// coverage question advertises nothing for this cycle rather than
 /// blocking on it; the hash stays scheduled and retries next cycle via the
 /// `cache_still_holds` due-time gate.
-async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> Coverage {
+async fn fetch_coverage(
+    cache: &decdn_cache::CacheEngine,
+    hash: ContentHash,
+) -> (Coverage, Option<u64>) {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
-    match cache.coverage(h).await {
-        Ok(coverage) => coverage,
+    match cache.coverage_sized(h).await {
+        Ok((coverage, size)) => (coverage, size.or_else(|| cache.origin_held_size(h))),
         Err(err) => {
             tracing::debug!(
                 hash = ?hash,
                 error = %err.display_chain(),
                 "dht republish: coverage query faulted; publishing empty coverage this cycle"
             );
-            Coverage::empty()
+            (Coverage::empty(), None)
         }
     }
+}
+
+/// The origin attestation to publish `hash` with (ADR 022 § Origin
+/// Attestation), or `None` when the node holds no valid one and cannot sign
+/// its own. `size` is the blob size a self-signed attestation commits to.
+fn attestation_for(
+    cache: &decdn_cache::CacheEngine,
+    attestations: &Attestations,
+    hash: ContentHash,
+    size: Option<u64>,
+) -> Option<OriginAttestation> {
+    let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
+    let size = size.or_else(|| cache.origin_held_size(h)).unwrap_or(0);
+    let attestation = attestations.for_publish(*hash.as_bytes(), size);
+    if attestation.is_none() {
+        tracing::debug!(
+            hash = ?hash,
+            "dht republish: no valid origin attestation held; not advertising this cycle"
+        );
+    }
+    attestation
 }
 
 /// One republish cycle's `receiver → hashes` grouping, which is also the
@@ -1332,6 +1398,7 @@ async fn publish_batch(
     conns: &Connections,
     self_node_id: NodeId,
     cache: &decdn_cache::CacheEngine,
+    attestations: &Attestations,
     groups: HashMap<NodeId, Vec<ContentHash>>,
 ) -> BatchOutcome {
     if groups.is_empty() {
@@ -1339,20 +1406,28 @@ async fn publish_batch(
         // Nothing to do this cycle; the scheduler will retry.
         return BatchOutcome::default();
     }
-    // Derive each hash's coverage once, up front, and share it across every
-    // receiver's batch — the same rationale as `publish_hash`'s single
-    // snapshot: every receiver of a given hash this cycle sees the same
-    // coverage rather than a per-batch re-derivation that could drift.
+    // Derive each hash's coverage and attestation once, up front, and share
+    // them across every receiver's batch — the same rationale as
+    // `publish_hash`'s single snapshot: every receiver of a given hash this
+    // cycle sees the same record rather than a per-batch re-derivation that
+    // could drift. A hash without a valid attestation leaves every batch.
     let hashes: HashSet<ContentHash> = groups.values().flatten().copied().collect();
-    let mut coverage_by_hash = HashMap::with_capacity(hashes.len());
+    let mut record_by_hash = HashMap::with_capacity(hashes.len());
     for hash in hashes {
-        coverage_by_hash.insert(hash, fetch_coverage(cache, hash).await);
+        let (coverage, size) = fetch_coverage(cache, hash).await;
+        if let Some(attestation) = attestation_for(cache, attestations, hash, size) {
+            record_by_hash.insert(hash, (coverage, attestation));
+        }
     }
-    let coverage_by_hash = Arc::new(coverage_by_hash);
+    let record_by_hash = Arc::new(record_by_hash);
     let mut handles = Vec::with_capacity(groups.len());
-    for (peer, peer_hashes) in groups {
+    for (peer, mut peer_hashes) in groups {
+        peer_hashes.retain(|h| record_by_hash.contains_key(h));
+        if peer_hashes.is_empty() {
+            continue;
+        }
         let conns = conns.clone();
-        let coverage_by_hash = Arc::clone(&coverage_by_hash);
+        let record_by_hash = Arc::clone(&record_by_hash);
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
                 Ok(k) => k,
@@ -1369,11 +1444,12 @@ async fn publish_batch(
             let mut accepted: u64 = 0;
             let mut announced = Vec::new();
             for chunk in peer_hashes.chunks(MAX_BATCH_STORE_HASHES) {
-                let entries: Vec<(ContentHash, Coverage)> = chunk
+                let entries: Vec<(ContentHash, Coverage, OriginAttestation)> = chunk
                     .iter()
-                    .map(|h| {
-                        let coverage = coverage_by_hash.get(h).cloned().unwrap_or_else(Coverage::empty);
-                        (*h, coverage)
+                    .filter_map(|h| {
+                        record_by_hash
+                            .get(h)
+                            .map(|(coverage, attestation)| (*h, coverage.clone(), attestation.clone()))
                     })
                     .collect();
                 match client::batch_store(
@@ -1433,14 +1509,14 @@ struct BatchOutcome {
 /// advertised at least one block. `results` answers `entries` in request
 /// order; an entry it does not answer is not accepted.
 fn announced_in_batch<'a>(
-    entries: &'a [(ContentHash, Coverage)],
+    entries: &'a [(ContentHash, Coverage, OriginAttestation)],
     results: &'a [bool],
 ) -> impl Iterator<Item = ContentHash> + 'a {
     entries
         .iter()
         .zip(results)
-        .filter(|((_, coverage), accepted)| **accepted && !coverage.is_empty())
-        .map(|((hash, _), _)| *hash)
+        .filter(|((_, coverage, _), accepted)| **accepted && !coverage.is_empty())
+        .map(|((hash, _, _), _)| *hash)
 }
 
 #[cfg(test)]
