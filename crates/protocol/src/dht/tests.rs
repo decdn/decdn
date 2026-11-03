@@ -15,11 +15,33 @@ fn closer(nodes: Vec<NodeId>) -> CloserNodes {
     CloserNodes::try_new(nodes).expect("test closer_nodes within MAX_CLOSER_NODES")
 }
 
+/// A sample attestation. Its signature bytes are arbitrary: the wire layer
+/// checks only their length.
+fn att() -> OriginAttestation {
+    OriginAttestation {
+        rate_per_mb: 10,
+        total_bytes: 4096,
+        timestamp_us: 1_700_000_000_000_000,
+        slash_sig: vec![0x5A; SLASH_SIG_LEN],
+    }
+}
+
+/// An attestation at its widest encoding: every varint at ten bytes.
+fn widest_att() -> OriginAttestation {
+    OriginAttestation {
+        rate_per_mb: u64::MAX,
+        total_bytes: u64::MAX,
+        timestamp_us: u64::MAX,
+        slash_sig: vec![0x5A; SLASH_SIG_LEN],
+    }
+}
+
 /// A `Provider` holding `node` with a one-block-full `Coverage`.
 fn provider(node: NodeId) -> Provider {
     Provider {
         node,
         coverage: Coverage::full(1),
+        attestation: att(),
     }
 }
 
@@ -43,6 +65,7 @@ fn sample_store_request() -> StoreRequest {
         hash: ch(0x66),
         holder: nid(0x77),
         coverage: Coverage::full(1),
+        attestation: att(),
     }
 }
 
@@ -69,7 +92,10 @@ fn sample_find_node_response() -> FindNodeResponse {
 
 fn sample_batch_store_request() -> BatchStoreRequest {
     BatchStoreRequest {
-        entries: vec![(ch(0xCC), Coverage::full(1)), (ch(0xDD), Coverage::empty())],
+        entries: vec![
+            (ch(0xCC), Coverage::full(1), att()),
+            (ch(0xDD), Coverage::empty(), att()),
+        ],
         holder: nid(0xEE),
     }
 }
@@ -311,10 +337,11 @@ fn dht_frame_ceiling_holds_the_largest_message() -> Result<(), postcard::Error> 
     let widest_provider = Provider {
         node: nid(0xCD),
         coverage: widest_coverage(),
+        attestation: widest_att(),
     };
     let batch = DhtMessage::BatchStore(BatchStoreRequest {
         entries: (0..MAX_BATCH_STORE_HASHES)
-            .map(|_| (ch(0xEE), widest_coverage()))
+            .map(|_| (ch(0xEE), widest_coverage(), widest_att()))
             .collect(),
         holder: nid(0xAB),
     });
@@ -325,12 +352,14 @@ fn dht_frame_ceiling_holds_the_largest_message() -> Result<(), postcard::Error> 
     });
 
     let batch_len = postcard::to_allocvec(&batch)?.len();
-    // 1 discriminant + 2 (entry count 256) + 256 × (32 hash + 2 + 200 bitmap)
-    // + 32 holder.
-    assert_eq!(batch_len, 59_939, "BatchStoreRequest at full width");
+    // 1 discriminant + 2 (entry count 192) + 192 × (32 hash + 2 + 200 bitmap
+    // + 96 attestation) + 32 holder. The attestation is 3 × 10 varint bytes
+    // plus 1 + 65 for the signature.
+    assert_eq!(batch_len, 63_395, "BatchStoreRequest at full width");
     let response_len = postcard::to_allocvec(&find_value_response)?.len();
-    // 1 + 32 hash + 1 + 50 × (32 node + 2 + 200 bitmap) + 1 + 20 × 32.
-    assert_eq!(response_len, 12_375, "FindValueResponse at full width");
+    // 1 + 32 hash + 1 + 50 × (32 node + 2 + 200 bitmap + 96 attestation) + 1
+    // + 20 × 32.
+    assert_eq!(response_len, 17_175, "FindValueResponse at full width");
 
     let others = [
         DhtMessage::FindValue(sample_find_value_request()),
@@ -338,6 +367,7 @@ fn dht_frame_ceiling_holds_the_largest_message() -> Result<(), postcard::Error> 
             hash: ch(0x01),
             holder: nid(0x02),
             coverage: widest_coverage(),
+            attestation: widest_att(),
         }),
         DhtMessage::StoreAck(StoreAck {
             hash: ch(0x03),
@@ -445,14 +475,14 @@ fn find_node_response_decode_rejects_oversize_closer_nodes() -> Result<(), postc
 #[test]
 fn batch_store_request_decode_rejects_oversize_hashes() -> Result<(), postcard::Error> {
     let msg = BatchStoreRequest {
-        entries: vec![(ch(0xCD), Coverage::empty()); MAX_BATCH_STORE_HASHES + 1],
+        entries: vec![(ch(0xCD), Coverage::empty(), att()); MAX_BATCH_STORE_HASHES + 1],
         holder: nid(0),
     };
     let bytes = postcard::to_allocvec(&msg)?;
     let decoded: Result<BatchStoreRequest, _> = postcard::from_bytes(&bytes);
     assert!(
         decoded.is_err(),
-        "ADR 022 §STORE Flow: BatchStore > 256 hashes must reject at decode"
+        "ADR 022 §STORE Flow: BatchStore > 192 entries must reject at decode"
     );
     Ok(())
 }
@@ -484,7 +514,7 @@ fn caps_accept_exactly_max() -> Result<(), postcard::Error> {
     assert_eq!(decoded.providers.len(), MAX_PROVIDERS_PER_HASH);
     assert_eq!(decoded.closer_nodes.len(), MAX_CLOSER_NODES);
     let batch = BatchStoreRequest {
-        entries: vec![(ch(0), Coverage::empty()); MAX_BATCH_STORE_HASHES],
+        entries: vec![(ch(0), Coverage::empty(), att()); MAX_BATCH_STORE_HASHES],
         holder: nid(0),
     };
     let bytes = postcard::to_allocvec(&batch)?;
@@ -514,6 +544,46 @@ fn closer_nodes_try_new_enforces_cap() {
             .expect("empty is valid")
             .is_empty()
     );
+}
+
+#[test]
+fn attestation_decode_rejects_a_wrong_signature_length() -> Result<(), postcard::Error> {
+    for len in [0, SLASH_SIG_LEN - 1, SLASH_SIG_LEN + 1] {
+        let bytes = postcard::to_allocvec(&OriginAttestation {
+            slash_sig: vec![0; len],
+            ..att()
+        })?;
+        assert!(
+            postcard::from_bytes::<OriginAttestation>(&bytes).is_err(),
+            "a {len}-byte signature must reject at decode"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn attestation_round_trips_through_its_signed_body() {
+    let a = att();
+    let body = a.signed_body([3; 32]);
+    assert!(body.ok);
+    assert_eq!(body.hash, [3; 32]);
+    let resp = crate::client::StreamResponse {
+        body,
+        slash_sig: a.slash_sig.clone(),
+    };
+    assert_eq!(OriginAttestation::from_response(&resp), Some(a));
+}
+
+#[test]
+fn a_refusal_attests_nothing() {
+    let resp = crate::client::StreamResponse {
+        body: crate::client::StreamResponseBody {
+            ok: false,
+            ..att().signed_body([3; 32])
+        },
+        slash_sig: vec![0; SLASH_SIG_LEN],
+    };
+    assert_eq!(OriginAttestation::from_response(&resp), None);
 }
 
 #[test]

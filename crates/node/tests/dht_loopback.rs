@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use decdn_common::config::ResolvedSecurity;
+use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::routing::RoutingTable;
 use decdn_node::dht::{
     DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet, rate_limit::DhtRateLimitConfig,
@@ -93,6 +94,15 @@ impl StakerSet for AllStaked {
 
 fn empty_record_store() -> Arc<Mutex<RecordStore>> {
     Arc::new(Mutex::new(RecordStore::new(RecordStoreConfig::default())))
+}
+
+/// A batch entry for `hash` with one full block and a valid attestation.
+fn entry(hash: [u8; 32]) -> (ContentHash, Coverage, wire::OriginAttestation) {
+    (
+        ContentHash::from_bytes(hash),
+        Coverage::full(1),
+        test_support::attest(hash),
+    )
 }
 
 fn permissive_dht_rate_limiter(metrics: &Arc<Metrics>) -> Arc<DhtRateLimiter> {
@@ -167,6 +177,7 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
         limiter,
         Arc::clone(&metrics),
         Arc::new(AllStaked::new()),
+        test_support::verifier(),
         empty_record_store(),
     ));
 
@@ -290,6 +301,7 @@ async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> 
         limiter,
         Arc::clone(&metrics),
         Arc::new(AllStaked::new()),
+        test_support::verifier(),
         empty_record_store(),
     ));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -374,6 +386,7 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
         limiter,
         Arc::clone(&metrics),
         Arc::new(AllStaked::new()),
+        test_support::verifier(),
         empty_record_store(),
     ));
 
@@ -480,6 +493,7 @@ mod adr_013_error_codes {
             limiter,
             metrics,
             Arc::new(AllStaked::new()),
+            test_support::verifier(),
             empty_record_store(),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -757,9 +771,9 @@ mod adr_013_error_codes {
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
             entries: vec![
-                (ContentHash::from_bytes([0x01u8; 32]), Coverage::full(1)),
-                (ContentHash::from_bytes([0x02u8; 32]), Coverage::full(1)),
-                (ContentHash::from_bytes([0x03u8; 32]), Coverage::full(1)),
+                entry([0x01u8; 32]),
+                entry([0x02u8; 32]),
+                entry([0x03u8; 32]),
             ],
             // Claim a holder that is NOT the authenticated client id.
             holder: NodeId::from_bytes([0xAB; 32]),
@@ -801,10 +815,7 @@ mod adr_013_error_codes {
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         // 257 hashes > the 256 wire cap.
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            entries: vec![
-                (ContentHash::from_bytes([0x07u8; 32]), Coverage::full(1));
-                decdn_protocol::dht::MAX_BATCH_STORE_HASHES + 1
-            ],
+            entries: vec![entry([0x07u8; 32]); decdn_protocol::dht::MAX_BATCH_STORE_HASHES + 1],
             holder: NodeId::from_bytes(*client_ep.id().as_bytes()),
         });
         let payload = encode_message(&req)?;
@@ -855,6 +866,7 @@ mod adr_013_error_codes {
             limiter,
             metrics,
             Arc::new(AllStaked::new()),
+            test_support::verifier(),
             empty_record_store(),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -959,6 +971,7 @@ mod store_admission {
             limiter,
             Arc::clone(&metrics),
             staker_set,
+            test_support::verifier(),
             Arc::clone(&records),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -1001,6 +1014,7 @@ mod store_admission {
                 hash: target_hash,
                 holder: NodeId::from_bytes(*client_id.as_bytes()),
                 coverage: partial_coverage.clone(),
+                attestation: test_support::attest(*target_hash.as_bytes()),
             });
             let payload = encode_message(&req)?;
             write_frame(&mut s, &payload).await?;
@@ -1040,6 +1054,7 @@ mod store_admission {
                 vec![wire::Provider {
                     node: NodeId::from_bytes(*client_id.as_bytes()),
                     coverage: partial_coverage.clone(),
+                    attestation: test_support::attest(*target_hash.as_bytes()),
                 }],
                 "stored holder and its partial coverage must survive the RecordStore \
                  round-trip and come back in providers"
@@ -1088,6 +1103,7 @@ mod store_admission {
             limiter,
             Arc::clone(&metrics),
             staker_set,
+            test_support::verifier(),
             Arc::clone(&records),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -1121,6 +1137,7 @@ mod store_admission {
             hash: ContentHash::from_bytes([0xCCu8; 32]),
             holder: NodeId::from_bytes(*client_ep.id().as_bytes()),
             coverage: Coverage::full(1),
+            attestation: test_support::attest([0xCCu8; 32]),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -1182,6 +1199,7 @@ mod store_admission {
             limiter,
             Arc::clone(&metrics),
             staker_set,
+            test_support::verifier(),
             Arc::clone(&records),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -1215,6 +1233,7 @@ mod store_admission {
             hash: ContentHash::from_bytes([0xDDu8; 32]),
             holder: NodeId::from_bytes(fake_holder), // != client_id
             coverage: Coverage::full(1),
+            attestation: test_support::attest([0xDDu8; 32]),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -1282,6 +1301,7 @@ mod batch_store_admission {
             limiter,
             Arc::clone(&metrics),
             staker_set,
+            test_support::verifier(),
             Arc::clone(&records),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -1312,10 +1332,7 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            entries: hashes
-                .into_iter()
-                .map(|h| (ContentHash::from_bytes(h), Coverage::full(1)))
-                .collect(),
+            entries: hashes.into_iter().map(entry).collect(),
             holder: NodeId::from_bytes(*client_id.as_bytes()),
         });
         let payload = encode_message(&req)?;
@@ -1368,7 +1385,7 @@ mod batch_store_admission {
         for h in &hashes {
             assert!(
                 store
-                    .providers_at(&ContentHash::from_bytes(*h), 0)
+                    .providers_at(&ContentHash::from_bytes(*h), 0, |_| true)
                     .iter()
                     .any(|p| p.node == holder),
                 "hash {h:?} must be in the record store after a batch admit"
@@ -1391,7 +1408,7 @@ mod batch_store_admission {
             records
                 .lock()
                 .expect("records lock")
-                .providers_at(&ContentHash::from_bytes([0x42u8; 32]), 0)
+                .providers_at(&ContentHash::from_bytes([0x42u8; 32]), 0, |_| true)
                 .iter()
                 .any(|p| p.node == holder)
         );
@@ -1421,6 +1438,7 @@ mod batch_store_admission {
             limiter,
             Arc::clone(&metrics),
             Arc::new(AllStaked::new()),
+            test_support::verifier(),
             empty_record_store(),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -1451,10 +1469,7 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            entries: vec![
-                (ContentHash::from_bytes([0x01u8; 32]), Coverage::full(1)),
-                (ContentHash::from_bytes([0x02u8; 32]), Coverage::full(1)),
-            ],
+            entries: vec![entry([0x01u8; 32]), entry([0x02u8; 32])],
             holder: NodeId::from_bytes([0xAB; 32]), // != authenticated client id
         });
         let payload = encode_message(&req)?;
@@ -1507,6 +1522,7 @@ mod batch_store_admission {
             limiter,
             Arc::clone(&metrics),
             staker_set,
+            test_support::verifier(),
             Arc::clone(&records),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -1538,10 +1554,7 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            entries: vec![
-                (ContentHash::from_bytes([0x01u8; 32]), Coverage::full(1)),
-                (ContentHash::from_bytes([0x02u8; 32]), Coverage::full(1)),
-            ],
+            entries: vec![entry([0x01u8; 32]), entry([0x02u8; 32])],
             holder: NodeId::from_bytes(*client_sk.public().as_bytes()),
         });
         let payload = encode_message(&req)?;
@@ -1606,7 +1619,7 @@ mod batch_store_admission {
         for h in hashes.iter().take(4) {
             assert!(
                 store
-                    .providers_at(&ContentHash::from_bytes(*h), 0)
+                    .providers_at(&ContentHash::from_bytes(*h), 0, |_| true)
                     .iter()
                     .any(|p| p.node == holder)
             );
@@ -1614,7 +1627,7 @@ mod batch_store_admission {
         for h in hashes.iter().skip(4) {
             assert!(
                 !store
-                    .providers_at(&ContentHash::from_bytes(*h), 0)
+                    .providers_at(&ContentHash::from_bytes(*h), 0, |_| true)
                     .iter()
                     .any(|p| p.node == holder),
                 "deferred hash {h:?} must NOT be inserted"
@@ -1664,6 +1677,7 @@ mod batch_store_client {
             limiter,
             Arc::clone(&metrics),
             staker_set,
+            test_support::verifier(),
             empty_record_store(),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -1701,11 +1715,7 @@ mod batch_store_client {
         let ack = client::batch_store(
             &conns,
             target,
-            hashes
-                .iter()
-                .copied()
-                .map(|h| (ContentHash::from_bytes(h), Coverage::full(1)))
-                .collect(),
+            hashes.iter().copied().map(entry).collect(),
             NodeId::from_bytes(holder),
         )
         .await?;

@@ -6,13 +6,95 @@ fn nid(b: u8) -> NodeId {
 fn h(b: u8) -> Hash {
     Hash::from_bytes([b; 32])
 }
-/// A `Provider` for `node` with the same one-block-full `Coverage` used
-/// by every `insert_at` call in this module's tests.
+/// A `Provider` for `node` with the same one-block-full `Coverage` and
+/// attestation used by every insert in this module's tests.
 fn provider(node: NodeId) -> Provider {
     Provider {
         node,
         coverage: Coverage::full(1),
+        attestation: att(),
     }
+}
+
+/// The attestation every fixture record carries. The store keeps it as given;
+/// the handler is what verifies it.
+fn att() -> OriginAttestation {
+    OriginAttestation {
+        rate_per_mb: 1,
+        total_bytes: 1,
+        timestamp_us: 1,
+        slash_sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
+    }
+}
+
+/// The fixture signer every record recovers to.
+const SIGNER: Address = Address::repeat_byte(0x5E);
+
+/// Insert and read without caring about attestation: every record carries
+/// [`att`] signed by [`SIGNER`], and every signer is admitted.
+trait Fixture {
+    fn insert_test(
+        &mut self,
+        holder: NodeId,
+        hash: Hash,
+        coverage: Coverage,
+        receive_us: u64,
+    ) -> InsertOutcome;
+    fn providers_test(&mut self, hash: &Hash, now_us: u64) -> Vec<Provider>;
+}
+
+impl Fixture for RecordStore {
+    fn insert_test(
+        &mut self,
+        holder: NodeId,
+        hash: Hash,
+        coverage: Coverage,
+        receive_us: u64,
+    ) -> InsertOutcome {
+        self.insert_at(
+            holder,
+            hash,
+            coverage,
+            AttestedBy {
+                attestation: att(),
+                signer: SIGNER,
+            },
+            receive_us,
+        )
+    }
+
+    fn providers_test(&mut self, hash: &Hash, now_us: u64) -> Vec<Provider> {
+        self.providers_at(hash, now_us, |_| true)
+    }
+}
+
+#[test]
+fn providers_leave_out_a_record_whose_signer_lost_its_seat() {
+    let mut s = RecordStore::new(small_cfg());
+    s.insert_test(nid(1), h(1), Coverage::full(1), 0);
+    assert_eq!(
+        s.providers_at(&h(1), 0, |signer| *signer == SIGNER).len(),
+        1
+    );
+    assert!(s.providers_at(&h(1), 0, |_| false).is_empty());
+    assert_eq!(
+        s.len(),
+        1,
+        "an unadmitted record stays stored until it expires"
+    );
+}
+
+#[test]
+fn stored_signer_matches_only_the_same_attestation() {
+    let mut s = RecordStore::new(small_cfg());
+    s.insert_test(nid(1), h(1), Coverage::full(1), 0);
+    assert_eq!(s.stored_signer(&nid(1), &h(1), &att()), Some(SIGNER));
+    let other = OriginAttestation {
+        timestamp_us: 2,
+        ..att()
+    };
+    assert_eq!(s.stored_signer(&nid(1), &h(1), &other), None);
+    assert_eq!(s.stored_signer(&nid(2), &h(1), &att()), None);
 }
 
 fn small_cfg() -> RecordStoreConfig {
@@ -28,19 +110,19 @@ fn small_cfg() -> RecordStoreConfig {
 fn insert_new_returns_inserted_and_increments_counts() {
     let mut s = RecordStore::new(small_cfg());
     assert_eq!(s.len(), 0);
-    let out = s.insert_at(nid(1), h(1), Coverage::full(1), 0);
+    let out = s.insert_test(nid(1), h(1), Coverage::full(1), 0);
     assert_eq!(out, InsertOutcome::Inserted);
     assert!(out.accepted());
     assert_eq!(s.len(), 1);
     assert_eq!(s.publisher_record_count(&nid(1)), 1);
-    assert_eq!(s.providers_at(&h(1), 0), vec![provider(nid(1))]);
+    assert_eq!(s.providers_test(&h(1), 0), vec![provider(nid(1))]);
 }
 
 #[test]
 fn re_insert_same_holder_hash_refreshes_not_duplicates() {
     let mut s = RecordStore::new(small_cfg());
-    s.insert_at(nid(1), h(1), Coverage::full(1), 100);
-    let out = s.insert_at(nid(1), h(1), Coverage::full(1), 200);
+    s.insert_test(nid(1), h(1), Coverage::full(1), 100);
+    let out = s.insert_test(nid(1), h(1), Coverage::full(1), 200);
     assert_eq!(out, InsertOutcome::Refreshed);
     assert!(out.accepted());
     // Count stays at 1 (refresh, not new).
@@ -61,12 +143,12 @@ fn per_publisher_cap_hard_rejects() {
     // cap = 3
     for i in 1..=3u8 {
         assert_eq!(
-            s.insert_at(nid(7), h(i), Coverage::full(1), i.into()),
+            s.insert_test(nid(7), h(i), Coverage::full(1), i.into()),
             InsertOutcome::Inserted
         );
     }
     // Fourth distinct hash from publisher 7 must reject.
-    let out = s.insert_at(nid(7), h(4), Coverage::full(1), 10);
+    let out = s.insert_test(nid(7), h(4), Coverage::full(1), 10);
     assert_eq!(out, InsertOutcome::RejectedQuotaExceeded);
     assert!(!out.accepted());
     // Counts unchanged.
@@ -78,11 +160,11 @@ fn per_publisher_cap_hard_rejects() {
 fn per_publisher_cap_does_not_block_other_publishers() {
     let mut s = RecordStore::new(small_cfg());
     for i in 1..=3u8 {
-        s.insert_at(nid(7), h(i), Coverage::full(1), i.into());
+        s.insert_test(nid(7), h(i), Coverage::full(1), i.into());
     }
     // Publisher 8 is below their cap and should be admitted.
     assert_eq!(
-        s.insert_at(nid(8), h(4), Coverage::full(1), 100),
+        s.insert_test(nid(8), h(4), Coverage::full(1), 100),
         InsertOutcome::Inserted
     );
     assert_eq!(s.publisher_record_count(&nid(8)), 1);
@@ -101,16 +183,16 @@ fn global_cap_evicts_oldest_when_publisher_below_quota() {
         (2, 5, 50),
         (2, 6, 60),
     ] {
-        s.insert_at(nid(p), h(h_byte), Coverage::full(1), ts);
+        s.insert_test(nid(p), h(h_byte), Coverage::full(1), ts);
     }
     assert_eq!(s.len(), 6);
     // Insert from publisher 3 (below their cap) — should evict
     // the globally-oldest (publisher 1 / hash 1, receive_us 10).
-    let out = s.insert_at(nid(3), h(7), Coverage::full(1), 70);
+    let out = s.insert_test(nid(3), h(7), Coverage::full(1), 70);
     assert_eq!(out, InsertOutcome::Inserted);
     assert_eq!(s.len(), 6);
-    assert!(s.providers_at(&h(1), 0).is_empty(), "oldest hash evicted");
-    assert_eq!(s.providers_at(&h(7), 0), vec![provider(nid(3))]);
+    assert!(s.providers_test(&h(1), 0).is_empty(), "oldest hash evicted");
+    assert_eq!(s.providers_test(&h(7), 0), vec![provider(nid(3))]);
     // Publisher 1's count dropped by 1.
     assert_eq!(s.publisher_record_count(&nid(1)), 2);
 }
@@ -118,12 +200,12 @@ fn global_cap_evicts_oldest_when_publisher_below_quota() {
 #[test]
 fn ttl_expiry_drops_record_on_providers_at() {
     let mut s = RecordStore::new(small_cfg());
-    s.insert_at(nid(1), h(1), Coverage::full(1), 1_000);
+    s.insert_test(nid(1), h(1), Coverage::full(1), 1_000);
     // Before TTL: present.
-    assert_eq!(s.providers_at(&h(1), 1_000).len(), 1);
+    assert_eq!(s.providers_test(&h(1), 1_000).len(), 1);
     // After TTL (now_us > expiry_us): scrubbed.
     let after = 1_000 + 2_000_000;
-    assert!(s.providers_at(&h(1), after).is_empty());
+    assert!(s.providers_test(&h(1), after).is_empty());
     // Indexes cleaned up.
     assert_eq!(s.len(), 0);
     assert_eq!(s.publisher_record_count(&nid(1)), 0);
@@ -135,7 +217,7 @@ fn gc_sweep_removes_every_expired_record() {
     cfg.ttl_us = 100;
     let mut s = RecordStore::new(cfg);
     for i in 1..=4u8 {
-        s.insert_at(nid(i), h(i), Coverage::full(1), 0);
+        s.insert_test(nid(i), h(i), Coverage::full(1), 0);
     }
     assert_eq!(s.len(), 4);
     let removed = s.gc(10_000);
@@ -150,19 +232,19 @@ fn per_hash_cap_evicts_oldest_holder_for_that_hash() {
     let mut s = RecordStore::new(small_cfg());
     for i in 1..=4u8 {
         assert_eq!(
-            s.insert_at(nid(i), h(1), Coverage::full(1), i.into()),
+            s.insert_test(nid(i), h(1), Coverage::full(1), i.into()),
             InsertOutcome::Inserted
         );
     }
-    assert_eq!(s.providers_at(&h(1), 0).len(), 4);
+    assert_eq!(s.providers_test(&h(1), 0).len(), 4);
     // Fifth holder for the same hash: oldest (publisher 1) should
     // be evicted.
     assert_eq!(
-        s.insert_at(nid(5), h(1), Coverage::full(1), 100),
+        s.insert_test(nid(5), h(1), Coverage::full(1), 100),
         InsertOutcome::Inserted
     );
     let providers: std::collections::HashSet<NodeId> = s
-        .providers_at(&h(1), 0)
+        .providers_test(&h(1), 0)
         .into_iter()
         .map(|p| p.node)
         .collect();
@@ -205,7 +287,7 @@ fn publisher_quota_beats_global_lru() {
     let mut s = RecordStore::new(cfg);
     for i in 1..=3u8 {
         assert_eq!(
-            s.insert_at(nid(1), h(i), Coverage::full(1), i.into()),
+            s.insert_test(nid(1), h(i), Coverage::full(1), i.into()),
             InsertOutcome::Inserted
         );
     }
@@ -214,13 +296,13 @@ fn publisher_quota_beats_global_lru() {
     // must hard-reject without touching the global LRU.
     let len_before = s.len();
     let count_before = s.publisher_record_count(&nid(1));
-    let out = s.insert_at(nid(1), h(99), Coverage::full(1), 100);
+    let out = s.insert_test(nid(1), h(99), Coverage::full(1), 100);
     assert_eq!(out, InsertOutcome::RejectedQuotaExceeded);
     assert_eq!(s.len(), len_before, "rejected insert must not evict");
     assert_eq!(s.publisher_record_count(&nid(1)), count_before);
     // Existing records are intact.
     for i in 1..=3u8 {
-        assert!(!s.providers_at(&h(i), 0).is_empty(), "h({i}) intact");
+        assert!(!s.providers_test(&h(i), 0).is_empty(), "h({i}) intact");
     }
 }
 
@@ -236,16 +318,16 @@ fn refresh_does_not_count_against_quota() {
     let mut s = RecordStore::new(small_cfg());
     // Fill publisher 1 to cap.
     for i in 1..=3u8 {
-        s.insert_at(nid(1), h(i), Coverage::full(1), i.into());
+        s.insert_test(nid(1), h(i), Coverage::full(1), i.into());
     }
     assert_eq!(s.publisher_record_count(&nid(1)), 3);
     // Refresh hash 1 — still 3.
-    let out = s.insert_at(nid(1), h(1), Coverage::full(1), 100);
+    let out = s.insert_test(nid(1), h(1), Coverage::full(1), 100);
     assert_eq!(out, InsertOutcome::Refreshed);
     assert_eq!(s.publisher_record_count(&nid(1)), 3);
     // A NEW hash from publisher 1 still rejects.
     assert_eq!(
-        s.insert_at(nid(1), h(99), Coverage::full(1), 200),
+        s.insert_test(nid(1), h(99), Coverage::full(1), 200),
         InsertOutcome::RejectedQuotaExceeded
     );
 }
@@ -273,10 +355,10 @@ fn ttl_is_anchored_to_wall_clock_regardless_of_insert_volume() {
     for i in 0..10_000u32 {
         let mut holder = [0u8; 32];
         holder[..4].copy_from_slice(&i.to_le_bytes());
-        s.insert_at(NodeId::from_bytes(holder), h(0xEE), Coverage::full(1), 500);
+        s.insert_test(NodeId::from_bytes(holder), h(0xEE), Coverage::full(1), 500);
     }
     // Insert the record under test at wall-clock 500.
-    s.insert_at(nid(0xCC), h(0xFF), Coverage::full(1), 500);
+    s.insert_test(nid(0xCC), h(0xFF), Coverage::full(1), 500);
     // Expiry MUST be exactly 500 + 1_000 = 1_500, with no drift
     // from the prior 10k inserts.
     let entries = s.by_hash.get(&h(0xFF)).unwrap();
@@ -288,8 +370,8 @@ fn ttl_is_anchored_to_wall_clock_regardless_of_insert_volume() {
     );
     // And consequently the record is still alive at wall-clock 1_499
     // and dead at 1_501 (i.e. the TTL window is exactly ttl_us long).
-    assert_eq!(s.providers_at(&h(0xFF), 1_499).len(), 1);
-    assert!(s.providers_at(&h(0xFF), 1_501).is_empty());
+    assert_eq!(s.providers_test(&h(0xFF), 1_499).len(), 1);
+    assert!(s.providers_test(&h(0xFF), 1_501).is_empty());
 }
 
 /// Regression guard for the "two evictions for one insert" bug. When
@@ -311,23 +393,23 @@ fn insert_at_per_hash_cap_does_not_also_trigger_global_eviction() {
     };
     let mut s = RecordStore::new(cfg);
     // Fill hash A (target) to per-hash cap (2 holders).
-    s.insert_at(nid(1), h(0xAA), Coverage::full(1), 10);
-    s.insert_at(nid(2), h(0xAA), Coverage::full(1), 20);
+    s.insert_test(nid(1), h(0xAA), Coverage::full(1), 10);
+    s.insert_test(nid(2), h(0xAA), Coverage::full(1), 20);
     // Fill hash B with two unrelated records to take the store to
     // the global cap (4 total).
-    s.insert_at(nid(3), h(0xBB), Coverage::full(1), 30);
-    s.insert_at(nid(4), h(0xBB), Coverage::full(1), 40);
+    s.insert_test(nid(3), h(0xBB), Coverage::full(1), 30);
+    s.insert_test(nid(4), h(0xBB), Coverage::full(1), 40);
     assert_eq!(s.len(), 4);
     // Insert into hash A from a new publisher. Per-hash cap fires
     // (evicts oldest A holder = nid(1)). Global cap MUST NOT also
     // fire — otherwise hash B's oldest (nid(3) for hash 0xBB)
     // would be wrongly dropped.
-    let out = s.insert_at(nid(5), h(0xAA), Coverage::full(1), 50);
+    let out = s.insert_test(nid(5), h(0xAA), Coverage::full(1), 50);
     assert_eq!(out, InsertOutcome::Inserted);
     assert_eq!(s.len(), 4, "global count must remain at the cap");
     // Hash A: nid(2) and nid(5); nid(1) was evicted by per-hash cap.
     let a_holders: std::collections::HashSet<NodeId> = s
-        .providers_at(&h(0xAA), 0)
+        .providers_test(&h(0xAA), 0)
         .into_iter()
         .map(|p| p.node)
         .collect();
@@ -337,7 +419,7 @@ fn insert_at_per_hash_cap_does_not_also_trigger_global_eviction() {
     // Hash B: BOTH original holders survive — global LRU did NOT
     // fire on the same insert.
     let b_holders: std::collections::HashSet<NodeId> = s
-        .providers_at(&h(0xBB), 0)
+        .providers_test(&h(0xBB), 0)
         .into_iter()
         .map(|p| p.node)
         .collect();
@@ -409,7 +491,7 @@ fn tri_index_stays_consistent_across_mixed_operations() {
         (2, 3, 170), // global now at the 8-record cap
     ] {
         assert_eq!(
-            s.insert_at(nid(p), h(hb), Coverage::full(1), ts),
+            s.insert_test(nid(p), h(hb), Coverage::full(1), ts),
             InsertOutcome::Inserted
         );
     }
@@ -420,12 +502,12 @@ fn tri_index_stays_consistent_across_mixed_operations() {
     // oldest h(1) holder (nid(1)@100) and nets the global count out, so
     // the global LRU must NOT also fire.
     assert_eq!(
-        s.insert_at(nid(4), h(1), Coverage::full(1), 180),
+        s.insert_test(nid(4), h(1), Coverage::full(1), 180),
         InsertOutcome::Inserted
     );
     assert_eq!(s.len(), 8, "per-hash eviction must not change global count");
     assert!(
-        !s.providers_at(&h(1), 0).iter().any(|p| p.node == nid(1)),
+        !s.providers_test(&h(1), 0).iter().any(|p| p.node == nid(1)),
         "oldest h(1) holder evicted by per-hash cap"
     );
     assert_tri_index_consistent(&s);
@@ -434,7 +516,7 @@ fn tri_index_stays_consistent_across_mixed_operations() {
     // this insert grows the store; at the global cap it evicts the
     // globally-oldest record.
     assert_eq!(
-        s.insert_at(nid(4), h(3), Coverage::full(1), 190),
+        s.insert_test(nid(4), h(3), Coverage::full(1), 190),
         InsertOutcome::Inserted
     );
     assert_eq!(s.len(), 8, "global cap holds the store at 8");
@@ -442,7 +524,7 @@ fn tri_index_stays_consistent_across_mixed_operations() {
 
     // Phase 4 — refresh (remove + re-add, net-zero on counts).
     assert_eq!(
-        s.insert_at(nid(3), h(1), Coverage::full(1), 200),
+        s.insert_test(nid(3), h(1), Coverage::full(1), 200),
         InsertOutcome::Refreshed
     );
     assert_eq!(s.len(), 8);
@@ -460,7 +542,7 @@ fn tri_index_stays_consistent_across_mixed_operations() {
     // evictions on h(1).
     for (p, ts) in [(7u8, 6_000u64), (8, 6_001), (9, 6_002)] {
         assert_eq!(
-            s.insert_at(nid(p), h(1), Coverage::full(1), ts),
+            s.insert_test(nid(p), h(1), Coverage::full(1), ts),
             InsertOutcome::Inserted
         );
     }
@@ -477,7 +559,7 @@ fn gc_drops_orphan_global_lru_key_without_spinning() {
     cfg.ttl_us = 100;
     let mut s = RecordStore::new(cfg);
     // One real record (expires at 100).
-    s.insert_at(nid(1), h(1), Coverage::full(1), 0);
+    s.insert_test(nid(1), h(1), Coverage::full(1), 0);
     // Inject an orphaned global_lru key with no by_hash entry.
     s.global_lru.insert((5, 999, h(0xEE), nid(2)));
     // GC past both expiries: the real record is removed via remove_entry,
@@ -499,12 +581,12 @@ fn providers_at_scrubs_only_expired_holders_in_mixed_bucket() {
     cfg.ttl_us = 1_000;
     cfg.max_providers_per_hash = 10; // keep per-hash eviction out of it
     let mut s = RecordStore::new(cfg);
-    s.insert_at(nid(1), h(1), Coverage::full(1), 0); // expiry 1_000
-    s.insert_at(nid(2), h(1), Coverage::full(1), 5_000); // expiry 6_000
-    s.insert_at(nid(3), h(1), Coverage::full(1), 5_500); // expiry 6_500
+    s.insert_test(nid(1), h(1), Coverage::full(1), 0); // expiry 1_000
+    s.insert_test(nid(2), h(1), Coverage::full(1), 5_000); // expiry 6_000
+    s.insert_test(nid(3), h(1), Coverage::full(1), 5_500); // expiry 6_500
     // now_us between the expiries: nid(1) expired, nid(2)/nid(3) live.
     let live: std::collections::HashSet<NodeId> = s
-        .providers_at(&h(1), 2_000)
+        .providers_test(&h(1), 2_000)
         .into_iter()
         .map(|p| p.node)
         .collect();

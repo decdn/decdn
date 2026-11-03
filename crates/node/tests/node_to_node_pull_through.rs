@@ -640,7 +640,6 @@ async fn lying_upstream(
         rate_per_mb,
         total_bytes: u64::try_from(served.len())
             .map_err(|_| anyhow::anyhow!("served len overflows u64"))?,
-        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -651,7 +650,7 @@ async fn lying_upstream(
     let resp = StreamResponse { body, slash_sig };
     let payload = decdn_protocol::encode_stream_response(
         &resp,
-        Some(&decdn_protocol::StreamResponseExt { error: None }),
+        Some(&decdn_protocol::StreamResponseExt::default()),
     )?;
     write_frame(&mut send, &payload)
         .await

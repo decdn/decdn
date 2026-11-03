@@ -1403,6 +1403,7 @@ mod doubles {
                     total_bytes: self.signed_size.unwrap_or_else(|| self.total_bytes()),
                     rate_per_mb: SCRIPTED_RATE_PER_MB,
                     interval_bytes: SCRIPTED_INTERVAL_BYTES,
+                    origin_attestation: None,
                     // No real network round trip in this scripted double.
                 };
                 // Wire bytes this leg will drain (post-fault-truncation). `finish`

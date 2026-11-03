@@ -14783,7 +14783,6 @@ async fn serve_lying_stream(
         ok: true,
         rate_per_mb: RATE_PER_MB,
         total_bytes: advertised_total_bytes,
-        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -14794,7 +14793,7 @@ async fn serve_lying_stream(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -15765,7 +15764,6 @@ async fn serve_stop_send_then_signal(
         ok: true,
         rate_per_mb: RATE_PER_MB,
         total_bytes,
-        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -15776,7 +15774,7 @@ async fn serve_stop_send_then_signal(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;

@@ -820,6 +820,10 @@ fn seeded_dht_handles() -> DhtStatusHandles {
         NodeId::from_bytes([5u8; 32]),
         ContentHash::from_bytes([7u8; 32]),
         Coverage::full(1),
+        crate::dht::AttestedBy {
+            attestation: crate::dht::attestation::test_support::attest([7u8; 32]),
+            signer: crate::dht::attestation::test_support::ORIGIN.address(),
+        },
         1_000,
     );
 

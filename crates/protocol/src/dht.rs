@@ -8,14 +8,20 @@
 //!
 //! # Authentication model
 //!
-//! [`StoreRequest`] has no per-record signature. The receiver instead checks
-//! that `holder` equals the authenticated `NodeId` of the inbound QUIC
+//! [`StoreRequest`] has no per-record holder signature. The receiver instead
+//! checks that `holder` equals the authenticated `NodeId` of the inbound QUIC
 //! connection (`NodeId`s are 32-byte Ed25519 public keys; iroh's QUIC handshake
 //! binds the connection to that key). This depends on records being pushed
 //! directly by the holder to the K-closest nodes and never relayed
 //! peer-to-peer — if a future scheme introduces peer relay of records, a
 //! per-record signature MUST be reintroduced together with an in-scope sender
 //! timestamp in the signed body (ADR 022 §STORE Flow).
+//!
+//! Every record also carries an [`OriginAttestation`]: a seated origin's
+//! signed `StreamResponse` for the hash (ADR 022 § Origin Attestation). It is
+//! not a holder claim, so it stays valid whichever holder carries it.
+//! Verifying it needs `alloy`, so the check lives in `decdn-incentive` and
+//! `decdn-node`; this crate carries the bytes.
 //!
 //! # `BatchStore` wire types
 //!
@@ -41,13 +47,15 @@
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
+use crate::client::{StreamResponse, StreamResponseBody};
 use crate::coverage::Coverage;
 use crate::identity::{ContentHash, NodeId};
+use crate::message::SLASH_SIG_LEN;
 
 /// Wire-level maximum number of providers a [`FindValueResponse`] may carry
-/// (ADR 022 §Content Records and TTL). With 200-byte coverage bitmaps it bounds
-/// a full response to the 12,375 bytes in ADR 022 §DHT Bandwidth Analysis,
-/// inside [`MAX_DHT_FRAME`].
+/// (ADR 022 §Content Records and TTL). With 200-byte coverage bitmaps and full
+/// origin attestations it bounds a full response to the 17,175 bytes in
+/// ADR 022 §DHT Bandwidth Analysis, inside [`MAX_DHT_FRAME`].
 ///
 /// Enforced at the wire boundary by `deserialize_providers`; oversize values
 /// fail decode rather than being silently truncated.
@@ -61,23 +69,74 @@ pub const MAX_PROVIDERS_PER_HASH: usize = 50;
 pub const MAX_CLOSER_NODES: usize = 20;
 
 /// Wire-level maximum number of hashes a [`BatchStoreRequest`] may carry
-/// (ADR 022 §STORE Flow — "Batch size is bounded at 256 hashes"). Applies
+/// (ADR 022 §STORE Flow — "Batch size is bounded at 192 entries"). Applies
 /// symmetrically to [`BatchStoreAck::results`] (one bool per request hash,
 /// same cap so a malicious responder can't reply with an oversize ack).
 /// Enforced at the wire boundary; ADR 022 spells out that oversize batches
 /// close the stream with `MALFORMED_MESSAGE` (`0x03`) — the decode-time
 /// reject here surfaces as that error code via the framing layer.
-pub const MAX_BATCH_STORE_HASHES: usize = 256;
+pub const MAX_BATCH_STORE_HASHES: usize = 192;
 
 /// Frame ceiling for `cdn/dht/v1`, in payload bytes (ADR 013 § Wire Framing).
 ///
 /// Every DHT read passes this to [`crate::read_frame`], for requests and
 /// responses alike. The largest legitimate message is a full
 /// [`BatchStoreRequest`]: [`MAX_BATCH_STORE_HASHES`] entries, each a 32-byte
-/// hash and a [`Coverage`] of up to 202 bytes, plus the holder — 59,939 bytes.
-/// The largest response is a full [`FindValueResponse`] at 12,375 bytes. The
+/// hash, a [`Coverage`] of up to 202 bytes and an [`OriginAttestation`] of up
+/// to 96 bytes, plus the holder — 63,395 bytes. The largest response is a full
+/// [`FindValueResponse`] at 17,175 bytes. The
 /// `dht_frame_ceiling_holds_the_largest_message` test pins the margin.
 pub const MAX_DHT_FRAME: u32 = 64 * 1024;
+
+/// A seated origin's signed serve of a hash (ADR 022 § Origin Attestation):
+/// the signed fields of its `StreamResponse` that a record does not already
+/// carry, plus the signature. The record supplies the hash, and `ok` is always
+/// `true`, so neither is stored.
+///
+/// The attestation is valid when the signature over the rebuilt
+/// [`StreamResponseBody`] recovers to an operator that holds an origin seat in
+/// at least one namespace. Nothing here is checked at decode beyond the
+/// signature length; the verifier owns validity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OriginAttestation {
+    /// The origin's quoted rate in its signed response.
+    pub rate_per_mb: u64,
+    /// The blob size the origin signed.
+    pub total_bytes: u64,
+    /// The timestamp the origin signed. Validity never reads it.
+    pub timestamp_us: u64,
+    /// The origin's 65-byte EIP-712 `StreamResponse` signature. Any other
+    /// length fails decode.
+    #[serde(deserialize_with = "deserialize_slash_sig")]
+    pub slash_sig: Vec<u8>,
+}
+
+impl OriginAttestation {
+    /// Take the attestation from an origin's own signed `ok: true` response.
+    /// A refusal attests nothing, so `ok: false` yields `None`.
+    #[must_use]
+    pub fn from_response(resp: &StreamResponse) -> Option<Self> {
+        resp.body.ok.then(|| Self {
+            rate_per_mb: resp.body.rate_per_mb,
+            total_bytes: resp.body.total_bytes,
+            timestamp_us: resp.body.timestamp_us,
+            slash_sig: resp.slash_sig.clone(),
+        })
+    }
+
+    /// Rebuild the signed `StreamResponse` body this attestation covers for
+    /// `hash`, with `ok: true`.
+    #[must_use]
+    pub const fn signed_body(&self, hash: [u8; 32]) -> StreamResponseBody {
+        StreamResponseBody {
+            hash,
+            ok: true,
+            rate_per_mb: self.rate_per_mb,
+            total_bytes: self.total_bytes,
+            timestamp_us: self.timestamp_us,
+        }
+    }
+}
 
 /// A bounded list of the K closest [`NodeId`]s a responder returns in a
 /// `closer_nodes` field (ADR 022 §Routing Table). Wraps `Vec<NodeId>` and
@@ -223,21 +282,24 @@ pub struct FindValueRequest {
 }
 
 /// A known holder of a content hash, plus which [`Coverage`] blocks it
-/// reports being able to serve (range-keyed discovery). Carried in
-/// [`FindValueResponse::providers`].
+/// reports being able to serve (range-keyed discovery) and the origin
+/// attestation for the hash. Carried in [`FindValueResponse::providers`].
 ///
 /// `coverage` is unsigned and responder-controlled, like the rest of a DHT
 /// record — see the module docs' authentication-model note. A lying
 /// responder can only ever cost the requester a wasted probe against a
 /// provider that turns out not to hold what it claimed; it cannot forge a
 /// record for a `node` it doesn't control (the STORE-time `holder ==
-/// authenticated NodeId` check still applies).
+/// authenticated NodeId` check still applies). The requester verifies
+/// `attestation` itself before it probes `node`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provider {
     /// The holder's `NodeId`.
     pub node: NodeId,
     /// Discovery blocks this holder reports covering.
     pub coverage: Coverage,
+    /// The seated origin's signed serve of the hash.
+    pub attestation: OriginAttestation,
 }
 
 /// Response to a [`FindValueRequest`] (ADR 022 §Message Types).
@@ -247,7 +309,7 @@ pub struct Provider {
 /// in XOR keyspace, used by the requester to continue iterative lookup.
 ///
 /// Responders MUST NOT emit more than [`MAX_PROVIDERS_PER_HASH`] providers or
-/// more than [`MAX_CLOSER_NODES`] closer nodes — the 12,375-byte worst case in
+/// more than [`MAX_CLOSER_NODES`] closer nodes — the 17,175-byte worst case in
 /// ADR 022 §DHT Bandwidth Analysis, and so [`MAX_DHT_FRAME`], depend on these
 /// bounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,10 +331,11 @@ pub struct FindValueResponse {
 /// §STORE Flow). Sent by the holder to each of the K+3 nodes closest to
 /// `hash` in keyspace.
 ///
-/// There is no per-record signature: the receiver MUST instead check that
-/// `holder` equals the authenticated `NodeId` of the inbound QUIC connection.
-/// Records are never relayed peer-to-peer; if that changes, a per-record
-/// signature MUST be reintroduced (see module docs).
+/// There is no per-record holder signature: the receiver MUST instead check
+/// that `holder` equals the authenticated `NodeId` of the inbound QUIC
+/// connection. Records are never relayed peer-to-peer; if that changes, a
+/// per-record signature MUST be reintroduced (see module docs). The receiver
+/// also verifies `attestation` before it stores the record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreRequest {
     /// BLAKE3 hash of the content being advertised.
@@ -282,6 +345,8 @@ pub struct StoreRequest {
     pub holder: NodeId,
     /// Discovery blocks the holder reports covering for `hash`.
     pub coverage: Coverage,
+    /// The seated origin's signed serve of `hash`.
+    pub attestation: OriginAttestation,
 }
 
 /// Optional [`FindValueResponse`] extension fields, carried as trailing bytes
@@ -441,12 +506,12 @@ pub struct FindNodeResponse {
 /// two-stage rate-limit accounting live in the `decdn-node` handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchStoreRequest {
-    /// `(hash, coverage)` pairs being published in this batch. Capped at
-    /// [`MAX_BATCH_STORE_HASHES`] (ADR 022 §STORE Flow); oversize values fail
-    /// decode (the handler maps that to `MALFORMED_MESSAGE` 0x03 per
-    /// ADR 013).
+    /// `(hash, coverage, attestation)` entries being published in this batch.
+    /// Capped at [`MAX_BATCH_STORE_HASHES`] (ADR 022 §STORE Flow); oversize
+    /// values fail decode (the handler maps that to `MALFORMED_MESSAGE` 0x03
+    /// per ADR 013).
     #[serde(deserialize_with = "deserialize_batch_entries")]
-    pub entries: Vec<(ContentHash, Coverage)>,
+    pub entries: Vec<(ContentHash, Coverage, OriginAttestation)>,
     /// Single holder for the batch. Per ADR 022 §STORE Flow the receiver
     /// checks this once against the authenticated QUIC `NodeId`; the
     /// per-hash check is skipped because the field is batch-level.
@@ -477,11 +542,27 @@ where
     deserialize_bounded_vec(d, MAX_PROVIDERS_PER_HASH, "providers")
 }
 
-fn deserialize_batch_entries<'de, D>(d: D) -> Result<Vec<(ContentHash, Coverage)>, D::Error>
+fn deserialize_batch_entries<'de, D>(
+    d: D,
+) -> Result<Vec<(ContentHash, Coverage, OriginAttestation)>, D::Error>
 where
     D: Deserializer<'de>,
 {
     deserialize_bounded_vec(d, MAX_BATCH_STORE_HASHES, "entries")
+}
+
+fn deserialize_slash_sig<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Vec::<u8>::deserialize(d)?;
+    if v.len() != SLASH_SIG_LEN {
+        return Err(de::Error::custom(format!(
+            "attestation slash_sig length {} is not {SLASH_SIG_LEN}",
+            v.len(),
+        )));
+    }
+    Ok(v)
 }
 
 fn deserialize_batch_results<'de, D>(d: D) -> Result<Vec<bool>, D::Error>
@@ -509,8 +590,8 @@ where
     T: Deserialize<'de>,
 {
     // `T` is either `#[serde(transparent)]` over `[u8; 32]` (a bare `NodeId`
-    // or `ContentHash`) or a small fixed-shape struct built from such types
-    // (`Provider`, `(ContentHash, Coverage)`), so the decoded length and
+    // or `ContentHash`) or a small bounded struct built from such types
+    // (`Provider`, `(ContentHash, Coverage, OriginAttestation)`), so the decoded length and
     // per-element bytes are identical to the raw wire form; the cap is the
     // only thing this hook adds.
     //

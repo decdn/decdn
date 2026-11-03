@@ -462,6 +462,12 @@ pub struct StreamResponseExt {
     /// is checked by [`StreamResponseExt::validate`], which takes `ok` — the
     /// base-only [`StreamResponse::validate`] cannot see this field.
     pub error: Option<StreamError>,
+    /// The origin attestation the serving node holds for the hash (ADR 022
+    /// § Origin Attestation), forwarded so a pulling relay can publish its own
+    /// DHT records. A seated origin serving from its backend leaves it empty,
+    /// because its own `StreamResponse` is the attestation. A client ignores
+    /// it; a relay verifies it before keeping it.
+    pub origin_attestation: Option<crate::dht::OriginAttestation>,
 }
 
 impl StreamResponseExt {
@@ -550,9 +556,6 @@ pub struct StreamResponseBody {
     /// does not enforce its `max_blob_size` against this claim: it enforces the
     /// ceiling on the bytes it receives (ADR 005 §`max_blob_size` enforcement).
     pub total_bytes: u64,
-    /// `pool_id` echoed from the [`StreamRequest`] (signed, so a node cannot
-    /// silently re-bind the response to a different pool).
-    pub pool_id: [u8; 32],
     /// Requester-generated microsecond timestamp from the [`StreamRequest`],
     /// echoed back unchanged.
     pub timestamp_us: u64,

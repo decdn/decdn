@@ -1051,10 +1051,11 @@ fn announced_mark_is_independent_of_scheduling() {
 #[test]
 fn announced_in_batch_keeps_accepted_entries_with_coverage() {
     let covered = Coverage::from_block_indices(1, [0u32].into_iter());
+    let att = crate::dht::attestation::test_support::attest([0; 32]);
     let entries = vec![
-        (h(1), covered.clone()),
-        (h(2), covered),
-        (h(3), Coverage::empty()),
+        (h(1), covered.clone(), att.clone()),
+        (h(2), covered, att.clone()),
+        (h(3), Coverage::empty(), att),
     ];
 
     let announced = announced_in_batch(&entries, &[true, false, true]);
@@ -1067,7 +1068,8 @@ fn announced_in_batch_keeps_accepted_entries_with_coverage() {
 #[test]
 fn announced_in_batch_ignores_entries_the_ack_did_not_answer() {
     let covered = Coverage::from_block_indices(1, [0u32].into_iter());
-    let entries = vec![(h(1), covered.clone()), (h(2), covered)];
+    let att = crate::dht::attestation::test_support::attest([0; 32]);
+    let entries = vec![(h(1), covered.clone(), att.clone()), (h(2), covered, att)];
 
     let announced = announced_in_batch(&entries, &[true]);
 

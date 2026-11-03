@@ -81,12 +81,12 @@ pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::re
 pub struct decdn_protocol::client::StreamResponseBody
 pub decdn_protocol::client::StreamResponseBody::hash: [u8; 32]
 pub decdn_protocol::client::StreamResponseBody::ok: bool
-pub decdn_protocol::client::StreamResponseBody::pool_id: [u8; 32]
 pub decdn_protocol::client::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::client::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::client::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::client::StreamResponseExt
 pub decdn_protocol::client::StreamResponseExt::error: core::option::Option<decdn_protocol::client::StreamError>
+pub decdn_protocol::client::StreamResponseExt::origin_attestation: core::option::Option<decdn_protocol::dht::OriginAttestation>
 impl decdn_protocol::client::StreamResponseExt
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::Voucher
@@ -161,7 +161,7 @@ pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 pub struct decdn_protocol::dht::BatchStoreAck
 pub decdn_protocol::dht::BatchStoreAck::results: alloc::vec::Vec<bool>
 pub struct decdn_protocol::dht::BatchStoreRequest
-pub decdn_protocol::dht::BatchStoreRequest::entries: alloc::vec::Vec<(decdn_protocol::identity::ContentHash, decdn_protocol::coverage::Coverage)>
+pub decdn_protocol::dht::BatchStoreRequest::entries: alloc::vec::Vec<(decdn_protocol::identity::ContentHash, decdn_protocol::coverage::Coverage, decdn_protocol::dht::OriginAttestation)>
 pub decdn_protocol::dht::BatchStoreRequest::holder: decdn_protocol::identity::NodeId
 #[repr(transparent)] pub struct decdn_protocol::dht::CloserNodes(_)
 impl decdn_protocol::dht::CloserNodes
@@ -193,13 +193,23 @@ pub decdn_protocol::dht::FindValueResponse::closer_nodes: decdn_protocol::dht::C
 pub decdn_protocol::dht::FindValueResponse::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::dht::FindValueResponse::providers: alloc::vec::Vec<decdn_protocol::dht::Provider>
 pub struct decdn_protocol::dht::FindValueResponseExt
+pub struct decdn_protocol::dht::OriginAttestation
+pub decdn_protocol::dht::OriginAttestation::rate_per_mb: u64
+pub decdn_protocol::dht::OriginAttestation::slash_sig: alloc::vec::Vec<u8>
+pub decdn_protocol::dht::OriginAttestation::timestamp_us: u64
+pub decdn_protocol::dht::OriginAttestation::total_bytes: u64
+impl decdn_protocol::dht::OriginAttestation
+pub fn decdn_protocol::dht::OriginAttestation::from_response(&decdn_protocol::client::StreamResponse) -> core::option::Option<Self>
+pub const fn decdn_protocol::dht::OriginAttestation::signed_body(&self, [u8; 32]) -> decdn_protocol::client::StreamResponseBody
 pub struct decdn_protocol::dht::Provider
+pub decdn_protocol::dht::Provider::attestation: decdn_protocol::dht::OriginAttestation
 pub decdn_protocol::dht::Provider::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::dht::Provider::node: decdn_protocol::identity::NodeId
 pub struct decdn_protocol::dht::StoreAck
 pub decdn_protocol::dht::StoreAck::accepted: bool
 pub decdn_protocol::dht::StoreAck::hash: decdn_protocol::identity::ContentHash
 pub struct decdn_protocol::dht::StoreRequest
+pub decdn_protocol::dht::StoreRequest::attestation: decdn_protocol::dht::OriginAttestation
 pub decdn_protocol::dht::StoreRequest::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::dht::StoreRequest::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::dht::StoreRequest::holder: decdn_protocol::identity::NodeId
@@ -413,7 +423,7 @@ pub const fn decdn_protocol::client::VoucherRejectReason::refuses_proof(self) ->
 pub struct decdn_protocol::BatchStoreAck
 pub decdn_protocol::BatchStoreAck::results: alloc::vec::Vec<bool>
 pub struct decdn_protocol::BatchStoreRequest
-pub decdn_protocol::BatchStoreRequest::entries: alloc::vec::Vec<(decdn_protocol::identity::ContentHash, decdn_protocol::coverage::Coverage)>
+pub decdn_protocol::BatchStoreRequest::entries: alloc::vec::Vec<(decdn_protocol::identity::ContentHash, decdn_protocol::coverage::Coverage, decdn_protocol::dht::OriginAttestation)>
 pub decdn_protocol::BatchStoreRequest::holder: decdn_protocol::identity::NodeId
 pub struct decdn_protocol::ChunkData
 impl decdn_protocol::client::ChunkData
@@ -494,6 +504,14 @@ impl core::convert::From<decdn_protocol::identity::NodeId> for [u8; 32]
 pub fn [u8; 32]::from(decdn_protocol::identity::NodeId) -> Self
 impl core::fmt::Display for decdn_protocol::identity::NodeId
 pub fn decdn_protocol::identity::NodeId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_protocol::OriginAttestation
+pub decdn_protocol::OriginAttestation::rate_per_mb: u64
+pub decdn_protocol::OriginAttestation::slash_sig: alloc::vec::Vec<u8>
+pub decdn_protocol::OriginAttestation::timestamp_us: u64
+pub decdn_protocol::OriginAttestation::total_bytes: u64
+impl decdn_protocol::dht::OriginAttestation
+pub fn decdn_protocol::dht::OriginAttestation::from_response(&decdn_protocol::client::StreamResponse) -> core::option::Option<Self>
+pub const fn decdn_protocol::dht::OriginAttestation::signed_body(&self, [u8; 32]) -> decdn_protocol::client::StreamResponseBody
 pub struct decdn_protocol::ProbeRequest
 pub decdn_protocol::ProbeRequest::hash: [u8; 32]
 pub decdn_protocol::ProbeRequest::timestamp_us: u64
@@ -512,6 +530,10 @@ pub decdn_protocol::ProbeResponseExt::coverage: decdn_protocol::coverage::Covera
 pub decdn_protocol::ProbeResponseExt::total_bytes: core::option::Option<u64>
 impl decdn_protocol::message::ProbeResponseExt
 pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, &decdn_protocol::message::ProbeResponseBody) -> bool
+pub struct decdn_protocol::Provider
+pub decdn_protocol::Provider::attestation: decdn_protocol::dht::OriginAttestation
+pub decdn_protocol::Provider::coverage: decdn_protocol::coverage::Coverage
+pub decdn_protocol::Provider::node: decdn_protocol::identity::NodeId
 pub struct decdn_protocol::Region(_)
 impl decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::as_str(&self) -> &str
@@ -533,6 +555,7 @@ pub struct decdn_protocol::StoreAck
 pub decdn_protocol::StoreAck::accepted: bool
 pub decdn_protocol::StoreAck::hash: decdn_protocol::identity::ContentHash
 pub struct decdn_protocol::StoreRequest
+pub decdn_protocol::StoreRequest::attestation: decdn_protocol::dht::OriginAttestation
 pub decdn_protocol::StoreRequest::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::StoreRequest::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::StoreRequest::holder: decdn_protocol::identity::NodeId
@@ -557,12 +580,12 @@ pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::re
 pub struct decdn_protocol::StreamResponseBody
 pub decdn_protocol::StreamResponseBody::hash: [u8; 32]
 pub decdn_protocol::StreamResponseBody::ok: bool
-pub decdn_protocol::StreamResponseBody::pool_id: [u8; 32]
 pub decdn_protocol::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::StreamResponseExt
 pub decdn_protocol::StreamResponseExt::error: core::option::Option<decdn_protocol::client::StreamError>
+pub decdn_protocol::StreamResponseExt::origin_attestation: core::option::Option<decdn_protocol::dht::OriginAttestation>
 impl decdn_protocol::client::StreamResponseExt
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::TestBlockSizeGuard

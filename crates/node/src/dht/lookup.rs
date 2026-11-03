@@ -32,28 +32,53 @@
 //!    requester has already observed returning `has_blob: false`
 //!    within the cache TTL. Only applies to `providers`, never to
 //!    `closer_nodes`.
+//! 4. **Origin attestation** — drop a provider whose attestation does
+//!    not recover to a seated origin (ADR 022 § Origin Attestation). This
+//!    check is the requester's own, so a receiver that stores invalid
+//!    records cannot make this node pull from their holders. Each distinct
+//!    attestation is recovered once per lookup.
+//!
+//! The lookup also returns the seated origin each valid attestation names
+//! ([`Lookup::origins`]), including those of providers filter 3 dropped: a
+//! stale record still routes the requester to the origin its content came
+//! from.
 //!
 //! After filtering, the surviving provider set is **randomised**
 //! before return. ADR 022 § Lookup integrity: "Randomization on the requester is
 //! the load-bearing defense against ordering manipulation."
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use alloy::primitives::Address;
 use decdn_client::Connections;
-use decdn_protocol::Coverage;
-use indexmap::IndexMap;
+use decdn_protocol::{Coverage, OriginAttestation};
+use indexmap::{IndexMap, IndexSet};
 use iroh::{EndpointAddr, PublicKey};
 use rand::seq::SliceRandom;
 use tokio::task::JoinSet;
 use tracing::{Instrument as _, debug, warn};
 
+use crate::dht::attestation::AttestationVerifier;
 use crate::dht::client;
 use crate::dht::negative_cache::{Hash, NegativeProbeCache};
 use crate::dht::routing::{K_BUCKET_SIZE, NODE_ID_LEN, NodeId, RoutingTable, xor_distance_bytes};
 use crate::dht::staker_set::StakerSet;
+
+/// What one lookup found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lookup {
+    /// The randomised, filter-surviving providers, each with its stale
+    /// coverage hint.
+    pub providers: Vec<(NodeId, Coverage)>,
+    /// The seated origins the valid attestations in the answers name, in the
+    /// order the lookup first saw them. The requester's fallback probes these
+    /// before it reads a namespace's origin directory (ADR 022 § `FIND_VALUE`
+    /// Flow).
+    pub origins: Vec<Address>,
+}
 
 /// Default α — parallel in-flight RPCs per round. ADR 022 § Routing Table.
 pub const DEFAULT_ALPHA: NonZeroUsize = match NonZeroUsize::new(3) {
@@ -168,12 +193,13 @@ pub async fn find_providers(
     conns: &Connections,
     routing_table: &Arc<Mutex<RoutingTable>>,
     staker_set: &Arc<dyn StakerSet>,
+    verifier: &AttestationVerifier,
     negative_cache: &NegativeProbeCache,
     requester_id: NodeId,
     target: Hash,
     cfg: LookupConfig,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Vec<(NodeId, Coverage)> {
+) -> Lookup {
     if let Some(metrics) = metrics {
         metrics.dht_findvalue_query();
     }
@@ -181,6 +207,7 @@ pub async fn find_providers(
         conns,
         routing_table,
         staker_set: staker_set.as_ref(),
+        verifier,
         negative_cache,
         requester_id,
         target,
@@ -234,12 +261,12 @@ pub async fn find_providers(
     }
 
     let cooling_skipped = state.cooling_skipped;
-    let providers = state.into_randomised_providers();
+    let lookup = state.into_lookup();
     let span = tracing::Span::current();
     span.record("rounds", rounds_run);
-    span.record("providers", providers.len());
+    span.record("providers", lookup.providers.len());
     span.record("cooling", cooling_skipped);
-    providers
+    lookup
 }
 
 /// Per-peer error category surfaced by a single RPC attempt within a
@@ -268,6 +295,7 @@ struct LookupCtx<'a> {
     conns: &'a Connections,
     routing_table: &'a Arc<Mutex<RoutingTable>>,
     staker_set: &'a dyn StakerSet,
+    verifier: &'a AttestationVerifier,
     negative_cache: &'a NegativeProbeCache,
     requester_id: NodeId,
     target: Hash,
@@ -403,14 +431,30 @@ fn process_response(
     responder: NodeId,
     state: &mut LookupState,
 ) -> bool {
-    fold_response(
+    let unattested = fold_response(
         &ctx.target,
         ctx.staker_set,
+        ctx.verifier,
         ctx.negative_cache,
         resp,
         responder,
         state,
-    )
+    );
+    if let Some(metrics) = ctx.metrics {
+        for _ in 0..unattested.dropped {
+            metrics.dht_lookup_provider_unattested();
+        }
+    }
+    unattested.observed_closer
+}
+
+/// What folding one response did, beyond the state it updated.
+struct Folded {
+    /// Whether a surviving `closer_node` is strictly closer than the best
+    /// queried distance.
+    observed_closer: bool,
+    /// Providers filter 4 dropped for an invalid attestation.
+    dropped: usize,
 }
 
 /// Filter + fold step shared with the unit tests, which can't easily
@@ -419,11 +463,12 @@ fn process_response(
 fn fold_response(
     target: &Hash,
     staker_set: &dyn StakerSet,
+    verifier: &AttestationVerifier,
     negative_cache: &NegativeProbeCache,
     resp: decdn_protocol::dht::FindValueResponse,
     responder: NodeId,
     state: &mut LookupState,
-) -> bool {
+) -> Folded {
     let kept_closer = filter_xor_closer(resp.closer_nodes.into_inner(), target, &responder);
     let kept_closer = filter_active_stakers(kept_closer, staker_set);
 
@@ -434,16 +479,31 @@ fn fold_response(
     // survived, so `coverage` rides along to `record_provider` rather than
     // being dropped by a `Vec<NodeId>` round-trip.
     let provider_ids: Vec<NodeId> = resp.providers.iter().map(|p| p.node).collect();
-    let kept_ids = filter_active_stakers(provider_ids, staker_set);
-    let kept_ids = filter_negative_cache(kept_ids, target, negative_cache);
-    let kept_ids: HashSet<NodeId> = kept_ids.into_iter().collect();
+    let bonded: HashSet<NodeId> = filter_active_stakers(provider_ids, staker_set)
+        .into_iter()
+        .collect();
+    let probeable: HashSet<NodeId> =
+        filter_negative_cache(bonded.iter().copied().collect(), target, negative_cache)
+            .into_iter()
+            .collect();
 
+    // Filter 4 runs over every bonded provider, so an origin named only by a
+    // record filter 3 dropped still reaches the fallback.
+    let mut dropped = 0usize;
     for p in resp
         .providers
         .into_iter()
-        .filter(|p| kept_ids.contains(&p.node))
+        .filter(|p| bonded.contains(&p.node))
     {
-        state.record_provider(p.node, p.coverage);
+        match state.attesting_origin(verifier, target, &p.attestation) {
+            Some(origin) => {
+                state.origins.insert(origin);
+                if probeable.contains(&p.node) {
+                    state.record_provider(p.node, p.coverage);
+                }
+            }
+            None => dropped = dropped.saturating_add(1),
+        }
     }
     let mut observed_closer = false;
     for c in kept_closer {
@@ -451,7 +511,10 @@ fn fold_response(
             observed_closer = true;
         }
     }
-    observed_closer
+    Folded {
+        observed_closer,
+        dropped,
+    }
 }
 
 // ============================================================
@@ -524,6 +587,11 @@ struct LookupState {
     /// folded `Coverage`. Insertion order preserved; randomisation happens
     /// at return time.
     providers: IndexMap<NodeId, Coverage>,
+    /// Seated origins named by the valid attestations seen so far.
+    origins: IndexSet<Address>,
+    /// Each distinct attestation's verdict, so one repeated across answers
+    /// is recovered once.
+    verdicts: HashMap<OriginAttestation, Option<Address>>,
     /// Smallest XOR distance among queried nodes so far. New
     /// candidates only count as "closer" if they beat this.
     best_queried_distance: [u8; NODE_ID_LEN],
@@ -554,6 +622,8 @@ impl LookupState {
             candidates: BTreeMap::new(),
             queried: HashSet::new(),
             providers: IndexMap::new(),
+            origins: IndexSet::new(),
+            verdicts: HashMap::new(),
             best_queried_distance: [0xFFu8; NODE_ID_LEN],
             cooling: HashSet::new(),
             cooling_skipped: 0,
@@ -676,6 +746,22 @@ impl LookupState {
         self.providers.insert(peer, coverage);
     }
 
+    /// The seated origin `attestation` names for the target, or `None` when
+    /// it is not valid. A repeated attestation reuses its first verdict.
+    fn attesting_origin(
+        &mut self,
+        verifier: &AttestationVerifier,
+        target: &Hash,
+        attestation: &OriginAttestation,
+    ) -> Option<Address> {
+        if let Some(verdict) = self.verdicts.get(attestation) {
+            return *verdict;
+        }
+        let verdict = verifier.verify(*target.as_bytes(), attestation);
+        self.verdicts.insert(attestation.clone(), verdict);
+        verdict
+    }
+
     fn have_enough_providers(&self) -> bool {
         self.providers.len() >= self.k
     }
@@ -691,11 +777,14 @@ impl LookupState {
     /// randomisation of the *surviving* set — shuffle precedes
     /// truncation so the truncated K is a random sample, not a
     /// deterministic prefix.
-    fn into_randomised_providers(self) -> Vec<(NodeId, Coverage)> {
+    fn into_lookup(self) -> Lookup {
         let mut providers: Vec<(NodeId, Coverage)> = self.providers.into_iter().collect();
         providers.shuffle(&mut rand::rng());
         providers.truncate(self.k);
-        providers
+        Lookup {
+            providers,
+            origins: self.origins.into_iter().collect(),
+        }
     }
 }
 

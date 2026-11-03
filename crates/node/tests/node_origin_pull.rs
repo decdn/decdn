@@ -39,6 +39,7 @@ use decdn_incentive::{
     min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
+use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
@@ -912,6 +913,7 @@ async fn build_origin_with_discovery(
         ),
         routing_table: Arc::new(Mutex::new(routing)),
         staker_set: Arc::new(ConfigStakerSet::new(stakers)) as Arc<dyn StakerSet>,
+        attestations: test_support::self_signing(),
         origin_directory: Arc::new(StaticOriginDirectory::new(directory))
             as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
@@ -1080,6 +1082,7 @@ async fn build_origin_multi_hash(
         // no routing entries — so fetch #1 resolves via the directory as before.
         staker_set: Arc::new(ConfigStakerSet::new(providers.iter().copied().collect()))
             as Arc<dyn StakerSet>,
+        attestations: test_support::self_signing(),
         origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
@@ -1692,6 +1695,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         )))),
         staker_set: Arc::new(ConfigStakerSet::new(providers.into_iter().collect()))
             as Arc<dyn StakerSet>,
+        attestations: test_support::self_signing(),
         origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
@@ -1776,7 +1780,6 @@ async fn serve_wrong_bytes(
         ok: true,
         rate_per_mb: rate,
         total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
-        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -1787,7 +1790,7 @@ async fn serve_wrong_bytes(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -1910,7 +1913,6 @@ async fn serve_gated_correct_bytes(
             ok: true,
             rate_per_mb: rate,
             total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
-            pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
         };
         let slash_sig = StreamSlashData::from_response_body(&body)
@@ -1919,7 +1921,7 @@ async fn serve_gated_correct_bytes(
             .as_bytes()
             .to_vec();
         let resp = StreamResponse { body, slash_sig };
-        let resp_ext = StreamResponseExt { error: None };
+        let resp_ext = StreamResponseExt::default();
         write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
             .await
             .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -2101,7 +2103,6 @@ async fn serve_then_reject_voucher(
         ok: true,
         rate_per_mb: rate,
         total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
-        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -2112,7 +2113,7 @@ async fn serve_then_reject_voucher(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -2185,7 +2186,6 @@ async fn serve_then_error_on_voucher(
         ok: true,
         rate_per_mb: rate,
         total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
-        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -2196,7 +2196,7 @@ async fn serve_then_error_on_voucher(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -3871,7 +3871,6 @@ fn signed_response(
         ok: error.is_none(),
         rate_per_mb: rate,
         total_bytes,
-        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -3881,7 +3880,10 @@ fn signed_response(
         .to_vec();
     Ok((
         StreamResponse { body, slash_sig },
-        StreamResponseExt { error },
+        StreamResponseExt {
+            error,
+            origin_attestation: None,
+        },
     ))
 }
 
@@ -9745,7 +9747,6 @@ async fn serve_wire_paced(
         ok: true,
         rate_per_mb: rate,
         total_bytes,
-        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -9756,7 +9757,7 @@ async fn serve_wire_paced(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -11530,6 +11531,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
             *b_id.as_bytes(),
         )))),
         staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
+        attestations: test_support::self_signing(),
         origin_directory: Arc::new(StaticOriginDirectory::new(HashMap::from([
             (U256::ZERO, providers.clone()),
             (U256::ZERO, providers),
@@ -13056,6 +13058,10 @@ impl OriginDirectory for MutableOriginDirectory {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn origin_nodes(&self, _operators: &[alloy::primitives::Address]) -> Vec<DhtNodeId> {
+        Vec::new()
+    }
 }
 
 /// A cached entry can be disowned INSIDE its own 15s: a node ejected from the active
@@ -13193,6 +13199,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         ),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         staker_set: Arc::clone(&mutable_staker) as Arc<dyn StakerSet>,
+        attestations: test_support::self_signing(),
         origin_directory: Arc::clone(&mutable_dir) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
@@ -14745,6 +14752,7 @@ async fn build_origin_economics(
         ),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         staker_set: Arc::new(stakers) as Arc<dyn StakerSet>,
+        attestations: test_support::self_signing(),
         origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
@@ -16062,6 +16070,10 @@ async fn spawn_dht_record_server(
             holder,
             ContentHash::from_bytes(*hash.as_bytes()),
             coverage,
+            decdn_node::dht::AttestedBy {
+                attestation: test_support::attest(*hash.as_bytes()),
+                signer: test_support::ORIGIN.address(),
+            },
             receive_us,
         );
     anyhow::ensure!(
@@ -16077,6 +16089,7 @@ async fn spawn_dht_record_server(
         permissive_limiter(&metrics),
         Arc::clone(&metrics),
         Arc::new(ConfigStakerSet::new(HashSet::new())) as Arc<dyn StakerSet>,
+        test_support::verifier(),
         records,
     ));
     let (ep, addr) = local_endpoint(sk, vec![decdn_protocol::ALPN_DHT.to_vec()]).await?;

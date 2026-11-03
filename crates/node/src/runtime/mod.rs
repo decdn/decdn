@@ -873,6 +873,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     dht_rate_limiter: Arc<DhtRateLimiter>,
     record_store: Arc<std::sync::Mutex<RecordStore>>,
     origin_directory: Arc<dyn crate::dht::origin::OriginDirectory>,
+    /// The origin attestations this node holds (ADR 022 § Origin
+    /// Attestation), shared by the republisher, the serve path and the pull
+    /// legs.
+    attestations: Arc<crate::attestations::Attestations>,
     dht_handler: Arc<DhtHandler>,
     dht_routing: Arc<std::sync::Mutex<crate::dht::RoutingTable>>,
     /// The `CapacityBond` registry's `NodeId → regionHint` projection (ADR 030),
@@ -1224,12 +1228,51 @@ async fn build_chain_and_handlers(
         } else {
             Arc::new(crate::dht::origin::EmptyOriginDirectory)
         };
+    // The seated-origin set every DHT record's attestation is checked against
+    // (ADR 022 § Origin Attestation). The `OriginAssignment` watcher fills it at
+    // boot and keeps it current. Without that address it stays empty, and no
+    // record is valid here: the check fails closed.
+    let seated_origins = Arc::new(crate::dht::SeatedOriginSet::new());
+    if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
+        let origin_assignment_addr =
+            parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
+        let seat_route = crate::origin_seat_watcher::bootstrap(
+            providers.read_only(event_poll_interval),
+            origin_assignment_addr,
+            Arc::clone(&head),
+            Arc::clone(&seated_origins),
+            Arc::clone(&infra.node_metrics),
+            &boot,
+        )
+        .await
+        .context("bootstrap the origin seat watcher")?;
+        poller_routes.push(seat_route);
+    } else {
+        tracing::warn!(
+            "blockchain.origin_assignment_address is not set: no origin seat is known, \
+             so this node accepts and follows no DHT record"
+        );
+    }
+    let attestation_verifier = crate::dht::AttestationVerifier::new(
+        Arc::clone(&seated_origins) as Arc<dyn crate::dht::SeatedOrigins>,
+        reload_state.content_denylist(),
+        slash_domain.clone(),
+    );
+    let attestations = Arc::new(crate::attestations::Attestations::open(
+        attestation_verifier.clone(),
+        &cfg.identity.data_dir,
+        Some(crate::attestations::SelfOrigin {
+            signer: Arc::clone(&infra.eth_signer),
+            rate_per_mb: cfg.payment.rate_per_mb,
+        }),
+    ));
     let dht_handler = Arc::new(DhtHandler::new(
         infra.secret_key.public(),
         Arc::clone(&dht_rate_limiter),
         Arc::clone(&infra.limiter),
         Arc::clone(&infra.node_metrics),
         Arc::clone(&staker_set),
+        attestation_verifier,
         Arc::clone(&record_store),
     ));
 
@@ -1464,6 +1507,7 @@ async fn build_chain_and_handlers(
         max_concurrent_streams: MAX_CLIENT_STREAMS,
         content_deny: Arc::clone(&content_denylist),
         chain_freshness: Some(chain_freshness.clone()),
+        attestations: Some(Arc::clone(&attestations)),
         // Hint the settlement service on each accepted voucher so a lane's
         // accrued claim is planned into a chunk promptly rather than waiting the
         // self-tick.
@@ -1645,6 +1689,7 @@ async fn build_chain_and_handlers(
         dht_rate_limiter,
         record_store,
         origin_directory,
+        attestations,
         dht_handler,
         dht_routing,
         registry_regions,
@@ -1994,6 +2039,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         Arc::clone(&ch.staker_set),
         Arc::clone(&republish_scheduler),
         infra.cache.clone(),
+        Arc::clone(&ch.attestations),
         cfg.cache.relay_foreign_namespaces,
         Arc::clone(&infra.node_metrics),
         cache_inserts_rx,
@@ -2205,6 +2251,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let dht_routing_c = Arc::clone(&ch.dht_routing);
     let dht_conns_c = infra.dht_conns.clone();
     let staker_set_c = Arc::clone(&ch.staker_set);
+    let attestations_c = Arc::clone(&ch.attestations);
     let origin_directory_c = Arc::clone(&ch.origin_directory);
     let local_reputation_c = Arc::clone(&local_reputation);
     let registry_regions_c = Arc::clone(&ch.registry_regions);
@@ -2270,6 +2317,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     dht_connections: dht_conns_c,
                     routing_table: dht_routing_c,
                     staker_set: staker_set_c,
+                    attestations: attestations_c,
                     // FIND_VALUE directory reads: the last-resort fallback when
                     // the DHT returns no providers, and the supplement when a
                     // ranged pull's probed holders do not span the blob (ADR 022

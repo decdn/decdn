@@ -77,9 +77,19 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("stream slash_sig signing failed: {e}"))?
             .as_bytes()
             .to_vec();
+        // An `ok: true` response forwards the origin attestation this node
+        // holds for the hash (ADR 022 § Origin Attestation), so the pulling
+        // relay can advertise what it pulls.
+        let origin_attestation = body
+            .ok
+            .then(|| self.attestations.as_ref()?.held(&body.hash))
+            .flatten();
         Ok((
             StreamResponse { body, slash_sig },
-            StreamResponseExt { error },
+            StreamResponseExt {
+                error,
+                origin_attestation,
+            },
         ))
     }
 
@@ -129,7 +139,6 @@ impl ClientHandler {
             ok: false,
             rate_per_mb,
             total_bytes: 0,
-            pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
         };
         let (resp, resp_ext) = self
