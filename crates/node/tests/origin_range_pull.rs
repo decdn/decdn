@@ -780,6 +780,206 @@ async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Re
     Ok(())
 }
 
+/// An outboard GET 503 is a fault the serve-miss probe records (#2826), yet the
+/// range still delivers through the buffered whole-blob fallback: the fault
+/// counts as a pull-through error, and the pull never enters the two-leg tier.
+#[tokio::test(flavor = "multi_thread")]
+async fn range_request_with_outboard_outage_falls_back_to_whole_blob() -> anyhow::Result<()> {
+    let (blob, _outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+    let (req_off, req_len) = (16 * 1024u64, 32 * 1024u64);
+
+    let server = MockServer::start().await;
+    // HEAD answers and a plain whole-blob GET is served, but `{H}.obao4`
+    // answers 503: the outboard half of the probe faults.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x7A);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        Some(Duration::from_secs(15)),
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        req_off,
+        req_len,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    let want = blob
+        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "an outboard outage must still deliver the correct range bytes"
+    );
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "the whole-blob fallback must complete and cache the blob"
+    );
+    let ranged_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(
+        ranged_gets == 0,
+        "no ranged GET should occur once the outboard probe faults, saw {ranged_gets}"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 0,
+        "a faulted outboard probe must not enter the two-leg tier"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "node_pull_through_errors_total")? == 1,
+        "the outboard 503 must count as a pull-through error, not a silent decline"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// An outboard GET 503 with no other fill tier configured refuses as
+/// `InternalError` (a degraded node), never `NotFound` (an empty one), and
+/// nothing is signed (#2826).
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> anyhow::Result<()> {
+    let (blob, _outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    // The size answers but the outboard answers 503. Nothing else is mounted:
+    // no fill tier can serve.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x7B);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = client_eth
+        .sign_hash_sync(&binding_hash)?
+        .as_bytes()
+        .to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: now_us(),
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(!resp.body.ok, "a faulted node must refuse");
+    conn.close(0u32.into(), b"done");
+
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
+        "an outboard 503 must refuse as InternalError (degraded node)"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
+        "a degraded node must not be reported as an empty one"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result<()> {
     // A ranged cache-miss request WITHOUT an ownership binding must not make the

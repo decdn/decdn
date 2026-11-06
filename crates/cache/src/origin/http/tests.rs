@@ -55,8 +55,9 @@ async fn fetch_outboard_404_is_not_found() -> anyhow::Result<()> {
 }
 
 /// A deterministic decline (403 here) degrades to `Unsupported` rather than
-/// erroring — the optimization is best-effort. Only retriable statuses
-/// (5xx/408/429) fault; see `fetch_outboard_5xx_is_a_transient_fault_not_a_decline`.
+/// erroring — the optimization is best-effort. Among non-404 statuses, only
+/// the retriable ones (5xx/408/429) fault; see
+/// `fetch_outboard_5xx_is_a_transient_fault_not_a_decline`.
 #[tokio::test]
 async fn fetch_outboard_non_404_decline_is_unsupported() -> anyhow::Result<()> {
     let server = MockServer::start().await;
@@ -74,16 +75,13 @@ async fn fetch_outboard_non_404_decline_is_unsupported() -> anyhow::Result<()> {
             origin.fetch_outboard(hash, 1 << 20).await?,
             OutboardFetch::Unsupported
         ),
-        "non-404 decline must degrade to Unsupported",
+        "a 403 decline must degrade to Unsupported",
     );
     Ok(())
 }
 
-/// An outboard GET 503 is a transient fault, never a decline (#2826):
-/// folding it into `Unsupported` is indistinguishable from an origin that
-/// publishes no outboards, so every range pull silently degraded to the
-/// buffered whole-blob path while the origin erred. Mirrors the S3
-/// adapter's `classify_get_object_error`.
+/// An outboard GET 503 is a transient fault, never a decline (#2826); see
+/// `get_outboard_bounded`.
 #[tokio::test]
 async fn fetch_outboard_5xx_is_a_transient_fault_not_a_decline() -> anyhow::Result<()> {
     let server = MockServer::start().await;
@@ -99,9 +97,104 @@ async fn fetch_outboard_5xx_is_a_transient_fault_not_a_decline() -> anyhow::Resu
     match origin.fetch_outboard(hash, 1 << 20).await {
         Err(err) => anyhow::ensure!(
             err.is_transient(),
-            "a 503 is worth waiting out; got a permanent fault: {err}"
+            "a 503 must classify as Transient; got a permanent fault: {err}"
         ),
         Ok(fetch) => anyhow::bail!("a 503 must fault, got Ok({fetch:?})"),
+    }
+    Ok(())
+}
+
+/// Each outboard-decline status class warns once per origin: a repeat of the
+/// class logs at debug, a new class warns again, and clones share the state.
+#[tokio::test]
+async fn outboard_decline_warns_once_per_status_class() -> anyhow::Result<()> {
+    let origin = HttpOrigin::parse("http://127.0.0.1:1")?;
+    let clone = origin.clone();
+    let steps = [
+        (&origin, StatusCode::FORBIDDEN, true),
+        (&origin, StatusCode::FORBIDDEN, false),
+        (&clone, StatusCode::FORBIDDEN, false),
+        (&clone, StatusCode::UNAUTHORIZED, true),
+        (&origin, StatusCode::FOUND, true),
+        (&origin, StatusCode::TEMPORARY_REDIRECT, false),
+        (&origin, StatusCode::GONE, true),
+        (&clone, StatusCode::METHOD_NOT_ALLOWED, false),
+    ];
+    for (o, status, want) in steps {
+        anyhow::ensure!(
+            o.first_outboard_decline(status) == want,
+            "first_outboard_decline({status}) must be {want}",
+        );
+    }
+    Ok(())
+}
+
+/// A ranged-data GET 503 is a transient fault, never a decline: a decline
+/// reads as an origin that cannot serve ranges and hides the outage behind a
+/// whole-blob pull. See `get_range_bytes`.
+#[tokio::test]
+async fn fetch_range_data_5xx_is_a_transient_fault_not_a_decline() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let hash = Hash::new(b"http-range-outage-marker");
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+    let req = OriginRangeRequest {
+        fetch_start: 0,
+        fetch_end: 1024,
+    };
+
+    match origin.fetch_range_data(hash, req).await {
+        Err(err) => anyhow::ensure!(
+            err.is_transient(),
+            "a 503 must classify as Transient; got a permanent fault: {err}"
+        ),
+        Ok(fetch) => anyhow::bail!("a 503 must fault, got Ok({fetch:?})"),
+    }
+    Ok(())
+}
+
+/// A ranged-data GET 404 is a decline, not a fault: the range path degrades
+/// to a whole-blob pull, which answers the absence authoritatively.
+#[tokio::test]
+async fn fetch_range_data_404_is_unsupported() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let hash = Hash::new(b"http-range-missing-marker");
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+    let req = OriginRangeRequest {
+        fetch_start: 0,
+        fetch_end: 1024,
+    };
+
+    anyhow::ensure!(
+        matches!(
+            origin.fetch_range_data(hash, req).await?,
+            OriginRangeFetch::Unsupported
+        ),
+        "a 404 range GET must degrade to Unsupported",
+    );
+    Ok(())
+}
+
+/// 5xx, 408 and 429 are retriable; every other status is not. Shared by the
+/// whole-blob GET, the size HEAD, the ranged-data GET and the outboard GET.
+#[test]
+fn is_transient_status_classification_matches_rfc_9110() -> anyhow::Result<()> {
+    for code in [500, 503, 599, 408, 429] {
+        let status = StatusCode::from_u16(code)?;
+        anyhow::ensure!(is_transient_status(status), "{code} must be transient");
+    }
+    for code in [400, 401, 403, 404, 409, 200, 304] {
+        let status = StatusCode::from_u16(code)?;
+        anyhow::ensure!(!is_transient_status(status), "{code} must not be transient");
     }
     Ok(())
 }
