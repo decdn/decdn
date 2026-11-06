@@ -1162,6 +1162,58 @@ async fn intake_counts_an_invalid_signature_drop() {
     .await;
 }
 
+/// #2835: a capability whose owner signature carries a raw-parity recovery
+/// byte (0/1) is accepted — recovery proves the owner either way — and the
+/// lane stores the canonical form (v = 27 + parity), never the raw wire
+/// bytes: on-chain `ecrecover` returns `address(0)` for v ∉ {27, 28}, so the
+/// raw form forwarded into a `CapabilityReg` would revert every `redeemMany`
+/// the lane joins.
+#[tokio::test]
+async fn intake_stores_a_raw_parity_owner_signature_canonicalized() {
+    let metrics = Arc::new(Metrics::new());
+    let owner = PrivateKeySigner::random();
+    let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
+    let pool_id = B256::repeat_byte(0x6A);
+    let signer = Address::repeat_byte(0x6B);
+    let mut wire = signed_wire(
+        &owner,
+        Capability {
+            signer,
+            spending_cap: 1_000_000,
+            pool_id,
+            expiry: 1_900_000_000,
+        },
+    );
+    let canonical: [u8; 65] = wire
+        .owner_signature
+        .clone()
+        .try_into()
+        .expect("a 65-byte owner signature");
+    let canonical_v = canonical.last().copied().expect("a non-empty signature");
+    assert!(
+        canonical_v == 27 || canonical_v == 28,
+        "signing emits the canonical form"
+    );
+    let v = wire
+        .owner_signature
+        .last_mut()
+        .expect("a non-empty signature");
+    *v = canonical_v - 27; // the raw-parity (0/1) wire form an off-spec client sends
+
+    handler.intake_capability(pool_id, signer, owner.address(), &wire);
+
+    let lane_key = LaneKey {
+        pool_id,
+        signer,
+        provider: handler.eth_signer.address(),
+    };
+    assert_eq!(
+        lane_owner_sig(&handler, &lane_key).await,
+        Some(canonical),
+        "a raw-parity capability registers its lane with the canonical v = 27 + parity"
+    );
+}
+
 /// #1789 item 2: the verification cache returns the cached recovery for an
 /// identical repeat, treats a tampered signature as a miss (ecrecover is
 /// keyed on the full signed material, so a different signature can never

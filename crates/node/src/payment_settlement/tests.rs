@@ -4024,6 +4024,65 @@ async fn a_possibly_broadcast_oversize_redeem_halves() -> Result<()> {
     )
 }
 
+/// #2835: one claim the contract refuses vetoes the whole `redeemMany`, so a
+/// reverted multi-claim chunk halves like an oversize send: the healthy claim
+/// lands, and the poisoned claim ends alone in a single-claim chunk that
+/// stays on warn-and-retry.
+#[tokio::test]
+async fn a_reverted_multi_claim_chunk_halves_and_lands_the_healthy_claim() -> Result<()> {
+    use alloy::sol_types::SolCall;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt, reverted_receipt};
+
+    let log = CapturedLog::default();
+    let _subscriber = log.install();
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let unpaid = vec![lane(0), lane(0)];
+    let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&unpaid);
+    // The full 2-claim chunk reverts; its halves then send the healthy claim,
+    // which lands, and the poisoned claim, which reverts again — alone.
+    let provider = ScriptedRpc::mined_in_order([
+        reverted_receipt(Address::ZERO),
+        mined_receipt(Address::ZERO, Vec::new()),
+        reverted_receipt(Address::ZERO),
+    ])
+    .answering_calls([Bytes::from(watermarks)])
+    .provider();
+    let contract = PaymentPool::new(Address::ZERO, provider);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        false,
+        &metrics,
+        &open_pools(),
+        &test_recorder(),
+    )
+    .await;
+
+    assert!(faulted, "the poisoned claim's lone revert is a chain fault");
+    let split = log.lines("halving chunk to isolate the reverting claim")?;
+    anyhow::ensure!(split.len() == 1, "the 2-claim chunk splits once: {split:?}");
+    let retried = log.lines("reverted on-chain; leaving claims for retry")?;
+    anyhow::ensure!(
+        retried.len() == 1,
+        "only the lone poisoned claim stays on warn-and-retry: {retried:?}"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_reverted_total 2",
+            "decdn_onchain_tx_landed_total 1",
+            "decdn_pool_redemptions_total 1",
+            "decdn_redemption_failures_total 1",
+        ],
+    )
+}
+
 /// #2575: a possibly-broadcast send with no oversize signal does not halve.
 #[tokio::test]
 async fn a_possibly_broadcast_redeem_with_no_size_signal_does_not_halve() -> Result<()> {
@@ -4674,10 +4733,46 @@ fn plan_lane_unregistered_with_material_attaches_registration() -> Result<()> {
     assert_eq!(reg.expiry, st.expiry, "reg carries the lane's expiry");
     assert_eq!(
         reg.ownerSig.as_ref(),
-        sig_with_v(1).as_slice(),
-        "reg carries the lane's own owner signature"
+        sig_with_v(28).as_slice(),
+        "reg carries the lane's own owner signature, canonicalized to v = 27 + parity"
     );
     assert_eq!(plan.key, st.key());
+    Ok(())
+}
+
+/// #2835: on-chain `ecrecover` pays only v ∈ {27, 28}, so the planner
+/// re-canonicalizes the stored owner signature — a durable row holding a
+/// raw-parity (0/1) or EIP-155 recovery byte would revert every `redeemMany`
+/// it joins. A row `from_raw` cannot parse is sent as held: the contract
+/// refuses it either way.
+#[test]
+fn plan_lane_sends_the_stored_owner_sig_canonicalized() -> Result<()> {
+    for (stored, sent) in [
+        (0u8, 27u8), // raw parity 0
+        (1, 28),     // raw parity 1
+        (27, 27),    // already canonical
+        (28, 28),
+        (35, 27), // EIP-155, parity 0
+        (5, 5),   // unparseable: sent as held
+    ] {
+        let st = signed_lane_state(1, 11, 21, Some(sig_with_v(stored)));
+        let paid = PaidWatermarks::default();
+        let plan = plan_lane(
+            &st,
+            &paid,
+            Address::from([21u8; 20]),
+            &RegistrationStatus::Unregistered,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("unregistered lane with held material should plan"))?;
+        let reg = plan
+            .register
+            .ok_or_else(|| anyhow::anyhow!("an unregistered signer attaches a CapabilityReg"))?;
+        assert_eq!(
+            reg.ownerSig.as_ref(),
+            sig_with_v(sent).as_slice(),
+            "a stored recovery byte {stored} goes on-chain as {sent}"
+        );
+    }
     Ok(())
 }
 

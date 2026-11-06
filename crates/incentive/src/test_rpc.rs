@@ -37,10 +37,23 @@ pub const SCRIPTED_NONCE: u64 = 5;
 /// `logs`: one to hand [`ScriptedRpc::mined`].
 #[must_use]
 pub const fn mined_receipt(to: Address, logs: Vec<Log>) -> TransactionReceipt {
+    receipt_with_status(to, logs, true)
+}
+
+/// A receipt for [`SCRIPTED_TX`], sent to `to`, that mined and reverted
+/// (status 0): one to hand [`ScriptedRpc::mined_in_order`].
+#[must_use]
+pub const fn reverted_receipt(to: Address) -> TransactionReceipt {
+    receipt_with_status(to, Vec::new(), false)
+}
+
+/// A receipt for [`SCRIPTED_TX`], sent to `to`, with `logs` and EIP-658
+/// `status`.
+const fn receipt_with_status(to: Address, logs: Vec<Log>, status: bool) -> TransactionReceipt {
     TransactionReceipt {
         inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
             receipt: Receipt {
-                status: Eip658Value::Eip658(true),
+                status: Eip658Value::Eip658(status),
                 cumulative_gas_used: 0,
                 logs,
             },
@@ -73,12 +86,15 @@ pub const fn mined_receipt(to: Address, logs: Vec<Log>) -> TransactionReceipt {
 /// transport also answers the block number, and a receipt read before
 /// [`ScriptedRpc::mine`] with "not mined".
 ///
-/// A clone shares the receipt, the `eth_call` queue, the send failures and
-/// the recorded nonces.
+/// A clone shares the receipt and the per-send receipt queue, the `eth_call`
+/// queue, the send failures and the recorded nonces.
 #[derive(Clone, Debug)]
 pub struct ScriptedRpc {
     send: bool,
     receipt: Arc<Mutex<Option<TransactionReceipt>>>,
+    /// Per-send receipts ([`Self::mined_in_order`]): each answered send pops
+    /// the front and makes it the receipt every read answers from then on.
+    receipts: Arc<Mutex<VecDeque<TransactionReceipt>>>,
     /// Answer a receipt read with "not mined" while no receipt is scripted,
     /// instead of never completing.
     unmined_answers: bool,
@@ -116,6 +132,7 @@ impl ScriptedRpc {
         Self {
             send: true,
             receipt: Arc::default(),
+            receipts: Arc::default(),
             unmined_answers: false,
             block: None,
             head_timestamp: None,
@@ -172,6 +189,18 @@ impl ScriptedRpc {
     pub fn mined(receipt: TransactionReceipt) -> Self {
         Self {
             receipt: Arc::new(Mutex::new(Some(receipt))),
+            ..Self::parked_receipt()
+        }
+    }
+
+    /// A transport whose sends each mine their own receipt, in order: the
+    /// N-th answered send makes the N-th of `receipts` the one every receipt
+    /// read answers, until the next send. A send past the queue keeps the
+    /// last receipt; a receipt read before the first send parks.
+    #[must_use]
+    pub fn mined_in_order(receipts: impl IntoIterator<Item = TransactionReceipt>) -> Self {
+        Self {
+            receipts: Arc::new(Mutex::new(receipts.into_iter().collect())),
             ..Self::parked_receipt()
         }
     }
@@ -326,6 +355,14 @@ impl tower::Service<RequestPacket> for ScriptedRpc {
             }
             ("eth_sendTransaction", ..) if self.send => {
                 self.record_nonce(req.params());
+                let next = self
+                    .receipts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front();
+                if let Some(next) = next {
+                    *self.receipt.lock().unwrap_or_else(PoisonError::into_inner) = Some(next);
+                }
                 serde_json::value::to_raw_value(&SCRIPTED_TX)
             }
             ("eth_getTransactionReceipt", Some(receipt), _) => {
