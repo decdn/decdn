@@ -8,6 +8,8 @@ pub(crate) mod decompress;
 pub mod fs;
 pub mod http;
 pub(crate) mod io_runtime;
+#[cfg(test)]
+mod log_capture;
 pub mod s3;
 
 use std::future::Future;

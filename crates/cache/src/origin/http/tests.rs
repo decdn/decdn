@@ -2,6 +2,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
+use crate::origin::log_capture::LogBuffer;
 
 /// A published sibling `{hex}.obao4` is fetched in full via
 /// `fetch_outboard` alone (no data GET at all, #1130 stream-while-store
@@ -126,6 +127,43 @@ async fn outboard_decline_warns_once_per_status_class() -> anyhow::Result<()> {
             "first_outboard_decline({status}) must be {want}",
         );
     }
+    Ok(())
+}
+
+/// The first outboard decline of a status class logs at warn and a repeat logs
+/// at debug. The bit logic alone cannot catch swapped `warn!`/`debug!` arms
+/// (#2856), so this pins the levels in the formatted output.
+#[test]
+fn outboard_decline_logs_warn_once_then_debug() -> anyhow::Result<()> {
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    tracing::subscriber::with_default(subscriber, || {
+        let _guard = runtime.enter();
+        let origin = HttpOrigin::parse("http://127.0.0.1:1")?;
+        origin.log_outboard_decline("http://127.0.0.1:1/h.obao4", StatusCode::FORBIDDEN);
+        origin.log_outboard_decline("http://127.0.0.1:1/h.obao4", StatusCode::FORBIDDEN);
+        anyhow::Ok(())
+    })?;
+
+    let text = logs.contents();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("declined the outboard GET"))
+        .collect();
+    anyhow::ensure!(
+        matches!(
+            lines.as_slice(),
+            [first, second] if first.contains("WARN") && second.contains("DEBUG")
+        ),
+        "expected one WARN then one DEBUG decline line:\n{text}"
+    );
     Ok(())
 }
 

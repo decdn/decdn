@@ -1,4 +1,5 @@
 use super::*;
+use crate::origin::log_capture::LogBuffer;
 
 #[tokio::test]
 async fn new_rejects_missing_path() -> anyhow::Result<()> {
@@ -832,42 +833,6 @@ fn a_stale_file_handle_is_transient() {
     assert!(classify_io_error(err).is_transient());
     let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     assert!(!classify_io_error(denied).is_transient());
-}
-
-/// A `MakeWriter` that keeps every formatted log line in memory.
-#[derive(Clone, Default)]
-struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl LogBuffer {
-    fn contents(&self) -> String {
-        let bytes = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-}
-
-impl std::io::Write for LogBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
 }
 
 /// An outboard over its cap degrades to `Unsupported`, which the engine
