@@ -54,9 +54,9 @@ async fn fetch_outboard_404_is_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A non-404 decline (403 here) degrades to `Unsupported` rather than
-/// erroring — mirrors `fetch_range_data`'s "best-effort, never an error for a
-/// status-level decline" contract.
+/// A deterministic decline (403 here) degrades to `Unsupported` rather than
+/// erroring — the optimization is best-effort. Only retriable statuses
+/// (5xx/408/429) fault; see `fetch_outboard_5xx_is_a_transient_fault_not_a_decline`.
 #[tokio::test]
 async fn fetch_outboard_non_404_decline_is_unsupported() -> anyhow::Result<()> {
     let server = MockServer::start().await;
@@ -76,6 +76,33 @@ async fn fetch_outboard_non_404_decline_is_unsupported() -> anyhow::Result<()> {
         ),
         "non-404 decline must degrade to Unsupported",
     );
+    Ok(())
+}
+
+/// An outboard GET 503 is a transient fault, never a decline (#2826):
+/// folding it into `Unsupported` is indistinguishable from an origin that
+/// publishes no outboards, so every range pull silently degraded to the
+/// buffered whole-blob path while the origin erred. Mirrors the S3
+/// adapter's `classify_get_object_error`.
+#[tokio::test]
+async fn fetch_outboard_5xx_is_a_transient_fault_not_a_decline() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let hash = Hash::new(b"http-outboard-outage-marker");
+    let hex = hash.to_hex();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+
+    match origin.fetch_outboard(hash, 1 << 20).await {
+        Err(err) => anyhow::ensure!(
+            err.is_transient(),
+            "a 503 is worth waiting out; got a permanent fault: {err}"
+        ),
+        Ok(fetch) => anyhow::bail!("a 503 must fault, got Ok({fetch:?})"),
+    }
     Ok(())
 }
 

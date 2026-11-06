@@ -541,10 +541,11 @@ impl HttpOrigin {
     }
 
     /// GET `url` and buffer the whole body, capped at `max_bytes`, as an
-    /// [`OutboardFetch`]. A genuine 404 is [`OutboardFetch::NotFound`]; every
-    /// other non-success status — redirect (disabled per #579), permission
-    /// decline, 5xx — is [`OutboardFetch::Unsupported`]. Neither is an error; only a
-    /// transport-level fault on the `.send()` surfaces as [`OriginPullError`].
+    /// [`OutboardFetch`]. A genuine 404 is [`OutboardFetch::NotFound`]. A
+    /// retriable status (5xx/408/429 per [`is_transient_status`]) is an
+    /// [`OriginPullError::Transient`]: the origin errs, it does not decline.
+    /// Any other non-success status — redirect (disabled per #579), permission
+    /// decline — warns and degrades to [`OutboardFetch::Unsupported`].
     async fn get_outboard_bounded(
         &self,
         url: &reqwest::Url,
@@ -557,11 +558,28 @@ impl HttpOrigin {
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(OutboardFetch::NotFound);
         }
-        // Any other non-success (3xx — redirects are disabled, #579 — 401/403,
-        // 5xx) degrades rather than errors: the optimization is best-effort,
-        // and a persistent fault re-surfaces at full severity on whatever
-        // fallback path the caller takes next.
-        if !resp.status().is_success() {
+        // A retriable status is a fault, not a decline: folding a 503 into
+        // `Unsupported` is indistinguishable from an origin that publishes no
+        // outboards, so every range pull of the blob silently degrades to the
+        // buffered whole-blob path while the origin errs. The engine logs the
+        // fault and still falls back to whole-blob for this pull. Mirrors the
+        // S3 adapter's `classify_get_object_error`.
+        let status = resp.status();
+        if !status.is_success() && is_transient_status(status) {
+            return Err(OriginPullError::Transient(anyhow::anyhow!(
+                "origin outboard GET {url_log} answered {status}"
+            )));
+        }
+        // A deterministic decline (3xx — redirects are disabled, #579 —
+        // 401/403) degrades rather than errors: the optimization is
+        // best-effort, and the warn is the only record that range pulls of
+        // this blob fall back to whole-blob.
+        if !status.is_success() {
+            tracing::warn!(
+                url = %url_log,
+                %status,
+                "origin declined the outboard GET; range pulls of this blob fall back to whole-blob",
+            );
             return Ok(OutboardFetch::Unsupported);
         }
         // An outboard over the cap degrades rather than errors, so the engine
