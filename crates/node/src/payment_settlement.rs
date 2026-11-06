@@ -276,10 +276,16 @@ fn remember_auth(
 /// on-chain lane watermark is monotone).
 const REDEEM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// Bound on the reactive halve-and-retry when a chunk fails to send oversized.
-/// A default-sized chunk (300) sits far under the block-gas ceiling, so a real
-/// oversize needs at most one or two halvings; this caps the worst-case fan-out
-/// (a transient error mis-flagged as oversize) at 2^6 doomed sub-sends.
+/// Bound on the reactive halve-and-retry when a chunk fails to send oversized
+/// or reverts ([`submit_chunk`]). A default-sized chunk (300) sits far under
+/// the block-gas ceiling, so a real oversize needs at most one or two
+/// halvings; this caps the worst-case fan-out (a transient error mis-flagged
+/// as oversize, or a chunk whose every claim reverts) at 2^6 doomed
+/// sub-sends. Isolating one poisoned claim out of a full default chunk needs
+/// more halvings than the bound allows in one sweep, so the sweep that hits
+/// the bound leaves a small multi-claim chunk on retry — but its landed
+/// siblings leave the plan, so the next sweep starts from a working set small
+/// enough to finish the isolation.
 const MAX_SPLIT_DEPTH: u32 = 6;
 
 /// Lanes per pre-redeem `getWatermarks` read ([`reconcile_onchain_watermarks`]).
@@ -2308,16 +2314,25 @@ fn plan_lane(
             // form would revert every `redeemMany` it joins with
             // `InvalidCapabilitySignature`, on every sweep, until the
             // capability expired. Intake stores the canonical form, and this
-            // re-canonicalizes whatever the row holds — the store merge keeps
-            // an existing `owner_sig`, so intake alone never rewrites a row. A
-            // row `from_raw` cannot parse is sent as held: the contract
-            // refuses it either way.
-            let owner_sig = Signature::from_raw(&owner_sig).map_or(owner_sig, |sig| sig.as_bytes());
+            // re-canonicalizes whatever the row holds — `register_lane`
+            // records only into a vacant lane slot, so intake never rewrites
+            // an existing row. A row `from_raw` cannot parse is the same
+            // class of durability fault as a missing one: skip it and surface
+            // the break rather than spend gas on a claim the contract refuses.
+            let Ok(parsed) = Signature::from_raw(&owner_sig) else {
+                error!(
+                    pool_id = %key.pool_id,
+                    signer = %key.signer,
+                    "BUG: redeemable lane holds an unparseable owner_sig, so its signer cannot \
+                     be registered; skipping (node durability fault, not a client re-send)"
+                );
+                return Ok(None);
+            };
             Some(PaymentPool::CapabilityReg {
                 signer: key.signer,
                 spendingCap: to_pool_u64(st.cap, "capability spending cap")?,
                 expiry: st.expiry,
-                ownerSig: Bytes::from(owner_sig.to_vec()),
+                ownerSig: Bytes::from(parsed.as_bytes().to_vec()),
             })
         }
     };
@@ -2565,16 +2580,20 @@ async fn redeem_sweep<P: Provider + Clone>(
 }
 
 /// Submit one chunk of planned lanes as a single `redeemMany`, sent by
-/// `signer`. On an oversize send ([`is_oversize_send`]), refused or possibly
-/// broadcast, with more than one lane, halve the chunk and retry each half,
-/// bounded by `MAX_SPLIT_DEPTH`. An on-chain revert of a multi-lane chunk
-/// halves the same way: one claim the contract refuses vetoes the whole
-/// `redeemMany`, so the split lands the healthy claims and leaves the
-/// poisoned one alone in a single-claim chunk. The halved send still counts
-/// into its `onchain_tx_*` bucket (`send_failed` or `maybe_broadcast`), but
-/// not into `redemption_failure`. A revert that is not halved (one lane, or
-/// the depth bound), a refused send that is not halved, and an oversize send
-/// that cannot be halved further each record one `redemption_failure`. An unconfirmed receipt (a failed or
+/// `signer`. Three outcomes of a multi-lane chunk halve it and retry each
+/// half, bounded by `MAX_SPLIT_DEPTH`: an oversize send
+/// ([`is_oversize_send`]), refused or possibly broadcast; a gas estimate that
+/// reverts ([`is_revert_send`]) — the usual surface of one claim the contract
+/// refuses vetoing the whole `redeemMany`, since the provider estimates
+/// before every send; and the rarer mined on-chain revert (an
+/// estimate-to-inclusion state race). The split lands the healthy claims and
+/// leaves the poisoned one alone in a single-claim chunk, whose warn names
+/// its lane. The halved send still counts into its `onchain_tx_*` bucket
+/// (`reverted`, `send_failed` or `maybe_broadcast`), but not into
+/// `redemption_failure`. A revert — mined or at the estimate — that is not
+/// halved (one lane, or the depth bound), a refused send that is not halved,
+/// and an oversize send that cannot be halved further each record one
+/// `redemption_failure`. An unconfirmed receipt (a failed or
 /// lapsed wait that the by-hash fetch in `send_and_await_receipt` could not
 /// resolve) and any other send that may have broadcast are not failures: the
 /// tx may have mined, and each counts only into its `onchain_tx_*` bucket.
@@ -2592,7 +2611,7 @@ async fn redeem_sweep<P: Provider + Clone>(
 /// and the `outcome`. A halved retry nests its two halves as child spans.
 /// Every warning of a chunk that did not land names `signer`: a send with no
 /// tx hash resolves only through that account's pending and latest nonce.
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)] // one linear arm per TxOutcome, three of which halve.
 #[tracing::instrument(
     name = "onchain_tx",
     skip_all,
@@ -2668,10 +2687,28 @@ async fn submit_chunk<P: Provider + Clone>(
         }
         // A revert vetoes the whole chunk: one claim the contract refuses —
         // e.g. a capability registration it cannot verify — blocks every
-        // healthy claim batched with it. Halving isolates it: the healthy
-        // halves land, and the poisoned claim ends alone in a single-claim
-        // chunk that stays on warn-and-retry. Re-sending a landed half's lanes
-        // is safe for the same reason as the oversize split above.
+        // healthy claim batched with it. The provider estimates gas before
+        // every send, so the common veto surfaces here, as the estimate
+        // reverting before anything broadcasts; a mined revert (the arm
+        // below) is the rarer estimate-to-inclusion state race. Either way,
+        // halving isolates the poison: the healthy halves land, and the
+        // poisoned claim ends alone in a single-claim chunk that stays on
+        // warn-and-retry. Re-sending the chunk's lanes in halves is safe for
+        // the same reason as the oversize split above.
+        TxOutcome::SendErr(err)
+            if lanes.len() >= 2 && depth < MAX_SPLIT_DEPTH && is_revert_send(&err) =>
+        {
+            span.record("outcome", "split");
+            warn!(
+                error = %sanitize_error_sources(&err),
+                voucher_count,
+                depth,
+                %signer,
+                "redeemMany gas estimate reverted; halving chunk to isolate the reverting claim"
+            );
+            return submit_halves(contract, store, lanes, signer, metrics, recorder, depth + 1)
+                .await;
+        }
         TxOutcome::Reverted(receipt) if lanes.len() >= 2 && depth < MAX_SPLIT_DEPTH => {
             span.record("tx", tracing::field::display(receipt.transaction_hash));
             span.record("outcome", "split");
@@ -2685,13 +2722,25 @@ async fn submit_chunk<P: Provider + Clone>(
             return submit_halves(contract, store, lanes, signer, metrics, recorder, depth + 1)
                 .await;
         }
+        // A revert that cannot be halved further. A lone claim is the end of
+        // an isolation: the warn names its lane, the one identity an operator
+        // needs to trace the refused registration or voucher.
         TxOutcome::Reverted(receipt) => {
             record_tx_failure(&span, "reverted", Some(receipt.transaction_hash));
-            warn!(voucher_count, %signer, tx = %receipt.transaction_hash, "redeemMany reverted on-chain; leaving claims for retry");
+            warn_unhalved_revert(
+                &lanes,
+                signer,
+                depth,
+                &RevertCause::Mined(receipt.transaction_hash),
+            );
         }
         TxOutcome::SendErr(err) | TxOutcome::MaybeBroadcast(err) if is_oversize_send(&err) => {
             record_tx_failure(&span, send_outcome, None);
             warn!(error = %sanitize_error_sources(&err), send_outcome, voucher_count, depth, %signer, "redeemMany send rejected oversized and cannot be halved further; lower blockchain.redeem_max_vouchers_per_tx; leaving claims for retry");
+        }
+        TxOutcome::SendErr(err) if is_revert_send(&err) => {
+            record_tx_failure(&span, "send_failed", None);
+            warn_unhalved_revert(&lanes, signer, depth, &RevertCause::Estimate(&err));
         }
         TxOutcome::SendErr(err) => {
             record_tx_failure(&span, "send_failed", None);
@@ -2723,10 +2772,47 @@ async fn submit_chunk<P: Provider + Clone>(
     chain_fault
 }
 
-/// Submit the two halves of an oversize chunk, each as its own
-/// [`submit_chunk`] at `depth`. Each half counts its own outcome; the split
-/// itself is not a failure. Returns whether either half hit a chain fault. The
-/// right half is sent whatever the left half's outcome.
+/// How an unhalved `redeemMany` chunk reverted, for [`warn_unhalved_revert`].
+enum RevertCause<'a> {
+    /// The transaction mined and reverted.
+    Mined(TxHash),
+    /// The pre-flight gas estimate reverted; nothing broadcast.
+    Estimate(&'a ContractError),
+}
+
+/// Warn for a reverted chunk that is not halved further — mined on-chain or
+/// refused at the pre-flight gas estimate. A lone claim is the end of an
+/// isolation, so its warn names the lane: the one identity an operator needs
+/// to trace the refused registration or voucher. The claims stay for retry
+/// until their capabilities expire.
+#[allow(clippy::cognitive_complexity)] // four `warn!` arms: cause × lone/multi.
+fn warn_unhalved_revert(
+    lanes: &[PlannedLane],
+    signer: Address,
+    depth: u32,
+    cause: &RevertCause<'_>,
+) {
+    let voucher_count = lanes.len();
+    match (lanes, cause) {
+        ([lane], RevertCause::Mined(tx)) => {
+            warn!(pool_id = %lane.key.pool_id, lane_signer = %lane.key.signer, %signer, %tx, "redeemMany reverted on-chain for a lone claim; leaving the claim for retry until its capability expires");
+        }
+        (_, RevertCause::Mined(tx)) => {
+            warn!(voucher_count, depth, %signer, %tx, "redeemMany reverted on-chain; leaving claims for retry");
+        }
+        ([lane], RevertCause::Estimate(err)) => {
+            warn!(error = %sanitize_error_sources(*err), pool_id = %lane.key.pool_id, lane_signer = %lane.key.signer, %signer, "redeemMany gas estimate reverted for a lone claim; the contract refuses it; leaving the claim for retry until its capability expires");
+        }
+        (_, RevertCause::Estimate(err)) => {
+            warn!(error = %sanitize_error_sources(*err), voucher_count, depth, %signer, "redeemMany gas estimate reverted and the chunk cannot be halved further; leaving claims for retry");
+        }
+    }
+}
+
+/// Submit the two halves of a halved chunk — oversize or reverting — each as
+/// its own [`submit_chunk`] at `depth`. Each half counts its own outcome; the
+/// split itself is not a failure. Returns whether either half hit a chain
+/// fault. The right half is sent whatever the left half's outcome.
 async fn submit_halves<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -2752,8 +2838,9 @@ async fn submit_halves<P: Provider + Clone>(
 /// ([`redeemer_loop`]). Every outcome but `Landed` is one, the unconfirmed ones
 /// included: the lane's claim stays unsettled either way, so a hint that retries
 /// it at once meets the same fault. A chunk that `submit_chunk` halves — an
-/// oversize send, refused or possibly broadcast, or a reverted multi-lane
-/// chunk — takes the outcome of its halves instead.
+/// oversize send, refused or possibly broadcast, a reverted gas estimate, or
+/// a mined revert of a multi-lane chunk — takes the outcome of its halves
+/// instead.
 const fn is_chain_fault(outcome: &TxOutcome) -> bool {
     match outcome {
         TxOutcome::Landed(_) => false,
@@ -2776,8 +2863,8 @@ const fn is_chain_fault(outcome: &TxOutcome) -> bool {
 /// on. Any other send that may have broadcast (`MaybeBroadcast`) may also mine,
 /// so it counts only into `decdn_onchain_tx_maybe_broadcast_total`. A chunk
 /// that `submit_chunk` halves — an oversize send, refused or possibly
-/// broadcast, or a reverted multi-lane chunk — never reaches this count: each
-/// half counts its own outcome.
+/// broadcast, a reverted gas estimate, or a mined revert of a multi-lane
+/// chunk — never reaches this count: each half counts its own outcome.
 fn is_redemption_failure(outcome: &TxOutcome) -> bool {
     match outcome {
         TxOutcome::Reverted(_) | TxOutcome::SendErr(_) => true,
@@ -3449,6 +3536,31 @@ fn is_oversize_send(err: &ContractError) -> bool {
 /// sweep, and its lanes stay unredeemed until
 /// `blockchain.redeem_max_vouchers_per_tx` drops; the caller bounds retry depth,
 /// so a false positive costs at most a bounded number of doomed smaller sends.
+/// Whether a JSON-RPC error message carries the standard revert text: the
+/// text half of [`is_revert_send`]. Matched case-insensitively.
+fn is_revert_send_marker(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("execution reverted")
+}
+
+/// Whether a `redeemMany` send error is the pre-flight gas estimate
+/// reverting. The node's wallet provider fills gas through
+/// [`decdn_incentive::tx::GasHeadroomFiller`], which estimates before every
+/// send, so a chunk holding a claim the contract refuses — e.g. a
+/// `CapabilityReg` whose signature `ecrecover` rejects — fails here, with
+/// nothing broadcast and no gas spent. Matched on the JSON-RPC answer only:
+/// revert data attached, the standard revert code `3`, or the
+/// `execution reverted` text. The caller bounds retry depth, so a false
+/// positive costs at most a bounded number of doomed smaller sends; a false
+/// negative leaves the chunk re-sent whole on every sweep.
+fn is_revert_send(err: &ContractError) -> bool {
+    use alloy::transports::RpcError;
+
+    let ContractError::TransportError(RpcError::ErrorResp(resp)) = err else {
+        return false;
+    };
+    resp.as_revert_data().is_some() || resp.code == 3 || is_revert_send_marker(&resp.message)
+}
+
 fn is_oversize_send_err(msg: &str) -> bool {
     const MARKERS: [&str; 5] = [
         "gas required exceeds",

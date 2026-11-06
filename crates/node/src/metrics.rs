@@ -950,8 +950,11 @@ pub struct DecdnMetrics {
     /// Redemption steps that failed: a `redeemMany` chunk that reverted
     /// on-chain or that the RPC refused at `send`, a lane whose plan failed,
     /// or a hint-path lane that could not be read from the lane store. A
-    /// chunk whose receipt stays unconfirmed after the by-hash fetch does not
-    /// count here; it counts into `decdn_onchain_tx_receipt_failed_total` or
+    /// multi-lane chunk the redeemer halves — oversize, estimate-reverted, or
+    /// mined-reverted — does not count here; each half counts its own
+    /// outcome. A chunk whose receipt stays unconfirmed after the by-hash
+    /// fetch does not count here either; it counts into
+    /// `decdn_onchain_tx_receipt_failed_total` or
     /// `decdn_onchain_tx_timeout_total`. Nor does a chunk whose send may have
     /// broadcast; it counts into `decdn_onchain_tx_maybe_broadcast_total`.
     /// Each failure is otherwise only a single `warn!`; a sustained rate means

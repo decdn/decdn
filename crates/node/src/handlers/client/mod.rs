@@ -2263,9 +2263,9 @@ impl ClientHandler {
         // never the raw wire bytes: `from_raw` also accepts the raw-parity
         // (0/1) and EIP-155 recovery-byte forms, but on-chain `ecrecover`
         // returns `address(0)` for v ∉ {27, 28}, so a raw form forwarded
-        // verbatim would revert every `redeemMany` the lane joins. Recovery
-        // above already proved the owner, so the grant is normalized, not
-        // refused.
+        // verbatim would make every `redeemMany` the lane joins revert (at
+        // the gas estimate, or mined). Recovery above already proved the
+        // owner, so the grant is normalized, not refused.
         // Kept ON the lane — not in a side table — so it is written in the same
         // durable transaction as the voucher frontier and can never be lost while
         // the frontier survives (#1906). A buffered in-memory insert like every
