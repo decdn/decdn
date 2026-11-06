@@ -6,6 +6,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -58,6 +60,25 @@ pub struct HttpOrigin {
     /// [`DecompressMode::Auto`] — see that type for the full semantics.
     /// Override with [`Self::with_decompress_mode`].
     decompress: DecompressMode,
+    /// One bit per outboard-decline status class (see
+    /// [`outboard_decline_class`]) that has already logged at warn. An origin
+    /// that answers 403 for a missing key (an S3 REST endpoint without
+    /// `s3:ListBucket`, a CDN with origin access control) declines the outboard of every
+    /// blob, so each class warns once per origin and logs at debug after that.
+    /// Shared across clones, which are the same origin.
+    outboard_declines_warned: Arc<AtomicU8>,
+}
+
+/// The warn-once bit for a non-success, non-404, non-retriable outboard GET
+/// status: 401, 403 and 3xx each have their own class; every other status
+/// shares the last one.
+fn outboard_decline_class(status: StatusCode) -> u8 {
+    match status {
+        StatusCode::UNAUTHORIZED => 1,
+        StatusCode::FORBIDDEN => 1 << 1,
+        s if s.is_redirection() => 1 << 2,
+        _ => 1 << 3,
+    }
 }
 
 impl HttpOrigin {
@@ -140,7 +161,37 @@ impl HttpOrigin {
             response_headers_timeout: RESPONSE_HEADERS_TIMEOUT,
             chunk_idle_timeout: CHUNK_IDLE_TIMEOUT,
             decompress: DecompressMode::Auto,
+            outboard_declines_warned: Arc::new(AtomicU8::new(0)),
         })
+    }
+
+    /// Whether `status` is the first outboard decline of its class on this
+    /// origin. Marks the class as seen.
+    fn first_outboard_decline(&self, status: StatusCode) -> bool {
+        let bit = outboard_decline_class(status);
+        let seen = self
+            .outboard_declines_warned
+            .fetch_or(bit, Ordering::Relaxed);
+        seen & bit == 0
+    }
+
+    /// Log a deterministic outboard decline: at warn for the first decline of
+    /// its status class on this origin, at debug after that.
+    fn log_outboard_decline(&self, url_log: &str, status: StatusCode) {
+        if self.first_outboard_decline(status) {
+            tracing::warn!(
+                url = %url_log,
+                %status,
+                "origin declined the outboard GET; range pulls fall back to whole-blob \
+                 (further declines with this status class log at debug)",
+            );
+        } else {
+            tracing::debug!(
+                url = %url_log,
+                %status,
+                "origin declined the outboard GET; range pulls fall back to whole-blob",
+            );
+        }
     }
 
     /// Convenience constructor that parses `raw` via [`parse_origin_url`]
@@ -387,7 +438,8 @@ impl Origin for HttpOrigin {
             // compliant origin answers `206 Partial Content` with exactly the
             // requested span. A `200` means the origin ignored `Range` and
             // would stream the whole blob — refuse and let the engine
-            // whole-blob pull instead of buffering the entire object here.
+            // whole-blob pull instead of buffering the entire object here. A
+            // retriable status is a fault (see `get_range_bytes`).
             let data_url = self
                 .base_url
                 .as_url()
@@ -541,10 +593,13 @@ impl HttpOrigin {
     }
 
     /// GET `url` and buffer the whole body, capped at `max_bytes`, as an
-    /// [`OutboardFetch`]. A genuine 404 is [`OutboardFetch::NotFound`]; every
-    /// other non-success status — redirect (disabled per #579), permission
-    /// decline, 5xx — is [`OutboardFetch::Unsupported`]. Neither is an error; only a
-    /// transport-level fault on the `.send()` surfaces as [`OriginPullError`].
+    /// [`OutboardFetch`]. A genuine 404 is [`OutboardFetch::NotFound`]. A
+    /// retriable status (5xx/408/429 per [`is_transient_status`]) is an
+    /// [`OriginPullError::Transient`]: the origin errs, it does not decline.
+    /// Any other non-success status — redirect (disabled per #579), permission
+    /// decline — degrades to [`OutboardFetch::Unsupported`] and warns once per
+    /// status class on this origin. A transport fault on the send or the body
+    /// read is an [`OriginPullError`] too.
     async fn get_outboard_bounded(
         &self,
         url: &reqwest::Url,
@@ -557,11 +612,25 @@ impl HttpOrigin {
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(OutboardFetch::NotFound);
         }
-        // Any other non-success (3xx — redirects are disabled, #579 — 401/403,
-        // 5xx) degrades rather than errors: the optimization is best-effort,
-        // and a persistent fault re-surfaces at full severity on whatever
-        // fallback path the caller takes next.
-        if !resp.status().is_success() {
+        // A retriable status is a fault, not a decline. An `Unsupported` here
+        // looks the same as an origin that publishes no outboards, so an
+        // outage would degrade every range pull of the blob and leave no fault
+        // record. As an error, the engine warns and tries the next origin; the
+        // serve-miss probe latches the fault (#1129) and degrades that pull to
+        // a whole-blob populate. Retriable statuses classify as in the S3
+        // adapter's `classify_get_object_error`.
+        let status = resp.status();
+        if !status.is_success() && is_transient_status(status) {
+            return Err(OriginPullError::Transient(anyhow::anyhow!(
+                "origin outboard GET {url_log} answered {status}"
+            )));
+        }
+        // A deterministic decline (3xx — redirects are disabled, #579 —
+        // 401/403) degrades rather than errors: the optimization is
+        // best-effort. The engine never logs an `Unsupported`, so the first
+        // decline of each class warns; repeats log at debug.
+        if !status.is_success() {
+            self.log_outboard_decline(&url_log, status);
             return Ok(OutboardFetch::Unsupported);
         }
         // An outboard over the cap degrades rather than errors, so the engine
@@ -594,10 +663,12 @@ impl HttpOrigin {
     }
 
     /// GET `url` with a `Range` header and buffer the partial body. Returns
-    /// `Ok(None)` when the origin does not honor the range (any status other
-    /// than `206`, e.g. a `200` whole-blob response) or the returned span is
-    /// not exactly `want` bytes — both degrade the engine to a whole-blob
-    /// pull. `want` is capped both as the buffer ceiling and as an exact-length
+    /// `Ok(None)` when the origin does not honor the range (any non-retriable
+    /// status other than `206`, e.g. a `200` whole-blob response) or the
+    /// returned span is not exactly `want` bytes — both degrade the engine to a
+    /// whole-blob pull. A retriable status (5xx/408/429 per
+    /// [`is_transient_status`]) is an [`OriginPullError::Transient`], never a
+    /// decline. `want` is capped both as the buffer ceiling and as an exact-length
     /// check, so an origin that streams the whole object on a `200` is rejected
     /// at the header (status) before any large buffer is committed.
     async fn get_range_bytes(
@@ -613,10 +684,19 @@ impl HttpOrigin {
                 &format!("GET {url_log} (range)"),
             )
             .await?;
+        // A retriable status is a fault, not a decline: a decline reads as an
+        // origin that cannot serve ranges, which hides an outage behind a
+        // whole-blob pull with no fault record. As in the outboard GET.
+        let status = resp.status();
+        if !status.is_success() && is_transient_status(status) {
+            return Err(OriginPullError::Transient(anyhow::anyhow!(
+                "origin GET {url_log} (range) answered {status}"
+            )));
+        }
         // Only `206 Partial Content` is an honored range. A `200` means the
         // origin ignored `Range` and is sending the whole blob — degrade
         // before reading the (potentially huge) body.
-        if resp.status() != StatusCode::PARTIAL_CONTENT {
+        if status != StatusCode::PARTIAL_CONTENT {
             return Ok(None);
         }
         // A `206` whose advertised `Content-Length` already differs from the

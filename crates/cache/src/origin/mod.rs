@@ -8,6 +8,8 @@ pub(crate) mod decompress;
 pub mod fs;
 pub mod http;
 pub(crate) mod io_runtime;
+#[cfg(test)]
+mod log_capture;
 pub mod s3;
 
 use std::future::Future;
@@ -412,10 +414,13 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// shipped adapters override it.
     ///
     /// Like [`Self::fetch_range_data`], returning [`OutboardFetch::Unsupported`]
-    /// or [`OutboardFetch::NotFound`] is never an error. A transport or
-    /// permission failure, or an object the origin refuses to read (the
-    /// filesystem origin's symlink escape or non-regular file), surfaces as
-    /// [`OriginPullError`].
+    /// or [`OutboardFetch::NotFound`] is never an error. A transport fault, a
+    /// retriable origin fault (an HTTP 5xx, 408 or 429), or an object the origin
+    /// refuses to read (the filesystem origin's symlink escape or non-regular
+    /// file) surfaces as [`OriginPullError`]. An adapter may degrade a
+    /// deterministic non-404 decline to [`OutboardFetch::Unsupported`]: the HTTP
+    /// adapter does, because an origin in front of a bucket answers 403 for a
+    /// missing key; the S3 adapter faults it as [`OriginPullError::Permanent`].
     fn fetch_outboard(
         &self,
         _hash: Hash,
