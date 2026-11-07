@@ -219,13 +219,14 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MB", default_value_t = 1_048_576)]
     pub max_blob_mb: u64,
 
-    /// Refuse a provider that quotes a per-MB rate above this many USDC base units
-    /// **before** paying any voucher (#1375). Guards against a provider that quotes
-    /// low on the probe then high on the stream. `0` (the default) = no ceiling.
-    /// For a bundle this applies per entry. Note: unlike the node's automatic
-    /// node-to-node pull (which also caps at the candidate's own probe rate), the
-    /// CLI applies only this absolute value — set it to opt into buyer rate
-    /// protection on the client path.
+    /// Refuse a provider that quotes a per-MB stream rate above this many USDC
+    /// base units **before** paying any voucher (#1375). `0` (the default) = no
+    /// absolute ceiling. For a bundle this applies per entry. Each lane is also
+    /// capped at the rate the candidate's own probe signed — the quote selection
+    /// ranks on — as the node's automatic node-to-node pull caps its upstream, so
+    /// a provider that quotes low on the probe then high on the stream is refused
+    /// even at the default. A pull that harvests no probe rate (the peer-store
+    /// fast path, a pinned `--node-id`) is bounded by this value alone.
     #[arg(long, value_name = "UNITS", default_value_t = 0)]
     pub max_rate_per_mb: u64,
 

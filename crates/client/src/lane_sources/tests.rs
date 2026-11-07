@@ -129,7 +129,7 @@ fn one_operator_yields_one_holder_the_nearer_by_rank() {
         late: crate::targets::LateSlot::default(),
     };
     let mut nodes = std::collections::HashMap::new();
-    let holders = holders_from(&targets, &mut nodes);
+    let holders = holders_from(&targets, &mut nodes, &mut std::collections::HashMap::new());
     assert_eq!(holders.len(), 1, "one holder per operator");
     assert!(
         holders.iter().all(|h| !h.probed_holder),
@@ -146,8 +146,18 @@ fn one_operator_yields_one_holder_the_nearer_by_rank() {
 fn holders_carry_coverage_and_rtt_and_index_their_nodes() {
     let (targets, a, b) = crate::targets::tests_support::two_holder_targets();
     let mut nodes = std::collections::HashMap::new();
-    let holders = holders_from(&targets, &mut nodes);
+    let mut rates = std::collections::HashMap::new();
+    let holders = holders_from(&targets, &mut nodes, &mut rates);
     assert_eq!(holders.len(), 2);
+    assert_eq!(
+        rates.get(&a.node_id).copied(),
+        targets
+            .probed_samples
+            .iter()
+            .find(|(node_id, _, _)| *node_id == a.node_id)
+            .map(|&(_, _, rate)| rate),
+        "a probed holder's signed rate is kept for its lane's ceiling"
+    );
     assert!(
         holders
             .iter()
@@ -259,6 +269,34 @@ fn a_late_node_joins_only_for_a_new_operator() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A lane is built at [`crate::effective_rate_ceiling`] of the candidate's
+/// probed rate and the absolute config cap; a candidate this fetch harvested
+/// no rate for keeps the config cap alone.
+#[test]
+fn the_lane_ceiling_is_the_probe_quote_bounded_by_the_config_cap() {
+    use super::lane_rate_ceiling;
+    let node_id = iroh::SecretKey::from_bytes(&[8; 32]).public();
+    let rates = std::collections::HashMap::from([(node_id, 40u64)]);
+    assert_eq!(lane_rate_ceiling(&rates, &node_id, 100), 40, "probe binds");
+    assert_eq!(lane_rate_ceiling(&rates, &node_id, 10), 10, "config binds");
+    assert_eq!(
+        lane_rate_ceiling(&rates, &node_id, 0),
+        40,
+        "the probe quote arms the stream-rate check at the config default of 0"
+    );
+    let unprobed = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    assert_eq!(
+        lane_rate_ceiling(&rates, &unprobed, 25),
+        25,
+        "no sample: the config cap alone"
+    );
+    assert_eq!(
+        lane_rate_ceiling(&rates, &unprobed, 0),
+        0,
+        "no sample, no config cap: unbounded"
+    );
+}
+
 /// Failed outcomes never join.
 #[test]
 fn late_join_ignores_failed_outcomes() {
@@ -295,8 +333,9 @@ fn a_rediscovery_refreshes_an_operators_node() {
         late: crate::targets::LateSlot::default(),
     };
     let mut nodes = std::collections::HashMap::new();
-    holders_from(&targets(node(1)), &mut nodes);
-    holders_from(&targets(node(2)), &mut nodes);
+    let mut rates = std::collections::HashMap::new();
+    holders_from(&targets(node(1)), &mut nodes, &mut rates);
+    holders_from(&targets(node(2)), &mut nodes, &mut rates);
     assert_eq!(
         nodes.get(&Address::repeat_byte(0xAA)).map(|n| n.node_id),
         Some(node(2).node_id)
@@ -307,7 +346,7 @@ fn a_rediscovery_refreshes_an_operators_node() {
 async fn claim_of(targets: &crate::targets::ResolvedTargets) -> anyhow::Result<(u64, usize)> {
     let opens = std::sync::atomic::AtomicUsize::new(0);
     let mut nodes = std::collections::HashMap::new();
-    let holders = holders_from(targets, &mut nodes);
+    let holders = holders_from(targets, &mut nodes, &mut std::collections::HashMap::new());
     let claim = super::first_claim_or_open(targets.size_hint, holders, |holders| {
         opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         async move {
@@ -356,14 +395,15 @@ fn a_pinned_node_is_a_probed_holder() {
     let (mut targets, _, _) = crate::targets::tests_support::two_holder_targets();
     targets.coverage_by_node.clear();
     let mut nodes = std::collections::HashMap::new();
+    let mut rates = std::collections::HashMap::new();
     assert!(
-        holders_from(&targets, &mut nodes)
+        holders_from(&targets, &mut nodes, &mut rates)
             .iter()
             .all(|h| !h.probed_holder)
     );
     targets.pinned = true;
     assert!(
-        holders_from(&targets, &mut nodes)
+        holders_from(&targets, &mut nodes, &mut rates)
             .iter()
             .all(|h| h.probed_holder)
     );
@@ -666,5 +706,142 @@ fn the_primed_first_leg_carries_the_streamers_store_size() -> anyhow::Result<()>
     let leg = primed_first_leg(streamed, 0, &span, short)
         .ok_or_else(|| anyhow::anyhow!("the clamped pull is not the leg"))?;
     anyhow::ensure!(leg == decdn_bao_range::align_range(0, 0, short)?, "{leg:?}");
+    Ok(())
+}
+
+/// A late-joining holder's probed rate is captured for its lane's
+/// stream-rate ceiling, exactly as a first-round holder's is.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fixture: the lane deps a real LaneSources needs"
+)]
+#[tokio::test]
+async fn a_late_holders_probed_rate_is_captured_for_its_lane_ceiling() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::buyer_pool::BuyerPoolStore;
+    use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
+    use decdn_incentive::payment_pool::PaymentPool;
+    use futures_util::StreamExt as _;
+
+    use crate::SourceProvider as _;
+
+    use crate::lanes::{LaneDeps, LanePayer};
+    use crate::session::{
+        ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PoolOpen, PullSite,
+    };
+
+    let chain = ChainConfig {
+        rpc_url: "http://config:8545".to_string(),
+        chain_id: 1,
+        payment_pool: Address::repeat_byte(0x33),
+        slash_judge: Address::repeat_byte(0x44),
+        capacity_bond: None,
+    };
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn BuyerPoolStore> =
+        Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
+    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await?;
+    let rpc = alloy::providers::ProviderBuilder::new()
+        .connect_mocked_client(alloy::providers::mock::Asserter::new());
+    let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
+    let site = PullSite {
+        data_dir: dir.path().to_path_buf(),
+        region: None,
+        region_allowlist: Vec::new(),
+    };
+    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.slash_judge);
+    let connections = crate::Connections::new(ep.clone());
+    let writes = crate::ordered_writes::OrderedWrites::default();
+    let funding = crate::funding::RunFunding::default();
+    let payer = crate::buyer_pool::OwnedPayer::for_store(
+        Arc::new(PrivateKeySigner::random()),
+        store.as_ref(),
+    )?;
+    let deps = LaneDeps {
+        marks: None,
+        evidence: None,
+        endpoint: &ep,
+        store: &store,
+        contract: &contract,
+        rpc: &rpc,
+        slash_dom: &slash_dom,
+        self_address: payer.owner().address(),
+        token: Address::repeat_byte(0x22),
+        chain: &chain,
+        site: &site,
+        deposit: DepositPolicy {
+            working_deposit: alloy::primitives::U256::ZERO,
+            max_approve: false,
+            adoption: ChainAdoption::Refused,
+            open: PoolOpen::Allowed,
+        },
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        max_rate_per_mb: 0,
+        max_blob_bytes: 0,
+        deadlines: crate::PullDeadlines::new(Duration::from_secs(5), Duration::from_secs(5), 0)?,
+        connections: &connections,
+        writes: &writes,
+        funding: &funding,
+    };
+    let discovery = DiscoveryOptions::default();
+    let voucher_dom = chain.deployment().voucher_domain();
+    let recovery = Arc::new(crate::RecoveryGate::new());
+    let sources = super::LaneSources::new(
+        &deps,
+        &discovery,
+        &[],
+        LanePayer::Owned(&payer),
+        &voucher_dom,
+        None,
+        None,
+        None,
+        &recovery,
+    );
+
+    let node_id = iroh::SecretKey::from_bytes(&[6; 32]).public();
+    let late_rate = 7u64;
+    let outcome = crate::targets::ProbeOutcome::Holder(
+        crate::discovery::Probed {
+            candidate: crate::discovery::NodeCandidate {
+                node_id,
+                eth_address: Address::repeat_byte(6),
+                region_hint: None,
+                multiaddrs: alloy::primitives::Bytes::new(),
+            },
+            rtt_ms: 100.0,
+            total_bytes: None,
+            coverage: decdn_protocol::Coverage::full(4),
+        },
+        (node_id, 100.0, late_rate),
+    );
+    *sources
+        .late
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::targets::LateProbes {
+        tail: Box::pin(futures_util::stream::iter(vec![outcome])),
+        best_holder_rtt_ms: 200.0,
+        warming: warming(true),
+    });
+    let mut arrivals = sources
+        .arrivals()
+        .ok_or_else(|| anyhow::anyhow!("the late slot holds a round"))?;
+    let joined = arrivals
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("the late holder joins"))?;
+    anyhow::ensure!(joined.provider == Address::repeat_byte(6));
+    drop(arrivals);
+    anyhow::ensure!(
+        super::lane_rate_ceiling(&sources.lock_probe_rates(), &node_id, 0) == late_rate,
+        "the late holder's lane ceiling is its probed rate"
+    );
+    drop(sources);
+    ep.close().await;
     Ok(())
 }

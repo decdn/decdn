@@ -273,6 +273,7 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
             Arc::clone(&ctx),
             Arc::clone(&ledger),
             provider,
+            0,
         );
         assert!(
             source.open(entry, range.clone()).await.is_err(),
@@ -716,6 +717,7 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
         &voucher_dom,
         Address::repeat_byte(0xB0),
         addr,
+        0,
         Some(&open_lock),
         None,
         &ended,

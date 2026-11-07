@@ -16,7 +16,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
 use decdn_bao_range::AlignedRange;
 use decdn_incentive::{LaneKey, PoolId};
-use iroh::RelayUrl;
+use iroh::{PublicKey, RelayUrl};
 use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::WatermarkRow;
@@ -211,6 +211,11 @@ pub struct LaneSources<'a, P> {
     recovery: &'a Arc<RecoveryGate>,
     /// Every holder's node, keyed by its on-chain provider address.
     nodes: Mutex<HashMap<Address, NodeCandidate>>,
+    /// The per-MiB rate each verified probe answer signed this fetch, keyed by
+    /// node id: the probe-relative bound every lane build folds into its
+    /// stream-rate ceiling ([`lane_rate_ceiling`]), so a node is never paid a
+    /// stream rate above the quote it was selected on.
+    probe_rates: Mutex<HashMap<PublicKey, u64>>,
     peer_store: crate::PeerStore,
     /// Every built lane's watermark handle, in build order.
     handles: Mutex<Vec<FaceLaneHandle>>,
@@ -265,6 +270,7 @@ where
             lane_cap,
             recovery,
             nodes: Mutex::new(HashMap::new()),
+            probe_rates: Mutex::new(HashMap::new()),
             peer_store: crate::PeerStore::open(&deps.site.data_dir),
             handles: Mutex::new(Vec::new()),
             parked: Mutex::new(HashMap::new()),
@@ -274,8 +280,9 @@ where
     }
 
     /// The holders `targets` names, indexing each one's node for `connect`.
-    /// A probe's size hint is kept for [`Self::first_claim`], and a streamed
-    /// round's pending probes for [`SourceProvider::arrivals`].
+    /// A probe's size hint is kept for [`Self::first_claim`], a streamed
+    /// round's pending probes for [`SourceProvider::arrivals`], and each
+    /// probed rate for the lane's stream-rate ceiling (`lane_rate_ceiling`).
     pub fn holders_from(&self, targets: &ResolvedTargets) -> Vec<Holder> {
         if let Some(hint) = targets.size_hint {
             *self
@@ -286,7 +293,11 @@ where
         if let Some(late) = targets.late.take() {
             *self.late.lock().unwrap_or_else(PoisonError::into_inner) = Some(late);
         }
-        holders_from(targets, &mut self.lock_nodes())
+        holders_from(
+            targets,
+            &mut self.lock_nodes(),
+            &mut self.lock_probe_rates(),
+        )
     }
 
     /// The [`Holder`] for a late `join` ([`admit_late`]), counted as joined.
@@ -619,6 +630,12 @@ where
         self.nodes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn lock_probe_rates(&self) -> std::sync::MutexGuard<'_, HashMap<PublicKey, u64>> {
+        self.probe_rates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Take `provider`'s lane that the first open parked, if it is still
     /// parked. The first open built it through [`Self::build`], so it already
     /// holds what `build` gives every lane.
@@ -677,6 +694,11 @@ where
             .ok_or_else(|| anyhow::anyhow!("no known node for provider {}", holder.provider))?;
         let addr = self.discovery.pinned.and_then(|pinned| pinned.addr);
         let target = lane_target(&candidate, addr, self.relays);
+        let rate_ceiling = lane_rate_ceiling(
+            &self.lock_probe_rates(),
+            &candidate.node_id,
+            self.deps.max_rate_per_mb,
+        );
         // A lane built after a swap records the new key's earlier spend first.
         if let LanePayer::Delegated(slot) = self.payer {
             self.seed_spend(slot);
@@ -687,6 +709,7 @@ where
             self.voucher_dom,
             holder.provider,
             target,
+            rate_ceiling,
             self.open_lock,
             self.ledgers,
             ended,
@@ -810,6 +833,8 @@ where
                 async move {
                     while let Some(outcome) = tail.next().await {
                         if let Some(sample) = outcome.sample() {
+                            let (node_id, _, rate_per_mb) = sample;
+                            self.lock_probe_rates().insert(node_id, rate_per_mb);
                             samples.push(sample);
                         }
                         if let Some(holder) = late_join(outcome, &mut best, warming)
@@ -991,11 +1016,17 @@ pub(crate) fn admit_late(
 /// are not. Each holder's node goes into `nodes`, keyed by provider, and
 /// replaces the node a rediscovery found for that operator before, so the next
 /// lane build dials the node the latest probe ranked. A lane already built
-/// keeps its node.
+/// keeps its node. Each verified sample's signed rate goes into `probe_rates`,
+/// keyed by node id, for the lane's stream-rate ceiling
+/// ([`lane_rate_ceiling`]).
 pub(crate) fn holders_from(
     targets: &ResolvedTargets,
     nodes: &mut HashMap<Address, NodeCandidate>,
+    probe_rates: &mut HashMap<PublicKey, u64>,
 ) -> Vec<Holder> {
+    for &(node_id, _, rate_per_mb) in &targets.probed_samples {
+        probe_rates.insert(node_id, rate_per_mb);
+    }
     let rtt: HashMap<_, f64> = targets
         .probed_samples
         .iter()
@@ -1020,6 +1051,25 @@ pub(crate) fn holders_from(
         nodes.insert(candidate.eth_address, candidate.clone());
     }
     holders
+}
+
+/// The stream-rate ceiling a lane to `node_id` is built with:
+/// [`crate::effective_rate_ceiling`] of the rate the node's latest verified
+/// probe signed this fetch (`0`, no probe-relative bound, when no sample was
+/// harvested: the peer-store fast path, or a pinned `--node-id`) and the
+/// absolute `max_rate_per_mb` config cap. The bound the daemon's node-to-node
+/// miss pull applies, so a node that signs a low probe rate — the quote
+/// selection ranked on — and a higher stream rate is refused at the open
+/// ([`crate::RateAboveCeiling`]) even at the config default of `0`.
+pub(crate) fn lane_rate_ceiling(
+    probe_rates: &HashMap<PublicKey, u64>,
+    node_id: &PublicKey,
+    max_rate_per_mb: u64,
+) -> u64 {
+    crate::effective_rate_ceiling(
+        probe_rates.get(node_id).copied().unwrap_or(0),
+        max_rate_per_mb,
+    )
 }
 
 #[cfg(test)]
