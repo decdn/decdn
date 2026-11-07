@@ -1280,6 +1280,18 @@ impl Gateway {
         })
     }
 
+    /// How many generated-page bytes could fit the public allowance `bucket`
+    /// right now: what is left of it today, or no bound on a loopback
+    /// gateway. A render counted under this cap stops once it cannot fit.
+    fn listing_cap(&self, bucket: Option<u64>) -> usize {
+        self.public.as_ref().map_or(usize::MAX, |public| {
+            match public.allowance.remaining(bucket, now_secs()) {
+                Ok(left) => usize::try_from(left).unwrap_or(usize::MAX),
+                Err(_retry_after) => 0,
+            }
+        })
+    }
+
     async fn answer<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
@@ -2216,21 +2228,42 @@ impl Gateway {
         let uri = DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace);
         // The listing has a length too: one that does not fit is refused,
         // before any of the page is allocated — escaping can grow a row to
-        // several times its manifest entry. Neither sink here can fail.
-        let mut counted = CountingWriter(0);
-        let _ = write_listing(
+        // several times its manifest entry. The count is capped at what is
+        // left of the allowance, so a listing past it stops rendering as
+        // soon as that is known.
+        let mut counted = CountingWriter::up_to(self.listing_cap(paying.bucket()));
+        if write_listing(
             &mut counted,
             &manifest,
             manifest_hash,
             namespace,
             present,
             &uri,
-        );
-        let length = u64::try_from(counted.0).unwrap_or(u64::MAX);
+        )
+        .is_err()
+        {
+            let length = u64::try_from(counted.count).unwrap_or(u64::MAX);
+            if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length)) {
+                return Ok(refused);
+            }
+            // The allowance reset between the cap read and the check (a new
+            // day): count again under no bound. An unbounded count, and the
+            // build below, cannot fail.
+            counted = CountingWriter::up_to(usize::MAX);
+            let _ = write_listing(
+                &mut counted,
+                &manifest,
+                manifest_hash,
+                namespace,
+                present,
+                &uri,
+            );
+        }
+        let length = u64::try_from(counted.count).unwrap_or(u64::MAX);
         if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length)) {
             return Ok(refused);
         }
-        let mut page = String::with_capacity(counted.0);
+        let mut page = String::with_capacity(counted.count);
         let _ = write_listing(
             &mut page,
             &manifest,
@@ -2239,7 +2272,7 @@ impl Gateway {
             present,
             &uri,
         );
-        debug_assert_eq!(page.len(), counted.0);
+        debug_assert_eq!(page.len(), counted.count);
         self.charge(paying.bucket(), page.len());
         Ok(html(StatusCode::OK, &page))
     }
@@ -3504,21 +3537,39 @@ fn write_escaped(out: &mut impl std::fmt::Write, s: &str) -> std::fmt::Result {
 }
 
 /// A [`std::fmt::Write`] sink that keeps nothing: it counts the UTF-8 bytes
-/// written, so a page's length is known before the page is built.
-struct CountingWriter(usize);
+/// written, so a page's length is known before the page is built. A write
+/// that takes the count past the cap fails, which stops a render as soon as
+/// the page is known not to fit; the count then sits just past the cap.
+struct CountingWriter {
+    /// UTF-8 bytes written so far (saturating).
+    count: usize,
+    /// The bound: a count past it fails the write.
+    cap: usize,
+}
+
+impl CountingWriter {
+    /// A sink that accepts up to `cap` bytes. `usize::MAX` never fails.
+    const fn up_to(cap: usize) -> Self {
+        Self { count: 0, cap }
+    }
+}
 
 impl std::fmt::Write for CountingWriter {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.0 = self.0.saturating_add(s.len());
+        self.count = self.count.saturating_add(s.len());
+        if self.count > self.cap {
+            return Err(std::fmt::Error);
+        }
         Ok(())
     }
 }
 
-/// Writes the listing page of a bundle without an `index.html` into `out`:
-/// the bundle URI, then one row per manifest entry linking to its URL. The
-/// counting pass and the building pass both render through this one function,
-/// so the length checked against the allowance and the page charged for it
-/// cannot drift.
+/// Writes the HTML listing of a bundle's entries into `out` — the bundle URI,
+/// then one row per entry linking to its URL — which [`Gateway::index`]
+/// answers when it does not serve the bundle's `index.html`. The counting
+/// pass and the building pass both render through this one function, over
+/// the same in-memory manifest, so the length checked against the allowance
+/// and the page charged for it cannot drift.
 fn write_listing(
     out: &mut impl std::fmt::Write,
     manifest: &BundleManifest,
