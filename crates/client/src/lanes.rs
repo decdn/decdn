@@ -172,7 +172,10 @@ pub struct LaneDeps<'a, P> {
     pub deposit: DepositPolicy,
     /// The ADR 005 namespace routing hint every request carries.
     pub namespace_id: [u8; 32],
-    /// The highest per-MB rate a lane accepts; `0` sets no ceiling.
+    /// The absolute per-MB rate cap, folded per lane with the rate the
+    /// candidate's own probe signed ([`crate::effective_rate_ceiling`]);
+    /// `0` sets no absolute cap, and a probed lane is still capped at its
+    /// probe rate.
     pub max_rate_per_mb: u64,
     /// The largest blob a lane accepts.
     pub max_blob_bytes: u64,

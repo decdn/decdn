@@ -1054,13 +1054,14 @@ pub(crate) fn holders_from(
 }
 
 /// The stream-rate ceiling a lane to `node_id` is built with:
-/// [`crate::effective_rate_ceiling`] of the rate the node's latest verified
-/// probe signed this fetch (`0`, no probe-relative bound, when no sample was
-/// harvested: the peer-store fast path, or a pinned `--node-id`) and the
-/// absolute `max_rate_per_mb` config cap. The bound the daemon's node-to-node
-/// miss pull applies, so a node that signs a low probe rate — the quote
-/// selection ranked on — and a higher stream rate is refused at the open
-/// ([`crate::RateAboveCeiling`]) even at the config default of `0`.
+/// [`crate::effective_rate_ceiling`] of the rate the node's last recorded
+/// verified probe signed this fetch (`0`, no probe-relative bound, when no
+/// sample was harvested: the peer-store fast path, or a pinned `--node-id`)
+/// and the absolute `max_rate_per_mb` config cap. The probe-relative fold the
+/// daemon's node-to-node miss pull also applies, so a node that signs a low
+/// probe rate — the quote the node was selected on — and a higher stream rate
+/// is refused at the open ([`crate::RateAboveCeiling`]) even at the config
+/// default of `0`.
 pub(crate) fn lane_rate_ceiling(
     probe_rates: &HashMap<PublicKey, u64>,
     node_id: &PublicKey,

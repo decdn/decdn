@@ -149,15 +149,15 @@ fn holders_carry_coverage_and_rtt_and_index_their_nodes() {
     let mut rates = std::collections::HashMap::new();
     let holders = holders_from(&targets, &mut nodes, &mut rates);
     assert_eq!(holders.len(), 2);
-    assert_eq!(
-        rates.get(&a.node_id).copied(),
-        targets
-            .probed_samples
-            .iter()
-            .find(|(node_id, _, _)| *node_id == a.node_id)
-            .map(|&(_, _, rate)| rate),
-        "a probed holder's signed rate is kept for its lane's ceiling"
-    );
+    // The fixture's two samples carry distinct rates, so a rate keyed to the
+    // wrong node fails here.
+    for (node_id, _, rate) in &targets.probed_samples {
+        assert_eq!(
+            rates.get(node_id).copied(),
+            Some(*rate),
+            "each probed holder's signed rate is kept under its own node id"
+        );
+    }
     assert!(
         holders
             .iter()
@@ -324,21 +324,29 @@ fn a_rediscovery_refreshes_an_operators_node() {
         region_hint: None,
         multiaddrs: alloy::primitives::Bytes::new(),
     };
-    let targets = |n: crate::discovery::NodeCandidate| crate::targets::ResolvedTargets {
+    let targets = |n: crate::discovery::NodeCandidate, rate: u64| crate::targets::ResolvedTargets {
+        probed_samples: vec![(n.node_id, 1.0, rate)],
         candidates: vec![n],
         coverage_by_node: std::collections::HashMap::new(),
-        probed_samples: Vec::new(),
         pinned: false,
         size_hint: None,
         late: crate::targets::LateSlot::default(),
     };
     let mut nodes = std::collections::HashMap::new();
     let mut rates = std::collections::HashMap::new();
-    holders_from(&targets(node(1)), &mut nodes, &mut rates);
-    holders_from(&targets(node(2)), &mut nodes, &mut rates);
+    holders_from(&targets(node(1), 4), &mut nodes, &mut rates);
+    holders_from(&targets(node(2), 6), &mut nodes, &mut rates);
     assert_eq!(
         nodes.get(&Address::repeat_byte(0xAA)).map(|n| n.node_id),
         Some(node(2).node_id)
+    );
+    // A re-probe of a node replaces its recorded rate.
+    holders_from(&targets(node(2), 8), &mut nodes, &mut rates);
+    assert_eq!(rates.get(&node(2).node_id).copied(), Some(8));
+    assert_eq!(
+        rates.get(&node(1).node_id).copied(),
+        Some(4),
+        "the replaced node's rate stays recorded under its own id"
     );
 }
 
@@ -841,6 +849,159 @@ async fn a_late_holders_probed_rate_is_captured_for_its_lane_ceiling() -> anyhow
         super::lane_rate_ceiling(&sources.lock_probe_rates(), &node_id, 0) == late_rate,
         "the late holder's lane ceiling is its probed rate"
     );
+    drop(sources);
+    ep.close().await;
+    Ok(())
+}
+
+/// A lane built from a probed candidate carries the probed rate as its
+/// stream-rate ceiling at the config default of `0`: the splice from the
+/// harvested sample through `build_fresh` and `lane_source` into the
+/// [`crate::PeerSource`] the lane pays on.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fixture: the lane deps a real LaneSources needs"
+)]
+#[tokio::test]
+async fn a_built_lane_carries_the_probed_rate_as_its_ceiling() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use alloy::primitives::B256;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol_types::SolValue as _;
+    use decdn_incentive::buyer_pool::BuyerPoolStore;
+    use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
+    use decdn_incentive::payment_pool::PaymentPool;
+
+    use crate::SourceProvider as _;
+    use crate::lanes::{LaneDeps, LanePayer};
+    use crate::session::{
+        ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PoolOpen, PullSite,
+    };
+
+    let delegate = PrivateKeySigner::random();
+    let capability = decdn_incentive::Capability {
+        signer: delegate.address(),
+        spending_cap: 1_000,
+        pool_id: B256::repeat_byte(0x11),
+        expiry: u64::MAX,
+    }
+    .sign(
+        &PrivateKeySigner::random(),
+        &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+    )?;
+    let slot = crate::CredentialSlot::new(Arc::new(delegate), capability)?;
+
+    let chain = ChainConfig {
+        rpc_url: "http://config:8545".to_string(),
+        chain_id: 1,
+        payment_pool: Address::repeat_byte(0x33),
+        slash_judge: Address::repeat_byte(0x44),
+        capacity_bond: None,
+    };
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn BuyerPoolStore> =
+        Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
+    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await?;
+    // The on-chain reads the delegated lane build makes: `getPool`, then the
+    // contract's `usdc()`.
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success::<alloy::primitives::Bytes>(
+        &PaymentPool::Pool {
+            owner: Address::repeat_byte(0x0C),
+            status: PaymentPool::Status::Open,
+            disputeDeadline: 0,
+            deposit: 1_000_000,
+            totalRedeemed: 0,
+        }
+        .abi_encode()
+        .into(),
+    );
+    asserter
+        .push_success::<alloy::primitives::Bytes>(&Address::repeat_byte(0x22).abi_encode().into());
+    let rpc = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+    let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
+    let site = PullSite {
+        data_dir: dir.path().to_path_buf(),
+        region: None,
+        region_allowlist: Vec::new(),
+    };
+    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.slash_judge);
+    let connections = crate::Connections::new(ep.clone());
+    let writes = crate::ordered_writes::OrderedWrites::default();
+    let funding = crate::funding::RunFunding::default();
+    let deps = LaneDeps {
+        marks: None,
+        evidence: None,
+        endpoint: &ep,
+        store: &store,
+        contract: &contract,
+        rpc: &rpc,
+        slash_dom: &slash_dom,
+        self_address: Address::repeat_byte(0x0A),
+        token: Address::repeat_byte(0x22),
+        chain: &chain,
+        site: &site,
+        deposit: DepositPolicy {
+            working_deposit: alloy::primitives::U256::ZERO,
+            max_approve: false,
+            adoption: ChainAdoption::Refused,
+            open: PoolOpen::Allowed,
+        },
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        max_rate_per_mb: 0,
+        max_blob_bytes: 0,
+        deadlines: crate::PullDeadlines::new(Duration::from_secs(5), Duration::from_secs(5), 0)?,
+        connections: &connections,
+        writes: &writes,
+        funding: &funding,
+    };
+    let discovery = DiscoveryOptions::default();
+    let voucher_dom = chain.deployment().voucher_domain();
+    let recovery = Arc::new(crate::RecoveryGate::new());
+    let sources = super::LaneSources::new(
+        &deps,
+        &discovery,
+        &[],
+        LanePayer::Delegated(&slot),
+        &voucher_dom,
+        None,
+        None,
+        None,
+        &recovery,
+    );
+
+    let probed_rate = 7u64;
+    let candidate = crate::discovery::NodeCandidate {
+        node_id: iroh::SecretKey::from_bytes(&[5; 32]).public(),
+        eth_address: Address::repeat_byte(5),
+        region_hint: None,
+        multiaddrs: alloy::primitives::Bytes::new(),
+    };
+    let targets = crate::targets::ResolvedTargets {
+        candidates: vec![candidate.clone()],
+        coverage_by_node: std::collections::HashMap::new(),
+        probed_samples: vec![(candidate.node_id, 10.0, probed_rate)],
+        pinned: false,
+        size_hint: None,
+        late: crate::targets::LateSlot::default(),
+    };
+    let holders = sources.holders_from(&targets);
+    let holder = holders
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the probed candidate is a holder"))?;
+    let ended = tokio_util::sync::CancellationToken::new();
+    let lane = sources.connect(holder, &ended).await?;
+    anyhow::ensure!(
+        lane.source.inner().rate_ceiling() == probed_rate,
+        "the lane's ceiling is the probed rate, not the config value of 0: {}",
+        lane.source.inner().rate_ceiling()
+    );
+    drop(lane);
     drop(sources);
     ep.close().await;
     Ok(())

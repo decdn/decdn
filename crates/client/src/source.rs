@@ -453,6 +453,13 @@ impl<'a> PeerSource<'a> {
         }
     }
 
+    /// The stream-rate ceiling this source refuses a quote above (`0` = no
+    /// ceiling): what the lane build passed as `max_rate_per_mb`.
+    #[cfg(test)]
+    pub(crate) const fn rate_ceiling(&self) -> u64 {
+        self.max_rate_per_mb
+    }
+
     /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end)
     /// as a raw pull, unaligned, for a caller that reads only the signed
     /// header and then aborts the pull.

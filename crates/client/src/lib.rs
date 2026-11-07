@@ -890,7 +890,9 @@ impl std::error::Error for BlobTooLarge {}
 /// The ceiling is the lower of two bounds the caller supplies: the probe rate the
 /// candidate was selected on (a stream quote may not exceed what the probe
 /// advertised) and an optional absolute buyer config (`max_rate_per_mb`). Because
-/// the probe-relative bound is always applied by the node pull path, a *completed*
+/// the probe-relative bound is always applied by both built-in pull paths — the
+/// node's miss pull and the client's lane build (a caller that assembles a
+/// [`PeerSource`] by hand applies only the ceiling it passes) — a *completed*
 /// delivery is by construction priced at or below the probe rate — so it can never
 /// be rate-manipulation (`SlashJudge` requires `stream.ratePerMb > probe.ratePerMb`),
 /// and the challengeable case is exactly this abort.

@@ -1677,7 +1677,8 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// sources, and a pinned node's dial address. An entry's first holders
     /// come from [`Self::nodes`].
     pub(super) discovery: DiscoveryOptions,
-    /// The highest per-MB rate a lane accepts; `0` sets no ceiling.
+    /// The absolute per-MB rate cap, folded per lane with the rate the
+    /// candidate's own probe signed; `0` sets no absolute cap.
     pub(super) max_rate_per_mb: u64,
     /// The largest blob one entry fetches.
     pub(super) max_blob_bytes: u64,
