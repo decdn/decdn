@@ -141,7 +141,6 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1256,6 +1255,8 @@ impl Gateway {
 
     /// The 402 for `uri` when `size` (its length, when known) does not fit
     /// what is left of the public allowance `bucket` today, else `None`.
+    /// `size_is_floor` marks `size` as a lower bound on the length, not the
+    /// length itself; the refusal log then says so.
     /// Refusing before the pull costs nothing; cutting it after would waste
     /// what it paid for.
     fn too_large(
@@ -1263,6 +1264,7 @@ impl Gateway {
         bucket: Option<u64>,
         uri: &DecdnUri,
         size: Option<u64>,
+        size_is_floor: bool,
     ) -> Option<Response<Body>> {
         let public = self.public.as_ref()?;
         let size = size?;
@@ -1271,13 +1273,34 @@ impl Gateway {
             Err(retry_after) => (0, retry_after),
         };
         (size > left).then(|| {
-            tracing::info!(%uri, size, left, "the response does not fit today's allowance");
+            if size_is_floor {
+                tracing::info!(
+                    %uri,
+                    size_at_least = size,
+                    left,
+                    "the response does not fit today's allowance"
+                );
+            } else {
+                tracing::info!(%uri, size, left, "the response does not fit today's allowance");
+            }
             pay_elsewhere(
                 StatusCode::PAYMENT_REQUIRED,
                 uri,
                 retry_after,
                 "the response does not fit what is left of the gateway's allowance today",
             )
+        })
+    }
+
+    /// How many generated-page bytes could fit the public allowance `bucket`
+    /// right now: what is left of it today, or no bound on a loopback
+    /// gateway. A render counted under this cap stops once it cannot fit.
+    fn listing_cap(&self, bucket: Option<u64>) -> usize {
+        self.public.as_ref().map_or(usize::MAX, |public| {
+            match public.allowance.remaining(bucket, now_secs()) {
+                Ok(left) => usize::try_from(left).unwrap_or(usize::MAX),
+                Err(_retry_after) => 0,
+            }
         })
     }
 
@@ -2050,7 +2073,7 @@ impl Gateway {
             Ok(extent) => extent,
             Err(size) => return Ok(not_satisfiable(size)),
         };
-        if let Some(refused) = self.too_large(paying.bucket(), uri, extent.billable()) {
+        if let Some(refused) = self.too_large(paying.bucket(), uri, extent.billable(), false) {
             return Ok(refused);
         }
         if size == Some(0) {
@@ -2155,7 +2178,7 @@ impl Gateway {
                 Ok(extent) => extent,
                 Err(size) => return Ok(not_satisfiable(size)),
             };
-            if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable()) {
+            if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
             }
             if entry.size == Some(0) {
@@ -2197,7 +2220,7 @@ impl Gateway {
                 Ok(extent) => extent,
                 Err(size) => return Ok(not_satisfiable(size)),
             };
-            if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable()) {
+            if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
             }
             if entry.size == Some(0) {
@@ -2214,36 +2237,55 @@ impl Gateway {
                 )
                 .await;
         }
-        let mut rows = String::new();
-        for entry in &manifest.entries {
-            let link = if present == Present::Site {
-                format!("./{}", entry_link(manifest_hash, &entry.path))
-            } else {
-                DecdnUri::new(
-                    manifest_hash,
-                    UriTarget::BundleEntry(entry.path.clone()),
-                    namespace,
-                )
-                .to_string()
-            };
-            let size = entry.size.map_or_else(String::new, human_bytes);
-            let _ = write!(
-                rows,
-                "<tr><td><a href=\"{}\">{}</a></td><td>{size}</td></tr>",
-                escape(&link),
-                escape(&entry.path),
+        let uri = DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace);
+        // The listing has a length too: one that does not fit is refused,
+        // before any of the page is allocated — escaping can grow a row to
+        // several times its manifest entry. The count is capped at what is
+        // left of the allowance, so a listing past it stops rendering as
+        // soon as that is known.
+        let mut counted = CountingWriter::up_to(self.listing_cap(paying.bucket()));
+        if write_listing(
+            &mut counted,
+            &manifest,
+            manifest_hash,
+            namespace,
+            present,
+            &uri,
+        )
+        .is_err()
+        {
+            // The count stopped just past the cap: a floor on the length.
+            let length = u64::try_from(counted.count).unwrap_or(u64::MAX);
+            if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length), true) {
+                return Ok(refused);
+            }
+            // The allowance reset between the cap read and the check (a new
+            // day): count again under no bound. An unbounded count, and the
+            // build below, cannot fail.
+            counted = CountingWriter::up_to(usize::MAX);
+            let _ = write_listing(
+                &mut counted,
+                &manifest,
+                manifest_hash,
+                namespace,
+                present,
+                &uri,
             );
         }
-        let uri = DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace);
-        let page = format!(
-            "<h1>Bundle</h1><p><code>{}</code></p><table>{rows}</table>",
-            escape(&uri.to_string())
-        );
-        // The listing has a length too: one that does not fit is refused.
-        let length = u64::try_from(page.len()).unwrap_or(u64::MAX);
-        if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length)) {
+        let length = u64::try_from(counted.count).unwrap_or(u64::MAX);
+        if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length), false) {
             return Ok(refused);
         }
+        let mut page = String::with_capacity(counted.count);
+        let _ = write_listing(
+            &mut page,
+            &manifest,
+            manifest_hash,
+            namespace,
+            present,
+            &uri,
+        );
+        debug_assert_eq!(page.len(), counted.count);
         self.charge(paying.bucket(), page.len());
         Ok(html(StatusCode::OK, &page))
     }
@@ -3491,12 +3533,89 @@ fn html(status: StatusCode, body: &str) -> Response<Body> {
     typed(status, page, "text/html; charset=utf-8")
 }
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+/// Writes `s` into `out` HTML-escaped: `&`, `<`, `>`, `"` and `'` become
+/// entities, every other character passes through.
+fn write_escaped(out: &mut impl std::fmt::Write, s: &str) -> std::fmt::Result {
+    for c in s.chars() {
+        match c {
+            '&' => out.write_str("&amp;")?,
+            '<' => out.write_str("&lt;")?,
+            '>' => out.write_str("&gt;")?,
+            '"' => out.write_str("&quot;")?,
+            '\'' => out.write_str("&#39;")?,
+            other => out.write_char(other)?,
+        }
+    }
+    Ok(())
+}
+
+/// A [`std::fmt::Write`] sink that keeps nothing: it counts the UTF-8 bytes
+/// written, so a page's length is known before the page is built. A write
+/// that takes the count past the cap fails, which stops a render as soon as
+/// the page is known not to fit; the count then sits just past the cap.
+struct CountingWriter {
+    /// UTF-8 bytes written so far (saturating).
+    count: usize,
+    /// The bound: a count past it fails the write.
+    cap: usize,
+}
+
+impl CountingWriter {
+    /// A sink that accepts up to `cap` bytes. `usize::MAX` never fails.
+    const fn up_to(cap: usize) -> Self {
+        Self { count: 0, cap }
+    }
+}
+
+impl std::fmt::Write for CountingWriter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.count = self.count.saturating_add(s.len());
+        if self.count > self.cap {
+            return Err(std::fmt::Error);
+        }
+        Ok(())
+    }
+}
+
+/// Writes the HTML listing of a bundle's entries into `out` — the bundle URI,
+/// then one row per entry linking to its URL — which [`Gateway::index`]
+/// answers when it does not serve the bundle's `index.html`. The counting
+/// pass and the building pass both render through this one function, over
+/// the same in-memory manifest, so the length checked against the allowance
+/// and the page charged for it cannot drift.
+fn write_listing(
+    out: &mut impl std::fmt::Write,
+    manifest: &BundleManifest,
+    manifest_hash: [u8; 32],
+    namespace: Option<u64>,
+    present: Present,
+    uri: &DecdnUri,
+) -> std::fmt::Result {
+    out.write_str("<h1>Bundle</h1><p><code>")?;
+    write_escaped(out, &uri.to_string())?;
+    out.write_str("</code></p><table>")?;
+    for entry in &manifest.entries {
+        let link = if present == Present::Site {
+            format!("./{}", entry_link(manifest_hash, &entry.path))
+        } else {
+            DecdnUri::new(
+                manifest_hash,
+                UriTarget::BundleEntry(entry.path.clone()),
+                namespace,
+            )
+            .to_string()
+        };
+        out.write_str("<tr><td><a href=\"")?;
+        write_escaped(out, &link)?;
+        out.write_str("\">")?;
+        write_escaped(out, &entry.path)?;
+        out.write_str("</a></td><td>")?;
+        if let Some(size) = entry.size {
+            out.write_str(&human_bytes(size))?;
+        }
+        out.write_str("</td></tr>")?;
+    }
+    out.write_str("</table>")
 }
 
 fn human_bytes(n: u64) -> String {
