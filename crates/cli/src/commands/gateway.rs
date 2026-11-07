@@ -141,7 +141,6 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2214,36 +2213,33 @@ impl Gateway {
                 )
                 .await;
         }
-        let mut rows = String::new();
-        for entry in &manifest.entries {
-            let link = if present == Present::Site {
-                format!("./{}", entry_link(manifest_hash, &entry.path))
-            } else {
-                DecdnUri::new(
-                    manifest_hash,
-                    UriTarget::BundleEntry(entry.path.clone()),
-                    namespace,
-                )
-                .to_string()
-            };
-            let size = entry.size.map_or_else(String::new, human_bytes);
-            let _ = write!(
-                rows,
-                "<tr><td><a href=\"{}\">{}</a></td><td>{size}</td></tr>",
-                escape(&link),
-                escape(&entry.path),
-            );
-        }
         let uri = DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace);
-        let page = format!(
-            "<h1>Bundle</h1><p><code>{}</code></p><table>{rows}</table>",
-            escape(&uri.to_string())
+        // The listing has a length too: one that does not fit is refused,
+        // before any of the page is allocated — escaping can grow a row to
+        // several times its manifest entry. Neither sink here can fail.
+        let mut counted = CountingWriter(0);
+        let _ = write_listing(
+            &mut counted,
+            &manifest,
+            manifest_hash,
+            namespace,
+            present,
+            &uri,
         );
-        // The listing has a length too: one that does not fit is refused.
-        let length = u64::try_from(page.len()).unwrap_or(u64::MAX);
+        let length = u64::try_from(counted.0).unwrap_or(u64::MAX);
         if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length)) {
             return Ok(refused);
         }
+        let mut page = String::with_capacity(counted.0);
+        let _ = write_listing(
+            &mut page,
+            &manifest,
+            manifest_hash,
+            namespace,
+            present,
+            &uri,
+        );
+        debug_assert_eq!(page.len(), counted.0);
         self.charge(paying.bucket(), page.len());
         Ok(html(StatusCode::OK, &page))
     }
@@ -3491,12 +3487,71 @@ fn html(status: StatusCode, body: &str) -> Response<Body> {
     typed(status, page, "text/html; charset=utf-8")
 }
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+/// Writes `s` into `out` HTML-escaped: `&`, `<`, `>`, `"` and `'` become
+/// entities, every other character passes through.
+fn write_escaped(out: &mut impl std::fmt::Write, s: &str) -> std::fmt::Result {
+    for c in s.chars() {
+        match c {
+            '&' => out.write_str("&amp;")?,
+            '<' => out.write_str("&lt;")?,
+            '>' => out.write_str("&gt;")?,
+            '"' => out.write_str("&quot;")?,
+            '\'' => out.write_str("&#39;")?,
+            other => out.write_char(other)?,
+        }
+    }
+    Ok(())
+}
+
+/// A [`std::fmt::Write`] sink that keeps nothing: it counts the UTF-8 bytes
+/// written, so a page's length is known before the page is built.
+struct CountingWriter(usize);
+
+impl std::fmt::Write for CountingWriter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 = self.0.saturating_add(s.len());
+        Ok(())
+    }
+}
+
+/// Writes the listing page of a bundle without an `index.html` into `out`:
+/// the bundle URI, then one row per manifest entry linking to its URL. The
+/// counting pass and the building pass both render through this one function,
+/// so the length checked against the allowance and the page charged for it
+/// cannot drift.
+fn write_listing(
+    out: &mut impl std::fmt::Write,
+    manifest: &BundleManifest,
+    manifest_hash: [u8; 32],
+    namespace: Option<u64>,
+    present: Present,
+    uri: &DecdnUri,
+) -> std::fmt::Result {
+    out.write_str("<h1>Bundle</h1><p><code>")?;
+    write_escaped(out, &uri.to_string())?;
+    out.write_str("</code></p><table>")?;
+    for entry in &manifest.entries {
+        let link = if present == Present::Site {
+            format!("./{}", entry_link(manifest_hash, &entry.path))
+        } else {
+            DecdnUri::new(
+                manifest_hash,
+                UriTarget::BundleEntry(entry.path.clone()),
+                namespace,
+            )
+            .to_string()
+        };
+        out.write_str("<tr><td><a href=\"")?;
+        write_escaped(out, &link)?;
+        out.write_str("\">")?;
+        write_escaped(out, &entry.path)?;
+        out.write_str("</a></td><td>")?;
+        if let Some(size) = entry.size {
+            out.write_str(&human_bytes(size))?;
+        }
+        out.write_str("</td></tr>")?;
+    }
+    out.write_str("</table>")
 }
 
 fn human_bytes(n: u64) -> String {
