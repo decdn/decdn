@@ -1255,6 +1255,8 @@ impl Gateway {
 
     /// The 402 for `uri` when `size` (its length, when known) does not fit
     /// what is left of the public allowance `bucket` today, else `None`.
+    /// `size_is_floor` marks `size` as a lower bound on the length, not the
+    /// length itself; the refusal log then says so.
     /// Refusing before the pull costs nothing; cutting it after would waste
     /// what it paid for.
     fn too_large(
@@ -1262,6 +1264,7 @@ impl Gateway {
         bucket: Option<u64>,
         uri: &DecdnUri,
         size: Option<u64>,
+        size_is_floor: bool,
     ) -> Option<Response<Body>> {
         let public = self.public.as_ref()?;
         let size = size?;
@@ -1270,7 +1273,16 @@ impl Gateway {
             Err(retry_after) => (0, retry_after),
         };
         (size > left).then(|| {
-            tracing::info!(%uri, size, left, "the response does not fit today's allowance");
+            if size_is_floor {
+                tracing::info!(
+                    %uri,
+                    size_at_least = size,
+                    left,
+                    "the response does not fit today's allowance"
+                );
+            } else {
+                tracing::info!(%uri, size, left, "the response does not fit today's allowance");
+            }
             pay_elsewhere(
                 StatusCode::PAYMENT_REQUIRED,
                 uri,
@@ -2061,7 +2073,7 @@ impl Gateway {
             Ok(extent) => extent,
             Err(size) => return Ok(not_satisfiable(size)),
         };
-        if let Some(refused) = self.too_large(paying.bucket(), uri, extent.billable()) {
+        if let Some(refused) = self.too_large(paying.bucket(), uri, extent.billable(), false) {
             return Ok(refused);
         }
         if size == Some(0) {
@@ -2166,7 +2178,7 @@ impl Gateway {
                 Ok(extent) => extent,
                 Err(size) => return Ok(not_satisfiable(size)),
             };
-            if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable()) {
+            if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
             }
             if entry.size == Some(0) {
@@ -2208,7 +2220,7 @@ impl Gateway {
                 Ok(extent) => extent,
                 Err(size) => return Ok(not_satisfiable(size)),
             };
-            if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable()) {
+            if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
             }
             if entry.size == Some(0) {
@@ -2242,8 +2254,9 @@ impl Gateway {
         )
         .is_err()
         {
+            // The count stopped just past the cap: a floor on the length.
             let length = u64::try_from(counted.count).unwrap_or(u64::MAX);
-            if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length)) {
+            if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length), true) {
                 return Ok(refused);
             }
             // The allowance reset between the cap read and the check (a new
@@ -2260,7 +2273,7 @@ impl Gateway {
             );
         }
         let length = u64::try_from(counted.count).unwrap_or(u64::MAX);
-        if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length)) {
+        if let Some(refused) = self.too_large(paying.bucket(), &uri, Some(length), false) {
             return Ok(refused);
         }
         let mut page = String::with_capacity(counted.count);
