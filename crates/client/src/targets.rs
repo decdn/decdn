@@ -583,8 +583,10 @@ pub(crate) fn classify_probe(
 /// candidate's on-chain operator address (ADR 014 §1). Selection reads
 /// `has_blob` and coverage off the response and pairs them with the measured
 /// RTT; `rate_per_mb` is harvested into `probed_samples` for the peer store
-/// only, never ranked on — the fetch pays the stream's own signed quote, gated
-/// by `--max-rate-per-mb`. `has_blob` and the harvested rate are only
+/// and for each lane's stream-rate ceiling (`lane_rate_ceiling`), never ranked
+/// on — the fetch pays the stream's own signed quote, gated by
+/// [`crate::effective_rate_ceiling`] of the probed rate and
+/// `--max-rate-per-mb`. `has_blob` and the harvested rate are only
 /// meaningful once the signature attributes them to the peer (coverage is
 /// unsigned; the consistency check below ties it to `has_blob`): an unverified
 /// quote is a claim no one is accountable for, so a node could seed the store

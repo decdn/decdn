@@ -31,7 +31,8 @@ pub(crate) fn two_holder_targets() -> (ResolvedTargets, NodeCandidate, NodeCandi
     let mut b = holder(2, 20.0);
     b.coverage = decdn_protocol::Coverage::from_block_indices(4, [2, 3].into_iter());
     let (node_a, node_b) = (a.candidate.clone(), b.candidate.clone());
-    let probed_samples = vec![(node_a.node_id, a.rtt_ms, 1), (node_b.node_id, b.rtt_ms, 1)];
+    // Distinct rates, so a test that keys a rate to the wrong node fails.
+    let probed_samples = vec![(node_a.node_id, a.rtt_ms, 3), (node_b.node_id, b.rtt_ms, 9)];
     let ordered = super::failover_order(
         vec![b, a],
         &[],
