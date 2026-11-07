@@ -4199,19 +4199,21 @@ async fn a_reverted_chunk_whose_halves_both_land_is_not_a_fault() -> Result<()> 
     )
 }
 
-/// At the depth bound a reverted multi-claim chunk no longer splits: it stays
-/// on warn-and-retry and counts one redemption failure for the whole chunk.
-/// Landed siblings of earlier splits leave the next sweep's plan, so the
-/// isolation finishes across sweeps.
+/// The oversize depth bound does not stop a revert split: a reverted
+/// multi-claim chunk already `MAX_SPLIT_DEPTH` halvings deep still halves,
+/// so the isolation always ends at the lone poisoned claim.
 #[tokio::test]
-async fn a_reverted_chunk_at_the_depth_bound_does_not_split() -> Result<()> {
-    use decdn_incentive::test_rpc::{ScriptedRpc, reverted_receipt};
+async fn a_reverted_chunk_past_the_oversize_depth_bound_still_halves() -> Result<()> {
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt, reverted_receipt};
 
-    let log = CapturedLog::default();
-    let _subscriber = log.install();
     let metrics = Arc::new(Metrics::new());
     let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
-    let provider = ScriptedRpc::mined(reverted_receipt(Address::ZERO)).provider();
+    let provider = ScriptedRpc::mined_in_order([
+        reverted_receipt(Address::ZERO),
+        mined_receipt(Address::ZERO, Vec::new()),
+        reverted_receipt(Address::ZERO),
+    ])
+    .provider();
     let contract = PaymentPool::new(Address::ZERO, provider);
 
     let faulted = submit_chunk(
@@ -4225,20 +4227,86 @@ async fn a_reverted_chunk_at_the_depth_bound_does_not_split() -> Result<()> {
     )
     .await;
 
-    assert!(faulted, "an unhalvable revert is a chain fault");
-    let retried = log.lines("reverted on-chain; leaving claims for retry")?;
-    anyhow::ensure!(
-        retried.len() == 1,
-        "the whole chunk stays on one warn-and-retry: {retried:?}"
-    );
-    // One reverted send and one failure for the whole chunk: a split would
-    // have sent the halves too, counting further reverts.
+    assert!(faulted, "the poisoned claim's lone revert is a chain fault");
     ensure_metric_lines(
         &metrics,
         &[
-            "decdn_onchain_tx_reverted_total 1",
+            "decdn_onchain_tx_reverted_total 2",
+            "decdn_onchain_tx_landed_total 1",
+            "decdn_pool_redemptions_total 1",
             "decdn_redemption_failures_total 1",
-            "decdn_onchain_tx_landed_total 0",
+        ],
+    )
+}
+
+/// One poisoned claim in a full default chunk under a nonzero floor: the
+/// isolation runs to the lone claim in the same sweep, so every healthy claim
+/// lands. A sub-chunk left for a later sweep would meet the floor again on its
+/// own value — 300 claims of 4,000 micro-USDC clear a 1,000,000 micro-USDC floor, but a
+/// handful of them never would — and its healthy claims would wait unpaid
+/// until their capabilities expire.
+#[tokio::test]
+async fn a_full_chunk_isolates_one_poisoned_claim_in_one_sweep_under_a_floor() -> Result<()> {
+    use alloy::sol_types::SolCall;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
+
+    const CLAIMS: usize = 300;
+    // The poisoned claim is the last lane, so every split leaves it in the
+    // right half: 300 → 150 → 75 → 38 → 19 → 10 → 5 → 3 → 2 → 1. Each of the
+    // nine splits sends a left half that lands and a right half that reverts
+    // at the estimate, after the full chunk's own reverting estimate.
+    const SPLITS: usize = 9;
+
+    let log = CapturedLog::default();
+    let _subscriber = log.install();
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let plans: Vec<PlannedLane> = (1..=2u8)
+        .flat_map(|pool| (0..150u8).map(move |signer| planned(pool, signer, 4_000, false)))
+        .collect();
+    anyhow::ensure!(plans.len() == CLAIMS, "a full default chunk");
+    let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0); CLAIMS]);
+    let sends = std::iter::once(Some(revert_payload()))
+        .chain((0..SPLITS).flat_map(|_| [None, Some(revert_payload())]));
+    let provider =
+        ScriptedRpc::mined_in_order((0..SPLITS).map(|_| mined_receipt(Address::ZERO, Vec::new())))
+            .erroring_sends(sends)
+            .answering_calls([Bytes::from(watermarks)])
+            .provider();
+    let contract = PaymentPool::new(Address::ZERO, provider);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        plans,
+        SELLER,
+        U256::from(1_000_000u64),
+        CLAIMS,
+        false,
+        &metrics,
+        &open_pools(),
+        &test_recorder(),
+    )
+    .await;
+
+    assert!(faulted, "the poisoned claim's lone revert is a chain fault");
+    let split = log.lines("gas estimate reverted; halving chunk")?;
+    anyhow::ensure!(
+        split.len() == SPLITS,
+        "every chunk holding the poison splits: {split:?}"
+    );
+    let retried = log.lines("gas estimate reverted for a lone claim")?;
+    anyhow::ensure!(
+        retried.len() == 1,
+        "only the lone poisoned claim stays on warn-and-retry: {retried:?}"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_send_failed_total 10",
+            "decdn_onchain_tx_landed_total 9",
+            "decdn_pool_redemptions_total 299",
+            "decdn_redemption_failures_total 1",
         ],
     )
 }
