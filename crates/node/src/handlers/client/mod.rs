@@ -2259,6 +2259,13 @@ impl ClientHandler {
         // The verified owner signature rides the lane record itself, alongside
         // the `cap`/`expiry` it authorizes: it is the `ownerSig` the redeemer
         // submits as a `CapabilityReg` on the signer's first on-chain redemption.
+        // Stored in the canonical 65-byte form (`as_bytes`, v = 27 + parity),
+        // never the raw wire bytes: `from_raw` also accepts the raw-parity
+        // (0/1) and EIP-155 recovery-byte forms, but on-chain `ecrecover`
+        // returns `address(0)` for v ∉ {27, 28}, so a raw form forwarded
+        // verbatim would make every `redeemMany` the lane joins revert (at
+        // the gas estimate, or mined). Recovery above already proved the
+        // owner, so the grant is normalized, not refused.
         // Kept ON the lane — not in a side table — so it is written in the same
         // durable transaction as the voucher frontier and can never be lost while
         // the frontier survives (#1906). A buffered in-memory insert like every
@@ -2277,7 +2284,7 @@ impl ClientHandler {
             None,
             decdn_incentive::LaneChain::NONE,
         );
-        lane.owner_sig = Some(sig_bytes);
+        lane.owner_sig = Some(signature.as_bytes());
         if let Err(e) = self.register_lane(lane) {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
         }

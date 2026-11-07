@@ -4024,6 +4024,336 @@ async fn a_possibly_broadcast_oversize_redeem_halves() -> Result<()> {
     )
 }
 
+/// #2835: one claim the contract refuses vetoes the whole `redeemMany`, so a
+/// reverted multi-claim chunk halves like an oversize send: the healthy claim
+/// lands, and the poisoned claim ends alone in a single-claim chunk that
+/// stays on warn-and-retry.
+#[tokio::test]
+async fn a_reverted_multi_claim_chunk_halves_and_lands_the_healthy_claim() -> Result<()> {
+    use alloy::sol_types::SolCall;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt, reverted_receipt};
+
+    let log = CapturedLog::default();
+    let _subscriber = log.install();
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let unpaid = vec![lane(0), lane(0)];
+    let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&unpaid);
+    // The full 2-claim chunk reverts; its halves then send the healthy claim,
+    // which lands, and the poisoned claim, which reverts again — alone.
+    let provider = ScriptedRpc::mined_in_order([
+        reverted_receipt(Address::ZERO),
+        mined_receipt(Address::ZERO, Vec::new()),
+        reverted_receipt(Address::ZERO),
+    ])
+    .answering_calls([Bytes::from(watermarks)])
+    .provider();
+    let contract = PaymentPool::new(Address::ZERO, provider);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        false,
+        &metrics,
+        &open_pools(),
+        &test_recorder(),
+    )
+    .await;
+
+    assert!(faulted, "the poisoned claim's lone revert is a chain fault");
+    let split = log.lines("halving chunk to isolate the reverting claim")?;
+    anyhow::ensure!(split.len() == 1, "the 2-claim chunk splits once: {split:?}");
+    let retried = log.lines("reverted on-chain for a lone claim")?;
+    anyhow::ensure!(
+        retried.len() == 1
+            && retried
+                .iter()
+                .all(|line| line.contains("pool_id=") && line.contains("lane_signer=")),
+        "only the lone poisoned claim stays on warn-and-retry, named by its lane: {retried:?}"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_reverted_total 2",
+            "decdn_onchain_tx_landed_total 1",
+            "decdn_pool_redemptions_total 1",
+            "decdn_redemption_failures_total 1",
+        ],
+    )
+}
+
+/// #2835: the node's wallet provider estimates gas before every send, so the
+/// common surface of a poisoned claim is the estimate reverting — a refused
+/// send, not a mined revert. A multi-claim chunk halves there the same way:
+/// the healthy claim lands, the poisoned claim ends alone, warn-and-retried
+/// with its lane named.
+#[tokio::test]
+async fn an_estimate_reverting_multi_claim_chunk_halves_and_lands_the_healthy_claim() -> Result<()>
+{
+    use alloy::sol_types::SolCall;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
+
+    let log = CapturedLog::default();
+    let _subscriber = log.install();
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let unpaid = vec![lane(0), lane(0)];
+    let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&unpaid);
+    // The full 2-claim chunk's estimate reverts; of its halves, the healthy
+    // claim's send goes through and mines, and the poisoned claim's estimate
+    // reverts again — alone.
+    let provider = ScriptedRpc::mined_in_order([mined_receipt(Address::ZERO, Vec::new())])
+        .erroring_sends([Some(revert_payload()), None, Some(revert_payload())])
+        .answering_calls([Bytes::from(watermarks)])
+        .provider();
+    let contract = PaymentPool::new(Address::ZERO, provider);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        false,
+        &metrics,
+        &open_pools(),
+        &test_recorder(),
+    )
+    .await;
+
+    assert!(faulted, "the poisoned claim's lone revert is a chain fault");
+    let split = log.lines("gas estimate reverted; halving chunk")?;
+    anyhow::ensure!(split.len() == 1, "the 2-claim chunk splits once: {split:?}");
+    let retried = log.lines("gas estimate reverted for a lone claim")?;
+    anyhow::ensure!(
+        retried.len() == 1
+            && retried
+                .iter()
+                .all(|line| line.contains("pool_id=") && line.contains("lane_signer=")),
+        "the lone poisoned claim is warn-and-retried, named by its lane: {retried:?}"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_send_failed_total 2",
+            "decdn_onchain_tx_reverted_total 0",
+            "decdn_onchain_tx_landed_total 1",
+            "decdn_pool_redemptions_total 1",
+            "decdn_redemption_failures_total 1",
+        ],
+    )
+}
+
+/// A transient parent revert — the watermark raced between the plan and the
+/// send — whose halves both land is no fault at all: the hint path un-parks,
+/// and no redemption failure counts.
+#[tokio::test]
+async fn a_reverted_chunk_whose_halves_both_land_is_not_a_fault() -> Result<()> {
+    use alloy::sol_types::SolCall;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt, reverted_receipt};
+
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let unpaid = vec![lane(0), lane(0)];
+    let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&unpaid);
+    let provider = ScriptedRpc::mined_in_order([
+        reverted_receipt(Address::ZERO),
+        mined_receipt(Address::ZERO, Vec::new()),
+        mined_receipt(Address::ZERO, Vec::new()),
+    ])
+    .answering_calls([Bytes::from(watermarks)])
+    .provider();
+    let contract = PaymentPool::new(Address::ZERO, provider);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        false,
+        &metrics,
+        &open_pools(),
+        &test_recorder(),
+    )
+    .await;
+
+    assert!(
+        !faulted,
+        "both halves landed, so the chunk is no chain fault"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_reverted_total 1",
+            "decdn_onchain_tx_landed_total 2",
+            "decdn_pool_redemptions_total 2",
+            "decdn_redemption_failures_total 0",
+        ],
+    )
+}
+
+/// The oversize depth bound does not stop a revert split: a reverted
+/// multi-claim chunk already `MAX_SPLIT_DEPTH` halvings deep still halves,
+/// so the isolation always ends at the lone poisoned claim.
+#[tokio::test]
+async fn a_reverted_chunk_past_the_oversize_depth_bound_still_halves() -> Result<()> {
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt, reverted_receipt};
+
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let provider = ScriptedRpc::mined_in_order([
+        reverted_receipt(Address::ZERO),
+        mined_receipt(Address::ZERO, Vec::new()),
+        reverted_receipt(Address::ZERO),
+    ])
+    .provider();
+    let contract = PaymentPool::new(Address::ZERO, provider);
+
+    let faulted = submit_chunk(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)],
+        SELLER,
+        &metrics,
+        &test_recorder(),
+        MAX_SPLIT_DEPTH,
+    )
+    .await;
+
+    assert!(faulted, "the poisoned claim's lone revert is a chain fault");
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_reverted_total 2",
+            "decdn_onchain_tx_landed_total 1",
+            "decdn_pool_redemptions_total 1",
+            "decdn_redemption_failures_total 1",
+        ],
+    )
+}
+
+/// One poisoned claim in a full default chunk under a nonzero floor: the
+/// isolation runs to the lone claim in the same sweep, so every healthy claim
+/// lands. A sub-chunk left for a later sweep would meet the floor again on its
+/// own value — 300 claims of 4,000 micro-USDC clear a 1,000,000 micro-USDC floor, but a
+/// handful of them never would — and its healthy claims would wait unpaid
+/// until their capabilities expire.
+#[tokio::test]
+async fn a_full_chunk_isolates_one_poisoned_claim_in_one_sweep_under_a_floor() -> Result<()> {
+    use alloy::sol_types::SolCall;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
+
+    const CLAIMS: usize = 300;
+    // The poisoned claim is the last lane, so every split leaves it in the
+    // right half: 300 → 150 → 75 → 38 → 19 → 10 → 5 → 3 → 2 → 1. Each of the
+    // nine splits sends a left half that lands and a right half that reverts
+    // at the estimate, after the full chunk's own reverting estimate.
+    const SPLITS: usize = 9;
+
+    let log = CapturedLog::default();
+    let _subscriber = log.install();
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let plans: Vec<PlannedLane> = (1..=2u8)
+        .flat_map(|pool| (0..150u8).map(move |signer| planned(pool, signer, 4_000, false)))
+        .collect();
+    anyhow::ensure!(plans.len() == CLAIMS, "a full default chunk");
+    let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0); CLAIMS]);
+    let sends = std::iter::once(Some(revert_payload()))
+        .chain((0..SPLITS).flat_map(|_| [None, Some(revert_payload())]));
+    let provider =
+        ScriptedRpc::mined_in_order((0..SPLITS).map(|_| mined_receipt(Address::ZERO, Vec::new())))
+            .erroring_sends(sends)
+            .answering_calls([Bytes::from(watermarks)])
+            .provider();
+    let contract = PaymentPool::new(Address::ZERO, provider);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        plans,
+        SELLER,
+        U256::from(1_000_000u64),
+        CLAIMS,
+        false,
+        &metrics,
+        &open_pools(),
+        &test_recorder(),
+    )
+    .await;
+
+    assert!(faulted, "the poisoned claim's lone revert is a chain fault");
+    let split = log.lines("gas estimate reverted; halving chunk")?;
+    anyhow::ensure!(
+        split.len() == SPLITS,
+        "every chunk holding the poison splits: {split:?}"
+    );
+    let retried = log.lines("gas estimate reverted for a lone claim")?;
+    anyhow::ensure!(
+        retried.len() == 1,
+        "only the lone poisoned claim stays on warn-and-retry: {retried:?}"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_send_failed_total 10",
+            "decdn_onchain_tx_landed_total 9",
+            "decdn_pool_redemptions_total 299",
+            "decdn_redemption_failures_total 1",
+        ],
+    )
+}
+
+/// The revert payload a node answers a send with when the pre-flight gas
+/// estimate reverts, as anvil and geth shape it.
+fn revert_payload() -> alloy_json_rpc::ErrorPayload {
+    alloy_json_rpc::ErrorPayload {
+        code: 3,
+        message: "execution reverted: custom error 0x6a172882".into(),
+        data: None,
+    }
+}
+
+/// `is_revert_send` matches only a JSON-RPC answer that carries the revert
+/// code or text; transport faults and oversize refusals stay on their own
+/// paths.
+#[test]
+fn is_revert_send_matches_estimate_reverts_only() {
+    use alloy::transports::RpcError;
+
+    let resp_err = |code: i64, message: &str| {
+        ContractError::TransportError(RpcError::ErrorResp(alloy_json_rpc::ErrorPayload {
+            code,
+            message: message.to_owned().into(),
+            data: None,
+        }))
+    };
+    assert!(is_revert_send(&resp_err(3, "execution reverted")));
+    assert!(
+        is_revert_send(&resp_err(3, "out of gas")),
+        "the standard revert code matches whatever the text"
+    );
+    assert!(
+        is_revert_send(&resp_err(-32000, "Execution Reverted: boom")),
+        "the revert text matches case-insensitively whatever the code"
+    );
+    assert!(!is_revert_send(&resp_err(-32000, "nonce too low")));
+    assert!(!is_revert_send(&resp_err(
+        -32000,
+        "transaction exceeds block gas limit"
+    )));
+    assert!(!is_revert_send(&ContractError::TransportError(
+        alloy::transports::TransportErrorKind::http_error(502, "bad gateway".to_owned())
+    )));
+}
+
 /// #2575: a possibly-broadcast send with no oversize signal does not halve.
 #[tokio::test]
 async fn a_possibly_broadcast_redeem_with_no_size_signal_does_not_halve() -> Result<()> {
@@ -4674,10 +5004,67 @@ fn plan_lane_unregistered_with_material_attaches_registration() -> Result<()> {
     assert_eq!(reg.expiry, st.expiry, "reg carries the lane's expiry");
     assert_eq!(
         reg.ownerSig.as_ref(),
-        sig_with_v(1).as_slice(),
-        "reg carries the lane's own owner signature"
+        sig_with_v(28).as_slice(),
+        "reg carries the lane's own owner signature, canonicalized to v = 27 + parity"
     );
     assert_eq!(plan.key, st.key());
+    Ok(())
+}
+
+/// #2835: on-chain `ecrecover` accepts only v ∈ {27, 28}, so the planner
+/// re-canonicalizes the stored owner signature — a durable row holding a
+/// raw-parity (0/1) or EIP-155 recovery byte would revert every `redeemMany`
+/// it joins.
+#[test]
+fn plan_lane_sends_the_stored_owner_sig_canonicalized() -> Result<()> {
+    for (stored, sent) in [
+        (0u8, 27u8), // raw parity 0
+        (1, 28),     // raw parity 1
+        (27, 27),    // already canonical
+        (28, 28),
+        (35, 27), // EIP-155, parity 0
+        (36, 28), // EIP-155, parity 1
+    ] {
+        let st = signed_lane_state(1, 11, 21, Some(sig_with_v(stored)));
+        let paid = PaidWatermarks::default();
+        let plan = plan_lane(
+            &st,
+            &paid,
+            Address::from([21u8; 20]),
+            &RegistrationStatus::Unregistered,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("unregistered lane with held material should plan"))?;
+        let reg = plan
+            .register
+            .ok_or_else(|| anyhow::anyhow!("an unregistered signer attaches a CapabilityReg"))?;
+        assert_eq!(
+            reg.ownerSig.as_ref(),
+            sig_with_v(sent).as_slice(),
+            "a stored recovery byte {stored} goes on-chain as {sent}"
+        );
+    }
+    Ok(())
+}
+
+/// #2835: a stored `owner_sig` that `Signature::from_raw` cannot parse is the
+/// same durability fault as a missing one — intake only ever stores a parsed
+/// signature — so the planner skips the lane instead of spending gas on a
+/// registration the contract refuses.
+#[test]
+fn plan_lane_skips_an_unparseable_owner_sig() -> Result<()> {
+    // Recovery byte 5 is outside every form `from_raw` accepts.
+    let st = signed_lane_state(1, 12, 22, Some(sig_with_v(5)));
+    let paid = PaidWatermarks::default();
+    let plan = plan_lane(
+        &st,
+        &paid,
+        Address::from([22u8; 20]),
+        &RegistrationStatus::Unregistered,
+    )?;
+    assert!(
+        plan.is_none(),
+        "an unregistered lane with an unparseable owner_sig is skipped"
+    );
     Ok(())
 }
 
