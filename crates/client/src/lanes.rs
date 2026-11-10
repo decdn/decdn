@@ -172,7 +172,10 @@ pub struct LaneDeps<'a, P> {
     pub deposit: DepositPolicy,
     /// The ADR 005 namespace routing hint every request carries.
     pub namespace_id: [u8; 32],
-    /// The highest per-MB rate a lane accepts; `0` sets no ceiling.
+    /// The absolute per-MB rate cap, folded per lane with the rate the
+    /// candidate's own probe signed ([`crate::effective_rate_ceiling`]);
+    /// `0` sets no absolute cap, and a probed lane is still capped at its
+    /// probe rate.
     pub max_rate_per_mb: u64,
     /// The largest blob a lane accepts.
     pub max_blob_bytes: u64,
@@ -299,6 +302,11 @@ pub(crate) fn lane_target(
 /// seed a ledger from that lane's persisted cumulative, and wrap a
 /// [`PeerSource`] over it.
 ///
+/// `rate_ceiling` is the stream rate the lane refuses to pay above
+/// ([`crate::lane_sources::lane_rate_ceiling`]): [`crate::effective_rate_ceiling`]
+/// of the rate the candidate's probe signed and the absolute config cap, `0`
+/// for no ceiling.
+///
 /// `open_lock`, when `Some`, serializes the pool open-or-reuse inside
 /// [`build_ctx_for_fetch`]: across one fetch's concurrently built lanes, which
 /// all open or reuse the one on-chain pool, and across other fetches sharing
@@ -316,6 +324,7 @@ pub(crate) async fn build_multi_lane<'a, P>(
     voucher_dom: &Eip712Domain,
     provider: Address,
     target: EndpointAddr,
+    rate_ceiling: u64,
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
     ended: &CancellationToken,
@@ -377,6 +386,7 @@ where
         Arc::clone(&ctx),
         Arc::clone(&ledger),
         provider,
+        rate_ceiling,
     );
     if let Some(marks) = deps.marks {
         marks.lane_built();
@@ -392,7 +402,8 @@ where
     })
 }
 
-/// `provider`'s lane source at `target`, paying through `ctx` and `ledger`.
+/// `provider`'s lane source at `target`, paying through `ctx` and `ledger`,
+/// refusing a stream quote above `rate_ceiling` (`0` for no ceiling).
 /// Every open takes a stream on the command's connection to `target`
 /// ([`LaneDeps::connections`]).
 fn lane_source<'a, P>(
@@ -401,6 +412,7 @@ fn lane_source<'a, P>(
     ctx: Arc<Mutex<PoolContext>>,
     ledger: Arc<PoolLedger>,
     provider: Address,
+    rate_ceiling: u64,
 ) -> PeerSource<'a> {
     PeerSource::new(
         deps.endpoint,
@@ -411,7 +423,7 @@ fn lane_source<'a, P>(
         provider,
         deps.namespace_id,
         deps.max_blob_bytes,
-        deps.max_rate_per_mb,
+        rate_ceiling,
         deps.deadlines,
         Some(deps.connections.clone()),
     )
