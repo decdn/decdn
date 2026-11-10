@@ -141,6 +141,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -3053,11 +3054,11 @@ fn over_manifest_cap(stop: ManifestStop) -> ManifestStop {
 /// percent-encoded as in its `decdn:` URI.
 fn entry_link(hash: [u8; 32], path: &str) -> String {
     let uri = DecdnUri::new(hash, UriTarget::BundleEntry(path.to_owned()), None).to_string();
-    // `decdn:<hash>/` precedes the path.
-    uri.get(decdn_client::uri::SCHEME.len() + 65..)
-        .unwrap_or_default()
-        .to_owned()
+    uri.get(ENTRY_PATH_OFFSET..).unwrap_or_default().to_owned()
 }
+
+/// Where an entry's path starts in its `decdn:` URI: past `decdn:<hash>/`.
+const ENTRY_PATH_OFFSET: usize = decdn_client::uri::SCHEME.len() + 65;
 
 /// The hint to fetch blob `hash` raw, at its gateway path.
 fn raw_blob_hint(hash: [u8; 32], namespace: Option<u64>) -> String {
@@ -3577,6 +3578,68 @@ impl std::fmt::Write for CountingWriter {
     }
 }
 
+/// Writes the link to bundle entry `path` into `out`: on a site, `./` and
+/// the path relative to the bundle root (as [`entry_link`] gives it);
+/// otherwise the entry's `decdn:` URI. The URI streams out of its `Display`
+/// as it encodes, so a sink that stops early stops the encoding too, and no
+/// encoded copy of the path is held whole.
+fn write_link(
+    out: &mut impl std::fmt::Write,
+    manifest_hash: [u8; 32],
+    path: &str,
+    namespace: Option<u64>,
+    present: Present,
+) -> std::fmt::Result {
+    if present == Present::Site {
+        out.write_str("./")?;
+        let uri = DecdnUri::new(manifest_hash, UriTarget::BundleEntry(path.to_owned()), None);
+        let mut rest = Skipping {
+            out,
+            skip: ENTRY_PATH_OFFSET,
+        };
+        write!(rest, "{uri}")
+    } else {
+        let uri = DecdnUri::new(
+            manifest_hash,
+            UriTarget::BundleEntry(path.to_owned()),
+            namespace,
+        );
+        write!(out, "{uri}")
+    }
+}
+
+/// A [`std::fmt::Write`] adapter that HTML-escapes ([`write_escaped`]) all
+/// it is given into the sink it wraps.
+struct Escaping<'a, W>(&'a mut W);
+
+impl<W: std::fmt::Write> std::fmt::Write for Escaping<'_, W> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        write_escaped(self.0, s)
+    }
+}
+
+/// A [`std::fmt::Write`] adapter that drops the first `skip` bytes it is
+/// given and passes the rest to `out`. A skip that ends inside a character
+/// fails the write.
+struct Skipping<'a, W> {
+    /// The sink the bytes past the skip go to.
+    out: &'a mut W,
+    /// Bytes still to drop.
+    skip: usize,
+}
+
+impl<W: std::fmt::Write> std::fmt::Write for Skipping<'_, W> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if let Some(left) = self.skip.checked_sub(s.len()) {
+            self.skip = left;
+            return Ok(());
+        }
+        let rest = s.get(self.skip..).ok_or(std::fmt::Error)?;
+        self.skip = 0;
+        self.out.write_str(rest)
+    }
+}
+
 /// Writes the HTML listing of a bundle's entries into `out` — the bundle URI,
 /// then one row per entry linking to its URL — which [`Gateway::index`]
 /// answers when it does not serve the bundle's `index.html`. The counting
@@ -3592,21 +3655,17 @@ fn write_listing(
     uri: &DecdnUri,
 ) -> std::fmt::Result {
     out.write_str("<h1>Bundle</h1><p><code>")?;
-    write_escaped(out, &uri.to_string())?;
+    write!(Escaping(&mut *out), "{uri}")?;
     out.write_str("</code></p><table>")?;
     for entry in &manifest.entries {
-        let link = if present == Present::Site {
-            format!("./{}", entry_link(manifest_hash, &entry.path))
-        } else {
-            DecdnUri::new(
-                manifest_hash,
-                UriTarget::BundleEntry(entry.path.clone()),
-                namespace,
-            )
-            .to_string()
-        };
         out.write_str("<tr><td><a href=\"")?;
-        write_escaped(out, &link)?;
+        write_link(
+            &mut Escaping(&mut *out),
+            manifest_hash,
+            &entry.path,
+            namespace,
+            present,
+        )?;
         out.write_str("\">")?;
         write_escaped(out, &entry.path)?;
         out.write_str("</a></td><td>")?;

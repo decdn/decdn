@@ -1500,6 +1500,57 @@ fn a_listing_renders_its_rows_and_an_empty_size_cell() {
     );
 }
 
+/// A streamed link is the link the gateway gives elsewhere: on a site, `./`
+/// and [`entry_link`]; otherwise the entry's `decdn:` URI, namespace and all.
+#[test]
+fn a_streamed_link_matches_the_entry_link() {
+    let hash = [0x22; 32];
+    for path in [
+        "a.txt",
+        "dir/a b.txt",
+        "it's & \"that\".bin",
+        "ünïcødé/文件 ?#.bin",
+    ] {
+        for namespace in [None, Some(9)] {
+            let mut site = String::new();
+            write_link(&mut site, hash, path, namespace, Present::Site).unwrap();
+            assert_eq!(site, format!("./{}", entry_link(hash, path)), "{path}");
+            let mut bare = String::new();
+            write_link(&mut bare, hash, path, namespace, Present::Bare).unwrap();
+            let uri = DecdnUri::new(hash, UriTarget::BundleEntry(path.to_owned()), namespace);
+            assert_eq!(bare, uri.to_string(), "{path} ns={namespace:?}");
+        }
+    }
+}
+
+/// One entry with a long path that percent-encodes to three times its length
+/// stops the capped count inside its link: the count sits just past a small
+/// cap, under both presentations, however long the path is.
+#[test]
+fn a_long_path_stops_a_small_capped_count_inside_its_link() {
+    let hash = [0x33; 32];
+    let manifest = BundleManifest::new(
+        hash,
+        vec![decdn_client::bundle::ManifestEntry::new(
+            format!("a{}.txt", " ".repeat(1 << 20)),
+            [0xe0; 32],
+            Some(3),
+        )],
+    );
+    let uri = DecdnUri::new(hash, UriTarget::Bundle, None);
+    let cap = 200;
+    for present in [Present::Site, Present::Bare] {
+        let mut counted = CountingWriter::up_to(cap);
+        let stopped = write_listing(&mut counted, &manifest, hash, None, present, &uri);
+        assert!(stopped.is_err(), "{present:?}");
+        assert!(
+            counted.count > cap && counted.count <= cap + 6,
+            "{present:?}: the count {} sits just past the cap",
+            counted.count
+        );
+    }
+}
+
 /// A count capped below the page stops rendering at the first write past the
 /// cap: the counted length sits just past the cap, far short of the page's.
 #[test]
