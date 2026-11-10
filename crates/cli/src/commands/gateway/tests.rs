@@ -1423,10 +1423,155 @@ fn content_type_by_extension_and_markup_as_text() {
 }
 
 #[test]
-fn escape_covers_markup_and_quotes() {
+fn write_escaped_covers_markup_and_quotes() {
+    let mut out = String::new();
+    write_escaped(&mut out, r#"<a href="x">'&'</a>"#).unwrap();
+    assert_eq!(out, "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
+}
+
+/// The counting pass and the building pass render through one function: the
+/// length counted before the page exists equals the built page's, for paths
+/// that escape (`&`, `'`, `"`), multibyte paths, and spaces, under both
+/// presentations, with and without a namespace.
+#[test]
+fn a_listing_count_matches_the_built_page() {
+    let manifest_hash = [0xaa; 32];
+    let manifest = BundleManifest::new(
+        manifest_hash,
+        vec![
+            decdn_client::bundle::ManifestEntry::new("a&&b.txt", [0xe0; 32], Some(3)),
+            decdn_client::bundle::ManifestEntry::new("it's \"here\".txt", [0xe1; 32], Some(1024)),
+            decdn_client::bundle::ManifestEntry::new("ünïcødé 文件.bin", [0xe2; 32], None),
+            decdn_client::bundle::ManifestEntry::new("plain path.css", [0xe3; 32], Some(0)),
+        ],
+    );
+    for present in [Present::Site, Present::Bare] {
+        for namespace in [None, Some(7)] {
+            let uri = DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace);
+            let mut counted = CountingWriter::up_to(usize::MAX);
+            write_listing(
+                &mut counted,
+                &manifest,
+                manifest_hash,
+                namespace,
+                present,
+                &uri,
+            )
+            .unwrap();
+            let mut page = String::new();
+            write_listing(
+                &mut page,
+                &manifest,
+                manifest_hash,
+                namespace,
+                present,
+                &uri,
+            )
+            .unwrap();
+            assert_eq!(counted.count, page.len(), "{present:?} ns={namespace:?}");
+        }
+    }
+}
+
+/// The listing's markup, pinned whole for one small bundle: the heading, the
+/// row shape, and the empty size cell of an entry without a size.
+#[test]
+fn a_listing_renders_its_rows_and_an_empty_size_cell() {
+    let hash = [0x11; 32];
+    let manifest = BundleManifest::new(
+        hash,
+        vec![
+            decdn_client::bundle::ManifestEntry::new("a.txt", [0xe0; 32], Some(3)),
+            decdn_client::bundle::ManifestEntry::new("c.bin", [0xe1; 32], None),
+        ],
+    );
+    let uri = DecdnUri::new(hash, UriTarget::Bundle, None);
+    let a = DecdnUri::new(hash, UriTarget::BundleEntry("a.txt".to_owned()), None);
+    let c = DecdnUri::new(hash, UriTarget::BundleEntry("c.bin".to_owned()), None);
+    let mut page = String::new();
+    write_listing(&mut page, &manifest, hash, None, Present::Bare, &uri).unwrap();
     assert_eq!(
-        escape(r#"<a href="x">'&'</a>"#),
-        "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"
+        page,
+        format!(
+            "<h1>Bundle</h1><p><code>{uri}</code></p><table>\
+             <tr><td><a href=\"{a}\">a.txt</a></td><td>3 B</td></tr>\
+             <tr><td><a href=\"{c}\">c.bin</a></td><td></td></tr></table>"
+        )
+    );
+}
+
+/// A streamed link is the link the gateway gives elsewhere: on a site, `./`
+/// and [`entry_link`]; otherwise the entry's `decdn:` URI, namespace and all.
+#[test]
+fn a_streamed_link_matches_the_entry_link() {
+    let hash = [0x22; 32];
+    for path in [
+        "a.txt",
+        "dir/a b.txt",
+        "it's & \"that\".bin",
+        "ünïcødé/文件 ?#.bin",
+    ] {
+        for namespace in [None, Some(9)] {
+            let mut site = String::new();
+            write_link(&mut site, hash, path, namespace, Present::Site).unwrap();
+            assert_eq!(site, format!("./{}", entry_link(hash, path)), "{path}");
+            let mut bare = String::new();
+            write_link(&mut bare, hash, path, namespace, Present::Bare).unwrap();
+            let uri = DecdnUri::new(hash, UriTarget::BundleEntry(path.to_owned()), namespace);
+            assert_eq!(bare, uri.to_string(), "{path} ns={namespace:?}");
+        }
+    }
+}
+
+/// One entry with a long path that percent-encodes to three times its length
+/// stops the capped count inside its link: the count sits just past a small
+/// cap, under both presentations, however long the path is.
+#[test]
+fn a_long_path_stops_a_small_capped_count_inside_its_link() {
+    let hash = [0x33; 32];
+    let manifest = BundleManifest::new(
+        hash,
+        vec![decdn_client::bundle::ManifestEntry::new(
+            format!("a{}.txt", " ".repeat(1 << 20)),
+            [0xe0; 32],
+            Some(3),
+        )],
+    );
+    let uri = DecdnUri::new(hash, UriTarget::Bundle, None);
+    let cap = 200;
+    for present in [Present::Site, Present::Bare] {
+        let mut counted = CountingWriter::up_to(cap);
+        let stopped = write_listing(&mut counted, &manifest, hash, None, present, &uri);
+        assert!(stopped.is_err(), "{present:?}");
+        assert!(
+            counted.count > cap && counted.count <= cap + 6,
+            "{present:?}: the count {} sits just past the cap",
+            counted.count
+        );
+    }
+}
+
+/// A count capped below the page stops rendering at the first write past the
+/// cap: the counted length sits just past the cap, far short of the page's.
+#[test]
+fn a_capped_count_stops_early() {
+    let hash = [0x11; 32];
+    let entries = (0..32)
+        .map(|n| decdn_client::bundle::ManifestEntry::new(format!("entry-{n}.bin"), [n; 32], None))
+        .collect();
+    let manifest = BundleManifest::new(hash, entries);
+    let uri = DecdnUri::new(hash, UriTarget::Bundle, None);
+    let mut full = CountingWriter::up_to(usize::MAX);
+    write_listing(&mut full, &manifest, hash, None, Present::Bare, &uri).unwrap();
+    let mut capped = CountingWriter::up_to(10);
+    let stopped = write_listing(&mut capped, &manifest, hash, None, Present::Bare, &uri);
+    assert!(stopped.is_err(), "a count past the cap fails the render");
+    assert!(capped.count > 10, "the count sits past the cap");
+    assert!(
+        capped.count < full.count / 2,
+        "the render stopped early: {} of {}",
+        capped.count,
+        full.count
     );
 }
 
@@ -1514,6 +1659,29 @@ fn noindex_manifest() -> Vec<u8> {
     .to_string()
     .into_bytes()
 }
+
+/// A bundle whose entry path is heavy with `&`, so its escaped listing page
+/// far outgrows the manifest itself.
+const AMPS: [u8; 32] = [0xee; 32];
+
+/// The [`AMPS`] bundle's manifest.
+fn amps_manifest() -> Vec<u8> {
+    let path = format!("a{}.txt", "&".repeat(64));
+    serde_json::json!({"version": 1, "entries": [
+        {"path": path, "hash": alloy::hex::encode(ENTRY), "size": 3},
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+/// The exact length of the [`AMPS`] bundle's site listing.
+fn amps_listing_len() -> u64 {
+    let manifest = BundleManifest::parse(&amps_manifest()).unwrap();
+    let uri = DecdnUri::new(AMPS, UriTarget::Bundle, None);
+    let mut counted = CountingWriter::up_to(usize::MAX);
+    write_listing(&mut counted, &manifest, AMPS, None, Present::Site, &uri).unwrap();
+    u64::try_from(counted.count).unwrap()
+}
 const BIG_LEN: usize = 600 * 1024;
 
 /// What a size proof spends of the allowance.
@@ -1574,6 +1742,7 @@ async fn public_gateway_proving(
         (BIG, Reply::Bytes(vec![0x42; BIG_LEN])),
         (PARTIAL, Reply::BytesThenTooLarge(b"partial".to_vec())),
         (NOINDEX, Reply::Bytes(noindex_manifest())),
+        (AMPS, Reply::Bytes(amps_manifest())),
         (HELD, Reply::Hold),
         (HELD_PROOF, Reply::HoldProof),
     ]);
@@ -2472,6 +2641,48 @@ async fn a_listing_that_does_not_fit_the_allowance_is_refused() {
     });
     let listing = request(&gateway, &host, "/", &[]).await;
     assert_eq!(listing.status, StatusCode::PAYMENT_REQUIRED);
+}
+
+/// A listing that exactly fits what is left of the allowance is served and
+/// charged its whole length: the day ends with nothing left.
+#[tokio::test]
+async fn a_fitting_listing_is_served_and_charged() {
+    let len = amps_listing_len();
+    let allowance = u64::try_from(amps_manifest().len()).unwrap() + len;
+    let (gateway, _, _) = public_gateway_with(allowance).await;
+    let host = gateway.sites.site_host(&Site {
+        hash: AMPS,
+        namespace: None,
+    });
+    let listing = request(&gateway, &host, "/", &[]).await;
+    assert_eq!(listing.status, StatusCode::OK, "{}", listing.body);
+    assert_eq!(left(&gateway), 0, "the listing charges exactly its length");
+}
+
+/// A listing one byte past what is left of the allowance is refused before
+/// it is built: the 402 comes back, the refusal charges nothing, and the
+/// repeat (the manifest stays cached, so it pulls nothing) leaves the
+/// allowance where it was.
+#[tokio::test]
+async fn an_oversized_listing_is_refused_without_charge() {
+    let len = amps_listing_len();
+    let allowance = u64::try_from(amps_manifest().len()).unwrap() + len - 1;
+    let (gateway, _, _) = public_gateway_with(allowance).await;
+    let host = gateway.sites.site_host(&Site {
+        hash: AMPS,
+        namespace: None,
+    });
+    let refused = request(&gateway, &host, "/", &[]).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        refused.body
+    );
+    assert_eq!(left(&gateway), len - 1, "only the manifest pull charges");
+    let again = request(&gateway, &host, "/", &[]).await;
+    assert_eq!(again.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(left(&gateway), len - 1, "a refusal charges nothing");
 }
 
 /// A manifest read stops at the allowance: a blob that is no manifest, read
