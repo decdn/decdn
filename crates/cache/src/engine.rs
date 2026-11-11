@@ -530,9 +530,10 @@ struct Inner {
     /// bytes, so the bound caps their sum.
     own_origin_range_pulls: Arc<tokio::sync::Semaphore>,
     /// The sizes a verified last chunk group from an own origin proved, keyed
-    /// by hash ([`CacheEngine::origin_range_serviceable`]). Bounded at
+    /// by hash, each with the index of the origin that served the group
+    /// ([`CacheEngine::origin_range_serviceable`]). Bounded at
     /// [`ORIGIN_PROVEN_SIZES_MAX`] hashes.
-    origin_proven_sizes: Mutex<HashMap<Hash, u64>>,
+    origin_proven_sizes: Mutex<HashMap<Hash, (u64, usize)>>,
     /// Origin `{H}.obao4` outboards already read, keyed by hash, tagged with
     /// the serving origin, and bounded by bytes. The serviceability probe's
     /// outboard half ([`CacheEngine::origin_fetch_outboard_bytes`]) and every
@@ -3945,7 +3946,7 @@ impl CacheEngine {
         aligned: &AlignedRange,
     ) -> CacheResult<Option<OriginRangeWire>> {
         let permit = self.range_pull_permit().await?;
-        let Some(cursor) = self.open_range_cursor(hash, aligned, None).await? else {
+        let Some((_origin, cursor)) = self.open_range_cursor(hash, aligned, None).await? else {
             return Ok(None);
         };
         OriginRangeWire::spawn(cursor, aligned, permit, self.inner.outboards.clone()).map(Some)
@@ -3987,13 +3988,15 @@ impl CacheEngine {
         let Some((outboard, ix)) = self.outboard_with_origin(hash, total_bytes).await? else {
             return Ok(false);
         };
-        if total_bytes == 0 || self.origin_size_proven(hash) == Some(total_bytes) {
+        // The memo answers only for the origin that proved it: another origin
+        // the outboard now comes from has not shown that it serves ranges.
+        if total_bytes == 0 || self.origin_proof(hash) == Some((total_bytes, ix)) {
             return Ok(true);
         }
         let last_group = align_range(total_bytes - 1, 1, total_bytes).map_err(|e| {
             CacheError::Internal(anyhow::Error::from(e).context("range probe alignment"))
         })?;
-        let Some(mut cursor) = self
+        let Some((served_by, mut cursor)) = self
             .open_range_cursor(hash, &last_group, Some((ix, outboard)))
             .await?
         else {
@@ -4025,7 +4028,7 @@ impl CacheEngine {
             );
             return Ok(false);
         }
-        self.remember_origin_size(hash, total_bytes);
+        self.remember_origin_size(hash, total_bytes, served_by);
         Ok(true)
     }
 
@@ -4033,6 +4036,12 @@ impl CacheEngine {
     /// origin ([`Self::origin_range_serviceable`]), if one did.
     #[must_use]
     pub fn origin_size_proven(&self, hash: Hash) -> Option<u64> {
+        self.origin_proof(hash).map(|(size, _)| size)
+    }
+
+    /// The size a verified last chunk group proved for `hash`, and the index
+    /// of the origin that served that group.
+    fn origin_proof(&self, hash: Hash) -> Option<(u64, usize)> {
         self.inner
             .origin_proven_sizes
             .lock()
@@ -4041,11 +4050,11 @@ impl CacheEngine {
             .copied()
     }
 
-    /// Remember that a verified last chunk group proved `size` for `hash`.
-    /// The memo is bounded: once it holds [`ORIGIN_PROVEN_SIZES_MAX`] hashes it
-    /// starts over, and a forgotten hash proves its size again on its next
-    /// probe.
-    fn remember_origin_size(&self, hash: Hash, size: u64) {
+    /// Remember that a verified last chunk group from the origin at `origin`
+    /// proved `size` for `hash`. The memo is bounded: once it holds
+    /// [`ORIGIN_PROVEN_SIZES_MAX`] hashes it starts over, and a forgotten hash
+    /// proves its size again on its next probe.
+    fn remember_origin_size(&self, hash: Hash, size: u64, origin: usize) {
         let mut sizes = self
             .inner
             .origin_proven_sizes
@@ -4054,7 +4063,7 @@ impl CacheEngine {
         if sizes.len() >= ORIGIN_PROVEN_SIZES_MAX {
             sizes.clear();
         }
-        sizes.insert(hash, size);
+        sizes.insert(hash, (size, origin));
     }
 
     /// Open a cursor on the first origin that serves both the outboard and a
@@ -4064,14 +4073,15 @@ impl CacheEngine {
     /// cached copy. Every other origin, in chain order, reads its own outboard
     /// through the exact-length gate. A per-origin decline, transport fault,
     /// wrong-length outboard or wrong-length first window advances the chain,
-    /// so a broken origin never shadows a healthy later one. The opened origin
-    /// is marked range-confirmed. Errors as [`Self::origin_range_wire`].
+    /// so a broken origin never shadows a healthy later one. Returns the
+    /// opened origin's index with its cursor. Errors as
+    /// [`Self::origin_range_wire`].
     async fn open_range_cursor(
         &self,
         hash: Hash,
         aligned: &AlignedRange,
         preferred: Option<(usize, Bytes)>,
-    ) -> CacheResult<Option<OriginRangeCursor>> {
+    ) -> CacheResult<Option<(usize, OriginRangeCursor)>> {
         let expected_len = expected_outboard_len(aligned.blob_size());
         let cached = preferred.or_else(|| {
             self.inner
@@ -4124,7 +4134,7 @@ impl CacheEngine {
                     );
                     wrong_length = true;
                 }
-                Ok(Some(cursor)) => return Ok(Some(cursor)),
+                Ok(Some(cursor)) => return Ok(Some((ix, cursor))),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(

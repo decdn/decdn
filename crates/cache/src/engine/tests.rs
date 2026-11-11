@@ -4146,6 +4146,8 @@ async fn origin_range_serviceable_latches_a_small_blob() -> anyhow::Result<()> {
 
 /// A first origin that publishes the outboard but declines ranges does not
 /// shadow a second origin that serves both; the probe confirms the second.
+/// The walk caches the second origin's outboard, so a draw starts there, and
+/// the next probe takes the memo the second origin proved without a read.
 #[tokio::test]
 async fn origin_range_serviceable_walks_past_a_range_declining_origin() -> anyhow::Result<()> {
     let (data, hash, mut declining, _) = multi_window_stub();
@@ -4164,7 +4166,48 @@ async fn origin_range_serviceable_walks_past_a_range_declining_origin() -> anyho
     anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
     anyhow::ensure!(
         declined.load(Ordering::SeqCst) == before && served.load(Ordering::SeqCst) == 1,
-        "a second probe reads no range from either origin"
+        "the memo answers for the origin a draw now starts at: declined {} \
+         (before {before}), served {}",
+        declined.load(Ordering::SeqCst),
+        served.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
+
+/// A proof answers for the origin that served it: once the selected origin
+/// is the one that proved the size, the next probe reads nothing.
+#[tokio::test]
+async fn origin_range_serviceable_memo_answers_for_the_proving_origin() -> anyhow::Result<()> {
+    let (data, hash, first, _) = multi_window_stub();
+    let total = u64::try_from(data.len())?;
+    let (_, _, second, _) = multi_window_stub();
+    let first_reads = Arc::clone(&first.range_fetches);
+    let second_reads = Arc::clone(&second.range_fetches);
+    let (engine, _tmp) = stub_engine(vec![first, second]).await?;
+    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+    anyhow::ensure!(
+        first_reads.load(Ordering::SeqCst) == 1 && second_reads.load(Ordering::SeqCst) == 0,
+        "the proving origin is read once and the memo answers for it"
+    );
+    Ok(())
+}
+
+/// A proof from another origin does not vouch for the origin the outboard
+/// comes from: the probe reads that origin's last chunk group again.
+#[tokio::test]
+async fn origin_range_serviceable_memo_ignores_another_origins_proof() -> anyhow::Result<()> {
+    let (data, hash, first, _) = multi_window_stub();
+    let total = u64::try_from(data.len())?;
+    let (_, _, second, _) = multi_window_stub();
+    let first_reads = Arc::clone(&first.range_fetches);
+    let (engine, _tmp) = stub_engine(vec![first, second]).await?;
+    engine.remember_origin_size(hash, total, 1);
+    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+    anyhow::ensure!(
+        first_reads.load(Ordering::SeqCst) == 1,
+        "the first origin proves its own last group, got {} reads",
+        first_reads.load(Ordering::SeqCst)
     );
     Ok(())
 }
