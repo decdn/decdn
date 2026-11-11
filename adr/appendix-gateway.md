@@ -79,8 +79,10 @@ reported a size that is too small, a short pull would end as a whole
 response, and the client would keep a cut file.
 
 Thus, before it answers a raw blob that no pull verified, the gateway proves
-the size of the blob. The size proof pays for the last byte under the first
-size that a node reports: one chunk group and its bao proof
+the size of the blob. The client reads no size from a probe, so the first size
+that a node reports is the size that the header of the first open signs. The
+size proof
+pays for the last byte under that size: one chunk group and its bao proof
 ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)).
 Only the true size verifies a final chunk
 ([ADR 039](039-multi-source-parallel-fetch.md#failure-handling-reassign-only-tail)).
