@@ -15,9 +15,8 @@ use crate::sink::MemoryBlobCache;
 use crate::source::{BlobSource, FakeFunder, Recovery, ScriptedSource, SourceFuture};
 use crate::{
     BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, ProgressClock, PullConfig,
-    StaticSources, StopPolicy, UpstreamPullHeader, UpstreamRefused, VoucherProgress,
+    StaticSources, StopPolicy, UpstreamPullHeader, VoucherProgress,
 };
-use decdn_protocol::client::StreamError;
 
 fn healthy_ctx() -> PoolContext {
     PoolContext {
@@ -696,6 +695,7 @@ impl BlobSource for TamperTailSource {
             }
             let header = UpstreamPullHeader {
                 total_bytes: self.total,
+                size_proof: None,
                 rate_per_mb: 0,
                 interval_bytes: decdn_protocol::client::CHUNK_BYTES,
                 origin_attestation: None,
@@ -1013,12 +1013,12 @@ async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A bounded window past a size claim too small for the blob is clipped to
-/// the claim: the fetch takes nothing past the end of the blob as the caller
-/// knows it, and the stream ends with an error naming the shortfall, never
-/// following the blob past a reader that stopped.
+/// A bounded window past a first size too small for the blob streams in
+/// full: the first leg's size proof proves the true size, and the window
+/// regains its requested end (#2865), so the stream carries exactly the
+/// window's bytes and no leg runs past the window.
 #[tokio::test]
-async fn a_window_past_a_short_claim_is_clipped_to_it() -> anyhow::Result<()> {
+async fn a_window_past_a_short_first_size_streams_once_the_size_is_proven() -> anyhow::Result<()> {
     let blob = payload(3 * 1024 * 1024 + 777);
     let (source, ledger) = paying_source(blob.clone())?;
     let claim = 2 * 1024 * 1024 + 100;
@@ -1042,16 +1042,17 @@ async fn a_window_past_a_short_claim_is_clipped_to_it() -> anyhow::Result<()> {
         ),
     )
     .await
-    .context("the stream and its drive end")?;
-    let err = match got {
-        Ok(bytes) => anyhow::bail!("{} bytes past the claim were streamed", bytes.len()),
-        Err(err) => format!("{err:#}"),
-    };
-    anyhow::ensure!(err.contains("bytes readable"), "{err}");
+    .context("the stream and its drive end")??;
+    let want = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + 1_000)?)
+        .context("window inside the blob")?;
+    anyhow::ensure!(got == want, "{} of 1000 window bytes", got.len());
+    let window_end = (offset + 1_000).div_ceil(decdn_bao_range::CHUNK_GROUP_BYTES)
+        * decdn_bao_range::CHUNK_GROUP_BYTES;
     for &(start, fetch_len) in &probe.opened_ranges() {
         anyhow::ensure!(
-            start + fetch_len <= claim,
-            "leg ({start}, {fetch_len}) runs past the claim"
+            start + fetch_len <= window_end,
+            "leg ({start}, {fetch_len}) runs past the window"
         );
     }
     Ok(())
@@ -1170,151 +1171,43 @@ async fn a_window_ending_at_the_cap_stays_bounded() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prove the size of `root` under `claim`, one lane per source.
-async fn prove(
-    sources: Vec<ScriptedSource>,
-    root: [u8; 32],
-    claim: u64,
-) -> anyhow::Result<Option<u64>> {
-    let scratch = tempfile::tempdir()?;
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let candidates = sources
-        .into_iter()
-        .zip(0xA1u8..)
-        .map(|(source, provider)| {
-            candidate(
-                source.paying(Arc::clone(&ledger)),
-                Arc::clone(&ledger),
-                provider,
-            )
-        })
-        .collect();
-    streamer(candidates, scratch.path())?
-        .prove_size(root, claim, &PullConfig::default(), stop())
-        .await
-}
-
-/// A true claim is proven by its last chunk group alone: the proof opens
-/// nothing before the group that holds the final byte.
-#[tokio::test]
-async fn a_true_claim_is_proven_by_its_last_group() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(3 * 1024 * 1024 + 777))?;
-    let (root, total, probe) = (source.root(), source.total_bytes(), source.clone());
-    let proven = prove(vec![source], root, total).await?;
-    anyhow::ensure!(proven == Some(total), "proved {proven:?} of {total}");
-    let group = decdn_bao_range::CHUNK_GROUP_BYTES;
-    let last_group = (total - 1) / group * group;
-    let opened = probe.opened_ranges();
-    anyhow::ensure!(!opened.is_empty(), "the proof opens a leg");
-    for &(start, len) in &opened {
-        anyhow::ensure!(
-            start >= last_group && start + len <= total,
-            "leg ({start}, {len}) is not the last group of {total}"
-        );
-    }
-    Ok(())
-}
-
-/// A claim below the true size proves nothing: the last byte under it is not
-/// the blob's final chunk, so no size is given.
-#[tokio::test]
-async fn a_low_claim_proves_nothing() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(3 * 1024 * 1024 + 777))?;
-    let root = source.root();
-    let proven = prove(vec![source], root, 1024 * 1024).await?;
-    anyhow::ensure!(proven.is_none(), "a low claim proved {proven:?}");
-    Ok(())
-}
-
-/// A claim past the true size gives no size: every holder declines its last
-/// byte, as a node declines a range past the end, and the proof ends at once
-/// with the decline.
-#[tokio::test]
-async fn a_high_claim_gives_no_size() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(100_000))?.refusing_opens_from(0, || {
-        anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined))
-    });
-    let root = source.root();
-    let proven = tokio::time::timeout(
-        Duration::from_secs(20),
-        prove(vec![source], root, 4 * 1024 * 1024),
-    )
-    .await
-    .context("the proof ends")?;
-    let err = match proven {
-        Ok(proven) => anyhow::bail!("a high claim proved {proven:?}"),
-        Err(err) => err,
-    };
-    anyhow::ensure!(
-        err.downcast_ref::<crate::NoNodeWillServe>().is_some(),
-        "{err:#}"
-    );
-    Ok(())
-}
-
-/// A node that signs a wrong size fails to verify the final chunk, and the
-/// proof takes the true size from an honest node. The liar is asked, and
-/// its claim never becomes the size.
+/// A node that signs a size it cannot prove opens no leg: its open fails
+/// with [`crate::UnprovenSize`], its ranges move to the honest node, and the
+/// stream carries every byte of the blob from it.
 #[tokio::test]
 async fn a_lying_source_is_passed_over_for_an_honest_one() -> anyhow::Result<()> {
     let blob = payload(600_000);
-    let honest = ScriptedSource::new(blob.clone())?;
-    let (root, total) = (honest.root(), honest.total_bytes());
-    let liar = ScriptedSource::new(blob)?.signing_size(total - 1);
-    let (asked_honest, asked_liar) = (honest.clone(), liar.clone());
-    let proven = prove(vec![liar, honest], root, total).await?;
-    anyhow::ensure!(proven == Some(total), "proved {proven:?} of {total}");
-    anyhow::ensure!(
-        !asked_liar.opened_ranges().is_empty() && !asked_honest.opened_ranges().is_empty(),
-        "liar {:?}, honest {:?}",
-        asked_liar.opened_ranges(),
-        asked_honest.opened_ranges()
-    );
-    Ok(())
-}
-
-/// A claim off by less than one chunk group, either way, proves the blob's
-/// own size, never the claim: the last group under it is the blob's last.
-#[tokio::test]
-async fn a_claim_within_the_last_group_proves_the_true_size() -> anyhow::Result<()> {
-    for offset in [-100i64, 100] {
-        let source = ScriptedSource::new(payload(600_000))?;
-        let (root, total) = (source.root(), source.total_bytes());
-        let claim = total.checked_add_signed(offset).context("a claim")?;
-        let proven = prove(vec![source], root, claim).await?;
-        anyhow::ensure!(
-            proven == Some(total),
-            "claim {claim} proved {proven:?} of {total}"
-        );
-    }
-    Ok(())
-}
-
-/// A claim past the cap on held bytes proves nothing and opens nothing: a
-/// blob that large is not held whole, and its claim never sizes the work.
-#[tokio::test]
-async fn a_claim_past_the_cap_opens_nothing() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(600_000))?;
-    let (root, total, probe) = (source.root(), source.total_bytes(), source.clone());
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let honest = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+    let (root, total) = (honest.root(), honest.total_bytes());
+    let liar = ScriptedSource::new(blob.clone())?
+        .signing_size(total - 1)
+        .paying(Arc::clone(&ledger));
+    let asked_liar = liar.clone();
     let scratch = tempfile::tempdir()?;
-    let proven = streamer(
-        vec![candidate(source.paying(Arc::clone(&ledger)), ledger, 0xA1)],
+    let streamer = streamer(
+        vec![
+            candidate(liar, Arc::clone(&ledger), 0xA1),
+            candidate(honest, ledger, 0xA2),
+        ],
         scratch.path(),
-    )?
-    .max_blob_bytes(total - 1)
-    .prove_size(root, total, &PullConfig::default(), stop())
-    .await?;
-    anyhow::ensure!(proven.is_none() && probe.opened_ranges().is_empty());
-    Ok(())
-}
-
-/// A zero claim proves nothing and opens nothing.
-#[tokio::test]
-async fn a_zero_claim_opens_nothing() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(100_000))?;
-    let (root, probe) = (source.root(), source.clone());
-    let proven = prove(vec![source], root, 0).await?;
-    anyhow::ensure!(proven.is_none() && probe.opened_ranges().is_empty());
+    )?;
+    let (mut reader, mut drive) = streamer
+        .open(
+            root,
+            total,
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    drive.finish().await?;
+    anyhow::ensure!(out == blob, "the stream must carry the honest bytes");
+    anyhow::ensure!(
+        !asked_liar.opened_ranges().is_empty(),
+        "the liar was asked and refused"
+    );
     Ok(())
 }

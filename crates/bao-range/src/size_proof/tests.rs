@@ -225,6 +225,50 @@ fn the_encoder_refuses_inputs_that_do_not_prove_the_size() {
     );
 }
 
+/// The bao wire of the last chunk group, as a verified range export yields
+/// it, builds the same proof as the outboard and the tail do.
+#[test]
+fn the_tail_wire_builds_the_same_proof() {
+    for size in SIZES {
+        let data = blob(size);
+        let (root, outboard, tail) = origin_parts(&data);
+        let tail_start = size_proof_tail_start(size);
+        let aligned = crate::align_range_clamped(tail_start, size - tail_start, size).unwrap();
+        // `encode_verified_range` leads with the 8-byte size header that an
+        // import reads; the wire is what follows it.
+        let wire = if size == 0 {
+            Bytes::new()
+        } else {
+            crate::encode_verified_range(root, &aligned, tail, Bytes::from(outboard.clone()))
+                .unwrap()
+                .slice(8..)
+        };
+        let from_wire = size_proof_from_tail_wire(root, size, &wire).unwrap();
+        let from_outboard = encode_size_proof(root, size, &outboard, tail).unwrap();
+        assert_eq!(from_wire, from_outboard, "size {size}");
+    }
+}
+
+#[test]
+fn a_tampered_or_short_tail_wire_proves_nothing() {
+    let size = 100_000;
+    let data = blob(size);
+    let (root, outboard, tail) = origin_parts(&data);
+    let tail_start = size_proof_tail_start(size);
+    let aligned = crate::align_range_clamped(tail_start, size - tail_start, size).unwrap();
+    let wire = crate::encode_verified_range(root, &aligned, tail, Bytes::from(outboard))
+        .unwrap()
+        .slice(8..);
+    let mut bad = wire.to_vec();
+    bad[0] ^= 1;
+    assert_eq!(
+        size_proof_from_tail_wire(root, size, &bad),
+        Err(SizeProofError::Verification { blob_size: size })
+    );
+    assert!(size_proof_from_tail_wire(root, size, &wire[..10]).is_err());
+    assert!(size_proof_from_tail_wire(root, size + 1, &wire).is_err());
+}
+
 #[test]
 fn the_tail_starts_at_the_last_chunk_group() {
     assert_eq!(size_proof_tail_start(0), 0);

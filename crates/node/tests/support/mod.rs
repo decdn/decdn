@@ -75,12 +75,62 @@ pub(crate) fn bao_wire_len_whole(total: u64) -> u64 {
 /// encoding is a NEW range encoding with its own root->offset proof path — not a
 /// suffix of the offset-0 one — which is why a resumed leg's wire cost cannot be
 /// derived by subtracting from the whole-blob cost.
+/// Size proofs of the payloads a test has handed to a scripted upstream, by
+/// hash. A scripted upstream knows only the hash and the size it signs, so
+/// [`size_proof_for`] reads the proof from here.
+static SIZE_PROOFS: std::sync::LazyLock<std::sync::Mutex<SizeProofs>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Each registered payload's size and size proof, by hash.
+type SizeProofs = std::collections::HashMap<[u8; 32], (u64, decdn_protocol::SizeProof)>;
+
+/// Record `payload`'s size proof for [`size_proof_for`], and return its hash,
+/// as [`Hash::new`] does.
+pub(crate) fn register_payload(payload: impl AsRef<[u8]>) -> Hash {
+    let payload = payload.as_ref();
+    let hash = Hash::new(payload);
+    let size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    if let Ok(eo) = decdn_bao_range::encode_outboard(payload, size)
+        && let Ok(proof) = decdn_protocol::SizeProof::new(eo.size_proof.to_vec())
+        && let Ok(mut proofs) = SIZE_PROOFS.lock()
+    {
+        proofs.insert(*hash.as_bytes(), (size, proof));
+    }
+    hash
+}
+
+/// The size proof a scripted upstream sends when it signs `total_bytes` for
+/// `hash`: the registered payload's proof when that is its size, else `None`,
+/// as a node that cannot prove the size it states.
+pub(crate) fn size_proof_for(
+    hash: [u8; 32],
+    total_bytes: u64,
+) -> Option<decdn_protocol::SizeProof> {
+    SIZE_PROOFS
+        .lock()
+        .ok()?
+        .get(&hash)
+        .filter(|(size, _)| *size == total_bytes)
+        .map(|(_, proof)| proof.clone())
+}
+
+/// The extension a scripted upstream sends on its `ok: true` response: the
+/// size proof of `resp`'s signed size, when a registered payload proves it.
+pub(crate) fn proven_ext(
+    resp: &decdn_protocol::client::StreamResponse,
+) -> decdn_protocol::client::StreamResponseExt {
+    decdn_protocol::client::StreamResponseExt {
+        size_proof: size_proof_for(resp.body.hash, resp.body.total_bytes),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn honest_bao_wire_range(
     payload: &[u8],
     byte_offset: u64,
     byte_len: u64,
 ) -> anyhow::Result<Vec<u8>> {
-    let hash = Hash::new(payload);
+    let hash = register_payload(payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
         payload,
@@ -117,7 +167,7 @@ pub(crate) async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::Temp
 pub(crate) async fn cache_with_blob(
     payload: &[u8],
 ) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
-    let hash = Hash::new(payload);
+    let hash = register_payload(payload);
     let origin_dir = tempfile::tempdir()?;
     let hex = hash.to_hex();
     let shard = hex
@@ -878,7 +928,7 @@ pub(crate) async fn read_stream_response(
     decdn_protocol::StreamResponse,
     decdn_protocol::StreamResponseExt,
 )> {
-    let frame = read_frame(recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME)
+    let frame = read_frame(recv, decdn_protocol::MAX_STREAM_RESPONSE_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read frame: {e}"))?;
     let (msg, tail) =

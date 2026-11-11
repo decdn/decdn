@@ -536,7 +536,7 @@ async fn open_and_hold(
 
     let first = tokio::time::timeout(
         FIRST_FRAME_BUDGET,
-        decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME),
+        decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_STREAM_RESPONSE_FRAME),
     )
     .await
     .context("node sent no open frame within budget")?

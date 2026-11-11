@@ -66,20 +66,30 @@ pub const CHUNK_BYTES: u64 = MB_BYTES;
 /// 255 MiB at [`CHUNK_BYTES`]. 256 slots = one payable base + 255 increments.
 pub const MAX_CHAIN_LENGTH: u8 = 255;
 
-/// Frame ceiling for every `cdn/client/v1` message except
-/// [`ClientMessage::ChunkData`], in payload bytes (ADR 013 § Wire Framing).
+/// Frame ceiling for every `cdn/client/v1` message the node reads, in payload
+/// bytes (ADR 013 § Wire Framing).
 ///
-/// The node reads a [`StreamRequest`] and every later payment proof against it,
-/// and a payer reads the [`StreamResponse`] against it. The largest legitimate
-/// message is a [`StreamResponse`] whose extension carries a full
-/// [`crate::MAX_SIZE_PROOF_BYTES`] size proof and an origin attestation, a
-/// little under 5 KiB, since every signature on the wire is a 65-byte EOA
-/// signature. The ceiling leaves headroom for Tier-1 extension fields and
+/// The node reads a [`StreamRequest`] and every later payment proof against it.
+/// The largest legitimate message is a [`StreamRequest`] with a client binding
+/// and a capability: 301 bytes, since every signature on the wire is a 65-byte
+/// EOA signature. The ceiling leaves headroom for Tier-1 extension fields and
 /// refuses a larger frame before the reader buffers it. It is also the wire
 /// bound on `owner_signature`, which decode checks only for being non-empty.
 /// The `client_control_frame_ceiling_holds_the_largest_message` test pins the
 /// margin.
-pub const MAX_CLIENT_CONTROL_FRAME: u32 = 8 * 1024;
+pub const MAX_CLIENT_CONTROL_FRAME: u32 = 4 * 1024;
+
+/// Frame ceiling for the [`StreamResponse`] a payer reads, in payload bytes
+/// (ADR 013 § Wire Framing).
+///
+/// The largest legitimate response carries a full [`crate::MAX_SIZE_PROOF_BYTES`]
+/// size proof, an origin attestation and a refusal code: under 5 KiB. The
+/// ceiling leaves headroom for Tier-1 extension fields and refuses a larger
+/// frame before the reader buffers it. The node reads no response, so this
+/// ceiling adds nothing to the node's reader buffers. The
+/// `stream_response_frame_ceiling_holds_the_largest_response` test pins the
+/// margin.
+pub const MAX_STREAM_RESPONSE_FRAME: u32 = 8 * 1024;
 
 /// Frame ceiling for the node → payer delivery stream, in payload bytes
 /// (ADR 013 § Wire Framing): one [`ClientMessage::ChunkData`] that carries a

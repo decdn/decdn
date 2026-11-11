@@ -159,11 +159,11 @@ async fn run_acquire_with<S: BlobSource>(
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
             total_bytes: total,
-            ranges: &[(0, total)],
+            // The whole blob: one tail that runs to the end the bound names.
+            ranges: &[(0, 0)],
         },
         &mut set,
         &AcquireEnv {
@@ -3013,7 +3013,6 @@ async fn acquire_bounded<St: crate::source::IngestStore>(
         run: None,
     };
     let target = AcquireTarget {
-        bounded: false,
         store,
         hash: root,
         total_bytes: total,
@@ -3616,7 +3615,6 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
     let gate = recovery_gate();
     let err = acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -3662,7 +3660,6 @@ async fn acquire_under<S: BlobSource>(
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
     acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
             total_bytes: total,
@@ -4322,7 +4319,6 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4403,7 +4399,6 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4829,7 +4824,6 @@ async fn acquire_with_late_builds_halted(
         run: None,
     };
     let target = AcquireTarget {
-        bounded: false,
         store: &store,
         hash: root,
         total_bytes: total,
@@ -5184,7 +5178,6 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5247,7 +5240,6 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5310,7 +5302,6 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5357,7 +5348,6 @@ async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5398,7 +5388,6 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
     let mib = 1024 * 1024;
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5464,19 +5453,6 @@ fn a_grown_bound_saturates_near_the_top() {
     assert_eq!(grown_bound(1, u64::MAX, 1), u64::MAX);
 }
 
-/// The bounds the growth rule steps through from a first claim of `c0`
-/// while every source honestly serves a `truth`-byte blob: each round
-/// fetches up to the bound, so everything past `c0` below it is present.
-fn predicted_growth(c0: u64, truth: u64) -> Vec<u64> {
-    let mut bounds = Vec::new();
-    let mut bound = c0;
-    while bound < truth {
-        bound = super::grown_bound(bound, c0, bound.saturating_sub(c0));
-        bounds.push(bound);
-    }
-    bounds
-}
-
 /// Acquire the whole blob into `store` from `provider`, recording every
 /// `(position, total)` the progress callback reports.
 async fn acquire_recording<S: BlobSource>(
@@ -5524,10 +5500,11 @@ fn honest_lanes(
     Ok((sources, StaticSources::new(candidates)?))
 }
 
-/// A first claim far below the blob grows by the rule until a leg
-/// verifies the true final chunk, and the fetch completes byte-identical.
+/// A first size far below the blob (a declared size) is replaced by the size
+/// the first leg's proof proves: the bound moves straight to the true size,
+/// with no growth round, and the fetch completes byte-identical.
 #[tokio::test(start_paused = true)]
-async fn a_too_small_claim_grows_until_the_true_end_is_proven() -> anyhow::Result<()> {
+async fn a_too_small_first_size_is_replaced_by_the_proven_size() -> anyhow::Result<()> {
     let (c0, truth) = (MIB, 70 * MIB);
     let data = blob(truth as usize);
     let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
@@ -5546,12 +5523,7 @@ async fn a_too_small_claim_grows_until_the_true_end_is_proven() -> anyhow::Resul
         .map(|&(_, total)| total)
         .filter(|&total| total != c0 && total != truth)
         .collect();
-    let predicted: std::collections::BTreeSet<u64> = predicted_growth(c0, truth)
-        .into_iter()
-        .filter(|&b| b != truth)
-        .collect();
-    assert_eq!(grown, predicted, "one growth round per the rule");
-    assert_eq!(predicted.len(), 1);
+    assert!(grown.is_empty(), "no growth round: {grown:?}");
     Ok(())
 }
 
@@ -5769,26 +5741,21 @@ async fn a_claim_above_the_cap_is_clamped_to_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Growth never raises the bound past the cap: a short claim grows to the
-/// cap at most, and a blob within it completes.
+/// A short first size under a cap: the first leg proves the true size, the
+/// bound never passes the cap, and a blob within it completes.
 #[tokio::test(start_paused = true)]
-async fn growth_stops_at_the_cap() -> anyhow::Result<()> {
+async fn a_short_first_size_proves_within_the_cap() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
     let cap = 5 * MIB;
     let (result, totals, store, _dir) = acquire_capped(&data, MIB, cap).await?;
     result?;
     assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
-    assert!(
-        totals.contains(&cap),
-        "the claim grew to the cap: {totals:?}"
-    );
     assert_eq!(store.proven(), Some(3 * MIB));
     Ok(())
 }
 
-/// A blob that holds bytes past the cap ends the item with `BlobTooLarge`
-/// once the bound reaches the cap with no size proven, whether the claim
-/// was short or above the cap.
+/// A blob larger than the cap ends the item with `BlobTooLarge` once a leg
+/// proves its size, whether the first size was short or above the cap.
 #[tokio::test(start_paused = true)]
 async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
@@ -5886,7 +5853,6 @@ async fn acquire_capped_into(
     let gate = recovery_gate();
     let result = acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
             total_bytes: u64::try_from(data.len())?,
@@ -6474,7 +6440,6 @@ async fn acquire_over<P: crate::SourceProvider>(
     let whole = [(0, total)];
     acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
             total_bytes: total,
@@ -7015,7 +6980,6 @@ async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
     let runs: Vec<(u64, u64)> = (0..6).map(|i| (i * 2 * MIB, MIB)).collect();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -7559,7 +7523,6 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     };
     let fetch = acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -7768,7 +7731,6 @@ async fn acquire_delegated_in_run(
     let gate = RecoveryGate::with_settle(Duration::ZERO);
     acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
             total_bytes: total,

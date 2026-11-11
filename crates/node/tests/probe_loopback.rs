@@ -1971,6 +1971,11 @@ async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow:
     let dir = origin_dir.path().join(shard);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(hex.as_str()), payload)?;
+    // The siblings `decdn origin import` writes: the outboard and the size
+    // proof, which lets the node state the size it advertises.
+    let eo = decdn_bao_range::encode_outboard(&payload[..], u64::try_from(payload.len())?)?;
+    std::fs::write(dir.join(eo.obao4_name()), &eo.outboard)?;
+    std::fs::write(dir.join(eo.size_proof_name()), &eo.size_proof)?;
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
@@ -2008,6 +2013,15 @@ async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow:
         "origin content's total_bytes should report the backend size, got {:?}",
         resp_ext.total_bytes
     );
+    let proof = resp_ext
+        .size_proof
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("a stated size carries its proof"))?;
+    anyhow::ensure!(decdn_bao_range::verify_size_proof(
+        *hash.as_bytes(),
+        payload.len() as u64,
+        proof.as_bytes()
+    ));
     anyhow::ensure!(
         resp_ext.coverage == Coverage::full(num_blocks(payload.len() as u64)),
         "an origin can serve every block, so coverage must be all-ones"

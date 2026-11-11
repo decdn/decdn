@@ -1203,6 +1203,86 @@ async fn decode_to_vec_rejects_wrong_root() -> anyhow::Result<()> {
 /// constructor the open stage uses — rather
 /// than a hand-built value, which #1377's newtype now makes impossible outside
 /// this crate anyway.
+/// The wire bound on a size proof is the codec's longest proof: a proof the
+/// codec builds always decodes, and the decode bound admits no longer one.
+#[test]
+fn the_wire_bounds_a_size_proof_at_the_codecs_longest() {
+    assert_eq!(
+        decdn_protocol::MAX_SIZE_PROOF_BYTES,
+        decdn_bao_range::MAX_SIZE_PROOF_BYTES
+    );
+}
+
+/// The open stage takes a node's signed `total_bytes` only with a proof of
+/// that size. A wrong size under a real proof of another size, a size with no
+/// proof, and a 2^60 size with garbage proof bytes all fail with
+/// [`super::UnprovenSize`] before any caller sees the size, and the fault is
+/// the source's.
+#[test]
+fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::slash_judge_domain;
+    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_protocol::SizeProof;
+    use decdn_protocol::client::{StreamResponse, StreamResponseBody, StreamResponseExt};
+
+    let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let size = u64::try_from(blob.len())?;
+    let hash = *blake3::hash(&blob).as_bytes();
+    let proof = SizeProof::new(
+        decdn_bao_range::encode_outboard(blob.as_slice(), size)?
+            .size_proof
+            .to_vec(),
+    )?;
+    let operator = PrivateKeySigner::random();
+    let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
+    let ts = 1_700_000_000_000_000;
+    let verify = |total_bytes: u64, size_proof: Option<SizeProof>| -> anyhow::Result<()> {
+        let body = StreamResponseBody {
+            hash,
+            ok: true,
+            rate_per_mb: 10,
+            total_bytes,
+            timestamp_us: ts,
+        };
+        let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+        let resp = StreamResponse {
+            body,
+            slash_sig: sig.as_bytes().to_vec(),
+        };
+        let ext = StreamResponseExt {
+            size_proof,
+            ..StreamResponseExt::default()
+        };
+        super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts)
+    };
+
+    verify(size, Some(proof.clone()))?;
+    for (what, total_bytes, size_proof) in [
+        ("a wrong size", size - 1, Some(proof.clone())),
+        ("no proof", size, None),
+        (
+            "a huge size",
+            1u64 << 60,
+            Some(SizeProof::new(vec![0xCD; 4000])?),
+        ),
+        ("a huge size with no proof", 1u64 << 60, None),
+    ] {
+        let err = verify(total_bytes, size_proof)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("{what} must not open"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<super::UnprovenSize>().is_some(),
+            "{what}: {err}"
+        );
+        anyhow::ensure!(
+            matches!(crate::fault::classify(&err), crate::fault::Fault::Source),
+            "{what} is the source's fault"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
@@ -1231,6 +1311,7 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
     let response_ext = decdn_protocol::StreamResponseExt {
         error: Some(StreamError::Declined),
         origin_attestation: None,
+        size_proof: None,
     };
     // Preconditions the real open stage enforces before ever calling `open`.
     response.validate()?;

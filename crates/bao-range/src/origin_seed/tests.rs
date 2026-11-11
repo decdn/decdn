@@ -66,12 +66,27 @@ fn obao4_name_appends_suffix() {
 /// for sizes on and off every boundary, and no other size.
 #[test]
 fn encode_outboard_proves_the_size() {
-    for size in [0u64, 1, 1023, 1024, 1025, 16 * 1024, 16 * 1024 + 1, 200 * 1024 + 7] {
+    for size in [
+        0u64,
+        1,
+        1023,
+        1024,
+        1025,
+        16 * 1024,
+        16 * 1024 + 1,
+        200 * 1024 + 7,
+    ] {
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let got = encode_outboard(payload.as_slice(), size).unwrap();
         let root: [u8; 32] = *bao_tree::blake3::hash(&payload).as_bytes();
-        assert!(crate::verify_size_proof(root, size, &got.size_proof), "size {size}");
-        assert!(!crate::verify_size_proof(root, size + 1, &got.size_proof), "size {size} + 1");
+        assert!(
+            crate::verify_size_proof(root, size, &got.size_proof),
+            "size {size}"
+        );
+        assert!(
+            !crate::verify_size_proof(root, size + 1, &got.size_proof),
+            "size {size} + 1"
+        );
     }
 }
 

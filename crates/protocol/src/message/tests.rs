@@ -449,7 +449,10 @@ fn probe_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::er
     let ext = ProbeResponseExt {
         total_bytes: Some(u64::MAX),
         coverage: crate::Coverage::full(u32::try_from(crate::coverage::MAX_COVERAGE_BYTES * 8)?),
-        size_proof: Some(crate::SizeProof::new(vec![0x04; crate::MAX_SIZE_PROOF_BYTES])?),
+        size_proof: Some(crate::SizeProof::new(vec![
+            0x04;
+            crate::MAX_SIZE_PROOF_BYTES
+        ])?),
     };
     let response = encode_probe_response(&response, Some(&ext))?;
     assert_eq!(response.len(), 4808, "ProbeResponse + ext at full width");

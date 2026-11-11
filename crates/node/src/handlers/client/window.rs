@@ -323,6 +323,23 @@ impl ClientHandler {
                 {
                     Ok(opened) => {
                         let total = opened.total_bytes;
+                        // Keep the upstream's proof, which its open verified, so
+                        // this node serves it before it holds the tail (ADR 005 §
+                        // A node proves the blob size).
+                        let kept = opened.size_proof.as_ref().is_some_and(|proof| {
+                            self.cache.keep_size_proof(hash, total, proof.as_bytes())
+                        });
+                        if !kept {
+                            release_reservation_unspent(floor_reservation.as_ref());
+                            return self
+                                .respond_error(
+                                    &mut send,
+                                    req,
+                                    ServeRejectReason::CacheMiss,
+                                    rate_per_mb,
+                                )
+                                .await;
+                        }
                         target = Some(opened);
                         total
                     }
@@ -336,33 +353,28 @@ impl ClientHandler {
             }
         };
 
-        // Deliberately NO bounds gate on this total (#1895, deflation direction):
-        // `total_bytes` is the peer's signed but unverified handshake value, so
-        // refusing a bounded/resumed request against it with a client-attributable
-        // `RangeNotSatisfiable` would let a holder UNDER-report a blob's size and
-        // make every relay refuse valid ranges — the mirror of the inflation
-        // attack the received-byte ceiling exists for. A total that genuinely
-        // cannot satisfy the request surfaces in `serve_leg`'s own bounds check
-        // as a stream fault attributed to the pull, never to the client. The
-        // own-origin twin keeps its pre-signature gate: that total is this
-        // node's own origin probe.
-
-        // (4) No size gate on the CLAIMED total (#1895): `total_bytes` is the peer's
-        // signed but unverified handshake value, so refusing on it would let a holder
-        // inflate a small blob's size to make every finite-ceiling relay refuse to
-        // pull/cache/serve while it monopolises the traffic. The `max_blob_size_bytes`
-        // cap is enforced instead on the bytes the pull leg stores for the blob
-        // (`decdn_client::drive`), which cuts each leg to the room left under the cap
-        // and ends the fill once no room is left. A lie is inert (it cannot produce
-        // bytes that verify against the true root); an honest giant is served up to
-        // the cap's worth of held bytes, at any offset.
-        //
-        // The request's end has no gate either. A request's `byte_len` may run past
-        // the blob, and only the claimed total says where the blob ends, so an end
-        // gate would again let an inflated claim refuse a small blob. A request with
-        // more missing bytes than the cap leaves room for commits: the serve leg
-        // delivers what the pull lands, then stops the stream with a `Declined`
-        // refusal once the pull ends at the cap.
+        // (4) `total_bytes` is proven (the upstream's size proof, or the live fill's
+        // kept proof). A request whose start has no byte of the blob refuses
+        // `RangeNotSatisfiable` before the response is signed, as on every other
+        // serve tier. An end past the blob is served clamped to the blob's end.
+        if super::dispatch::range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
+            release_reservation_unspent(floor_reservation.as_ref());
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::RangeNotSatisfiable,
+                    rate_per_mb,
+                )
+                .await;
+        }
+        // The `max_blob_size_bytes` cap binds on the bytes the pull leg stores for
+        // the blob (`decdn_client::drive`), which cuts each leg to the room left
+        // under the cap and ends the fill once no room is left: a node serves a
+        // range at any offset of a larger blob while the bytes it holds stay within
+        // the cap. A request with more missing bytes than the cap leaves room for
+        // commits: the serve leg delivers what the pull lands, then stops the
+        // stream with a `Declined` refusal once the pull ends at the cap.
 
         // (5) The signed `StreamResponse` commits to `total_bytes` (now known). It is
         // deferred to step (7), AFTER the fill is claimed — so a peeked geometry that
@@ -450,7 +462,13 @@ impl ClientHandler {
         // on, instead of `ok: true` and a truncated stream, when the ranked candidates
         // cannot cover the part of the pull range this node does not hold.
         if let Some(shortfall) = self
-            .pull_range_uncovered(hash, total_bytes, pull_range, target.as_ref())
+            .pull_range_uncovered(
+                hash,
+                total_bytes,
+                pull_range,
+                target.as_ref(),
+                origin.max_blob_size_bytes(),
+            )
             .await
         {
             release_reservation_unspent(floor_reservation.as_ref());
@@ -474,7 +492,7 @@ impl ClientHandler {
             total_bytes,
             timestamp_us: req.timestamp_us,
         };
-        let (resp, resp_ext) = self.sign_response(body, None)?;
+        let (resp, resp_ext) = self.sign_response(body, None).await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         first_byte.mark_responded();
@@ -792,7 +810,7 @@ impl ClientHandler {
             total_bytes,
             timestamp_us: req.timestamp_us,
         };
-        let (resp, resp_ext) = self.sign_response(body, None)?;
+        let (resp, resp_ext) = self.sign_response(body, None).await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         first_byte.mark_responded();
@@ -1046,13 +1064,17 @@ impl ClientHandler {
         total_bytes: u64,
         pull_range: Option<(u64, u64)>,
         target: Option<&PullLegTarget>,
+        max_blob_size_bytes: u64,
     ) -> Option<CoverageShortfall> {
         use decdn_bao_range::RangedStore as _;
         let (Some((pull_offset, pull_len)), Some(target)) = (pull_range, target) else {
             return None;
         };
         let store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
-        let gap = match store.missing_ranges(pull_offset, pull_len).await {
+        // The gap the pull plans: never past the bytes the node holds for one
+        // blob ([`crate::node_origin::planned_len`]), as the pull leg plans it.
+        let planned = crate::node_origin::planned_len(pull_len, max_blob_size_bytes);
+        let gap = match store.missing_ranges(pull_offset, planned).await {
             Ok(gap) => gap,
             Err(err) => {
                 tracing::warn!(

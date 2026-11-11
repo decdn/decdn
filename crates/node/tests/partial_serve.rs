@@ -433,6 +433,16 @@ async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Res
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.to_vec()))
         .mount(&server)
         .await;
+    // sibling size proof GET: the node proves the size before it states it.
+    let proof = decdn_bao_range::encode_outboard(plaintext.as_slice(), total)?.size_proof;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/{hex}{}",
+            decdn_bao_range::SIZE_PROOF_SUFFIX
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(proof.to_vec()))
+        .mount(&server)
+        .await;
     // The requested span is group 0 + group 1. Group 0 is already cached, group 1
     // is not, so the pull leg's `missing_ranges` is exactly group 1 — and that is
     // the ONLY ranged GET the origin may see. Mount a 206 for group 1 alone; a

@@ -47,6 +47,7 @@ pub mod range_pull;
 pub mod ranged_store;
 pub mod retry;
 pub mod serve_store;
+mod size_proofs;
 
 pub use circuit_breaker::{
     Admission, BreakerState, Clock, ManualClock, OriginBreaker, OriginOutcome, SystemClock,

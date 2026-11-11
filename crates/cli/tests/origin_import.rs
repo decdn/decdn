@@ -91,6 +91,24 @@ fn single_file_import_is_readable_and_range_serves() {
     rt().block_on(async {
         let reader = FilesystemOrigin::new(origin.path()).await.unwrap();
 
+        // The size proof sibling proves the true size and no other.
+        let proof = reader
+            .fetch_size_proof(hash)
+            .await
+            .unwrap()
+            .expect("import writes the size proof");
+        let size = u64::try_from(payload.len()).unwrap();
+        assert!(decdn_bao_range::verify_size_proof(
+            *hash.as_bytes(),
+            size,
+            &proof
+        ));
+        assert!(!decdn_bao_range::verify_size_proof(
+            *hash.as_bytes(),
+            size + 1,
+            &proof
+        ));
+
         // Whole-blob fetch round-trips the exact bytes.
         let fetched = reader.fetch(hash, 1 << 30).await.unwrap();
         let bytes = match fetched {
@@ -155,7 +173,11 @@ fn reimport_is_idempotent_noop() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(shard_entries.len(), 2, "expected only data + .obao4");
+    assert_eq!(
+        shard_entries.len(),
+        3,
+        "expected only data + .obao4 + .sizeproof"
+    );
 }
 
 #[test]

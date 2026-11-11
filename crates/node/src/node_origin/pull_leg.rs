@@ -83,6 +83,14 @@ use decdn_client::{PoolContext, PullDeadlines};
 /// is its boundaries scaled by this (twin of the driver's private constant).
 const CHUNK_BYTES: u64 = 1024;
 
+/// What a header handshake learns: the proven size, its proof, and the pull it
+/// opened for the first leg, if it kept one.
+type Handshake = (
+    u64,
+    Option<decdn_protocol::SizeProof>,
+    Option<PrimedHandshake>,
+);
+
 /// A discovered, ranked pull plan for one serve-miss: the `total_bytes` the caller
 /// needs to sign its `StreamResponse`, plus the RANKED candidate list (each
 /// carrying its probe-fresh range-keyed `coverage`, #1506) the ranged-drive loop
@@ -90,10 +98,14 @@ const CHUNK_BYTES: u64 = 1024;
 /// result is handed to [`run_pull_leg`], which opens a lane per planned run — a
 /// blob spread across partial holders is pulled from each in turn.
 pub(crate) struct PullLegTarget {
-    /// The upstream-claimed content length, from the header handshake against the
-    /// first openable candidate. Any holder — partial or whole — reports the same
-    /// blob geometry, so it is authoritative regardless of which candidate answered.
+    /// The content length, from the header handshake against the first openable
+    /// candidate and proven by [`Self::size_proof`]. Only the true size proves,
+    /// so it is the same whichever holder answered.
     pub(crate) total_bytes: u64,
+    /// The upstream's proof of `total_bytes`, verified by the handshake's open.
+    /// The serving node keeps it and serves it on its own response before it
+    /// holds the tail.
+    pub(crate) size_proof: Option<decdn_protocol::SizeProof>,
     /// The served client's namespace, threaded onto every lane (ADR 005), big-endian.
     namespace_id: [u8; 32],
     /// The ranked candidates (best-first), each with its probe-confirmed
@@ -690,6 +702,7 @@ impl NodeOrigin {
     /// every candidate declined — with the [`PullLegTrail`] of the walk. A
     /// [`PullMiss::LocalFault`] must not be signed to the client as a clean
     /// `NotFound` about the content (#1560).
+    #[allow(clippy::too_many_lines)] // one walk: cached candidates, then discovery
     pub(crate) async fn open_pull_leg(
         &self,
         hash: Hash,
@@ -728,9 +741,10 @@ impl NodeOrigin {
             trail.handshakes = count_u16(outcome.attempts);
             trail.last_fault = outcome.last_fault;
             match outcome.payload {
-                Ok((total_bytes, primed)) => {
+                Ok((total_bytes, size_proof, primed)) => {
                     return Ok(PullLegTarget {
                         total_bytes,
+                        size_proof,
                         namespace_id: namespace_bytes,
                         candidates: cached,
                         primed,
@@ -800,8 +814,9 @@ impl NodeOrigin {
             trail.last_fault = outcome.last_fault;
         }
         match outcome.payload {
-            Ok((total_bytes, primed)) => Ok(PullLegTarget {
+            Ok((total_bytes, size_proof, primed)) => Ok(PullLegTarget {
                 total_bytes,
+                size_proof,
                 namespace_id: namespace_bytes,
                 candidates: ranked,
                 primed,
@@ -832,7 +847,7 @@ impl NodeOrigin {
         namespace_id: U256,
         budget: usize,
         prime: Option<PrimeLeg>,
-    ) -> PullOutcome<(u64, Option<PrimedHandshake>)> {
+    ) -> PullOutcome<Handshake> {
         let mut attempts = 0;
         let mut miss = PullMiss::Clean;
         let mut last_fault = None;
@@ -906,7 +921,7 @@ impl NodeOrigin {
         hash_bytes: [u8; 32],
         namespace_id: U256,
         prime: Option<PrimeLeg>,
-    ) -> Result<(u64, Option<PrimedHandshake>), HandshakeFault> {
+    ) -> Result<Handshake, HandshakeFault> {
         let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
             return Err(HandshakeFault::clean("no_address"));
         };
@@ -1005,6 +1020,7 @@ impl NodeOrigin {
                     deps.attestations
                         .keep_offered(hash_bytes, header.origin_attestation.as_ref());
                     let total_bytes = header.total_bytes;
+                    let size_proof = header.size_proof.clone();
                     if hint != Some(total_bytes) {
                         warn!(
                             peer = %pk,
@@ -1014,7 +1030,7 @@ impl NodeOrigin {
                             "node-origin: the provider signs another size than it probed; \
                              closing the first-leg handshake pull"
                         );
-                        return Ok((total_bytes, None));
+                        return Ok((total_bytes, size_proof, None));
                     }
                     let primed = PrimedHandshake {
                         key: PrimeKey {
@@ -1028,7 +1044,7 @@ impl NodeOrigin {
                         header,
                         reader,
                     };
-                    return Ok((total_bytes, Some(primed)));
+                    return Ok((total_bytes, size_proof, Some(primed)));
                 }
                 // A range past the blob's end means the probed size was wrong, not
                 // the provider: ask it for the whole blob instead.
@@ -1093,9 +1109,12 @@ impl NodeOrigin {
             }
         };
         let total_bytes = header.total_bytes;
+        let size_proof = header.size_proof.clone();
+        deps.attestations
+            .keep_offered(hash_bytes, header.origin_attestation.as_ref());
         let _ = probe.abort();
         drop(stream_guard);
-        Ok((total_bytes, None))
+        Ok((total_bytes, size_proof, None))
     }
 }
 
@@ -1230,6 +1249,7 @@ pub(crate) async fn run_pull_leg(
     let hash_bytes = *hash.as_bytes();
     let PullLegTarget {
         total_bytes,
+        size_proof: _,
         namespace_id,
         candidates,
         primed,
@@ -1293,6 +1313,9 @@ pub(crate) async fn run_pull_leg(
         primed: std::sync::Mutex::new(primed),
     };
 
+    // The plan never reaches past the request's end or past the bytes the
+    // node holds for one blob.
+    let len = super::ranged_pull::planned_len(len, deps.config.max_blob_size_bytes);
     let outcome = assemble(&sink, &coverages, offset, len, total_bytes).await;
     // One outbound outcome per assembled range. A cancelled assembly (the serve
     // leg finished first) is neither.

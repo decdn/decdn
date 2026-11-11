@@ -1375,6 +1375,11 @@ where
                 let generation_at_open = ledger.generation();
                 let leg: anyhow::Result<()> = match source.open(hash, aligned.clone()).await {
                     Ok((header, reader)) => {
+                        // A paid open verified the header's size proof: the
+                        // size is the blob's, and the planner works to it.
+                        if header.size_proof.is_some() {
+                            store.prove_size(header.total_bytes);
+                        }
                         counters.next_voucher_cost = voucher_cost(&header);
                         if let Some(quotes) = pool.and_then(|p| p.quotes) {
                             quotes.observe(header.rate_per_mb, header.interval_bytes);

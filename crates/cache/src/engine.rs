@@ -46,6 +46,7 @@ use crate::range_pull::{AlignedRange, align_range, align_range_clamped};
 use crate::retry::{
     TerminalFailure, classify_io_error, drain_to_bytes, run_with_retry_classified, should_buffer,
 };
+use crate::size_proofs::{SIZE_PROOF_ENTRIES, SizeProofMemo};
 use crate::{from_store_hash, to_store_hash};
 
 /// Rescan slot: no pass running, and none requested.
@@ -538,6 +539,9 @@ struct Inner {
     /// [`OriginRangeWire`] holds a handle and evicts the copy it used when the
     /// range fails bao verification.
     outboards: OutboardCache,
+    /// The verified size proof of each blob the engine states a size for
+    /// ([`CacheEngine::size_proof`]). Evicting a blob drops its proof.
+    size_proofs: SizeProofMemo,
     /// One async lock per hash whose outboard an origin read is fetching, so
     /// concurrent cold misses of one hash wait for the first read and reuse its
     /// cached copy instead of each downloading it. Held as `Weak`: an entry
@@ -1473,7 +1477,7 @@ impl CacheEngine {
     /// through `open_full` (which supplies a [`SystemClock`]); tests use
     /// this to drive the breaker's cooldown deterministically with a
     /// [`crate::ManualClock`].
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one field per engine part
     pub async fn open_full_with_clock(
         cache_dir: &Path,
         origins: Vec<Arc<dyn Origin>>,
@@ -1629,6 +1633,7 @@ impl CacheEngine {
                 )),
                 origin_range_confirmed,
                 outboards: OutboardCache::new(OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES),
+                size_proofs: SizeProofMemo::new(SIZE_PROOF_ENTRIES),
                 outboard_flights: Mutex::new(HashMap::new()),
                 origin_read_head_start_ms: AtomicU64::new(0),
                 origin_read_min_bps: AtomicU64::new(0),
@@ -2875,6 +2880,8 @@ impl CacheEngine {
     /// tag lookup, so this lists every tag and filters in Rust. Fine at
     /// operator-evict / mismatch rates; not something to call on a hot path.
     async fn drop_named_tags_for(&self, hash: Hash) -> CacheResult<u64> {
+        // The blob goes, so its size proof goes with it.
+        self.inner.size_proofs.remove(&hash);
         // Invalidate the partial-protection memo before touching the store, so a
         // later admit re-issues the protecting tag rather than trusting a stale
         // "already protected" entry for the tag we are removing. Clearing it up
@@ -3999,6 +4006,117 @@ impl CacheEngine {
             );
         }
         Ok(opened)
+    }
+
+    /// The size proof that `hash` is `size` bytes long, or `None` when the
+    /// node cannot prove that size (ADR 005 § A node proves the blob size). A
+    /// node states no size without it.
+    ///
+    /// The engine looks in turn at:
+    ///
+    /// 1. the proof it keeps for the hash;
+    /// 2. the last chunk group in its own store, for a complete blob or a
+    ///    partial blob that holds its tail;
+    /// 3. the `{H}.sizeproof` object of each origin;
+    /// 4. the outboard and the last chunk group of each origin, for a blob an
+    ///    origin holds with no stored proof.
+    ///
+    /// Every proof it finds is verified against `hash` and `size` before it
+    /// is kept and returned. A proof that does not verify is skipped, so a
+    /// wrong `size` gives `None`. An origin fault gives `None` for that
+    /// origin.
+    pub async fn size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
+        let root = *hash.as_bytes();
+        if let Some(kept) = self.inner.size_proofs.get(&hash) {
+            if kept.size == size {
+                return Some(kept.proof);
+            }
+            // The kept proof proves another size, so this size is wrong.
+            return None;
+        }
+        let proof = match self.local_size_proof(hash, size).await {
+            Some(proof) => Some(proof),
+            None => self.origin_size_proof(hash, size).await,
+        }?;
+        if !decdn_bao_range::verify_size_proof(root, size, &proof) {
+            return None;
+        }
+        self.inner.size_proofs.insert(hash, size, proof.clone());
+        Some(proof)
+    }
+
+    /// The proof the engine keeps for `hash` and the size it proves, with no
+    /// I/O.
+    #[must_use]
+    pub fn kept_size_proof(&self, hash: Hash) -> Option<(u64, Bytes)> {
+        self.inner
+            .size_proofs
+            .get(&hash)
+            .map(|kept| (kept.size, kept.proof))
+    }
+
+    /// Keep `proof` as the size proof of `hash` when it proves `size`. A node
+    /// keeps the proof it verified from its upstream, so it serves the proof
+    /// before it holds the tail of the blob. Returns whether the proof
+    /// verified and was kept.
+    pub fn keep_size_proof(&self, hash: Hash, size: u64, proof: &[u8]) -> bool {
+        if !decdn_bao_range::verify_size_proof(*hash.as_bytes(), size, proof) {
+            return false;
+        }
+        self.inner
+            .size_proofs
+            .insert(hash, size, Bytes::copy_from_slice(proof));
+        true
+    }
+
+    /// Build the proof from the last chunk group in the local store.
+    async fn local_size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
+        if size == 0 {
+            return Some(Bytes::new());
+        }
+        let tail_start = decdn_bao_range::size_proof_tail_start(size);
+        let wire = self
+            .export_bao_range(hash, tail_start, size - tail_start, size)
+            .await
+            .ok()?;
+        decdn_bao_range::size_proof_from_tail_wire(*hash.as_bytes(), size, &wire).ok()
+    }
+
+    /// Read the stored proof of an origin, or build one from its outboard and
+    /// its last chunk group.
+    async fn origin_size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
+        let root = *hash.as_bytes();
+        for origin in &*self.inner.origins {
+            match origin.fetch_size_proof(hash).await {
+                Ok(Some(proof)) if decdn_bao_range::verify_size_proof(root, size, &proof) => {
+                    return Some(proof);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(%hash, error = %e, "origin size proof read failed");
+                }
+            }
+        }
+        if self.inner.origins.is_empty() {
+            return None;
+        }
+        // No origin stores a proof that verifies: build one from the range
+        // wire of the last chunk group, which the outboard proves.
+        let tail_start = decdn_bao_range::size_proof_tail_start(size);
+        let aligned = align_range(tail_start, size - tail_start, size).ok()?;
+        let mut wire = match self.origin_range_wire(hash, &aligned).await {
+            Ok(Some(wire)) => wire,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(%hash, error = %e, "origin tail read for a size proof failed");
+                return None;
+            }
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = wire.next_chunk().await {
+            bytes.extend_from_slice(&chunk.ok()?);
+        }
+        decdn_bao_range::size_proof_from_tail_wire(root, size, &bytes).ok()
     }
 
     /// Whether the origin at `ix` has served a clean first range window.
@@ -6008,3 +6126,7 @@ fn record_origin_pull<T>(span: &tracing::Span, result: &CacheResult<T>) {
     clippy::cast_possible_truncation
 )]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)] // test blob bytes are `i % 251`
+mod size_proof_tests;

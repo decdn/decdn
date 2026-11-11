@@ -67,7 +67,9 @@ where
 {
     let bytes = Vec::<u8>::deserialize(d)?;
     if bytes.len() > MAX_SIZE_PROOF_BYTES {
-        return Err(serde::de::Error::custom(SizeProofTooLong { len: bytes.len() }));
+        return Err(serde::de::Error::custom(SizeProofTooLong {
+            len: bytes.len(),
+        }));
     }
     Ok(bytes)
 }

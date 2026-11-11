@@ -241,6 +241,14 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     fn set_bound(&self, bound: u64) {
         let _ = bound;
     }
+
+    /// Record `size` as the blob's proven size: a node's size proof verified
+    /// it against the root before the leg that carried it opened. The
+    /// planner's bound becomes it at once. A store keyed by a fixed size knows
+    /// its size already, so the default does nothing.
+    fn prove_size(&self, size: u64) {
+        let _ = size;
+    }
 }
 
 /// The current pool no longer accepts funds, and the funding recovery step
@@ -1312,9 +1320,9 @@ mod doubles {
         }
 
         /// Sign `total_bytes` in every header in place of the blob's own size:
-        /// a peer that reports a wrong size. Its wire stays the blob's own, so
-        /// a leg that holds the final chunk fails to verify under the signed
-        /// size.
+        /// a peer that reports a wrong size. Its size proof cannot prove that
+        /// size, so every open fails with [`crate::UnprovenSize`], as the real
+        /// open does.
         #[must_use]
         pub const fn signing_size(mut self, total_bytes: u64) -> Self {
             self.signed_size = Some(total_bytes);
@@ -1385,6 +1393,20 @@ mod doubles {
                         return Err(make());
                     }
                 }
+                // The real open checks the size proof before it returns a
+                // header; a size the blob's proof does not prove fails here.
+                let total = self.total_bytes();
+                let tail_start = usize::try_from(decdn_bao_range::size_proof_tail_start(total))?;
+                let proof = decdn_bao_range::encode_size_proof(
+                    self.root,
+                    total,
+                    &self.outboard,
+                    self.blob.get(tail_start..).unwrap_or_default(),
+                )?;
+                let size_proof = decdn_protocol::SizeProof::new(proof.to_vec())?;
+                if let Some(signed) = self.signed_size {
+                    crate::check_size_proof(self.root, signed, Some(&size_proof))?;
+                }
                 // Serve the request clamped to this blob's end, as a node
                 // does: the requester's range may be aligned under another
                 // size than this blob's.
@@ -1407,7 +1429,8 @@ mod doubles {
                 }
                 let fault_gate = fault.as_ref().and(fault_gate);
                 let header = UpstreamPullHeader {
-                    total_bytes: self.signed_size.unwrap_or_else(|| self.total_bytes()),
+                    total_bytes: total,
+                    size_proof: Some(size_proof),
                     rate_per_mb: SCRIPTED_RATE_PER_MB,
                     interval_bytes: SCRIPTED_INTERVAL_BYTES,
                     origin_attestation: None,

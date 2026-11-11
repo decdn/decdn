@@ -592,7 +592,7 @@ impl worker::Backend for Recording {
         blob: &BlobFetch,
         sink: &mut super::super::fetch::Sink,
     ) -> anyhow::Result<()> {
-        if blob.prove {
+        if blob.size_only {
             self.proofs.lock().unwrap().push(blob.hash);
             match self.replies.get(&blob.hash) {
                 None => anyhow::bail!("no node holds the blob"),
@@ -1684,9 +1684,6 @@ fn amps_listing_len() -> u64 {
 }
 const BIG_LEN: usize = 600 * 1024;
 
-/// What a size proof spends of the allowance.
-const PROOF: u64 = PROOF_BYTES as u64;
-
 /// The empty entry of the public gateway's bundle.
 const EMPTY: [u8; 32] = [0xe8; 32];
 
@@ -2276,7 +2273,7 @@ async fn an_exhausted_allowance_answers_402_with_the_uri() {
 /// carries: the hint is the client's to set, so it buys no bucket of its own.
 #[tokio::test]
 async fn every_request_spends_the_one_allowance() {
-    let (gateway, _, _) = public_gateway_with(PROOF + 10).await;
+    let (gateway, _, _) = public_gateway_with(10).await;
     let other = alloy::hex::encode(OTHER);
     let first = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
     assert_eq!(first.status, StatusCode::OK);
@@ -2326,9 +2323,9 @@ async fn an_entry_that_does_not_fit_is_refused_before_its_pull() {
 #[tokio::test]
 async fn a_stream_is_cut_when_the_allowance_runs_out() {
     // A 600 KiB blob streams in three frames of 256 KiB; the second reaches
-    // a 300 KiB allowance and the third never goes out. Each blob's size
-    // proof, which proves nothing here, spends `PROOF` first.
-    let (gateway, _, _) = public_gateway_with(PROOF + 300 * 1024).await;
+    // a 300 KiB allowance and the third never goes out. No holder proves a
+    // size here, and the lookup spends nothing.
+    let (gateway, _, _) = public_gateway_with(300 * 1024).await;
     let big = alloy::hex::encode(BIG);
     let req = Request::builder()
         .method(Method::GET)
@@ -2348,7 +2345,7 @@ async fn a_stream_is_cut_when_the_allowance_runs_out() {
 
     // Eleven bytes against ten: the one frame reaches the bound and the body
     // still ends whole.
-    let (gateway, _, _) = public_gateway_with(PROOF + 10).await;
+    let (gateway, _, _) = public_gateway_with(10).await;
     let other = alloy::hex::encode(OTHER);
     let whole = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
     assert_eq!(
@@ -2360,7 +2357,7 @@ async fn a_stream_is_cut_when_the_allowance_runs_out() {
 /// `HEAD` reads the manifest, a paid pull, so it needs the allowance too.
 #[tokio::test]
 async fn a_public_head_needs_the_allowance() {
-    let (gateway, logs, host) = public_gateway_with(PROOF + 10).await;
+    let (gateway, logs, host) = public_gateway_with(10).await;
     let other = alloy::hex::encode(OTHER);
     let spend = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
     assert_eq!(spend.status, StatusCode::OK);
@@ -2487,17 +2484,14 @@ async fn a_dropped_response_is_charged_its_read_ahead() {
     let taken = first.data_ref().unwrap().len() as u64;
     assert!(taken > 0 && taken < BIG_LEN as u64);
     drop(body);
-    assert_eq!(
-        left(&gateway),
-        allowance - PROOF - taken - DROP_PENALTY_BYTES
-    );
+    assert_eq!(left(&gateway), allowance - taken - DROP_PENALTY_BYTES);
 
     let whole = request(&gateway, "decdn.test", &format!("/{big}"), &[]).await;
     assert_eq!(whole.status, StatusCode::OK);
     assert_eq!(whole.body.len(), BIG_LEN);
     assert_eq!(
         left(&gateway),
-        allowance - 2 * PROOF - taken - DROP_PENALTY_BYTES - BIG_LEN as u64
+        allowance - taken - DROP_PENALTY_BYTES - BIG_LEN as u64
     );
 }
 
@@ -2726,7 +2720,7 @@ async fn a_request_dropped_before_its_first_byte_is_charged() {
         dropped.is_err(),
         "the pull never answers, so the request is dropped"
     );
-    assert_eq!(left(&gateway), allowance - PROOF - DROP_PENALTY_BYTES);
+    assert_eq!(left(&gateway), allowance - DROP_PENALTY_BYTES);
 }
 
 /// `Range` → the byte window of a `size`-byte entry: one satisfiable range
@@ -3110,9 +3104,9 @@ async fn a_range_on_a_cold_raw_blob_answers_206() {
 }
 
 /// A raw blob whose proven size does not fit what is left of the allowance
-/// is refused before its pull; its proof spent `PROOF` of it.
+/// is refused before its pull; learning its size spent nothing.
 #[tokio::test]
-async fn a_cold_raw_blob_that_does_not_fit_is_refused_after_its_proof() {
+async fn a_cold_raw_blob_that_does_not_fit_is_refused_after_its_size_lookup() {
     let allowance = 300 * 1024;
     let (gateway, logs, _) = proving_gateway_with(allowance).await;
     let big = alloy::hex::encode(BIG);
@@ -3120,15 +3114,15 @@ async fn a_cold_raw_blob_that_does_not_fit_is_refused_after_its_proof() {
     assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
     assert_eq!(*logs.proofs.lock().unwrap(), [BIG]);
     assert!(logs.caps.lock().unwrap().is_empty(), "nothing was pulled");
-    assert_eq!(left(&gateway), allowance - PROOF);
+    assert_eq!(left(&gateway), allowance);
 }
 
-/// `HEAD` of a raw blob no pull verified pays for its size proof, and
-/// answers with the proven length and no pull; at no allowance it is
-/// refused as its `GET` would be, with no proof. A site answers the same
+/// `HEAD` of a raw blob no pull verified learns its proven size at no
+/// charge, and answers with that length and no pull; at no allowance it is
+/// refused as its `GET` would be, with no lookup. A site answers the same
 /// under `/_decdn/`.
 #[tokio::test]
-async fn a_cold_head_pays_for_its_size_proof() {
+async fn a_cold_head_learns_its_size_for_free() {
     let allowance = 1 << 20;
     let (gateway, logs, host) = proving_gateway_with(allowance).await;
     let other = alloy::hex::encode(OTHER);
@@ -3145,7 +3139,7 @@ async fn a_cold_head_pays_for_its_size_proof() {
     assert_eq!(head.header(header::ACCEPT_RANGES), Some("bytes"));
     assert_eq!(*logs.proofs.lock().unwrap(), [OTHER]);
     assert!(logs.caps.lock().unwrap().is_empty(), "HEAD pulls nothing");
-    assert_eq!(left(&gateway), allowance - PROOF);
+    assert_eq!(left(&gateway), allowance);
 
     let big = alloy::hex::encode(BIG);
     let site = send(
@@ -3851,10 +3845,10 @@ async fn status_spells_addresses_eip55_and_hashes_bare() {
     );
 }
 
-/// A request dropped while its size proof runs is still charged the proof:
-/// the worker goes on paying for it.
+/// A request dropped while its size lookup runs is charged nothing: the
+/// lookup pays for no byte.
 #[tokio::test]
-async fn a_request_dropped_during_its_proof_is_charged() {
+async fn a_request_dropped_during_its_size_lookup_is_not_charged() {
     let allowance = 1 << 20;
     let (gateway, logs, _) = proving_gateway_with(allowance).await;
     let held = alloy::hex::encode(HELD_PROOF);
@@ -3866,34 +3860,34 @@ async fn a_request_dropped_during_its_proof_is_charged() {
         .unwrap();
     let dropped =
         tokio::time::timeout(Duration::from_millis(200), Arc::clone(&gateway).handle(req)).await;
-    assert!(dropped.is_err(), "the proof never ends");
+    assert!(dropped.is_err(), "the lookup never ends");
     assert_eq!(*logs.proofs.lock().unwrap(), [HELD_PROOF]);
-    assert_eq!(left(&gateway), allowance - PROOF);
+    assert_eq!(left(&gateway), allowance);
 }
 
-/// `HEAD` under `/_decdn/` on a namespace's host pays for a proof from the
+/// `HEAD` under `/_decdn/` on a namespace's host learns a size under the
 /// bucket its `GET` would spend: the namespace's own for its bundle's hash,
-/// the shared one for any other blob.
+/// the shared one for any other blob. A spent namespace bucket refuses the
+/// lookup of its bundle's hash, and the shared bucket still admits another
+/// blob's.
 #[tokio::test]
 async fn a_cold_head_under_decdn_spends_the_bucket_its_get_would() {
-    let allowance = Allowance::with_namespaces(u64::MAX, [(7, 1)]);
+    let allowance = Allowance::with_namespaces(u64::MAX, [(7, 0)]);
     let proves = HashMap::from([(OTHER, 11)]);
     let (gateway, logs, _) = public_gateway_proving(allowance, HashMap::new(), proves).await;
     hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
     let own = format!("/_decdn/{}", alloy::hex::encode(BLOB));
-    let first = send(&gateway, Method::HEAD, "7.decdn.test", &own, &[]).await;
-    assert_eq!(first.status, StatusCode::OK);
     let spent = send(&gateway, Method::HEAD, "7.decdn.test", &own, &[]).await;
     assert_eq!(
         spent.status,
         StatusCode::PAYMENT_REQUIRED,
-        "the namespace's bucket paid for the first proof"
+        "the namespace's spent bucket refuses its bundle's lookup"
     );
     let other = format!("/_decdn/{}", alloy::hex::encode(OTHER));
     let shared = send(&gateway, Method::HEAD, "7.decdn.test", &other, &[]).await;
     assert_eq!(shared.status, StatusCode::OK);
     assert_eq!(shared.header(header::CONTENT_LENGTH), Some("11"));
-    assert_eq!(*logs.proofs.lock().unwrap(), [BLOB, OTHER]);
+    assert_eq!(*logs.proofs.lock().unwrap(), [OTHER]);
 }
 
 /// A raw blob of known size whose pull stops for funding answers 503, as an

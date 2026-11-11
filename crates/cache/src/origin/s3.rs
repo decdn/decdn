@@ -912,6 +912,44 @@ impl Origin for S3Origin {
         })
     }
 
+    fn fetch_size_proof(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let key = format!(
+                "{}{}",
+                key_for(&self.prefix, hash),
+                decdn_bao_range::SIZE_PROOF_SUFFIX
+            );
+            let log_target = format!("s3://{}/{}", self.bucket, key);
+            let resp = match self
+                .io
+                .run(
+                    self.client
+                        .get_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&key)
+                        .send(),
+                )
+                .await
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
+            {
+                Ok(r) => r,
+                // A missing proof is expected for a blob imported without
+                // one; the engine builds it.
+                Err(e) => match classify_get_object_error(e, &log_target)? {
+                    OriginFetch::NotFound
+                    | OriginFetch::Found { .. }
+                    | OriginFetch::AlreadyAdmitted => {
+                        return Ok(None);
+                    }
+                },
+            };
+            collect_bounded(resp.body, decdn_bao_range::MAX_SIZE_PROOF_BYTES).await
+        })
+    }
+
     fn size(
         &self,
         hash: Hash,

@@ -53,11 +53,32 @@ impl ClientHandler {
     /// Sign a `StreamResponse` body and assemble the frozen base plus its
     /// unsigned extension (ADR 013 §Tier 1). `error` rides in the extension, so
     /// the pair must be written together — see [`Self::write_stream_response`].
-    pub(super) fn sign_response(
+    ///
+    /// An `ok: true` response carries the size proof of `body.total_bytes`
+    /// (ADR 005 § A node proves the blob size), which the cache engine keeps
+    /// or builds. Every success path checks the proof before it reaches here,
+    /// so a missing proof is this node's fault and fails the signing: the node
+    /// states no size it cannot prove.
+    pub(super) async fn sign_response(
         &self,
         body: StreamResponseBody,
         error: Option<StreamError>,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
+        let size_proof = if body.ok {
+            let proof = self
+                .cache
+                .size_proof(Hash::from_bytes(body.hash), body.total_bytes)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no size proof for a {}-byte blob; the node states no size it cannot prove",
+                        body.total_bytes
+                    )
+                })?;
+            Some(decdn_protocol::SizeProof::new(proof.to_vec())?)
+        } else {
+            None
+        };
         // Every stream signature passes through here, and every caller echoes
         // the dispatch-gated first request's `timestamp_us`
         // (`crate::handlers::timestamp_skew`). This check catches only a
@@ -89,6 +110,7 @@ impl ClientHandler {
             StreamResponseExt {
                 error,
                 origin_attestation,
+                size_proof,
             },
         ))
     }
@@ -143,6 +165,7 @@ impl ClientHandler {
         };
         let (resp, resp_ext) = self
             .sign_response(body, Some(error))
+            .await
             .with_context(|| format!("sign the {reason:?} refusal"))?;
         tolerate_departed_peer(
             self.write_stream_response(send, &resp, &resp_ext).await,

@@ -1206,21 +1206,21 @@ async fn a_leg_under_a_different_claim_lands_genuine_bytes() -> anyhow::Result<(
     Ok(())
 }
 
-/// A node that signs one byte more than the blob holds: its tail leg cannot
-/// verify under that claim, so nothing lands and nothing is proven.
+/// A node that signs one byte more than the blob holds cannot prove that
+/// size, so its open fails before the store sees a byte or a size.
 #[tokio::test]
-async fn a_lying_claim_on_the_final_chunk_is_rejected() -> anyhow::Result<()> {
+async fn a_lying_size_opens_no_leg() -> anyhow::Result<()> {
     let truth = 3 * GROUP + 100;
     let source =
         crate::source::ScriptedSource::new(blob(usize::try_from(truth)?))?.signing_size(truth + 1);
     let store = fresh_store(source.root(), truth);
 
     let tail = decdn_bao_range::align_range(3 * GROUP, 0, truth)?;
-    let (claim, reader) = open_leg(&source, &tail).await?;
-    assert_eq!(claim, truth + 1);
-    let result = store.ingest_stream(&tail, reader, None, claim).await;
-
-    assert!(result.is_err(), "a lying final-chunk claim must not verify");
+    let err = open_leg(&source, &tail)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a lying size must not open"))?;
+    assert!(err.downcast_ref::<crate::UnprovenSize>().is_some(), "{err}");
     assert!(store.present_ranges().await?.is_empty());
     assert_eq!(store.proven(), None);
     assert_eq!(store.bound(), truth);

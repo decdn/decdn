@@ -325,19 +325,15 @@ pub struct AcquireTarget<'a, St> {
     pub store: &'a St,
     /// The blob's BLAKE3 root.
     pub hash: [u8; 32],
-    /// The first size claim: a hint. A resumed store's bound wins over it,
-    /// and a leg that verifies the final chunk proves the size.
+    /// The blob's size as the caller knows it: a size a node proved, or a
+    /// bundle manifest's declared size. A resumed store's bound wins over it,
+    /// and the first leg's proven size sets the store's bound.
     pub total_bytes: u64,
-    /// The `(offset, len)` byte ranges to fill. Unless `bounded`, a range that
-    /// reaches `total_bytes` or the store's bound, or has a zero length, is a
-    /// tail: it follows the bound as it grows or shrinks. Bytes outside the
-    /// ranges and their tail are never fetched.
+    /// The `(offset, len)` byte ranges to fill. A range with a zero length is
+    /// a tail: it runs to the end of the blob and follows the bound. Every
+    /// other range is exact, and is clipped to the bound. Bytes outside the
+    /// ranges are never fetched.
     pub ranges: &'a [(u64, u64)],
-    /// The ranges are exact: none is a tail, even one that reaches the end
-    /// of the blob as the caller knows it. A range past a size a leg proves
-    /// is clipped to it. A caller that wants a byte window and nothing past
-    /// it sets this; a whole-blob target leaves it unset.
-    pub bounded: bool,
 }
 
 impl<St> std::fmt::Debug for AcquireTarget<'_, St> {
@@ -3002,66 +2998,58 @@ impl std::fmt::Debug for ConsumptionPacing<'_> {
 /// The byte ranges one [`acquire`] fills, fitted to the store's bound as it
 /// moves (ADR 039 § Dynamic segmentation and tail-stealing).
 struct Want {
-    /// The `(offset, len)` ranges still to fill, each inside `bound`.
+    /// The `(offset, len)` ranges the caller asked for; a zero length is a
+    /// tail that runs to the end of the blob.
+    requested: Vec<(u64, u64)>,
+    /// The `(offset, len)` ranges still to fill: `requested` clipped to
+    /// `bound`, each tail running to it.
     ranges: Vec<(u64, u64)>,
-    /// The ranges reach the bound's end: a whole-blob target, or explicit
-    /// ranges that hold the tail. Such a target follows the bound as it grows
-    /// and needs a proven size to complete.
-    tail: bool,
     /// The bound the ranges were last fitted to.
     bound: u64,
 }
 
 impl Want {
-    /// `ranges` against a first bound of `bound`, cut from a first claim of
-    /// `c0`. Unless `bounded`, a range that reaches the end of the blob as the
-    /// caller knows it, `min(c0, bound)`, or has a zero length, is a tail: it
-    /// runs to `bound`. Every other range is clipped to `bound`. A resumed
-    /// record's bound can be past `c0`, so a whole-blob target cut from `c0`
-    /// still reaches it.
-    fn new(ranges: &[(u64, u64)], bound: u64, c0: u64, bounded: bool) -> Self {
-        let end = c0.min(bound);
-        let reaches_end =
-            |start: u64, len: u64| !bounded && (len == 0 || start.saturating_add(len) >= end);
-        let tail = ranges.iter().any(|&(start, len)| reaches_end(start, len));
-        let ranges: Vec<(u64, u64)> = ranges
-            .iter()
-            .filter(|&&(start, _)| start < bound)
-            .map(|&(start, len)| {
-                let room = bound - start;
-                let len = if reaches_end(start, len) {
-                    room
-                } else {
-                    len.min(room)
-                };
-                (start, len)
-            })
-            .collect();
+    /// `ranges` fitted to a first bound of `bound`. Only a zero-length range
+    /// is a tail (#2865): a range with a length keeps its requested end, and
+    /// is clipped to the bound.
+    fn new(ranges: &[(u64, u64)], bound: u64) -> Self {
+        let requested = ranges.to_vec();
         Self {
-            ranges,
-            tail,
+            ranges: Self::clipped(&requested, bound),
+            requested,
             bound,
         }
     }
 
-    /// Fit the ranges to a new `bound`. A tail target gains `[old, bound)`
-    /// when the bound grows; every range is clipped when it shrinks. Returns
-    /// whether the bound moved.
+    /// `requested` clipped to `bound`, each tail running to it.
+    fn clipped(requested: &[(u64, u64)], bound: u64) -> Vec<(u64, u64)> {
+        requested
+            .iter()
+            .filter(|&&(start, _)| start < bound)
+            .map(|&(start, len)| {
+                let room = bound - start;
+                (start, if len == 0 { room } else { len.min(room) })
+            })
+            .collect()
+    }
+
+    /// Whether a requested range wants bytes past the bound: a tail, or an
+    /// exact range that ends past it. Such a target completes only once the
+    /// size is proven, or once the bound grows past every exact end.
+    fn reaches_past(&self) -> bool {
+        self.requested
+            .iter()
+            .any(|&(start, len)| len == 0 || start.saturating_add(len) > self.bound)
+    }
+
+    /// Fit the ranges to a new `bound`: every requested range is clipped to
+    /// it again, so an exact range regains its requested end as the bound
+    /// grows. Returns whether the bound moved.
     fn fit(&mut self, bound: u64) -> bool {
         if bound == self.bound {
             return false;
         }
-        if bound > self.bound && self.tail {
-            self.ranges.push((self.bound, bound - self.bound));
-        }
-        if bound < self.bound {
-            self.ranges = self
-                .ranges
-                .iter()
-                .filter(|&&(start, _)| start < bound)
-                .map(|&(start, len)| (start, len.min(bound - start)))
-                .collect();
-        }
+        self.ranges = Self::clipped(&self.requested, bound);
         self.bound = bound;
         true
     }
@@ -3620,7 +3608,6 @@ where
         hash,
         total_bytes: c0,
         ranges,
-        bounded,
     } = target;
     let health = Arc::clone(sources.health());
     // A claim is peer- or manifest-controlled: clamp it to the furthest the
@@ -3635,7 +3622,7 @@ where
     }
     // A resumed record's bound wins over the caller's hint.
     let first_bound = store.total_bytes();
-    let mut want = Want::new(ranges, first_bound, c0, bounded);
+    let mut want = Want::new(ranges, first_bound);
     let missing = missing_chunks(store, &want.ranges).await?;
     let mut pending = VecDeque::new();
     for (start, len) in contiguous_byte_ranges(&missing, first_bound) {
@@ -3833,6 +3820,19 @@ where
         loop {
             let bound = store.total_bytes();
             if want.fit(bound) {
+                // A leg proved the size. Ranges that need more than the cap
+                // under it can never complete: end before the work grows.
+                if cap > 0 && store.proven().is_some() {
+                    let held = ranges_content_len(&store.present_ranges().await?, bound);
+                    let missing = missing_chunks(store, &want.ranges).await?;
+                    let needs = held.saturating_add(ranges_content_len(&missing, bound));
+                    if needs > cap {
+                        return Err(anyhow::Error::new(crate::BlobTooLarge {
+                            reached: needs,
+                            ceiling: cap,
+                        }));
+                    }
+                }
                 bound_seen.store(bound, Ordering::Release);
                 let mut w = work.lock().await;
                 w.grow_coverage(bound);
@@ -3858,7 +3858,7 @@ where
                     };
                     return Err(anyhow::Error::new(too_large));
                 }
-                if store.proven().is_some() || !want.tail {
+                if store.proven().is_some() || !want.reaches_past() {
                     // Land the write in flight first, so it cannot rename an
                     // older snapshot over the final one. Its failure is only
                     // logged: the final write below supersedes it, and its

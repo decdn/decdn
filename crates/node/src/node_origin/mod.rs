@@ -45,6 +45,7 @@ mod backend_source;
 mod funder;
 mod pull_leg;
 mod ranged_pull;
+pub(crate) use ranged_pull::planned_len;
 mod timed_source;
 
 pub(crate) use admit_store::NodeAdmitStore;
@@ -1701,6 +1702,13 @@ async fn probe_candidate(
         );
         return Err(ProbeDrop::Inconsistent);
     }
+    // A stated size is a fact only with its proof (ADR 005 § A node proves
+    // the blob size). A size with no valid proof is the holder's fault: drop
+    // the answer before the size can size a coverage union or a pull leg.
+    if let Err(e) = probe_size_proven(hash_bytes, &resp_ext) {
+        debug!(error = %e, "node-origin: dropping a probe response with an unproven size");
+        return Err(ProbeDrop::Inconsistent);
+    }
     if !resp.body.has_blob {
         // Reachable but does not hold the blob — not a reputation event (no
         // delivery attempted); cache the negative so the next lookup for this
@@ -1739,10 +1747,27 @@ async fn probe_candidate(
         // way execution reaches here), except for the empty root: its zero
         // blocks leave the coverage empty on a holder too (#2471).
         coverage: resp_ext.coverage,
-        // The holder's reported blob size. The coverage-union gather (#1506)
-        // reads it to know how many discovery blocks the union must span,
-        // and the pull leg cuts its first upstream open from it.
+        // The holder's blob size, proven above. The coverage-union gather
+        // (#1506) reads it to know how many discovery blocks the union must
+        // span, and the pull leg cuts its first upstream open from it.
         total_bytes_hint: resp_ext.total_bytes,
+    })
+}
+
+/// Whether a probe answer's size, when it states one, is proven for `hash`
+/// (ADR 005 § A node proves the blob size). An answer that states no size
+/// passes.
+///
+/// # Errors
+///
+/// [`decdn_client::UnprovenSize`] when the answer states a size with no
+/// valid proof.
+pub(super) fn probe_size_proven(
+    hash: [u8; 32],
+    ext: &decdn_protocol::ProbeResponseExt,
+) -> Result<(), decdn_client::UnprovenSize> {
+    ext.total_bytes.map_or(Ok(()), |total_bytes| {
+        decdn_client::check_size_proof(hash, total_bytes, ext.size_proof.as_ref())
     })
 }
 

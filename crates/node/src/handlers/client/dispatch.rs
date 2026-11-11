@@ -1164,8 +1164,12 @@ impl ClientHandler {
                                 // outboard and serves ranges. Enter the orchestration
                                 // directly — it claims the fill (owner-or-attach)
                                 // internally after signing the response, so no
-                                // coalescing decision happens here.
-                                Ok(true) => {
+                                // coalescing decision happens here. The origin size
+                                // must prove first (ADR 005 § A node proves the blob
+                                // size): an origin size with no proof degrades to the
+                                // buffered populate below, whose complete blob proves
+                                // its own size.
+                                Ok(true) if self.cache.size_proof(hash, total).await.is_some() => {
                                     // Boxed: the serve future is large
                                     // (clippy::large_futures).
                                     return Box::pin(self.serve_via_backend_origin(
@@ -1190,10 +1194,10 @@ impl ClientHandler {
                                     .await;
                                 }
                                 // Size known but no origin publishes the outboard
-                                // and serves ranges — not serviceable via the range
-                                // encoder. Degrade to the buffered local populate
-                                // below.
-                                Ok(false) => {}
+                                // and serves ranges, or the size does not prove —
+                                // not serviceable via the range encoder. Degrade to
+                                // the buffered local populate below.
+                                Ok(_) => {}
                                 // A genuine origin fault while probing the outboard
                                 // or the first range window. Latch it (#1129) so a
                                 // later-tier miss reports InternalError not NotFound,
@@ -1529,7 +1533,7 @@ impl ClientHandler {
             total_bytes,
             timestamp_us: req.timestamp_us,
         };
-        let (resp, resp_ext) = self.sign_response(body, None)?;
+        let (resp, resp_ext) = self.sign_response(body, None).await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);

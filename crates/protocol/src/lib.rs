@@ -26,7 +26,8 @@
 //!
 //! Every message is a postcard encoding behind a varint length prefix. Each read
 //! caps the prefix at its frame ceiling — [`MAX_PROBE_FRAME`],
-//! [`MAX_CLIENT_CONTROL_FRAME`], [`MAX_CHUNK_FRAME`] or [`MAX_DHT_FRAME`]
+//! [`MAX_CLIENT_CONTROL_FRAME`], [`MAX_STREAM_RESPONSE_FRAME`],
+//! [`MAX_CHUNK_FRAME`] or [`MAX_DHT_FRAME`]
 //! ([ADR 013 § Wire Framing]). A signed message has a frozen
 //! base: the fields its signature covers. Unsigned fields travel as trailing
 //! bytes after the base. [`decode_message`] returns them as a remainder, and the
@@ -68,10 +69,11 @@ pub mod size_proof;
 
 pub use client::{
     BINDING_SIG_LEN, CHUNK_BYTES, ChunkData, ChunkPreimage, ClientBinding, ClientMessage,
-    MAX_CHAIN_LENGTH, MAX_CHUNK_FRAME, MAX_CLIENT_CONTROL_FRAME, MB_BYTES, StreamError,
-    StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody, StreamResponseExt,
-    VOUCHER_SIG_LEN, Voucher, VoucherRejectReason, encode_chunk_frame, encode_stream_request,
-    encode_stream_response, parse_stream_request_ext, parse_stream_response_ext,
+    MAX_CHAIN_LENGTH, MAX_CHUNK_FRAME, MAX_CLIENT_CONTROL_FRAME, MAX_STREAM_RESPONSE_FRAME,
+    MB_BYTES, StreamError, StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody,
+    StreamResponseExt, VOUCHER_SIG_LEN, Voucher, VoucherRejectReason, encode_chunk_frame,
+    encode_stream_request, encode_stream_response, parse_stream_request_ext,
+    parse_stream_response_ext,
 };
 pub use coverage::{Coverage, DISCOVERY_BLOCK_BYTES, discovery_block_bytes, num_blocks};
 #[cfg(feature = "test-support")]

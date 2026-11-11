@@ -202,10 +202,11 @@ impl ClientHandler {
     /// skip straight to the size gate + delivery instead of running the
     /// miss-path fill legs; `None` otherwise.
     ///
-    /// `None` covers two cases the caller treats identically — this is a
-    /// best-effort optimization, never a decline path, so both fall through
+    /// `None` covers three cases the caller treats identically — this is a
+    /// best-effort optimization, never a decline path, so all fall through
     /// to the ordinary miss path unchanged: the requested span is genuinely
-    /// not fully cached, or the hash is absent/evicted/refused.
+    /// not fully cached, the hash is absent/evicted/refused, or the node has
+    /// no proof of the size.
     ///
     /// The size comes from the `observe()` bitfield
     /// ([`CacheEngine::present_ranges`](super::CacheEngine::present_ranges)),
@@ -234,6 +235,10 @@ impl ClientHandler {
         if size == 0 {
             return None;
         }
+        // The node serves under a size only with its proof (ADR 005 § A node
+        // proves the blob size). A partial with no kept proof and no tail falls
+        // through to the miss path, whose upstream pull brings the proof.
+        self.cache.size_proof(hash, size).await?;
         let missing = self
             .cache
             .missing_ranges(hash, byte_offset, byte_len, size)

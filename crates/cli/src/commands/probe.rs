@@ -102,6 +102,13 @@ pub async fn probe(
     // registry client, so it enforces presence/shape only.
     resp.validate()
         .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
+    // A stated size is shown only once its proof verifies against the hash
+    // (ADR 005 § A node proves the blob size). A node that states a size it
+    // cannot prove gives a faulty answer.
+    if let Some(total_bytes) = resp_ext.total_bytes {
+        decdn_client::check_size_proof(hash, total_bytes, resp_ext.size_proof.as_ref())
+            .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
+    }
 
     let mut stdout = std::io::stdout().lock();
     write_probe_response(&mut stdout, &resp, &resp_ext, rtt.ms, args.json)

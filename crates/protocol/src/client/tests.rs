@@ -1246,12 +1246,55 @@ fn widest_bundle() -> WatermarkBundle {
     }
 }
 
-/// Every `cdn/client/v1` control message at its widest legitimate encoding fits
-/// [`MAX_CLIENT_CONTROL_FRAME`] (ADR 013 § Wire Framing). The node reads the
-/// request and every payment proof against that ceiling, and the payer reads the
-/// response against it, so a message that outgrew it would be refused on the
-/// wire. The `StreamRequest` size is pinned exactly so the ceiling's headroom
-/// stays visible.
+/// The widest legitimate `StreamResponse` fits [`MAX_STREAM_RESPONSE_FRAME`]
+/// (ADR 013 § Wire Framing): a refusal code, an origin attestation and a full
+/// size proof. The payer reads every response against that ceiling.
+#[test]
+fn stream_response_frame_ceiling_holds_the_largest_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let response = StreamResponse {
+        body: StreamResponseBody {
+            hash: [0x07; 32],
+            ok: false,
+            rate_per_mb: MAX_RATE_PER_MB,
+            total_bytes: u64::MAX,
+            timestamp_us: u64::MAX,
+        },
+        slash_sig: vec![0x09; SLASH_SIG_LEN],
+    };
+    let response_len = encode_stream_response(
+        &response,
+        Some(&StreamResponseExt {
+            error: Some(StreamError::VoucherRejected {
+                reason: VoucherRejectReason::BytesRegression,
+                bundle: Some(widest_bundle()),
+            }),
+            origin_attestation: Some(crate::dht::OriginAttestation {
+                rate_per_mb: u64::MAX,
+                total_bytes: u64::MAX,
+                timestamp_us: u64::MAX,
+                slash_sig: vec![0x0D; SLASH_SIG_LEN],
+            }),
+            size_proof: Some(crate::SizeProof::new(vec![
+                0x0E;
+                crate::MAX_SIZE_PROOF_BYTES
+            ])?),
+        }),
+    )?
+    .len();
+    assert!(response_len > MAX_CLIENT_CONTROL_FRAME as usize);
+    assert!(
+        response_len <= MAX_STREAM_RESPONSE_FRAME as usize,
+        "StreamResponse = {response_len} B exceeds MAX_STREAM_RESPONSE_FRAME"
+    );
+    Ok(())
+}
+
+/// Every `cdn/client/v1` message the node reads, at its widest legitimate
+/// encoding, fits [`MAX_CLIENT_CONTROL_FRAME`] (ADR 013 § Wire Framing). The
+/// node reads the request and every payment proof against that ceiling, so a
+/// message that outgrew it would be refused on the wire. The `StreamRequest`
+/// size is pinned exactly so the ceiling's headroom stays visible.
 #[test]
 fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -1278,38 +1321,10 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dy
     let request_len = encode_stream_request(&request, Some(&ext))?.len();
     assert_eq!(request_len, 301, "StreamRequest + ext at full width");
 
-    let response = StreamResponse {
-        body: StreamResponseBody {
-            hash: [0x07; 32],
-            ok: false,
-            rate_per_mb: MAX_RATE_PER_MB,
-            total_bytes: u64::MAX,
-            timestamp_us: u64::MAX,
-        },
-        slash_sig: vec![0x09; SLASH_SIG_LEN],
-    };
     let rejected = StreamError::VoucherRejected {
         reason: VoucherRejectReason::BytesRegression,
         bundle: Some(widest_bundle()),
     };
-    let response_len = encode_stream_response(
-        &response,
-        Some(&StreamResponseExt {
-            error: Some(rejected.clone()),
-            origin_attestation: Some(crate::dht::OriginAttestation {
-                rate_per_mb: u64::MAX,
-                total_bytes: u64::MAX,
-                timestamp_us: u64::MAX,
-                slash_sig: vec![0x0D; SLASH_SIG_LEN],
-            }),
-            size_proof: Some(crate::SizeProof::new(vec![0x0E; crate::MAX_SIZE_PROOF_BYTES])?),
-        }),
-    )?
-    .len();
-    assert!(
-        response_len > crate::MAX_SIZE_PROOF_BYTES,
-        "the widest StreamResponse carries a full size proof"
-    );
     let voucher_len = encode_message(&ClientMessage::Voucher(Voucher {
         signature: vec![0x0A; VOUCHER_SIG_LEN],
         amount: u64::MAX,
@@ -1327,7 +1342,6 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dy
 
     for (what, len) in [
         ("StreamRequest", request_len),
-        ("StreamResponse", response_len),
         ("Voucher", voucher_len),
         ("ChunkPreimage", preimage_len),
         ("StreamError", error_len),

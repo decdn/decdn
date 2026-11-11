@@ -120,6 +120,7 @@ pub const decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX: usize
 pub const decdn_protocol::client::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::client::MAX_CHUNK_FRAME: u32
 pub const decdn_protocol::client::MAX_CLIENT_CONTROL_FRAME: u32
+pub const decdn_protocol::client::MAX_STREAM_RESPONSE_FRAME: u32
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
@@ -637,6 +638,7 @@ pub const decdn_protocol::MAX_PROBE_FRAME: u32
 pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::MAX_SIZE_PROOF_BYTES: usize
+pub const decdn_protocol::MAX_STREAM_RESPONSE_FRAME: u32
 pub const decdn_protocol::MB_BYTES: u64
 pub const decdn_protocol::SLASH_SIG_LEN: usize
 pub const decdn_protocol::VOUCHER_SIG_LEN: usize

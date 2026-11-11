@@ -322,7 +322,6 @@ where
         state.start,
         state.end.map_or(0, |end| end.saturating_sub(state.start)),
     )];
-    let bounded = state.end.is_some();
     // Under consumption pacing `acquire` turns its lane watchdog off: a lane
     // parked on the consumer cursor is waiting, not stalled. A genuinely silent
     // source trips its own per-stream idle window mid-read instead.
@@ -347,7 +346,6 @@ where
             hash,
             total_bytes: state.hint,
             ranges: &ranges,
-            bounded,
         },
         &mut sources,
         &env,
@@ -687,56 +685,6 @@ where
                 error: None,
             },
         ))
-    }
-
-    /// Prove the size of `hash` before any of its bytes are handed out: fetch,
-    /// and pay for, the last byte under the size `claim` (the aligned chunk
-    /// group that holds it and its proof, ADR 038), and return the size a leg
-    /// proved.
-    ///
-    /// Only the true size verifies a final chunk (ADR 039), so the size this
-    /// returns is the blob's own, whatever a node claimed: a `claim` off by
-    /// less than one chunk group still proves the true size. A leg whose
-    /// sender signs any other size fails to verify, and its range moves to
-    /// another source. `None` is "no proof": `claim` is `0`, it lies past the
-    /// cap on held bytes (a blob that large is not held whole, and its claim
-    /// never sizes the work), or the chunk group under it is not the blob's
-    /// last.
-    ///
-    /// # Errors
-    ///
-    /// The fetch's error: every source failed or declined, including when the
-    /// chunk group under `claim` starts past the true size, so that no holder
-    /// can serve it.
-    pub async fn prove_size(
-        self,
-        hash: [u8; 32],
-        claim: u64,
-        config: &PullConfig,
-        stop: StopPolicy,
-    ) -> anyhow::Result<Option<u64>> {
-        if claim == 0 || (self.max_blob_bytes > 0 && claim > self.max_blob_bytes) {
-            return Ok(None);
-        }
-        let (mut reader, mut drive) = self
-            .open_range(
-                hash,
-                claim,
-                (claim - 1, 1),
-                config,
-                Arc::new(crate::NoCache),
-                stop,
-            )
-            .await?;
-        let mut last = Vec::new();
-        let read = drive
-            .alongside(tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut last))
-            .await;
-        // The fetch's own typed error comes first: a read error that follows
-        // a failed fetch carries only its message.
-        drive.finish().await?;
-        read?;
-        Ok(drive.state.as_ref().and_then(|state| state.store.proven()))
     }
 }
 

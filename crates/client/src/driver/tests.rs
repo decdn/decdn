@@ -227,9 +227,10 @@ async fn a_lane_gates_on_the_pools_shared_spend() {
     assert_eq!(source.opened_ranges().len(), 1);
 }
 
-/// A leg whose signed size differs from the store's bound verifies under its
-/// own claim: the planner's bound is too small, the leg's range lies inside
-/// both sizes, and its bytes land at their offsets.
+/// A leg whose proven size differs from the store's bound verifies under its
+/// own size: the planner's bound is too small, the leg's range lies inside
+/// both sizes, and its bytes land at their offsets. The leg's size proof makes
+/// the store's size the true one, though the leg holds no final chunk.
 #[tokio::test]
 async fn a_leg_whose_claim_differs_from_the_bound_is_ingested_under_its_claim() {
     let truth = 8 * GROUP;
@@ -271,8 +272,12 @@ async fn a_leg_whose_claim_differs_from_the_bound_is_ingested_under_its_claim() 
             .as_ref(),
         &plaintext[(4 * GROUP) as usize..(6 * GROUP) as usize]
     );
-    assert_eq!(store.proven(), None, "a non-final leg proves no size");
-    assert_eq!(store.bound(), bound);
+    assert_eq!(
+        store.proven(),
+        Some(truth),
+        "the leg's size proof proves the size"
+    );
+    assert_eq!(store.bound(), truth);
 }
 
 /// `first_leg` is exactly the range the drive opens first, both on a fresh
@@ -944,6 +949,7 @@ impl BlobSource for FailFirstOpen {
                 // fault instead of yielding any wire bytes.
                 let header = UpstreamPullHeader {
                     total_bytes: self.inner.total_bytes(),
+                    size_proof: None,
                     rate_per_mb: 1,
                     interval_bytes: 1024 * 1024,
                     origin_attestation: None,
@@ -1014,6 +1020,7 @@ impl BlobSource for FaultingOpens {
             if let Some(fault) = fault {
                 let header = UpstreamPullHeader {
                     total_bytes: self.inner.total_bytes(),
+                    size_proof: None,
                     rate_per_mb: 1,
                     interval_bytes: 1024 * 1024,
                     origin_attestation: None,
@@ -1525,6 +1532,7 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                 let ext = StreamResponseExt {
                     error: Some(StreamError::Unfunded),
                     origin_attestation: None,
+                    size_proof: None,
                 };
                 return Err(UpstreamRefused::open(resp, &ext));
             }

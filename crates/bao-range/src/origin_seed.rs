@@ -100,7 +100,8 @@ impl<R: Read> Read for TailCapture<R> {
         if end > self.from {
             // `from - pos` is below `n` here, so it fits a `usize`.
             let skip = usize::try_from(self.from.saturating_sub(self.pos)).unwrap_or(usize::MAX);
-            self.tail.extend_from_slice(read.get(skip..).unwrap_or_default());
+            self.tail
+                .extend_from_slice(read.get(skip..).unwrap_or_default());
         }
         self.pos = end;
         Ok(n)

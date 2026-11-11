@@ -3071,18 +3071,69 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
         .is_some(),
         "the timestamp must sit beyond the admission bound for this test to mean anything"
     );
+    let data = vec![7u8; 1024];
+    let proof = decdn_bao_range::encode_outboard(data.as_slice(), 1024)?.size_proof;
+    let hash = Hash::new(&data);
+    assert!(handler.cache.keep_size_proof(hash, 1024, &proof));
     let body = StreamResponseBody {
-        hash: [7; 32],
+        hash: *hash.as_bytes(),
         ok: true,
         rate_per_mb: 1,
         total_bytes: 1024,
         timestamp_us: an_hour_ago,
     };
-    let (resp, _ext) = handler.sign_response(body.clone(), None)?;
+    let (resp, _ext) = handler.sign_response(body.clone(), None).await?;
     assert_eq!(resp.body.timestamp_us, an_hour_ago);
     let sig = alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?;
     let recovered =
         StreamSlashData::from_response_body(&body).recover_signer(&sig, &handler.slash_domain)?;
     assert_eq!(recovered, handler.eth_signer.address());
+    Ok(())
+}
+
+/// A success response carries the proof of its size, and the node signs no
+/// success for a size it cannot prove: a size the kept proof does not prove,
+/// or a 2^60 size for a hash the node knows nothing of.
+#[tokio::test]
+async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests(&metrics).await;
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let size = u64::try_from(data.len())?;
+    let proof = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof;
+    let hash = Hash::new(&data);
+    assert!(handler.cache.keep_size_proof(hash, size, &proof));
+    let body = |hash: [u8; 32], total_bytes| StreamResponseBody {
+        hash,
+        ok: true,
+        rate_per_mb: 1,
+        total_bytes,
+        timestamp_us: crate::handlers::timestamp_skew::now_us(),
+    };
+
+    let (_, ext) = handler
+        .sign_response(body(*hash.as_bytes(), size), None)
+        .await?;
+    let sent = ext
+        .size_proof
+        .ok_or_else(|| anyhow::anyhow!("no proof sent"))?;
+    assert!(decdn_bao_range::verify_size_proof(
+        *hash.as_bytes(),
+        size,
+        sent.as_bytes()
+    ));
+
+    assert!(
+        handler
+            .sign_response(body(*hash.as_bytes(), size + 1), None)
+            .await
+            .is_err()
+    );
+    assert!(
+        handler
+            .sign_response(body([9; 32], 1 << 60), None)
+            .await
+            .is_err()
+    );
     Ok(())
 }

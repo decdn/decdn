@@ -387,6 +387,7 @@ async fn answer_probe_with_coverage(
         Some(&ProbeResponseExt {
             total_bytes: Some(total_bytes),
             coverage,
+            size_proof: support::size_proof_for(req.hash, total_bytes),
         }),
     )
     .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
@@ -1222,7 +1223,7 @@ async fn throwaway_engine() -> Result<(CacheEngine, tempfile::TempDir)> {
 async fn cache_with_blobs(payloads: &[&[u8]]) -> Result<(CacheEngine, tempfile::TempDir)> {
     let origin_dir = tempfile::tempdir()?;
     for payload in payloads {
-        let hex = Hash::new(payload).to_hex();
+        let hex = support::register_payload(payload).to_hex();
         let shard = hex
             .get(..2)
             .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
@@ -1234,7 +1235,7 @@ async fn cache_with_blobs(payloads: &[&[u8]]) -> Result<(CacheEngine, tempfile::
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
     let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
     for payload in payloads {
-        let _ = cache.get(Hash::new(payload)).await?; // populate the local store
+        let _ = cache.get(support::register_payload(payload)).await?; // populate the local store
     }
     drop(origin_dir);
     Ok((cache, cache_dir))
@@ -1256,7 +1257,7 @@ async fn cache_with_fs_origin_only(
     tempfile::TempDir,
     tempfile::TempDir,
 )> {
-    let hash = Hash::new(payload);
+    let hash = support::register_payload(payload);
     let origin_dir = tempfile::tempdir()?;
     let hex = hash.to_hex();
     let shard = hex
@@ -1296,7 +1297,7 @@ async fn cache_with_fs_origin_only(
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<()> {
     let payload = vec![0x9Eu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A (upstream): blob ONLY in its fs origin; store starts empty. ----
@@ -1414,7 +1415,7 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
 async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let spans = support::capture_spans();
     let payload = vec![0xABu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: holds the blob; serves probe + client over one endpoint. -----
@@ -1585,7 +1586,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         x ^= x << 5;
         *b = x.to_le_bytes().first().copied().unwrap_or(0);
     }
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(LARGE_PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: holds the blob; serves probe + client over one endpoint. -----
@@ -1790,7 +1791,7 @@ async fn serve_wrong_bytes(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -1921,7 +1922,7 @@ async fn serve_gated_correct_bytes(
             .as_bytes()
             .to_vec();
         let resp = StreamResponse { body, slash_sig };
-        let resp_ext = StreamResponseExt::default();
+        let resp_ext = support::proven_ext(&resp);
         write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
             .await
             .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -2113,7 +2114,7 @@ async fn serve_then_reject_voucher(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -2196,7 +2197,7 @@ async fn serve_then_error_on_voucher(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -2473,7 +2474,7 @@ async fn stall_stream(
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     let payload = vec![0xCDu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Honest node A: holds the blob; serves probe + client at `RATE`. ------
@@ -2665,7 +2666,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     let payload = vec![0xE1u8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Honest node A: holds the blob, opens instantly, serves it. -----------
@@ -2928,7 +2929,7 @@ impl PoolOpener for ReportedFailureOpener {
 /// Pull one blob from one seeded candidate whose pool open fails with an
 /// already-reported error, and return the node's metrics.
 async fn pull_through_a_reported_open_failure(local: bool) -> Result<Arc<Metrics>> {
-    let hash = Hash::new(b"reported open failure");
+    let hash = support::register_payload(b"reported open failure");
     let provider_id = fresh_key().public();
     let provider_dht = DhtNodeId::from_bytes(*provider_id.as_bytes());
     let b_sk = fresh_key();
@@ -2985,7 +2986,7 @@ async fn a_reported_open_failure_is_not_metered_again() -> Result<()> {
 /// no reputation, and bumps the no-providers counter.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
-    let hash = Hash::new(b"nobody-has-this");
+    let hash = support::register_payload(b"nobody-has-this");
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
@@ -3024,7 +3025,7 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
 /// listed, the miss is a clean "no providers" (#2224).
 #[tokio::test(flavor = "multi_thread")]
 async fn an_origin_directory_entry_for_this_node_is_not_a_candidate() -> Result<()> {
-    let hash = Hash::new(b"only-this-node-is-listed");
+    let hash = support::register_payload(b"only-this-node-is-listed");
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_dht = DhtNodeId::from_bytes(*fresh_key().public().as_bytes());
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
@@ -3061,7 +3062,7 @@ async fn an_origin_directory_entry_for_this_node_is_not_a_candidate() -> Result<
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> {
     let payload = vec![0x5Au8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let a_sk = fresh_key();
     let a_id = a_sk.public();
@@ -3131,7 +3132,7 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
 /// and the unreachable counter moves.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
-    let hash = Hash::new(b"present-at-a-dead-peer");
+    let hash = support::register_payload(b"present-at-a-dead-peer");
     // "A" is a fresh identity with NO server — dialing it fails fast.
     let a_id = fresh_key().public();
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -3180,9 +3181,12 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
 #[allow(clippy::too_many_lines)]
 async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     let honest = vec![0x11u8; 4096];
-    let hash = Hash::new(&honest);
+    let hash = support::register_payload(&honest);
     let served = vec![0x22u8; 4096]; // same length, different content → hash mismatch
-    anyhow::ensure!(Hash::new(&served) != hash, "fixtures must differ");
+    anyhow::ensure!(
+        support::register_payload(&served) != hash,
+        "fixtures must differ"
+    );
 
     let a_sk = fresh_key();
     let a_id = a_sk.public();
@@ -3267,7 +3271,7 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
 #[allow(clippy::too_many_lines)]
 async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
     let payload = vec![0x33u8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let a_sk = fresh_key();
     let a_id = a_sk.public();
@@ -3354,7 +3358,7 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
     fetches: usize,
 ) -> Result<(Arc<Metrics>, Arc<LocalReputation>, iroh::PublicKey, B256)> {
     let payload = vec![0x33u8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let pool_id = B256::repeat_byte(0xC7);
 
     let a_sk = fresh_key();
@@ -3518,7 +3522,7 @@ async fn a_buffered_walk_that_exhausts_its_budget_on_local_faults_refuses_rather
 /// One run of the test above, with `candidates` seeded into the probe cache.
 async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
     let payload = vec![0x5Du8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
@@ -3611,7 +3615,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
     const CHEAP_RATE: u64 = RATE / 2;
 
     let payload = vec![0x5Cu8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let b_buyer = Arc::new(PrivateKeySigner::random());
 
@@ -3759,7 +3763,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
 #[allow(clippy::too_many_lines)]
 async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> {
     let payload = vec![0x44u8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -3881,6 +3885,11 @@ fn signed_response(
     Ok((
         StreamResponse { body, slash_sig },
         StreamResponseExt {
+            size_proof: if error.is_none() {
+                support::size_proof_for(req.hash, total_bytes)
+            } else {
+                None
+            },
             error,
             origin_attestation: None,
         },
@@ -4249,7 +4258,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     // and acked.
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(2)).unwrap_or(usize::MAX);
     let payload = vec![0x7Du8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -4639,7 +4648,7 @@ const EMPTY_CHUNK_ASSERT_WINDOW: Duration = Duration::from_secs(10);
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> {
     let payload = vec![0x5Eu8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -4743,7 +4752,7 @@ async fn node_origin_mid_stream_silence_does_not_score_stalled_upstream() -> Res
     // Advertise a big blob but send only a few frames, so the receive loop is left
     // genuinely waiting for the rest.
     let payload = vec![0x7Du8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -4862,7 +4871,7 @@ async fn node_origin_mid_stream_silence_does_not_score_stalled_upstream() -> Res
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -> Result<()> {
     let payload = vec![0x7Eu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -4988,7 +4997,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     let payload = vec![0x8Bu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -5102,7 +5111,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     // chunk has arrived. The server can then read that single voucher and reply, with no
     // mid-stream voucher racing the chunk writes into the ack wait (the #857 test's fixture size).
     let payload = vec![0x4Du8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -5206,8 +5215,8 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     // voucher fires cleanly — see the ack-wait test).
     let payload1 = vec![0x11u8; 4096];
     let payload2 = vec![0x22u8; 4096];
-    let hash1 = Hash::new(&payload1);
-    let hash2 = Hash::new(&payload2);
+    let hash1 = support::register_payload(&payload1);
+    let hash2 = support::register_payload(&payload2);
 
     let a_sk = fresh_key();
     let a_id = a_sk.public();
@@ -5328,7 +5337,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remedy() -> Result<()> {
     let payload = vec![0x9Cu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -5467,7 +5476,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     let stall_budget = Duration::from_secs(5);
 
     let payload = vec![0x5Eu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Two candidates that open honestly, deliver 3 frames, then go silent. ---
@@ -5678,7 +5687,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     // 6 KiB ⇒ six 1 KiB `ChunkData` frames (a single 16 KiB bao group, so the wire
     // is the content and one closing voucher settles it).
     let payload = vec![0x51u8; 6 * WIRE_FRAME];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let wire = honest_bao_wire(&payload)?;
 
@@ -5795,7 +5804,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
 #[allow(clippy::too_many_lines)] // two real serving nodes; setup dominates
 async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     let payload = vec![0x4Eu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let pool_id = B256::repeat_byte(0x4E);
@@ -6028,7 +6037,7 @@ const PAST_THE_TINY_TTL: Duration = Duration::from_millis(600);
 /// `DurableMiss`'s suppression was deleted outright.
 async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result<bool> {
     let payload = vec![0x6Bu8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -6165,7 +6174,7 @@ async fn a_transient_refusal_is_suppressed_briefly_and_a_durable_one_for_the_ful
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_declined_refusal_is_not_scored() -> Result<()> {
     let payload = vec![0x1Eu8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -6249,7 +6258,7 @@ async fn node_origin_declined_refusal_is_not_scored() -> Result<()> {
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -> Result<()> {
     let payload = vec![0xABu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
     // Buyer ceiling well below the 1.5 MiB blob → the received bytes cross it.
     let ceiling: u64 = 1_048_576;
@@ -6370,7 +6379,7 @@ async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -
 /// positive one must not refuse a 0-byte blob.
 async fn empty_blob_fetch_at_ceiling(ceiling: u64) -> Result<()> {
     let payload: Vec<u8> = Vec::new();
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     anyhow::ensure!(
         *hash.as_bytes() == decdn_protocol::EMPTY_ROOT,
         "fixture must be the empty root"
@@ -6499,7 +6508,7 @@ async fn node_origin_discovers_the_empty_blob_by_probe_under_a_ceiling() -> Resu
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<()> {
     let payload = vec![0xABu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
     let probe_rate = RATE / 2; // A advertises cheap at probe...
 
@@ -6631,8 +6640,8 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     // so both advance the shared lane's watermark.
     let payload1 = vec![0xABu8; PAYLOAD_LEN];
     let payload2 = vec![0xCDu8; PAYLOAD_LEN];
-    let hash1 = Hash::new(&payload1);
-    let hash2 = Hash::new(&payload2);
+    let hash1 = support::register_payload(&payload1);
+    let hash2 = support::register_payload(&payload2);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: holds both blobs; serves probe + client over one endpoint. ---
@@ -6794,7 +6803,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<()> {
     let payload = vec![0xABu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: holds the blob; serves probe + client over one endpoint. -----
@@ -7370,7 +7379,7 @@ async fn leaf_paced_pull_mode(
         acks,
         paid_wire,
         completed: true,
-        hash_ok: decoded.is_some_and(|p| Hash::new(&p) == hash),
+        hash_ok: decoded.is_some_and(|p| support::register_payload(&p) == hash),
     })
 }
 
@@ -7653,7 +7662,7 @@ async fn spawn_node_a_metered(
     tokio::task::JoinHandle<()>,
     Arc<Metrics>,
 )> {
-    let hash = Hash::new(payload);
+    let hash = support::register_payload(payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let (cache_a, hash_a, tmp_a) = cache_with_blob(payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
@@ -7778,7 +7787,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     let window = decdn_client::PULL_WINDOW_FLOOR;
     let payload_len = usize::try_from(window.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0xCDu8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA1);
@@ -7915,7 +7924,7 @@ async fn window_pull_through_handshake_is_the_first_pull_leg() -> Result<()> {
     let window = decdn_client::PULL_WINDOW_FLOOR;
     let payload_len = usize::try_from(window.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0x5Au8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA1);
@@ -7991,7 +8000,7 @@ async fn window_pull_through_completes_a_blob_past_the_ramp_floor() -> Result<()
         x ^= x << 5;
         *b = x.to_le_bytes().first().copied().unwrap_or(0);
     }
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA3);
@@ -8079,7 +8088,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
     // Many 1 MiB chunks, so plenty of re-check boundaries remain
     // after the deny-set flip lands. Kept under node A's 16 MiB engine cap.
     let payload = vec![0x6Bu8; 12 * 1024 * 1024];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -8190,7 +8199,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() -> Result<()> {
     let payload = vec![0xC1u8; 64 * 1024];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA1);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -8277,7 +8286,7 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> Result<()> {
     let payload = vec![0xC2u8; 64 * 1024];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA2);
@@ -8364,11 +8373,11 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
 /// which the in-memory loopback e2e (`client_delivers_empty_blob`) does not
 /// cover. For 0 wire bytes the window
 /// never pauses, B pays A no voucher, and B still promotes the empty blob against
-/// the empty root `Hash::new(&[])`.
+/// the empty root `support::register_payload(&[])`.
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
     let payload: Vec<u8> = Vec::new();
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA1);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -8457,7 +8466,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     // closing voucher (a multi-window cadence would need an interleaved server);
     // coalescing is independent of blob size.
     let payload = vec![0xC0u8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA8);
@@ -8654,7 +8663,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     use alloy::signers::SignerSync;
 
     let payload = vec![0xC7u8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA9);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -8812,7 +8821,7 @@ async fn window_pull_through_bounded_unaligned_range_pulls_only_the_span() -> Re
     let payload: Vec<u8> = (0..PAYLOAD_LEN)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total = u64::try_from(PAYLOAD_LEN)?;
 
     let ab_pool_id = B256::repeat_byte(0xA9);
@@ -8917,7 +8926,7 @@ async fn window_pull_through_bounded_miss_seeds_only_the_held_ranges_inside_it()
     let payload: Vec<u8> = (0..PAYLOAD_LEN)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total = u64::try_from(PAYLOAD_LEN)?;
     let outboard = bao_tree::io::outboard::PreOrderMemOutboard::create(
         &payload,
@@ -9041,7 +9050,7 @@ async fn window_pull_through_bounded_miss_seeds_only_the_held_ranges_inside_it()
 #[allow(clippy::too_many_lines)]
 async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Result<()> {
     let payload = vec![0x7Eu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -9119,7 +9128,7 @@ async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Res
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_end_past_the_blob_is_served_by_the_fused_path_clamped() -> Result<()> {
     let payload = vec![0x7Eu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total = u64::try_from(PAYLOAD_LEN)?;
 
     let ab_pool_id = B256::repeat_byte(0xA6);
@@ -9190,7 +9199,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     // the first interval, acks one voucher, then drops. B must stop pulling — its
     // upstream spend is bounded to ~one window, NOT the whole blob.
     let payload = vec![0x4Du8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA2);
@@ -9291,7 +9300,7 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     // in the pacer pins the exact demand draw.
     let payload_len = 8 * CHUNK_BYTES;
     let payload = vec![0x5Au8; usize::try_from(payload_len)?];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA9);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -9458,7 +9467,7 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
     // a remaining of 5 cannot cover it and the pull-through is refused at the
     // pre-spend gate.
     let payload = vec![0x9Eu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA3);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -9757,7 +9766,7 @@ async fn serve_wire_paced(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&StreamResponseExt::default()))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -9859,9 +9868,12 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
     // single-leaf: wire == content for ≤16 KiB) blob keeps the buyer↔upstream
     // voucher exchange to one closing voucher.
     let honest = vec![0x77u8; 4096];
-    let hash = Hash::new(&honest);
+    let hash = support::register_payload(&honest);
     let served_wrong = vec![0x88u8; 4096];
-    anyhow::ensure!(Hash::new(&served_wrong) != hash, "fixtures must differ");
+    anyhow::ensure!(
+        support::register_payload(&served_wrong) != hash,
+        "fixtures must differ"
+    );
     let advertised_bytes = u64::try_from(honest.len()).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA6);
@@ -9955,7 +9967,7 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
     // remainder of wire stays undelivered behind it.
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0xB7u8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
     let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
         &payload,
@@ -10231,7 +10243,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     // to underpay rather than draining the whole blob first.
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0x7Cu8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -10335,7 +10347,7 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
     // Three intervals, so the stream is still mid-blob when the first one is paid.
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x2Du8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA8);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -10468,7 +10480,7 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
     );
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x3Eu8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xA9);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -10547,7 +10559,7 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
 async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon() -> Result<()> {
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x4Cu8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xAA);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -10636,7 +10648,7 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
 async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline() -> Result<()> {
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x5Eu8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xAB);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -10706,7 +10718,7 @@ async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline
 async fn window_pull_through_never_paying_leaf_is_refused_after_its_floor() -> Result<()> {
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x6Du8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0x6D);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -10787,7 +10799,7 @@ async fn window_pull_through_leaf_gone_while_the_pull_owes_the_first_byte_ends_t
 -> Result<()> {
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x3Cu8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
@@ -10877,7 +10889,7 @@ async fn window_pull_through_leaf_gone_while_the_pull_owes_the_first_byte_ends_t
 async fn window_pull_through_leaf_drop_after_paying_is_a_serve_abandon() -> Result<()> {
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(4)).unwrap_or(usize::MAX);
     let payload = vec![0x6Au8; payload_len];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     let ab_pool_id = B256::repeat_byte(0xAB);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -10948,7 +10960,7 @@ async fn window_pull_through_oversized_upstream_stops_at_the_held_cap() -> Resul
     // the too-large pull counter moves, no node fault is counted, and the ended fill
     // releases its tee claim so an identical retry is not wedged.
     let payload = vec![0xB1u8; 4 * 1024 * 1024];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA6);
@@ -11126,7 +11138,7 @@ async fn ranged_pull_under_cap(
     byte_offset: u64,
     byte_len: u64,
 ) -> Result<HeldCapRun> {
-    let hash = Hash::new(payload);
+    let hash = support::register_payload(payload);
     let ab_pool_id = B256::repeat_byte(0xC7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
@@ -11262,7 +11274,7 @@ async fn window_pull_through_with_the_cap_already_held_is_refused_before_commit(
     let payload: Vec<u8> = (0..256 * 1024usize)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let cap = 64 * 1024u64;
     let ab_pool_id = B256::repeat_byte(0xC8);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -11428,10 +11440,10 @@ async fn window_pull_through_over_long_range_on_a_blob_within_the_cap_is_served(
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<()> {
     let payload = vec![0xC1u8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     // A second blob of the SAME length: the probe responder quotes one `total_bytes`.
     let payload2 = vec![0xC2u8; PAYLOAD_LEN];
-    let hash2 = Hash::new(&payload2);
+    let hash2 = support::register_payload(&payload2);
     anyhow::ensure!(hash != hash2, "the two fixtures must be distinct blobs");
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
@@ -11678,7 +11690,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> {
     let payload = vec![0x5Cu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: holds the blob; serves probe + client, counting probes. ------
@@ -11808,7 +11820,7 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
     let payload = vec![0x7Eu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: holds the blob; serves probe + client, counting probes. ------
@@ -11964,7 +11976,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Result<()> {
     let payload = vec![0x3Bu8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let probes = Arc::new(AtomicUsize::new(0));
@@ -12169,7 +12181,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once() -> Result<()> {
     let payload = vec![0x1Bu8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     // --- Provider N: reachable, honest at probe, refuses the pull with
@@ -12396,7 +12408,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     let payload = vec![0x9Du8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node N: refuses every pull with NotFound (honest, negative-cacheable),
@@ -12596,7 +12608,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Result<()> {
     let payload = vec![0x2Fu8; 4096];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     // --- Node N: honest at probe, refuses every pull `Declined`, which is
@@ -12753,8 +12765,8 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     // the blob whose cached entry is under test.
     let payload1 = vec![0x33u8; 4096];
     let payload2 = vec![0x44u8; 4096];
-    let hash1 = Hash::new(&payload1);
-    let hash2 = Hash::new(&payload2);
+    let hash1 = support::register_payload(&payload1);
+    let hash2 = support::register_payload(&payload2);
 
     // --- Node A: honest at probe for everything, serves payload1, then rejects
     //     the closing voucher with `AmountRegression` — the wedge trigger. -------
@@ -13079,7 +13091,7 @@ impl OriginDirectory for MutableOriginDirectory {
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let payload = vec![0xA7u8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: holds the blob; serves probe + client, counting BOTH so a hit
@@ -13533,7 +13545,7 @@ async fn serve_with_deposit_ceiling(
     // concurrent-pulls regression test needs two pulls on ONE lane.
     let payload: &[u8] = payloads
         .iter()
-        .find(|p| *Hash::new(p.as_slice()).as_bytes() == req.hash)
+        .find(|p| *support::register_payload(p.as_slice()).as_bytes() == req.hash)
         .map(|p| p.as_slice())
         .ok_or_else(|| anyhow::anyhow!("deposit-capped upstream: unknown hash requested"))?;
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -13901,7 +13913,7 @@ async fn top_up_fixture_multi_rep(
             .first()
             .ok_or_else(|| anyhow::anyhow!("at least one payload"))?,
     );
-    let hash = Hash::new(payload.as_ref());
+    let hash = support::register_payload(payload.as_ref());
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let deposit = shared_deposit(setup.initial_micro_usdc);
     let ceiling = shared_deposit(setup.ceiling_micro_usdc.unwrap_or(setup.initial_micro_usdc));
@@ -14025,7 +14037,11 @@ async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> 
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the recovery top-up pull never finished"))?
@@ -14035,7 +14051,10 @@ async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> 
         matches!(got, OriginFetch::AlreadyAdmitted),
         "a topped-up pull must deliver the blob, not NotFound"
     );
-    let bytes = fixture.engine.get(Hash::new(payload.as_ref())).await?;
+    let bytes = fixture
+        .engine
+        .get(support::register_payload(payload.as_ref()))
+        .await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "the resumed pull delivered {} bytes, expected {}",
@@ -14131,7 +14150,11 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the recovery top-up pull never finished"))?
@@ -14140,7 +14163,10 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
         matches!(got, OriginFetch::AlreadyAdmitted),
         "a topped-up pull must deliver the blob, not NotFound"
     );
-    let bytes = fixture.engine.get(Hash::new(payload.as_ref())).await?;
+    let bytes = fixture
+        .engine
+        .get(support::register_payload(payload.as_ref()))
+        .await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "the resumed pull delivered {} bytes, expected {}",
@@ -14205,7 +14231,11 @@ async fn the_resumed_leg_does_not_re_pay_for_delivered_bytes() -> Result<()> {
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the recovery top-up pull never finished"))?
@@ -14275,7 +14305,11 @@ async fn a_node_crying_poverty_gets_one_recovery_step_and_no_more() -> Result<()
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the pull never ended"))?
@@ -14315,7 +14349,11 @@ async fn a_topup_that_adds_no_headroom_ends_the_pull() -> Result<()> {
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("an unfundable pull must not hang"))?
@@ -14353,7 +14391,7 @@ async fn a_topup_that_adds_no_headroom_ends_the_pull() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_landing_short_of_the_owed_debt_ends_the_fill_after_one_step() -> Result<()> {
     let payload = multi_interval_payload();
-    let hash = Hash::new(payload.as_ref());
+    let hash = support::register_payload(payload.as_ref());
     let initial = 2 * RATE;
     let cap = RATE;
     let fixture = top_up_fixture(
@@ -14431,7 +14469,11 @@ async fn a_short_landing_keeps_what_landed_and_completes_the_pull() -> Result<()
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("an underfunded pull must not hang"))?
@@ -14496,7 +14538,11 @@ async fn a_full_pool_refused_by_a_stale_upstream_settles_then_is_served() -> Res
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("a settling pull must not hang"))?
@@ -14528,7 +14574,11 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the pull never ended"))?
@@ -14581,8 +14631,8 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_lanes() -> Result
             .map(|i| u8::try_from(i % 247).unwrap_or(1))
             .collect(),
     );
-    let hash_a = Hash::new(payload_a.as_ref());
-    let hash_b = Hash::new(payload_b.as_ref());
+    let hash_a = support::register_payload(payload_a.as_ref());
+    let hash_b = support::register_payload(payload_b.as_ref());
     anyhow::ensure!(hash_a != hash_b, "fixtures must be distinct blobs");
 
     // The initial deposit funds roughly six wire intervals — enough for real
@@ -14679,7 +14729,11 @@ async fn a_long_pull_recovers_again_after_verified_progress() -> Result<()> {
 
     let got = tokio::time::timeout(
         Duration::from_mins(1),
-        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+        Origin::fetch(
+            &fixture.origin,
+            support::register_payload(payload.as_ref()),
+            u64::MAX,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("a pull funded step by step must not loop forever"))?
@@ -14845,7 +14899,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
     const LEDGER_DEPOSIT: u64 = 1_000_000_000;
 
     let payload = vec![0xADu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: the malicious upstream, quoting the ceiling exactly. -------
@@ -15107,7 +15161,7 @@ async fn attack_b_attempt(
 ) -> Result<(bool, Arc<Metrics>)> {
     const LEDGER_DEPOSIT: u64 = 1_000_000_000;
     let payload = vec![salt; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
@@ -15523,7 +15577,7 @@ async fn spawn_partial_holder(
     tokio::task::JoinHandle<()>,
     Arc<MemoryPoolStateStore>,
 )> {
-    let hash = Hash::new(payload);
+    let hash = support::register_payload(payload);
     let (cache, hash_h, tmp) = cache_with_blob(payload).await?;
     anyhow::ensure!(hash_h == hash, "holder fixture hash mismatch");
     std::mem::forget(tmp);
@@ -15557,7 +15611,7 @@ async fn spawn_block_holder(
     Arc<MemoryPoolStateStore>,
     Arc<Metrics>,
 )> {
-    let hash = Hash::new(payload);
+    let hash = support::register_payload(payload);
     let total = u64::try_from(payload.len())?;
     let block = decdn_protocol::discovery_block_bytes();
     let outboard = bytes::Bytes::from(
@@ -15872,7 +15926,7 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
     let payload: Vec<u8> = (0..payload_len)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = 2 * block;
     anyhow::ensure!(
         decdn_protocol::num_blocks(total_bytes) == 2,
@@ -16125,7 +16179,7 @@ fn two_block_blob() -> Result<(decdn_protocol::TestBlockSizeGuard, Vec<u8>, Hash
     let payload: Vec<u8> = (0..payload_len)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     anyhow::ensure!(
         decdn_protocol::num_blocks(2 * block) == 2,
         "the blob must span exactly two discovery blocks under the override"
@@ -17141,7 +17195,7 @@ async fn sole_coverer_refusal_is_retried(leaves: usize) -> Result<()> {
     let payload: Vec<u8> = (0..payload_len)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
-    let hash = Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let total_bytes = 2 * block;
 
     let ab_pool_id = B256::repeat_byte(0xA2);

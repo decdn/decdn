@@ -166,6 +166,77 @@ pub fn encode_size_proof(
             blob_size: size,
         });
     }
+    // Offset in `outboard` of the pair of the subtree in hand.
+    let mut pair_at = 0usize;
+    build_proof(root, size, tail, |left| {
+        // In pre-order the pairs of the left subtree follow the pair of the
+        // subtree in hand: one for each of its chunk groups but the last.
+        let pair = outboard.get(pair_at..pair_at.saturating_add(PAIR_BYTES))?;
+        let left_pairs = (left / CHUNK_GROUP_BYTES).saturating_sub(1);
+        let skip = usize::try_from(left_pairs)
+            .ok()?
+            .checked_mul(PAIR_BYTES)?
+            .checked_add(PAIR_BYTES)?;
+        pair_at = pair_at.checked_add(skip)?;
+        Some(pair)
+    })
+}
+
+/// Build the size proof of a `size`-byte blob with BLAKE3 hash `root` from
+/// the bao wire of its last chunk group: the bytes a verified range export at
+/// [`IROH_BLOCK_SIZE`] yields for `[size_proof_tail_start(size), size)`. That
+/// wire is the parent pairs on the path from the root to the last chunk
+/// group, top down, then the group's bytes.
+///
+/// `wire` is not trusted. The proof is verified against `root` before it is
+/// returned.
+///
+/// # Errors
+///
+/// - [`SizeProofError::TailSize`] when `wire` is shorter than the last chunk
+///   group.
+/// - [`SizeProofError::Verification`] when the wire does not prove `size`
+///   under `root`.
+pub fn size_proof_from_tail_wire(
+    root: [u8; 32],
+    size: u64,
+    wire: &[u8],
+) -> Result<Bytes, SizeProofError> {
+    let tail_len = size.saturating_sub(size_proof_tail_start(size));
+    let split = u64::try_from(wire.len())
+        .ok()
+        .and_then(|len| len.checked_sub(tail_len))
+        .and_then(|at| usize::try_from(at).ok())
+        .ok_or(SizeProofError::TailSize {
+            expected: tail_len,
+            got: wire.len(),
+            blob_size: size,
+        })?;
+    let (pairs, tail) = wire
+        .split_at_checked(split)
+        .ok_or(SizeProofError::Verification { blob_size: size })?;
+    let (pairs, rest) = pairs.as_chunks::<PAIR_BYTES>();
+    if !rest.is_empty() {
+        return Err(SizeProofError::Verification { blob_size: size });
+    }
+    let mut pairs = pairs.iter();
+    build_proof(root, size, tail, |_left| {
+        pairs.next().map(<[u8; PAIR_BYTES]>::as_slice)
+    })
+}
+
+/// Walk the right edge of the tree of a `size`-byte blob from the root to its
+/// last chunk and emit the proof. `next_pair` gives the stored pair of each
+/// subtree that spans more than one chunk group, top down; it takes the
+/// length of that subtree's left child. The pairs inside the last chunk group
+/// are hashed from `tail`. The result is verified against `root`.
+fn build_proof<'a>(
+    root: [u8; 32],
+    size: u64,
+    tail: &[u8],
+    mut next_pair: impl FnMut(u64) -> Option<&'a [u8]>,
+) -> Result<Bytes, SizeProofError> {
+    let tail_start = size_proof_tail_start(size);
     let malformed = || SizeProofError::Verification { blob_size: size };
     // A slice of `tail` by blob offsets. Every offset here is inside the last
     // chunk group, so the differences fit a `usize`.
@@ -176,29 +247,19 @@ pub fn encode_size_proof(
     };
 
     let mut proof = Vec::with_capacity(MAX_SIZE_PROOF_BYTES.min(tail.len() + 16 * PAIR_BYTES));
-    // Walk the right edge of the tree from the root to the last chunk. The
-    // subtree in hand covers `[start, start + len)`.
+    // The subtree in hand covers `[start, start + len)`.
     let mut start = 0u64;
     let mut len = size;
-    // Offset in `outboard` of the pair of the subtree in hand.
-    let mut pair_at = 0usize;
     while len > CHUNK_BYTES {
         let left = left_subtree_len(len);
         if len > CHUNK_GROUP_BYTES {
-            // The subtree spans more than one chunk group, so the outboard
-            // holds its pair. In pre-order the pairs of the left subtree
-            // follow it: one for each of its chunk groups but the last.
-            let pair = outboard
-                .get(pair_at..pair_at.saturating_add(PAIR_BYTES))
-                .ok_or_else(malformed)?;
+            // The subtree spans more than one chunk group, so its pair is
+            // stored.
+            let pair = next_pair(left).ok_or_else(malformed)?;
+            if pair.len() != PAIR_BYTES {
+                return Err(malformed());
+            }
             proof.extend_from_slice(pair);
-            let left_pairs = (left / CHUNK_GROUP_BYTES).saturating_sub(1);
-            let skip = usize::try_from(left_pairs)
-                .ok()
-                .and_then(|n| n.checked_mul(PAIR_BYTES))
-                .and_then(|n| n.checked_add(PAIR_BYTES))
-                .ok_or_else(malformed)?;
-            pair_at = pair_at.checked_add(skip).ok_or_else(malformed)?;
         } else {
             // The subtree is inside the last chunk group. The outboard stores
             // no pair this low, so hash both children from the tail.

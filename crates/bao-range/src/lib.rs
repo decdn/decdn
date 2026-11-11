@@ -52,8 +52,8 @@ pub use origin_seed::{
 };
 pub use ranged_store::{RangedFuture, RangedStore, RangedStoreError};
 pub use size_proof::{
-    MAX_SIZE_PROOF_BYTES, SizeProofError, encode_size_proof, size_proof_tail_start,
-    verify_size_proof,
+    MAX_SIZE_PROOF_BYTES, SizeProofError, encode_size_proof, size_proof_from_tail_wire,
+    size_proof_tail_start, verify_size_proof,
 };
 
 /// `iroh-blobs`' canonical on-disk block size (16 KiB chunk groups,

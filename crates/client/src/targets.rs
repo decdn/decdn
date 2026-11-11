@@ -497,6 +497,27 @@ impl ProbeTally {
     }
 }
 
+/// Whether `ext` states a size for `hash` with no valid size proof. A stated
+/// size is a fact only with its proof (ADR 005 § A node proves the blob
+/// size), and a size with no valid proof is a fault of the node: the caller
+/// drops the answer before the size can reach a plan or a price.
+fn states_an_unproven_size(
+    cand: &NodeCandidate,
+    hash: [u8; 32],
+    ext: &decdn_protocol::ProbeResponseExt,
+) -> bool {
+    let Some(total_bytes) = ext.total_bytes else {
+        return false;
+    };
+    match crate::check_size_proof(hash, total_bytes, ext.size_proof.as_ref()) {
+        Ok(()) => false,
+        Err(e) => {
+            tracing::warn!("dropping a probe response from {}: {e}", cand.node_id);
+            true
+        }
+    }
+}
+
 /// Verify `cand`'s probe result and classify it. Every response is verified
 /// before it can influence the order (ADR 014 §1). A failure is requester-local
 /// policy, with no reputation effect, because an unrecovered signature
@@ -544,6 +565,9 @@ pub(crate) fn classify_probe(
             "dropping a probe response from {} with has_blob/coverage mismatch",
             cand.node_id
         );
+        return ProbeOutcome::Unusable;
+    }
+    if states_an_unproven_size(cand, hash, &resp_ext) {
         return ProbeOutcome::Unusable;
     }
     let rtt_ms = rtt.ms;

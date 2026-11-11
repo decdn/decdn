@@ -535,6 +535,17 @@ impl ClientRangedStore {
         }
     }
 
+    /// Record `size` as proven: a node's size proof verified it against the
+    /// root (ADR 005 § A node proves the blob size), so the bound becomes it
+    /// before any leg holds the final chunk. A size already proven stays:
+    /// only the true size proves, so a second proof names the same size.
+    pub fn prove_size(&self, size: u64) {
+        let mut state = self.lock_state();
+        if state.proven.is_none() {
+            state.prove(size);
+        }
+    }
+
     /// The state under its lock. A poisoned lock still holds a consistent
     /// state: every writer updates it in one assignment or one union.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, StoreState> {
@@ -1618,6 +1629,10 @@ impl crate::source::IngestStore for ClientRangedStore {
 
     fn set_bound(&self, bound: u64) {
         Self::set_bound(self, bound);
+    }
+
+    fn prove_size(&self, size: u64) {
+        Self::prove_size(self, size);
     }
 }
 

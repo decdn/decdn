@@ -25,6 +25,7 @@ fn fixture(
             } else {
                 decdn_protocol::Coverage::empty()
             },
+            size_proof: None,
         },
     )
 }

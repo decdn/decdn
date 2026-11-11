@@ -418,6 +418,7 @@ async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result
 /// before a test's own data mocks, so the probe wins over a mock that fails
 /// every ranged GET.
 async fn mount_range_probe(server: &MockServer, hex: &str, blob: &[u8]) {
+    mount_size_proof(server, hex, blob).await;
     let end = blob.len().min(16 * 1024);
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
@@ -425,6 +426,24 @@ async fn mount_range_probe(server: &MockServer, hex: &str, blob: &[u8]) {
         .respond_with(
             ResponseTemplate::new(206).set_body_bytes(blob.get(..end).unwrap_or_default().to_vec()),
         )
+        .mount(server)
+        .await;
+}
+
+/// Serve the `{hex}.sizeproof` sibling `decdn origin import` writes, which
+/// proves the blob's size before the node states it (ADR 005 § A node
+/// proves the blob size).
+async fn mount_size_proof(server: &MockServer, hex: &str, blob: &[u8]) {
+    let size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let Ok(eo) = decdn_bao_range::encode_outboard(blob, size) else {
+        return;
+    };
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/{hex}{}",
+            decdn_bao_range::SIZE_PROOF_SUFFIX
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(eo.size_proof.to_vec()))
         .mount(server)
         .await;
 }
