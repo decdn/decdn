@@ -48,6 +48,14 @@ The **origin acquisition hop is internal, not `cdn/client/v1`**, so which source
 
 The receiver feeds the stream to a bao verifying decoder as it arrives. A corrupt chunk group aborts the pull at that group. A range beginning at `byte_offset > 0` verifies on its own against the root, with no dependency on earlier bytes. There is no whole-blob fallback for resumed requests.
 
+### Size proof
+
+A size proof proves the size of a blob before any range of it arrives ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)). It is the bao encoding of the final BLAKE3 chunk at block size 0: one pair of parent hashes (64 bytes) for each level on the path from the root to the last chunk, top down, then the last chunk (at most 1 KiB). The stock bao decoder verifies it against the root and the stated size. BLAKE3 binds the length of the input into the tree, so a proof verifies for the true size and for no other. The longest proof is 1 KiB and 54 pairs (4,480 bytes), the depth of the tree for the largest `u64` length. The wire bounds a proof at that length at decode.
+
+The group-level `{H}.obao4` outboard stores no hash below a 16 KiB chunk group. So an encoder computes the pairs inside the last chunk group from the bytes of that group. It takes the pairs above the group from the outboard, or from the bao encoding of the last chunk group that a verified range export yields. `decdn-bao-range` holds the encoder and the verifier. The verifier allocates nothing that grows with the stated size.
+
+The proof is not paid for. It is at most 4,480 bytes, and it travels once per response.
+
 ### Payment metering
 
 Paid bytes are the bytes on the wire — content data **plus** interleaved proof nodes. The proof is real bandwidth the operator serves, and metering the raw stream keeps payment a single byte count. Excluding proof bytes would force payer and node to agree on how many proof bytes were interleaved — a dispute surface for a `~0.4%` overhead (one 64-byte node per 16 KiB group ≈ 1/256 of content). The delivered byte count is adopted.
