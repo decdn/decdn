@@ -138,7 +138,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
     /// @notice Operator registry. A pool names no provider and runs no
     ///         `isActive` gate at `openPool` (ADR 016). `redeemMany` reads it
-    ///         to pay only bound operators and to count bytes only for active
+    ///         to pay only staked operators and to count bytes only for active
     ///         ones.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICapacityBondActivity public immutable capacityBond;
@@ -640,9 +640,10 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // amount, and there is nothing to settle.
         if (totalPaid != 0) {
             // Only a staked operator is a payee: a bound, non-ejected operator
-            // that is active or has bond in its unbonding queue. A binding alone
-            // costs no bond, so a capability holder that binds its own address
-            // still cannot sign vouchers to itself and draw its cap as USDC.
+            // whose active and unbonding bond together cover its minimum bond.
+            // A binding alone costs no bond, so a capability holder that binds
+            // its own address still cannot sign vouchers to itself and draw
+            // its cap as USDC.
             // Its bytes count toward the governance window only while it is
             // active.
             (bool payee, bool active) = capacityBond.payeeStatus(msg.sender);

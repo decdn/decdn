@@ -219,6 +219,84 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         assertEq(d.router.bytesPerEpoch(op, uint64(epoch)), 0, "an inactive payee adds no governance bytes");
     }
 
+    /// @notice A capability holder binds its own address, bonds one base unit
+    ///         and queues it for unbonding. Dust in the unbonding queue is not
+    ///         the minimum bond, so the redeem reverts.
+    function test_e2e_redeemMany_dustUnbondingPayeeReverts() public {
+        _bind(SIGNER_PK, signer, bytes32(uint256(0xD057)));
+        vm.prank(tokenHolder);
+        d.token.transfer(signer, 1);
+        vm.startPrank(signer);
+        d.token.approve(address(d.bond), 1);
+        d.bond.bond(1);
+        d.bond.requestUnbond(1);
+        vm.stopPrank();
+        (uint256 queued,) = d.bond.unbondingOf(signer);
+        assertEq(queued, 1, "one base unit sits in the unbonding queue");
+
+        PaymentPool.PoolBatch[] memory batches = _settleBatch(_openPool(), signer);
+        vm.prank(signer);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotStaked.selector, signer));
+        d.paymentPool.redeemMany(batches);
+    }
+
+    /// @notice An operator one base unit short of the minimum bond is not a
+    ///         payee, active and unbonding bond counted together.
+    function test_e2e_redeemMany_belowMinimumBondReverts() public {
+        uint256 opPk = 0x5407;
+        address op = vm.addr(opPk);
+        vm.prank(tokenHolder);
+        d.token.transfer(op, MIN_BOND);
+        vm.startPrank(op);
+        d.token.approve(address(d.bond), MIN_BOND);
+        d.bond.bond(MIN_BOND - 1);
+        d.bond.requestUnbond(MIN_BOND / 2);
+        vm.stopPrank();
+        _bind(opPk, op, bytes32(uint256(0x5407)));
+
+        PaymentPool.PoolBatch[] memory batches = _settleBatch(_openPool(), op);
+        vm.prank(op);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotStaked.selector, op));
+        d.paymentPool.redeemMany(batches);
+    }
+
+    /// @notice A node that deregisters and leaves its whole bond active still
+    ///         redeems the vouchers it earned: the stake is all still at risk.
+    function test_e2e_redeemMany_deregisteredOperatorWithActiveBondStillPaid() public {
+        address op = _registerBonded(0xDE4E6);
+        vm.prank(op);
+        d.bond.deregisterNode();
+        assertFalse(d.bond.isActive(op), "deregistered");
+        assertEq(d.bond.activeBond(op), MIN_BOND, "with the whole bond still active");
+        (uint256 queued,) = d.bond.unbondingOf(op);
+        assertEq(queued, 0, "and nothing queued for unbonding");
+
+        PaymentPool.PoolBatch[] memory batches = _settleBatch(_openPool(), op);
+        vm.prank(op);
+        d.paymentPool.redeemMany(batches);
+        assertEq(usdc.balanceOf(op), SETTLE_AMOUNT * cfg.feeRouterShares[0] / 10_000, "operator share paid");
+        uint256 epoch = block.timestamp / cfg.feeRouterEpochLength;
+        assertEq(d.router.bytesPerEpoch(op, uint64(epoch)), 0, "an inactive payee adds no governance bytes");
+    }
+
+    /// @notice Once the unbonded stake leaves the contract the operator is no
+    ///         longer a payee.
+    function test_e2e_redeemMany_withdrawnOperatorReverts() public {
+        address op = _registerBonded(0x61D0E);
+        vm.startPrank(op);
+        d.bond.deregisterNode();
+        d.bond.requestUnbond(MIN_BOND);
+        (, uint256 unlockAt) = d.bond.unbondingOf(op);
+        vm.warp(unlockAt);
+        d.bond.unbond();
+        vm.stopPrank();
+
+        PaymentPool.PoolBatch[] memory batches = _settleBatch(_openPool(), op);
+        vm.prank(op);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotStaked.selector, op));
+        d.paymentPool.redeemMany(batches);
+    }
+
     /// @notice An ejected operator is never paid, even with its bond intact.
     function test_e2e_redeemMany_ejectedOperatorReverts() public {
         address op = _registerBonded(0xE7EC7);
