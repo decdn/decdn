@@ -25,10 +25,10 @@
 //! ALPN bump. ADR 013 freezes a signed field set at the protocol version that
 //! introduces it; `cdn/probe/v1` had no prior signed `ProbeResponse`, so the
 //! set `{hash, has_blob, rate_per_mb, timestamp_us}` is the v1 baseline (ADR
-//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` rides in
-//! [`ProbeResponseExt`] as the ADR 013 Tier-1 unsigned-evolution exemplar (ADR
-//! 005 §`cdn/probe/v1`) and is deliberately NOT covered by `slash_sig`. The
-//! `ProbeMessage` variant order is unchanged.
+//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` and its `size_proof` ride
+//! in [`ProbeResponseExt`] as ADR 013 Tier-1 unsigned extension fields (ADR
+//! 005 §`cdn/probe/v1`) and are NOT covered by `slash_sig`: the proof, not a
+//! signature, makes the size a fact.
 //!
 //! This crate deliberately does not depend on any crypto library. The caller
 //! (`decdn_incentive::ProbeSlashData` and the probe handler/CLI) computes and
@@ -60,12 +60,14 @@ pub const MAX_RATE_PER_MB: u64 = 1000;
 ///
 /// Every probe read passes this to [`crate::read_frame`]. The largest legitimate
 /// message is a [`ProbeResponse`] with its [`ProbeResponseExt`] at full width:
-/// 325 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap and
-/// its 2-byte length). A [`ProbeRequest`] is
-/// at most 43 bytes. The ceiling leaves headroom for Tier-1 extension fields
-/// and refuses a larger frame before the reader buffers it. The
-/// `probe_frame_ceiling_holds_the_largest_message` test pins the margin.
-pub const MAX_PROBE_FRAME: u32 = 1024;
+/// 4,808 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap
+/// and its 2-byte length) and the size proof up to 4,483 (a
+/// [`crate::MAX_SIZE_PROOF_BYTES`] proof, its 2-byte length and its `Some`
+/// tag). A [`ProbeRequest`] is at most 43 bytes. The ceiling leaves headroom
+/// for Tier-1 extension fields and refuses a larger frame before the reader
+/// buffers it. The `probe_frame_ceiling_holds_the_largest_message` test pins
+/// the margin.
+pub const MAX_PROBE_FRAME: u32 = 8 * 1024;
 
 /// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
 ///
@@ -272,18 +274,19 @@ pub struct ProbeResponse {
 /// the `ProbeResponse` message via the two-phase pattern (ADR 013 §Tier 1; see
 /// [`encode_probe_response`] / [`parse_probe_response_ext`]).
 ///
-/// Nothing here is covered by `slash_sig`, and nothing here may become
-/// load-bearing for payment, slashing, or any decision a lying node profits
-/// from: an unsigned field is a hint, and the sender is the party with the
-/// motive to shade it.
+/// Nothing here is covered by `slash_sig`. `coverage` is a hint: nothing may
+/// let it decide a payment, a slash, or anything a lying node profits from.
+/// `total_bytes` is a fact once its `size_proof` verifies against the hash,
+/// and nothing before that.
 ///
 /// New fields are appended to the END of this struct and MUST be `Option<T>` or
 /// have a meaningful `Default`. Insertions and reordering are Tier-3.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProbeResponseExt {
-    /// Blob size in bytes when known. Nodes SHOULD include it when the size is
-    /// known so requesters can estimate cost before opening a payment pool.
-    /// Unsigned: treat it as a sizing hint, never as a commitment.
+    /// Blob size in bytes. A node states it only together with a
+    /// [`Self::size_proof`] for it, so a requester can price the blob before it
+    /// opens a payment pool. A requester verifies the proof before it uses the
+    /// size, and drops a response that states a size with no valid proof.
     pub total_bytes: Option<u64>,
     /// Which discovery blocks (`decdn_protocol::coverage`) this node will
     /// serve. Unsigned: treat it as a hint, never as a commitment. A
@@ -291,6 +294,9 @@ pub struct ProbeResponseExt {
     /// `has_blob`) with [`ProbeResponseExt::consistent_with`] and drop a
     /// response where they disagree rather than trust either field alone.
     pub coverage: crate::Coverage,
+    /// The proof of [`Self::total_bytes`] under the signed `hash` (ADR 005 § A
+    /// node proves the blob size). Present exactly when `total_bytes` is.
+    pub size_proof: Option<crate::SizeProof>,
 }
 
 /// The BLAKE3 hash of zero bytes: the root of the empty blob.
@@ -317,7 +323,7 @@ impl ProbeResponseExt {
     /// empty on a holder and a non-holder alike. For that hash the coverage
     /// must be empty and `has_blob` alone says whether the node serves it
     /// (#2471). The rule keys on `body.hash`, which the signature covers,
-    /// never on the unsigned `total_bytes` hint.
+    /// never on `total_bytes`.
     ///
     /// Neither `coverage` nor `total_bytes` is in the signed set, so a mismatch
     /// has no attributable author to slash: a requester finding `false` here

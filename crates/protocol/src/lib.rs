@@ -18,6 +18,7 @@
 //! | [`client`] | `cdn/client/v1`: [`StreamRequest`], [`StreamResponse`], [`ChunkData`], the wire [`Voucher`], [`StreamError`] |
 //! | [`dht`] | `cdn/dht/v1`: store and find requests, provider records, closer-node lists |
 //! | [`coverage`] | The block coverage bitmap a partial holder advertises |
+//! | [`size_proof`] | The [`SizeProof`] that proves a stated blob size |
 //! | [`identity`] | The 32-byte [`NodeId`] and [`ContentHash`] newtypes |
 //! | [`region`] | ISO 3166-1 alpha-2 [`Region`] codes |
 //!
@@ -63,6 +64,7 @@ pub mod framing;
 pub mod identity;
 pub mod message;
 pub mod region;
+pub mod size_proof;
 
 pub use client::{
     BINDING_SIG_LEN, CHUNK_BYTES, ChunkData, ChunkPreimage, ClientBinding, ClientMessage,
@@ -93,6 +95,7 @@ pub use message::{
     encode_probe_response, parse_probe_response_ext,
 };
 pub use region::{InvalidRegion, Region, is_valid_region};
+pub use size_proof::{MAX_SIZE_PROOF_BYTES, SizeProof, SizeProofTooLong};
 
 /// ALPN protocol identifier for latency and availability probing.
 pub const ALPN_PROBE: &[u8] = b"cdn/probe/v1";

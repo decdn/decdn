@@ -71,13 +71,15 @@ pub const MAX_CHAIN_LENGTH: u8 = 255;
 ///
 /// The node reads a [`StreamRequest`] and every later payment proof against it,
 /// and a payer reads the [`StreamResponse`] against it. The largest legitimate
-/// message is a [`StreamRequest`] with a client binding and a capability: 301
-/// bytes, since every signature on the wire is a 65-byte EOA signature. The
-/// ceiling leaves headroom for Tier-1 extension fields and refuses a larger
-/// frame before the reader buffers it. It is also the wire bound on
-/// `owner_signature`, which decode checks only for being non-empty. The
-/// `client_control_frame_ceiling_holds_the_largest_message` test pins the margin.
-pub const MAX_CLIENT_CONTROL_FRAME: u32 = 4 * 1024;
+/// message is a [`StreamResponse`] whose extension carries a full
+/// [`crate::MAX_SIZE_PROOF_BYTES`] size proof and an origin attestation, a
+/// little under 5 KiB, since every signature on the wire is a 65-byte EOA
+/// signature. The ceiling leaves headroom for Tier-1 extension fields and
+/// refuses a larger frame before the reader buffers it. It is also the wire
+/// bound on `owner_signature`, which decode checks only for being non-empty.
+/// The `client_control_frame_ceiling_holds_the_largest_message` test pins the
+/// margin.
+pub const MAX_CLIENT_CONTROL_FRAME: u32 = 8 * 1024;
 
 /// Frame ceiling for the node → payer delivery stream, in payload bytes
 /// (ADR 013 § Wire Framing): one [`ClientMessage::ChunkData`] that carries a
@@ -468,6 +470,12 @@ pub struct StreamResponseExt {
     /// because its own `StreamResponse` is the attestation. A client ignores
     /// it; a relay verifies it before keeping it.
     pub origin_attestation: Option<crate::dht::OriginAttestation>,
+    /// The proof of the signed `total_bytes` under the signed `hash` (ADR 005
+    /// § A node proves the blob size). A node sends it on every response with
+    /// `ok = true`. The receiver verifies it before it uses the size, and
+    /// treats a response with `ok = true` and no valid proof as a fault of the
+    /// node.
+    pub size_proof: Option<crate::SizeProof>,
 }
 
 impl StreamResponseExt {
@@ -552,9 +560,9 @@ pub struct StreamResponseBody {
     /// Quoted rate in token base units per MB. Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "crate::message::deserialize_rate_per_mb")]
     pub rate_per_mb: u64,
-    /// Total blob size in bytes, as the signing node claims it. A pulling node
-    /// does not enforce its `max_blob_size` against this claim: it enforces the
-    /// ceiling on the bytes it receives (ADR 005 §`max_blob_size` enforcement).
+    /// Total blob size in bytes. On a response with `ok = true` the
+    /// [`StreamResponseExt::size_proof`] proves it, and a receiver uses it only
+    /// after that proof verifies.
     pub total_bytes: u64,
     /// Requester-generated microsecond timestamp from the [`StreamRequest`],
     /// echoed back unchanged.

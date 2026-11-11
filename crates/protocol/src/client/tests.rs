@@ -1,5 +1,5 @@
 use super::*;
-use crate::framing::{FrameError, decode_message, encode_message, read_frame, write_frame};
+use crate::framing::{decode_message, encode_message, read_frame, write_frame};
 use std::assert_matches;
 
 fn sample_body() -> StreamResponseBody {
@@ -197,6 +197,7 @@ fn stream_response_error_roundtrip() -> Result<(), postcard::Error> {
     let ext = StreamResponseExt {
         error: Some(StreamError::Declined),
         origin_attestation: None,
+        size_proof: None,
     };
     let buf = encode_stream_response(&resp, Some(&ext))?;
     let (decoded, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
@@ -526,6 +527,7 @@ fn stream_response_wire_format_is_stable() -> Result<(), postcard::Error> {
         Some(&StreamResponseExt {
             error: Some(StreamError::NotFound),
             origin_attestation: None,
+            size_proof: crate::SizeProof::new(vec![0x11, 0x22]).ok(),
         }),
     )?;
     let mut expected_framed = vec![1u8]; // ClientMessage::StreamResponse discriminant
@@ -533,6 +535,9 @@ fn stream_response_wire_format_is_stable() -> Result<(), postcard::Error> {
     expected_framed.push(1u8); // error = Some
     expected_framed.push(0u8); // StreamError::NotFound discriminant
     expected_framed.push(0u8); // origin_attestation = None
+    expected_framed.push(1u8); // size_proof = Some
+    expected_framed.push(2u8); // size_proof length prefix
+    expected_framed.extend_from_slice(&[0x11, 0x22]); // size_proof bytes
     assert_eq!(framed, expected_framed);
     Ok(())
 }
@@ -1024,6 +1029,7 @@ fn stream_response_ext_validate_rejects_error_with_ok() {
     let ext = StreamResponseExt {
         error: Some(StreamError::NotFound),
         origin_attestation: None,
+        size_proof: None,
     };
     assert_eq!(
         ext.validate(true),
@@ -1044,6 +1050,7 @@ fn stream_response_ext_validate_accepts_failure_with_delivery_error() {
     let ext = StreamResponseExt {
         error: Some(StreamError::Unfunded),
         origin_attestation: None,
+        size_proof: None,
     };
     assert_eq!(ext.validate(false), Ok(()));
 }
@@ -1057,6 +1064,7 @@ fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
             bundle: None,
         }),
         origin_attestation: None,
+        size_proof: None,
     };
     assert_eq!(
         ext.validate(false),
@@ -1074,6 +1082,7 @@ fn stream_response_base_validate_cannot_see_the_ext() -> Result<(), MessageValid
     let stray = StreamResponseExt {
         error: Some(StreamError::NotFound),
         origin_attestation: None,
+        size_proof: None,
     };
     assert_eq!(
         stray.validate(sample_response().body.ok),
@@ -1112,6 +1121,7 @@ fn stream_response_ext_tolerates_future_trailing_bytes() -> Result<(), postcard:
     let ext = StreamResponseExt {
         error: Some(StreamError::Declined),
         origin_attestation: None,
+        size_proof: None,
     };
     let mut bytes = postcard::to_allocvec(&ext)?;
     bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
@@ -1243,7 +1253,8 @@ fn widest_bundle() -> WatermarkBundle {
 /// wire. The `StreamRequest` size is pinned exactly so the ceiling's headroom
 /// stays visible.
 #[test]
-fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), FrameError> {
+fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::error::Error>>
+{
     let ceiling = MAX_CLIENT_CONTROL_FRAME as usize;
     let request = StreamRequest {
         hash: [0x01; 32],
@@ -1291,9 +1302,14 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), FrameE
                 timestamp_us: u64::MAX,
                 slash_sig: vec![0x0D; SLASH_SIG_LEN],
             }),
+            size_proof: Some(crate::SizeProof::new(vec![0x0E; crate::MAX_SIZE_PROOF_BYTES])?),
         }),
     )?
     .len();
+    assert!(
+        response_len > crate::MAX_SIZE_PROOF_BYTES,
+        "the widest StreamResponse carries a full size proof"
+    );
     let voucher_len = encode_message(&ClientMessage::Voucher(Voucher {
         signature: vec![0x0A; VOUCHER_SIG_LEN],
         amount: u64::MAX,

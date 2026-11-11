@@ -47,7 +47,9 @@ pub mod origin_seed;
 pub mod ranged_store;
 pub mod size_proof;
 pub mod streaming;
-pub use origin_seed::{EncodedOutboard, OBAO4_SUFFIX, encode_outboard, shard_prefix};
+pub use origin_seed::{
+    EncodedOutboard, OBAO4_SUFFIX, SIZE_PROOF_SUFFIX, encode_outboard, shard_prefix,
+};
 pub use ranged_store::{RangedFuture, RangedStore, RangedStoreError};
 pub use size_proof::{
     MAX_SIZE_PROOF_BYTES, SizeProofError, encode_size_proof, size_proof_tail_start,
