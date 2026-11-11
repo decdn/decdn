@@ -6,10 +6,55 @@ use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
 use super::{
     AssembleOutcome, MAX_BACKPRESSURE_RETRIES, MAX_REASSIGN_ATTEMPTS, RecoveryEnd, RunOutcome,
-    RunSink, UnavailableCause, assemble,
+    RunSink, UnavailableCause, assemble, planned_len,
 };
 
 const BAO_CHUNK_BYTES: u64 = 1024;
+
+/// A pull plans no further than the request's end or the cap on bytes a node
+/// holds, whatever the upstream claims: a whole-blob request (`0`) plans the
+/// cap's worth, a longer request is cut to the cap, a shorter one keeps its
+/// length, and with no cap the request stands.
+#[test]
+fn a_pull_plans_no_further_than_the_request_or_the_cap() {
+    let cap = 4 * DISCOVERY_BLOCK_BYTES;
+    // One chunk group past the cap, so a pull past it meets the held-bytes
+    // meter.
+    let reach = cap + decdn_bao_range::CHUNK_GROUP_BYTES;
+    assert_eq!(
+        planned_len(0, cap),
+        reach,
+        "a whole-blob request plans the cap's reach"
+    );
+    assert_eq!(planned_len(u64::MAX, cap), reach, "a longer request is cut");
+    assert_eq!(planned_len(1024, cap), 1024, "a shorter request stands");
+    assert_eq!(planned_len(0, 0), 0, "no cap: to the end");
+    assert_eq!(planned_len(77, 0), 77);
+}
+
+/// A node pull leg against an upstream that claims 2^60 bytes plans only
+/// the blocks of the request: the plan stays one run over the requested
+/// block, and nothing past it is uncovered or planned.
+#[test]
+fn an_inflated_upstream_claim_plans_only_the_requested_blocks() {
+    let claim = 1u64 << 60;
+    let offset = DISCOVERY_BLOCK_BYTES;
+    let len = planned_len(4096, 8 * DISCOVERY_BLOCK_BYTES);
+    let gap = ChunkRanges::from(
+        ChunkNum(offset / BAO_CHUNK_BYTES)..ChunkNum((offset + len) / BAO_CHUNK_BYTES),
+    );
+    let coverages = vec![cov(4, &[1])];
+    let (runs, uncovered) = super::plan_over(&gap, claim, &coverages, &[0]);
+    assert!(uncovered.is_empty());
+    assert_eq!(
+        runs,
+        vec![CoveredRun {
+            offset,
+            len,
+            source_ix: 0,
+        }]
+    );
+}
 
 fn cov(nb: u32, blocks: &[u32]) -> Coverage {
     Coverage::from_block_indices(nb, blocks.iter().copied())

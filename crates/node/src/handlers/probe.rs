@@ -648,8 +648,15 @@ impl ProbeHandler {
             // empty root (#2471).
             (Coverage::empty(), total_bytes)
         } else if is_origin_sourced {
+            // The origin's own size names its blocks, up to the most a
+            // well-formed coverage names on the wire: a larger bitmap is
+            // rejected at decode, so it would advertise nothing.
             (
-                total_bytes.map_or_else(Coverage::empty, |size| Coverage::full(num_blocks(size))),
+                total_bytes.map_or_else(Coverage::empty, |size| {
+                    Coverage::full(num_blocks(
+                        size.min(decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES),
+                    ))
+                }),
                 total_bytes,
             )
         } else if holds_disabled || !self.relay_foreign_namespaces {

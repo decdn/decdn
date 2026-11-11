@@ -9,6 +9,34 @@ fn whole_gap(total_bytes: u64) -> ChunkRanges {
     ChunkRanges::from(ChunkNum(0)..ChunkNum(total_bytes.div_ceil(BAO_CHUNK_BYTES)))
 }
 
+/// The planners walk only the blocks the gap touches: a gap of one block of a
+/// blob claimed at 2^60 bytes plans that block and nothing else, at once.
+#[test]
+fn a_huge_claimed_size_plans_only_the_blocks_the_gap_touches() {
+    let total = 1u64 << 60;
+    let start = 3 * DISCOVERY_BLOCK_BYTES;
+    let gap = ChunkRanges::from(
+        bao_tree::ChunkNum(start / 1024)..bao_tree::ChunkNum((start + 4096) / 1024),
+    );
+    let sources = vec![SourceCoverage {
+        source_ix: 0,
+        coverage: cov(8, &[3]),
+    }];
+    let (runs, uncovered) = plan_covered_runs(&gap, total, &sources, &[0]);
+    assert!(uncovered.is_empty());
+    assert_eq!(
+        runs,
+        vec![CoveredRun {
+            offset: start,
+            len: 4096,
+            source_ix: 0,
+        }]
+    );
+    let (runs, uncovered) = spread_segments(&gap, total, &sources, &[0]);
+    assert!(uncovered.is_empty());
+    assert_eq!(runs.len(), 1);
+}
+
 #[test]
 fn covering_sources_picks_best_ranked() {
     let sources = vec![

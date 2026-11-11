@@ -450,7 +450,13 @@ impl ClientHandler {
         // on, instead of `ok: true` and a truncated stream, when the ranked candidates
         // cannot cover the part of the pull range this node does not hold.
         if let Some(shortfall) = self
-            .pull_range_uncovered(hash, total_bytes, pull_range, target.as_ref())
+            .pull_range_uncovered(
+                hash,
+                total_bytes,
+                pull_range,
+                target.as_ref(),
+                origin.max_blob_size_bytes(),
+            )
             .await
         {
             release_reservation_unspent(floor_reservation.as_ref());
@@ -1046,13 +1052,17 @@ impl ClientHandler {
         total_bytes: u64,
         pull_range: Option<(u64, u64)>,
         target: Option<&PullLegTarget>,
+        max_blob_size_bytes: u64,
     ) -> Option<CoverageShortfall> {
         use decdn_bao_range::RangedStore as _;
         let (Some((pull_offset, pull_len)), Some(target)) = (pull_range, target) else {
             return None;
         };
         let store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
-        let gap = match store.missing_ranges(pull_offset, pull_len).await {
+        // The gap the pull plans: never past the bytes the node holds for one
+        // blob, whatever the upstream claims.
+        let planned = crate::node_origin::planned_len(pull_len, max_blob_size_bytes);
+        let gap = match store.missing_ranges(pull_offset, planned).await {
             Ok(gap) => gap,
             Err(err) => {
                 tracing::warn!(

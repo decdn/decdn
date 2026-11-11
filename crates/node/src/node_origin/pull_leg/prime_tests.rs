@@ -174,14 +174,11 @@ fn the_handshake_visits_the_first_runs_holder_first() {
     let later = Coverage::from_block_indices(blocks, [1, 2].into_iter());
     let head = Coverage::from_block_indices(blocks, [0].into_iter());
     let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
-    assert_eq!(
-        handshake_order(&[later, head], Some(total), Some(prime)),
-        vec![1, 0]
-    );
+    assert_eq!(handshake_order(&[later, head], Some(prime)), vec![1, 0]);
 }
 
-/// Without a prime, or without a size to plan over, the handshake walks
-/// the rank order.
+/// Without a prime, the handshake walks the rank order. A block's offset
+/// does not depend on the blob's size, so no size is needed to order it.
 #[test]
 fn without_a_prime_the_handshake_walks_the_rank_order() {
     let total = 3 * DISCOVERY_BLOCK_BYTES;
@@ -189,9 +186,7 @@ fn without_a_prime_the_handshake_walks_the_rank_order() {
     let later = Coverage::from_block_indices(blocks, [1, 2].into_iter());
     let head = Coverage::from_block_indices(blocks, [0].into_iter());
     let coverages = [later, head];
-    assert_eq!(handshake_order(&coverages, Some(total), None), vec![0, 1]);
-    let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
-    assert_eq!(handshake_order(&coverages, None, Some(prime)), vec![0, 1]);
+    assert_eq!(handshake_order(&coverages, None), vec![0, 1]);
 }
 
 /// When no candidate covers the prime's first block, the handshake walks
@@ -203,10 +198,7 @@ fn with_no_holder_of_the_first_block_the_handshake_walks_the_rank_order() {
     let last = Coverage::from_block_indices(blocks, [2].into_iter());
     let middle = Coverage::from_block_indices(blocks, [1].into_iter());
     let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
-    assert_eq!(
-        handshake_order(&[last, middle], Some(total), Some(prime)),
-        vec![0, 1]
-    );
+    assert_eq!(handshake_order(&[last, middle], Some(prime)), vec![0, 1]);
 }
 
 /// A run adopts the pull only on its own source, pool, and lane ledger,

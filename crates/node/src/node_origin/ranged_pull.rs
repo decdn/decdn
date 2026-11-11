@@ -420,6 +420,23 @@ pub(crate) async fn assemble<S: RunSink>(
     }
 }
 
+/// The length of a pull of `len` bytes (`0`: to the end) the pull plans, cut
+/// to the bytes a node holds for one blob, `max_blob_size_bytes` (`0`: no
+/// cap). The upstream's size claim names the tree each leg verifies under,
+/// never the work: a whole-blob request of a blob claimed far past the cap
+/// plans no block past the cap's reach from the pull's offset. The reach
+/// runs one chunk group past the cap, so a pull that would hold more than
+/// the cap still meets the held-bytes meter and ends with `BlobTooLarge`.
+/// The result is never `0` for a nonzero cap, so it never reads as "to the
+/// end".
+pub(crate) const fn planned_len(len: u64, max_blob_size_bytes: u64) -> u64 {
+    if max_blob_size_bytes == 0 {
+        return len;
+    }
+    let reach = max_blob_size_bytes.saturating_add(decdn_bao_range::CHUNK_GROUP_BYTES);
+    if len == 0 || len > reach { reach } else { len }
+}
+
 /// The part of `gap` that no candidate in `coverage` covers — the test
 /// [`assemble`]'s first round applies before it drives any run. The serve leg
 /// runs it before `ok: true`, so a gap no candidate can fill is refused rather

@@ -55,6 +55,7 @@ pub(crate) use pull_leg::{
     CandidateSource, PrimeLeg, PullLegMiss, PullLegTarget, PullLegTrail, run_local_pull_leg,
     run_pull_leg,
 };
+pub(crate) use ranged_pull::planned_len;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -1740,8 +1741,8 @@ async fn probe_candidate(
         // blocks leave the coverage empty on a holder too (#2471).
         coverage: resp_ext.coverage,
         // The holder's reported blob size. The coverage-union gather (#1506)
-        // reads it to know how many discovery blocks the union must span,
-        // and the pull leg cuts its first upstream open from it.
+        // reads it to know how many discovery blocks the union must span.
+        // The pull plans nothing from it.
         total_bytes_hint: resp_ext.total_bytes,
     })
 }

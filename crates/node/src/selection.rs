@@ -219,10 +219,9 @@ pub struct Candidate {
     pub coverage: Coverage,
     /// The blob size the candidate reported on that probe
     /// (`ProbeResponseExt.total_bytes`), when it knows it. UNSIGNED: a sizing
-    /// hint, never a commitment. The pull leg cuts its first upstream open from
-    /// it. When that open runs past the blob's end, the pull leg opens the whole
-    /// blob instead; when the signed size differs from the hint, it drops the
-    /// pull.
+    /// hint, never a commitment. Only the coverage-union probe gather reads it,
+    /// to count the blocks a union of partial holders must span; the pull
+    /// plans nothing from it.
     pub total_bytes_hint: Option<u64>,
 }
 

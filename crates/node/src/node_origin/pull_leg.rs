@@ -103,8 +103,9 @@ pub(crate) struct PullLegTarget {
     candidates: Vec<Candidate>,
     /// The handshake's pull, opened at the first leg the pull leg is expected to
     /// open, for that leg to adopt (#2063). `None` when the handshake kept no
-    /// first-leg pull: no prime or size hint, no predictable leg, a bounded open
-    /// past the blob's end, or a signed size that differs from the hint.
+    /// first-leg pull: no prime, no predictable leg, a bounded open past the
+    /// blob's end, or a pull that is not the first run's leg under the signed
+    /// size.
     primed: Option<PrimedHandshake>,
 }
 
@@ -115,8 +116,7 @@ impl PullLegTarget {
     }
 
     /// The part of `gap` no candidate covers ([`super::ranged_pull::uncovered`]),
-    /// judged against the signed `total_bytes` rather than any candidate's
-    /// unsigned size hint.
+    /// its blocks counted against the signed `total_bytes`.
     pub(crate) fn uncovered(&self, gap: &ChunkRanges) -> ChunkRanges {
         let coverages: Vec<decdn_protocol::Coverage> =
             self.candidates.iter().map(|c| c.coverage.clone()).collect();
@@ -228,65 +228,49 @@ impl PrimeLeg {
     }
 
     /// The index into `coverages` of the source the pull leg's first run uses,
-    /// planned as [`super::ranged_pull::assemble`] plans its first round over
-    /// the ranked candidates' `coverages` of a `total_bytes` blob, or `None`
-    /// when no candidate covers the pull's first block. It assumes the node
-    /// holds none of the range, as [`Self::predicted_leg`] does.
-    fn first_run_source(
-        &self,
-        total_bytes: u64,
-        coverages: &[decdn_protocol::Coverage],
-    ) -> Option<usize> {
-        let end = if self.len == 0 {
-            total_bytes
-        } else {
-            self.offset.saturating_add(self.len).min(total_bytes)
-        };
-        if self.offset >= end {
-            return None;
-        }
-        let gap = whole_range_chunks(self.offset, end - self.offset);
-        let rank: Vec<usize> = (0..coverages.len()).collect();
-        let (runs, _) = super::ranged_pull::plan_over(&gap, total_bytes, coverages, &rank);
-        let run = runs.first()?;
+    /// as [`super::ranged_pull::assemble`] plans its first round over the
+    /// ranked candidates' `coverages`: the best-ranked candidate that covers
+    /// the pull's first block, or `None` when none does. A block's offset does
+    /// not depend on the blob's size, so neither does this. It assumes the
+    /// node holds none of the range, as [`Self::predicted_leg`] does.
+    fn first_run_source(&self, coverages: &[decdn_protocol::Coverage]) -> Option<usize> {
         let block_bytes = decdn_protocol::discovery_block_bytes();
-        (run.offset / block_bytes == self.offset / block_bytes).then_some(run.source_ix)
+        let first_block = u32::try_from(self.offset / block_bytes).ok()?;
+        coverages
+            .iter()
+            .position(|coverage| coverage.covers(first_block))
     }
 }
 
 /// The order the header handshake visits the ranked candidates, as indices
-/// into them: with a `prime` and a blob size, the candidate the pull leg's
-/// first run uses ([`PrimeLeg::first_run_source`]) comes first, so the
-/// handshake's primed pull is the one that run adopts; the rest follow in rank
-/// order. Without a prime, a size, or a candidate covering the prime's first
-/// block, the order is the rank order.
-fn handshake_order(
-    coverages: &[decdn_protocol::Coverage],
-    total_bytes: Option<u64>,
-    prime: Option<PrimeLeg>,
-) -> Vec<usize> {
+/// into them: with a `prime`, the candidate the pull leg's first run uses
+/// ([`PrimeLeg::first_run_source`]) comes first, so the handshake's primed
+/// pull is the one that run adopts; the rest follow in rank order. Without a
+/// prime, or a candidate covering the prime's first block, the order is the
+/// rank order.
+fn handshake_order(coverages: &[decdn_protocol::Coverage], prime: Option<PrimeLeg>) -> Vec<usize> {
     let mut order: Vec<usize> = (0..coverages.len()).collect();
-    let first = prime
-        .zip(total_bytes)
-        .and_then(|(prime, total)| prime.first_run_source(total, coverages));
-    if let Some(first) = first {
+    if let Some(first) = prime.and_then(|prime| prime.first_run_source(coverages)) {
         order.retain(|&ix| ix != first);
         order.insert(0, first);
     }
     order
 }
 
-/// The header handshake's range for a candidate advertising `coverage` of a
-/// `total_bytes` blob: the first chunk group of the first discovery block it
-/// covers, as `(offset, len)`, or `None` when it covers none of the blob.
-fn covered_handshake_range(
-    coverage: &decdn_protocol::Coverage,
-    total_bytes: u64,
-) -> Option<(u64, u64)> {
-    let blocks = decdn_protocol::num_blocks(total_bytes);
-    let first = coverage.covered_blocks().find(|&block| block < blocks)?;
+/// A size no blob reaches, for the first-leg handshake that opens before the
+/// upstream signs a size: a leg that ends inside the blob ends at the same
+/// byte for every larger size, and the upstream clamps a pull that runs past
+/// the end.
+const UNBOUNDED_SIZE: u64 = 1 << 62;
+
+/// The header handshake's range for a candidate advertising `coverage`: the
+/// first chunk group of the first discovery block it covers, as `(offset,
+/// len)`, or `None` when it covers none. A block's offset does not depend on
+/// the blob's size; the upstream clamps a group that runs past the end.
+fn covered_handshake_range(coverage: &decdn_protocol::Coverage) -> Option<(u64, u64)> {
+    let first = coverage.covered_blocks().next()?;
     let start = u64::from(first).checked_mul(decdn_protocol::discovery_block_bytes())?;
-    (start < total_bytes).then(|| (start, CHUNK_GROUP_BYTES.min(total_bytes - start)))
+    Some((start, CHUNK_GROUP_BYTES))
 }
 
 /// Which run may adopt a primed pull, apart from the pull itself: the facts a
@@ -668,11 +652,11 @@ impl NodeOrigin {
     ///
     /// The handshake that reads `total_bytes` is a real open on the upstream: it
     /// signs, claims a fill, and on a miss starts its own origin draw. With a
-    /// `prime` and a candidate that reported its size on the probe, the handshake
-    /// therefore opens the pull leg's own first leg and parks the pull in the
-    /// target for that leg to adopt (#2063). Otherwise it opens one chunk group
-    /// of a block the candidate advertised, reads the header, and drops the pull;
-    /// only without a size hint it can trust does it open the whole blob.
+    /// `prime`, the handshake therefore opens the pull leg's own first leg and
+    /// parks the pull in the target for that leg to adopt (#2063). Otherwise it
+    /// opens one chunk group of a block the candidate advertised, reads the
+    /// header, and drops the pull; only for a candidate that advertised no
+    /// block does it open the whole blob.
     ///
     /// `requester` is the node the serve answers. It is never a candidate: pulling
     /// from it would hand it back its own bytes, and two nodes that each lack part
@@ -838,10 +822,7 @@ impl NodeOrigin {
         let mut last_fault = None;
         let coverages: Vec<decdn_protocol::Coverage> =
             ranked.iter().map(|c| c.coverage.clone()).collect();
-        // The size the order plans over is a probe hint; each candidate's own
-        // hint cuts its primed leg in `handshake_total_bytes`.
-        let total_hint = ranked.iter().find_map(|c| c.total_bytes_hint);
-        let visits = handshake_order(&coverages, total_hint, prime)
+        let visits = handshake_order(&coverages, prime)
             .into_iter()
             .filter_map(|ix| ranked.get(ix).map(|candidate| (ix, candidate)));
         for (candidate_ix, candidate) in visits.take(budget) {
@@ -890,11 +871,11 @@ impl NodeOrigin {
     /// is. The pool it opens is cached by `open_or_reuse_pool`, so the ranged
     /// pull's first lane to this provider reuses it.
     ///
-    /// With a `prime` and the candidate's probe-reported size, the handshake opens
-    /// [`PrimeLeg::predicted_leg`]. The size is unsigned, so a bounded open that
-    /// fails (a range past a smaller blob's end) is asked again for the whole blob
-    /// before the candidate counts as failed, and a pull whose signed size differs
-    /// from the hint is dropped: its range was cut from the wrong size.
+    /// With a `prime`, the handshake opens [`PrimeLeg::predicted_leg`] cut as for
+    /// a blob of no known size. A bounded open that fails because the request
+    /// starts past the blob's end is asked again for the whole blob's header
+    /// before the candidate counts as failed, and a pull that is not the first
+    /// run's leg under the signed size is closed.
     // Straight-line resolve → gate → open → bind → handshake; the bounded first
     // attempt adds one branch to a flow that reads best in one piece.
     #[allow(clippy::too_many_lines)]
@@ -966,20 +947,21 @@ impl NodeOrigin {
         let namespace_bytes = namespace_id.to_be_bytes::<32>();
         let stream_guard = deps.metrics.outbound_stream_guard();
 
-        // The pull leg's own first leg, when the probe reported the size to cut it
-        // from. It opens a stream on the node's shared connection to the
-        // upstream, whose driver runs on the main runtime and outlives the pull
-        // thread that adopts the pull.
-        let hint = candidate.total_bytes_hint;
-        // Set when the primed open runs past the blob's end: the probed size is
-        // wrong, so no range cut from it can be trusted.
-        let mut hint_wrong = false;
-        let predicted = prime.zip(hint).and_then(|(prime, total)| {
+        // The pull leg's own first leg, cut as for a blob of no known size: its
+        // end does not depend on the size while the blob runs past it, and the
+        // upstream clamps a pull that runs past the end. It opens a stream on
+        // the node's shared connection to the upstream, whose driver runs on
+        // the main runtime and outlives the pull thread that adopts the pull.
+        let max_blob = deps.config.max_blob_size_bytes;
+        // Set when the first-leg open runs past the blob's end: the request
+        // starts past it, so the header comes from a whole-blob open.
+        let mut past_end = false;
+        let predicted = prime.and_then(|prime| {
             prime
-                .predicted_leg(total, &candidate.coverage, deps.config.max_blob_size_bytes)
-                .map(|range| (prime, range))
+                .predicted_leg(UNBOUNDED_SIZE, &candidate.coverage, max_blob)
+                .map(|span| (prime, span))
         });
-        if let Some((prime, range)) = predicted {
+        if let Some((prime, span)) = predicted {
             let source = PeerSource::new(
                 &deps.endpoint,
                 EndpointAddr::new(pk),
@@ -996,7 +978,7 @@ impl NodeOrigin {
                 Some(deps.connections.clone()),
             );
             let handshake = timed_open(
-                source.open(hash_bytes, range.clone()),
+                source.open(hash_bytes, span.clone()),
                 Arc::clone(&deps.metrics),
             );
             match handshake.await {
@@ -1005,17 +987,25 @@ impl NodeOrigin {
                     deps.attestations
                         .keep_offered(hash_bytes, header.origin_attestation.as_ref());
                     let total_bytes = header.total_bytes;
-                    if hint != Some(total_bytes) {
-                        warn!(
+                    // The first run cuts its leg under the signed size. The pull
+                    // is that leg only when the upstream served exactly the
+                    // span, clamped to the signed size.
+                    let Some(range) = prime
+                        .predicted_leg(total_bytes, &candidate.coverage, max_blob)
+                        .filter(|leg| {
+                            leg.fetch_start() == span.fetch_start()
+                                && leg.fetch_end() == span.fetch_end().min(total_bytes)
+                        })
+                    else {
+                        debug!(
                             peer = %pk,
                             hash = %Hash::from(hash_bytes),
                             signed = total_bytes,
-                            ?hint,
-                            "node-origin: the provider signs another size than it probed; \
-                             closing the first-leg handshake pull"
+                            "node-origin: the first-leg handshake pull is not the first run's \
+                             leg under the signed size; closing it"
                         );
                         return Ok((total_bytes, None));
-                    }
+                    };
                     let primed = PrimedHandshake {
                         key: PrimeKey {
                             candidate_ix,
@@ -1030,15 +1020,16 @@ impl NodeOrigin {
                     };
                     return Ok((total_bytes, Some(primed)));
                 }
-                // A range past the blob's end means the probed size was wrong, not
-                // the provider: ask it for the whole blob instead.
+                // A range past the blob's end means the request starts past it,
+                // not that the provider failed: ask it for the whole blob's
+                // header instead.
                 Err(err) if decdn_client::is_range_past_end(&err) => {
-                    hint_wrong = true;
+                    past_end = true;
                     debug!(
                         peer = %pk,
                         hash = %Hash::from(hash_bytes),
                         "node-origin: the first-leg handshake runs past the blob's end ({err:#}); \
-                         opening the whole blob, as the probed size is wrong"
+                         opening the whole blob"
                     );
                 }
                 // Any other failure is the handshake's own outcome, classified as the
@@ -1059,11 +1050,12 @@ impl NodeOrigin {
         // The range lies in a block the candidate advertised, so a partial holder
         // answers from what it holds; asked for bytes it lacks, a holder that pulls
         // through starts its own pull for them, and partial holders asking each
-        // other form a loop. Only without a size to cut that range from is the
-        // whole blob (`byte_offset == 0`, `byte_len == 0`) the range asked for.
-        let (byte_offset, byte_len) = hint
-            .filter(|_| !hint_wrong)
-            .and_then(|total| covered_handshake_range(&candidate.coverage, total))
+        // other form a loop. Only for a candidate that covers no block, or a
+        // first leg that ran past the end, is the whole blob (`byte_offset ==
+        // 0`, `byte_len == 0`) the range asked for.
+        let (byte_offset, byte_len) = (!past_end)
+            .then(|| covered_handshake_range(&candidate.coverage))
+            .flatten()
             .unwrap_or((0, 0));
         let header_source = PeerSource::new(
             &deps.endpoint,
@@ -1293,6 +1285,10 @@ pub(crate) async fn run_pull_leg(
         primed: std::sync::Mutex::new(primed),
     };
 
+    // The plan never reaches past the request's end or past the bytes the
+    // node holds for one blob: the upstream's claim names the tree, not the
+    // work.
+    let len = super::ranged_pull::planned_len(len, deps.config.max_blob_size_bytes);
     let outcome = assemble(&sink, &coverages, offset, len, total_bytes).await;
     // One outbound outcome per assembled range. A cancelled assembly (the serve
     // leg finished first) is neither.

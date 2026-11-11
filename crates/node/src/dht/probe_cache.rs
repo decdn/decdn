@@ -101,8 +101,8 @@ pub struct ProbedProvider {
     pub coverage: Coverage,
     /// The blob size the provider reported on that probe
     /// (`ProbeResponseExt.total_bytes`), when it knew it. UNSIGNED, like
-    /// `coverage`, so it carries no slashable author either: a sizing hint the
-    /// pull leg cuts its first upstream open from.
+    /// `coverage`, so it carries no slashable author either: a hint only the
+    /// coverage-union probe gather reads.
     pub total_bytes_hint: Option<u64>,
 }
 
