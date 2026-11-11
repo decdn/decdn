@@ -639,8 +639,8 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // A call that paid nothing moves nothing: the router rejects a zero
         // amount, and there is nothing to settle.
         if (totalPaid != 0) {
-            // Only a staked operator is a payee: a bound NodeId plus active and
-            // unbonding bond at or above half its entry floor. A binding alone
+            // Only a staked operator is a payee: a bound, non-ejected operator
+            // that is active or has bond in its unbonding queue. A binding alone
             // costs no bond, so a capability holder that binds its own address
             // still cannot sign vouchers to itself and draw its cap as USDC.
             // Its bytes count toward the governance window only while it is

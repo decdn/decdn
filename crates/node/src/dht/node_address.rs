@@ -22,7 +22,7 @@
 //! bindings arms follow only `NodeRegistered` (insert) and `NodeDeregistered`
 //! (remove) — notably `NodeAutoEjected` deactivates without clearing a binding —
 //! and the enumeration applies no `isActive` filter: an operator below its bond
-//! floor is inactive but still payable.
+//! floor is inactive but is paid while its bond unbonds and again once it tops up.
 //!
 //! # Failure model
 //!

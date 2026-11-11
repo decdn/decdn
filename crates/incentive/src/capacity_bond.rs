@@ -15,7 +15,8 @@
 //!   bond ≥ the operator's floor AND not ejected" predicate. Callers take
 //!   the membership set from `active[]` and keep the full page for the
 //!   payout bindings (an operator below its floor is `active == false`
-//!   but still payable), with no per-entry round-trip.
+//!   but is paid while bond sits in its unbonding queue and again once it
+//!   tops up), with no per-entry round-trip.
 //! - `nodeIdOf` returns `(bytes32 nodeId, bool active)` where the bool
 //!   is the full `isActive` predicate, not a separate "registered"
 //!   flag.

@@ -219,6 +219,67 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         assertEq(d.router.bytesPerEpoch(op, uint64(epoch)), 0, "an inactive payee adds no governance bytes");
     }
 
+    /// @notice An ejected operator is never paid, even with its bond intact.
+    function test_e2e_redeemMany_ejectedOperatorReverts() public {
+        address op = _registerBonded(0xE7EC7);
+        (bool payee,) = d.bond.payeeStatus(op);
+        assertTrue(payee, "a registered bonded operator is a payee");
+
+        vm.prank(address(d.blacklist));
+        d.bond.ejectNode(op);
+        assertEq(d.bond.activeBond(op), MIN_BOND, "ejection leaves the bond in place");
+
+        PaymentPool.PoolBatch[] memory batches = _settleBatch(_openPool(), op);
+        vm.prank(op);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotStaked.selector, op));
+        d.paymentPool.redeemMany(batches);
+    }
+
+    /// @notice A slash below the entry floor that does not eject leaves the
+    ///         operator inactive, so it is not paid until it tops up to its
+    ///         floor. After the top-up the same batch pays.
+    function test_e2e_redeemMany_slashedBelowFloorPaidAfterTopUp() public {
+        address op = _registerBonded(0x5A5ED);
+        vm.prank(address(d.slashJudge));
+        (, uint256 slashed) = d.bond.slash(op, address(0xC4A11), 1, bytes32(0));
+        assertFalse(d.bond.ejected(op), "a tier-1 slash does not eject");
+        assertFalse(d.bond.isActive(op), "but leaves the operator below its floor");
+
+        PaymentPool.PoolBatch[] memory batches = _settleBatch(_openPool(), op);
+        vm.prank(op);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotStaked.selector, op));
+        d.paymentPool.redeemMany(batches);
+
+        vm.prank(tokenHolder);
+        d.token.transfer(op, slashed);
+        vm.prank(op);
+        d.bond.bond(slashed);
+        assertTrue(d.bond.isActive(op), "the top-up restores the floor");
+
+        vm.prank(op);
+        d.paymentPool.redeemMany(batches);
+        assertEq(usdc.balanceOf(op), SETTLE_AMOUNT * cfg.feeRouterShares[0] / 10_000, "paid after the top-up");
+    }
+
+    /// @dev Bond `MIN_BOND` and `registerNode` for the key `pk`.
+    function _registerBonded(uint256 pk) internal returns (address op) {
+        op = vm.addr(pk);
+        bytes32 nodeId = bytes32(pk);
+        vm.prank(tokenHolder);
+        d.token.transfer(op, MIN_BOND);
+        vm.startPrank(op);
+        d.token.approve(address(d.bond), type(uint256).max);
+        d.bond.bond(MIN_BOND);
+        vm.stopPrank();
+        bytes32 structHash = keccak256(
+            abi.encode(d.bond.REGISTER_NODE_TYPEHASH(), nodeId, d.bond.bindingNonce(op), cfg.currentTermsHash)
+        );
+        bytes memory sig = _bondSig(pk, structHash);
+        vm.prank(op);
+        d.bond.registerNode(nodeId, hex"", "us-east", cfg.currentTermsHash, sig, hex"01");
+        assertTrue(d.bond.isActive(op), "registered and active");
+    }
+
     function _openPool() internal returns (bytes32 poolId) {
         vm.prank(owner);
         poolId = d.paymentPool.openPool(DEPOSIT);
@@ -228,6 +289,13 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     ///      ed25519 verifier accepts the ownership proof.
     function _bind(uint256 pk, address who, bytes32 nodeId) internal {
         bytes32 structHash = keccak256(abi.encode(d.bond.BIND_NODE_TYPEHASH(), nodeId, d.bond.bindingNonce(who)));
+        bytes memory sig = _bondSig(pk, structHash);
+        vm.prank(who);
+        d.bond.bindNodeId(nodeId, sig, hex"01");
+    }
+
+    /// @dev EIP-712 signature over `structHash` in the `CapacityBond` domain.
+    function _bondSig(uint256 pk, bytes32 structHash) internal view returns (bytes memory) {
         bytes32 domain = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -238,8 +306,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             )
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, keccak256(abi.encodePacked("\x19\x01", domain, structHash)));
-        vm.prank(who);
-        d.bond.bindNodeId(nodeId, abi.encodePacked(r, s, v), hex"01");
+        return abi.encodePacked(r, s, v);
     }
 
     /// @dev One pool group: the signer's capability plus one sealed voucher

@@ -1174,20 +1174,13 @@ contract CapacityBond is
     ///      degenerate case (a zero-bond phantom slash) with nothing to
     ///      grandfather.
     function _maybeAutoEject(address operator) internal {
-        if (activeBond[operator] >= _ejectLine(operator) || ejected[operator]) return;
+        uint256 floor = bondFloorAtActivation[operator];
+        if (floor == 0) floor = minBond;
+        if (activeBond[operator] >= (floor / 2) || ejected[operator]) return;
         ejected[operator] = true;
         bytes32 nodeId = _ejectNodeEffects(operator);
         emit AutoEjected(operator, activeBond[operator]);
         if (nodeId != bytes32(0)) emit NodeAutoEjected(nodeId, activeBond[operator]);
-    }
-
-    /// @dev Half the operator's entry floor, or half the live `minBond` when it
-    ///      holds no floor: the auto-eject threshold, and the stake a payee
-    ///      must hold in `payeeStatus`.
-    function _ejectLine(address operator) internal view returns (uint256) {
-        uint256 floor = bondFloorAtActivation[operator];
-        if (floor == 0) floor = minBond;
-        return floor / 2;
     }
 
     // -----------------------------------------------------------------
@@ -1573,15 +1566,18 @@ contract CapacityBond is
     }
 
     /// @notice Whether `operator` may be paid for vouchers, and whether its bytes
-    ///         count toward governance. `payee` needs a bound NodeId and slashable
-    ///         stake: active plus unbonding bond at or above the auto-eject line
-    ///         (half the entry floor). A binding alone costs no bond, so it does
-    ///         not make a payee. Unbonding bond counts, so a deregistered node
-    ///         redeems its earned vouchers while its bond unbonds.
+    ///         count toward governance. `payee` is a state check with no
+    ///         threshold of its own: the operator holds a bound NodeId, is not
+    ///         ejected, and is either `isActive` or has bond in the unbonding
+    ///         queue. A registered bonded operator is paid, and a deregistering
+    ///         node keeps redeeming earned vouchers while its bond unbonds. A
+    ///         binding alone costs no bond, so a bound address that never
+    ///         bonded is never paid. An operator slashed below its floor but not
+    ///         ejected is not `isActive`, so it is paid again once it tops up.
     function payeeStatus(address operator) external view returns (bool payee, bool active) {
-        payee = addressToNodeId[operator] != bytes32(0)
-            && activeBond[operator] + unbondingOf[operator].amount >= _ejectLine(operator);
         active = isActive(operator);
+        payee = addressToNodeId[operator] != bytes32(0) && !ejected[operator]
+            && (active || unbondingOf[operator].amount != 0);
     }
 
     function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory) {
@@ -1618,8 +1614,10 @@ contract CapacityBond is
     ///         record is registered, regardless of bond/unbonding/ejection) plus
     ///         a parallel `active[]` where `active[i] == isActive(page[i].ethAddress)`.
     ///         The two projections diverge on purpose: an operator whose bond sits
-    ///         below its floor is `active[i] == false` but still present in `page` because it remains
-    ///         payable, so the off-chain node→address bindings must survive. Computing
+    ///         below its floor is `active[i] == false` but still present in `page` because it stays
+    ///         registered: it is a `payeeStatus` payee while bond sits in its unbonding queue,
+    ///         and again once it tops up to its floor, so the off-chain node→address
+    ///         bindings must survive. Computing
     ///         `active` here lets callers derive the true active-membership set from a
     ///         single call, with no per-entry `isActive` round-trip (issue #1565).
     function getRegisteredNodes(uint256 offset, uint256 limit)

@@ -18,9 +18,9 @@ pragma solidity 0.8.28;
 interface ICapacityBondActivity {
     function isActive(address operator) external view returns (bool);
 
-    /// @notice Whether the operator may be paid (a bound NodeId plus active and
-    ///         unbonding bond at or above half its entry floor) and its
-    ///         `isActive` status, in one read. `PaymentPool.redeemMany` uses it
+    /// @notice Whether the operator may be paid (a bound NodeId, not ejected,
+    ///         and either `isActive` or holding bond in the unbonding queue) and
+    ///         its `isActive` status, in one read. `PaymentPool.redeemMany` uses it
     ///         to pay only staked operators and to count bytes only for active
     ///         ones.
     function payeeStatus(address operator) external view returns (bool payee, bool active);
