@@ -104,10 +104,12 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// poller then halves its window until the provider accepts it.
 pub const DEFAULT_GET_LOGS_MAX_BLOCK_SPAN: u64 = 10_000;
 
-/// Default accrued-claim redemption threshold: 1 USDC (`1_000_000` `µUSDC`).
-/// At this size the ~$0.10 redeem gas is a few percent of the redeemed
-/// amount while bounding unsettled exposure to ~1 USDC per pool (#327).
-const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
+/// Default accrued-claim redemption threshold: 0.05 USDC (`50_000` `µUSDC`).
+/// One first-time `redeemMany` lane costs ~63.4k gas, about $0.002 on
+/// Arbitrum One at a 0.01 gwei base fee and $3,000 ETH, so 0.05 USDC keeps a
+/// lane's gas near 5% of what it redeems with room for a 10x fee spike, while
+/// a lane that ends below the threshold leaves at most 0.05 USDC unredeemed.
+const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 50_000;
 /// Default redemption chunk size: 300 vouchers per `redeemMany` transaction.
 /// The benchmarks in `contracts/test/PaymentPool.t.sol` pin two marginals for
 /// one added cold-lane voucher: ~34.5k gas when the signer is already
@@ -180,15 +182,14 @@ pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Precise sizing per ADR 003 is governance/ops policy, not a build-time
 /// constant.
 pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
-/// Default per-signer floor cap `k`, in ramp-start credit windows: `8`.
-/// The most live un-vouchered floor reservation plus floor debt any one capability
-/// signer may hold against a pool is `k · one credit window`, underneath the
-/// pool-wide `remaining − M` ceiling (ADR 003 § Pool solvency, per-signer floor
-/// isolation). The window is the
+/// Default per-signer LIVE concurrency cap `k`, in ramp-start credit windows: `8`.
+/// The most live un-vouchered floor reservation any one capability signer may hold
+/// against a pool is `k · one credit window`, underneath the pool-wide `remaining − M`
+/// ceiling (ADR 003 § Pool solvency, per-signer floor isolation). The window is the
 /// unit rationed — honest need is `concurrent un-vouchered streams × one window`
-/// regardless of pool size — so an absolute count fits it directly. It recycles as
-/// each stream pays; a stream that ends unpaid leaves floor debt that only payment
-/// clears.
+/// regardless of pool size — so an absolute count fits it directly. It carries no
+/// permanent memory: it recycles as each stream pays, and never penalizes a signer for
+/// quitting.
 pub const DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS: u64 = 8;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
@@ -1643,7 +1644,7 @@ fn resolve_blockchain_into(
         .and_then(|b| b.pool_min_remaining_deposit_micro_usdc)
         .unwrap_or(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
 
-    // Per-signer floor cap `k`, in credit windows (ADR 003 § Pool
+    // Per-signer LIVE concurrency cap `k`, in credit windows (ADR 003 § Pool
     // solvency, per-signer floor isolation). Any value is legal: the node
     // lower-clamps the cap to one window at use, so `0` behaves as "admit a lone
     // signer's first stream" rather than wedging it — no bound to enforce.

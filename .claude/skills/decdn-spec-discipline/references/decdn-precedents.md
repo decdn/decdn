@@ -51,12 +51,13 @@ Every reason here traces to a real PR/issue/ADR. Quotes are from the commit/PR/A
   addressed is real egress the attacker pays for byte-by-byte — a residual ADR 003 already accepts that
   "grows with neither the pool nor the network," so it is not scale infra either. Net −3,855 lines. Kept:
   the in-memory pool ceiling + per-signer live cap.
-  The trickle turned out not to be slow: at 100 req/s per peer and free NodeIds it is ~100 MiB/s of
-  free download per peer, and on a miss the node fronts upstream USDC (#2767). The fix is **floor
-  debt** on the same in-memory accumulator, and it passes the gates the bucket failed: only payment
-  clears it (time never clears it, so it is not a rate), the pool level sums every signer and is bound
-  to the on-chain deposit (rotation meets it), and it adds no store, no knob, and no wire field. The
-  lesson: a signer-keyed *rate* is unenforceable; a pool-bounded, payment-cleared *debt* is not.
+- **Per-signer floor debt** (#2779, cut by #2831). An abandoned stream's unpaid floor kept as debt on
+  the signer and the pool, cleared only by later payment past a stream's own floor. It failed the same
+  way as the leaky bucket: a cheater rotates to a fresh signer and starts clean, while an honest client
+  that drops stalled lanes fills its cap and is locked out of the node until a restart (#2831, seen on
+  three production nodes in one batch). A node-side upstream fault also forgave it (#2841). The
+  per-stream credit window already bounds what one stream can take. Kept: the in-memory pool ceiling +
+  per-signer live cap.
 - **Client NodeId rotation** (#1437, demoted). "the serving node already learns your on-chain address,
   so rotation does nothing against the two adversaries who matter." Its own Limitation paragraph gutted
   the claim.

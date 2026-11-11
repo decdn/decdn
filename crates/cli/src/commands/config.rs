@@ -969,13 +969,13 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
 # get_logs_max_block_span = 10000    # max blocks per chain-watcher eth_getLogs request; set to your RPC provider's range limit (the poller also shrinks the window when the provider rejects a range; set it to the lowest span the poller reaches while rejections keep coming); default 10000, must be > 0
 # fee_shares_poll_interval_sec = 3600  # authoritative getShares() re-read cadence, safety net beside the SharesUpdated subscription (ADR 041); default 3600s, must be > 0
-# redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
+# redeem_threshold_micro_usdc = 50000            # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 0.05 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
 # buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
-# pool_floor_signer_live_windows = 8              # per-signer floor cap k, in ramp-start credit windows: the most live un-vouchered floor reservation plus floor debt one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as the signer pays; lower-clamped to one window; default 8
+# pool_floor_signer_live_windows = 8              # per-signer LIVE concurrency cap k, in ramp-start credit windows: the most live un-vouchered floor reservation one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as streams pay; lower-clamped to one window; default 8
 # CLI-only [blockchain] keys — consumed by `decdn appeal` / the client, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
