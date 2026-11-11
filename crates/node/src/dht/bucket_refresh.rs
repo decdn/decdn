@@ -42,8 +42,8 @@ use crate::dht::staker_set::StakerSet;
 /// non-empty bucket per tick so each populated bucket gets the
 /// ADR-mandated hourly refresh. At realistic scale (≤30 populated
 /// buckets even in a 500-node network) this is ≤30 `FindNode` RPCs
-/// per hour, comfortably within the routing-table peers' own per-IP
-/// rate limit (100 req/s by default).
+/// per hour, comfortably within the routing-table peers' own per-peer
+/// rate limit (20 req/s by default).
 pub const BUCKET_REFRESH_TICK: Duration = Duration::from_hours(1);
 
 /// Long-running task: every [`BUCKET_REFRESH_TICK`] runs a

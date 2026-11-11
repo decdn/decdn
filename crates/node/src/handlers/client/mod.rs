@@ -56,7 +56,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
-use crate::dispatch::{ConnectionLimiter, RejectReason};
+use crate::dispatch::ConnectionLimiter;
 use crate::metrics::Metrics;
 use crate::node_origin::NodeOrigin;
 use crate::receipt_log::{RawReceipt, ReceiptSink};
@@ -97,7 +97,6 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// wait (see [`proof_wait`]). Traffic on sibling streams of the same
 /// connection counts as progress, so it can hold a wait up to that ceiling.
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 /// After a clean `StreamEnd`, how long the serve waits for the client's FIN while
 /// draining its send half (see [`drain_recv_to_fin`]). A conforming client
 /// finishes its send right after its last voucher, so the FIN lands within a round
@@ -991,7 +990,7 @@ pub struct ClientHandlerDeps {
     pub node_id: PublicKey,
     /// Shared metrics registry the serve path records into.
     pub metrics: Arc<Metrics>,
-    /// Per-source connection-rate gate, applied before any work is done.
+    /// Connection concurrency gate, applied before any work is done.
     pub limiter: Arc<ConnectionLimiter>,
     /// Overload-protection gate: sheds new serves under resource pressure.
     pub shed: Arc<crate::load_shed::LoadShedController>,
@@ -3093,9 +3092,6 @@ pub(super) async fn handler_over_store(
         Arc::new(ConnectionLimiter::new(
             &decdn_common::config::ResolvedSecurity {
                 max_concurrent_handlers: u32::MAX,
-                per_source_rate_per_sec: 1e9,
-                per_source_burst: u32::MAX,
-                max_tracked_sources: 16,
             },
             Arc::clone(metrics),
         )),

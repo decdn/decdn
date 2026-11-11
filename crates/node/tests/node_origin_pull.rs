@@ -15968,11 +15968,8 @@ async fn spawn_dht_record_server(
         &DhtRateLimitConfig {
             per_peer_rate_per_sec: 1e6,
             per_peer_burst: u32::MAX,
-            per_ip_rate_per_sec: 1e6,
-            per_ip_burst: u32::MAX,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         },
         Arc::clone(&metrics),

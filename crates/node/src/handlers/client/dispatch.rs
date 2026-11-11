@@ -5,9 +5,9 @@ use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
     FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, MissPath,
-    MissRefusal, OwnedSemaphorePermit, PublicKey, REJECTION_CLOSE_TIMEOUT, RecvStream,
-    RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest,
-    StreamResponseBody, U256, VarInt, read_first_message, reset_stream, verify_binding,
+    MissRefusal, OwnedSemaphorePermit, PublicKey, RecvStream, Semaphore, SendStream,
+    ServeRejectReason, StreamReadError, StreamRequest, StreamResponseBody, U256, VarInt,
+    read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
@@ -118,9 +118,6 @@ impl ClientHandler {
                     VarInt::from_u32(APP_ERR_RATE_LIMITED),
                     reason.as_str().as_bytes(),
                 );
-                if reason != RejectReason::GlobalFull {
-                    let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
-                }
                 return Ok(());
             }
         };
@@ -337,19 +334,11 @@ impl ClientHandler {
         // signed response. Most refusals after the request is read sign a
         // response, and an origin-only node probes its backend for an unseen
         // hash before any payment check, so an unpaid flood must stop here.
-        let peer_ip = crate::rate_limit::peer_ip(&conn);
         if let Some(limiter) = &self.request_limiter
-            && let Err(layer) = limiter.check(
-                &crate::dht::routing::NodeId::from_bytes(*peer.as_bytes()),
-                peer_ip,
-            )
+            && let Err(layer) =
+                limiter.check(&crate::dht::routing::NodeId::from_bytes(*peer.as_bytes()))
         {
-            tracing::debug!(
-                layer = layer.as_str(),
-                %peer,
-                ?peer_ip,
-                "client request rate-limited"
-            );
+            tracing::debug!(layer = layer.as_str(), %peer, "client request rate-limited");
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(ServeEnd::Reset(ResetCause::RateLimited(layer)));
         }
@@ -932,7 +921,7 @@ impl ClientHandler {
                 // The shed gate runs before the lane-authority refusal below,
                 // so an unbound / unknown-lane request can transiently hold a
                 // `ShedSlot` until that refusal returns it. This is bounded by
-                // the `ConnectionLimiter` global + per-source caps and is
+                // the `ConnectionLimiter` global cap and is
                 // self-limiting: once the node is pressured, further such
                 // requests shed right here without acquiring a slot at all.
                 // Keeping the gate here — ahead of lane authority and any

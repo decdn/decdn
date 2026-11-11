@@ -193,16 +193,6 @@ pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
 pub const DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS: u64 = 8;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
-/// Default per-source rate-limit refill (cells/second). A single source
-/// may legitimately host a fleet of clients; the value is generous
-/// enough to absorb that without rejecting well-behaved peers.
-const DEFAULT_PER_SOURCE_RATE_PER_SEC: f64 = 100.0;
-/// Default per-source burst — 2× the steady-state rate gives well-behaved
-/// peers headroom for jitter/clumping that would otherwise produce
-/// spurious rejections at burst == rate.
-const DEFAULT_PER_SOURCE_BURST: u32 = 200;
-/// Default hard cap on tracked source entries in the keyed limiter.
-const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
 /// Egress ceiling off unless the operator sets one.
 const DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS: u64 = 0;
 /// Load-shed concurrency high-water mark (start shedding misses at/above).
@@ -217,17 +207,10 @@ const DEFAULT_LOAD_SHED_PER_CLIENT_CAP: u32 = 32;
 const DEFAULT_DHT_PER_PEER_RATE_PER_SEC: f64 = 20.0;
 /// Default per-peer burst capacity for `cdn/dht/v1`. ADR 022 default: 40.
 const DEFAULT_DHT_PER_PEER_BURST: u32 = 40;
-/// Default sustained per-IP rate for `cdn/dht/v1`. ADR 022 default: 100.
-const DEFAULT_DHT_PER_IP_RATE_PER_SEC: f64 = 100.0;
-/// Default per-IP burst capacity for `cdn/dht/v1`. ADR 022 default: 200.
-const DEFAULT_DHT_PER_IP_BURST: u32 = 200;
 /// Default sustained global rate for `cdn/dht/v1`. ADR 022 default: 1000.
 const DEFAULT_DHT_GLOBAL_RATE_PER_SEC: f64 = 1000.0;
 /// Default global burst capacity for `cdn/dht/v1`. ADR 022 default: 2000.
 const DEFAULT_DHT_GLOBAL_BURST: u32 = 2000;
-/// Default hard cap on tracked per-IP entries in the DHT keyed limiter
-/// (#645). Mirrors `DEFAULT_MAX_TRACKED_SOURCES` for the dispatch layer.
-const DEFAULT_DHT_MAX_TRACKED_PER_IP: usize = 4096;
 /// Default hard cap on tracked per-peer (`NodeId`) entries in the DHT
 /// keyed limiter (#645).
 const DEFAULT_DHT_MAX_TRACKED_PER_PEER: usize = 4096;
@@ -237,17 +220,10 @@ const DEFAULT_DHT_MAX_TRACKED_PER_PEER: usize = 4096;
 const DEFAULT_PROBE_PER_PEER_RATE_PER_SEC: f64 = 5.0;
 /// Default per-peer burst capacity for `cdn/probe/v1`. ADR 005 default: 5.
 const DEFAULT_PROBE_PER_PEER_BURST: u32 = 5;
-/// Default sustained per-IP rate for `cdn/probe/v1`. ADR 005 default: 50.
-const DEFAULT_PROBE_PER_IP_RATE_PER_SEC: f64 = 50.0;
-/// Default per-IP burst capacity for `cdn/probe/v1`. ADR 005 default: 200.
-const DEFAULT_PROBE_PER_IP_BURST: u32 = 200;
 /// Default sustained global rate for `cdn/probe/v1`. ADR 005 default: 1000.
 const DEFAULT_PROBE_GLOBAL_RATE_PER_SEC: f64 = 1000.0;
 /// Default global burst capacity for `cdn/probe/v1`. ADR 005 default: 2000.
 const DEFAULT_PROBE_GLOBAL_BURST: u32 = 2000;
-/// Default hard cap on tracked per-IP entries in the probe keyed limiter
-/// (#645). Mirrors `DEFAULT_DHT_MAX_TRACKED_PER_IP`.
-const DEFAULT_PROBE_MAX_TRACKED_PER_IP: usize = 4096;
 /// Default hard cap on tracked per-peer (`NodeId`) entries in the probe
 /// keyed limiter (#645).
 const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
@@ -257,16 +233,10 @@ const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
 const DEFAULT_SERVE_PER_PEER_RATE_PER_SEC: f64 = 100.0;
 /// Default per-peer burst capacity for `cdn/client/v1`. ADR 005 default: 400.
 const DEFAULT_SERVE_PER_PEER_BURST: u32 = 400;
-/// Default sustained per-IP rate for `cdn/client/v1`. ADR 005 default: 200.
-const DEFAULT_SERVE_PER_IP_RATE_PER_SEC: f64 = 200.0;
-/// Default per-IP burst capacity for `cdn/client/v1`. ADR 005 default: 800.
-const DEFAULT_SERVE_PER_IP_BURST: u32 = 800;
 /// Default sustained global rate for `cdn/client/v1`. ADR 005 default: 2000.
 const DEFAULT_SERVE_GLOBAL_RATE_PER_SEC: f64 = 2000.0;
 /// Default global burst capacity for `cdn/client/v1`. ADR 005 default: 5000.
 const DEFAULT_SERVE_GLOBAL_BURST: u32 = 5000;
-/// Default hard cap on tracked per-IP entries in the serve keyed limiter.
-const DEFAULT_SERVE_MAX_TRACKED_PER_IP: usize = 4096;
 /// Default hard cap on tracked per-peer (`NodeId`) entries in the serve keyed
 /// limiter.
 const DEFAULT_SERVE_MAX_TRACKED_PER_PEER: usize = 4096;
@@ -3085,22 +3055,10 @@ fn resolve_receipts_into(
     }
 }
 
-/// Resolve security / rate-limiting fields.
+/// Resolve the connection concurrency cap.
 ///
-/// Each numeric field accepts `0` as the "disable this layer" sentinel:
-/// `max_concurrent_handlers = 0` skips the global semaphore acquire,
-/// `per_*_rate_per_sec = 0.0` skips the corresponding token bucket, and
-/// `max_tracked_sources = 0` makes the bookkeeping map unbounded (operator
-/// opt-in — an attacker churning identities can grow the map without
-/// bound). The `per_*_burst > 0` rule is paired with the matching rate:
-/// `burst` is irrelevant when `rate == 0` (the layer's `try_consume` short-
-/// circuits before the bucket is touched), but a `rate > 0` with `burst == 0`
-/// is a deny-all corner case operators don't actually want — reject it
-/// outright so a typo turns into a config error rather than a black-hole node.
-// Each field is a linear "default-or-file → validate → log-if-disabled"
-// triple; splitting them out would scatter the field-pair invariants
-// (rate/burst coupling) across helpers that have to take both arguments
-// anyway. Keep it linear.
+/// `max_concurrent_handlers = 0` is the "disable this layer" sentinel: it
+/// skips the global semaphore acquire.
 #[cfg(test)]
 pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<ResolvedSecurity> {
     one_section(|bag| resolve_security_into(file, bag))
@@ -3109,7 +3067,6 @@ pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<
 /// Bag-threading variant of the test-only `resolve_security` shim. Shares a bag with other
 /// sections during startup ([`resolve_config`]) and SIGHUP reload
 /// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
-#[allow(clippy::cognitive_complexity)]
 pub fn resolve_security_into(
     file: Option<&types::SecurityConfig>,
     bag: &mut ConfigDiagnostics,
@@ -3133,55 +3090,15 @@ pub fn resolve_security_into(
         ),
     );
 
-    let per_source_rate_per_sec = file
-        .and_then(|s| s.per_source_rate_per_sec)
-        .unwrap_or(DEFAULT_PER_SOURCE_RATE_PER_SEC);
-    bag.check(
-        per_source_rate_per_sec.is_finite() && per_source_rate_per_sec >= 0.0,
-        "security.per_source_rate_per_sec",
-        "security.per_source_rate_per_sec must be a finite non-negative number \
-         (0 disables the per-source layer)",
-    );
-
-    let per_source_burst = file
-        .and_then(|s| s.per_source_burst)
-        .unwrap_or(DEFAULT_PER_SOURCE_BURST);
-    bag.check(
-        per_source_rate_per_sec == 0.0 || per_source_burst > 0,
-        "security.per_source_burst",
-        "security.per_source_burst must be > 0 when per_source_rate_per_sec > 0 \
-         (set both to 0 to disable the per-source layer)",
-    );
-
-    let max_tracked_sources = file
-        .and_then(|s| s.max_tracked_sources)
-        .unwrap_or(DEFAULT_MAX_TRACKED_SOURCES);
-
     if max_concurrent_handlers == 0 {
         bag.note(
             "security.max_concurrent_handlers",
             "0: global concurrency cap disabled",
         );
     }
-    if per_source_rate_per_sec == 0.0 {
-        bag.note(
-            "security.per_source_rate_per_sec",
-            "0: per-source rate-limit disabled",
-        );
-    }
-    if max_tracked_sources == 0 {
-        bag.warn(
-            "security.max_tracked_sources",
-            "0: rate-limit bookkeeping map is unbounded; an attacker churning sources can \
-             grow it without limit",
-        );
-    }
 
     ResolvedSecurity {
         max_concurrent_handlers,
-        per_source_rate_per_sec,
-        per_source_burst,
-        max_tracked_sources,
     }
 }
 
@@ -3237,8 +3154,8 @@ pub fn resolve_load_shed_into(
 ///
 /// Each `*_rate_per_sec == 0.0` paired with `*_burst == 0` disables that
 /// layer (operator opt-out). Mixing `rate > 0` with `burst == 0` is
-/// rejected as a deny-all corner case — the resolver treats it the same
-/// way [`resolve_security_into`] handles the `per_source` pairing.
+/// rejected as a deny-all corner case, so a typo turns into a config error
+/// rather than a black-hole node.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
 pub fn resolve_dht_into(
     file: Option<&types::DhtConfig>,
@@ -3266,23 +3183,6 @@ pub fn resolve_dht_into(
         "dht.rate_limit.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let per_ip_rate_per_sec = rate_limit
-        .and_then(|r| r.per_ip_rate_per_sec)
-        .unwrap_or(DEFAULT_DHT_PER_IP_RATE_PER_SEC);
-    bag.check(
-        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
-        "dht.rate_limit.per_ip_rate_per_sec",
-        "dht.rate_limit.per_ip_rate_per_sec must be a finite non-negative number (0 disables the layer)",
-    );
-    let per_ip_burst = rate_limit
-        .and_then(|r| r.per_ip_burst)
-        .unwrap_or(DEFAULT_DHT_PER_IP_BURST);
-    bag.check(
-        per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
-        "dht.rate_limit.per_ip_burst",
-        "dht.rate_limit.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 (set both to 0 to disable)",
-    );
-
     let global_rate_per_sec = rate_limit
         .and_then(|r| r.global_rate_per_sec)
         .unwrap_or(DEFAULT_DHT_GLOBAL_RATE_PER_SEC);
@@ -3300,19 +3200,9 @@ pub fn resolve_dht_into(
         "dht.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let max_tracked_per_ip = rate_limit
-        .and_then(|r| r.max_tracked_per_ip)
-        .unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_IP);
     let max_tracked_per_peer = rate_limit
         .and_then(|r| r.max_tracked_per_peer)
         .unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_PEER);
-    if max_tracked_per_ip == 0 {
-        bag.warn(
-            "dht.rate_limit.max_tracked_per_ip",
-            "0: per-IP bookkeeping map is unbounded; an attacker churning source IPs can \
-             grow it without limit",
-        );
-    }
     if max_tracked_per_peer == 0 {
         bag.warn(
             "dht.rate_limit.max_tracked_per_peer",
@@ -3324,11 +3214,8 @@ pub fn resolve_dht_into(
     ResolvedDht {
         per_peer_rate_per_sec,
         per_peer_burst,
-        per_ip_rate_per_sec,
-        per_ip_burst,
         global_rate_per_sec,
         global_burst,
-        max_tracked_per_ip,
         max_tracked_per_peer,
     }
 }
@@ -3370,23 +3257,6 @@ pub fn resolve_probe_into(
         "probe.rate_limit.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let per_ip_rate_per_sec = rate_limit
-        .and_then(|r| r.per_ip_rate_per_sec)
-        .unwrap_or(DEFAULT_PROBE_PER_IP_RATE_PER_SEC);
-    bag.check(
-        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
-        "probe.rate_limit.per_ip_rate_per_sec",
-        "probe.rate_limit.per_ip_rate_per_sec must be a finite non-negative number (0 disables the layer)",
-    );
-    let per_ip_burst = rate_limit
-        .and_then(|r| r.per_ip_burst)
-        .unwrap_or(DEFAULT_PROBE_PER_IP_BURST);
-    bag.check(
-        per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
-        "probe.rate_limit.per_ip_burst",
-        "probe.rate_limit.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 (set both to 0 to disable)",
-    );
-
     let global_rate_per_sec = rate_limit
         .and_then(|r| r.global_rate_per_sec)
         .unwrap_or(DEFAULT_PROBE_GLOBAL_RATE_PER_SEC);
@@ -3404,19 +3274,9 @@ pub fn resolve_probe_into(
         "probe.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let max_tracked_per_ip = rate_limit
-        .and_then(|r| r.max_tracked_per_ip)
-        .unwrap_or(DEFAULT_PROBE_MAX_TRACKED_PER_IP);
     let max_tracked_per_peer = rate_limit
         .and_then(|r| r.max_tracked_per_peer)
         .unwrap_or(DEFAULT_PROBE_MAX_TRACKED_PER_PEER);
-    if max_tracked_per_ip == 0 {
-        bag.warn(
-            "probe.rate_limit.max_tracked_per_ip",
-            "0: per-IP bookkeeping map is unbounded; an attacker churning source IPs can \
-             grow it without limit",
-        );
-    }
     if max_tracked_per_peer == 0 {
         bag.warn(
             "probe.rate_limit.max_tracked_per_peer",
@@ -3428,11 +3288,8 @@ pub fn resolve_probe_into(
     ResolvedProbe {
         per_peer_rate_per_sec,
         per_peer_burst,
-        per_ip_rate_per_sec,
-        per_ip_burst,
         global_rate_per_sec,
         global_burst,
-        max_tracked_per_ip,
         max_tracked_per_peer,
     }
 }
@@ -3473,23 +3330,6 @@ pub fn resolve_serve_into(
         "serve.rate_limit.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let per_ip_rate_per_sec = rate_limit
-        .and_then(|r| r.per_ip_rate_per_sec)
-        .unwrap_or(DEFAULT_SERVE_PER_IP_RATE_PER_SEC);
-    bag.check(
-        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
-        "serve.rate_limit.per_ip_rate_per_sec",
-        "serve.rate_limit.per_ip_rate_per_sec must be a finite non-negative number (0 disables the layer)",
-    );
-    let per_ip_burst = rate_limit
-        .and_then(|r| r.per_ip_burst)
-        .unwrap_or(DEFAULT_SERVE_PER_IP_BURST);
-    bag.check(
-        per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
-        "serve.rate_limit.per_ip_burst",
-        "serve.rate_limit.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 (set both to 0 to disable)",
-    );
-
     let global_rate_per_sec = rate_limit
         .and_then(|r| r.global_rate_per_sec)
         .unwrap_or(DEFAULT_SERVE_GLOBAL_RATE_PER_SEC);
@@ -3507,19 +3347,9 @@ pub fn resolve_serve_into(
         "serve.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let max_tracked_per_ip = rate_limit
-        .and_then(|r| r.max_tracked_per_ip)
-        .unwrap_or(DEFAULT_SERVE_MAX_TRACKED_PER_IP);
     let max_tracked_per_peer = rate_limit
         .and_then(|r| r.max_tracked_per_peer)
         .unwrap_or(DEFAULT_SERVE_MAX_TRACKED_PER_PEER);
-    if max_tracked_per_ip == 0 {
-        bag.warn(
-            "serve.rate_limit.max_tracked_per_ip",
-            "0: per-IP bookkeeping map is unbounded; an attacker churning source IPs can \
-             grow it without limit",
-        );
-    }
     if max_tracked_per_peer == 0 {
         bag.warn(
             "serve.rate_limit.max_tracked_per_peer",
@@ -3531,11 +3361,8 @@ pub fn resolve_serve_into(
     ResolvedServe {
         per_peer_rate_per_sec,
         per_peer_burst,
-        per_ip_rate_per_sec,
-        per_ip_burst,
         global_rate_per_sec,
         global_burst,
-        max_tracked_per_ip,
         max_tracked_per_peer,
     }
 }

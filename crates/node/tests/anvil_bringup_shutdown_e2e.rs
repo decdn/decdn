@@ -448,9 +448,6 @@ fn build_config(
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,
-            per_source_rate_per_sec: 100.0,
-            per_source_burst: 200,
-            max_tracked_sources: 4096,
         },
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         content: decdn_common::config::ResolvedContent::default(),

@@ -363,7 +363,7 @@ insta = "1"
 # standing up MinIO.
 aws-smithy-mocks = "0.3"
 
-# Rate limiting (per-source connection rate limits in `node`)
+# Rate limiting (per-peer and global request rate limits in `node`)
 governor = "0.10"
 
 # Atomic Arc swap (used by `node` to swap the dispatch semaphore on reload)

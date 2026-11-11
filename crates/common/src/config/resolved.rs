@@ -595,19 +595,13 @@ pub struct ResolvedDht {
     /// Bucket capacity for the per-peer limiter: how many requests one
     /// peer may send back to back before the refill rate binds. `0` alongside
     /// a `0.0` rate disables the layer; `0` against a nonzero rate is rejected
-    /// as a deny-all. The same pairing rule holds for the two below.
+    /// as a deny-all. The same pairing rule holds for the global layer.
     pub per_peer_burst: u32,
-    /// Token refill rate for the per-source-IP limiter, in requests/second.
-    pub per_ip_rate_per_sec: f64,
-    /// Bucket capacity for the per-IP limiter.
-    pub per_ip_burst: u32,
     /// Token refill rate for the handler-wide limiter, in requests/second. Applies
-    /// across all peers and all source IPs together.
+    /// across all peers together.
     pub global_rate_per_sec: f64,
     /// Bucket capacity for the handler-wide limiter.
     pub global_burst: u32,
-    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
-    pub max_tracked_per_ip: usize,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
     /// => unbounded.
     pub max_tracked_per_peer: usize,
@@ -618,11 +612,8 @@ impl Default for ResolvedDht {
         Self {
             per_peer_rate_per_sec: 20.0,
             per_peer_burst: 40,
-            per_ip_rate_per_sec: 100.0,
-            per_ip_burst: 200,
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
-            max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }
     }
@@ -642,19 +633,13 @@ pub struct ResolvedProbe {
     /// Bucket capacity for the per-peer limiter: how many probes one
     /// peer may send back to back before the refill rate binds. `0` alongside
     /// a `0.0` rate disables the layer; `0` against a nonzero rate is rejected
-    /// as a deny-all. The same pairing rule holds for the two below.
+    /// as a deny-all. The same pairing rule holds for the global layer.
     pub per_peer_burst: u32,
-    /// Token refill rate for the per-source-IP limiter, in probes/second.
-    pub per_ip_rate_per_sec: f64,
-    /// Bucket capacity for the per-IP limiter.
-    pub per_ip_burst: u32,
     /// Token refill rate for the handler-wide limiter, in probes/second. Applies
-    /// across all peers and all source IPs together.
+    /// across all peers together.
     pub global_rate_per_sec: f64,
     /// Bucket capacity for the handler-wide limiter.
     pub global_burst: u32,
-    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
-    pub max_tracked_per_ip: usize,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
     /// => unbounded.
     pub max_tracked_per_peer: usize,
@@ -665,11 +650,8 @@ impl Default for ResolvedProbe {
         Self {
             per_peer_rate_per_sec: 5.0,
             per_peer_burst: 5,
-            per_ip_rate_per_sec: 50.0,
-            per_ip_burst: 200,
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
-            max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }
     }
@@ -690,19 +672,13 @@ pub struct ResolvedServe {
     /// Bucket capacity for the per-peer limiter: how many requests one peer
     /// may open back to back before the refill rate binds. `0` alongside a
     /// `0.0` rate disables the layer; `0` against a nonzero rate is rejected
-    /// as a deny-all. The same pairing rule holds for the two below.
+    /// as a deny-all. The same pairing rule holds for the global layer.
     pub per_peer_burst: u32,
-    /// Token refill rate for the per-source-IP limiter, in requests/second.
-    pub per_ip_rate_per_sec: f64,
-    /// Bucket capacity for the per-IP limiter.
-    pub per_ip_burst: u32,
     /// Token refill rate for the handler-wide limiter, in requests/second.
-    /// Applies across all peers and all source IPs together.
+    /// Applies across all peers together.
     pub global_rate_per_sec: f64,
     /// Bucket capacity for the handler-wide limiter.
     pub global_burst: u32,
-    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
-    pub max_tracked_per_ip: usize,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
     /// => unbounded.
     pub max_tracked_per_peer: usize,
@@ -713,29 +689,18 @@ impl Default for ResolvedServe {
         Self {
             per_peer_rate_per_sec: 100.0,
             per_peer_burst: 400,
-            per_ip_rate_per_sec: 200.0,
-            per_ip_burst: 800,
             global_rate_per_sec: 2000.0,
             global_burst: 5000,
-            max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }
     }
 }
 
-/// Resolved security / rate-limiting fields.
+/// Resolved connection-concurrency field.
 #[derive(Debug, Clone)]
 pub struct ResolvedSecurity {
     /// Global cap on concurrent in-flight QUIC handler tasks.
     pub max_concurrent_handlers: u32,
-    /// Per-source rate-limit refill (cells/second). `0.0` disables the
-    /// layer.
-    pub per_source_rate_per_sec: f64,
-    /// Per-source rate-limit burst capacity. Ignored when
-    /// `per_source_rate_per_sec == 0.0`.
-    pub per_source_burst: u32,
-    /// Hard cap on the number of tracked sources in the keyed limiter.
-    pub max_tracked_sources: usize,
 }
 
 /// Which load-shed policy the node runs.

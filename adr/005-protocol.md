@@ -57,7 +57,7 @@ When a node responds `has_blob: true` to a `ProbeRequest`, it SHOULD keep the bl
 
 #### Hold budget
 
-The total number of concurrently held blobs is bounded by `max_probe_holds` (default: 256, operator-configurable). Holds are per-blob, not per-probe — multiple peers probing the same blob share one hold slot, so effective throughput exceeds `max_probe_holds / probe_hold_duration` for popular content. When all hold slots are occupied, a probe for a held blob still receives `has_blob: true` but the blob gets no eviction hold, so it may be LRU-evicted before the pull. This bounds the number of eviction-exempt blobs to at most `max_probe_holds` (setting `max_probe_holds = 0` disables holds entirely and opts the node out of advertising *store-backed* content — probes answer `has_blob: false` for it. Content servable from a configured origin takes no eviction hold and is therefore unaffected by this setting: such a node still advertises origin-servable hashes). Operators running small caches should set `max_probe_holds` proportional to cache size (recommended: no more than 25% of cache capacity); production nodes serving many peers should increase the default proportionally. The existing inbound probe rate limit (5 probes/peer/second — see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) bounds the rate at which any single peer can consume hold slots. Coordinated probe floods across many peers (Sybil attack) are bounded by the per-IP and global layers in [§ Probe rate limiting](#probe-rate-limiting) below — admission to the hold path occurs only after all three rate-limit layers pass. A Sybil flood over the relay meets only the global layer. Hold-budget exhaustion at the admitted rate is an availability degradation: the node still wins selection on the unheld probes but loses the delivery whenever the blob is evicted before the pull arrives.
+The total number of concurrently held blobs is bounded by `max_probe_holds` (default: 256, operator-configurable). Holds are per-blob, not per-probe — multiple peers probing the same blob share one hold slot, so effective throughput exceeds `max_probe_holds / probe_hold_duration` for popular content. When all hold slots are occupied, a probe for a held blob still receives `has_blob: true` but the blob gets no eviction hold, so it may be LRU-evicted before the pull. This bounds the number of eviction-exempt blobs to at most `max_probe_holds` (setting `max_probe_holds = 0` disables holds entirely and opts the node out of advertising *store-backed* content — probes answer `has_blob: false` for it. Content servable from a configured origin takes no eviction hold and is therefore unaffected by this setting: such a node still advertises origin-servable hashes). Operators running small caches should set `max_probe_holds` proportional to cache size (recommended: no more than 25% of cache capacity); production nodes serving many peers should increase the default proportionally. The existing inbound probe rate limit (5 probes/peer/second — see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) bounds the rate at which any single peer can consume hold slots. Coordinated probe floods across many peers (Sybil attack) are bounded by the global layer in [§ Probe rate limiting](#probe-rate-limiting) below — admission to the hold path occurs only after both rate-limit layers pass. Hold-budget exhaustion at the admitted rate is an availability degradation: the node still wins selection on the unheld probes but loses the delivery whenever the blob is evicted before the pull arrives.
 
 #### Rate bounds
 
@@ -73,17 +73,16 @@ A node with a cache miss issues a `cdn/dht/v1` FIND_VALUE lookup for the target 
 
 #### Probe rate limiting
 
-`cdn/probe/v1` inbound requests are subject to three layered token-bucket rate limits applied **before** any signature is computed and **before** any [Probe-Triggered Eviction Hold](#probe-triggered-eviction-hold) slot is allocated. A probe must pass all three layers to be admitted; failing any layer closes the stream with QUIC application error code `0x10` (`RATE_LIMITED`) per [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes).
+`cdn/probe/v1` inbound requests are subject to two layered token-bucket rate limits applied **before** any signature is computed and **before** any [Probe-Triggered Eviction Hold](#probe-triggered-eviction-hold) slot is allocated. A probe must pass both layers to be admitted; failing either layer closes the stream with QUIC application error code `0x10` (`RATE_LIMITED`) per [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes).
 
 | Layer | Default refill | Default burst | Hard bounds | Scope |
 |---|---:|---:|---|---|
 | Per-peer (NodeId) | 5 probes/sec | 5 | (existing — [ADR 001, Content Discovery](001-network.md#content-discovery-dht--probe)) | The source iroh `NodeId` on the QUIC connection. |
-| Per-IP | 50 probes/sec | 200 | refill `[10, 1000]`; burst `[refill, 5×refill]` | The direct-path QUIC source IP, masked to its /64 prefix for IPv6. A relay-only connection has no direct-path IP, so this layer does not charge it. |
 | Global node | 1000 probes/sec | 2000 | refill `[100, 100000]`; burst `[refill, 10×refill]` | Single global bucket across all probes inbound to this node. |
 
-Checks fire narrowest-first (per-peer → per-IP → global). A layer charges its token only after every narrower layer admits the probe. A probe that its own peer or IP bucket refuses therefore spends no token of the global budget, so one `NodeId` that floods past its cap cannot starve the other requesters. Each admitted probe consumes one token from each bucket that applies to it. A relay-only probe skips the per-IP bucket.
+Checks fire narrowest-first (per-peer → global). The global layer charges its token only after the per-peer layer admits the probe. A probe that its own peer bucket refuses therefore spends no token of the global budget, so one `NodeId` that floods past its cap cannot starve the other requesters. Each admitted probe consumes one token from each bucket.
 
-**Why three layers, not one.** Per-peer alone is bypassable: clients are unstaked and can rotate `NodeId` for free per [ADR 003 § Probe fishing](003-payments.md#probe-fishing). The per-IP layer raises the cost of bulk probing — IP rotation requires money (proxies, IPv6 prefix delegation, cloud bills) and disadvantages bulk-probers without disadvantaging staked node-to-node traffic, which uses stable IPs. This cost argument applies only to direct-path connections. The relay does not show the client address to the node. A relay-only connection therefore passes this layer unchecked. The per-peer layer still bounds a relay peer that keeps its `NodeId`. A relay peer that rotates its `NodeId` meets only the global cap. The global cap is defence in depth against distributed attacks across many IPs that would otherwise exhaust the node's per-probe signing capacity.
+**Why these two layers.** The per-peer layer bounds a peer that keeps its `NodeId`. Clients are unstaked and can rotate `NodeId` for free per [ADR 003 § Probe fishing](003-payments.md#probe-fishing), so a peer that rotates its `NodeId` meets only the global cap. The global cap bounds the node's per-probe signing capacity against all requesters together. The node keys no layer on the source IP. The relay does not show the client address to the node, so an attacker that dials through a relay skips such a layer at no cost. Honest peers behind one NAT share one address, so such a layer refuses them together ([#2505](https://github.com/decdn/decdn/issues/2505)).
 
 **Interaction with the hold budget.** Because the rate limiter fires before the hold-allocation path, a rate-limited probe never consumes a hold slot. The hold-budget exhaustion concern in [§ Hold budget](#hold-budget) is therefore bounded by the **admitted** probe rate, not the offered load — a probe flood exceeding the rate limits cannot exhaust the hold budget.
 
@@ -91,7 +90,7 @@ Checks fire narrowest-first (per-peer → per-IP → global). A layer charges it
 
 | Metric | Type | Description |
 |---|---|---|
-| `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total` | three counters, unlabeled | Probes rejected by the rate limiter, one sibling counter per layer that rejected first. Sibling counters rather than a `layer` label, per the sibling-counter convention — see [appendix-observability.md § Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels). No single labelled `decdn_probe_rate_limit_rejections_total` counter exists; the three sibling counters above are the only export. |
+| `decdn_probe_rate_limit_rejected_{per_peer,global}_total` | two counters, unlabeled | Probes rejected by the rate limiter, one sibling counter per layer that rejected first. Sibling counters rather than a `layer` label, per the sibling-counter convention — see [appendix-observability.md § Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels). No single labelled `decdn_probe_rate_limit_rejections_total` counter exists; the two sibling counters above are the only export. |
 
 ### `cdn/client/v1` — paid delivery protocol
 
@@ -235,12 +234,11 @@ On `cdn/client/v1` the node also holds a per-connection stream semaphore of 100 
 
 #### Request rate limiting
 
-The node limits inbound `cdn/client/v1` requests with three layered token buckets. The layers and their narrowest-first order are the same as in [§ Probe rate limiting](#probe-rate-limiting). The node checks them once per stream, after the stream permit and **before** it reads the request. A stream that fails any layer is reset with `RATE_LIMITED` (`0x10`, [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)), and the node signs no response for it.
+The node limits inbound `cdn/client/v1` requests with two layered token buckets. The layers and their narrowest-first order are the same as in [§ Probe rate limiting](#probe-rate-limiting). The node checks them once per stream, after the stream permit and **before** it reads the request. A stream that fails either layer is reset with `RATE_LIMITED` (`0x10`, [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)), and the node signs no response for it.
 
 | Layer | Default refill | Default burst | Scope |
 |---|---:|---:|---|
 | Per-peer (NodeId) | 100 requests/sec | 400 | The source iroh `NodeId` on the QUIC connection. |
-| Per-IP | 200 requests/sec | 800 | The direct-path QUIC source IP, masked to its /64 prefix for IPv6. A relay-only connection has no direct-path IP, so this layer does not charge it. |
 | Global node | 2000 requests/sec | 5000 | Single global bucket across all inbound `cdn/client/v1` requests to this node. |
 
 Operators set the layers under `[serve.rate_limit]`. A rate of `0` turns a layer off.
@@ -249,9 +247,9 @@ Operators set the layers under `[serve.rate_limit]`. A rate of `0` turns a layer
 
 **Why these defaults.** One request is one stream, and an honest client opens one stream per pull leg, with up to 100 at once on one connection ([§ Concurrent stream limits](#concurrent-stream-limits)). A node pulling on a cache miss shares one `NodeId` across all its pulls. The caps therefore sit well above the probe caps. `decdn-client` reads a `RATE_LIMITED` reset as back-off, not as a fault.
 
-**Why NodeId, IP and global, not signer.** The layers key on the connection, not on the voucher signer. A signer key is free to rotate, and a node keeps no per-signer rate memory ([ADR 003](003-payments.md#adr-003-payment-model)). The per-IP layer has the relay-only gap that [§ Probe rate limiting](#probe-rate-limiting) describes ([#2505](https://github.com/decdn/decdn/issues/2505)).
+**Why NodeId and global, not signer or IP.** The layers key on the connection, not on the voucher signer. A signer key is free to rotate, and a node keeps no per-signer rate memory ([ADR 003](003-payments.md#adr-003-payment-model)). The node keys no layer on the source IP, for the reason that [§ Probe rate limiting](#probe-rate-limiting) gives ([#2505](https://github.com/decdn/decdn/issues/2505)).
 
-**Metrics.** `decdn_serve_rate_limit_rejected_{per_peer,per_ip,global}_total`, three sibling counters, unlabeled. Each refused stream counts on the counter of the layer that refused it first.
+**Metrics.** `decdn_serve_rate_limit_rejected_{per_peer,global}_total`, two sibling counters, unlabeled. Each refused stream counts on the counter of the layer that refused it first.
 
 #### Payment lanes and concurrent streams
 

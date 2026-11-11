@@ -177,9 +177,6 @@ impl ServeEnd {
                 ResetCause::RateLimited(RejectLayer::PerPeer) => {
                     metrics.serve_rate_limit_rejected_per_peer();
                 }
-                ResetCause::RateLimited(RejectLayer::PerIp) => {
-                    metrics.serve_rate_limit_rejected_per_ip();
-                }
                 ResetCause::RateLimited(RejectLayer::Global) => {
                     metrics.serve_rate_limit_rejected_global();
                 }

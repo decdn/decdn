@@ -270,9 +270,6 @@ async fn handler_for_tests_with_signer_policy(
         Arc::new(ConnectionLimiter::new(
             &decdn_common::config::ResolvedSecurity {
                 max_concurrent_handlers: u32::MAX,
-                per_source_rate_per_sec: 1e9,
-                per_source_burst: u32::MAX,
-                max_tracked_sources: 16,
             },
             Arc::clone(metrics),
         )),
@@ -814,9 +811,6 @@ async fn handler_with_capability_intake(
         Arc::new(ConnectionLimiter::new(
             &decdn_common::config::ResolvedSecurity {
                 max_concurrent_handlers: u32::MAX,
-                per_source_rate_per_sec: 1e9,
-                per_source_burst: u32::MAX,
-                max_tracked_sources: 16,
             },
             Arc::clone(metrics),
         )),
@@ -881,9 +875,6 @@ async fn handler_with_pool_view_and_freshness(
         Arc::new(ConnectionLimiter::new(
             &decdn_common::config::ResolvedSecurity {
                 max_concurrent_handlers: u32::MAX,
-                per_source_rate_per_sec: 1e9,
-                per_source_burst: u32::MAX,
-                max_tracked_sources: 16,
             },
             Arc::clone(metrics),
         )),

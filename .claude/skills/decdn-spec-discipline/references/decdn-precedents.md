@@ -58,6 +58,12 @@ Every reason here traces to a real PR/issue/ADR. Quotes are from the commit/PR/A
   three production nodes in one batch). A node-side upstream fault also forgave it (#2841). The
   per-stream credit window already bounds what one stream can take. Kept: the in-memory pool ceiling +
   per-signer live cap.
+- **Per-IP / per-source rate layers** (#2505, cut). Token buckets keyed on the connection's source IP in
+  the dispatch limiter and the probe, DHT and serve limiters. Gate 2 (attacker binding) fails: a
+  relay-routed connection carries no client address, so an attacker that dials through a relay skips
+  the layer for free, while honest peers behind one NAT share one bucket. Each layer also carried a
+  keyed map, a prune task, metrics and config knobs. Kept: the per-peer (`NodeId`) layer, the global
+  layer and the connection concurrency cap.
 - **Client NodeId rotation** (#1437, demoted). "the serving node already learns your on-chain address,
   so rotation does nothing against the two adversaries who matter." Its own Limitation paragraph gutted
   the claim.
