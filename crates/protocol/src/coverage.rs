@@ -75,15 +75,22 @@ pub const fn discovery_block_bytes() -> u64 {
     DISCOVERY_BLOCK_BYTES
 }
 
-/// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans.
+/// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans,
+/// saturated at `u32::MAX` blocks — 2^58 bytes (256 PiB) under the production
+/// 64 MiB block.
 ///
 /// The empty blob spans zero blocks (`num_blocks(0) == 0`), not one — an
 /// empty [`Coverage`] over it is trivially complete.
 #[cfg(not(feature = "test-support"))]
 #[must_use]
-#[allow(clippy::cast_possible_truncation)] // a blob would need to be ~256 EiB to truncate here
+#[allow(clippy::cast_possible_truncation)] // the cast is behind an explicit `n > u32::MAX` branch
 pub const fn num_blocks(total_bytes: u64) -> u32 {
-    total_bytes.div_ceil(DISCOVERY_BLOCK_BYTES) as u32
+    let n = total_bytes.div_ceil(DISCOVERY_BLOCK_BYTES);
+    if n > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        n as u32
+    }
 }
 
 /// The active discovery-block size in bytes — the `test-support` twin whose
@@ -95,14 +102,15 @@ pub fn discovery_block_bytes() -> u64 {
     test_block_size::current()
 }
 
-/// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans —
-/// the `test-support` twin, which reads the overridable block size rather than
-/// the constant. Same arithmetic as the production `const fn`.
+/// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans,
+/// saturated at `u32::MAX` blocks — 2^58 bytes (256 PiB) under the production
+/// 64 MiB block — the `test-support` twin, which reads the overridable block
+/// size rather than the constant. Same arithmetic as the production `const fn`.
 #[cfg(feature = "test-support")]
 #[must_use]
-#[allow(clippy::cast_possible_truncation)] // a blob would need to be ~256 EiB to truncate here
 pub fn num_blocks(total_bytes: u64) -> u32 {
-    total_bytes.div_ceil(discovery_block_bytes()) as u32
+    let n = total_bytes.div_ceil(discovery_block_bytes());
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 /// The overridable discovery-block size, compiled only under `test-support`.

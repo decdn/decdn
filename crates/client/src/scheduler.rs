@@ -236,17 +236,40 @@ pub(crate) fn grown_bound(bound: u64, c0: u64, extra: u64) -> u64 {
     want.div_ceil(SEED).saturating_mul(SEED)
 }
 
+/// The furthest past the requested ranges a cap-free fetch sizes its work
+/// from a size claim: 1 TiB, 16,384 discovery blocks, ~2 MiB of coverage
+/// bitmaps. Planning is linear in blocks, and a claim is unverified — the
+/// unsigned probe hint, or a signed `StreamResponse` size no proof backs —
+/// so the claim alone never sizes the work. The ceiling bounds only the
+/// sizing: the bound still grows past it as bytes verify ([`grown_bound`],
+/// [`growth_limit`]), so a genuinely larger blob completes with memory
+/// proportional to verified progress.
+pub(crate) const UNCAPPED_SIZING_CEILING: u64 = 1 << 40;
+
 /// The furthest a size claim can usefully reach for `ranges` under a cap of
-/// `cap` bytes held (`0` is no cap, and reaches `u64::MAX`): the furthest
-/// range start plus the cap. A store that holds no more than the cap holds no
-/// byte past it, so a claim beyond it sizes no work or coverage bitmap. A
-/// whole-blob fetch, from offset `0`, reaches the cap itself.
+/// `cap` bytes held: the furthest range start plus the cap, or plus
+/// [`UNCAPPED_SIZING_CEILING`] when `cap` is `0` (no cap). A store that holds
+/// no more than the cap holds no byte past it, so a claim beyond it sizes no
+/// work or coverage bitmap; with no cap, the ceiling keeps the first sizing
+/// finite whatever the claim. A whole-blob fetch, from offset `0`, reaches
+/// the cap itself.
 pub(crate) fn claim_reach(ranges: &[(u64, u64)], cap: u64) -> u64 {
-    if cap == 0 {
-        return u64::MAX;
-    }
     let furthest = ranges.iter().map(|&(start, _)| start).max().unwrap_or(0);
-    furthest.saturating_add(cap)
+    let reach = if cap == 0 {
+        UNCAPPED_SIZING_CEILING
+    } else {
+        cap
+    };
+    furthest.saturating_add(reach)
+}
+
+/// The most the bound may grow to under `cap`, with `reach` its
+/// [`claim_reach`]: the reach under a real cap, `u64::MAX` with none. With no
+/// cap the reach is only a sizing ceiling; a growth clamped to it would leave
+/// a larger blob's grow step empty with no size proven, and the fetch would
+/// never end.
+pub(crate) const fn growth_limit(cap: u64, reach: u64) -> u64 {
+    if cap > 0 { reach } else { u64::MAX }
 }
 
 /// The end of the blob as the fetch knows it: the proven size, or with none
@@ -3625,9 +3648,13 @@ where
     let health = Arc::clone(sources.health());
     // A claim is peer- or manifest-controlled: clamp it to the furthest the
     // cap on held bytes lets the ranges reach before it sizes any work or
-    // coverage bitmap. A proven size stands: it is verified.
+    // coverage bitmap. A proven size stands: it is verified. The growth
+    // limit is kept apart from the sizing reach: with no cap the reach is a
+    // ceiling on the first sizing only, and the bound grows past it as
+    // bytes verify.
     let cap = env.max_blob_bytes;
     let reach = claim_reach(ranges, cap);
+    let limit = growth_limit(cap, reach);
     let capped = |size: u64| size.min(reach);
     let c0 = capped(c0);
     if store.total_bytes() > reach {
@@ -3887,7 +3914,7 @@ where
                     return Err(anyhow::Error::new(too_large));
                 }
                 let extra = bytes_past(&store.present_ranges().await?, c0, bound);
-                let grown = capped(grown_bound(bound, c0, extra));
+                let grown = grown_bound(bound, c0, extra).min(limit);
                 tracing::debug!(
                     hash = %blake3::Hash::from_bytes(hash).to_hex(),
                     bound,

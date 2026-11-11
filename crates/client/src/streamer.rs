@@ -504,9 +504,10 @@ impl<'a, P, F> Streamer<'a, P, F> {
     /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim past
     /// what the window can reach under the cap (the cap itself for the whole
     /// blob, the window's offset plus the cap otherwise) is clamped before the
-    /// fill store is sized, and a blob that holds bytes past the cap ends the
-    /// stream with [`crate::BlobTooLarge`]
-    /// ([`crate::AcquireEnv::max_blob_bytes`]).
+    /// fill store is sized — with no cap, the claim is clamped to a finite
+    /// sizing ceiling instead and the store's bound grows as bytes verify —
+    /// and a blob that holds bytes past the cap ends the stream with
+    /// [`crate::BlobTooLarge`] ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
         self.max_blob_bytes = max_blob_bytes;
@@ -700,8 +701,9 @@ where
     /// sender signs any other size fails to verify, and its range moves to
     /// another source. `None` is "no proof": `claim` is `0`, it lies past the
     /// cap on held bytes (a blob that large is not held whole, and its claim
-    /// never sizes the work), or the chunk group under it is not the blob's
-    /// last.
+    /// never sizes the work), it lies past the cap-free sizing ceiling
+    /// (an unverified claim that large never sizes a proof window), or the
+    /// chunk group under it is not the blob's last.
     ///
     /// # Errors
     ///
@@ -715,7 +717,12 @@ where
         config: &PullConfig,
         stop: StopPolicy,
     ) -> anyhow::Result<Option<u64>> {
-        if claim == 0 || (self.max_blob_bytes > 0 && claim > self.max_blob_bytes) {
+        let ceiling = if self.max_blob_bytes > 0 {
+            self.max_blob_bytes
+        } else {
+            crate::scheduler::UNCAPPED_SIZING_CEILING
+        };
+        if claim == 0 || claim > ceiling {
             return Ok(None);
         }
         let (mut reader, mut drive) = self

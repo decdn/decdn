@@ -5753,6 +5753,52 @@ async fn acquire_capped(
     Ok((result, totals, store, dir))
 }
 
+/// With no cap the reach is the sizing ceiling past the furthest range
+/// start, never `u64::MAX`: an unverified claim must not size the work.
+#[test]
+fn an_uncapped_reach_is_the_sizing_ceiling_not_unbounded() {
+    use super::{UNCAPPED_SIZING_CEILING, claim_reach};
+    assert_eq!(claim_reach(&[(0, 100)], 0), UNCAPPED_SIZING_CEILING);
+    assert_eq!(
+        claim_reach(&[(0, 100), (5 * MIB, MIB)], 0),
+        5 * MIB + UNCAPPED_SIZING_CEILING
+    );
+}
+
+/// The growth limit is unbounded with no cap: the sizing ceiling bounds only
+/// the first sizing, so the bound grows past it as bytes verify and a blob
+/// larger than the ceiling still completes. Under a real cap the limit is
+/// the reach itself.
+#[test]
+fn the_growth_limit_is_unbounded_with_no_cap() {
+    use super::{UNCAPPED_SIZING_CEILING, claim_reach, growth_limit};
+    let ranges = [(0, 100)];
+    assert_eq!(growth_limit(0, claim_reach(&ranges, 0)), u64::MAX);
+    assert_eq!(growth_limit(0, UNCAPPED_SIZING_CEILING), u64::MAX);
+    assert_eq!(
+        growth_limit(8 * MIB, claim_reach(&ranges, 8 * MIB)),
+        8 * MIB
+    );
+}
+
+/// With no cap, a huge unverified claim never sizes the work: every planned
+/// bound stays at or under the sizing ceiling, and the fetch completes at
+/// the blob's true size.
+#[tokio::test(start_paused = true)]
+async fn an_uncapped_huge_claim_is_sized_by_the_ceiling() -> anyhow::Result<()> {
+    let data = blob(3 * MIB as usize);
+    let (result, totals, store, dir) = acquire_capped(&data, 1 << 57, 0).await?;
+    result?;
+    assert!(
+        totals.iter().all(|&t| t <= super::UNCAPPED_SIZING_CEILING),
+        "{totals:?}"
+    );
+    assert_eq!(store.proven(), Some(3 * MIB));
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    Ok(())
+}
+
 /// A first claim above the cap is clamped to it before any work is sized:
 /// no bound past the cap is ever planned, and a blob within the cap
 /// completes.

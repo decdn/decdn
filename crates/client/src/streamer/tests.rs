@@ -1309,6 +1309,17 @@ async fn a_claim_past_the_cap_opens_nothing() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// With no cap, a claim past the sizing ceiling proves nothing and opens
+/// nothing: an unverified claim that large never sizes a proof window.
+#[tokio::test]
+async fn an_uncapped_claim_past_the_ceiling_opens_nothing() -> anyhow::Result<()> {
+    let source = ScriptedSource::new(payload(100_000))?;
+    let (root, probe) = (source.root(), source.clone());
+    let proven = prove(vec![source], root, 1 << 57).await?;
+    anyhow::ensure!(proven.is_none() && probe.opened_ranges().is_empty());
+    Ok(())
+}
+
 /// A zero claim proves nothing and opens nothing.
 #[tokio::test]
 async fn a_zero_claim_opens_nothing() -> anyhow::Result<()> {
