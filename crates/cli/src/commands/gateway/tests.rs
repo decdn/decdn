@@ -440,7 +440,7 @@ async fn test_gateway_in(
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
         manifest_fills: std::sync::Mutex::default(),
-        manifest_fill_slots: Semaphore::new(MAX_MANIFEST_FILLS),
+        manifest_buffer: Semaphore::new(MANIFEST_BUFFER_BYTES),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
         sites,
         metrics: Metrics::default(),
@@ -4011,8 +4011,8 @@ async fn pulls_reach(caps: &Log<u64>, count: usize) {
     .expect("the pull starts");
 }
 
-/// Wait until `count` requests hold `hash`'s fill lock or wait on it.
-async fn fill_holders_reach(gateway: &Gateway, hash: [u8; 32], count: usize) {
+/// Wait until `count` requests hold the fill lock of `key` or wait on it.
+async fn fill_holders_reach(gateway: &Gateway, key: FlightKey, count: usize) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let holders = gateway
@@ -4020,7 +4020,7 @@ async fn fill_holders_reach(gateway: &Gateway, hash: [u8; 32], count: usize) {
                 .lock()
                 .unwrap()
                 .flights
-                .get(&hash)
+                .get(&key)
                 .map_or(0, Weak::strong_count);
             if holders >= count {
                 return;
@@ -4070,7 +4070,7 @@ async fn concurrent_requests_for_one_manifest_pull_once() {
     let first = spawn_get(&gateway, HELD);
     pulls_reach(&caps, 1).await;
     let second = spawn_get(&gateway, HELD);
-    fill_holders_reach(&gateway, HELD, 2).await;
+    fill_holders_reach(&gateway, (HELD, None), 2).await;
     assert_eq!(
         caps.lock().unwrap().len(),
         1,
@@ -4083,66 +4083,95 @@ async fn concurrent_requests_for_one_manifest_pull_once() {
     abort_held(second).await;
 }
 
-/// `count` distinct blobs for the fill-slot tests.
+/// `count` distinct blobs for the fill-bound tests.
 fn slot_blobs(count: usize) -> Vec<[u8; 32]> {
     (0xd0..).take(count).map(|n| [n; 32]).collect()
 }
 
-/// A pull that has found no holder yet buffers nothing, so it takes no fill
-/// slot: as many stalled discoveries as there are slots leave the next
-/// manifest free to fill.
+/// More stalled fills than the old fill slots.
+const STALLED_FILLS: usize = 5;
+
+/// A pull that has found no holder yet buffers nothing: stalled discoveries
+/// leave the next manifest free to fill.
 #[tokio::test]
-async fn stalled_discoveries_hold_no_fill_slot() {
-    let held = slot_blobs(MAX_MANIFEST_FILLS);
+async fn stalled_discoveries_buffer_nothing() {
+    let held = slot_blobs(STALLED_FILLS);
     let mut replies: HashMap<_, _> = held.iter().map(|&h| (h, Reply::Hold)).collect();
     replies.insert(BLOB, Reply::Bytes(noindex_manifest()));
-    let (gateway, caps) = recording_gateway_slots(replies, &[], MAX_MANIFEST_FILLS + 1).await;
+    let (gateway, caps) = recording_gateway_slots(replies, &[], STALLED_FILLS + 1).await;
     let stalled: Vec<_> = held.iter().map(|&h| spawn_get(&gateway, h)).collect();
-    pulls_reach(&caps, MAX_MANIFEST_FILLS).await;
+    pulls_reach(&caps, STALLED_FILLS).await;
+    assert_eq!(
+        gateway.manifest_buffer.available_permits(),
+        MANIFEST_BUFFER_BYTES
+    );
     let blob = alloy::hex::encode(BLOB);
     let (status, body) = tokio::time::timeout(Duration::from_secs(10), async {
         get(&gateway, &format!("/{blob}/")).await
     })
     .await
-    .expect("stalled discoveries hold no fill slot");
+    .expect("stalled discoveries block no other manifest");
     assert_eq!(status, StatusCode::OK, "{body}");
     for task in stalled {
         abort_held(task).await;
     }
 }
 
-/// Fills that are receiving bytes take the fill slots; one past them waits
-/// until a slot frees.
+/// Fills whose bytes trickle in hold only the bytes they buffered, so they
+/// block no other manifest.
 #[tokio::test]
-async fn fills_past_the_bound_wait_for_a_slot() {
-    let held = slot_blobs(MAX_MANIFEST_FILLS);
+async fn trickling_fills_block_no_other_manifest() {
+    let held = slot_blobs(STALLED_FILLS);
     let mut replies: HashMap<_, _> = held
         .iter()
         .map(|&h| (h, Reply::BytesThenHold(b"{".to_vec())))
         .collect();
     replies.insert(BLOB, Reply::Bytes(noindex_manifest()));
-    let (gateway, caps) = recording_gateway_slots(replies, &[], MAX_MANIFEST_FILLS + 2).await;
-    let mut filling: Vec<_> = held.iter().map(|&h| spawn_get(&gateway, h)).collect();
+    let (gateway, _) = recording_gateway_slots(replies, &[], STALLED_FILLS + 1).await;
+    let filling: Vec<_> = held.iter().map(|&h| spawn_get(&gateway, h)).collect();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while gateway.manifest_fill_slots.available_permits() > 0 {
+        while gateway.manifest_buffer.available_permits() > MANIFEST_BUFFER_BYTES - STALLED_FILLS {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the fills take every slot");
-    let waiting = spawn_get(&gateway, BLOB);
-    pulls_reach(&caps, MAX_MANIFEST_FILLS + 1).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!waiting.is_finished(), "the fill past the bound waits");
-    abort_held(filling.remove(0)).await;
-    let (status, body) = tokio::time::timeout(Duration::from_secs(10), waiting)
-        .await
-        .expect("a freed slot lets the waiting fill run")
-        .unwrap();
+    .expect("each fill buffers its byte");
+    let blob = alloy::hex::encode(BLOB);
+    let (status, body) = tokio::time::timeout(Duration::from_secs(10), async {
+        get(&gateway, &format!("/{blob}/")).await
+    })
+    .await
+    .expect("trickling fills block no other manifest");
     assert_eq!(status, StatusCode::OK, "{body}");
     for task in filling {
         abort_held(task).await;
     }
+}
+
+/// A fill that would pass the buffer budget fails at once instead of
+/// waiting, and the next fill runs once the budget frees.
+#[tokio::test]
+async fn a_spent_buffer_budget_fails_a_fill_fast() {
+    let replies = HashMap::from([(BLOB, Reply::Bytes(noindex_manifest()))]);
+    let (gateway, _) = recording_gateway_of(replies, &[]).await;
+    let spent = u32::try_from(MANIFEST_BUFFER_BYTES - 1).unwrap();
+    let taken = gateway.manifest_buffer.try_acquire_many(spent).unwrap();
+    let blob = alloy::hex::encode(BLOB);
+    let (status, body) = tokio::time::timeout(Duration::from_secs(10), async {
+        get(&gateway, &format!("/{blob}/")).await
+    })
+    .await
+    .expect("a fill past the budget does not wait");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("manifest buffer is full"), "{body}");
+    drop(taken);
+    let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        gateway.manifest_buffer.available_permits(),
+        MANIFEST_BUFFER_BYTES,
+        "the fill gave its budget back"
+    );
 }
 
 /// The flight map prunes the locks of finished fills as it grows, so it does
@@ -4213,7 +4242,7 @@ async fn waiters_share_a_failed_pool_fill() {
         })
         .collect();
     pulls_reach(&caps, 1).await;
-    fill_holders_reach(&gateway, HELD, 3).await;
+    fill_holders_reach(&gateway, (HELD, None), 3).await;
     notice.notify_one();
     for request in requests {
         let status = tokio::time::timeout(Duration::from_secs(10), request)
@@ -4223,4 +4252,44 @@ async fn waiters_share_a_failed_pool_fill() {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
     assert_eq!(caps.lock().unwrap().len(), 1, "the waiters pulled nothing");
+}
+
+/// A request that comes after a fill failed pulls again, even while the
+/// fill's lock lives on.
+#[tokio::test]
+async fn a_failure_is_not_shared_with_later_requests() {
+    let (gateway, caps, _pointers) = public_gateway_replying(HashMap::new()).await;
+    let host = gateway.sites.site_host(&Site {
+        hash: HELD,
+        namespace: None,
+    });
+    // Holds the entry alive, as an overlapping request would.
+    let _lock = gateway.manifest_flight((HELD, None));
+    for pulls in 1..=2 {
+        let status = send(&gateway, Method::GET, &host, "/", &[]).await.status;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(caps.lock().unwrap().len(), pulls, "each request pulls");
+    }
+}
+
+/// A request routed through another namespace does not wait on a fill of the
+/// same hash: the fill lock is per hash and namespace.
+#[tokio::test]
+async fn another_namespace_does_not_wait_on_a_fill() {
+    let replies = HashMap::from([(HELD, Reply::Hold)]);
+    let (gateway, caps, _pointers) = public_gateway_replying(replies).await;
+    let spawn_in = |namespace| {
+        let gateway = Arc::clone(&gateway);
+        let host = gateway.sites.site_host(&Site {
+            hash: HELD,
+            namespace: Some(namespace),
+        });
+        tokio::spawn(async move { send(&gateway, Method::GET, &host, "/", &[]).await.status })
+    };
+    let first = spawn_in(7);
+    pulls_reach(&caps, 1).await;
+    let second = spawn_in(9);
+    pulls_reach(&caps, 2).await;
+    abort_held(first).await;
+    abort_held(second).await;
 }
