@@ -5127,6 +5127,7 @@ async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
             &[DownloadTarget {
                 hash: root(&blob),
                 total_bytes: u64::try_from(blob.len())?,
+                declared: false,
                 dest: &dest,
                 ranges: Some(&ranges),
             }],

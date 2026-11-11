@@ -217,31 +217,28 @@ const EXTRA_REFUSALS_LOGGED: u32 = 3;
 /// stream. A change between those lines logs at debug.
 const WAITING_RELOG: Duration = Duration::from_secs(30);
 
-/// The unit the planner grows a size claim by. A claim is a hint: when every
-/// byte below the bound is present and no leg has proved the size, the bound
-/// grows by at least one `SEED` ([`grown_bound`]). It is one discovery block,
-/// the unit the planner assigns to nodes.
+/// The unit the planner seeds and grows a bound by: one discovery block, the
+/// unit the planner assigns to nodes. Before any byte verifies, a range that
+/// runs to the end of the blob plans at most one `SEED` past its start
+/// ([`first_bound`]), and a bound grows by at least one `SEED`
+/// ([`grown_bound`]).
 pub(crate) const SEED: u64 = decdn_protocol::DISCOVERY_BLOCK_BYTES;
 
-/// The next bound after every byte below `bound` is present and no size is
-/// proven: `max(bound + SEED, c0 + 2 * extra)`, rounded up to a multiple of
-/// [`SEED`]. `c0` is the first claim and `extra` the verified bytes past it,
-/// so a claim that falls far short of the blob grows geometrically. The sum
-/// saturates at `u64::MAX`.
+/// The next bound while no size is proven: `max(bound + SEED, 2 * frontier)`,
+/// rounded up to a multiple of [`SEED`]. `frontier` is the end of the
+/// furthest verified byte, so the bound grows geometrically with verified
+/// bytes and with nothing else. The sum saturates at `u64::MAX`.
 #[must_use]
-pub(crate) fn grown_bound(bound: u64, c0: u64, extra: u64) -> u64 {
-    let want = bound
-        .saturating_add(SEED)
-        .max(c0.saturating_add(extra.saturating_mul(2)));
+pub(crate) fn grown_bound(bound: u64, frontier: u64) -> u64 {
+    let want = bound.saturating_add(SEED).max(frontier.saturating_mul(2));
     want.div_ceil(SEED).saturating_mul(SEED)
 }
 
-/// The furthest a size claim can usefully reach for `ranges` under a cap of
-/// `cap` bytes held (`0` is no cap, and reaches `u64::MAX`): the furthest
-/// range start plus the cap. A store that holds no more than the cap holds no
-/// byte past it, so a claim beyond it sizes no work or coverage bitmap. A
-/// whole-blob fetch, from offset `0`, reaches the cap itself.
-pub(crate) fn claim_reach(ranges: &[(u64, u64)], cap: u64) -> u64 {
+/// The furthest the bytes held for `ranges` can reach under a cap of `cap`
+/// bytes held (`0` is no cap, and reaches `u64::MAX`): the furthest range
+/// start plus the cap. A store that holds no more than the cap holds no byte
+/// past it, so the planner never plans or grows past it.
+fn cap_reach(ranges: &[(u64, u64)], cap: u64) -> u64 {
     if cap == 0 {
         return u64::MAX;
     }
@@ -249,21 +246,63 @@ pub(crate) fn claim_reach(ranges: &[(u64, u64)], cap: u64) -> u64 {
     furthest.saturating_add(cap)
 }
 
-/// The end of the blob as the fetch knows it: the proven size, or with none
-/// proven the smaller of the first claim `c0` and the store's bound. A piece
-/// that starts at or past it can lie past the true end.
-fn known_end<St: IngestStore>(store: &St, c0: u64) -> u64 {
-    store
-        .proven()
-        .unwrap_or_else(|| c0.min(store.total_bytes()))
+/// The bound a fetch of `ranges` plans to before any of its bytes verify,
+/// under a first leg whose sender claims `claim` bytes (`0`: no claim).
+///
+/// Each range reaches its own end, and a range with a zero length (a tail)
+/// one [`SEED`] past its start; the furthest reach, cut to what the cap on
+/// held bytes `cap` lets the ranges reach ([`cap_reach`]), is the plan. The
+/// claim only shortens it, never below the furthest range start plus one
+/// byte: the claim picks the shape of the first leg, which verifies under it,
+/// and a leg that verifies the final chunk of a short claim proves it. A
+/// claim never lengthens the plan: what lies past it is planned from bytes
+/// that verify ([`grown_bound`]) and from a tail proof.
+pub(crate) fn first_bound(claim: u64, ranges: &[(u64, u64)], cap: u64) -> u64 {
+    let reach = ranges
+        .iter()
+        .map(|&(start, len)| {
+            if len == 0 {
+                start.saturating_add(SEED)
+            } else {
+                start.saturating_add(len)
+            }
+        })
+        .max()
+        .unwrap_or(SEED)
+        .min(cap_reach(ranges, cap));
+    if claim == 0 {
+        return reach;
+    }
+    let past_start = ranges
+        .iter()
+        .map(|&(start, _)| start.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    reach.min(claim.max(past_start))
 }
 
-/// Bytes of the store's `present` chunks at or past `from`, against `bound`.
-fn bytes_past(present: &ChunkRanges, from: u64, bound: u64) -> u64 {
-    contiguous_byte_ranges(present, bound)
-        .into_iter()
-        .map(|(start, len)| start.saturating_add(len).saturating_sub(start.max(from)))
-        .fold(0, u64::saturating_add)
+/// The end of the bytes the fetch knows exist: the proven size, or with none
+/// proven the store's verified floor ([`IngestStore::floor`]) lifted to a
+/// `declared` size and, for any blob but the empty one, past byte `0`. A
+/// piece that starts at or past it can lie past the true end. A claim plays
+/// no part.
+fn known_end<St: IngestStore>(store: &St, hash: [u8; 32], declared: u64) -> u64 {
+    store.proven().unwrap_or_else(|| {
+        let floor = store.floor().max(declared);
+        if hash == decdn_protocol::EMPTY_ROOT {
+            floor
+        } else {
+            floor.max(1)
+        }
+    })
+}
+
+/// The end of the furthest verified chunk in `present`.
+fn verified_frontier(present: &ChunkRanges) -> u64 {
+    present
+        .boundaries()
+        .last()
+        .map_or(0, |end| end.0.saturating_mul(1024))
 }
 
 /// The chunks of `[start, start+len)` the store misses, clipped to its
@@ -325,25 +364,28 @@ pub struct AcquireTarget<'a, St> {
     pub store: &'a St,
     /// The blob's BLAKE3 root.
     pub hash: [u8; 32],
-    /// The first size claim: a hint. A resumed store's bound wins over it,
-    /// and a leg that verifies the final chunk proves the size.
+    /// The size the first leg's sender signs (`0`: none), unless `declared`.
+    /// A claim only picks shapes: the first leg's and the tail proof's, the
+    /// last chunk group under it. Neither plans past what verifies
+    /// ([`acquire`]).
     pub total_bytes: u64,
-    /// The `(offset, len)` byte ranges to fill. Unless `bounded`, a range that
-    /// reaches `total_bytes` or the store's bound, or has a zero length, is a
-    /// tail: it follows the bound as it grows or shrinks. Bytes outside the
-    /// ranges and their tail are never fetched.
+    /// `total_bytes` is a size the caller already holds authenticated, such
+    /// as a bundle manifest entry's under the manifest's root: the fetch plans
+    /// to it from the start and runs no tail proof.
+    pub declared: bool,
+    /// The `(offset, len)` byte ranges to fill. A range with a zero length is
+    /// a tail: it runs to the end of the blob and follows the bound as it
+    /// grows or shrinks. Every other range is exact, and is clipped to a size
+    /// a leg proves. Bytes outside the ranges and their tails are never
+    /// fetched.
     pub ranges: &'a [(u64, u64)],
-    /// The ranges are exact: none is a tail, even one that reaches the end
-    /// of the blob as the caller knows it. A range past a size a leg proves
-    /// is clipped to it. A caller that wants a byte window and nothing past
-    /// it sets this; a whole-blob target leaves it unset.
-    pub bounded: bool,
 }
 
 impl<St> std::fmt::Debug for AcquireTarget<'_, St> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcquireTarget")
             .field("total_bytes", &self.total_bytes)
+            .field("declared", &self.declared)
             .field("ranges", &self.ranges)
             .finish_non_exhaustive()
     }
@@ -943,7 +985,7 @@ struct Work {
     coverage: Vec<Coverage>,
     /// `measured[i]` is `true` when lane `i`'s coverage is a probed bitmap.
     /// A lane without one holds the whole blob, so its coverage follows the
-    /// bound as it grows ([`Work::regrow`]).
+    /// bound as it grows ([`Work::extend`]).
     measured: Vec<bool>,
     /// `lane_of[i]` is the lane slot worker slot `i` fetches for: `i` itself
     /// for a lane's own worker, the lane's slot for an extra worker
@@ -1189,16 +1231,18 @@ impl Work {
         wanted
     }
 
-    /// Plan `missing` afresh under a grown bound of `total_bytes`: every lane
-    /// without a probed bitmap now covers the grown region, and `pending` is
-    /// replanned across the lanes. Only called while no range is in flight.
+    /// Plan `missing`, the chunks a grown bound of `total_bytes` adds, across
+    /// the lanes beside the work already planned: every lane without a probed
+    /// bitmap now covers the grown region, and the new pieces join `pending`.
+    /// Ranges in flight keep running.
     ///
     /// # Errors
     ///
     /// A segmentation alignment error.
-    fn regrow(&mut self, missing: &ChunkRanges, total_bytes: u64) -> anyhow::Result<()> {
+    fn extend(&mut self, missing: &ChunkRanges, total_bytes: u64) -> anyhow::Result<()> {
         self.grow_coverage(total_bytes);
-        self.pending = plan_pending(missing, total_bytes, &self.coverage)?;
+        let more = plan_pending(missing, total_bytes, &self.coverage)?;
+        self.pending.extend(more);
         Ok(())
     }
 
@@ -2608,6 +2652,7 @@ where
             // No anchor from an earlier gap: a cancel that drops `fill_gap`
             // before its first pass prices this gap from its own start.
             counters.leg_anchor = None;
+            counters.leg_claim = None;
             // `dropped`: an arm other than `fill` ended the unit, so `fill_gap`
             // stopped mid-leg and noted nothing.
             let (outcome, dropped) = {
@@ -2699,6 +2744,7 @@ where
                             g_start,
                             g_start.saturating_add(g_len),
                             counters.leg_anchor,
+                            counters.leg_claim,
                         )
                         .await;
                         if let Some((paid, delivered)) = ended {
@@ -3002,68 +3048,70 @@ impl std::fmt::Debug for ConsumptionPacing<'_> {
 /// The byte ranges one [`acquire`] fills, fitted to the store's bound as it
 /// moves (ADR 039 § Dynamic segmentation and tail-stealing).
 struct Want {
-    /// The `(offset, len)` ranges still to fill, each inside `bound`.
+    /// The `(offset, len)` ranges the caller asked for; a zero length is a
+    /// tail that runs to the end of the blob.
+    requested: Vec<(u64, u64)>,
+    /// The `(offset, len)` ranges still to fill: `requested` clipped to
+    /// `bound`, each tail running to it.
     ranges: Vec<(u64, u64)>,
-    /// The ranges reach the bound's end: a whole-blob target, or explicit
-    /// ranges that hold the tail. Such a target follows the bound as it grows
-    /// and needs a proven size to complete.
-    tail: bool,
     /// The bound the ranges were last fitted to.
     bound: u64,
 }
 
 impl Want {
-    /// `ranges` against a first bound of `bound`, cut from a first claim of
-    /// `c0`. Unless `bounded`, a range that reaches the end of the blob as the
-    /// caller knows it, `min(c0, bound)`, or has a zero length, is a tail: it
-    /// runs to `bound`. Every other range is clipped to `bound`. A resumed
-    /// record's bound can be past `c0`, so a whole-blob target cut from `c0`
-    /// still reaches it.
-    fn new(ranges: &[(u64, u64)], bound: u64, c0: u64, bounded: bool) -> Self {
-        let end = c0.min(bound);
-        let reaches_end =
-            |start: u64, len: u64| !bounded && (len == 0 || start.saturating_add(len) >= end);
-        let tail = ranges.iter().any(|&(start, len)| reaches_end(start, len));
-        let ranges: Vec<(u64, u64)> = ranges
-            .iter()
-            .filter(|&&(start, _)| start < bound)
-            .map(|&(start, len)| {
-                let room = bound - start;
-                let len = if reaches_end(start, len) {
-                    room
-                } else {
-                    len.min(room)
-                };
-                (start, len)
-            })
-            .collect();
+    /// `ranges` fitted to a first bound of `bound`.
+    fn new(ranges: &[(u64, u64)], bound: u64) -> Self {
+        let requested = ranges.to_vec();
         Self {
-            ranges,
-            tail,
+            ranges: Self::clipped(&requested, bound),
+            requested,
             bound,
         }
     }
 
-    /// Fit the ranges to a new `bound`. A tail target gains `[old, bound)`
-    /// when the bound grows; every range is clipped when it shrinks. Returns
-    /// whether the bound moved.
-    fn fit(&mut self, bound: u64) -> bool {
+    /// `requested` clipped to `bound`, each tail running to it.
+    fn clipped(requested: &[(u64, u64)], bound: u64) -> Vec<(u64, u64)> {
+        requested
+            .iter()
+            .filter(|&&(start, _)| start < bound)
+            .map(|&(start, len)| {
+                let room = bound - start;
+                (start, if len == 0 { room } else { len.min(room) })
+            })
+            .collect()
+    }
+
+    /// The parts of the requested ranges that lie in `[from, to)`.
+    fn between(&self, from: u64, to: u64) -> Vec<(u64, u64)> {
+        Self::clipped(&self.requested, to)
+            .into_iter()
+            .filter_map(|(start, len)| {
+                let end = start.saturating_add(len);
+                let start = start.max(from);
+                (end > start).then(|| (start, end - start))
+            })
+            .collect()
+    }
+
+    /// Whether a requested range wants bytes past the bound: a tail, or an
+    /// exact range that ends past it. Such a target completes only once a leg
+    /// proves the size, or once the bound grows past every exact end.
+    fn reaches_past(&self) -> bool {
+        self.requested
+            .iter()
+            .any(|&(start, len)| len == 0 || start.saturating_add(len) > self.bound)
+    }
+
+    /// Fit the ranges to a new `bound`. Returns the bound they were fitted to
+    /// before, when it moved.
+    fn fit(&mut self, bound: u64) -> Option<u64> {
         if bound == self.bound {
-            return false;
+            return None;
         }
-        if bound > self.bound && self.tail {
-            self.ranges.push((self.bound, bound - self.bound));
-        }
-        if bound < self.bound {
-            self.ranges = self
-                .ranges
-                .iter()
-                .filter(|&&(start, _)| start < bound)
-                .map(|&(start, len)| (start, len.min(bound - start)))
-                .collect();
-        }
+        let old = self.bound;
+        self.ranges = Self::clipped(&self.requested, bound);
         self.bound = bound;
-        true
+        Some(old)
     }
 }
 
@@ -3187,6 +3235,38 @@ where
     Ok(false)
 }
 
+/// Check that the bytes `want` needs, among those verified knowledge proves
+/// exist, fit the cap on held bytes `cap` (`0` is no cap): the bytes the
+/// store holds plus the missing bytes of the ranges below the store's floor
+/// ([`IngestStore::floor`]). Ranges that need more than the cap from bytes
+/// that exist can never complete, so the fetch ends before it pays for more.
+///
+/// # Errors
+///
+/// [`crate::BlobTooLarge`] when they do not fit, or a store error.
+async fn known_fits_cap<St>(store: &St, want: &Want, cap: u64) -> anyhow::Result<()>
+where
+    St: IngestStore,
+{
+    if cap == 0 {
+        return Ok(());
+    }
+    let bound = store.total_bytes();
+    let known = Want::clipped(&want.requested, store.floor().min(bound));
+    let held = ranges_content_len(&store.present_ranges().await?, bound);
+    let needs = held.saturating_add(ranges_content_len(
+        &missing_chunks(store, &known).await?,
+        bound,
+    ));
+    if needs > cap {
+        return Err(anyhow::Error::new(crate::BlobTooLarge {
+            reached: needs,
+            ceiling: cap,
+        }));
+    }
+    Ok(())
+}
+
 /// A lane build in flight: the provider it builds for, and the result.
 pub(crate) type Connecting<'p, S> = std::pin::Pin<
     Box<dyn Future<Output = (Address, anyhow::Result<StreamCandidate<S>>)> + Send + 'p>,
@@ -3214,6 +3294,60 @@ async fn poll_opt<T>(slot: &mut Option<SourceFuture<'_, T>>) -> anyhow::Result<T
         Some(fut) => fut.await,
         None => std::future::pending().await,
     }
+}
+
+/// A tail proof in flight ([`prove_tail`]). It streams into the store, whose
+/// ingest future is not `Send`, so neither is this.
+type TailProof<'a> = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
+
+/// The tail proof's result, or wait forever without one.
+async fn poll_proof(slot: &mut Option<TailProof<'_>>) -> anyhow::Result<()> {
+    match slot.as_mut() {
+        Some(fut) => fut.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// How long a tail proof may run before the fetch gives up on it and grows
+/// from verified bytes instead.
+const TAIL_PROOF_DEADLINE: Duration = FIRST_BYTE_GRACE;
+
+/// Prove the size `claim` names on `lane`: fetch, and pay for, the last chunk
+/// group under it and its proof (ADR 038). A verified final chunk proves the
+/// size, and the store's bound moves to it. The leg verifies under the size
+/// its own sender signs, so a sender that signs another size proves that one
+/// or nothing. `grant` is the lane's extra stream, given back when the proof
+/// ends.
+///
+/// # Errors
+///
+/// The open's, the ingest's or the drain's fault, or the deadline: the claim
+/// is then unproven, which costs the fetch nothing but this one group.
+async fn prove_tail<St, S>(
+    store: &St,
+    lane: Arc<StreamCandidate<S>>,
+    hash: [u8; 32],
+    claim: u64,
+    grant: Option<ReleaseGrant<S>>,
+) -> anyhow::Result<()>
+where
+    St: IngestStore,
+    S: BlobSource,
+{
+    let proof = async {
+        let range = align_range(claim.saturating_sub(1), 1, claim)?;
+        let (header, reader) = lane.source.open(hash, range.clone()).await?;
+        let (reader, _) = store
+            .ingest_stream(&range, reader, None, header.total_bytes, None)
+            .await?;
+        lane.source.finish(reader).await?;
+        anyhow::Ok(())
+    };
+    let proved = tokio::time::timeout(TAIL_PROOF_DEADLINE, proof)
+        .await
+        .map_err(|_| anyhow::anyhow!("the tail proof took longer than {TAIL_PROOF_DEADLINE:?}"))?;
+    drop(grant);
+    proved
 }
 
 /// The next item of `slot`'s stream, or wait forever without one.
@@ -3500,24 +3634,36 @@ where
 /// The lane watchdog ([`LANE_WATCHDOG`]) is on for an eager fetch and off
 /// under consumption pacing.
 ///
-/// # The size is a hint
+/// # A size claim only picks a shape
 ///
-/// `target.total_bytes` is the first size claim, `C0`, from a probe hint, a
-/// signed header or a manifest; a resumed store keeps the bound its record
-/// holds. The loop corrects the claim as bytes land:
+/// `target.total_bytes` is the size the first leg's sender signs, `C0`. It
+/// picks the shape of the first leg, which verifies under it, and of one tail
+/// proof; it never plans work past what verifies. The loop plans from
+/// verified knowledge alone:
 ///
+/// - **First bound.** A proven size, else each range's own end, a tail one
+///   `SEED` (one discovery block) past its start, cut to `C0`. A resumed store's
+///   verified floor lifts it; the bound its record holds does not.
+/// - **Root split.** The first leaf a leg verifies under a claim proves the
+///   claim's root split: every byte below the left subtree's size exists,
+///   and the store's bound rises to it ([`crate::ClientRangedStore::floor`]).
+/// - **Tail proof.** Once the first leg verifies a byte, one lane fetches the
+///   last chunk group under `C0` beside it. A verified final chunk proves the
+///   size, and the bound moves to it.
 /// - **Shrink.** A leg that verifies the final chunk of its sender's claim
 ///   proves that size, and the store's bound moves to it. The loop clips every
 ///   pending and in-flight range to it and cancels a lane whose range starts
 ///   past it.
-/// - **Grow.** When every byte below the bound is present and no size is
-///   proven, the bound grows to `max(bound + SEED, C0 + 2 * extra)`, rounded
-///   up to a multiple of `SEED` (one discovery block), where `extra` is the
-///   verified bytes past `C0`. The loop plans the new region.
+/// - **Grow.** While no size is proven and the target wants bytes past the
+///   bound, the bound grows once the verified frontier passes half of it, or
+///   once nothing below it is left to fetch: to `max(bound + SEED, 2 *
+///   frontier)`, rounded up to a multiple of `SEED`. The loop plans the new
+///   region beside the ranges in flight.
 ///
-/// A target whose ranges reach the bound's end completes once a size is
-/// proven and every byte below it is present. Explicit ranges that stop short
-/// of the end complete once they are present.
+/// A target with a tail completes once a size is proven and every byte below
+/// it is present. Exact ranges complete once they are present, or once a
+/// proven size ends them. A `declared` size (a bundle manifest's) is the first
+/// bound, with no tail proof.
 ///
 /// # Per-source payment (ADR 039 § Payment)
 ///
@@ -3619,23 +3765,26 @@ where
         store,
         hash,
         total_bytes: c0,
+        declared,
         ranges,
-        bounded,
     } = target;
     let health = Arc::clone(sources.health());
-    // A claim is peer- or manifest-controlled: clamp it to the furthest the
-    // cap on held bytes lets the ranges reach before it sizes any work or
-    // coverage bitmap. A proven size stands: it is verified.
+    // The cap on held bytes bounds every plan: a store that holds no more
+    // than the cap holds no byte past the furthest range start plus it.
     let cap = env.max_blob_bytes;
-    let reach = claim_reach(ranges, cap);
-    let capped = |size: u64| size.min(reach);
-    let c0 = capped(c0);
-    if store.total_bytes() > reach {
-        store.set_bound(reach);
-    }
-    // A resumed record's bound wins over the caller's hint.
+    let reach = cap_reach(ranges, cap);
+    // The first bound rests on verified knowledge: a proven size, a declared
+    // one, or the first leg's reach, lifted by the floor a resumed store
+    // proves. The bound a resumed record holds counts only through it.
+    let declared_end = if declared { c0.min(reach) } else { 0 };
+    let planned = match store.proven() {
+        Some(proven) => proven,
+        None if declared => declared_end,
+        None => first_bound(c0, ranges, cap),
+    };
+    store.set_bound(planned.max(store.floor()));
     let first_bound = store.total_bytes();
-    let mut want = Want::new(ranges, first_bound, c0, bounded);
+    let mut want = Want::new(ranges, first_bound);
     let missing = missing_chunks(store, &want.ranges).await?;
     let mut pending = VecDeque::new();
     for (start, len) in contiguous_byte_ranges(&missing, first_bound) {
@@ -3645,20 +3794,20 @@ where
     // where the last run left off; each lane folds in its own leg deltas.
     let base_present = ranges_content_len(&store.present_ranges().await?, first_bound);
     let needs = base_present.saturating_add(ranges_content_len(&missing, first_bound));
-    // A proven size is verified, so ranges that need more than the cap under
-    // it can never complete: end before any leg opens.
-    if cap > 0 && store.proven().is_some() && needs > cap {
-        return Err(anyhow::Error::new(crate::BlobTooLarge {
-            reached: needs,
-            ceiling: cap,
-        }));
-    }
+    // Ranges whose bytes are proven to exist and need more than the cap can
+    // never complete: end before any leg opens.
+    known_fits_cap(store, &want, cap).await?;
     // Each leg's room is what the store's held bytes leave under the cap, and
     // a leg in flight on another stream is not yet held. Work that could pass
     // the cap therefore runs one stream at a time: one lane, no extra streams.
-    // The planned work rests on a claim that may be inflated, so it narrows
-    // the fetch and never refuses it.
     let mut one_stream = cap > 0 && needs > cap;
+    // The tail proof's claim, until the loop starts it: one per fetch.
+    let mut proof_claim = (!declared && c0 > 0).then_some(c0);
+    // The tail proof in flight, if any.
+    let mut proving: Option<TailProof<'_>> = None;
+    // Whether a worker has ended: its first leg is no longer the open the
+    // size open primed, so the tail proof cannot close that pull.
+    let mut first_leg_settled = false;
     let work = AsyncMutex::new(Work::new(pending, hash, env.pacing.is_some()));
     let progress_wake = Notify::new();
 
@@ -3754,11 +3903,14 @@ where
     if let Some(cb) = env.on_progress {
         cb(base_present, first_bound);
     }
-    // The bound the loop last fitted its work to. A leg that proves a size
-    // moves the store's bound; the progress report sees that first and wakes
-    // the loop to clip the work.
+    // The bound the loop last fitted its work to. A leg that proves a size or
+    // a root split moves the store's bound; the progress report sees that
+    // first and wakes the loop to fit the work.
     let bound_seen = AtomicU64::new(first_bound);
     let bound_moved = Notify::new();
+    // The bound whose half the verified position last passed: the report
+    // wakes the loop once per bound to weigh growth.
+    let half_woken = AtomicU64::new(u64::MAX);
     // The highest position reported so far: each rise is newly verified bytes
     // for the recovery gate's progress rule.
     let verified_seen = AtomicU64::new(base_present);
@@ -3770,7 +3922,11 @@ where
             env.recovery.record_verified(position - before);
         }
         env.stop.clock.tick();
-        if store.total_bytes() != bound_seen.load(Ordering::Acquire) {
+        let seen = bound_seen.load(Ordering::Acquire);
+        if store.total_bytes() != seen
+            || (position.saturating_mul(2) > seen
+                && half_woken.swap(seen, Ordering::AcqRel) != seen)
+        {
             bound_moved.notify_one();
         }
         if let Some(cb) = env.on_progress {
@@ -3832,11 +3988,89 @@ where
     let result: anyhow::Result<()> = async {
         loop {
             let bound = store.total_bytes();
-            if want.fit(bound) {
+            if let Some(old) = want.fit(bound) {
                 bound_seen.store(bound, Ordering::Release);
-                let mut w = work.lock().await;
-                w.grow_coverage(bound);
-                w.clip(bound)?;
+                known_fits_cap(store, &want, cap).await?;
+                if bound < old {
+                    let mut w = work.lock().await;
+                    w.grow_coverage(bound);
+                    w.clip(bound)?;
+                } else {
+                    // The lanes not yet started plan the whole want when they
+                    // seed; once seeded, the new region joins the plan.
+                    let added = missing_chunks(store, &want.between(old, bound)).await?;
+                    if seeded {
+                        work.lock().await.extend(&added, bound)?;
+                    }
+                    let held = ranges_content_len(&store.present_ranges().await?, bound);
+                    let needs = held.saturating_add(ranges_content_len(
+                        &missing_chunks(store, &want.ranges).await?,
+                        bound,
+                    ));
+                    if cap > 0 && needs > cap {
+                        one_stream = true;
+                    }
+                    if let Some(cb) = env.on_progress {
+                        cb(progress_agg.load(Ordering::Relaxed), bound);
+                    }
+                }
+            }
+            // Grow before the lanes drain: once the verified frontier passes
+            // half the bound, the bytes past it are planned while the lanes
+            // still run, so no lane idles at a barrier. Only verified bytes
+            // move the frontier, and growth stops at the cap's reach. It
+            // runs only once no claim is left to prove: an honest claim
+            // proves the size by its own tail, and growth past it would plan
+            // past the blob's end. A declared size is planned whole.
+            if store.proven().is_none()
+                && !declared
+                && proof_claim.is_none()
+                && proving.is_none()
+                && want.reaches_past()
+                && bound < reach
+            {
+                let frontier = verified_frontier(&store.present_ranges().await?);
+                if frontier.saturating_mul(2) > bound {
+                    let grown = grown_bound(bound, frontier).min(reach);
+                    tracing::debug!(
+                        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                        bound,
+                        grown,
+                        frontier,
+                        "the verified frontier passed half the bound and no size is proven; \
+                         growing the bound"
+                    );
+                    store.set_bound(grown);
+                    continue;
+                }
+            }
+            // A lane may prove the size beside the first leg: the last chunk
+            // group under the first claim. It starts once the first leg has
+            // verified a byte or ended, so it never delays the first byte, and
+            // runs at most once per fetch. It runs when the claim lies past
+            // the bound and the target wants bytes there, or when the bound
+            // lies past the claim (a window past the claimed end), which a
+            // proven size then ends. A proof that fails leaves the fetch to
+            // grow from verified bytes.
+            if proving.is_none()
+                && store.proven().is_none()
+                && (store.floor() > 0 || first_leg_settled)
+                && let Some(claim) = proof_claim.filter(|&claim| {
+                    (claim > bound && want.reaches_past()) || claim < bound
+                })
+                && let Some(lane) = started.0.first().map(Arc::clone)
+            {
+                // The store already holds the claim's last group: it was
+                // fetched under another claim, and fetching it again proves
+                // nothing new.
+                let tail = bao_tree::ChunkNum(claim.saturating_sub(1) / 1024);
+                if store.present_ranges().await?.contains(&tail) {
+                    proof_claim = None;
+                } else if lane.widen.as_ref().is_none_or(|w| w.grow(GrowFor::Extra)) {
+                    proof_claim = None;
+                    let grant = lane.widen.is_some().then(|| ReleaseGrant(Arc::clone(&lane)));
+                    proving = Some(Box::pin(prove_tail(store, lane, hash, claim, grant)));
+                }
             }
             if running.is_empty()
                 && ready.is_empty()
@@ -3858,7 +4092,7 @@ where
                     };
                     return Err(anyhow::Error::new(too_large));
                 }
-                if store.proven().is_some() || !want.tail {
+                if store.proven().is_some() || !want.reaches_past() {
                     // Land the write in flight first, so it cannot rename an
                     // older snapshot over the final one. Its failure is only
                     // logged: the final write below supersedes it, and its
@@ -3875,10 +4109,10 @@ where
                     return Ok(());
                 }
                 // Every byte below the bound is present and no leg proved a
-                // size: the claim was short. Grow and plan the new region, but
-                // never past the cap: a store already holding the cap's worth,
-                // or a bound at the claim's reach, with no proof means the blob
-                // holds bytes the store cannot take.
+                // size: the blob may hold more. Grow and plan the new region
+                // (at the loop top), but never past the cap: a store already
+                // holding the cap's worth, or a bound at the cap's reach, with
+                // no proof means the blob holds bytes the store cannot take.
                 if cap > 0 && (held >= cap || bound >= reach) {
                     let too_large = crate::BlobTooLarge {
                         reached: held.saturating_add(1),
@@ -3886,27 +4120,17 @@ where
                     };
                     return Err(anyhow::Error::new(too_large));
                 }
-                let extra = bytes_past(&store.present_ranges().await?, c0, bound);
-                let grown = capped(grown_bound(bound, c0, extra));
+                let frontier = verified_frontier(&store.present_ranges().await?);
+                let grown = grown_bound(bound, frontier).min(reach);
                 tracing::debug!(
                     hash = %blake3::Hash::from_bytes(hash).to_hex(),
                     bound,
                     grown,
-                    extra,
-                    "every byte below the size claim is present and none proves the size; \
-                     growing the claim"
+                    frontier,
+                    "every byte below the bound is present and none proves the size; \
+                     growing the bound"
                 );
                 store.set_bound(grown);
-                want.fit(grown);
-                bound_seen.store(grown, Ordering::Release);
-                let missing = missing_chunks(store, &want.ranges).await?;
-                if cap > 0 && held.saturating_add(ranges_content_len(&missing, grown)) > cap {
-                    one_stream = true;
-                }
-                work.lock().await.regrow(&missing, grown)?;
-                if let Some(cb) = env.on_progress {
-                    cb(progress_agg.load(Ordering::Relaxed), grown);
-                }
                 continue;
             }
             // A sibling entry ended the pull: start nothing more. A build
@@ -4235,6 +4459,7 @@ where
             tokio::select! {
                 biased;
                 Some(end) = workers.next(), if !workers.is_empty() => {
+                    first_leg_settled = true;
                     // `Err` here is this process's fault (store I/O, a slot bug).
                     let WorkerEnd { provider, end, delivered, pulled_through, covered_served, extra } = match end {
                         Ok(end) => end,
@@ -4286,7 +4511,7 @@ where
                             anyhow::anyhow!("no verified progress for {watchdog:?}")
                         });
                         let range = crate::source_set::LaneRange {
-                            past_end: piece_at >= known_end(store, c0),
+                            past_end: piece_at >= known_end(store, hash, declared_end),
                             ..range
                         };
                         // A fault on an extra stream stops only that stream: it
@@ -4411,8 +4636,21 @@ where
                 Ok(()) = deposit_rx.changed() => {}
                 // A swapped credential: the loop top rebuilds the lanes.
                 () = swap_after(env.credentials, generation_seen) => {}
-                // A leg proved a size: the loop top clips the work to it.
+                // The bound moved, or the verified position passed half of
+                // it: the loop top fits the work and weighs growth.
                 () = bound_moved.notified() => {}
+                // The tail proof ended. A proven size moved the bound, which
+                // the loop top fits the work to.
+                proved = poll_proof(&mut proving), if proving.is_some() => {
+                    proving = None;
+                    if let Err(err) = proved {
+                        tracing::debug!(
+                            hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                            error = %decdn_common::redact::sanitize_err_chain(&err),
+                            "the tail proof proved no size; the bound grows from verified bytes"
+                        );
+                    }
+                }
                 flushed = poll_opt(&mut record), if record.is_some() => {
                     record = None;
                     flushed?;

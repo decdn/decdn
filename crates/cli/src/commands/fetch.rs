@@ -42,7 +42,7 @@ use anyhow::Context as _;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
-use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources};
+use decdn_client::lane_sources::{FaultContext, FirstClaim, FirstLeg, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::session::{
@@ -1201,12 +1201,12 @@ pub(crate) async fn fetch_on(
     // first verified holder, and the holders that answer later join it.
     let discovery = discovery_options(common)?;
     // A known size (a gateway's manifest entry, or a size an earlier fetch
-    // on the host verified) is the first size claim, and a pinned node is not
-    // probed for it.
+    // on the host verified) is authenticated: the fetch plans to it from the
+    // start, with no first-leg open to learn a claim.
+    let known = known_size(&hash, args.size_cap, sizes);
     let probe = ProbeOpts {
         marks: Some(timings),
         round: ProbeRound::Stream,
-        known_size: known_size(&hash, args.size_cap, sizes),
     };
     let resolved = holders_or_none(
         resolve_target_node(
@@ -1351,8 +1351,9 @@ pub(crate) async fn fetch_on(
         // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
-            // The first size claim: the probe's hint, or the header of an open
-            // of the drive's first leg, which that leg then adopts.
+            // The first size claim: a known size, or the header of an open of
+            // the drive's first leg, which that leg then adopts. A claim only
+            // picks the first leg's shape.
             let first_leg = if streams {
                 FirstLeg::Streamed {
                     window: args.range.unwrap_or((0, 0)),
@@ -1361,16 +1362,30 @@ pub(crate) async fn fetch_on(
             } else {
                 FirstLeg::Whole
             };
-            let claim = sources
-                .first_claim(hash, holders, first_leg, health, &stop)
-                .await?;
+            let claim = match known {
+                Some(total_bytes) => FirstClaim {
+                    total_bytes,
+                    holders,
+                },
+                None => {
+                    sources
+                        .first_claim(hash, holders, first_leg, health, &stop)
+                        .await?
+                }
+            };
             if replaced.is_none()
                 && let Some(hints) = &rate_hints
             {
-                // A whole blob is one range, so its wire bytes follow from
-                // its size; an unencodable size prints no estimate.
-                if let Ok(wire) = decdn_client::quote::wire_bytes(claim.total_bytes) {
-                    super::quote::print_estimate((claim.total_bytes, wire), hints, common);
+                // A known size prices the pull; a claim does not, so a raw
+                // blob of unknown size shows its nodes and rates alone. A
+                // whole blob is one range, so its wire bytes follow from its
+                // size; an unencodable size prints no estimate.
+                match known.map(|size| (size, decdn_client::quote::wire_bytes(size))) {
+                    Some((size, Ok(wire))) => {
+                        super::quote::print_estimate((size, wire), hints, common);
+                    }
+                    Some((_, Err(_))) => {}
+                    None => super::quote::print_rates(hints, common),
                 }
             }
             let total_bytes = claim.total_bytes;
@@ -1397,8 +1412,8 @@ pub(crate) async fn fetch_on(
                     Ok(None) => tracing::info!(
                         %blob,
                         claim = total_bytes,
-                        "a size proof proved nothing: the claim's last chunk group is not the \
-                         blob's last"
+                        "a size proof proved nothing: the claim is zero or past the cap on held \
+                         bytes, or its last chunk group is not the blob's last"
                     ),
                     Err(err) if proof_ends_fetch(&err) => return Err(err),
                     Err(err) => tracing::info!(
@@ -1433,6 +1448,7 @@ pub(crate) async fn fetch_on(
                     DownloadTarget {
                         hash,
                         total_bytes,
+                        declared: known.is_some(),
                         dest: &args.output,
                         ranges: None,
                     },

@@ -125,7 +125,6 @@ fn one_operator_yields_one_holder_the_nearer_by_rank() {
         coverage_by_node: std::collections::HashMap::new(),
         probed_samples: Vec::new(),
         pinned: false,
-        size_hint: None,
         late: crate::targets::LateSlot::default(),
     };
     let mut nodes = std::collections::HashMap::new();
@@ -208,7 +207,6 @@ fn late_holder(seed: u8, rtt_ms: f64) -> crate::targets::ProbeOutcome {
                 multiaddrs: alloy::primitives::Bytes::new(),
             },
             rtt_ms,
-            total_bytes: None,
             coverage: decdn_protocol::Coverage::full(4),
         },
         (node_id, rtt_ms, 1),
@@ -329,7 +327,6 @@ fn a_rediscovery_refreshes_an_operators_node() {
         candidates: vec![n],
         coverage_by_node: std::collections::HashMap::new(),
         pinned: false,
-        size_hint: None,
         late: crate::targets::LateSlot::default(),
     };
     let mut nodes = std::collections::HashMap::new();
@@ -348,52 +345,6 @@ fn a_rediscovery_refreshes_an_operators_node() {
         Some(4),
         "the replaced node's rate stays recorded under its own id"
     );
-}
-
-/// The first claim of `targets`, counting the header-only opens it makes.
-async fn claim_of(targets: &crate::targets::ResolvedTargets) -> anyhow::Result<(u64, usize)> {
-    let opens = std::sync::atomic::AtomicUsize::new(0);
-    let mut nodes = std::collections::HashMap::new();
-    let holders = holders_from(targets, &mut nodes, &mut std::collections::HashMap::new());
-    let claim = super::first_claim_or_open(targets.size_hint, holders, |holders| {
-        opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        async move {
-            Ok(super::FirstClaim {
-                total_bytes: 7,
-                holders,
-            })
-        }
-    })
-    .await?;
-    Ok((
-        claim.total_bytes,
-        opens.load(std::sync::atomic::Ordering::SeqCst),
-    ))
-}
-
-/// Holders whose probe gave a size hint take it as the first claim, with
-/// no whole-blob open for the header (#2218).
-#[tokio::test]
-async fn the_first_claim_comes_from_the_probe_hint_without_a_whole_blob_open() -> anyhow::Result<()>
-{
-    let (targets, _, _) = crate::targets::tests_support::two_holder_targets();
-    let hint = targets
-        .size_hint
-        .ok_or_else(|| anyhow::anyhow!("the fixture's probe gives a hint"))?;
-    assert_eq!(claim_of(&targets).await?, (hint, 0));
-    Ok(())
-}
-
-/// A pinned `--node-id` whose probe gave no size, or a pinned bundle entry with
-/// a size from neither its manifest nor a probe, opens one pull for the
-/// header's size.
-#[tokio::test]
-async fn a_pinned_node_without_a_hint_opens_for_the_header() -> anyhow::Result<()> {
-    let (mut targets, _, _) = crate::targets::tests_support::two_holder_targets();
-    targets.pinned = true;
-    targets.size_hint = None;
-    assert_eq!(claim_of(&targets).await?, (7, 1));
-    Ok(())
 }
 
 /// A pinned `--node-id` counts as a holder: its `NotFound` never marks it
@@ -665,17 +616,23 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
     Ok(())
 }
 
-/// A download, and the empty blob, which a holder serves only whole, take
-/// their size from a whole open; a streamed fetch of any other blob opens its
-/// first leg (#2644).
+/// The empty blob, which a holder serves only whole, takes its size from a
+/// whole open; a fetch of any other blob opens its first leg (#2644). A
+/// download's first leg is one seed of the blob, whatever the claim.
 #[test]
-fn a_size_open_pulls_the_streamed_first_leg_except_for_the_empty_blob() -> anyhow::Result<()> {
+fn a_size_open_pulls_the_first_leg_except_for_the_empty_blob() -> anyhow::Result<()> {
     use super::{FirstLeg, size_open_span};
     let streamed = FirstLeg::Streamed {
         window: (0, 0),
         read_ahead: 0,
     };
-    anyhow::ensure!(size_open_span([7; 32], FirstLeg::Whole, 0).is_none());
+    let whole = size_open_span([7; 32], FirstLeg::Whole, 0)
+        .ok_or_else(|| anyhow::anyhow!("a download opens its first leg"))?;
+    anyhow::ensure!(
+        (whole.fetch_start(), whole.fetch_len()) == (0, crate::scheduler::SEED),
+        "{whole:?}"
+    );
+    anyhow::ensure!(size_open_span(decdn_protocol::EMPTY_ROOT, FirstLeg::Whole, 0).is_none());
     anyhow::ensure!(
         size_open_span(decdn_protocol::EMPTY_ROOT, streamed, 0).is_none(),
         "a holder refuses any range of the empty blob but the whole"
@@ -823,7 +780,6 @@ async fn a_late_holders_probed_rate_is_captured_for_its_lane_ceiling() -> anyhow
                 multiaddrs: alloy::primitives::Bytes::new(),
             },
             rtt_ms: 100.0,
-            total_bytes: None,
             coverage: decdn_protocol::Coverage::full(4),
         },
         (node_id, 100.0, late_rate),
@@ -987,7 +943,6 @@ async fn a_built_lane_carries_the_probed_rate_as_its_ceiling() -> anyhow::Result
         coverage_by_node: std::collections::HashMap::new(),
         probed_samples: vec![(candidate.node_id, 10.0, probed_rate)],
         pinned: false,
-        size_hint: None,
         late: crate::targets::LateSlot::default(),
     };
     let holders = sources.holders_from(&targets);

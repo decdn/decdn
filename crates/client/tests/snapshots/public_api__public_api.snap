@@ -314,7 +314,6 @@ pub struct decdn_client::discovery::Probed
 pub decdn_client::discovery::Probed::candidate: decdn_client::discovery::NodeCandidate
 pub decdn_client::discovery::Probed::coverage: decdn_protocol::coverage::Coverage
 pub decdn_client::discovery::Probed::rtt_ms: f64
-pub decdn_client::discovery::Probed::total_bytes: core::option::Option<u64>
 pub const decdn_client::discovery::BOOTSTRAP_UNREACHABLE: &str
 pub fn decdn_client::discovery::admit_sources(alloc::vec::Vec<decdn_client::discovery::NodeCandidate>, usize) -> alloc::vec::Vec<decdn_client::discovery::NodeCandidate>
 pub async fn decdn_client::discovery::bootstrap_nodes(&str, alloy_primitives::bits::address::Address, &std::path::Path, core::time::Duration) -> anyhow::Result<decdn_client::discovery::Bootstrap>
@@ -322,6 +321,7 @@ pub fn decdn_client::discovery::select_candidates(alloc::vec::Vec<decdn_client::
 pub fn decdn_client::discovery::with_dial_addrs(iroh_base::endpoint_addr::EndpointAddr, &decdn_client::discovery::NodeCandidate) -> iroh_base::endpoint_addr::EndpointAddr
 pub mod decdn_client::downloader
 pub struct decdn_client::downloader::DownloadTarget<'a>
+pub decdn_client::downloader::DownloadTarget::declared: bool
 pub decdn_client::downloader::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::downloader::DownloadTarget::hash: [u8; 32]
 pub decdn_client::downloader::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>
@@ -377,14 +377,12 @@ pub decdn_client::quote::HashCensus::unverifiable: usize
 impl decdn_client::quote::HashCensus
 pub fn decdn_client::quote::HashCensus::holders(&self) -> usize
 pub fn decdn_client::quote::HashCensus::serve_order(&self, u64, decdn_client::session::ProxyWarmingParams) -> alloc::vec::Vec<&decdn_client::quote::NodeAnswer>
-pub fn decdn_client::quote::HashCensus::size_hint(&self) -> core::option::Option<u64>
 #[non_exhaustive] pub struct decdn_client::quote::NodeAnswer
 pub decdn_client::quote::NodeAnswer::candidate: decdn_client::discovery::NodeCandidate
 pub decdn_client::quote::NodeAnswer::coverage: decdn_protocol::coverage::Coverage
 pub decdn_client::quote::NodeAnswer::has_blob: bool
 pub decdn_client::quote::NodeAnswer::rate_per_mb: u64
 pub decdn_client::quote::NodeAnswer::rtt_ms: f64
-pub decdn_client::quote::NodeAnswer::total_bytes: core::option::Option<u64>
 #[non_exhaustive] pub struct decdn_client::quote::PriceRange
 pub decdn_client::quote::PriceRange::high: alloy_primitives::aliases::U256
 pub decdn_client::quote::PriceRange::likely: alloy_primitives::aliases::U256
@@ -826,6 +824,7 @@ impl core::convert::TryFrom<decdn_client::Cumulative> for decdn_client::receipt:
 pub type decdn_client::receipt::ReceiptAmount::Error = ruint::from::FromUintError<u64>
 pub fn decdn_client::receipt::ReceiptAmount::try_from(decdn_client::Cumulative) -> core::result::Result<Self, Self::Error>
 pub struct decdn_client::DownloadTarget<'a>
+pub decdn_client::DownloadTarget::declared: bool
 pub decdn_client::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::DownloadTarget::hash: [u8; 32]
 pub decdn_client::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>

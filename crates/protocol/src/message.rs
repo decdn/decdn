@@ -25,10 +25,12 @@
 //! ALPN bump. ADR 013 freezes a signed field set at the protocol version that
 //! introduces it; `cdn/probe/v1` had no prior signed `ProbeResponse`, so the
 //! set `{hash, has_blob, rate_per_mb, timestamp_us}` is the v1 baseline (ADR
-//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` rides in
+//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` and `coverage` ride in
 //! [`ProbeResponseExt`] as the ADR 013 Tier-1 unsigned-evolution exemplar (ADR
-//! 005 §`cdn/probe/v1`) and is deliberately NOT covered by `slash_sig`. The
-//! `ProbeMessage` variant order is unchanged.
+//! 005 §`cdn/probe/v1`) and are deliberately NOT covered by `slash_sig`. A
+//! size claim only picks the tree shape a leg verifies under, so a requester
+//! learns the size from the bytes it pulls. The `ProbeMessage` variant order
+//! is unchanged.
 //!
 //! This crate deliberately does not depend on any crypto library. The caller
 //! (`decdn_incentive::ProbeSlashData` and the probe handler/CLI) computes and
@@ -281,9 +283,11 @@ pub struct ProbeResponse {
 /// have a meaningful `Default`. Insertions and reordering are Tier-3.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProbeResponseExt {
-    /// Blob size in bytes when known. Nodes SHOULD include it when the size is
-    /// known so requesters can estimate cost before opening a payment pool.
-    /// Unsigned: treat it as a sizing hint, never as a commitment.
+    /// Blob size in bytes when the sender knows it. Unsigned and a hint only.
+    /// A size claim only picks the tree shape a leg verifies under, so no
+    /// fetch plans, caps, prices or ends on this field. Its one reader is a
+    /// node's coverage-union probe gather, which counts the blocks a union of
+    /// partial holders must span before it stops probing.
     pub total_bytes: Option<u64>,
     /// Which discovery blocks (`decdn_protocol::coverage`) this node will
     /// serve. Unsigned: treat it as a hint, never as a commitment. A

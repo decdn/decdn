@@ -69,8 +69,10 @@ struct StreamState {
     /// The byte the window ends before, or `None` for a tail that ends at the
     /// size a leg proves. The stream ends at the smaller of the two.
     end: Option<u64>,
-    /// The caller's size hint: the fetch's first claim. The stream ends at the
-    /// size a leg proves ([`ClientRangedStore::proven`]), whatever this says.
+    /// The size the first leg's sender signs: it picks the first leg's shape
+    /// and the tail proof's ([`crate::AcquireTarget::total_bytes`]). The
+    /// stream ends at the size a leg proves ([`ClientRangedStore::proven`]),
+    /// whatever this says.
     hint: u64,
     /// Woken by the reader when `cursor` advances, so a pull parked on a full
     /// read-ahead window ([`PaceDecision::Wait`](crate::pacer::PaceDecision::Wait))
@@ -322,7 +324,6 @@ where
         state.start,
         state.end.map_or(0, |end| end.saturating_sub(state.start)),
     )];
-    let bounded = state.end.is_some();
     // Under consumption pacing `acquire` turns its lane watchdog off: a lane
     // parked on the consumer cursor is waiting, not stalled. A genuinely silent
     // source trips its own per-stream idle window mid-read instead.
@@ -346,8 +347,8 @@ where
             store: &state.store,
             hash,
             total_bytes: state.hint,
+            declared: false,
             ranges: &ranges,
-            bounded,
         },
         &mut sources,
         &env,
@@ -501,12 +502,11 @@ impl<'a, P, F> Streamer<'a, P, F> {
         self
     }
 
-    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim past
-    /// what the window can reach under the cap (the cap itself for the whole
-    /// blob, the window's offset plus the cap otherwise) is clamped before the
-    /// fill store is sized, and a blob that holds bytes past the cap ends the
-    /// stream with [`crate::BlobTooLarge`]
-    /// ([`crate::AcquireEnv::max_blob_bytes`]).
+    /// Cap the stream at `max_blob_bytes` (`0` for no cap). The fetch never
+    /// plans past what the window can reach under the cap (the cap itself for
+    /// the whole blob, the window's offset plus the cap otherwise), and a blob
+    /// that holds bytes past the cap ends the stream with
+    /// [`crate::BlobTooLarge`] ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
         self.max_blob_bytes = max_blob_bytes;
@@ -545,8 +545,10 @@ where
     /// of the consumer's cursor, and the verified blob is teed to `cache` for the
     /// next revisit.
     ///
-    /// `total_bytes` is the first size claim, a hint. A resumed store's bound
-    /// wins, and a leg that verifies the final chunk proves the size. `hash` is
+    /// `total_bytes` is the size the first leg's sender signs: it picks the
+    /// first leg's shape and never plans past what verifies
+    /// ([`crate::acquire`]). A leg that verifies the final chunk proves the
+    /// size. `hash` is
     /// the bao root every byte is verified against; a wrong hash surfaces as a
     /// read error, never as silent corruption.
     ///
@@ -584,17 +586,15 @@ where
     /// revisit is served the whole blob; a cache that holds exactly the window
     /// serves it with no fetch.
     ///
-    /// `total_bytes` is the end of the blob as the caller knows it. A window
-    /// past it is clipped to it, and the stream then ends with an error naming
-    /// the shortfall; a window whose offset lies past the blob's real size,
-    /// under a claim that overstated it, ends with the fetch's error, as no
-    /// leg can verify it.
+    /// `total_bytes` is the size the first leg's sender signs: it picks the
+    /// first leg's shape and never ends the window. A window past the size a
+    /// leg proves ends there, and the stream then ends with an error naming
+    /// the shortfall; a window whose offset lies past the blob's real size
+    /// ends with the fetch's error, as no leg can verify it.
     ///
     /// # Errors
     ///
-    /// A window that starts past `0` and at or past `total_bytes` (the caller
-    /// knows the size and answers "not satisfiable" before any fetch), plus
-    /// everything [`Self::open`] lists.
+    /// Everything [`Self::open`] lists.
     pub async fn open_range<'a>(
         self,
         hash: [u8; 32],
@@ -609,13 +609,12 @@ where
         F: 'a,
     {
         let (offset, len) = window;
-        anyhow::ensure!(
-            offset == 0 || offset < total_bytes,
-            "stream window starts at byte {offset} of a {total_bytes}-byte blob"
-        );
         let end = (len > 0).then(|| offset.saturating_add(len));
+        // A tail's cache key runs to the claimed end. The cache holds only
+        // verified bytes, so a claim that is off only misses it.
         let want = end.map_or(total_bytes.saturating_sub(offset), |end| end - offset);
-        if let Some(cached) = cache.get(hash, offset, want).await?
+        if want > 0
+            && let Some(cached) = cache.get(hash, offset, want).await?
             && u64::try_from(cached.len()).is_ok_and(|cached_len| cached_len == want)
         {
             return Ok((
@@ -632,17 +631,12 @@ where
         }
 
         let stem = blake3::Hash::from_bytes(hash).to_hex();
-        // A claim past what the cap on held bytes lets the window reach never
-        // sizes the store.
-        let total_bytes = total_bytes.min(crate::scheduler::claim_reach(
-            &[window],
-            self.max_blob_bytes,
-        ));
         // Off the runtime: opening a finalized blob hashes its final file.
+        // The acquire loop sets the store's bound from what it knows.
         let store = {
             let (scratch, stem) = (self.scratch.to_path_buf(), stem.to_string());
             tokio::task::spawn_blocking(move || {
-                ClientRangedStore::open_or_create(&scratch, &stem, hash, total_bytes)
+                ClientRangedStore::open_or_create(&scratch, &stem, hash, 0)
                     .map_err(|e| anyhow::anyhow!("open stream store for {stem}: {e}"))
             })
             .await

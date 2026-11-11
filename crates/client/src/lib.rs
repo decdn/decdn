@@ -48,10 +48,10 @@
 //!    ([`discovery::select_candidates`]), and probe each one
 //!    ([`probe::probe_once`]). Verify every answer
 //!    ([`probe::verify_probe_response`]) before it counts, and drop an answer
-//!    whose `has_blob` and coverage disagree. A probe answer's size
-//!    ([`discovery::Probed::total_bytes`]) is an unsigned hint: pass it as the
-//!    fetch's first size claim, which the fetch grows or shrinks as verified
-//!    bytes land.
+//!    whose `has_blob` and coverage disagree. The fetch needs no size: pass
+//!    `0`, or a size you hold authenticated as `declared`. A size claim only
+//!    picks the tree a leg verifies under, and the fetch plans from the bytes
+//!    that verify ([`acquire`]).
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
 //!    what the `(pool, lane key, provider)` lane has already paid, and bind it

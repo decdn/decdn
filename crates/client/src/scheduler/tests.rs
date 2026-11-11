@@ -124,6 +124,10 @@ struct Knobs<'a> {
     pacing: Option<&'a ConsumptionPacing<'a>>,
     health: Arc<PeerHealth>,
     max_blob_bytes: u64,
+    /// The store's starting bound is a size the test holds authenticated
+    /// ([`AcquireTarget::declared`]), so the fetch plans to it at once. A
+    /// test of how a claim is treated sets this `false`.
+    declared: bool,
 }
 
 impl Knobs<'_> {
@@ -136,6 +140,7 @@ impl Knobs<'_> {
             pacing: None,
             health: Arc::default(),
             max_blob_bytes: 0,
+            declared: true,
         }
     }
 }
@@ -159,11 +164,11 @@ async fn run_acquire_with<S: BlobSource>(
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
+            declared: knobs.declared,
             store,
             hash: root,
             total_bytes: total,
-            ranges: &[(0, total)],
+            ranges: &[(0, 0)],
         },
         &mut set,
         &AcquireEnv {
@@ -3013,7 +3018,7 @@ async fn acquire_bounded<St: crate::source::IngestStore>(
         run: None,
     };
     let target = AcquireTarget {
-        bounded: false,
+        declared: false,
         store,
         hash: root,
         total_bytes: total,
@@ -3616,7 +3621,7 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
     let gate = recovery_gate();
     let err = acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -3662,7 +3667,7 @@ async fn acquire_under<S: BlobSource>(
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
     acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store,
             hash: root,
             total_bytes: total,
@@ -4322,7 +4327,8 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
+            // The size is known, so a refusal of block 1 is no overshoot.
+            declared: true,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4403,7 +4409,8 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
+            // The size is known, so a refusal of block 1 is no overshoot.
+            declared: true,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4829,7 +4836,7 @@ async fn acquire_with_late_builds_halted(
         run: None,
     };
     let target = AcquireTarget {
-        bounded: false,
+        declared: false,
         store: &store,
         hash: root,
         total_bytes: total,
@@ -5184,7 +5191,7 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5247,7 +5254,8 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
+            // The size is known, so a refusal of block 1 is no overshoot.
+            declared: true,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5310,7 +5318,8 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
+            // The size is known, so a refusal of block 1 is no overshoot.
+            declared: true,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5357,7 +5366,7 @@ async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5398,7 +5407,7 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
     let mib = 1024 * 1024;
     acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5437,41 +5446,70 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
 const MIB: u64 = 1024 * 1024;
 
 #[test]
-fn a_claim_with_nothing_past_it_grows_by_one_seed() {
+fn a_bound_with_a_short_frontier_grows_by_one_seed() {
     use super::{SEED, grown_bound};
     let gib = 1 << 30;
-    assert_eq!(grown_bound(gib, gib, 0), gib + SEED);
-    // A claim off the SEED grid rounds up to it.
+    assert_eq!(grown_bound(gib, 0), gib + SEED);
+    // A bound off the SEED grid rounds up to it.
     let gb = 1_000_000_000;
     let want = (gb + SEED).div_ceil(SEED) * SEED;
-    assert_eq!(grown_bound(gb, gb, 0), want);
+    assert_eq!(grown_bound(gb, gb / 2), want);
     assert_eq!(want % SEED, 0);
 }
 
 #[test]
-fn bytes_past_the_claim_grow_the_bound_twice_as_far() {
+fn a_verified_frontier_grows_the_bound_twice_as_far() {
     use super::{SEED, grown_bound};
-    let (gb, mb): (u64, u64) = (1_000_000_000, 1_000_000);
-    let want = (gb + 100 * mb).div_ceil(SEED) * SEED;
-    assert_eq!(grown_bound(gb, gb, 50 * mb), want);
+    let gb: u64 = 1_000_000_000;
+    let want = (2 * gb).div_ceil(SEED) * SEED;
+    assert_eq!(grown_bound(gb, gb), want);
 }
 
 #[test]
 fn a_grown_bound_saturates_near_the_top() {
     use super::grown_bound;
-    assert_eq!(grown_bound(u64::MAX - 10, 0, 0), u64::MAX);
-    assert_eq!(grown_bound(1, 0, u64::MAX), u64::MAX);
-    assert_eq!(grown_bound(1, u64::MAX, 1), u64::MAX);
+    assert_eq!(grown_bound(u64::MAX - 10, 0), u64::MAX);
+    assert_eq!(grown_bound(1, u64::MAX), u64::MAX);
 }
 
-/// The bounds the growth rule steps through from a first claim of `c0`
-/// while every source honestly serves a `truth`-byte blob: each round
-/// fetches up to the bound, so everything past `c0` below it is present.
-fn predicted_growth(c0: u64, truth: u64) -> Vec<u64> {
+/// Before any byte verifies, a claim only shortens the plan: a tail plans one
+/// `SEED` past its start whatever the claim, an exact range its own end, and
+/// the cap's reach bounds both.
+#[test]
+fn the_first_bound_never_reaches_past_a_tail_seed_or_a_range_end() {
+    use super::{SEED, first_bound};
+    let huge = 1 << 60;
+    assert_eq!(
+        first_bound(huge, &[(0, 0)], 0),
+        SEED,
+        "a liar plans one seed"
+    );
+    assert_eq!(first_bound(3 * MIB, &[(0, 0)], 0), 3 * MIB, "a short claim");
+    assert_eq!(first_bound(0, &[(0, 0)], 0), SEED, "no claim");
+    assert_eq!(
+        first_bound(huge, &[(10 * MIB, 0)], 0),
+        10 * MIB + SEED,
+        "a tail plans from its start"
+    );
+    assert_eq!(
+        first_bound(huge, &[(0, 5 * MIB)], 0),
+        5 * MIB,
+        "an exact range plans to its end"
+    );
+    assert_eq!(first_bound(huge, &[(0, 0)], MIB), MIB, "the cap's reach");
+    // A claim short of the window never plans below its start.
+    assert_eq!(first_bound(MIB, &[(8 * MIB, 4 * MIB)], 0), 8 * MIB + 1);
+}
+
+/// The bounds the growth rule steps through from a first bound of `first`
+/// while every source honestly serves a `truth`-byte blob and nothing
+/// proves the size: each round fetches up to the bound, so the verified
+/// frontier reaches it.
+fn predicted_growth(first: u64, truth: u64) -> Vec<u64> {
     let mut bounds = Vec::new();
-    let mut bound = c0;
+    let mut bound = first;
     while bound < truth {
-        bound = super::grown_bound(bound, c0, bound.saturating_sub(c0));
+        bound = super::grown_bound(bound, bound);
         bounds.push(bound);
     }
     bounds
@@ -5500,6 +5538,7 @@ async fn acquire_recording<S: BlobSource>(
         &no_funding(),
         Knobs {
             on_progress: Some(&on_progress),
+            declared: false,
             ..Knobs::lanes(lanes)
         },
     )
@@ -5524,8 +5563,11 @@ fn honest_lanes(
     Ok((sources, StaticSources::new(candidates)?))
 }
 
-/// A first claim far below the blob grows by the rule until a leg
-/// verifies the true final chunk, and the fetch completes byte-identical.
+/// A first claim far below the blob plans only to it; the first verified
+/// leaf proves the true root split, the bound rises to it and grows from
+/// verified bytes until a leg verifies the true final chunk, and the fetch
+/// completes byte-identical. No bound ever runs past twice the furthest
+/// verified byte, rounded up to a seed.
 #[tokio::test(start_paused = true)]
 async fn a_too_small_claim_grows_until_the_true_end_is_proven() -> anyhow::Result<()> {
     let (c0, truth) = (MIB, 70 * MIB);
@@ -5541,17 +5583,121 @@ async fn a_too_small_claim_grows_until_the_true_end_is_proven() -> anyhow::Resul
     assert_eq!(store.proven(), Some(truth));
     store.finalize().await?;
     assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-    let grown: std::collections::BTreeSet<u64> = samples
+    let most = samples.iter().map(|&(_, total)| total).max().unwrap_or(0);
+    let ceiling = predicted_growth(super::SEED, truth)
+        .last()
+        .copied()
+        .unwrap_or(truth);
+    assert!(most <= ceiling, "a bound of {most} ran past {ceiling}");
+    Ok(())
+}
+
+/// A liar's first claim far past the blob plans at most one seed before a
+/// byte verifies: it sizes no work, coverage or allocation. A leaf that
+/// verifies under the true size then proves the true root split, and the
+/// fetch completes byte-identical.
+#[tokio::test(start_paused = true)]
+async fn a_huge_claim_plans_no_more_than_one_seed() -> anyhow::Result<()> {
+    let truth = 3 * MIB;
+    let data = blob(truth as usize);
+    let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
+    let root = sources
+        .first()
+        .map(ScriptedSource::root)
+        .unwrap_or_default();
+    let (store, dir) = fresh_store(root, 1 << 60);
+    let (result, samples) = acquire_recording(&store, &provider, root, 2).await;
+    result?;
+    assert_eq!(store.proven(), Some(truth));
+    let most = samples.iter().map(|&(_, total)| total).max().unwrap_or(0);
+    assert!(most <= super::SEED, "a bound of {most} past one seed");
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    Ok(())
+}
+
+/// An honest claim past one seed plans one seed, then the tail proof beside
+/// the first leg proves the claim and the fetch plans to it: the bound never
+/// runs past the true size, and the claim's last group is fetched once.
+#[tokio::test(start_paused = true)]
+async fn an_honest_claim_past_one_seed_is_proven_by_its_tail() -> anyhow::Result<()> {
+    let truth = 70 * MIB;
+    let data = blob(truth as usize);
+    let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
+    let root = sources
+        .first()
+        .map(ScriptedSource::root)
+        .unwrap_or_default();
+    let (store, dir) = fresh_store(root, truth);
+    let (result, samples) = acquire_recording(&store, &provider, root, 2).await;
+    result?;
+    assert_eq!(store.proven(), Some(truth));
+    let most = samples.iter().map(|&(_, total)| total).max().unwrap_or(0);
+    assert_eq!(most, truth, "no bound past the proven size");
+    let tail_group = (truth - 1) / (16 * 1024) * (16 * 1024);
+    let proofs = sources
         .iter()
-        .map(|&(_, total)| total)
-        .filter(|&total| total != c0 && total != truth)
-        .collect();
-    let predicted: std::collections::BTreeSet<u64> = predicted_growth(c0, truth)
-        .into_iter()
-        .filter(|&b| b != truth)
-        .collect();
-    assert_eq!(grown, predicted, "one growth round per the rule");
-    assert_eq!(predicted.len(), 1);
+        .flat_map(ScriptedSource::opened_ranges)
+        .filter(|&(start, _)| start == tail_group)
+        .count();
+    assert_eq!(proofs, 1, "the claim's last group is fetched once");
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    Ok(())
+}
+
+/// With no claim at all, the fetch plans one seed and grows from the bytes
+/// that verify: once the verified frontier passes half the bound, the bound
+/// grows to twice the frontier while the lanes still run.
+#[tokio::test(start_paused = true)]
+async fn with_no_claim_the_bound_grows_from_verified_bytes() -> anyhow::Result<()> {
+    let truth = 70 * MIB;
+    let data = blob(truth as usize);
+    let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
+    let root = sources
+        .first()
+        .map(ScriptedSource::root)
+        .unwrap_or_default();
+    let (store, dir) = fresh_store(root, 0);
+    let (result, samples) = acquire_recording(&store, &provider, root, 2).await;
+    result?;
+    assert_eq!(store.proven(), Some(truth));
+    let totals: Vec<u64> = samples.iter().map(|&(_, total)| total).collect();
+    assert_eq!(totals.first().copied(), Some(super::SEED), "{totals:?}");
+    let most = totals.iter().copied().max().unwrap_or(0);
+    assert!(
+        most <= 2 * truth,
+        "a bound of {most} ran past twice the blob"
+    );
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    Ok(())
+}
+
+/// The first verified leaf under a claim proves the claim's root split: the
+/// store's floor and bound rise to the left subtree's size, every byte of
+/// which exists.
+#[tokio::test]
+async fn the_first_verified_leaf_proves_the_root_split() -> anyhow::Result<()> {
+    let truth = 5 * 16 * 1024 + 7;
+    let data = blob(truth as usize);
+    let (sources, provider) = honest_lanes(&data, &[0xA1])?;
+    let root = sources
+        .first()
+        .map(ScriptedSource::root)
+        .unwrap_or_default();
+    // Six chunk groups: the left subtree holds four.
+    assert_eq!(crate::ranged_store::root_split(truth), Some(4 * 16 * 1024));
+    assert_eq!(crate::ranged_store::root_split(16 * 1024), None);
+    assert_eq!(
+        crate::ranged_store::root_split(16 * 1024 + 1),
+        Some(16 * 1024)
+    );
+    let (store, _dir) = fresh_store(root, 16 * 1024);
+    let (result, _) = acquire_recording(&store, &provider, root, 1).await;
+    result?;
+    assert_eq!(store.floor(), truth);
+    assert_eq!(store.proven(), Some(truth));
     Ok(())
 }
 
@@ -5745,6 +5891,7 @@ async fn acquire_capped(
         Knobs {
             on_progress: Some(&on_progress),
             max_blob_bytes: cap,
+            declared: false,
             ..Knobs::lanes(1)
         },
     )
@@ -5886,7 +6033,7 @@ async fn acquire_capped_into(
     let gate = recovery_gate();
     let result = acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store,
             hash: root,
             total_bytes: u64::try_from(data.len())?,
@@ -6474,7 +6621,7 @@ async fn acquire_over<P: crate::SourceProvider>(
     let whole = [(0, total)];
     acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store,
             hash: root,
             total_bytes: total,
@@ -7015,7 +7162,7 @@ async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
     let runs: Vec<(u64, u64)> = (0..6).map(|i| (i * 2 * MIB, MIB)).collect();
     acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -7559,7 +7706,7 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     };
     let fetch = acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -7592,17 +7739,17 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     Ok(())
 }
 
-/// With no size proven, the end the fetch knows is the smaller of the
-/// first claim and the bound; a proven size replaces both.
+/// The end the fetch knows exists is the store's verified floor: nothing
+/// before a byte verifies, then the proven size once a leg proves it. A
+/// claim and the bound play no part.
 #[tokio::test]
-async fn the_known_end_is_the_claim_or_bound_until_a_size_is_proven() -> anyhow::Result<()> {
+async fn the_known_end_is_the_verified_floor() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let src = ScriptedSource::new(data)?.paying(Arc::clone(&ledger));
     let root = src.root();
     let (store, _dir) = fresh_store(root, 8 * MIB);
-    assert_eq!(super::known_end(&store, MIB), MIB, "a short claim");
-    assert_eq!(super::known_end(&store, 16 * MIB), 8 * MIB, "the bound");
+    assert_eq!(store.floor(), 0, "nothing verified yet");
 
     let provider = StaticSources::new(vec![candidate(src, ledger, 0xA1, None)])?;
     run_acquire(
@@ -7616,7 +7763,7 @@ async fn the_known_end_is_the_claim_or_bound_until_a_size_is_proven() -> anyhow:
         None,
     )
     .await?;
-    assert_eq!(super::known_end(&store, MIB), 3 * MIB, "the proven size");
+    assert_eq!(store.floor(), 3 * MIB, "the proven size");
     Ok(())
 }
 
@@ -7768,7 +7915,7 @@ async fn acquire_delegated_in_run(
     let gate = RecoveryGate::with_settle(Duration::ZERO);
     acquire(
         AcquireTarget {
-            bounded: false,
+            declared: false,
             store,
             hash: root,
             total_bytes: total,

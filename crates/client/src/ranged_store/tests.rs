@@ -44,6 +44,8 @@ fn record_round_trip_empty() {
 fn record_round_trip_single_range() {
     let mut state = StoreState::empty(9 * 1024);
     state.present = ChunkRanges::from(ChunkNum(2)..ChunkNum(9));
+    // A reopened store's floor is the end of its last present chunk.
+    state.floor = 9 * 1024;
     assert_eq!(round_trip("single.ranges", &state), state);
 }
 

@@ -937,35 +937,30 @@ async fn a_window_past_the_end_stops_at_the_proven_size() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A window that starts past the size claim is refused at open: the caller
-/// knows the size (a manifest entry) and answers its own "range not
-/// satisfiable" before any fetch.
+/// A claim never ends a window: a window that starts past the claim opens,
+/// and a window past the blob's real end ends with the fetch's error, since
+/// no leg can verify it.
 #[tokio::test]
-async fn a_window_past_the_claim_is_refused_at_open() -> anyhow::Result<()> {
+async fn a_window_past_the_end_ends_with_the_fetch_error() -> anyhow::Result<()> {
     let blob = payload(100_000);
     let (source, ledger) = paying_source(blob)?;
-    let root = source.root();
     let total = source.total_bytes();
-    let probe = source.clone();
-    let scratch = tempfile::tempdir()?;
-    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
-    let opened = streamer
-        .open_range(
-            root,
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        drain_range(
+            source,
+            ledger,
             total,
-            (total, 1),
-            &PullConfig::default(),
+            (total + 64 * 1024, 1),
             Arc::new(NoCache),
-            stop(),
-        )
-        .await;
+            &PullConfig::default(),
+        ),
+    )
+    .await
+    .context("the stream and its drive end")?;
     anyhow::ensure!(
-        opened.is_err(),
-        "a window at or past the claim must not open"
-    );
-    anyhow::ensure!(
-        probe.opened_ranges().is_empty(),
-        "nothing is fetched for it"
+        got.as_ref().map_or(true, Vec::is_empty),
+        "a window past the end streams nothing: {got:?}"
     );
     Ok(())
 }
@@ -1013,23 +1008,14 @@ async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A bounded window past a size claim too small for the blob is clipped to
-/// the claim: the fetch takes nothing past the end of the blob as the caller
-/// knows it, and the stream ends with an error naming the shortfall, never
-/// following the blob past a reader that stopped.
+/// A claim never ends a window: a window past a claim too small for the
+/// blob streams from the bytes that verify, under the size the sender signs.
 #[tokio::test]
-async fn a_window_past_a_short_claim_is_clipped_to_it() -> anyhow::Result<()> {
+async fn a_window_past_a_short_claim_streams_from_verified_bytes() -> anyhow::Result<()> {
     let blob = payload(3 * 1024 * 1024 + 777);
     let (source, ledger) = paying_source(blob.clone())?;
     let claim = 2 * 1024 * 1024 + 100;
     let offset = 2 * 1024 * 1024 + 5;
-    // The smallest read-ahead window, so a drive that outruns a stopped
-    // reader parks on it instead of finishing within the window.
-    let config = PullConfig {
-        read_ahead_bytes: 1,
-        ..PullConfig::default()
-    };
-    let probe = source.clone();
     let got = tokio::time::timeout(
         Duration::from_secs(20),
         drain_range(
@@ -1038,50 +1024,38 @@ async fn a_window_past_a_short_claim_is_clipped_to_it() -> anyhow::Result<()> {
             claim,
             (offset, 1_000),
             Arc::new(NoCache),
-            &config,
+            &PullConfig::default(),
         ),
     )
     .await
-    .context("the stream and its drive end")?;
-    let err = match got {
-        Ok(bytes) => anyhow::bail!("{} bytes past the claim were streamed", bytes.len()),
-        Err(err) => format!("{err:#}"),
-    };
-    anyhow::ensure!(err.contains("bytes readable"), "{err}");
-    for &(start, fetch_len) in &probe.opened_ranges() {
-        anyhow::ensure!(
-            start + fetch_len <= claim,
-            "leg ({start}, {fetch_len}) runs past the claim"
-        );
-    }
+    .context("the stream and its drive end")??;
+    let want = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + 1_000)?)
+        .context("window inside the blob")?;
+    anyhow::ensure!(got == want, "{} of {} bytes", got.len(), want.len());
     Ok(())
 }
 
-/// A window needs a size: only offset `0` opens against a zero claim (the
-/// empty blob, or a stream that learns the size from its first leg).
+/// A window streams with no size claim at all: it plans to its own end.
 #[tokio::test]
-async fn a_window_past_zero_needs_a_size_claim() -> anyhow::Result<()> {
+async fn a_deep_window_streams_with_no_size_claim() -> anyhow::Result<()> {
     let blob = payload(100_000);
-    let (source, ledger) = paying_source(blob)?;
-    let root = source.root();
-    let probe = source.clone();
-    let scratch = tempfile::tempdir()?;
-    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
-    let opened = streamer
-        .open_range(
-            root,
+    let (source, ledger) = paying_source(blob.clone())?;
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        drain_range(
+            source,
+            ledger,
             0,
             (4_096, 1_000),
-            &PullConfig::default(),
             Arc::new(NoCache),
-            stop(),
-        )
-        .await;
-    anyhow::ensure!(opened.is_err(), "a deep window with no size must not open");
-    anyhow::ensure!(
-        probe.opened_ranges().is_empty(),
-        "nothing is fetched for it"
-    );
+            &PullConfig::default(),
+        ),
+    )
+    .await
+    .context("the stream and its drive end")??;
+    let want = blob.get(4_096..5_096).context("window inside the blob")?;
+    anyhow::ensure!(got == want, "{} of {} bytes", got.len(), want.len());
     Ok(())
 }
 

@@ -37,16 +37,22 @@ use crate::stop::{ProgressClock, StopPolicy};
 use crate::{ClientRangedStore, RangedStore};
 
 /// One blob to fetch and where to write it: the content `hash` (the bao root),
-/// its `total_bytes` (authoritative for keying the store and sizing the fetch),
-/// the caller-chosen `dest` path the `.partial` and final file are keyed by,
-/// and the byte ranges to fill.
+/// a size that picks the first leg's shape (`total_bytes`), the caller-chosen
+/// `dest` path the `.partial` and final file are keyed by, and the byte
+/// ranges to fill.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadTarget<'a> {
     /// The blob's BLAKE3 content address (its bao root); every ingested byte is
     /// verified against it.
     pub hash: [u8; 32],
-    /// The blob's content length in bytes.
+    /// The size the first leg's sender signs (`0`: none), or with `declared`
+    /// a size the caller holds authenticated
+    /// ([`crate::AcquireTarget::total_bytes`]). A leg that verifies the
+    /// final chunk proves the size.
     pub total_bytes: u64,
+    /// `total_bytes` is authenticated, such as a bundle manifest entry's
+    /// size ([`crate::AcquireTarget::declared`]).
+    pub declared: bool,
     /// Where to write the finished blob. The `.partial` store and the promoted
     /// final file are keyed by this path, so the finished file IS `dest`.
     pub dest: &'a Path,
@@ -93,7 +99,13 @@ pub struct DownloadTarget<'a> {
 ///     dest: &Path,
 /// ) -> anyhow::Result<()> {
 ///     let downloader = Downloader::new(StaticSources::new(candidates)?, funder);
-///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None };
+///     let target = DownloadTarget {
+///         hash,
+///         total_bytes,
+///         declared: false,
+///         dest,
+///         ranges: None,
+///     };
 ///     downloader.fetch_to_paths(&[target], None).await?;
 ///     Ok(())
 /// }
@@ -229,8 +241,8 @@ impl<P, F> Downloader<P, F> {
     /// Cap the bytes held for every target at `max_blob_bytes` (`0` for no
     /// cap). A target's ranges are fetched at any offset while the bytes held
     /// fit; ranges that would hold more fail with [`crate::BlobTooLarge`]
-    /// ([`crate::AcquireEnv::max_blob_bytes`]). A size claim past the
-    /// furthest range start plus the cap never sizes the store.
+    /// ([`crate::AcquireEnv::max_blob_bytes`]). The fetch never plans past
+    /// the furthest range start plus the cap.
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
         self.max_blob_bytes = max_blob_bytes;
@@ -272,6 +284,7 @@ where
             .map(|(&(hash, total_bytes), dest)| DownloadTarget {
                 hash,
                 total_bytes,
+                declared: false,
                 dest,
                 ranges: None,
             })
@@ -313,9 +326,9 @@ where
     /// correctly. The whole blob is fetched at full throughput, with no
     /// read-ahead bound.
     ///
-    /// `total_bytes` is the first size claim, a hint: a resumed store's bound
-    /// wins over it, and a leg that verifies the final chunk proves the size.
-    /// The target `hash` is the bao root every ingested byte is verified
+    /// `total_bytes` picks the first leg's shape and never plans past what
+    /// verifies ([`crate::acquire`]); a leg that verifies the final chunk
+    /// proves the size. The target `hash` is the bao root every ingested byte is verified
     /// against: a wrong hash surfaces as a verification failure, never as
     /// silent corruption. A finalize whose whole-file hash does not match
     /// (bytes that drifted on disk after they verified) fetches the target
@@ -376,17 +389,17 @@ where
             tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
-            let whole = [(0, target.total_bytes)];
+            // The whole blob is a tail from offset 0: it runs to the size a
+            // leg proves.
+            let whole = [(0, 0)];
             let ranges = target.ranges.unwrap_or(&whole);
             // Off the runtime: opening a finalized blob hashes its final file.
+            // The acquire loop sets the store's bound from what it knows.
             let store = {
                 let (dir, stem) = (dir.clone(), stem.clone());
-                let (hash, total) = (target.hash, target.total_bytes);
-                // A claim past what the cap on held bytes lets the ranges
-                // reach never sizes the store.
-                let total = total.min(crate::scheduler::claim_reach(ranges, self.max_blob_bytes));
+                let hash = target.hash;
                 tokio::task::spawn_blocking(move || {
-                    ClientRangedStore::open_or_create(&dir, &stem, hash, total)
+                    ClientRangedStore::open_or_create(&dir, &stem, hash, 0)
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("open ranged store task: {e}"))?
@@ -424,10 +437,10 @@ where
                 let flush_on_drop = store.flush_on_drop();
                 let fetched = acquire(
                     AcquireTarget {
-                        bounded: false,
                         store: &store,
                         hash: target.hash,
                         total_bytes: target.total_bytes,
+                        declared: target.declared,
                         ranges,
                     },
                     &mut sources,

@@ -18,7 +18,6 @@ pub(crate) fn holder(seed: u8, rtt_ms: f64) -> discovery::Probed {
             multiaddrs: Bytes::new(),
         },
         rtt_ms,
-        total_bytes: Some(128 * 1024 * 1024),
         coverage: decdn_protocol::Coverage::empty(),
     }
 }
@@ -47,7 +46,6 @@ pub(crate) fn two_holder_targets() -> (ResolvedTargets, NodeCandidate, NodeCandi
         coverage_by_node: ordered.coverage_by_node,
         probed_samples,
         pinned: false,
-        size_hint: Some(128 * 1024 * 1024),
         late: super::LateSlot::default(),
     };
     (targets, node_a, node_b)

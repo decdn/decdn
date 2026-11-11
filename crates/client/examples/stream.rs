@@ -30,7 +30,9 @@ async fn main() -> Result<()> {
     )?;
 
     let buyer = Buyer::connect(Env::from_env()?).await?;
-    let (holders, total_bytes) = buyer.holders(*hash.as_bytes()).await?;
+    let holders = buyer.holders(*hash.as_bytes()).await?;
+    // No size claim: the stream plans from the bytes that verify.
+    let total_bytes = 0;
     let (candidates, lanes) = buyer.lanes(holders).await?;
 
     // The streamer keeps its verified range store in a scratch directory. It is

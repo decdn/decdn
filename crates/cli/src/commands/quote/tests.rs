@@ -1,7 +1,7 @@
 use alloy::primitives::Address;
 use decdn_client::bundle::ManifestEntry;
 use decdn_client::discovery::NodeCandidate;
-use decdn_client::quote::{HashCensus, NodeAnswer};
+use decdn_client::quote::{HashCensus, NodeAnswer, wire_bytes};
 
 use clap::Parser as _;
 
@@ -18,13 +18,12 @@ fn node(seed: u8) -> NodeCandidate {
     }
 }
 
-fn answer(seed: u8, rtt_ms: f64, rate_per_mb: u64, has_blob: bool, size: u64) -> NodeAnswer {
+fn answer(seed: u8, rtt_ms: f64, rate_per_mb: u64, has_blob: bool) -> NodeAnswer {
     NodeAnswer {
         candidate: node(seed),
         rtt_ms,
         rate_per_mb,
         has_blob,
-        total_bytes: has_blob.then_some(size),
         coverage: decdn_protocol::Coverage::empty(),
     }
 }
@@ -59,45 +58,38 @@ fn entry(path: &str, hash: u8, size: Option<u64>) -> ManifestEntry {
     ManifestEntry::new(path, [hash; 32], size)
 }
 
-/// A blob quote takes its size from the nearest holder and prices the
-/// holders it would draw from.
+/// A blob's size is learned from the bytes a pull verifies, so a blob quote
+/// shows its nodes and rates, with no total and no estimate.
 #[test]
-fn a_blob_quote_prices_its_holders() {
+fn a_blob_quote_shows_nodes_and_rates_alone() {
     let hash = [9; 32];
     let census = Census {
         probed: 8,
         hashes: vec![hash_census(
             hash,
             vec![
-                answer(1, 10.0, 10, true, 15 * GB),
-                answer(2, 20.0, 11, true, 15 * GB),
-                answer(3, 5.0, 3, false, 0),
+                answer(1, 10.0, 10, true),
+                answer(2, 20.0, 11, true),
+                answer(3, 5.0, 3, false),
             ],
         )],
         outage_fallback: false,
     };
-    let view = view(&Plan::Blob(hash), &census, 20, no_warming(), 4).unwrap();
-    assert_eq!(view.content_bytes, Some(15 * GB));
+    let view = view(&Plan::Blob(hash), &census, 20, no_warming(), 4);
+    assert_eq!(view.content_bytes, None);
+    assert_eq!(view.wire_bytes, None);
+    assert_eq!(view.price, None);
     assert_eq!(view.holders, Some((2, 2)));
     assert_eq!(view.rates, Some((10, 11)));
     assert_eq!(view.above_ceiling, 0);
-    let wire = decdn_client::quote::wire_bytes(15 * GB).unwrap();
-    let price = view.price.unwrap();
-    assert_eq!(
-        price.low,
-        decdn_incentive::rate::min_payment(wire, 10),
-        "{price:?}"
-    );
-    assert_eq!(price.high, decdn_incentive::rate::min_payment(wire, 11));
     assert_eq!(
         text(&view),
-        "blob     15.0 GB\n\
-         nodes    2 of 8 hold it   rates 0.0095–0.0105 USDC/GB   (ceiling: 0.0191 USDC/GB)\n\
-         estimate 0.14–0.16 USDC   likely 0.15 USDC\n"
+        "blob\n\
+         nodes    2 of 8 hold it   rates 0.0095–0.0105 USDC/GB   (ceiling: 0.0191 USDC/GB)\n"
     );
 }
 
-/// A node above the ceiling is left out of the price and named in a note.
+/// A node above the ceiling is left out of the rates and named in a note.
 #[test]
 fn a_node_above_the_ceiling_is_left_out() {
     let hash = [9; 32];
@@ -105,52 +97,34 @@ fn a_node_above_the_ceiling_is_left_out() {
         probed: 2,
         hashes: vec![hash_census(
             hash,
-            vec![answer(1, 10.0, 50, true, GB), answer(2, 20.0, 10, true, GB)],
+            vec![answer(1, 10.0, 50, true), answer(2, 20.0, 10, true)],
         )],
         outage_fallback: false,
     };
-    let view = view(&Plan::Blob(hash), &census, 20, no_warming(), 4).unwrap();
+    let view = view(&Plan::Blob(hash), &census, 20, no_warming(), 4);
     assert_eq!(view.rates, Some((10, 10)));
     assert_eq!(view.above_ceiling, 1);
     let out = text(&view);
     assert!(out.contains("1 node(s) above the ceiling"), "{out}");
-
-    let all_above = view_all_above(hash);
-    let out = text(&all_above);
-    assert!(
-        out.contains("estimate none: every answering node is above the ceiling"),
-        "{out}"
-    );
 }
 
-fn view_all_above(hash: [u8; 32]) -> QuoteView {
-    let census = Census {
-        probed: 1,
-        hashes: vec![hash_census(hash, vec![answer(1, 10.0, 50, true, GB)])],
-        outage_fallback: false,
-    };
-    view(&Plan::Blob(hash), &census, 20, no_warming(), 4).unwrap()
-}
-
-/// A blob no node holds has no size yet, so the quote gives its rates and
-/// no price.
+/// A blob no node holds gives its rates and no price.
 #[test]
 fn a_cold_blob_has_rates_but_no_size() {
     let hash = [9; 32];
     let census = Census {
         probed: 3,
-        hashes: vec![hash_census(hash, vec![answer(1, 10.0, 10, false, 0)])],
+        hashes: vec![hash_census(hash, vec![answer(1, 10.0, 10, false)])],
         outage_fallback: false,
     };
-    let view = view(&Plan::Blob(hash), &census, 0, no_warming(), 4).unwrap();
+    let view = view(&Plan::Blob(hash), &census, 0, no_warming(), 4);
     assert_eq!(view.content_bytes, None);
     assert_eq!(view.price, None);
     assert_eq!(
         text(&view),
-        "blob     size unknown\n\
+        "blob\n\
          nodes    none of 3 hold it; they pull it through from origin   rates 0.0095 USDC/GB   \
-         (ceiling: none)\n\
-         estimate unknown: no holder reported the size\n"
+         (ceiling: none)\n"
     );
 }
 
@@ -173,13 +147,13 @@ fn a_bundle_quote_samples_its_largest_blobs() {
             .map(|&h| {
                 hash_census(
                     h,
-                    vec![answer(1, 10.0, 10, true, 0), answer(2, 20.0, 10, true, 0)],
+                    vec![answer(1, 10.0, 10, true), answer(2, 20.0, 10, true)],
                 )
             })
             .collect(),
         outage_fallback: false,
     };
-    let view = view(&plan, &census, 0, no_warming(), 4).unwrap();
+    let view = view(&plan, &census, 0, no_warming(), 4);
     assert_eq!(view.content_bytes, Some(21 * GB));
     assert_eq!(
         view.sample,
@@ -237,11 +211,11 @@ fn a_blob_with_no_usable_rate_is_priced_and_named() {
                 rate_limited: 1,
                 ..hash_census([1; 32], Vec::new())
             },
-            hash_census([2; 32], vec![answer(1, 10.0, 10, true, 0)]),
+            hash_census([2; 32], vec![answer(1, 10.0, 10, true)]),
         ],
         outage_fallback: true,
     };
-    let view = view(&plan, &census, 0, no_warming(), 4).unwrap();
+    let view = view(&plan, &census, 0, no_warming(), 4);
     assert_eq!(view.unrated_blobs, 1);
     assert_eq!(view.holders, Some((0, 1)));
     let price = view.price.unwrap();
@@ -274,7 +248,7 @@ fn a_bundle_with_nothing_to_probe_makes_no_node_claim() {
     let no_sizes = BundleManifest::new([0xbb; 32], vec![entry("a", 1, None)]);
     let plan = Plan::bundle(&no_sizes, None).unwrap();
     assert!(plan.sample().is_empty());
-    let view = view(&plan, &empty, 0, no_warming(), 4).unwrap();
+    let view = view(&plan, &empty, 0, no_warming(), 4);
     assert_eq!(view.holders, None);
     assert_eq!(
         text(&view),
@@ -295,7 +269,7 @@ fn a_bundle_with_nothing_to_probe_makes_no_node_claim() {
 }
 
 fn view_of(plan: &Plan, census: &Census) -> QuoteView {
-    view(plan, census, 0, no_warming(), 4).unwrap()
+    view(plan, census, 0, no_warming(), 4)
 }
 
 /// An entry URI plans its one entry, and a missing entry is an error.
@@ -315,7 +289,7 @@ fn an_entry_plan_keeps_its_entry() {
     assert_eq!(plan.sample(), vec![[2; 32]]);
     let census = Census {
         probed: 1,
-        hashes: vec![hash_census([2; 32], vec![answer(1, 10.0, 10, true, 0)])],
+        hashes: vec![hash_census([2; 32], vec![answer(1, 10.0, 10, true)])],
         outage_fallback: false,
     };
     let view = view_of(&plan, &census);
@@ -341,15 +315,16 @@ fn an_entry_plan_keeps_its_entry() {
 /// The JSON quote carries exact micro-USDC strings and the raw rates.
 #[test]
 fn the_json_quote_is_exact() {
-    let hash = [9; 32];
+    let manifest = BundleManifest::new([0xbb; 32], vec![entry("f", 9, Some(1 << 20))]);
+    let plan = Plan::bundle(&manifest, None).unwrap();
     let census = Census {
         probed: 1,
-        hashes: vec![hash_census(hash, vec![answer(1, 10.0, 8, true, 1 << 20)])],
+        hashes: vec![hash_census([9; 32], vec![answer(1, 10.0, 8, true)])],
         outage_fallback: false,
     };
-    let view = view(&Plan::Blob(hash), &census, 0, no_warming(), 4).unwrap();
-    let json = json_quote("decdn:x", &view);
-    assert_eq!(json["target"], "blob");
+    let view = view(&plan, &census, 0, no_warming(), 4);
+    let json = json_quote("decdn:x/", &view);
+    assert_eq!(json["target"], "bundle");
     assert_eq!(json["content_bytes"], 1 << 20);
     assert_eq!(json["rate_min_per_mib"], 8);
     assert_eq!(json["ceiling_per_mib"], serde_json::Value::Null);
@@ -374,6 +349,16 @@ fn the_estimate_line_reads_one_figure_or_a_range() {
         "Estimate: 0.28–0.33 USDC, likely 0.31 USDC (29.0 GB at 0.0095–0.0114 USDC/GB)"
     );
     assert_eq!(estimate_line((GB, GB), &[], 4), None);
+}
+
+/// A pull of unknown size names its nodes and rates, and no total.
+#[test]
+fn the_rates_line_names_nodes_and_rates_alone() {
+    assert_eq!(
+        rates_line(&[10, 12]).unwrap(),
+        "Rates: 2 node(s) at 0.0095–0.0114 USDC/GB"
+    );
+    assert_eq!(rates_line(&[]), None);
 }
 
 /// Rates convert from micro-USDC per MiB to USDC per SI GB, rounded.

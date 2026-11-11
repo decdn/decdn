@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     let dest = PathBuf::from(args.next().context("pass an output path")?);
 
     let buyer = Buyer::connect(Env::from_env()?).await?;
-    let (holders, total_bytes) = buyer.holders(*hash.as_bytes()).await?;
+    let holders = buyer.holders(*hash.as_bytes()).await?;
     let (candidates, lanes) = buyer.lanes(holders).await?;
 
     // The `NoFunding` funder never adds funds: a fetch no holder serves at
@@ -39,7 +39,10 @@ async fn main() -> Result<()> {
         .fetch_to_paths(
             &[DownloadTarget {
                 hash: *hash.as_bytes(),
-                total_bytes,
+                // No size claim: the download plans from the bytes that
+                // verify.
+                total_bytes: 0,
+                declared: false,
                 dest: &dest,
                 ranges: None,
             }],

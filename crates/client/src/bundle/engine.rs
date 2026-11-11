@@ -105,7 +105,7 @@ use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
     ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
-    pinned_targets, probe_and_order, probe_pinned,
+    pinned_targets, probe_and_order,
 };
 use crate::{
     ClientRangedStore, Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded,
@@ -1806,46 +1806,26 @@ impl<P: Provider + Clone> PullCtx<P> {
         stop: &StopPolicy,
     ) -> anyhow::Result<bool> {
         slot.ensure().await?;
-        let targets = self.entry_targets(hash, total).await?;
+        let targets = self.entry_targets(hash).await?;
         self.acquire_entry(&targets, hash, staging, total, None, progress, stop)
             .await
     }
 
-    /// One entry's holders: the pinned node, probed for the blob's size when
-    /// `total` (the manifest's size) gives none, or a fresh probe of the
-    /// entry's own registry sample (proxy-warming non-holders first when they
+    /// One entry's holders: the pinned node, or a fresh probe of the entry's
+    /// own registry sample (proxy-warming non-holders first when they
     /// help, then holders nearest RTT first). An entry resolves them once and
     /// every fetch of the entry reuses them. A resolution that fails for any
     /// reason but the configuration ([`holders_or_none`]) starts the
     /// entry with no holder, and its acquire loop discovers them.
-    async fn entry_targets(
-        &self,
-        hash: [u8; 32],
-        total: Option<u64>,
-    ) -> anyhow::Result<ResolvedTargets> {
-        holders_or_none(self.resolve_entry_targets(hash, total).await)
+    async fn entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
+        holders_or_none(self.resolve_entry_targets(hash).await)
     }
 
     /// [`Self::entry_targets`] before a failure is sorted into a configuration
     /// fault or an empty start.
-    async fn resolve_entry_targets(
-        &self,
-        hash: [u8; 32],
-        total: Option<u64>,
-    ) -> anyhow::Result<ResolvedTargets> {
+    async fn resolve_entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
         match &self.nodes.selection {
-            Selection::Pinned(pinned) if total.is_some() => {
-                Ok(pinned_targets(pinned.node_id, pinned.provider))
-            }
-            Selection::Pinned(pinned) => Ok(probe_pinned(
-                &self.endpoint,
-                &self.chain,
-                self.relays.first().cloned(),
-                *pinned,
-                hash,
-                None,
-            )
-            .await),
+            Selection::Pinned(pinned) => Ok(pinned_targets(pinned.node_id, pinned.provider)),
             Selection::Registry(registry) => {
                 // The entry's round streams: its fetch starts at the first
                 // verified holder, and the holders that answer later join it.
@@ -1956,15 +1936,16 @@ impl<P: Provider + Clone> PullCtx<P> {
         // vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
-            // The manifest's size is the entry's first claim; without one, the
-            // probe's hint or a whole-blob open's header gives it.
-            let (total_bytes, holders) = if let Some(total) = total {
-                (total, holders)
+            // The manifest's size, authenticated under the manifest's root, is
+            // the entry's first bound; without one, the header of a first-leg
+            // open gives the claim that picks the first leg's shape.
+            let (total_bytes, declared, holders) = if let Some(total) = total {
+                (total, true, holders)
             } else {
                 let claim = sources
                     .first_claim(hash, holders, FirstLeg::Whole, &self.health, stop)
                     .await?;
-                (claim.total_bytes, claim.holders)
+                (claim.total_bytes, false, claim.holders)
             };
             // The max sources cap the lanes the entry stripes across at
             // once; every other holder waits as a reserve.
@@ -1982,6 +1963,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 &[DownloadTarget {
                     hash,
                     total_bytes,
+                    declared,
                     dest: staging,
                     ranges,
                 }],
@@ -2592,7 +2574,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // Resolve the entry's holders ONCE and reuse them across every drive
         // below (complement, donor re-fetch, whole-blob re-drive), so the entry
         // probes exactly once.
-        let targets = self.entry_targets(hash, Some(total)).await?;
+        let targets = self.entry_targets(hash).await?;
         let driver = AcquireRangeDriver {
             ctx: self,
             targets: &targets,

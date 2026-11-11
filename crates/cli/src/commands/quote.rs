@@ -33,7 +33,6 @@ use decdn_client::bundle::{BundleManifest, PlannedBlob, planned_downloads};
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::quote::{
     CENSUS_ENTRY_SAMPLE, Census, PriceRange, PricedBlob, RateHint, census, hint_rates, price,
-    wire_bytes,
 };
 use decdn_client::session::{PoolOpen, ProxyWarmingParams};
 use decdn_client::targets::ResolveConfigFault;
@@ -258,13 +257,13 @@ impl QuoteHost {
             &plan.sample(),
         )
         .await?;
-        view(
+        Ok(view(
             plan,
             &census,
             common.max_rate_per_mb,
             discovery.proxy_warming,
             common.max_sources,
-        )
+        ))
     }
 
     /// Close the endpoint, so its connections end cleanly.
@@ -397,8 +396,8 @@ pub(crate) struct Sample {
 pub(crate) struct QuoteView {
     /// What the URI names.
     pub(crate) target: Target,
-    /// The content bytes a fresh pull downloads; `None` for a blob no
-    /// holder reported a size for.
+    /// The content bytes a fresh pull downloads; `None` for a blob URI, whose
+    /// size is learned from the bytes a pull verifies.
     pub(crate) content_bytes: Option<u64>,
     /// The wire bytes it pays for, bao proof included.
     pub(crate) wire_bytes: Option<u64>,
@@ -439,31 +438,24 @@ fn widen<T: Copy + Ord>(range: Option<(T, T)>, x: T) -> (T, T) {
 
 /// Price `plan` from `census`, ranking each blob's answers as the pull does
 /// under `ceiling`, `warming` and `max_sources`.
-///
-/// # Errors
-///
-/// The bao wire length of a size cannot be computed.
 pub(crate) fn view(
     plan: &Plan,
     census: &Census,
     ceiling: u64,
     warming: ProxyWarmingParams,
     max_sources: usize,
-) -> anyhow::Result<QuoteView> {
+) -> QuoteView {
     let mut priced = Vec::new();
     let mut rates = None;
     let mut holders = None;
     let mut above = HashSet::new();
     let (mut unanswered, mut rate_limited, mut unrated_blobs) = (0, 0, 0);
-    let mut blob_size = None;
     for probed in &census.hashes {
-        // The blob's wire bytes: a blob URI's from the nearest holder's
-        // size, a bundle blob's from its planned download ranges.
+        // A bundle blob's wire bytes, from its planned download ranges. A
+        // blob URI has none: its size is learned from the bytes a pull
+        // verifies, so it is not priced.
         let wire = match plan {
-            Plan::Blob(_) => {
-                blob_size = probed.size_hint();
-                blob_size.map(wire_bytes).transpose()?
-            }
+            Plan::Blob(_) => None,
             Plan::Bundle { blobs, .. } => {
                 blobs.iter().find(|b| b.hash == probed.hash).map(|b| b.wire)
             }
@@ -497,13 +489,7 @@ pub(crate) fn view(
         }
     }
     let (content_bytes, wire_total, unsampled_wire, sample, unsized_blobs) = match plan {
-        Plan::Blob(_) => (
-            blob_size,
-            blob_size.map(wire_bytes).transpose()?,
-            0,
-            None,
-            0,
-        ),
+        Plan::Blob(_) => (None, None, 0, None, 0),
         Plan::Bundle { blobs, .. } => {
             let sampled: HashSet<[u8; 32]> = census.hashes.iter().map(|h| h.hash).collect();
             let mut unsampled = 0u64;
@@ -535,7 +521,7 @@ pub(crate) fn view(
         }
     };
     let price = content_bytes.and_then(|_| price(&priced, unsampled_wire, max_sources));
-    Ok(QuoteView {
+    QuoteView {
         target: plan.target(),
         content_bytes,
         wire_bytes: wire_total,
@@ -551,7 +537,7 @@ pub(crate) fn view(
         sample,
         unrated_blobs,
         unsized_blobs,
-    })
+    }
 }
 
 /// Write the quote's text block to `w`.
@@ -564,7 +550,9 @@ pub(crate) fn write_quote(w: &mut impl Write, view: &QuoteView) -> std::io::Resu
         .content_bytes
         .map_or_else(|| "size unknown".to_owned(), human_bytes);
     match &view.target {
-        Target::Blob => writeln!(w, "blob     {size}")?,
+        // A blob's size is learned from the bytes a pull verifies, so a quote
+        // shows its nodes and rates alone.
+        Target::Blob => writeln!(w, "blob")?,
         Target::Bundle { entries } => writeln!(w, "bundle   {size} in {entries} entries")?,
         Target::Entry { path } => writeln!(w, "entry    {path}  {size}")?,
     }
@@ -603,7 +591,7 @@ pub(crate) fn write_quote(w: &mut impl Write, view: &QuoteView) -> std::io::Resu
             usdc_range(price.low, price.high),
             usdc_short(price.likely)
         )?,
-        (None, None) => writeln!(w, "estimate unknown: no holder reported the size")?,
+        (None, None) => {}
         (None, Some(0)) if view.unsized_blobs > 0 => {
             writeln!(w, "estimate unknown: no blob declares a size")?;
         }
@@ -723,6 +711,28 @@ pub(crate) fn estimate_line(
         human_bytes(content),
         rate_range(lo, hi)
     ))
+}
+
+/// The one-line view of a pull whose size is learned from the bytes it
+/// verifies: how many nodes it draws from and at what rates, with no total
+/// and no estimate. `None` with no rate.
+pub(crate) fn rates_line(rates: &[u64]) -> Option<String> {
+    let lo = rates.iter().copied().min()?;
+    let hi = rates.iter().copied().max()?;
+    Some(format!(
+        "Rates: {} node(s) at {} USDC/GB",
+        rates.len(),
+        rate_range(lo, hi)
+    ))
+}
+
+/// Print [`rates_line`] on stderr for the nodes of `hints`, under `common`'s
+/// ceiling. Nothing prints when no hint has a usable rate.
+pub(crate) fn print_rates(hints: &[RateHint], common: &ClientFetchArgs) {
+    let rates = hint_rates(hints, common.max_rate_per_mb);
+    if let Some(line) = rates_line(&rates) {
+        eprintln!("{line}");
+    }
 }
 
 /// Print `decdn get`'s one-line estimate ([`estimate_line`]) on stderr for a

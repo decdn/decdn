@@ -398,10 +398,6 @@ pub struct ProbeOpts<'a> {
     pub marks: Option<&'a dyn FetchMarks>,
     /// How the probe round ends.
     pub round: ProbeRound,
-    /// The blob's size as the caller knows it (a bundle manifest's entry
-    /// size, or one an earlier fetch verified): the fetch's first size claim,
-    /// in place of any probe's hint. A pinned node is not probed for it.
-    pub known_size: Option<u64>,
 }
 
 impl std::fmt::Debug for ProbeOpts<'_> {
@@ -409,7 +405,6 @@ impl std::fmt::Debug for ProbeOpts<'_> {
         f.debug_struct("ProbeOpts")
             .field("marks", &self.marks.is_some())
             .field("round", &self.round)
-            .field("known_size", &self.known_size)
             .finish()
     }
 }
@@ -554,7 +549,6 @@ pub(crate) fn classify_probe(
             discovery::Probed {
                 candidate: cand.clone(),
                 rtt_ms,
-                total_bytes: resp_ext.total_bytes,
                 coverage: resp_ext.coverage,
             },
             sample,
@@ -685,7 +679,6 @@ pub async fn probe_and_order(
         );
     }
 
-    let size_hint = nearest_size_hint(&holders);
     let late = late_slot(round, tail, &holders, warming);
     let ordered = failover_order(holders, &non_holders, warming);
     if let Some((node_id, proxy_rtt, best_holder_rtt)) = ordered.warming_lead {
@@ -700,7 +693,6 @@ pub async fn probe_and_order(
         coverage_by_node: ordered.coverage_by_node,
         probed_samples,
         pinned: false,
-        size_hint,
         late,
     })
 }
@@ -745,16 +737,6 @@ where
         best_holder_rtt_ms,
         warming,
     })
-}
-
-/// The size hint of the nearest holder that gave one: the fetch's first size
-/// claim ([`ResolvedTargets::size_hint`]).
-fn nearest_size_hint(holders: &[discovery::Probed]) -> Option<u64> {
-    holders
-        .iter()
-        .filter(|h| h.total_bytes.is_some())
-        .min_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms))
-        .and_then(|h| h.total_bytes)
 }
 
 /// The ordered provider-failover list plus, when a proxy leads it, that proxy's
@@ -1061,7 +1043,6 @@ fn store_fast_path(
         coverage_by_node: HashMap::new(),
         probed_samples: Vec::new(),
         pinned: false,
-        size_hint: None,
         late: LateSlot::default(),
     })
 }
@@ -1250,7 +1231,6 @@ pub fn holders_or_none(
                 coverage_by_node: HashMap::new(),
                 probed_samples: Vec::new(),
                 pinned: false,
-                size_hint: None,
                 late: LateSlot::default(),
             })
         }
@@ -1274,12 +1254,6 @@ pub struct ResolvedTargets {
     /// The one candidate is the `--node-id` the user pinned. It counts as a
     /// holder, as a probe-reported holder does.
     pub(crate) pinned: bool,
-    /// The blob size the nearest probed holder reported, an unsigned hint
-    /// ([`discovery::Probed::total_bytes`]). `None` when nothing was probed
-    /// (the peer-store fast path, a pinned rediscovery, a pinned bundle entry
-    /// whose manifest gives its size), when no holder knew it, or when a
-    /// pinned `--node-id`'s probe failed or named no size.
-    pub(crate) size_hint: Option<u64>,
     /// The probes a streamed round left pending ([`ProbeRound::Stream`]).
     /// Empty on every other path.
     pub(crate) late: LateSlot,
@@ -1290,7 +1264,6 @@ impl std::fmt::Debug for ResolvedTargets {
         f.debug_struct("ResolvedTargets")
             .field("candidates", &self.candidates.len())
             .field("pinned", &self.pinned)
-            .field("size_hint", &self.size_hint)
             .finish_non_exhaustive()
     }
 }
@@ -1324,10 +1297,7 @@ impl ResolvedTargets {
     }
 }
 
-/// The one holder of a pinned `--node-id` at `provider`, with no size hint.
-/// A fetch that knows the blob's size (a manifest's entry size) takes that
-/// as its hint; any other fetch takes one from a probe of the node
-/// ([`probe_pinned`]).
+/// The one holder of a pinned `--node-id` at `provider`.
 pub(crate) fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
     ResolvedTargets {
         candidates: vec![NodeCandidate {
@@ -1343,14 +1313,12 @@ pub(crate) fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedT
         // A pinned fetch harvests no peer-store sample.
         probed_samples: Vec::new(),
         pinned: true,
-        size_hint: None,
         late: LateSlot::default(),
     }
 }
 
 /// Resolve the holders to fetch from (#1174): the pinned node as the one
-/// holder, with the size its probe reports as the first size claim, or
-/// auto-discovery (#936) when nothing is pinned (deriving each provider from
+/// holder, or auto-discovery (#936) when nothing is pinned (deriving each provider from
 /// its node's registry entry), nearest first. The acquire loop stripes across
 /// them; a set that goes stale is refreshed by a later discovery with
 /// [`DiscoveryOptions::rediscover`] forced, which reads the registry rather
@@ -1370,27 +1338,13 @@ pub async fn resolve_target_node(
     hash: [u8; 32],
     probe: ProbeOpts<'_>,
 ) -> anyhow::Result<ResolvedTargets> {
-    // The pinned probe reads a size hint and is no reachability pre-check: a
-    // failed probe ends nothing, and a known size needs no probe. The endpoint
-    // is discovery-enabled, so a node id resolves through its discovery and
-    // default relays even with no direct address or configured relay. A
-    // pinned node is its own only holder: a fault cools it and the fetch
-    // waits for it to return.
+    // A pinned node is its own only holder, with no probe: the first open's
+    // header names its claim. A fault cools it and the fetch waits for it to
+    // return. The endpoint is discovery-enabled, so a node id resolves
+    // through its discovery and default relays even with no direct address
+    // or configured relay.
     if let Some(pinned) = opts.pinned {
-        if let Some(size) = probe.known_size {
-            let mut targets = pinned_targets(pinned.node_id, pinned.provider);
-            targets.size_hint = Some(size);
-            return Ok(targets);
-        }
-        return Ok(probe_pinned(
-            endpoint,
-            chain,
-            relays.first().cloned(),
-            pinned,
-            hash,
-            probe.marks,
-        )
-        .await);
+        return Ok(pinned_targets(pinned.node_id, pinned.provider));
     }
 
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
@@ -1409,7 +1363,7 @@ pub async fn resolve_target_node(
     // here also cancels the ADR 012 § Bootstrap step 4 peer-store fallback,
     // so a client with a usable peer store would be handed a hard failure
     // instead of the degraded-but-working fetch the store exists to provide.
-    let mut order = discover_provider(
+    let order = discover_provider(
         endpoint,
         (chain, site),
         capacity_bond,
@@ -1419,9 +1373,6 @@ pub async fn resolve_target_node(
         probe,
     )
     .await?;
-    if let Some(size) = probe.known_size {
-        order.size_hint = Some(size);
-    }
     if !order.candidates.is_empty() {
         // A header event, then one event per candidate — the log-side shape of
         // the previous per-line stderr listing.
@@ -1477,75 +1428,6 @@ pub(crate) fn pinned_target(
         target = target.with_ip_addr(addr);
     }
     (cand, target)
-}
-
-/// How long the size probe of a pinned node may take. The hint saves at most
-/// the credit window a header-only open makes the node write, so a slow probe
-/// is not worth the wait: the fetch takes its size from that open instead.
-const PINNED_PROBE_TIMEOUT_MS: u64 = 2_000;
-
-/// The pinned node as its own only holder, with the size its probe reports as
-/// the first size claim. Without a size, the fetch reads one from the header
-/// of a paid open, and the node can write up to a credit window into that
-/// stream before the fetch drops it. A probe that fails, that does not verify,
-/// or whose node does not hold the blob or names no size leaves the claim to
-/// that header: the node stays the fetch's only holder either way. One
-/// attempt, with no backoff on a shed probe: a pinned client sends every
-/// probe to the one node, and a shed one costs only the header open. The
-/// probe waits for no direct path, since its RTT goes unused.
-pub(crate) async fn probe_pinned(
-    endpoint: &Endpoint,
-    chain: &ChainConfig,
-    relay: Option<RelayUrl>,
-    pinned: PinnedNode,
-    hash: [u8; 32],
-    marks: Option<&dyn FetchMarks>,
-) -> ResolvedTargets {
-    let (cand, target) = pinned_target(pinned, relay);
-    if let Some(marks) = marks {
-        marks.probe_started();
-    }
-    let started = std::time::Instant::now();
-    let timestamp_us = micros_now();
-    let res = crate::probe::probe_answer_once(
-        endpoint,
-        target,
-        hash,
-        timestamp_us,
-        Duration::from_millis(PINNED_PROBE_TIMEOUT_MS),
-    )
-    .await;
-    log_probe_result(&cand, &res, started);
-    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-    let outcome = classify_probe(&cand, res, hash, timestamp_us, &slash_dom);
-    if matches!(outcome, ProbeOutcome::NonHolder(..)) {
-        if chain.capacity_bond.is_none() {
-            tracing::warn!(
-                node = %pinned.node_id,
-                "the pinned node does not hold this blob, and with no CapacityBond \
-                 configured this client sends no identity binding, so the node \
-                 refuses to fill the miss"
-            );
-        } else {
-            tracing::info!(
-                node = %pinned.node_id,
-                "the pinned node does not hold this blob; it serves it only if it can \
-                 fill the miss"
-            );
-        }
-    }
-    let mut targets = pinned_targets(pinned.node_id, pinned.provider);
-    targets.size_hint = probed_size_hint(&outcome);
-    targets
-}
-
-/// The size a probe outcome offers as a first size claim: the unsigned size a
-/// holder reports in an answer whose signature verifies, else none.
-const fn probed_size_hint(outcome: &ProbeOutcome) -> Option<u64> {
-    match outcome {
-        ProbeOutcome::Holder(probed, _) => probed.total_bytes,
-        _ => None,
-    }
 }
 
 /// Build a probe target for a discovered candidate: its `node_id`, an optional

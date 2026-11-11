@@ -74,7 +74,7 @@ pub async fn probe(
     // Transport and RTT measurement live in `probe_once`.
     let result = probe_once(&endpoint, target, hash, timestamp_us, timeout).await;
     endpoint.close().await;
-    let (resp, resp_ext, rtt) = result?;
+    let (resp, _resp_ext, rtt) = result?;
 
     // Correlation: the node echoes both the queried hash and the
     // requester timestamp (ADR 005). A mismatch means a stale/confused
@@ -104,7 +104,7 @@ pub async fn probe(
         .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
 
     let mut stdout = std::io::stdout().lock();
-    write_probe_response(&mut stdout, &resp, &resp_ext, rtt.ms, args.json)
+    write_probe_response(&mut stdout, &resp, rtt.ms, args.json)
         .map_err(|e| anyhow::anyhow!("failed to write probe response: {e}"))?;
     Ok(())
 }
@@ -117,7 +117,6 @@ pub async fn probe(
 pub(crate) fn write_probe_response(
     w: &mut impl std::io::Write,
     resp: &decdn_protocol::message::ProbeResponse,
-    resp_ext: &decdn_protocol::ProbeResponseExt,
     rtt_ms: f64,
     json: bool,
 ) -> std::io::Result<()> {
@@ -147,7 +146,6 @@ pub(crate) fn write_probe_response(
             "hash": hash_hex,
             "has_blob": resp.body.has_blob,
             "rate_per_mb": resp.body.rate_per_mb,
-            "total_bytes": resp_ext.total_bytes,
             "timestamp_us": resp.body.timestamp_us,
             "rtt_ms": rtt_ms_quantized,
             "slash_sig": slash_sig_hex,
@@ -157,10 +155,6 @@ pub(crate) fn write_probe_response(
         writeln!(w, "hash:          {hash_hex}")?;
         writeln!(w, "has_blob:      {}", resp.body.has_blob)?;
         writeln!(w, "rate_per_mb:   {} (base units)", resp.body.rate_per_mb)?;
-        match resp_ext.total_bytes {
-            Some(n) => writeln!(w, "total_bytes:   {n}")?,
-            None => writeln!(w, "total_bytes:   (unknown)")?,
-        }
         writeln!(w, "timestamp_us:  {} (echoed ok)", resp.body.timestamp_us)?;
         writeln!(w, "rtt:           {rtt_ms:.3} ms")?;
         writeln!(w, "slash_sig:     {slash_sig_hex}")

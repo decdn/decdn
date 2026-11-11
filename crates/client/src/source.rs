@@ -241,6 +241,14 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     fn set_bound(&self, bound: u64) {
         let _ = bound;
     }
+
+    /// The bytes verified knowledge proves the blob holds: every byte below
+    /// it exists. [`crate::acquire`] never treats a piece below it as past the
+    /// end of the blob. A store keyed by a fixed size knows that size, so the
+    /// default is [`total_bytes`](decdn_bao_range::RangedStore::total_bytes).
+    fn floor(&self) -> u64 {
+        self.total_bytes()
+    }
 }
 
 /// The current pool no longer accepts funds, and the funding recovery step

@@ -50,9 +50,6 @@ pub struct NodeAnswer {
     /// Whether the node holds the blob in its cache. A node that does not
     /// can still serve it through its own origin.
     pub has_blob: bool,
-    /// The blob size the node reported. Unsigned, so a hint only; `None`
-    /// from a non-holder, or from a holder that reported no size.
-    pub total_bytes: Option<u64>,
     /// The byte ranges the node holds. Unsigned; empty exactly when
     /// `has_blob` is false, which the census checks before it keeps an
     /// answer.
@@ -87,17 +84,6 @@ impl HashCensus {
         self.answers.iter().filter(|a| a.has_blob).count()
     }
 
-    /// The blob size the nearest holder reported, as a pull takes its first
-    /// size claim.
-    #[must_use]
-    pub fn size_hint(&self) -> Option<u64> {
-        self.answers
-            .iter()
-            .filter(|a| a.has_blob && a.total_bytes.is_some())
-            .min_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms))
-            .and_then(|a| a.total_bytes)
-    }
-
     /// The answers a pull that probed every node would draw from, in the
     /// order it tries them: proxy-warming non-holders first when warming
     /// engages, then the holders nearest RTT first, or the non-holders
@@ -115,7 +101,6 @@ impl HashCensus {
                 holders.push(discovery::Probed {
                     candidate: answer.candidate.clone(),
                     rtt_ms: answer.rtt_ms,
-                    total_bytes: answer.total_bytes,
                     coverage: answer.coverage.clone(),
                 });
             } else {
@@ -292,7 +277,6 @@ pub(crate) fn tally(
                 rtt_ms: probed.rtt_ms,
                 rate_per_mb,
                 has_blob: true,
-                total_bytes: probed.total_bytes,
                 coverage: probed.coverage,
             }),
             ProbeOutcome::NonHolder(warming, (_, _, rate_per_mb)) => {
@@ -301,7 +285,6 @@ pub(crate) fn tally(
                     rtt_ms: warming.rtt_ms,
                     rate_per_mb,
                     has_blob: false,
-                    total_bytes: None,
                     coverage: decdn_protocol::Coverage::empty(),
                 });
             }

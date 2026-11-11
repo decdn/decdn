@@ -4,9 +4,10 @@
 //! `iroh-blobs` dependency: `decdn-client` must stay iroh-blobs-free so the
 //! CLI's pull path links no blob store / AWS SDK (#578).
 //!
-//! The store is keyed by offset, not by size. A blob's size is a hint: the
-//! store holds the current size `bound` the planner works to, and a `proven`
-//! size once some leg proves one. Each leg verifies under the size its own
+//! The store is keyed by offset, not by size. A blob's size is a claim: the
+//! store holds the current size `bound` the planner works to, the `floor`
+//! verified knowledge proves exists, and a `proven` size once some leg
+//! proves one. Each leg verifies under the size its own
 //! sender claims, because a range can verify only under its sender's tree:
 //! `ingest_stream` realigns the leg under that claim and decodes with
 //! `BaoTree::new(claim, IROH_BLOCK_SIZE)`. A verified leaf is a genuine byte
@@ -55,13 +56,17 @@ const HASH_BUF_BYTES: usize = 1 << 20;
 /// `.partial.ranges` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoreState {
-    /// The size, in bytes, the planner works to: the caller's hint until a leg
-    /// proves a size, then the proven size.
+    /// The size, in bytes, the planner works to: the planner's choice until a
+    /// leg proves a size, then the proven size.
     bound: u64,
     /// The size a verified final chunk proved, if any.
     proven: Option<u64>,
     /// Chunk ranges verified present at their offsets.
     present: ChunkRanges,
+    /// The bytes verified knowledge proves the blob holds: every byte below it
+    /// exists ([`StoreState::raise_floor`]). Derived, not persisted: a
+    /// reopened store reads it from `present` and `proven`.
+    floor: u64,
 }
 
 impl StoreState {
@@ -71,14 +76,69 @@ impl StoreState {
             bound,
             proven: None,
             present: ChunkRanges::empty(),
+            floor: 0,
         }
     }
 
-    /// Record that a verified final chunk proved `size`: the bound becomes it.
+    /// A state read back from a record: the floor is what the record proves,
+    /// the proven size or the end of the last present chunk.
+    fn from_record(bound: u64, proven: Option<u64>, present: ChunkRanges) -> Self {
+        let floor = proven.unwrap_or_else(|| present_end(&present));
+        Self {
+            bound,
+            proven,
+            present,
+            floor,
+        }
+    }
+
+    /// Record that a verified final chunk proved `size`: the bound and the
+    /// floor become it.
     const fn prove(&mut self, size: u64) {
         self.proven = Some(size);
         self.bound = size;
+        self.floor = size;
     }
+
+    /// Record that verified knowledge proves every byte below `floor` exists.
+    /// While no size is proven, a bound below it rises to it: the planner may
+    /// plan every byte that exists.
+    fn raise_floor(&mut self, floor: u64) {
+        if self.proven.is_some() {
+            return;
+        }
+        self.floor = self.floor.max(floor);
+        self.bound = self.bound.max(self.floor);
+    }
+}
+
+/// The end, in bytes, of the last present chunk of `present`. A store with no
+/// proven size never holds the final chunk, so every chunk below this end is
+/// whole and every byte below it exists.
+fn present_end(present: &ChunkRanges) -> u64 {
+    present
+        .boundaries()
+        .last()
+        .map_or(0, |end| end.0.saturating_mul(1024))
+}
+
+/// The size of the left subtree under the root of a blob of `claim` bytes, in
+/// bytes: the largest power-of-two count of chunk groups below the claim's
+/// group count. `None` for a claim of at most one chunk group, whose tree is
+/// a single leaf.
+///
+/// The root pair is the true root's two children, so a leaf that verifies
+/// under `claim` proves the true tree splits where `claim`'s tree does: every
+/// leaf hash binds its chunk offset, so no leaf verifies under a tree of
+/// another depth. The true size then lies in `(split, 2 * split]`, and every
+/// byte below the split exists.
+pub(crate) const fn root_split(claim: u64) -> Option<u64> {
+    let groups = claim.div_ceil(decdn_bao_range::CHUNK_GROUP_BYTES);
+    if groups <= 1 {
+        return None;
+    }
+    let left_groups = 1u64 << (groups - 1).ilog2();
+    Some(left_groups.saturating_mul(decdn_bao_range::CHUNK_GROUP_BYTES))
 }
 
 /// The on-disk shape of a [`StoreState`]: `present` as the boundary list of
@@ -291,11 +351,7 @@ fn read_record(path: &Path) -> io::Result<StoreState> {
         }
         acc |= ChunkRanges::from(ChunkNum(a)..ChunkNum(b));
     }
-    Ok(StoreState {
-        bound,
-        proven,
-        present: acc,
-    })
+    Ok(StoreState::from_record(bound, proven, acc))
 }
 
 impl ClientRangedStore {
@@ -370,11 +426,7 @@ impl ClientRangedStore {
             let len = std::fs::metadata(&final_path)?.len();
             if prefix_matches(&File::open(&final_path)?, len, root)? {
                 let _ = std::fs::remove_file(&ranges_path);
-                let state = StoreState {
-                    bound: len,
-                    proven: Some(len),
-                    present: whole(len),
-                };
+                let state = StoreState::from_record(len, Some(len), whole(len));
                 return Ok(Self::with_state(root, final_path, ranges_path, state));
             }
         }
@@ -525,14 +577,24 @@ impl ClientRangedStore {
         &self.present_grew
     }
 
-    /// Move the planner's bound to `bound`. The record picks it up at its next
-    /// flush. A proven size is final: once a leg has proved one, the bound
-    /// stays at it and this does nothing.
+    /// Move the planner's bound to `bound`, never below the verified floor
+    /// ([`Self::floor`]). The record picks it up at its next flush. A proven
+    /// size is final: once a leg has proved one, the bound stays at it and
+    /// this does nothing.
     pub fn set_bound(&self, bound: u64) {
         let mut state = self.lock_state();
         if state.proven.is_none() {
-            state.bound = bound;
+            state.bound = bound.max(state.floor);
         }
+    }
+
+    /// The bytes verified knowledge proves the blob holds: the proven size,
+    /// or with none proven the larger of the end of the last verified chunk
+    /// and the root split (the left subtree's size) of every claim a leaf
+    /// verified under. Every byte below it exists.
+    #[must_use]
+    pub fn floor(&self) -> u64 {
+        self.lock_state().floor
     }
 
     /// The state under its lock. A poisoned lock still holds a consistent
@@ -644,7 +706,10 @@ impl ClientRangedStore {
     /// its genuine offset under any claim, so the store's own bound plays no
     /// part in verification. A leg that verifies the final chunk of
     /// `claimed_total` proves that size: the store sets `proven` and its bound
-    /// to it once that chunk is durable.
+    /// to it once that chunk is durable. The first leaf it verifies proves the
+    /// root split of `claimed_total` (the left subtree's size), and every durable
+    /// checkpoint proves its prefix: the store's floor rises to each, and an
+    /// unproven bound below the floor rises with it.
     ///
     /// The call verifies each chunk group against the root as
     /// [`bao_tree::io::fsm::ResponseDecoder`] decodes it, collects the verified
@@ -795,6 +860,9 @@ impl ClientRangedStore {
         let mut batch = FlushBatch::default();
         // The size at which the batch in progress checkpoints.
         let mut batch_target = Self::INGEST_FIRST_CHECKPOINT_BYTES;
+        // Whether a leaf has verified yet: the first one proves the claim's
+        // root split ([`root_split`]).
+        let mut split_proven = false;
 
         loop {
             match decoder.next().await {
@@ -804,6 +872,12 @@ impl ClientRangedStore {
                             .max(leaf.offset.saturating_add(
                                 u64::try_from(leaf.data.len()).unwrap_or(u64::MAX),
                             ));
+                    if !split_proven {
+                        split_proven = true;
+                        if let Some(split) = root_split(claimed_total) {
+                            self.lock_state().raise_floor(split);
+                        }
+                    }
                     batch.leaves.push((leaf.offset, leaf.data));
                     if let Some(cb) = on_progress {
                         cb(received_end.saturating_sub(range.fetch_start()));
@@ -1353,6 +1427,8 @@ fn sync_and_union(
             );
         }
         state.prove(claim);
+    } else {
+        state.raise_floor(received_end);
     }
     Ok(())
 }
@@ -1618,6 +1694,10 @@ impl crate::source::IngestStore for ClientRangedStore {
 
     fn set_bound(&self, bound: u64) {
         Self::set_bound(self, bound);
+    }
+
+    fn floor(&self) -> u64 {
+        Self::floor(self)
     }
 }
 

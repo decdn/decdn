@@ -483,13 +483,11 @@ fn partial_holders_carry_their_own_coverage_and_are_admitted_like_full_holders()
         Probed {
             candidate: op1.clone(),
             rtt_ms: 10.0,
-            total_bytes: Some(128 * 1024 * 1024),
             coverage: Coverage::from_block_indices(2, [0].into_iter()),
         },
         Probed {
             candidate: op2.clone(),
             rtt_ms: 12.0,
-            total_bytes: Some(128 * 1024 * 1024),
             coverage: Coverage::from_block_indices(2, [1].into_iter()),
         },
     ];

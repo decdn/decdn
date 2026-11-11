@@ -460,6 +460,11 @@ pub(crate) struct DriveCounters {
     /// [`PoolLedger::settlement`] held then. A caller that drops [`fill_gap`] mid-leg prices the leg's paid
     /// frontier from it ([`ended_frontiers`]). `None` before the first pass.
     pub(crate) leg_anchor: Option<(u64, U256)>,
+    /// The size the sender of the leg [`fill_gap`] opened last signs in its
+    /// header: the tree that leg's wire follows, so its paid wire maps back to
+    /// content under it ([`crate::sink::content_paid_frontier`]). `None`
+    /// before the first open.
+    pub(crate) leg_claim: Option<u64>,
 }
 
 impl DriveCounters {
@@ -471,6 +476,7 @@ impl DriveCounters {
             next_voucher_cost: U256::ZERO,
             gap_paid_frontier: None,
             leg_anchor: None,
+            leg_claim: None,
         }
     }
 }
@@ -976,13 +982,16 @@ fn warn_on_new_hole(
 /// baseline, not only its committed watermark. A leg that ends on a fault can
 /// leave a voucher armed whose send did not confirm. The lane's next voucher
 /// builds on that voucher, so the bytes it signs are paid, and the span the
-/// lane owes starts past them.
+/// lane owes starts past them. The wire maps back to content under
+/// `leg_claim`, the size the leg's sender signed, whose tree the wire
+/// follows; with none, under the store's bound.
 pub(crate) async fn ended_frontiers<St: RangedStore + ?Sized>(
     store: &St,
     ledger: &PoolLedger,
     gap_start: u64,
     asked_end: u64,
     leg_anchor: Option<(u64, U256)>,
+    leg_claim: Option<u64>,
 ) -> Option<(u64, u64)> {
     let (still_missing, total_bytes) =
         missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start))
@@ -993,7 +1002,8 @@ pub(crate) async fn ended_frontiers<St: RangedStore + ?Sized>(
     let settled = ledger.settlement().bytes;
     let (leg_start, baseline) = leg_anchor.unwrap_or((gap_start, settled));
     let paid_wire = u64::try_from(settled.saturating_sub(baseline)).unwrap_or(u64::MAX);
-    let paid = crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire)
+    let wire_tree = leg_claim.unwrap_or(total_bytes);
+    let paid = crate::sink::content_paid_frontier(leg_start, wire_tree, paid_wire)
         .min(gap_end)
         .min(delivered);
     Some((paid, delivered))
@@ -1088,6 +1098,7 @@ where
     // resume: `paid_wire == 0`, frontier collapses to the leg start (the disk
     // frontier), nothing already-paid is re-pulled (the `cli_fetch_resume` property).
     counters.leg_anchor = None;
+    counters.leg_claim = None;
 
     // The last leg that finished cleanly, with the gap's two frontiers as the pass
     // that opened it read them. The next pass must see one of them move (#2194).
@@ -1185,9 +1196,12 @@ where
         // shared-ledger concurrent pull overshoots this leg's delivery. Or the
         // store leaves a hole before present bytes: the contiguous delivered
         // frontier stops at the hole, so the paid frontier stops there too and
-        // the next leg opens at the hole.
+        // the next leg opens at the hole. The wire maps back to content under
+        // the size the leg's sender signed, whose tree the wire follows: the
+        // store's bound can differ from it while no size is proven.
+        let wire_tree = counters.leg_claim.unwrap_or(total_bytes);
         let paid_frontier =
-            crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire_this_leg)
+            crate::sink::content_paid_frontier(leg_start, wire_tree, paid_wire_this_leg)
                 .min(gap_end)
                 .min(delivered_frontier);
         let paid_cleared = paid_frontier.saturating_sub(gap_start);
@@ -1384,6 +1398,7 @@ where
                         // streams, so the next pass prices its paid frontier
                         // against this leg's own wire spend alone.
                         counters.leg_anchor = Some((resume_start, ledger.settlement().bytes));
+                        counters.leg_claim = Some(header.total_bytes);
                         // The store is keyed by offset: the leg verifies under
                         // the size its own sender signs, whatever the bound.
                         match store
@@ -1513,9 +1528,15 @@ where
                     //    pays, so a leg cut short leaves verified bytes unpaid.
                     //    The lane's next drive, if it runs again, opens at the
                     //    paid frontier and bills them.
-                    if let Some((paid, delivered)) =
-                        ended_frontiers(store, ledger, gap_start, asked_end, counters.leg_anchor)
-                            .await
+                    if let Some((paid, delivered)) = ended_frontiers(
+                        store,
+                        ledger,
+                        gap_start,
+                        asked_end,
+                        counters.leg_anchor,
+                        counters.leg_claim,
+                    )
+                    .await
                     {
                         counters.gap_paid_frontier = Some(paid);
                         ledger.note_unpaid(hash, paid, delivered);

@@ -158,12 +158,13 @@ impl Buyer {
         })
     }
 
-    /// Find the registered nodes that hold `hash`, and the blob's size.
+    /// Find the registered nodes that hold `hash`. A probe names no size: the
+    /// fetch learns it from the bytes that verify.
     ///
     /// Every probe answer is verified before it counts (ADR 014 §1). An answer
     /// whose signature does not verify, or whose `has_blob` and coverage
     /// disagree, is dropped.
-    pub(crate) async fn holders(&self, hash: [u8; 32]) -> Result<(Vec<Holder>, u64)> {
+    pub(crate) async fn holders(&self, hash: [u8; 32]) -> Result<Vec<Holder>> {
         let bootstrap = discovery::bootstrap_nodes(
             &self.env.rpc_url,
             self.env.capacity_bond,
@@ -177,7 +178,6 @@ impl Buyer {
         let sample = discovery::select_candidates(bootstrap.into_peers(), None, PROBE_SAMPLE);
 
         let mut holders = Vec::new();
-        let mut total_bytes = None;
         for candidate in sample {
             let timestamp_us = now_us()?;
             let Ok((resp, ext, _rtt_ms)) = probe::probe_once(
@@ -201,15 +201,13 @@ impl Buyer {
             if verified.is_err() || !ext.consistent_with(&resp.body) || !resp.body.has_blob {
                 continue;
             }
-            total_bytes = total_bytes.or(ext.total_bytes);
             holders.push(Holder {
                 candidate,
                 coverage: ext.coverage,
                 rate_per_mb: resp.body.rate_per_mb,
             });
         }
-        let total_bytes = total_bytes.context("no verified holder reported the blob's size")?;
-        Ok((holders, total_bytes))
+        Ok(holders)
     }
 
     /// One paid lane per holder: a [`PoolContext`] pinned to that provider, a

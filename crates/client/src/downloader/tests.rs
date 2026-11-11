@@ -236,6 +236,7 @@ async fn fetch_to_paths_writes_each_blob_to_its_named_dest() -> anyhow::Result<(
             &[DownloadTarget {
                 hash: root,
                 total_bytes: total,
+                declared: false,
                 dest: &dest,
                 ranges: None,
             }],
@@ -275,6 +276,7 @@ async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::
             &[DownloadTarget {
                 hash: root,
                 total_bytes: total,
+                declared: false,
                 dest: &part,
                 ranges: Some(&half),
             }],
@@ -293,6 +295,7 @@ async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::
             &[DownloadTarget {
                 hash: root,
                 total_bytes: total,
+                declared: false,
                 dest: &whole,
                 ranges: Some(&all),
             }],
@@ -332,6 +335,7 @@ async fn fetch_to_paths_threads_a_shared_ledger_registry() -> anyhow::Result<()>
             &[DownloadTarget {
                 hash: root,
                 total_bytes: total,
+                declared: false,
                 dest: &dest,
                 ranges: None,
             }],
@@ -445,6 +449,7 @@ async fn fetch_ranges(
             &[DownloadTarget {
                 hash: probe.root(),
                 total_bytes: claim,
+                declared: false,
                 dest,
                 ranges,
             }],
@@ -531,6 +536,7 @@ async fn a_finalize_hash_mismatch_fetches_again_and_completes() -> anyhow::Resul
     let target = DownloadTarget {
         hash: probe.root(),
         total_bytes: total,
+        declared: false,
         dest: &dest,
         ranges: None,
     };
@@ -570,6 +576,7 @@ async fn a_lone_stalled_source_recovers_after_it_cools() -> anyhow::Result<()> {
             &[DownloadTarget {
                 hash: root,
                 total_bytes: total,
+                declared: false,
                 dest: &dest,
                 ranges: None,
             }],
@@ -604,6 +611,7 @@ async fn a_download_with_no_progress_gives_up() -> anyhow::Result<()> {
             &[DownloadTarget {
                 hash: root,
                 total_bytes: total,
+                declared: false,
                 dest: &dest,
                 ranges: None,
             }],
@@ -642,6 +650,7 @@ async fn a_dropped_download_records_the_landed_prefix() -> anyhow::Result<()> {
     let targets = [DownloadTarget {
         hash: root,
         total_bytes: total,
+        declared: false,
         dest: &dest,
         ranges: None,
     }];
