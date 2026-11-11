@@ -52,7 +52,7 @@ The receiver feeds the stream to a bao verifying decoder as it arrives. A corrup
 
 Paid bytes are the bytes on the wire — content data **plus** interleaved proof nodes. The proof is real bandwidth the operator serves, and metering the raw stream keeps payment a single byte count. Excluding proof bytes would force payer and node to agree on how many proof bytes were interleaved — a dispute surface for a `~0.4%` overhead (one 64-byte node per 16 KiB group ≈ 1/256 of content). The delivered byte count is adopted.
 
-The payer pays only for wire bytes its decoder has verified against the root. The decoder checks each parent pair and each leaf before it reads the next item, so payment follows verification by at most one leaf (one chunk group). A byte that fails verification, or that arrives past the point where the payer stops a stream, is never paid for. The node's credit window floor carries that one-group lag ([ADR 003 § Credit Window](003-payments.md#credit-window)).
+The payer pays ahead of delivery, within its credit window ([ADR 003 § Credit Window](003-payments.md#credit-window)). The decoder checks each parent pair and each leaf before it reads the next item, and the payer stops paying at the first item that does not verify. The payer's loss on a stream that fails verification, or on a stream that it stops, is the credit that the lane holds at that moment, at most one window. The floor of the window is one chunk plus one chunk group, because the leaf that completes a chunk can extend one chunk group past the chunk boundary.
 
 ### Scope boundary
 
