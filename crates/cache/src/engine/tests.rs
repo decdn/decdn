@@ -333,6 +333,68 @@ impl Origin for UnsizedOrigin {
     }
 }
 
+/// Enumerable origin whose `size` answer flips between a sized and an
+/// unsized hold at runtime, so a rescan test can model an operator turning
+/// on bucket compression (or a proxy stripping `Content-Length`) between
+/// passes.
+#[derive(Debug)]
+struct SwitchableSizeOrigin {
+    hash: Hash,
+    size: u64,
+    answers_unsized: Arc<AtomicBool>,
+}
+
+impl SwitchableSizeOrigin {
+    fn new(hash: Hash, size: u64) -> (Self, Arc<AtomicBool>) {
+        let answers_unsized = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                hash,
+                size,
+                answers_unsized: Arc::clone(&answers_unsized),
+            },
+            answers_unsized,
+        )
+    }
+}
+
+impl Origin for SwitchableSizeOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+    {
+        // Never exercised by the rescan (existence + size only).
+        Box::pin(async { Ok(OriginFetch::NotFound) })
+    }
+
+    fn size(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, crate::OriginPullError>> + Send + '_>> {
+        let answer = if hash != self.hash {
+            OriginSize::Absent
+        } else if self.answers_unsized.load(Ordering::SeqCst) {
+            OriginSize::Unsized
+        } else {
+            OriginSize::Known(self.size)
+        };
+        Box::pin(async move { Ok(answer) })
+    }
+
+    fn enumerate(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, crate::OriginPullError>> + Send + '_>> {
+        let hashes = vec![self.hash];
+        Box::pin(async move { Ok(hashes) })
+    }
+}
+
 /// A per-origin transport error on the live `HEAD` — not just a timeout —
 /// is `Fault`, never `Absent` (#1766 follow-up): `origin_probe_presence`
 /// walks the origin chain itself rather than going through
@@ -614,10 +676,130 @@ async fn origin_probe_presence_unsized_beats_a_sibling_fault() -> anyhow::Result
     Ok(())
 }
 
-/// The range-pull scope probe is untouched by the tri-state (#2827):
-/// `origin_size` still answers `Ok(None)` for an origin that holds the object
-/// without a stated length, so the caller's silent whole-blob fallback keeps
-/// working exactly as before.
+/// The walk keeps going past an unsized answer: a sibling origin that DOES
+/// state the size wins, so a compressed mirror sitting in front of a sized
+/// origin cannot demote the chain's answer to `PresentUnsized` — the hash
+/// stays sized, announced, and range-pullable.
+#[tokio::test]
+async fn origin_probe_presence_walks_past_unsized_to_a_sized_sibling() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let hash = Hash::new(b"unsized mirror in front of a sized origin");
+    let (unsized_origin, unsized_calls) = UnsizedOrigin::new(hash);
+    let (sized, _sized_calls) = CountingSizeOrigin::new(hash, 4096);
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![
+            Arc::new(unsized_origin) as Arc<dyn Origin>,
+            Arc::new(sized) as Arc<dyn Origin>,
+        ],
+        10,
+    )
+    .await?;
+
+    assert_eq!(
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::Present(4096),
+        "a sized sibling's answer wins over an earlier unsized one",
+    );
+    assert_eq!(
+        unsized_calls.load(Ordering::SeqCst),
+        1,
+        "the unsized origin was probed (and walked past), not skipped",
+    );
+    assert_eq!(
+        engine.origin_probe_size(hash).await,
+        Some(4096),
+        "the sized answer advertises",
+    );
+    Ok(())
+}
+
+/// A walk timeout that fires AFTER an origin confirmed an unsized hold keeps
+/// the confirmation: the walk only kept going in case a sibling could state
+/// the size, so the overrun cannot demote a known-present object to `Fault`
+/// (which the serve gate would refuse as `InternalError`).
+#[tokio::test]
+async fn origin_probe_presence_timeout_after_unsized_keeps_the_hold() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let hash = Hash::new(b"unsized hold then a slow sibling");
+    let (unsized_origin, _calls) = UnsizedOrigin::new(hash);
+    let (slow, _slow_calls) = CountingSizeOrigin::slow(hash, 4096, Duration::from_millis(400));
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![
+            Arc::new(unsized_origin) as Arc<dyn Origin>,
+            Arc::new(slow) as Arc<dyn Origin>,
+        ],
+        10,
+    )
+    .await?;
+    // Tight ceiling so the 400 ms sibling overruns it after the unsized
+    // origin has already answered.
+    engine.set_origin_probe_config(OriginProbePolicy {
+        positive_ttl: Duration::from_secs(15),
+        negative_ttl: Duration::from_secs(2),
+        fault_ttl: Duration::from_secs(5),
+        timeout: Duration::from_millis(20),
+        capacity: 16,
+    });
+
+    assert_eq!(
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::PresentUnsized,
+        "an overrun after a confirmed hold must not demote to Fault",
+    );
+    Ok(())
+}
+
+/// The rescan carries a previously-sized index entry forward when the
+/// origin's answer degrades to unsized: presence is confirmed and a BLAKE3
+/// hash's total length cannot change, so the carried size signs the same
+/// coverage it always did. A hash no pass ever sized stays out of the index.
+#[tokio::test]
+async fn rescan_carries_a_previous_size_over_an_unsized_answer() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let hash = Hash::new(b"sized then compressed");
+    let (origin, answers_unsized) = SwitchableSizeOrigin::new(hash, 4096);
+    let engine =
+        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+    engine.rescan_origins().await;
+    assert_eq!(
+        engine.origin_held_size(hash),
+        Some(4096),
+        "the sized pass indexes the hash",
+    );
+
+    // The operator turns on bucket compression: the next pass answers
+    // `Unsized` for the same object.
+    answers_unsized.store(true, Ordering::SeqCst);
+    engine.rescan_origins().await;
+    assert_eq!(
+        engine.origin_held_size(hash),
+        Some(4096),
+        "a confirmed hold keeps the size the previous index holds for it",
+    );
+
+    // A hash that was never sized has nothing to carry: it stays out.
+    let tmp2 = tempfile::tempdir()?;
+    let never_sized = Hash::new(b"compressed from the start");
+    let (origin2, answers_unsized2) = SwitchableSizeOrigin::new(never_sized, 4096);
+    answers_unsized2.store(true, Ordering::SeqCst);
+    let engine2 =
+        CacheEngine::open(tmp2.path(), vec![Arc::new(origin2) as Arc<dyn Origin>], 10).await?;
+    engine2.rescan_origins().await;
+    assert_eq!(
+        engine2.origin_held_size(never_sized),
+        None,
+        "with no size from any pass there is no coverage to sign, so the \
+         hash is not indexed",
+    );
+    Ok(())
+}
+
+/// `origin_size` answers `Ok(None)` for an origin that holds the object
+/// without a stated length: an unsized hold cannot scope a range pull, so
+/// the caller takes the silent whole-blob fallback.
 #[tokio::test]
 async fn origin_size_stays_none_for_an_unsized_hold() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;

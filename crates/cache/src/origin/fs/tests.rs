@@ -741,8 +741,8 @@ async fn read_capped_stale_hint_leaves_no_spare_capacity() -> anyhow::Result<()>
 }
 
 /// A leaf symlink whose target does not exist is a permanent fault, never
-/// the authoritative absence `Ok(None)`: as an absence, `size` would memoise
-/// the hash as absent and drop it from the rescan with no log (#2801).
+/// the authoritative [`OriginSize::Absent`]: as an absence, `size` would
+/// memoise the hash as absent and drop it from the rescan with no log (#2801).
 #[cfg(unix)]
 #[tokio::test]
 async fn a_dangling_leaf_symlink_is_permanent() -> anyhow::Result<()> {

@@ -130,7 +130,7 @@ impl FilesystemOrigin {
     /// exist — is not an absence: it is an operator mistake, for example an
     /// origin tree bind-mounted into a container with absolute links, so it
     /// is a permanent failure. As an absence, `size` would report it as an
-    /// authoritative `Ok(None)` with no log at any level.
+    /// authoritative [`OriginSize::Absent`] with no log at any level.
     async fn resolve_regular(
         &self,
         path: &Path,

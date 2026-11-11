@@ -949,11 +949,22 @@ impl Origin for S3Origin {
             }
             // `content_length()` is `Option<i64>`; a negative or absent value
             // is unusable — the `HeadObject` success proves presence either
-            // way, only the size is lost.
-            Ok(resp
-                .content_length()
-                .and_then(|len| u64::try_from(len).ok())
-                .map_or(OriginSize::Unsized, OriginSize::Known))
+            // way, only the size is lost. An absent length is ordinary; a
+            // negative one is backend breakage worth a trace.
+            let size = resp.content_length().and_then(|len| {
+                let parsed = u64::try_from(len).ok();
+                if parsed.is_none() {
+                    tracing::debug!(
+                        target: "decdn_cache::origin::s3",
+                        log_target = %log_target,
+                        len,
+                        "S3 HeadObject reports a negative Content-Length; \
+                         treating the hold as unsized",
+                    );
+                }
+                parsed
+            });
+            Ok(size.map_or(OriginSize::Unsized, OriginSize::Known))
         })
     }
 }

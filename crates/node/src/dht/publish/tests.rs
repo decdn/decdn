@@ -393,6 +393,11 @@ struct StubAxes {
     enumerable: bool,
     /// `size` confirms the blob — the ownership test.
     answers_size: bool,
+    /// `size` confirms the blob but states no canonical length
+    /// ([`decdn_cache::OriginSize::Unsized`]) — a `Content-Encoding` backend,
+    /// or a 2xx without a `Content-Length`. Overrides `answers_size`'s sized
+    /// answer for the held hash.
+    unsized_size: bool,
     /// `size` returns a transport error instead of an answer, because a
     /// backend that is merely unreachable must not read as one that does not
     /// hold the object.
@@ -443,7 +448,9 @@ impl decdn_cache::Origin for StubOrigin {
                 )))
             });
         }
-        let answer = if self.axes.answers_size && hash == self.hash {
+        let answer = if self.axes.unsized_size && hash == self.hash {
+            decdn_cache::OriginSize::Unsized
+        } else if self.axes.answers_size && hash == self.hash {
             decdn_cache::OriginSize::Known(u64::try_from(self.data.len()).unwrap_or(u64::MAX))
         } else {
             decdn_cache::OriginSize::Absent
@@ -515,6 +522,7 @@ fn enumerating_faulting_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cac
             answers_size: true,
             faults_size: true,
             faults_enumerate: true,
+            ..StubAxes::default()
         },
     })
 }
@@ -540,6 +548,20 @@ fn foreign_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
         data: bytes::Bytes::from_static(payload),
         hash: decdn_cache::Hash::new(payload),
         axes: StubAxes::default(),
+    })
+}
+
+/// A remote-shaped origin that confirms the hold but states no canonical
+/// size — a `Content-Encoding` bucket, or an origin that strips
+/// `Content-Length`. Own content, but with nothing to sign coverage from.
+fn unsized_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
+    Arc::new(StubOrigin {
+        data: bytes::Bytes::from_static(payload),
+        hash: decdn_cache::Hash::new(payload),
+        axes: StubAxes {
+            unsized_size: true,
+            ..StubAxes::default()
+        },
     })
 }
 
@@ -575,6 +597,38 @@ async fn holder_snapshot_unions_store_and_origin_held() -> anyhow::Result<()> {
         "origin-held half missing"
     );
     assert_eq!(snap.hashes.len(), 2, "the overlap must dedupe: {snap:?}");
+    Ok(())
+}
+
+/// A present-but-unsized hold (#2827) stays out of the announce set — there
+/// is no size to sign coverage from — but it is NOT a fault: nothing is
+/// degraded, so `ownership_probe_faults` stays 0 and the snapshot reads
+/// healthy. (The serve gate still admits the hash; it is only undiscoverable
+/// through this node's announcements.)
+#[tokio::test]
+async fn holder_snapshot_skips_an_unsized_hold_without_counting_a_fault() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let unsized_hold = decdn_cache::Hash::new(b"holder-unsized");
+    let cache = decdn_cache::CacheEngine::open(
+        tmp.path(),
+        vec![unsized_stub_origin(b"holder-unsized")],
+        16,
+    )
+    .await?;
+    cache.get(unsized_hold).await?;
+    cache.rescan_origins().await;
+
+    let snap = holder_snapshot(&cache, false).await;
+
+    assert!(
+        !snap.hashes.contains(&unsized_hold),
+        "an unsized hold has no size to sign coverage from, so it must not \
+         be announced"
+    );
+    assert_eq!(
+        snap.ownership_probe_faults, 0,
+        "a confirmed unsized hold is a deliberate skip, not a degraded probe"
+    );
     Ok(())
 }
 

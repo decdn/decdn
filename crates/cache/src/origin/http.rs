@@ -546,14 +546,28 @@ impl Origin for HttpOrigin {
             // Read the `Content-Length` header directly rather than
             // `resp.content_length()`: the latter reflects the (empty) HEAD
             // response body, not the header, so it cannot surface the object's
-            // true length; the header carries it. A 200 proves presence either
-            // way; a malformed/absent header only loses the size.
-            Ok(resp
-                .headers()
-                .get(CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map_or(OriginSize::Unsized, OriginSize::Known))
+            // true length; the header carries it. A 2xx proves presence either
+            // way; a malformed/absent header only loses the size. An absent
+            // header is ordinary (a chunked upstream); a header that is there
+            // but unparsable is origin breakage worth a trace.
+            let size = match resp.headers().get(CONTENT_LENGTH) {
+                None => None,
+                Some(value) => {
+                    let parsed = value
+                        .to_str()
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok());
+                    if parsed.is_none() {
+                        tracing::debug!(
+                            url = %url_log,
+                            "origin HEAD Content-Length is unparsable; \
+                             treating the hold as unsized",
+                        );
+                    }
+                    parsed
+                }
+            };
+            Ok(size.map_or(OriginSize::Unsized, OriginSize::Known))
         })
     }
 }

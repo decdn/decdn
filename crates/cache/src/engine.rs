@@ -35,7 +35,7 @@ use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::fill_session::{FillClaim, FillRegistry, FillSession};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginSize, OutboardFetch};
-use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
+use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy};
 use crate::origin_range::{
     MAX_CONCURRENT_RANGE_PULLS, OriginRangeCursor, OriginRangeWire, OriginReadBudget,
     RANGE_PULL_PERMIT_WARN_AFTER, within_origin_timeout,
@@ -122,6 +122,38 @@ struct RescanResolution {
     /// Faulted candidates that kept an entry from the previous index. Always
     /// `<= faults`, hence the same width.
     carried: u64,
+    /// Candidates a configured origin confirmed holding without a stated
+    /// size, that no previous index entry could size either. Servable but
+    /// not announced — usually an origin misconfiguration the operator can
+    /// fix (stored compression, a stripped `Content-Length`).
+    unsized_drops: u64,
+}
+
+/// Log what one rescan pass published: every way the index came up short
+/// warns, so a shrunken announce set is never silent.
+fn report_rescan_pass(count: usize, faults: u64, carried: u64, unsized_drops: u64) {
+    if faults > 0 {
+        tracing::warn!(
+            faults,
+            carried,
+            count,
+            "rescan_origins: origin size probes faulted; carried the previous \
+             index entry forward where there was one. Candidates with no \
+             previous entry are absent from the announce set until a rescan \
+             resolves them"
+        );
+    }
+    if unsized_drops > 0 {
+        tracing::warn!(
+            unsized_drops,
+            count,
+            "rescan_origins: an origin confirms holding these objects but \
+             states no canonical size for them, so they are servable but \
+             not announced — check the origin for stored compression \
+             (Content-Encoding) or a stripped Content-Length"
+        );
+    }
+    tracing::debug!(count, "rescan_origins: refreshed origin-held index");
 }
 
 /// One walk of the origin chain by [`CacheEngine::probe_origin_chain`].
@@ -131,12 +163,16 @@ struct ChainProbe {
     presence: OriginPresence,
     /// For a `Fault`, whether the fault is worth waiting out: at least one
     /// origin failed with a retry-eligible error, or the walk overran its
-    /// ceiling. `false` for any other presence.
+    /// ceiling. A `PresentUnsized` carries the same flag for the sibling
+    /// fault it outranked. `false` for `Present`/`Absent`.
     transient: bool,
     /// For a `Fault`, one per-origin error with its cause chain — the first
     /// non-transient one when the walk met one (the operator-actionable cause,
     /// which a later origin's transient fault must not shadow), else the last —
-    /// or the ceiling the walk overran. `None` for any other presence.
+    /// or the ceiling the walk overran. A `PresentUnsized` keeps the same
+    /// cause when a sibling origin faulted or the walk overran: the hold is
+    /// confirmed, but the degraded origin is still worth a log line. `None`
+    /// otherwise.
     cause: Option<String>,
 }
 
@@ -154,10 +190,10 @@ pub struct OriginHeldReport {
 }
 
 /// A live origin-existence answer (#1766), distinguishing a genuine negative
-/// from a backend fault, and a sized hold from an unsized one. It mirrors
-/// `crate::origin_probe::Presence` variant for variant; the size-only collapse
-/// (`Fault`, `PresentUnsized` and `Absent` all advertise no size) lives in
-/// [`CacheEngine::origin_probe_size`].
+/// from a backend fault, and a sized hold from an unsized one. It is also the
+/// probe memo's stored form ([`crate::origin_probe::OriginProbeMemo`]); the
+/// size-only collapse (`Fault`, `PresentUnsized` and `Absent` all advertise
+/// no size) lives in [`CacheEngine::origin_probe_size`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginPresence {
     /// A configured origin holds the blob; carries the total byte size.
@@ -179,17 +215,6 @@ pub enum OriginPresence {
     /// authoritative `NotFound` must not do so on a fault; see the
     /// origin-only serve gate (`dispatch.rs`).
     Fault,
-}
-
-impl From<Presence> for OriginPresence {
-    fn from(presence: Presence) -> Self {
-        match presence {
-            Presence::Present(size) => OriginPresence::Present(size),
-            Presence::PresentUnsized => OriginPresence::PresentUnsized,
-            Presence::Absent => OriginPresence::Absent,
-            Presence::Fault => OriginPresence::Fault,
-        }
-    }
 }
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
@@ -1841,10 +1866,14 @@ impl CacheEngine {
     /// as a permanent one — so no outage is dropped here as an absence. A
     /// present object whose canonical size the origin cannot state
     /// ([`OriginSize::Unsized`] — a `Content-Encoding` backend, a 200 without
-    /// a `Content-Length`) is also left out of the index, deliberately: every
-    /// entry's size backs a signed probe-coverage answer, and an unsized entry
-    /// would announce content the probe handler can never confirm. The serve
-    /// path still admits it through the live presence probe.
+    /// a `Content-Length`) keeps a size the previous index holds for it, like
+    /// a transient fault does: presence is confirmed and a hash's total length
+    /// cannot change, so the carried size signs the same coverage it always
+    /// did. Only when no pass ever sized the hash is it left out of the index,
+    /// deliberately: every entry's size backs a signed probe-coverage answer,
+    /// and an unsized entry would announce content the probe handler can never
+    /// confirm. The serve path still admits it through the live presence
+    /// probe.
     ///
     /// **Cost:** one origin probe per deduped candidate — every listed entry and
     /// every pin, including the ones that resolve absent and never enter the
@@ -1942,6 +1971,7 @@ impl CacheEngine {
             held,
             faults,
             carried,
+            unsized_drops,
         } = self.resolve_candidates(candidates).await;
 
         let count = held.len();
@@ -1958,18 +1988,7 @@ impl CacheEngine {
                 m.origin_enumerate_failures.inc_by(enumerate_failures);
             }
         }
-        if faults > 0 {
-            tracing::warn!(
-                faults,
-                carried,
-                count,
-                "rescan_origins: origin size probes faulted; carried the previous \
-                 index entry forward where there was one. Candidates with no \
-                 previous entry are absent from the announce set until a rescan \
-                 resolves them"
-            );
-        }
-        tracing::debug!(count, "rescan_origins: refreshed origin-held index");
+        report_rescan_pass(count, faults, carried, unsized_drops);
     }
 
     /// Every hash [`Self::rescan_origins`] considers: each enumerable origin's
@@ -2046,16 +2065,27 @@ impl CacheEngine {
                 OriginPresence::Present(size) => {
                     out.held.insert(hash, size);
                 }
-                // A present-but-unsized object stays out of the index like an
-                // absent one: the index maps each hash to the byte size the
-                // probe `has_blob` answer and the announce set sign coverage
-                // from, and an entry with no size would advertise content
-                // this node's probe handler can never confirm — "announced
-                // but probe-denied", a pure reputation cost. The serve path
-                // still admits the hash (the live probe memoises
-                // `PresentUnsized`), so the object is servable, just not
-                // announced.
-                OriginPresence::PresentUnsized | OriginPresence::Absent => {}
+                // A present-but-unsized answer cannot size a NEW index entry:
+                // the index maps each hash to the byte size the probe
+                // `has_blob` answer and the announce set sign coverage from,
+                // and an entry with no size would advertise content this
+                // node's probe handler can never confirm — "announced but
+                // probe-denied", a pure reputation cost. But a size the
+                // PREVIOUS index holds still stands: presence is confirmed,
+                // and a BLAKE3 hash's total length cannot change, so the
+                // carried size signs the same coverage it always did. Only a
+                // hash no pass ever sized drops out — counted, so the
+                // operator can see a compressed/length-less origin eating
+                // the announce set. The serve path admits the hash either
+                // way (the live probe memoises `PresentUnsized`).
+                OriginPresence::PresentUnsized => {
+                    if let Some(size) = previous.held.get(&hash).copied() {
+                        out.held.insert(hash, size);
+                    } else {
+                        out.unsized_drops = out.unsized_drops.saturating_add(1);
+                    }
+                }
+                OriginPresence::Absent => {}
                 OriginPresence::Fault => {
                     out.faults = out.faults.saturating_add(1);
                     // Carry forward only what a later pass might resolve. A
@@ -2164,8 +2194,10 @@ impl CacheEngine {
     /// - failing that, ANY origin answering [`OriginSize::Unsized`] is
     ///   `PresentUnsized`. The walk keeps going past an `Unsized` answer
     ///   because a sibling origin may hold the same object *with* a size —
-    ///   but once one origin confirmed the hold, a later origin's fault
-    ///   cannot demote the answer to `Fault`: the object is known present;
+    ///   but once one origin confirmed the hold, neither a later origin's
+    ///   fault nor the walk overrunning its ceiling can demote the answer to
+    ///   `Fault`: the object is known present, and the sibling's fault (or
+    ///   the overrun) rides along as [`ChainProbe::cause`] for the log;
     /// - failing that, ANY origin answering `Err(_)` (a transport error), or
     ///   the whole walk overrunning `timeout`, is `Fault`;
     /// - only when every configured origin answered [`OriginSize::Absent`] —
@@ -2189,11 +2221,14 @@ impl CacheEngine {
     ///
     /// **Never fetches the body** — existence and size only.
     async fn probe_origin_chain(&self, hash: Hash, timeout: Duration) -> ChainProbe {
+        // The walk's findings live OUTSIDE the walk future, so a timeout that
+        // drops the future mid-chain cannot also drop what it already learned:
+        // a confirmed unsized hold must survive a later sibling's overrun.
+        let mut cause: Option<String> = None;
+        let mut any_transient = false;
+        let mut any_unsized = false;
         let walk = async {
-            let mut cause = None;
             let mut kept_permanent_cause = false;
-            let mut any_transient = false;
-            let mut any_unsized = false;
             for origin in &self.inner.origins {
                 match origin.size(hash).await {
                     Ok(OriginSize::Known(size)) => {
@@ -2228,15 +2263,16 @@ impl CacheEngine {
             }
             // An unsized hold outranks a sibling origin's fault: one origin
             // confirmed the object is present, so the chain's answer is not
-            // "unknown".
+            // "unknown". The sibling's fault rides along as `cause` so the
+            // caller can still log the degraded origin.
             if any_unsized {
                 return ChainProbe {
                     presence: OriginPresence::PresentUnsized,
-                    transient: false,
-                    cause: None,
+                    transient: any_transient,
+                    cause: cause.take(),
                 };
             }
-            match cause {
+            match cause.take() {
                 Some(cause) => ChainProbe {
                     presence: OriginPresence::Fault,
                     transient: any_transient,
@@ -2249,8 +2285,21 @@ impl CacheEngine {
                 },
             }
         };
-        match tokio::time::timeout(timeout, walk).await {
+        // Bind the timeout result first: the `walk` future (and its borrows of
+        // the findings above) is dropped here, so the overrun arm can read them.
+        let outcome = tokio::time::timeout(timeout, walk).await;
+        match outcome {
             Ok(outcome) => outcome,
+            // An origin already confirmed the hold before the ceiling fired,
+            // so the overrun cannot demote the answer to a fault — the walk
+            // only kept going in case a sibling could state the size.
+            Err(_) if any_unsized => ChainProbe {
+                presence: OriginPresence::PresentUnsized,
+                transient: any_transient,
+                cause: cause
+                    .take()
+                    .or_else(|| Some(format!("the origin chain walk overran {timeout:?}"))),
+            },
             // A ceiling the origin overran says nothing about whether it would
             // answer given longer, so treat it as the waitable kind.
             Err(_) => ChainProbe {
@@ -2308,37 +2357,51 @@ impl CacheEngine {
         let timeout = {
             let mut memo = self.probe_memo_lock();
             if let Some(presence) = memo.get(hash, now) {
-                return presence.into();
+                return presence;
             }
             memo.timeout()
         };
         // Live probe off the memo lock (never hold it across the await).
         let probe = self.probe_origin_chain(hash, timeout).await;
         let presence = probe.presence;
-        let memo_presence = match presence {
-            OriginPresence::Present(size) => Presence::Present(size),
-            OriginPresence::PresentUnsized => Presence::PresentUnsized,
-            OriginPresence::Absent => Presence::Absent,
-            OriginPresence::Fault => Presence::Fault,
-        };
-        if matches!(presence, OriginPresence::Fault) {
-            // Warn rather than debug: the memo answers the repeats, so this
-            // fires at most once per hash per fault TTL — and it is the only
-            // record that this node is about to refuse serves and answer probes
-            // with "not held" for content it may well hold. It names the walk's
-            // last per-origin error, so a permanent fault (a symlink escape, a
-            // permission denied) shows at the default level; each per-origin
-            // error also logs at debug as the walk meets it.
-            tracing::warn!(
-                %hash,
-                fault_ttl_secs = self.probe_memo_lock().fault_ttl().as_secs(),
-                transient = probe.transient,
-                cause = probe.cause.as_deref().unwrap_or("unknown"),
-                "origin probe faulted; memoising the fault — serves for this hash \
-                 answer InternalError and probes answer not-held until it expires"
-            );
+        match presence {
+            OriginPresence::Fault => {
+                // Warn rather than debug: the memo answers the repeats, so this
+                // fires at most once per hash per fault TTL — and it is the only
+                // record that this node is about to refuse serves and answer probes
+                // with "not held" for content it may well hold. It names the walk's
+                // last per-origin error, so a permanent fault (a symlink escape, a
+                // permission denied) shows at the default level; each per-origin
+                // error also logs at debug as the walk meets it.
+                tracing::warn!(
+                    %hash,
+                    fault_ttl_secs = self.probe_memo_lock().fault_ttl().as_secs(),
+                    transient = probe.transient,
+                    cause = probe.cause.as_deref().unwrap_or("unknown"),
+                    "origin probe faulted; memoising the fault — serves for this hash \
+                     answer InternalError and probes answer not-held until it expires"
+                );
+            }
+            // The hold is confirmed and the memoised answer is healthy, but a
+            // sibling origin faulted (or the walk overran its ceiling) along
+            // the way. The presence memo would otherwise swallow the only
+            // default-level record of the degraded origin for a whole
+            // positive TTL.
+            OriginPresence::PresentUnsized => {
+                if let Some(cause) = probe.cause.as_deref() {
+                    tracing::warn!(
+                        %hash,
+                        transient = probe.transient,
+                        cause,
+                        "origin probe confirmed an unsized hold, but another \
+                         configured origin faulted during the walk — serves \
+                         continue; the faulting origin stays degraded"
+                    );
+                }
+            }
+            OriginPresence::Present(_) | OriginPresence::Absent => {}
         }
-        self.probe_memo_lock().insert(hash, memo_presence, now);
+        self.probe_memo_lock().insert(hash, presence, now);
         presence
     }
 

@@ -537,7 +537,10 @@ impl HolderSnapshot {
 /// from before the toggle was set, and announcing it would advertise blobs the
 /// serve gate now declines. Each stored hash is instead put to
 /// `origin_probe_presence`, the same question the origin-only serve gate asks,
-/// so the snapshot advertises exactly what this node would serve.
+/// so the snapshot advertises only what this node would serve — and, of that,
+/// only the holds with a stated size, because every announce entry backs a
+/// signed probe-coverage answer: a `PresentUnsized` hold is served but not
+/// announced.
 ///
 /// That check is what recovers a node's *own* store-only content. The
 /// origin-held index covers enumerable origins plus present pins, and a remote
@@ -549,10 +552,13 @@ impl HolderSnapshot {
 /// sweep landing inside that window re-reads the same fault rather than
 /// re-probing — the hash stays out of the announce set until the memo expires,
 /// which bounds how long a blip suppresses it and is why the fault TTL is
-/// capped below the positive TTL. Skipping is still a hash this node holds and
-/// does not announce, so each one counts toward `origin_probe_faults` —
-/// otherwise an origin-only node drops its own store-only content on a blip and
-/// reports a healthy snapshot.
+/// capped below the positive TTL. A `Fault` skip is still a hash this node
+/// holds and does not announce, so each one counts toward
+/// `origin_probe_faults` — otherwise an origin-only node drops its own
+/// store-only content on a blip and reports a healthy snapshot. A
+/// `PresentUnsized` skip is the other, deliberate kind: the hold is confirmed
+/// and nothing is degraded, the probe simply has no size to sign coverage
+/// from, so it stays out of the set without counting as a fault.
 ///
 /// Never fails: a store-walk error degrades to the origin-held half rather than
 /// yielding nothing, because a partial announce strictly beats none. Every way

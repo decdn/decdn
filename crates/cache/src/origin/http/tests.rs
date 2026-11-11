@@ -283,11 +283,11 @@ async fn size_404_is_absent() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A `HEAD` 503 is a transient fault, never an absence (#1815): folding it
-/// into `Ok(None)` made `probe_origin_chain` answer `Absent` for an origin
-/// mid-outage — the serve gate then signed an authoritative `NotFound`,
-/// memoised under the negative TTL, and the DHT republisher unscheduled
-/// the hash entirely.
+/// A `HEAD` 503 is a transient fault, never an absence (#1815): an outage
+/// folded into [`OriginSize::Absent`] would make `probe_origin_chain` answer
+/// `Absent` for an origin mid-outage — the serve gate then signs an
+/// authoritative `NotFound`, memoises it under the negative TTL, and the DHT
+/// republisher unschedules the hash entirely.
 #[tokio::test]
 async fn size_5xx_is_a_transient_fault_not_an_absence() -> anyhow::Result<()> {
     let server = MockServer::start().await;

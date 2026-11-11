@@ -12002,6 +12002,121 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Backend stub that confirms holding one blob WITHOUT a stated size
+/// (`OriginSize::Unsized` — a `Content-Encoding` bucket, or a 2xx with no
+/// `Content-Length`) and serves the body through the whole-blob `fetch`.
+#[derive(Debug)]
+struct UnsizedBackendOrigin {
+    hash: decdn_cache::Hash,
+    data: bytes::Bytes,
+}
+
+impl decdn_cache::Origin for UnsizedBackendOrigin {
+    fn kind(&self) -> decdn_cache::OriginKind {
+        decdn_cache::OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        hash: decdn_cache::Hash,
+        _max_bytes: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let result = if hash == self.hash {
+            Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
+        } else {
+            Ok(decdn_cache::OriginFetch::NotFound)
+        };
+        Box::pin(async move { result })
+    }
+
+    fn size(
+        &self,
+        hash: decdn_cache::Hash,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<decdn_cache::OriginSize, decdn_cache::OriginPullError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let answer = if hash == self.hash {
+            decdn_cache::OriginSize::Unsized
+        } else {
+            decdn_cache::OriginSize::Absent
+        };
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// #2827: an origin-only node whose backend holds the object but cannot state
+/// its canonical size (`PresentUnsized`) still serves it — the gate admits a
+/// confirmed hold, and the pull path fills it through the whole-blob
+/// fallback. Before the tri-state, this probe read as an authoritative
+/// absence: the gate declined the node's OWN content and memoised the lie.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_serves_an_unsized_backend_hash() -> anyhow::Result<()> {
+    let payload = vec![0x44u8; 64 * 1024];
+    let hash = decdn_cache::Hash::new(&payload);
+    let origin = Arc::new(UnsizedBackendOrigin {
+        hash,
+        data: bytes::Bytes::from(payload.clone()),
+    });
+    let cache_dir = tempfile::tempdir()?;
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    anyhow::ensure!(!cache.has(hash).await?, "cache store must start empty");
+
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        now_us(),
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch for an unsized own-backend hash"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "expected exactly 1 whole-blob origin fetch to fill the unsized hash, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// #1759: the gate is categorical — it sits ABOVE the cache-hit branch, so a
 /// foreign hash already sitting in the store (imported by an earlier relay,
 /// say) is still declined once the backend no longer holds it.

@@ -1160,6 +1160,23 @@ async fn size_compressed_object_is_unsized() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn size_missing_content_length_is_unsized() -> anyhow::Result<()> {
+    // A successful HeadObject proves presence even when the SDK carries no
+    // Content-Length — only the size is lost, so the answer is `Unsized`,
+    // never `Absent` (#2827).
+    let hash = Hash::new(b"no-length");
+    let rule = mock!(Client::head_object).then_output(|| HeadObjectOutput::builder().build());
+    let client = mock_s3_client_match_any(&[&rule]);
+    let origin = s3_origin(client, "")?;
+
+    anyhow::ensure!(
+        origin.size(hash).await? == OriginSize::Unsized,
+        "a HeadObject success without a length must be present but unsized"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn size_missing_object_is_absent() -> anyhow::Result<()> {
     let hash = Hash::new(b"absent");
     let rule = mock!(Client::head_object)

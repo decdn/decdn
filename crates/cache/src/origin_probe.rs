@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::Hash;
+use crate::{Hash, OriginPresence};
 
 /// Default TTL for a memoised positive origin-probe answer
 /// (`cache.origin_probe_ttl_sec`). Canonical seconds value from
@@ -55,43 +55,9 @@ pub const DEFAULT_ORIGIN_PROBE_TIMEOUT: Duration =
 pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: usize =
     decdn_config_types::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY as usize;
 
-/// A memoised existence answer for a hash against the configured origins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Presence {
-    /// The origin holds the blob; carries the total byte size for the probe's
-    /// `total_bytes`.
-    Present(u64),
-    /// The origin holds the blob but cannot state its canonical byte size (a
-    /// `Content-Encoding` backend, or a 200 without a parsable
-    /// `Content-Length`). A confirmed hold like [`Self::Present`] — the serve
-    /// gate admits it under the positive TTL — but it yields no probe
-    /// `total_bytes`, so the announce paths leave it out.
-    PresentUnsized,
-    /// No configured origin holds the blob (a `HEAD` 404, or no origin — an
-    /// authoritative "don't advertise").
-    Absent,
-    /// The probe could not get an authoritative answer: a transport error or
-    /// a timeout (a `HEAD` overrun). Distinct from `Absent` on purpose — a
-    /// caller that would otherwise sign an authoritative `NotFound` must not
-    /// do so on a fault, and a fault is worth memoising under its own TTL so
-    /// a failing origin is not re-probed on every request for its namespace.
-    Fault,
-}
-
-impl Presence {
-    /// The probe answer this presence yields: `Some(size)` advertises
-    /// `has_blob: true`, `None` leaves it `false`. A present-but-unsized hold
-    /// yields `None` too: origin-sourced probe coverage needs the blob's full
-    /// block count, which only a sized answer gives.
-    pub const fn size(self) -> Option<u64> {
-        match self {
-            Presence::Present(size) => Some(size),
-            Presence::PresentUnsized | Presence::Absent | Presence::Fault => None,
-        }
-    }
-}
-
-/// Bounded, lazily-expiring memo of origin-probe answers.
+/// Bounded, lazily-expiring memo of origin-probe answers. Stores
+/// [`OriginPresence`] directly — the engine's answer type is the memo's
+/// stored form, so there is exactly one four-state presence vocabulary.
 #[derive(Debug)]
 pub struct OriginProbeMemo {
     entries: HashMap<Hash, Entry>,
@@ -104,7 +70,7 @@ pub struct OriginProbeMemo {
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
-    presence: Presence,
+    presence: OriginPresence,
     /// Instant at which this entry stops being valid.
     expires_at: Instant,
 }
@@ -119,7 +85,8 @@ struct Entry {
 /// absence stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginProbePolicy {
-    /// TTL for a memoised `Present` answer (`cache.origin_probe_ttl_sec`).
+    /// TTL for a memoised `Present` or `PresentUnsized` answer
+    /// (`cache.origin_probe_ttl_sec`).
     pub positive_ttl: Duration,
     /// TTL for a memoised `Absent` answer
     /// (`cache.origin_probe_negative_ttl_sec`).
@@ -177,7 +144,7 @@ impl OriginProbeMemo {
     /// A live (non-expired) memoised answer for `hash`, or `None` on a miss.
     /// Expired entries are swept in passing so a stale answer is never returned
     /// and the map does not accrete dead entries on the read path.
-    pub fn get(&mut self, hash: Hash, now: Instant) -> Option<Presence> {
+    pub fn get(&mut self, hash: Hash, now: Instant) -> Option<OriginPresence> {
         match self.entries.get(&hash) {
             Some(entry) if entry.expires_at > now => Some(entry.presence),
             Some(_) => {
@@ -192,13 +159,13 @@ impl OriginProbeMemo {
     /// capacity bound: expired entries are swept first, and if the map is still
     /// at capacity one arbitrary live entry is dropped to make room, so the memo
     /// can never exceed `capacity` distinct hashes regardless of probe volume.
-    pub fn insert(&mut self, hash: Hash, presence: Presence, now: Instant) {
+    pub fn insert(&mut self, hash: Hash, presence: OriginPresence, now: Instant) {
         let ttl = match presence {
             // An unsized hold is as stable as a sized one — only the length
             // is missing — so it shares the positive TTL.
-            Presence::Present(_) | Presence::PresentUnsized => self.positive_ttl,
-            Presence::Absent => self.negative_ttl,
-            Presence::Fault => self.fault_ttl,
+            OriginPresence::Present(_) | OriginPresence::PresentUnsized => self.positive_ttl,
+            OriginPresence::Absent => self.negative_ttl,
+            OriginPresence::Fault => self.fault_ttl,
         };
         let expires_at = now + ttl;
         // Refreshing an existing key never grows the map.

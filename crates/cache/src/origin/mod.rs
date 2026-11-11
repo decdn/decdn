@@ -339,8 +339,11 @@ impl std::fmt::Debug for OutboardFetch {
 /// "the origin holds the object but cannot state its canonical length" apart
 /// from "the origin does not hold the object". The probe paths memoise
 /// [`Self::Absent`] as an authoritative negative (the origin-only serve gate
-/// declines, the DHT announce set drops the hash), so an adapter must never
-/// answer `Absent` for an object it holds.
+/// declines, the DHT announce set drops the hash), so an adapter that probes
+/// its backend must never answer `Absent` for an object it holds. The trait's
+/// default `size()` is the deliberate exception: a fetch-only [`Origin`]
+/// answers `Absent` for everything, with the consequences [`Origin::size`]
+/// spells out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginSize {
     /// The origin holds the object and states its canonical blob length in
@@ -350,10 +353,10 @@ pub enum OriginSize {
     /// The origin holds the object but cannot state the canonical length: a
     /// backend reporting a `Content-Encoding` advertises the *encoded* size
     /// (not the canonical blob length — the same trap as [`Origin::fetch`]'s
-    /// `size_hint`), and a 200 without a parsable `Content-Length` states no
+    /// `size_hint`), and a 2xx without a parsable `Content-Length` states no
     /// size at all. Present for the serve gate and the presence memo; sizeless
-    /// for range-pull scoping and probe coverage, so those callers degrade to
-    /// the whole-blob path.
+    /// for range-pull scoping (which degrades to the whole-blob path) and for
+    /// probe coverage (which leaves the hash unannounced).
     Unsized,
     /// The origin does not hold the object — an authoritative negative (a
     /// genuine HTTP 404 / S3 `NotFound`, a missing filesystem entry). Callers
@@ -474,7 +477,7 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     ///   canonical blob length. Callers may range-pull against it, advertise
     ///   it, and sign origin-sourced probe coverage from it.
     /// - [`OriginSize::Unsized`] — the origin holds the object but cannot
-    ///   state the canonical length (a `Content-Encoding` backend, or a 200
+    ///   state the canonical length (a `Content-Encoding` backend, or a 2xx
     ///   without a parsable `Content-Length`). Presence callers (the
     ///   origin-only serve gate, the presence memo) read it as present; size
     ///   callers degrade to the whole-blob path and must not memoise or sign
@@ -495,9 +498,13 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// faults surfaces the last one (#1129): the serve path must report a
     /// degraded node, not an empty one.
     ///
-    /// The default returns `Absent`, so a custom [`Origin`] that implements
-    /// only [`Self::fetch`] needs no change: it never range-pulls, and the
-    /// probe paths never read it as holding content it cannot confirm.
+    /// The default returns `Absent` for every hash. A custom [`Origin`] that
+    /// implements only [`Self::fetch`] therefore never range-pulls and never
+    /// reads as holding content the probe cannot confirm — but the trade cuts
+    /// both ways: the origin-only serve gate trusts this probe, so such an
+    /// origin's own content is declined there and never announced. An
+    /// operator pairing a custom origin with the origin-only policy
+    /// (`relay_foreign_namespaces == false`) must implement `size`.
     fn size(
         &self,
         _hash: Hash,
