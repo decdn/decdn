@@ -1138,12 +1138,14 @@ contract CapacityBondTest is Test {
     /// @notice A re-registration into a new region snapshots the old region in
     ///         `regionPrev`, so the old region's blacklist entries keep applying
     ///         through the stability window (ADR 030). Re-registering into the
-    ///         same region keeps the snapshot.
+    ///         same region keeps the snapshot. The change waits out the
+    ///         `updateRegion` cooldown, as every region change does.
     function test_reRegisterIntoNewRegion_recordsRegionPrev() public {
         uint256 opPk = 0x8EE9;
         bytes32 nodeId = bytes32(uint256(0x8EE9));
         address opAddr = _onboardAtTier(opPk, 1000, nodeId);
 
+        vm.warp(block.timestamp + bond.regionStabilityWindow());
         vm.prank(opAddr);
         bond.deregisterNode();
         bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
@@ -1161,6 +1163,47 @@ contract CapacityBondTest is Test {
         bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
         (, prev,,) = bond.regionScopeData(opAddr);
         assertEq(prev, "us-east", "an unchanged region keeps the snapshot");
+    }
+
+    /// @notice #2837: two deregister/re-register hops inside one stability
+    ///         window cannot flip the region twice. A → B waits out the window;
+    ///         B → C inside the next window reverts `RegionCooldownActive`, so
+    ///         `regionPrev` still holds A and A's regional entries still reach
+    ///         the operator.
+    function test_reRegister_secondRegionFlipInsideWindow_reverts() public {
+        uint256 opPk = 0x8EEA;
+        bytes32 nodeId = bytes32(uint256(0x8EEA));
+        address opAddr = _onboardAtTier(opPk, 1000, nodeId);
+
+        // Inside the registration-time window, even the first flip reverts.
+        uint64 readyAt = uint64(block.timestamp + bond.regionStabilityWindow());
+        vm.prank(opAddr);
+        bond.deregisterNode();
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.RegionCooldownActive.selector, readyAt));
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+
+        // A → B once the window has elapsed.
+        vm.warp(readyAt);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+
+        // B → C in the same block: rejected.
+        vm.prank(opAddr);
+        bond.deregisterNode();
+        sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        readyAt = uint64(block.timestamp + bond.regionStabilityWindow());
+        vm.prank(opAddr);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.RegionCooldownActive.selector, readyAt));
+        bond.registerNode(nodeId, hex"", "ap-south", TERMS_HASH, sig, hex"01");
+
+        // Re-registering into the current region is not a change and is allowed.
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+        (string memory region, string memory prev,,) = bond.regionScopeData(opAddr);
+        assertEq(region, "eu-west");
+        assertEq(prev, "us-east", "the serve-time region stays in scope");
     }
 
     function test_reRegisterAfterDeregister_keepsBondAndNeedsFreshDeclare() public {

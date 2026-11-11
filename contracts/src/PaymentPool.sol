@@ -279,7 +279,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error NotPoolOwner();
     error InvalidVoucherSignature();
     error InvalidCapabilitySignature();
-    error ProviderNotBound(address provider);
+    error ProviderNotStaked(address provider);
     error PoolClosed();
     error PoolNotClosing();
     error GraceWindowActive();
@@ -639,11 +639,14 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // A call that paid nothing moves nothing: the router rejects a zero
         // amount, and there is nothing to settle.
         if (totalPaid != 0) {
-            // Only a bound operator is a payee, so a capability holder cannot
-            // sign vouchers to itself and draw its cap as USDC. Its bytes count
-            // toward the governance window only while it is active.
-            (bytes32 nodeId, bool active) = capacityBond.nodeIdOf(msg.sender);
-            if (nodeId == bytes32(0)) revert ProviderNotBound(msg.sender);
+            // Only a staked operator is a payee: a bound NodeId plus active and
+            // unbonding bond at or above half its entry floor. A binding alone
+            // costs no bond, so a capability holder that binds its own address
+            // still cannot sign vouchers to itself and draw its cap as USDC.
+            // Its bytes count toward the governance window only while it is
+            // active.
+            (bool payee, bool active) = capacityBond.payeeStatus(msg.sender);
+            if (!payee) revert ProviderNotStaked(msg.sender);
             _route(msg.sender, active ? totalBytes : 0, totalPaid);
         }
     }

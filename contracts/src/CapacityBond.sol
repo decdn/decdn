@@ -812,22 +812,34 @@ contract CapacityBond is
         // `regionLastChanged` is stamped at registration and on every change, so
         // the stability-window cooldown applies uniformly from the moment the
         // current region took effect — including an operator's first change.
+        _requireRegionCooldownElapsed();
+
+        emit RegionUpdated(info.nodeId, _setRegion(info, newRegion), newRegion);
+    }
+
+    /// @dev ADR 030 § Cooldown: reverts `RegionCooldownActive` until
+    ///      `regionStabilityWindow` has elapsed since `regionLastChanged`.
+    function _requireRegionCooldownElapsed() internal view {
         uint64 readyAt = regionLastChanged[msg.sender] + uint64(regionStabilityWindow);
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < readyAt) revert RegionCooldownActive(readyAt);
-
-        emit RegionUpdated(info.nodeId, _setRegion(info, newRegion), newRegion);
     }
 
     /// @dev ADR 030 § Region-stability window: a region change snapshots the
     ///      old region into `regionPrev`, so its entries keep applying until the
     ///      change ripens; an unchanged region keeps the existing snapshot.
-    ///      `regionLastChanged` is stamped on every call, so it is never 0 for an
-    ///      active node, and both the ripening window and the `updateRegion`
-    ///      cooldown run from it. A re-registration restarts the window.
+    ///      A change is subject to the `updateRegion` cooldown on every path, so
+    ///      a deregister/re-register cycle cannot flip the region twice inside
+    ///      one window and push the serve-time region out of both slots. A
+    ///      first registration (`regionLastChanged == 0`) has no prior region
+    ///      and skips the cooldown. `regionLastChanged` is stamped on every
+    ///      call, so it is never 0 for an active node, and both the ripening
+    ///      window and the cooldown run from it. A re-registration restarts the
+    ///      window.
     function _setRegion(NodeInfo storage info, string calldata newRegion) internal returns (string memory oldRegion) {
         oldRegion = info.regionHint;
         if (keccak256(bytes(oldRegion)) != keccak256(bytes(newRegion))) {
+            if (regionLastChanged[msg.sender] != 0) _requireRegionCooldownElapsed();
             regionPrev[msg.sender] = oldRegion;
             info.regionHint = newRegion;
         }
@@ -1162,13 +1174,20 @@ contract CapacityBond is
     ///      degenerate case (a zero-bond phantom slash) with nothing to
     ///      grandfather.
     function _maybeAutoEject(address operator) internal {
-        uint256 floor = bondFloorAtActivation[operator];
-        if (floor == 0) floor = minBond;
-        if (activeBond[operator] >= (floor / 2) || ejected[operator]) return;
+        if (activeBond[operator] >= _ejectLine(operator) || ejected[operator]) return;
         ejected[operator] = true;
         bytes32 nodeId = _ejectNodeEffects(operator);
         emit AutoEjected(operator, activeBond[operator]);
         if (nodeId != bytes32(0)) emit NodeAutoEjected(nodeId, activeBond[operator]);
+    }
+
+    /// @dev Half the operator's entry floor, or half the live `minBond` when it
+    ///      holds no floor: the auto-eject threshold, and the stake a payee
+    ///      must hold in `payeeStatus`.
+    function _ejectLine(address operator) internal view returns (uint256) {
+        uint256 floor = bondFloorAtActivation[operator];
+        if (floor == 0) floor = minBond;
+        return floor / 2;
     }
 
     // -----------------------------------------------------------------
@@ -1550,6 +1569,18 @@ contract CapacityBond is
 
     function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active) {
         nodeId = addressToNodeId[operator];
+        active = isActive(operator);
+    }
+
+    /// @notice Whether `operator` may be paid for vouchers, and whether its bytes
+    ///         count toward governance. `payee` needs a bound NodeId and slashable
+    ///         stake: active plus unbonding bond at or above the auto-eject line
+    ///         (half the entry floor). A binding alone costs no bond, so it does
+    ///         not make a payee. Unbonding bond counts, so a deregistered node
+    ///         redeems its earned vouchers while its bond unbonds.
+    function payeeStatus(address operator) external view returns (bool payee, bool active) {
+        payee = addressToNodeId[operator] != bytes32(0)
+            && activeBond[operator] + unbondingOf[operator].amount >= _ejectLine(operator);
         active = isActive(operator);
     }
 

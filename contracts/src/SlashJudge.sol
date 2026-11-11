@@ -137,6 +137,18 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     ///         a mempool copy of the reveal (#854).
     mapping(bytes32 => uint64) public commitments;
 
+    /// @notice Total seconds this contract has spent paused. The reveal paths
+    ///         are `whenNotPaused`, so `_checkStaleness` takes this, plus
+    ///         `CapacityBond.pausedTotal` (a paused `slash` blocks a reveal too),
+    ///         off the evidence age: a pause never voids a pending offense.
+    ///         Conservative: a pause before the evidence was signed still counts,
+    ///         which only ever favors the challenger by the paused time.
+    uint64 public pausedTotal;
+
+    /// @notice `block.timestamp` at which the current pause began; 0 when not
+    ///         paused.
+    uint64 internal _pausedAt;
+
     // -----------------------------------------------------------------
     // Decoded evidence structs (ABI layout of the `*ResponseData` args)
     // -----------------------------------------------------------------
@@ -367,6 +379,22 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         _unpause();
     }
 
+    /// @dev Stamp the pause start so `_unpause` can add the duration to
+    ///      `pausedTotal`.
+    function _pause() internal override {
+        // forge-lint: disable-next-line(block-timestamp)
+        _pausedAt = uint64(block.timestamp);
+        super._pause();
+    }
+
+    /// @dev Add the just-ended pause interval to `pausedTotal`.
+    function _unpause() internal override {
+        // forge-lint: disable-next-line(block-timestamp)
+        pausedTotal += uint64(block.timestamp) - _pausedAt;
+        _pausedAt = 0;
+        super._unpause();
+    }
+
     // -----------------------------------------------------------------
     // Internal — verification
     // -----------------------------------------------------------------
@@ -547,11 +575,16 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         return block.timestamp > uint256(addedAt) + term;
     }
 
-    /// @dev Skew-safe evidence-age check (ADR 014 § Evidence staleness).
+    /// @dev Skew-safe evidence-age check (ADR 014 § Evidence staleness). The
+    ///      age excludes the time this contract and `CapacityBond` spent paused,
+    ///      since a reveal cannot land during either pause.
     function _checkStaleness(uint64 evidenceTsUs) internal view {
         uint256 nowUs = block.timestamp * 1_000_000;
         if (uint256(evidenceTsUs) > nowUs + MAX_FUTURE_SKEW_US) revert EvidenceInFuture(evidenceTsUs);
-        uint256 ageUs = uint256(evidenceTsUs) >= nowUs ? 0 : nowUs - uint256(evidenceTsUs);
+        // Staticcall to the trusted immutable `capacityBond`.
+        uint256 pausedUs = (uint256(pausedTotal) + capacityBond.pausedTotal()) * 1_000_000;
+        uint256 notBeforeUs = uint256(evidenceTsUs) + pausedUs;
+        uint256 ageUs = notBeforeUs >= nowUs ? 0 : nowUs - notBeforeUs;
         if (ageUs >= maxEvidenceAgeUs) revert EvidenceTooOld(ageUs, maxEvidenceAgeUs);
     }
 

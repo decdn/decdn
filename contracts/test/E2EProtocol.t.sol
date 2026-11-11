@@ -144,13 +144,9 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         PaymentPool.LaneSettled[] memory expected = new PaymentPool.LaneSettled[](1);
         expected[0] =
             PaymentPool.LaneSettled({ signer: signer, newPaidCumulative: SETTLE_AMOUNT, bytesPaid: SETTLE_BYTES });
-        // Redemption pays only a bound operator and stamps bytes only for an
+        // Redemption pays only a staked operator and stamps bytes only for an
         // active one; stand the operator up as both without a full onboarding.
-        vm.mockCall(
-            address(d.bond),
-            abi.encodeWithSignature("nodeIdOf(address)", operator),
-            abi.encode(bytes32(uint256(0x0FE1)), true)
-        );
+        vm.mockCall(address(d.bond), abi.encodeWithSignature("payeeStatus(address)", operator), abi.encode(true, true));
 
         vm.expectEmit(true, true, true, true, address(d.paymentPool));
         emit PoolRedeemed(poolId, operator, expected);
@@ -175,6 +171,106 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         PaymentPool.Lane memory lane = d.paymentPool.getWatermark(poolId, signer, operator);
         assertEq(lane.amount, SETTLE_AMOUNT, "watermark cumulative advanced");
         assertEq(lane.bytesDelivered, SETTLE_BYTES, "watermark bytes advanced");
+    }
+
+    // -----------------------------------------------------------------
+    // Payee gate (#2834): a payee needs stake, not just a binding
+    // -----------------------------------------------------------------
+
+    /// @notice A capability holder binds its own address with `bindNodeId`,
+    ///         which needs no bond, then signs a voucher for its cap naming
+    ///         itself as provider. The redeem reverts: a binding is not stake.
+    function test_e2e_redeemMany_boundButUnbondedPayeeReverts() public {
+        bytes32 poolId = _openPool();
+        _bind(SIGNER_PK, signer, bytes32(uint256(0x5E1F)));
+        (bytes32 nodeId, bool active) = d.bond.nodeIdOf(signer);
+        assertEq(nodeId, bytes32(uint256(0x5E1F)), "the capability holder holds a binding");
+        assertFalse(active, "and no registration");
+
+        PaymentPool.PoolBatch[] memory batches = _settleBatch(poolId, signer);
+        vm.prank(signer);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotStaked.selector, signer));
+        d.paymentPool.redeemMany(batches);
+        assertEq(usdc.balanceOf(signer), 0, "no USDC reaches the self-dealing holder");
+    }
+
+    /// @notice A bonded node that queues its whole bond for unbonding still
+    ///         redeems the vouchers it earned: unbonding bond is stake.
+    function test_e2e_redeemMany_unbondingOperatorStillPaid() public {
+        uint256 opPk = 0xB0DED;
+        address op = vm.addr(opPk);
+        vm.prank(tokenHolder);
+        d.token.transfer(op, MIN_BOND);
+        vm.startPrank(op);
+        d.token.approve(address(d.bond), MIN_BOND);
+        d.bond.bond(MIN_BOND);
+        vm.stopPrank();
+        _bind(opPk, op, bytes32(uint256(0xB0DED)));
+        vm.prank(op);
+        d.bond.requestUnbond(MIN_BOND);
+        assertEq(d.bond.activeBond(op), 0, "the whole bond is unbonding");
+
+        bytes32 poolId = _openPool();
+        PaymentPool.PoolBatch[] memory batches = _settleBatch(poolId, op);
+        vm.prank(op);
+        d.paymentPool.redeemMany(batches);
+        assertEq(usdc.balanceOf(op), SETTLE_AMOUNT * cfg.feeRouterShares[0] / 10_000, "operator share paid");
+        uint256 epoch = block.timestamp / cfg.feeRouterEpochLength;
+        assertEq(d.router.bytesPerEpoch(op, uint64(epoch)), 0, "an inactive payee adds no governance bytes");
+    }
+
+    function _openPool() internal returns (bytes32 poolId) {
+        vm.prank(owner);
+        poolId = d.paymentPool.openPool(DEPOSIT);
+    }
+
+    /// @dev `bindNodeId` with the operator's own EIP-712 consent; the mock
+    ///      ed25519 verifier accepts the ownership proof.
+    function _bind(uint256 pk, address who, bytes32 nodeId) internal {
+        bytes32 structHash = keccak256(abi.encode(d.bond.BIND_NODE_TYPEHASH(), nodeId, d.bond.bindingNonce(who)));
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("CapacityBond")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(d.bond)
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, keccak256(abi.encodePacked("\x19\x01", domain, structHash)));
+        vm.prank(who);
+        d.bond.bindNodeId(nodeId, abi.encodePacked(r, s, v), hex"01");
+    }
+
+    /// @dev One pool group: the signer's capability plus one sealed voucher
+    ///      for `SETTLE_AMOUNT` naming `provider_`.
+    function _settleBatch(bytes32 poolId, address provider_)
+        internal
+        view
+        returns (PaymentPool.PoolBatch[] memory batches)
+    {
+        uint64 expiry = uint64(block.timestamp + 365 days);
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
+        caps[0] = PaymentPool.CapabilityReg({
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _capabilitySig(poolId, signer, SPENDING_CAP, expiry, OWNER_PK)
+        });
+        (bytes32 vr, bytes32 vvs) = _voucherSig(poolId, signer, provider_, SETTLE_AMOUNT, SETTLE_BYTES, SIGNER_PK);
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
+        vouchers[0] = PaymentPool.LaneVoucher({
+            signer: signer,
+            cumulative: SETTLE_AMOUNT,
+            bytesDelivered: SETTLE_BYTES,
+            r: vr,
+            vs: vvs,
+            chainRoot: bytes32(0),
+            preimage: bytes32(0),
+            chainMeter: 0
+        });
+        batches = new PaymentPool.PoolBatch[](1);
+        batches[0] = PaymentPool.PoolBatch({ poolId: poolId, capabilities: caps, vouchers: vouchers });
     }
 
     // -----------------------------------------------------------------

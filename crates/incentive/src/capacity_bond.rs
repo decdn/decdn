@@ -324,7 +324,10 @@ mod sol_types {
             /// `termsHash` must equal `currentTermsHash` (ADR 019 § Terms
             /// Acceptance). Reverts if the operator's bond is below `minBond` /
             /// the declared-capacity curve — Phase 2.1/2.2 (`bond` /
-            /// `declareMbps`) are a precondition.
+            /// `declareMbps`) are a precondition. A re-registration into a
+            /// region other than the current one reverts
+            /// `RegionCooldownActive(readyAt)` within `regionStabilityWindow`
+            /// of the last region change, the same cooldown as `updateRegion`.
             function registerNode(
                 bytes32 nodeId,
                 bytes multiaddrs,

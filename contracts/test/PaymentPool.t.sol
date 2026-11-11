@@ -25,28 +25,27 @@ contract MockUSDC is ERC20 {
     }
 }
 
-/// @notice Configurable `isActive` registry stand-in. `PaymentPool` never
-///         calls it in this task (a pool names no provider), but the
-///         constructor still takes a validated non-zero `capacityBond`.
+/// @notice Configurable registry stand-in: `setStaked` and `setActive` set the
+///         two flags `payeeStatus` returns to `redeemMany`. The real stake rule
+///         runs against the deployed `CapacityBond` in `E2EProtocol.t.sol`.
 contract MockActiveBond is ICapacityBondActivity {
     mapping(address => bool) internal _active;
+    mapping(address => bool) public staked;
 
     function setActive(address operator, bool a) external {
         _active[operator] = a;
     }
 
-    mapping(address => bytes32) public boundNodeId;
-
     function isActive(address operator) external view override returns (bool) {
         return _active[operator];
     }
 
-    function setBound(address operator, bytes32 nodeId) external {
-        boundNodeId[operator] = nodeId;
+    function setStaked(address operator, bool s) external {
+        staked[operator] = s;
     }
 
-    function nodeIdOf(address operator) external view override returns (bytes32, bool) {
-        return (boundNodeId[operator], _active[operator]);
+    function payeeStatus(address operator) external view override returns (bool, bool) {
+        return (staked[operator], _active[operator]);
     }
 }
 
@@ -256,8 +255,8 @@ contract PaymentPoolTest is Test {
         vm.prank(admin);
         pool.grantRole(PAUSER_ROLE, pauser);
 
-        // The fixture payee is a bound, active operator.
-        bond.setBound(provider, bytes32(uint256(0xB0D)));
+        // The fixture payee is a staked, active operator.
+        bond.setStaked(provider, true);
         bond.setActive(provider, true);
 
         usdc.transfer(owner, 100_000e6);
@@ -1880,14 +1879,14 @@ contract PaymentPoolTest is Test {
     // redeemMany — register-batch then redeem-batch (ADR 003 § Batch redemption)
     // -----------------------------------------------------------------
 
-    /// @notice Only a bound operator is a payee: a capability holder that signs
-    ///         a voucher to its own unbound address cannot draw the cap as USDC.
-    function test_redeemMany_revertsForUnboundPayee() public {
+    /// @notice Only a staked operator is a payee: a capability holder that signs
+    ///         a voucher to its own unstaked address cannot draw the cap as USDC.
+    function test_redeemMany_revertsForUnstakedPayee() public {
         bytes32 id = _open();
         address self = address(0x5E1F);
         Sig memory sig = _signVoucherFor(address(pool), id, signer, self, 300e6, 30_000_000, SIGNER_PK);
         vm.prank(self);
-        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotBound.selector, self));
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.ProviderNotStaked.selector, self));
         _redeemOne(id, signer, self, 300e6, 30_000_000, sig, _cap(id, SPENDING_CAP, expiry));
     }
 
@@ -1909,7 +1908,7 @@ contract PaymentPoolTest is Test {
     function test_redeemMany_registersCapabilitiesThenRedeemsVouchers() public {
         bytes32 id = _open();
         address provider2 = address(0xCAFE);
-        bond.setBound(provider2, bytes32(uint256(0xCAFE)));
+        bond.setStaked(provider2, true);
 
         PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
         caps[0] = PaymentPool.CapabilityReg({
