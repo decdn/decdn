@@ -983,6 +983,25 @@ fn a_replaced_manifest_fetch_names_the_new_pool() {
     );
 }
 
+/// A manifest fetch that ends on the manifest cap says that the blob is not a
+/// manifest and how to fetch it, and keeps the typed fault for a caller.
+#[test]
+fn a_capped_manifest_fetch_points_at_the_raw_blob() {
+    let too_large = crate::BlobTooLarge {
+        reached: 64 << 20,
+        ceiling: 64 << 20,
+    };
+    let err = manifest_fetch_error(anyhow::Error::new(too_large));
+    let text = format!("{err:#}");
+    assert!(text.starts_with("fetch bundle manifest blob: "), "{text}");
+    assert!(
+        text.contains("larger than a bundle manifest can be (64 MiB"),
+        "{text}"
+    );
+    assert!(text.contains("drop the trailing path"), "{text}");
+    assert!(err.downcast_ref::<crate::BlobTooLarge>().is_some());
+}
+
 /// A gate that holds the replacement of pool `0x01` by pool `0x02`, as a
 /// recovery step leaves it.
 async fn gate_replaced() -> RecoveryGate {

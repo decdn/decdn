@@ -1264,6 +1264,14 @@ fn manifest_fetch_error(err: anyhow::Error) -> anyhow::Error {
         )),
         None => err,
     };
+    let err = if err.downcast_ref::<crate::BlobTooLarge>().is_some() {
+        err.context(format!(
+            "the blob is larger than a bundle manifest can be ({MAX_MANIFEST_MB} MiB, or the \
+             run's blob cap when that is lower); drop the trailing path to fetch the raw blob"
+        ))
+    } else {
+        err
+    };
     err.context("fetch bundle manifest blob")
 }
 
@@ -2192,8 +2200,9 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// health table and progress clock, as every entry. A manifest has no
     /// manifest size, so the fetch takes the first size claim (the probe hint,
     /// a pinned node's included, or a whole-blob open when there is none).
-    /// The fetch runs under [`manifest_cap_bytes`], so a size claim past the
-    /// largest manifest fails before any voucher.
+    /// The fetch runs under [`manifest_cap_bytes`], so a blob past the
+    /// largest manifest fails once the fetch holds the cap, and pays for at
+    /// most the cap.
     /// The staging file is removed once read back — a manifest fetch has
     /// nothing further to resume once its bytes are safely in memory.
     async fn fetch_to_memory(&self, hash: [u8; 32], out_root: &Path) -> anyhow::Result<Vec<u8>> {

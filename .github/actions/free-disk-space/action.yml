@@ -2,7 +2,7 @@ name: Free disk space
 description: >-
   Reclaim about 20 GB of preinstalled toolchains the workspace build never
   uses, only when the root file system has less free space than `min-free-gb`.
-  Hosted runners come with either a 145 GB root (about 90 GB free) or a 72 GB
+  Hosted runners come with either a 145 GB root (about 86 GB free) or a 72 GB
   one, and `runs-on: ubuntu-latest` cannot pick between them. The coverage
   build fills about 78 GB of the root, so a small runner fails with ENOSPC
   without this step, and a runner with the free space skips its 1:44 to 3:20
@@ -13,7 +13,7 @@ inputs:
     description: >-
       Free space on `/`, in GB, at or above which the step reclaims nothing.
     required: false
-    default: '90'
+    default: '80'
 
 runs:
   using: composite

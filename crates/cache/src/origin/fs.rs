@@ -178,9 +178,12 @@ impl FilesystemOrigin {
 
     /// The answer for a path that does not resolve and is no dangling link:
     /// an absence while the base still exists, else a permanent failure. The
-    /// base is checked once at construction, so a base directory deleted or
-    /// unmounted later would otherwise read as every hash being absent. A
-    /// stat error other than `NotFound` keeps the absence.
+    /// base is checked once at construction, so a base directory that is
+    /// deleted later, or that sits below a mount point and goes with the
+    /// unmount, would otherwise read as every hash being absent. A base that
+    /// is itself the mount point still exists as an empty directory after an
+    /// unmount and keeps the absence, as does a stat error other than
+    /// `NotFound`.
     async fn absent_unless_base_gone<T>(&self) -> Result<Option<T>, OriginPullError> {
         match tokio::fs::metadata(&self.base).await {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {

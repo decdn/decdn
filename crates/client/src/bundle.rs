@@ -74,8 +74,8 @@ pub use crate::lane_sources::FaultContext;
 pub const STAGING_DIR: &str = ".decdn-partial";
 
 /// The largest bundle manifest a pull fetches, in bytes. A manifest fetch
-/// runs under this cap or the run's own blob cap, whichever is lower, so its
-/// lanes refuse a larger size claim before they pay for a byte.
+/// runs under this cap or the run's own blob cap, whichever is lower, so a
+/// blob that is not a manifest costs the fetch at most the cap in paid bytes.
 pub const MAX_MANIFEST_BYTES: usize = 64 << 20;
 
 /// [`MAX_MANIFEST_BYTES`] in MiB.

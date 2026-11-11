@@ -63,7 +63,8 @@ const METRICS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The longest one `/metrics` connection lives, keep-alive included. A scrape
 /// takes milliseconds and a scraper reconnects on its next interval, so the
-/// bound only frees the permits of peers that hold idle connections open.
+/// bound only frees the permit of a peer that holds a connection open by
+/// reading a response slowly or trickling requests.
 const METRICS_CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Every counter that names why an inbound `cdn/client/v1` stream failed. Each
