@@ -95,7 +95,7 @@ use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
 use crate::fault::{carries_untracked_escrow, fold_escrow};
 use crate::funding::RunFunding;
-use crate::lane_sources::{FirstLeg, LaneSources};
+use crate::lane_sources::LaneSources;
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
 use crate::receipt::ReceiptEvidence;
@@ -1883,8 +1883,8 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// `total` is the entry's first size claim: the manifest's `size` when it
     /// gives one. The fetch grows or shrinks it as bytes land, so a manifest
     /// size that differs from the blob never fails the entry. With no manifest
-    /// size (the manifest blob itself, or an unsized entry), the first claim
-    /// comes from the probe's size hint, or else from a whole-blob first open.
+    /// size (the manifest blob itself, or an unsized entry), the fetch starts
+    /// with no claim and takes the size its first verified leaf proves.
     ///
     /// A holder that faults cools in the command-wide [`PeerHealth`] and
     /// returns inside the same loop, so a holder that fails one entry is
@@ -1937,16 +1937,9 @@ impl<P: Provider + Clone> PullCtx<P> {
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The manifest's size, authenticated under the manifest's root, is
-            // the entry's first bound; without one, the header of a first-leg
-            // open gives the claim that picks the first leg's shape.
-            let (total_bytes, declared, holders) = if let Some(total) = total {
-                (total, true, holders)
-            } else {
-                let claim = sources
-                    .first_claim(hash, holders, FirstLeg::Whole, &self.health, stop)
-                    .await?;
-                (claim.total_bytes, false, claim.holders)
-            };
+            // the entry's first bound. Without one, the entry plans one seed
+            // with no claim, and every lane starts at once.
+            let (total_bytes, declared) = total.map_or((0, false), |total| (total, true));
             // The max sources cap the lanes the entry stripes across at
             // once; every other holder waits as a reserve.
             let mut downloader = Downloader::new(&sources, sources.funder())

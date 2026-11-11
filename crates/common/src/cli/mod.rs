@@ -136,7 +136,9 @@ pub enum Command {
     /// paid `cdn/client/v1` path, paying per-MB from a `PaymentPool`.
     Get(Box<GetArgs>),
     /// Price a pull of what a `decdn:` URI names from the rates the nodes
-    /// sign in their probe answers, before any paid byte.
+    /// sign in their probe answers, before any paid byte. A raw blob's size
+    /// is learned from the bytes a pull verifies, so its quote shows nodes
+    /// and rates only.
     Quote(Box<QuoteArgs>),
     /// Check a pull receipt `decdn get --receipt` wrote (`verify`), or add the
     /// on-chain redemptions that settle it (`settle`).

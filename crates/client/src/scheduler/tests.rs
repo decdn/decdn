@@ -993,6 +993,7 @@ fn one_victim_work(total: u64, coverage: &Coverage) -> super::Work {
         no_uncovered: vec![false; 3],
         front_first: false,
         hash: [0; 32],
+        known: 0,
     }
 }
 
@@ -5474,31 +5475,62 @@ fn a_grown_bound_saturates_near_the_top() {
 
 /// Before any byte verifies, a claim only shortens the plan: a tail plans one
 /// `SEED` past its start whatever the claim, an exact range its own end, and
-/// the cap's reach bounds both.
+/// the cap's reach bounds both. With no claim a tail plans one chunk group
+/// across several holders, and one `SEED` from a lone holder.
 #[test]
 fn the_first_bound_never_reaches_past_a_tail_seed_or_a_range_end() {
     use super::{SEED, first_bound};
     let huge = 1 << 60;
     assert_eq!(
-        first_bound(huge, &[(0, 0)], 0),
+        first_bound(huge, &[(0, 0)], 0, 2),
         SEED,
         "a liar plans one seed"
     );
-    assert_eq!(first_bound(3 * MIB, &[(0, 0)], 0), 3 * MIB, "a short claim");
-    assert_eq!(first_bound(0, &[(0, 0)], 0), SEED, "no claim");
     assert_eq!(
-        first_bound(huge, &[(10 * MIB, 0)], 0),
+        first_bound(3 * MIB, &[(0, 0)], 0, 2),
+        3 * MIB,
+        "a short claim"
+    );
+    assert_eq!(
+        first_bound(0, &[(0, 0)], 0, 2),
+        decdn_bao_range::CHUNK_GROUP_BYTES,
+        "no claim, several holders: one chunk group"
+    );
+    assert_eq!(
+        first_bound(0, &[(0, 0)], 0, 1),
+        SEED,
+        "no claim, one holder: one seed as one leg"
+    );
+    assert_eq!(
+        first_bound(huge, &[(10 * MIB, 0)], 0, 2),
         10 * MIB + SEED,
         "a tail plans from its start"
     );
     assert_eq!(
-        first_bound(huge, &[(0, 5 * MIB)], 0),
+        first_bound(huge, &[(0, 5 * MIB)], 0, 2),
         5 * MIB,
         "an exact range plans to its end"
     );
-    assert_eq!(first_bound(huge, &[(0, 0)], MIB), MIB, "the cap's reach");
+    assert_eq!(first_bound(huge, &[(0, 0)], MIB, 2), MIB, "the cap's reach");
     // A claim short of the window never plans below its start.
-    assert_eq!(first_bound(MIB, &[(8 * MIB, 4 * MIB)], 0), 8 * MIB + 1);
+    assert_eq!(first_bound(MIB, &[(8 * MIB, 4 * MIB)], 0, 2), 8 * MIB + 1);
+}
+
+/// A whole holder's coverage never reaches past the largest discoverable blob
+/// on a bound that rests on a claim (a size proof's window at a 2^60 claim),
+/// and reaches as far as verified knowledge proves the blob does.
+#[test]
+fn a_claimed_bound_sizes_no_whole_coverage_bitmap() {
+    let max = decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES;
+    let claimed = super::whole_coverage(1 << 60, 0);
+    assert_eq!(claimed.covered_blocks().count(), num_blocks(max) as usize);
+    let verified = super::whole_coverage(1 << 60, 2 * max);
+    assert_eq!(
+        verified.covered_blocks().count(),
+        num_blocks(2 * max) as usize
+    );
+    let small = super::whole_coverage(3 * MIB, 0);
+    assert_eq!(small.covered_blocks().count(), 1);
 }
 
 /// The bounds the growth rule steps through from a first bound of `first`
@@ -5646,31 +5678,43 @@ async fn an_honest_claim_past_one_seed_is_proven_by_its_tail() -> anyhow::Result
     Ok(())
 }
 
-/// With no claim at all, the fetch plans one seed and grows from the bytes
-/// that verify: once the verified frontier passes half the bound, the bound
-/// grows to twice the frontier while the lanes still run.
+/// With no claim at all, the fetch plans one chunk group; the first leaf
+/// proves the root split and the claim it came under, whose tail then proves
+/// the size. The lanes split only bytes that exist, so both serve, and no
+/// bound runs past the blob.
 #[tokio::test(start_paused = true)]
-async fn with_no_claim_the_bound_grows_from_verified_bytes() -> anyhow::Result<()> {
-    let truth = 70 * MIB;
-    let data = blob(truth as usize);
-    let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
-    let root = sources
-        .first()
-        .map(ScriptedSource::root)
-        .unwrap_or_default();
-    let (store, dir) = fresh_store(root, 0);
-    let (result, samples) = acquire_recording(&store, &provider, root, 2).await;
-    result?;
-    assert_eq!(store.proven(), Some(truth));
-    let totals: Vec<u64> = samples.iter().map(|&(_, total)| total).collect();
-    assert_eq!(totals.first().copied(), Some(super::SEED), "{totals:?}");
-    let most = totals.iter().copied().max().unwrap_or(0);
-    assert!(
-        most <= 2 * truth,
-        "a bound of {most} ran past twice the blob"
-    );
-    store.finalize().await?;
-    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+async fn with_no_claim_the_lanes_split_only_verified_bytes() -> anyhow::Result<()> {
+    for truth in [40 * 16 * 1024 + 777, 70 * MIB] {
+        let data = blob(truth as usize);
+        let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
+        let root = sources
+            .first()
+            .map(ScriptedSource::root)
+            .unwrap_or_default();
+        let (store, dir) = fresh_store(root, 0);
+        let (result, samples) = acquire_recording(&store, &provider, root, 2).await;
+        result?;
+        assert_eq!(store.proven(), Some(truth));
+        let totals: Vec<u64> = samples.iter().map(|&(_, total)| total).collect();
+        assert_eq!(
+            totals.first().copied(),
+            Some(decdn_bao_range::CHUNK_GROUP_BYTES),
+            "{totals:?}"
+        );
+        let most = totals.iter().copied().max().unwrap_or(0);
+        assert_eq!(most, truth, "no bound past the blob: {totals:?}");
+        for source in &sources {
+            assert!(
+                source
+                    .opened_ranges()
+                    .iter()
+                    .any(|&(start, _)| start < truth),
+                "every lane serves bytes of the blob"
+            );
+        }
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    }
     Ok(())
 }
 

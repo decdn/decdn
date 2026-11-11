@@ -1362,16 +1362,25 @@ pub(crate) async fn fetch_on(
             } else {
                 FirstLeg::Whole
             };
+            // A download needs no claim before it starts: across several
+            // holders it plans one chunk group, whose verified leaf bounds the
+            // size, and every lane starts at once, so a small blob still
+            // splits across its holders. A stream's first leg and a size
+            // proof need a claim, which a first-leg open learns.
             let claim = match known {
                 Some(total_bytes) => FirstClaim {
                     total_bytes,
                     holders,
                 },
-                None => {
+                None if streams || args.prove => {
                     sources
                         .first_claim(hash, holders, first_leg, health, &stop)
                         .await?
                 }
+                None => FirstClaim {
+                    total_bytes: 0,
+                    holders,
+                },
             };
             if replaced.is_none()
                 && let Some(hints) = &rate_hints

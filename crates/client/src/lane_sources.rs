@@ -119,6 +119,7 @@ pub(crate) fn size_open_span(
         UNBOUNDED_SIZE,
         &[first_leg_window(first_leg)],
         max_blob_bytes,
+        1,
     );
     cut_first_leg(first_leg, max_blob_bytes, bound)
 }
@@ -136,8 +137,12 @@ pub(crate) fn primed_first_leg(
     span: &AlignedRange,
     total_bytes: u64,
 ) -> Option<AlignedRange> {
-    let bound =
-        crate::scheduler::first_bound(total_bytes, &[first_leg_window(first_leg)], max_blob_bytes);
+    let bound = crate::scheduler::first_bound(
+        total_bytes,
+        &[first_leg_window(first_leg)],
+        max_blob_bytes,
+        1,
+    );
     cut_first_leg(first_leg, max_blob_bytes, bound).filter(|leg| {
         leg.fetch_start() == span.fetch_start()
             && leg.fetch_end() == span.fetch_end().min(total_bytes)

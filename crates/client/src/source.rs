@@ -249,6 +249,14 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     fn floor(&self) -> u64 {
         self.total_bytes()
     }
+
+    /// The first size a leaf of the blob verified under: a claim whose root
+    /// split is proven. [`crate::acquire`] with no first claim proves this one
+    /// by its tail. A store keyed by a fixed size has no claim to prove, so
+    /// the default is `None`.
+    fn verified_claim(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The current pool no longer accepts funds, and the funding recovery step

@@ -67,6 +67,10 @@ struct StoreState {
     /// exists ([`StoreState::raise_floor`]). Derived, not persisted: a
     /// reopened store reads it from `present` and `proven`.
     floor: u64,
+    /// The first size a leaf verified under in this process: a claim whose
+    /// root split is proven. It only picks the shape of a tail proof
+    /// ([`crate::acquire`]). Not persisted.
+    first_claim: Option<u64>,
 }
 
 impl StoreState {
@@ -77,6 +81,7 @@ impl StoreState {
             proven: None,
             present: ChunkRanges::empty(),
             floor: 0,
+            first_claim: None,
         }
     }
 
@@ -89,6 +94,7 @@ impl StoreState {
             proven,
             present,
             floor,
+            first_claim: None,
         }
     }
 
@@ -597,6 +603,13 @@ impl ClientRangedStore {
         self.lock_state().floor
     }
 
+    /// The first size a leaf of this blob verified under in this process: a
+    /// claim whose root split is proven. `None` before a leaf verifies.
+    #[must_use]
+    pub fn verified_claim(&self) -> Option<u64> {
+        self.lock_state().first_claim
+    }
+
     /// The state under its lock. A poisoned lock still holds a consistent
     /// state: every writer updates it in one assignment or one union.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, StoreState> {
@@ -874,8 +887,10 @@ impl ClientRangedStore {
                             ));
                     if !split_proven {
                         split_proven = true;
+                        let mut state = self.lock_state();
+                        state.first_claim.get_or_insert(claimed_total);
                         if let Some(split) = root_split(claimed_total) {
-                            self.lock_state().raise_floor(split);
+                            state.raise_floor(split);
                         }
                     }
                     batch.leaves.push((leaf.offset, leaf.data));
@@ -1698,6 +1713,10 @@ impl crate::source::IngestStore for ClientRangedStore {
 
     fn floor(&self) -> u64 {
         Self::floor(self)
+    }
+
+    fn verified_claim(&self) -> Option<u64> {
+        Self::verified_claim(self)
     }
 }
 

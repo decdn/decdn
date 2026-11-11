@@ -58,7 +58,6 @@ use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::eth_identity;
-use decdn_incentive::rate::min_payment;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "quote-e2e-password";
@@ -214,36 +213,27 @@ async fn launch() -> anyhow::Result<Journey> {
 /// Steps 1–3: the blob's quote, capped, and pinned.
 fn blob_quotes(j: &Journey) -> anyhow::Result<()> {
     let uri = j.uri();
-    let wire = decdn_client::quote::wire_bytes(u64::try_from(j.blob.len())?)?;
-    // (1) Both holders, both signed rates, priced at each.
+    // (1) Both holders and both signed rates. A raw blob's size is learned
+    // from the bytes a pull verifies, so the quote names no size and no
+    // price.
     let quote = json(&j.decdn(&["quote", &uri, "--json"])?)?;
     assert_eq!(quote["target"], "blob");
-    assert_eq!(quote["content_bytes"], j.blob.len());
+    assert_eq!(quote["content_bytes"], serde_json::Value::Null, "{quote}");
+    assert_eq!(quote["wire_bytes"], serde_json::Value::Null, "{quote}");
+    assert_eq!(
+        quote["price_micro_usdc"],
+        serde_json::Value::Null,
+        "{quote}"
+    );
     assert_eq!(quote["nodes_probed"], 2, "{quote}");
     assert_eq!(quote["holders_min"], 2, "{quote}");
     assert_eq!(quote["rate_min_per_mib"], CHEAP_RATE, "{quote}");
     assert_eq!(quote["rate_max_per_mib"], DEAR_RATE, "{quote}");
-    let price = &quote["price_micro_usdc"];
-    assert_eq!(price["low"], min_payment(wire, CHEAP_RATE).to_string());
-    assert_eq!(price["high"], min_payment(wire, DEAR_RATE).to_string());
-    // Two lanes, one at each rate, split evenly.
-    let likely = min_payment(wire - wire / 2, CHEAP_RATE) + min_payment(wire / 2, DEAR_RATE);
-    let likely_alt = min_payment(wire - wire / 2, DEAR_RATE) + min_payment(wire / 2, CHEAP_RATE);
-    let got = price["likely"].as_str().unwrap_or_default().to_owned();
-    assert!(
-        got == likely.to_string() || got == likely_alt.to_string(),
-        "{quote}"
-    );
 
     // (2) A ceiling between the two rates leaves the more expensive node out.
     let capped = json(&j.decdn(&["quote", &uri, "--json", "--max-rate-per-mb", "10"])?)?;
     assert_eq!(capped["rate_max_per_mib"], CHEAP_RATE, "{capped}");
     assert_eq!(capped["above_ceiling"], 1, "{capped}");
-    assert_eq!(
-        capped["price_micro_usdc"]["high"],
-        min_payment(wire, CHEAP_RATE).to_string(),
-        "{capped}"
-    );
 
     // (3) A pinned node is probed alone.
     let node_id = j.cheap.node_id().to_string();
@@ -391,19 +381,18 @@ async fn bundle_quote(j: &Journey) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Step 6: a paid `get` prints its estimate once, before the pull.
+/// Step 6: a paid `get` of a raw blob prints its nodes and rates once, before
+/// the pull, and no estimate: the blob's size is learned from the bytes the
+/// pull verifies.
 fn get_estimate(j: &Journey) -> anyhow::Result<()> {
     let uri = j.uri();
     let out = j.client_dir.path().join("blob.bin");
     let out_arg = out.display().to_string();
-    // (6) A paid `get` prints its estimate once, before the pull.
+    // (6) A paid `get` prints its rates once, before the pull.
     let got = j.decdn(&["get", &uri, "-o", &out_arg])?;
-    let estimates = got
-        .stderr
-        .lines()
-        .filter(|l| l.starts_with("Estimate: "))
-        .count();
-    assert_eq!(estimates, 1, "{}", got.stderr);
+    let count = |prefix: &str| got.stderr.lines().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(count("Rates: 2 node(s)"), 1, "{}", got.stderr);
+    assert_eq!(count("Estimate: "), 0, "{}", got.stderr);
     assert_eq!(std::fs::read(&out)?, j.blob);
     Ok(())
 }

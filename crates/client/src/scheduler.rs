@@ -246,29 +246,41 @@ fn cap_reach(ranges: &[(u64, u64)], cap: u64) -> u64 {
     furthest.saturating_add(cap)
 }
 
-/// The bound a fetch of `ranges` plans to before any of its bytes verify,
-/// under a first leg whose sender claims `claim` bytes (`0`: no claim).
+/// The bound a fetch of `ranges` from `holders` known holders plans to
+/// before any of its bytes verify, under a first leg whose sender claims
+/// `claim` bytes (`0`: no claim).
 ///
-/// Each range reaches its own end, and a range with a zero length (a tail)
-/// one [`SEED`] past its start; the furthest reach, cut to what the cap on
-/// held bytes `cap` lets the ranges reach ([`cap_reach`]), is the plan. The
-/// claim only shortens it, never below the furthest range start plus one
-/// byte: the claim picks the shape of the first leg, which verifies under it,
-/// and a leg that verifies the final chunk of a short claim proves it. A
-/// claim never lengthens the plan: what lies past it is planned from bytes
-/// that verify ([`grown_bound`]) and from a tail proof.
-pub(crate) fn first_bound(claim: u64, ranges: &[(u64, u64)], cap: u64) -> u64 {
+/// Each range reaches its own end. A range with a zero length (a tail)
+/// reaches one [`SEED`] past its start under a claim or from a lone holder.
+/// With no claim and more than one holder it reaches one chunk group past
+/// its start: the lanes split the plan between them, and with no claim only
+/// the first group is known to hold bytes. The first leaf that verifies then
+/// proves the root split, which lifts the plan to bytes that exist before
+/// the lanes split it. A lone holder takes the whole tail as one leg, which
+/// a node cuts at the blob's end, so a small blob carries one proof. The furthest reach, cut to what the
+/// cap on held bytes `cap` lets the ranges reach ([`cap_reach`]), is the
+/// plan. The claim only shortens it, never below the furthest range start
+/// plus one byte: the claim picks the shape of the first leg, which verifies
+/// under it, and a leg that verifies the final chunk of a short claim proves
+/// it. A claim never lengthens the plan: what lies past it is planned from
+/// bytes that verify ([`grown_bound`]) and from a tail proof.
+pub(crate) fn first_bound(claim: u64, ranges: &[(u64, u64)], cap: u64, holders: usize) -> u64 {
+    let tail = if claim == 0 && holders > 1 {
+        decdn_bao_range::CHUNK_GROUP_BYTES
+    } else {
+        SEED
+    };
     let reach = ranges
         .iter()
         .map(|&(start, len)| {
             if len == 0 {
-                start.saturating_add(SEED)
+                start.saturating_add(tail)
             } else {
                 start.saturating_add(len)
             }
         })
         .max()
-        .unwrap_or(SEED)
+        .unwrap_or(tail)
         .min(cap_reach(ranges, cap));
     if claim == 0 {
         return reach;
@@ -279,6 +291,14 @@ pub(crate) fn first_bound(claim: u64, ranges: &[(u64, u64)], cap: u64) -> u64 {
         .max()
         .unwrap_or(0);
     reach.min(claim.max(past_start))
+}
+
+/// Whether one of the requested `ranges` holds byte `byte`. A range with a
+/// zero length (a tail) holds every byte from its start.
+fn reaches_byte(ranges: &[(u64, u64)], byte: u64) -> bool {
+    ranges
+        .iter()
+        .any(|&(start, len)| start <= byte && (len == 0 || byte - start < len))
 }
 
 /// The end of the bytes the fetch knows exist: the proven size, or with none
@@ -1009,12 +1029,17 @@ struct Work {
     front_first: bool,
     /// The blob the work fetches. Steal logs name it.
     hash: [u8; 32],
+    /// The bytes verified knowledge proves the blob holds
+    /// ([`IngestStore::floor`]): a whole holder's coverage reaches past the
+    /// discoverable limit only this far ([`whole_coverage`]).
+    known: u64,
 }
 
 impl Work {
     /// A work-state for blob `hash` with no lanes and `pending` queued.
     const fn new(pending: VecDeque<AlignedRange>, hash: [u8; 32], front_first: bool) -> Self {
         Self {
+            known: 0,
             pending,
             in_flight: Vec::new(),
             cancel: Vec::new(),
@@ -1083,8 +1108,9 @@ impl Work {
         self.units.push(0);
         self.alive.push(true);
         self.measured.push(coverage.is_some());
+        let known = self.known;
         self.coverage
-            .push(coverage.unwrap_or_else(|| Coverage::full(num_blocks(total_bytes))));
+            .push(coverage.unwrap_or_else(|| whole_coverage(total_bytes, known)));
         self.lane_of.push(slot);
         self.extra.push(false);
         self.providers.push(None);
@@ -1249,11 +1275,17 @@ impl Work {
     /// Size every lane without a probed bitmap to the whole blob of
     /// `total_bytes`.
     fn grow_coverage(&mut self, total_bytes: u64) {
+        let known = self.known;
         for (coverage, &measured) in self.coverage.iter_mut().zip(&self.measured) {
             if !measured {
-                *coverage = Coverage::full(num_blocks(total_bytes));
+                *coverage = whole_coverage(total_bytes, known);
             }
         }
+    }
+
+    /// Record that verified knowledge proves the blob holds `known` bytes.
+    fn set_known(&mut self, known: u64) {
+        self.known = self.known.max(known);
     }
 
     /// Clip every range to a proven size of `total_bytes`: drop the pending
@@ -3171,7 +3203,7 @@ fn lanes_to_start<P: SourceProvider>(
         busy.insert(holder.provider);
         let take_uncovered = !sources.no_pull_through(holder.provider);
         if work.has_work_for(
-            &holder_coverage(&holder, total_bytes),
+            &holder_coverage(&holder, total_bytes, work.known),
             total_bytes,
             take_uncovered,
         ) {
@@ -3181,13 +3213,24 @@ fn lanes_to_start<P: SourceProvider>(
     out
 }
 
-/// `holder`'s coverage, or every block of a blob of `total_bytes` for a holder
-/// of the whole blob.
-fn holder_coverage(holder: &Holder, total_bytes: u64) -> Coverage {
+/// `holder`'s coverage, or for a holder of the whole blob every block of a
+/// blob of `total_bytes` ([`whole_coverage`] under `known`).
+fn holder_coverage(holder: &Holder, total_bytes: u64, known: u64) -> Coverage {
     holder
         .coverage
         .clone()
-        .unwrap_or_else(|| Coverage::full(num_blocks(total_bytes)))
+        .unwrap_or_else(|| whole_coverage(total_bytes, known))
+}
+
+/// The coverage of a holder of the whole blob, sized to `total_bytes` but
+/// never past the largest blob discovery describes unless verified knowledge
+/// (`known`, the store's floor) proves the blob reaches further. The bound
+/// can rest on a claim (a size proof's window sits at the claimed end), and
+/// a claim never sizes a bitmap: a range past the limit is then outside the
+/// holder's coverage, and a lane serves it by pull-through.
+fn whole_coverage(total_bytes: u64, known: u64) -> Coverage {
+    let limit = known.max(decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES);
+    Coverage::full(num_blocks(total_bytes.min(limit)))
 }
 
 /// Whether no work left lies inside the coverage of a holder barred from
@@ -3203,7 +3246,13 @@ fn only_uncovered_left<P: SourceProvider>(
         .holders()
         .iter()
         .filter(|h| sources.no_pull_through(h.provider))
-        .all(|h| !work.has_work_for(&holder_coverage(h, total_bytes), total_bytes, false))
+        .all(|h| {
+            !work.has_work_for(
+                &holder_coverage(h, total_bytes, work.known),
+                total_bytes,
+                false,
+            )
+        })
 }
 
 /// Whether every byte of `ranges` is present. With no lane running nothing is
@@ -3780,7 +3829,7 @@ where
     let planned = match store.proven() {
         Some(proven) => proven,
         None if declared => declared_end,
-        None => first_bound(c0, ranges, cap),
+        None => first_bound(c0, ranges, cap, sources.holders().len()),
     };
     store.set_bound(planned.max(store.floor()));
     let first_bound = store.total_bytes();
@@ -3801,14 +3850,20 @@ where
     // a leg in flight on another stream is not yet held. Work that could pass
     // the cap therefore runs one stream at a time: one lane, no extra streams.
     let mut one_stream = cap > 0 && needs > cap;
-    // The tail proof's claim, until the loop starts it: one per fetch.
+    // The tail proof's claim, until the loop starts it: one per fetch. With
+    // no first claim, the claim the first verified leaf came under takes its
+    // place once one verifies.
     let mut proof_claim = (!declared && c0 > 0).then_some(c0);
+    let mut claim_pending = !declared && c0 == 0;
     // The tail proof in flight, if any.
     let mut proving: Option<TailProof<'_>> = None;
     // Whether a worker has ended: its first leg is no longer the open the
     // size open primed, so the tail proof cannot close that pull.
     let mut first_leg_settled = false;
-    let work = AsyncMutex::new(Work::new(pending, hash, env.pacing.is_some()));
+    let mut known_seen = store.floor();
+    let mut planned = Work::new(pending, hash, env.pacing.is_some());
+    planned.set_known(known_seen);
+    let work = AsyncMutex::new(planned);
     let progress_wake = Notify::new();
 
     // The pool deposit every lane draws on, as the loop last saw it. Each built
@@ -3988,6 +4043,15 @@ where
     let result: anyhow::Result<()> = async {
         loop {
             let bound = store.total_bytes();
+            // A whole holder's coverage reaches as far as verified knowledge
+            // proves the blob does ([`whole_coverage`]).
+            let floor = store.floor();
+            if floor > known_seen {
+                known_seen = floor;
+                let mut w = work.lock().await;
+                w.set_known(floor);
+                w.grow_coverage(bound);
+            }
             if let Some(old) = want.fit(bound) {
                 bound_seen.store(bound, Ordering::Release);
                 known_fits_cap(store, &want, cap).await?;
@@ -4010,10 +4074,16 @@ where
                     if cap > 0 && needs > cap {
                         one_stream = true;
                     }
-                    if let Some(cb) = env.on_progress {
-                        cb(progress_agg.load(Ordering::Relaxed), bound);
-                    }
                 }
+                if let Some(cb) = env.on_progress {
+                    cb(progress_agg.load(Ordering::Relaxed), bound);
+                }
+            }
+            // With no first claim, the claim the first verified leaf came
+            // under is the one to prove.
+            if claim_pending && let Some(claim) = store.verified_claim() {
+                claim_pending = false;
+                proof_claim = Some(claim);
             }
             // Grow before the lanes drain: once the verified frontier passes
             // half the bound, the bytes past it are planned while the lanes
@@ -4024,6 +4094,7 @@ where
             // past the blob's end. A declared size is planned whole.
             if store.proven().is_none()
                 && !declared
+                && !claim_pending
                 && proof_claim.is_none()
                 && proving.is_none()
                 && want.reaches_past()
@@ -4049,14 +4120,18 @@ where
             // verified a byte or ended, so it never delays the first byte, and
             // runs at most once per fetch. It runs when the claim lies past
             // the bound and the target wants bytes there, or when the bound
-            // lies past the claim (a window past the claimed end), which a
-            // proven size then ends. A proof that fails leaves the fetch to
-            // grow from verified bytes.
+            // lies past the claim and no requested range reaches the claim's
+            // last byte (a window past the claimed end), which a proven size
+            // then ends. A range that reaches that byte fetches its group
+            // anyway, so a lone holder's one leg over a small blob carries
+            // the only proof. A proof that fails leaves the fetch to grow
+            // from verified bytes.
             if proving.is_none()
                 && store.proven().is_none()
                 && (store.floor() > 0 || first_leg_settled)
                 && let Some(claim) = proof_claim.filter(|&claim| {
-                    (claim > bound && want.reaches_past()) || claim < bound
+                    (claim > bound && want.reaches_past())
+                        || (claim < bound && !reaches_byte(ranges, claim.saturating_sub(1)))
                 })
                 && let Some(lane) = started.0.first().map(Arc::clone)
             {
@@ -4444,7 +4519,7 @@ where
                 let building: Vec<Coverage> = connecting_set
                     .iter()
                     .filter_map(|&provider| sources.holder(provider))
-                    .map(|holder| holder_coverage(holder, total_bytes))
+                    .map(|holder| holder_coverage(holder, total_bytes, store.floor()))
                     .collect();
                 let uncovered = work.lock().await.uncovered_beside(total_bytes, &building);
                 if sources.wants_discovery(now, deposit, running.len(), uncovered) {

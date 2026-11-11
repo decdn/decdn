@@ -195,6 +195,61 @@ async fn the_stream_ends_at_the_proven_size_when_the_claim_was_small() -> anyhow
     Ok(())
 }
 
+/// An inflated claim never sizes a cache read: a tail whose claimed length
+/// is past what a fetch could hold skips the lookup, and the stream still
+/// drains the blob from the bytes that verify.
+#[tokio::test]
+async fn an_inflated_claim_sizes_no_cache_read() -> anyhow::Result<()> {
+    #[derive(Default)]
+    struct GetSpy {
+        longest: std::sync::atomic::AtomicU64,
+    }
+    impl BlobCache for GetSpy {
+        fn get(
+            &self,
+            _hash: [u8; 32],
+            _offset: u64,
+            len: u64,
+        ) -> crate::sink::SinkFuture<'_, Option<Bytes>> {
+            self.longest
+                .fetch_max(len, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(None) })
+        }
+        fn put(
+            &self,
+            _hash: [u8; 32],
+            _offset: u64,
+            _bytes: Bytes,
+        ) -> crate::sink::SinkFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let blob = payload(300_000);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let spy = Arc::new(GetSpy::default());
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        drain_range(
+            source,
+            ledger,
+            1 << 60,
+            (0, 0),
+            spy.clone(),
+            &PullConfig::default(),
+        ),
+    )
+    .await
+    .context("the stream and its drive end")??;
+    anyhow::ensure!(got == blob, "the stream drains the blob");
+    let longest = spy.longest.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        longest <= decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES,
+        "the cache was asked for {longest} bytes"
+    );
+    Ok(())
+}
+
 /// A sink that reports `caches() == false` is NEVER teed the whole blob on a
 /// clean finish — the `Streamer` skips the whole-blob read (and the memory it
 /// would cost) that only exists to populate a cache. This is what keeps a

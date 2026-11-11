@@ -611,9 +611,18 @@ where
         let (offset, len) = window;
         let end = (len > 0).then(|| offset.saturating_add(len));
         // A tail's cache key runs to the claimed end. The cache holds only
-        // verified bytes, so a claim that is off only misses it.
+        // verified bytes, so a claim that is off only misses it. The claim
+        // still names the length the cache is asked for, so a tail past what
+        // a fetch could hold (the cap, or the largest discoverable blob with
+        // no cap) skips the lookup: no claim sizes a cache read.
         let want = end.map_or(total_bytes.saturating_sub(offset), |end| end - offset);
+        let lookup_limit = if self.max_blob_bytes > 0 {
+            self.max_blob_bytes
+        } else {
+            decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES
+        };
         if want > 0
+            && (end.is_some() || want <= lookup_limit)
             && let Some(cached) = cache.get(hash, offset, want).await?
             && u64::try_from(cached.len()).is_ok_and(|cached_len| cached_len == want)
         {
