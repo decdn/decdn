@@ -76,7 +76,7 @@ pub const fn discovery_block_bytes() -> u64 {
 }
 
 /// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans,
-/// saturated at `u32::MAX` blocks — 2^58 bytes (256 PiB) under the production
+/// saturated at `u32::MAX` blocks — just under 2^58 bytes (256 PiB) under the production
 /// 64 MiB block.
 ///
 /// The empty blob spans zero blocks (`num_blocks(0) == 0`), not one — an
@@ -103,7 +103,7 @@ pub fn discovery_block_bytes() -> u64 {
 }
 
 /// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans,
-/// saturated at `u32::MAX` blocks — 2^58 bytes (256 PiB) under the production
+/// saturated at `u32::MAX` blocks — just under 2^58 bytes (256 PiB) under the production
 /// 64 MiB block — the `test-support` twin, which reads the overridable block
 /// size rather than the constant. Same arithmetic as the production `const fn`.
 #[cfg(feature = "test-support")]

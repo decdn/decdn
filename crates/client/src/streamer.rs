@@ -504,9 +504,10 @@ impl<'a, P, F> Streamer<'a, P, F> {
     /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim past
     /// what the window can reach under the cap (the cap itself for the whole
     /// blob, the window's offset plus the cap otherwise) is clamped before the
-    /// fill store is sized — with no cap, the claim is clamped to a finite
-    /// sizing ceiling instead and the store's bound grows as bytes verify —
-    /// and a blob that holds bytes past the cap ends the stream with
+    /// fill store is sized — with no cap, the claim is clamped to what the
+    /// window can reach under a finite sizing ceiling instead, and a fetch
+    /// that runs to the blob's end grows its bound as bytes verify — and a
+    /// blob that holds bytes past the cap ends the stream with
     /// [`crate::BlobTooLarge`] ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {

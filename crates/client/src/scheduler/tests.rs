@@ -5781,6 +5781,22 @@ fn the_growth_limit_is_unbounded_with_no_cap() {
     );
 }
 
+/// The grow step clamps to the growth limit, not the sizing reach: with no
+/// cap (`limit == u64::MAX`) a bound at the sizing ceiling grows past it, so
+/// a blob larger than the ceiling completes; under a real cap the limit
+/// clamps the grown bound.
+#[test]
+fn the_grow_step_passes_the_sizing_ceiling_with_no_cap() {
+    use super::{UNCAPPED_SIZING_CEILING, next_bound};
+    let at_ceiling = next_bound(UNCAPPED_SIZING_CEILING, MIB, 0, u64::MAX);
+    assert!(at_ceiling > UNCAPPED_SIZING_CEILING, "{at_ceiling}");
+    assert_eq!(
+        next_bound(UNCAPPED_SIZING_CEILING, MIB, 0, UNCAPPED_SIZING_CEILING),
+        UNCAPPED_SIZING_CEILING,
+        "a finite limit clamps the grown bound"
+    );
+}
+
 /// With no cap, a huge unverified claim never sizes the work: every planned
 /// bound stays at or under the sizing ceiling, and the fetch completes at
 /// the blob's true size.
@@ -5789,6 +5805,7 @@ async fn an_uncapped_huge_claim_is_sized_by_the_ceiling() -> anyhow::Result<()> 
     let data = blob(3 * MIB as usize);
     let (result, totals, store, dir) = acquire_capped(&data, 1 << 57, 0).await?;
     result?;
+    assert!(!totals.is_empty(), "the fetch reports progress");
     assert!(
         totals.iter().all(|&t| t <= super::UNCAPPED_SIZING_CEILING),
         "{totals:?}"

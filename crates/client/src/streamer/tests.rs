@@ -1320,6 +1320,35 @@ async fn an_uncapped_claim_past_the_ceiling_opens_nothing() -> anyhow::Result<()
     Ok(())
 }
 
+/// The cap-free ceiling is inclusive: a claim exactly at it still tries the
+/// proof (the holder's decline ends it), while one byte past it opens
+/// nothing.
+#[tokio::test]
+async fn an_uncapped_claim_at_the_ceiling_still_tries_the_proof() -> anyhow::Result<()> {
+    let ceiling = crate::scheduler::UNCAPPED_SIZING_CEILING;
+    let past = ScriptedSource::new(payload(100_000))?;
+    let (root, probe) = (past.root(), past.clone());
+    let proven = prove(vec![past], root, ceiling + 1).await?;
+    anyhow::ensure!(proven.is_none() && probe.opened_ranges().is_empty());
+
+    let at = ScriptedSource::new(payload(100_000))?.refusing_opens_from(0, || {
+        anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined))
+    });
+    let root = at.root();
+    let proven = tokio::time::timeout(Duration::from_secs(20), prove(vec![at], root, ceiling))
+        .await
+        .context("the proof ends")?;
+    let err = match proven {
+        Ok(proven) => anyhow::bail!("a claim at the ceiling proved {proven:?}"),
+        Err(err) => err,
+    };
+    anyhow::ensure!(
+        err.downcast_ref::<crate::NoNodeWillServe>().is_some(),
+        "{err:#}"
+    );
+    Ok(())
+}
+
 /// A zero claim proves nothing and opens nothing.
 #[tokio::test]
 async fn a_zero_claim_opens_nothing() -> anyhow::Result<()> {
