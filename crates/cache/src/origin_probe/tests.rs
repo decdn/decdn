@@ -168,6 +168,37 @@ fn presence_size_maps_to_probe_answer() {
         None,
         "a fault also leaves has_blob false"
     );
+    assert_eq!(
+        Presence::PresentUnsized.size(),
+        None,
+        "a confirmed hold with no stated length yields no coverage to sign"
+    );
+}
+
+#[test]
+fn present_unsized_is_memoised_under_the_positive_ttl() {
+    // positive 10s, negative 2s, fault 5s: an unsized hold is as stable as a
+    // sized one, so it outlives both the negative and the fault window.
+    let mut memo = OriginProbeMemo::new(OriginProbePolicy {
+        positive_ttl: Duration::from_secs(10),
+        negative_ttl: Duration::from_secs(2),
+        fault_ttl: Duration::from_secs(5),
+        timeout: Duration::from_secs(2),
+        capacity: 16,
+    });
+    let t0 = Instant::now();
+    memo.insert(hash(50), Presence::PresentUnsized, t0);
+
+    assert_eq!(
+        memo.get(hash(50), t0 + Duration::from_secs(6)),
+        Some(Presence::PresentUnsized),
+        "still live past the negative and fault TTLs",
+    );
+    assert_eq!(
+        memo.get(hash(50), t0 + Duration::from_secs(11)),
+        None,
+        "expires on the positive TTL like a sized hold",
+    );
 }
 
 #[test]

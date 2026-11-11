@@ -263,10 +263,10 @@ async fn fetch_outboard_oversize_is_unsupported() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A `HEAD` 404 is an authoritative absence: `size` answers `Ok(None)`
-/// so the probe chain reads it as `Absent`.
+/// A `HEAD` 404 is an authoritative absence: `size` answers
+/// [`OriginSize::Absent`] so the probe chain reads it as `Absent`.
 #[tokio::test]
-async fn size_404_is_none() -> anyhow::Result<()> {
+async fn size_404_is_absent() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let hash = Hash::new(b"http-size-missing-marker");
     Mock::given(method("HEAD"))
@@ -277,8 +277,8 @@ async fn size_404_is_none() -> anyhow::Result<()> {
     let origin = HttpOrigin::parse(&server.uri())?;
 
     anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
-        "a 404 must degrade to an unknown size, not error",
+        origin.size(hash).await? == OriginSize::Absent,
+        "a 404 must answer Absent, not error",
     );
     Ok(())
 }
@@ -347,7 +347,7 @@ async fn size_reads_content_length_on_success() -> anyhow::Result<()> {
     let origin = HttpOrigin::parse(&server.uri())?;
 
     anyhow::ensure!(
-        origin.size(hash).await? == Some(12345),
+        origin.size(hash).await? == OriginSize::Known(12345),
         "a 200 must surface the Content-Length",
     );
     Ok(())

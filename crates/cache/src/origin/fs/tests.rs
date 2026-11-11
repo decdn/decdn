@@ -795,7 +795,7 @@ async fn a_missing_leaf_under_a_valid_shard_symlink_is_absent() -> anyhow::Resul
     tokio::fs::symlink(&real, &shard).await?;
 
     anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
+        origin.size(hash).await? == OriginSize::Absent,
         "a missing leaf under a valid shard symlink must stay absent"
     );
     Ok(())

@@ -570,17 +570,22 @@ impl ClientHandler {
         // node's cache (e.g. seeded by an earlier relay) is still declined, so
         // the policy is categorical rather than "foreign misses only".
         //
-        // Three-way outcome (#1766): `Present` is own content and falls through
-        // to the normal serve path. `Absent` (a genuine 404, or no origin
-        // configured at all) is a real foreign-content answer, declined under
-        // its own reason so the operator's metrics separate policy declines
-        // from real cache misses. `Fault` (a transport error or a timed-out
-        // `HEAD`) is NOT an absence, so it refuses for `InternalError`,
-        // matching the store-fault handling on the `has()` path below. Both
-        // sign `Declined`: this node will not serve the hash during this fetch.
+        // Four-way outcome (#1766): `Present` and `PresentUnsized` are own
+        // content and fall through to the normal serve path — a backend that
+        // holds the object but cannot state its canonical length (a
+        // `Content-Encoding` origin, a 200 without a `Content-Length`) still
+        // holds it, and the pull path serves it through the whole-blob
+        // fallback. `Absent` (a genuine 404, or no origin configured at all)
+        // is a real foreign-content answer, declined under its own reason so
+        // the operator's metrics separate policy declines from real cache
+        // misses. `Fault` (a transport error or a timed-out `HEAD`) is NOT an
+        // absence, so it refuses for `InternalError`, matching the
+        // store-fault handling on the `has()` path below. Both sign
+        // `Declined`: this node will not serve the hash during this fetch.
         if !self.relay_foreign_namespaces {
             match self.cache.origin_probe_presence(hash).await {
-                decdn_cache::OriginPresence::Present(_) => {}
+                decdn_cache::OriginPresence::Present(_)
+                | decdn_cache::OriginPresence::PresentUnsized => {}
                 decdn_cache::OriginPresence::Absent => {
                     // The probe reads a withdrawn hash as absent. Keep the
                     // operator's metric on the withdrawal: it is this node's own

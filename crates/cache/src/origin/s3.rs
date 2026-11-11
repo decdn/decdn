@@ -45,7 +45,7 @@ use super::fs::OBAO4_SUFFIX;
 use super::io_runtime::IoRuntime;
 use super::{
     BlobTooLargeMarker, DecompressMode, Origin, OriginByteStream, OriginFetch, OriginKind,
-    OriginRangeFetch, OriginRangeRequest, OriginUrl, OutboardFetch, decompress,
+    OriginRangeFetch, OriginRangeRequest, OriginSize, OriginUrl, OutboardFetch, decompress,
 };
 use crate::error::{OriginError, OriginPullError};
 
@@ -499,26 +499,26 @@ fn classify_get_object_error(
 }
 
 /// Classify a `HeadObject` error for the best-effort [`Origin::size`] probe.
-/// A 404 / `NotFound` is a missing object, not a fault — return `Ok(None)` so
-/// the engine degrades the range pull to a whole-blob fetch. Transient
+/// A 404 / `NotFound` is a missing object, not a fault — return
+/// [`OriginSize::Absent`], the authoritative negative. Transient
 /// transport / 5xx faults surface as [`OriginPullError::Transient`]; anything
 /// else is [`OriginPullError::Permanent`]. Mirrors
-/// [`classify_get_object_error`] but collapses the not-found arm into the
-/// `None` size signal.
+/// [`classify_get_object_error`] but maps the not-found arm to the `Absent`
+/// size signal.
 fn classify_head_object_error(
     err: SdkError<HeadObjectError>,
     log_target: &str,
-) -> Result<Option<u64>, OriginPullError> {
+) -> Result<OriginSize, OriginPullError> {
     match err {
         SdkError::ServiceError(service_err) => {
             let status = service_err.raw().status().as_u16();
             let inner = service_err.into_err();
-            // The modeled `NotFound`, or a bare 404, means the object is absent
-            // → unknown size, degrade. HeadObject carries no response body, so
-            // the AWS error code is frequently empty on a 404; treat either
-            // signal as not-found.
+            // The modeled `NotFound`, or a bare 404, means the object is
+            // absent. HeadObject carries no response body, so the AWS error
+            // code is frequently empty on a 404; treat either signal as
+            // not-found.
             if matches!(inner, HeadObjectError::NotFound(_)) || status == 404 {
-                return Ok(None);
+                return Ok(OriginSize::Absent);
             }
             let context = format!(
                 "{log_target}: S3 HeadObject returned {status} ({})",
@@ -915,7 +915,7 @@ impl Origin for S3Origin {
     fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             let key = key_for(&self.prefix, hash);
             let log_target = format!("s3://{}/{key}", self.bucket);
@@ -938,19 +938,22 @@ impl Origin for S3Origin {
                 Err(e) => return classify_head_object_error(e, &log_target),
             };
             // A `Content-Encoding` object advertises the *encoded* length here,
-            // not the canonical blob size — degrade to unknown, consistent with
-            // `fetch_range_data` refusing compressed ranges.
+            // not the canonical blob size — present but unsized, consistent
+            // with `fetch_range_data` refusing compressed ranges: size callers
+            // degrade to the whole-blob path, presence callers admit it.
             if resp
                 .content_encoding()
                 .is_some_and(|e| !e.trim().is_empty())
             {
-                return Ok(None);
+                return Ok(OriginSize::Unsized);
             }
-            // `content_length()` is `Option<i64>`; a negative or absent value is
-            // unusable → unknown size.
+            // `content_length()` is `Option<i64>`; a negative or absent value
+            // is unusable — the `HeadObject` success proves presence either
+            // way, only the size is lost.
             Ok(resp
                 .content_length()
-                .and_then(|len| u64::try_from(len).ok()))
+                .and_then(|len| u64::try_from(len).ok())
+                .map_or(OriginSize::Unsized, OriginSize::Known))
         })
     }
 }

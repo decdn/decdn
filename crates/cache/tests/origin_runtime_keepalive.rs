@@ -240,7 +240,10 @@ async fn run_op(origin: &dyn Origin, op: Op, hash: Hash) -> anyhow::Result<()> {
         }
         Op::Size => {
             let size = origin.size(hash).await?;
-            anyhow::ensure!(size == Some(u64::try_from(BODY.len())?), "size {size:?}");
+            anyhow::ensure!(
+                size == decdn_cache::OriginSize::Known(u64::try_from(BODY.len())?),
+                "size {size:?}"
+            );
         }
     }
     Ok(())

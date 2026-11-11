@@ -583,7 +583,16 @@ pub(crate) async fn holder_snapshot(
                     decdn_cache::OriginPresence::Present(_) => {
                         hashes.insert(hash);
                     }
-                    decdn_cache::OriginPresence::Absent => {}
+                    // A present-but-unsized hold is skipped like an absent
+                    // one — not announced and not a fault: origin-sourced
+                    // probe coverage needs the blob's full block count to
+                    // sign, which only a sized answer gives, so announcing
+                    // the hash would create an "announced but probe-denied"
+                    // entry — a pure reputation cost. The serve gate still
+                    // admits it; it is only undiscoverable through this
+                    // node's announcements.
+                    decdn_cache::OriginPresence::PresentUnsized
+                    | decdn_cache::OriginPresence::Absent => {}
                     decdn_cache::OriginPresence::Fault => {
                         ownership_probe_faults = ownership_probe_faults.saturating_add(1);
                     }

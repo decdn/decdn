@@ -79,7 +79,7 @@ pub use iroh_blobs::Hash;
 pub use metrics::CacheMetrics;
 pub use origin::{
     FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest,
-    OutboardFetch, S3Credentials, S3Origin, S3OriginConfig,
+    OriginSize, OutboardFetch, S3Credentials, S3Origin, S3OriginConfig,
 };
 pub use origin_range::{MAX_CONCURRENT_RANGE_PULLS, OriginRangeWire, RANGE_PULL_WINDOW_BYTES};
 pub use policy::{

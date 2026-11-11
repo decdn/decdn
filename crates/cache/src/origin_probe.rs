@@ -7,8 +7,9 @@
 //! backend lists). A non-pinned bucket object is therefore invisible to the
 //! probe. This memo backs the per-probe fallback that consults the origin
 //! directly (`CacheEngine::origin_probe_size`): it caches BOTH a positive answer
-//! (`Present(size)`) under a long positive TTL and a negative one (`Absent`)
-//! under a short negative TTL, so a flood of random-hash probes turns into at
+//! (`Present(size)`, or `PresentUnsized` for a confirmed hold with no stated
+//! length) under a long positive TTL and a negative one (`Absent`) under a
+//! short negative TTL, so a flood of random-hash probes turns into at
 //! most one `HeadObject` per hash per TTL window rather than one per probe,
 //! while a stale `Absent` cannot hide newly-available own content for more
 //! than the short negative window.
@@ -60,8 +61,14 @@ pub enum Presence {
     /// The origin holds the blob; carries the total byte size for the probe's
     /// `total_bytes`.
     Present(u64),
-    /// No configured origin holds the blob (a `HEAD` 404, an unknown size,
-    /// or no origin — an authoritative "don't advertise").
+    /// The origin holds the blob but cannot state its canonical byte size (a
+    /// `Content-Encoding` backend, or a 200 without a parsable
+    /// `Content-Length`). A confirmed hold like [`Self::Present`] — the serve
+    /// gate admits it under the positive TTL — but it yields no probe
+    /// `total_bytes`, so the announce paths leave it out.
+    PresentUnsized,
+    /// No configured origin holds the blob (a `HEAD` 404, or no origin — an
+    /// authoritative "don't advertise").
     Absent,
     /// The probe could not get an authoritative answer: a transport error or
     /// a timeout (a `HEAD` overrun). Distinct from `Absent` on purpose — a
@@ -73,11 +80,13 @@ pub enum Presence {
 
 impl Presence {
     /// The probe answer this presence yields: `Some(size)` advertises
-    /// `has_blob: true`, `None` leaves it `false`.
+    /// `has_blob: true`, `None` leaves it `false`. A present-but-unsized hold
+    /// yields `None` too: origin-sourced probe coverage needs the blob's full
+    /// block count, which only a sized answer gives.
     pub const fn size(self) -> Option<u64> {
         match self {
             Presence::Present(size) => Some(size),
-            Presence::Absent | Presence::Fault => None,
+            Presence::PresentUnsized | Presence::Absent | Presence::Fault => None,
         }
     }
 }
@@ -185,7 +194,9 @@ impl OriginProbeMemo {
     /// can never exceed `capacity` distinct hashes regardless of probe volume.
     pub fn insert(&mut self, hash: Hash, presence: Presence, now: Instant) {
         let ttl = match presence {
-            Presence::Present(_) => self.positive_ttl,
+            // An unsized hold is as stable as a sized one — only the length
+            // is missing — so it shares the positive TTL.
+            Presence::Present(_) | Presence::PresentUnsized => self.positive_ttl,
             Presence::Absent => self.negative_ttl,
             Presence::Fault => self.fault_ttl,
         };

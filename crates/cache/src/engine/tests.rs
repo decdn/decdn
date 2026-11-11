@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::origin::{Origin, OriginFetch, OriginKind};
+use crate::origin::{Origin, OriginFetch, OriginKind, OriginSize};
 use std::assert_matches;
 
 /// A trivial in-memory origin for tests. Stores exactly one blob.
@@ -91,11 +91,16 @@ impl Origin for OutboardStubOrigin {
     fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, crate::OriginPullError>> + Send + '_>> {
         let matches = hash == self.hash;
         let len = u64::try_from(self.data.len()).unwrap_or(u64::MAX);
-        Box::pin(async move { Ok(matches.then_some(len)) })
+        Box::pin(async move {
+            Ok(if matches {
+                OriginSize::Known(len)
+            } else {
+                OriginSize::Absent
+            })
+        })
     }
 
     fn fetch_outboard(
@@ -204,8 +209,7 @@ impl Origin for CountingSizeOrigin {
     fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, crate::OriginPullError>> + Send + '_>> {
         let matches = hash == self.hash;
         let size = self.size;
         let calls = Arc::clone(&self.calls);
@@ -217,7 +221,11 @@ impl Origin for CountingSizeOrigin {
             if let Some(d) = delay {
                 tokio::time::sleep(d).await;
             }
-            Ok(matches.then_some(size))
+            Ok(if matches {
+                OriginSize::Known(size)
+            } else {
+                OriginSize::Absent
+            })
         })
     }
 }
@@ -259,14 +267,68 @@ impl Origin for FailingSizeOrigin {
     fn size(
         &self,
         _hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, crate::OriginPullError>> + Send + '_>> {
         let calls = Arc::clone(&self.calls);
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(crate::OriginPullError::Transient(anyhow::anyhow!(
                 "synthetic HEAD outage (connection refused)"
             )))
+        })
+    }
+}
+
+/// Origin whose `size()` answers [`OriginSize::Unsized`] for one hash — a
+/// `Content-Encoding` backend, or a 200 without a `Content-Length` — and
+/// COUNTS the calls. The `PresentUnsized` counterpart to
+/// [`CountingSizeOrigin`].
+#[derive(Debug)]
+struct UnsizedOrigin {
+    hash: Hash,
+    calls: Arc<AtomicUsize>,
+}
+
+impl UnsizedOrigin {
+    fn new(hash: Hash) -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                hash,
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+}
+
+impl Origin for UnsizedOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+    {
+        // Never exercised by the probe path (existence + size only).
+        Box::pin(async { Ok(OriginFetch::NotFound) })
+    }
+
+    fn size(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, crate::OriginPullError>> + Send + '_>> {
+        let matches = hash == self.hash;
+        let calls = Arc::clone(&self.calls);
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if matches {
+                OriginSize::Unsized
+            } else {
+                OriginSize::Absent
+            })
         })
     }
 }
@@ -482,6 +544,92 @@ async fn origin_probe_presence_distinguishes_present_absent_and_fault() -> anyho
         1,
         "the second probe served the cached fault instead of re-hitting \
          the backend (#1789 item 6)",
+    );
+    Ok(())
+}
+
+/// A present-but-unsized object (#2827: a `Content-Encoding` backend, or a
+/// 200 without a `Content-Length`) is `PresentUnsized`, never `Absent` — and
+/// it is memoised under the POSITIVE TTL, so a second probe issues no further
+/// backend call and can never flip to a cached absence. The size wrapper
+/// still answers `None` for it: origin-sourced probe coverage needs a size to
+/// sign, so the hash is servable but not advertised.
+#[tokio::test]
+async fn origin_probe_presence_memoises_present_unsized() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let hash = Hash::new(b"compressed remote object");
+    let (origin, calls) = UnsizedOrigin::new(hash);
+    let engine =
+        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+    assert_eq!(
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::PresentUnsized,
+        "a held object with no stated length is PresentUnsized, not Absent",
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one backend HEAD");
+    assert_eq!(
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::PresentUnsized,
+        "the memoised answer is still PresentUnsized — never a cached absence",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the second probe served the memo (positive TTL), not the backend",
+    );
+    assert_eq!(
+        engine.origin_probe_size(hash).await,
+        None,
+        "no size to sign coverage from, so the size wrapper answers None",
+    );
+    Ok(())
+}
+
+/// In a chain walk, one origin's confirmed-but-unsized hold outranks a
+/// sibling origin's fault: the object is known present, so the answer is
+/// `PresentUnsized`, not `Fault` (which the serve gate would refuse as
+/// `InternalError`).
+#[tokio::test]
+async fn origin_probe_presence_unsized_beats_a_sibling_fault() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let hash = Hash::new(b"unsized behind a faulting sibling");
+    let (faulting, _fault_calls) = FailingSizeOrigin::new();
+    let (unsized_origin, _calls) = UnsizedOrigin::new(hash);
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![
+            Arc::new(faulting) as Arc<dyn Origin>,
+            Arc::new(unsized_origin) as Arc<dyn Origin>,
+        ],
+        10,
+    )
+    .await?;
+
+    assert_eq!(
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::PresentUnsized,
+        "a confirmed unsized hold outranks a sibling origin's fault",
+    );
+    Ok(())
+}
+
+/// The range-pull scope probe is untouched by the tri-state (#2827):
+/// `origin_size` still answers `Ok(None)` for an origin that holds the object
+/// without a stated length, so the caller's silent whole-blob fallback keeps
+/// working exactly as before.
+#[tokio::test]
+async fn origin_size_stays_none_for_an_unsized_hold() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let hash = Hash::new(b"unsized hold for range scoping");
+    let (origin, _calls) = UnsizedOrigin::new(hash);
+    let engine =
+        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+    assert_eq!(
+        engine.origin_size(hash).await?,
+        None,
+        "an unsized hold cannot scope a range pull — degrade to whole-blob",
     );
     Ok(())
 }
@@ -734,8 +882,7 @@ impl Origin for ThrottlableOrigin {
     fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, crate::OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             self.size_calls.fetch_add(1, Ordering::SeqCst);
             let slow = self.slow_ms.load(Ordering::SeqCst);
@@ -754,13 +901,13 @@ impl Origin for ThrottlableOrigin {
                 });
             }
             if !self.holds.load(Ordering::SeqCst) {
-                return Ok(None);
+                return Ok(OriginSize::Absent);
             }
             Ok(self
                 .held
                 .iter()
                 .find(|(h, _)| *h == hash)
-                .map(|(_, len)| *len))
+                .map_or(OriginSize::Absent, |(_, len)| OriginSize::Known(*len)))
         })
     }
 
@@ -3918,9 +4065,12 @@ impl Origin for RangeStubOrigin {
     fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
-        let out = (hash == self.hash).then_some(self.size);
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, crate::OriginPullError>> + Send + '_>> {
+        let out = if hash == self.hash {
+            OriginSize::Known(self.size)
+        } else {
+            OriginSize::Absent
+        };
         Box::pin(async move { Ok(out) })
     }
 

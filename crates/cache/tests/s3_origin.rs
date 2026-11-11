@@ -24,7 +24,7 @@ use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::retry::RetryConfig;
 use decdn_cache::{
     CacheEngine, CacheError, DecompressMode, Hash, Origin, OriginError, OriginFetch,
-    OriginPullError, RetryPolicy, S3Origin, SupportedEncoding,
+    OriginPullError, OriginSize, RetryPolicy, S3Origin, SupportedEncoding,
 };
 
 /// Bucket and prefix used across tests. Matching constants on every rule
@@ -1110,8 +1110,9 @@ async fn fetch_range_data_wrong_length_span_degrades() -> anyhow::Result<()> {
 
 // ----------------------------------------------------------------------------
 // `S3Origin::size` issues a `HeadObject` to learn the canonical blob length for
-// scoping a range pull (#823). A `Content-Encoding` object or a missing key
-// yields `None` (degrade to whole-blob); a genuine 5xx surfaces as an error.
+// scoping a range pull (#823). A `Content-Encoding` object is present but
+// `Unsized` (degrade to whole-blob); a missing key is an authoritative
+// `Absent`; a genuine 5xx surfaces as an error.
 // ----------------------------------------------------------------------------
 
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
@@ -1128,7 +1129,7 @@ async fn size_returns_head_object_content_length() -> anyhow::Result<()> {
     let origin = s3_origin(client, "")?;
 
     anyhow::ensure!(
-        origin.size(hash).await? == Some(4096),
+        origin.size(hash).await? == OriginSize::Known(4096),
         "size must be the HeadObject Content-Length"
     );
     anyhow::ensure!(rule.num_calls() == 1, "exactly one HeadObject");
@@ -1136,9 +1137,11 @@ async fn size_returns_head_object_content_length() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn size_compressed_object_is_unknown() -> anyhow::Result<()> {
+async fn size_compressed_object_is_unsized() -> anyhow::Result<()> {
     // A `Content-Encoding` HeadObject advertises the encoded length, not the
-    // canonical blob size — `size` must degrade to `None`.
+    // canonical blob size — `size` must answer `Unsized`, never a wrong
+    // length and never `Absent` (#2827: the object is present; an absence
+    // would be memoised and decline the serve gate).
     let hash = Hash::new(b"compressed");
     let rule = mock!(Client::head_object).then_output(|| {
         HeadObjectOutput::builder()
@@ -1150,14 +1153,14 @@ async fn size_compressed_object_is_unknown() -> anyhow::Result<()> {
     let origin = s3_origin(client, "")?;
 
     anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
-        "compressed object size must be unknown"
+        origin.size(hash).await? == OriginSize::Unsized,
+        "compressed object must be present but unsized"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn size_missing_object_is_none() -> anyhow::Result<()> {
+async fn size_missing_object_is_absent() -> anyhow::Result<()> {
     let hash = Hash::new(b"absent");
     let rule = mock!(Client::head_object)
         .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
@@ -1165,8 +1168,8 @@ async fn size_missing_object_is_none() -> anyhow::Result<()> {
     let origin = s3_origin(client, "")?;
 
     anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
-        "missing object size must be None"
+        origin.size(hash).await? == OriginSize::Absent,
+        "missing object must be an authoritative absence"
     );
     Ok(())
 }

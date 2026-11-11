@@ -430,7 +430,11 @@ impl decdn_cache::Origin for StubOrigin {
         &self,
         hash: decdn_cache::Hash,
     ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<decdn_cache::OriginSize, decdn_cache::OriginPullError>>
+                + Send
+                + '_,
+        >,
     > {
         if self.axes.faults_size {
             return Box::pin(async {
@@ -439,9 +443,12 @@ impl decdn_cache::Origin for StubOrigin {
                 )))
             });
         }
-        let n = (self.axes.answers_size && hash == self.hash)
-            .then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
-        Box::pin(async move { Ok(n) })
+        let answer = if self.axes.answers_size && hash == self.hash {
+            decdn_cache::OriginSize::Known(u64::try_from(self.data.len()).unwrap_or(u64::MAX))
+        } else {
+            decdn_cache::OriginSize::Absent
+        };
+        Box::pin(async move { Ok(answer) })
     }
 
     fn enumerate(
@@ -1342,7 +1349,11 @@ impl decdn_cache::Origin for PanickingSizeOrigin {
         &self,
         _hash: decdn_cache::Hash,
     ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<decdn_cache::OriginSize, decdn_cache::OriginPullError>>
+                + Send
+                + '_,
+        >,
     > {
         let gate = Arc::clone(&self.gate);
         Box::pin(async move {

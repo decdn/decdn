@@ -797,10 +797,18 @@ fn enumerable_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin
             &self,
             hash: decdn_cache::Hash,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
+            Box<
+                dyn Future<Output = Result<decdn_cache::OriginSize, decdn_cache::OriginPullError>>
+                    + Send
+                    + '_,
+            >,
         > {
-            let n = (hash == self.hash).then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
-            Box::pin(async move { Ok(n) })
+            let answer = if hash == self.hash {
+                decdn_cache::OriginSize::Known(u64::try_from(self.data.len()).unwrap_or(u64::MAX))
+            } else {
+                decdn_cache::OriginSize::Absent
+            };
+            Box::pin(async move { Ok(answer) })
         }
 
         fn enumerate(

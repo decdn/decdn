@@ -94,8 +94,13 @@ impl Origin for FakeOrigin {
     fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        let out = (hash == self.hash).then_some(self.size);
+    ) -> Pin<Box<dyn Future<Output = Result<decdn_cache::OriginSize, OriginPullError>> + Send + '_>>
+    {
+        let out = if hash == self.hash {
+            decdn_cache::OriginSize::Known(self.size)
+        } else {
+            decdn_cache::OriginSize::Absent
+        };
         Box::pin(async move { Ok(out) })
     }
 

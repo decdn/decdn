@@ -34,7 +34,7 @@ use crate::circuit_breaker::{
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::fill_session::{FillClaim, FillRegistry, FillSession};
 use crate::metrics::CacheMetrics;
-use crate::origin::{Origin, OriginKind, OutboardFetch};
+use crate::origin::{Origin, OriginKind, OriginSize, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
 use crate::origin_range::{
     MAX_CONCURRENT_RANGE_PULLS, OriginRangeCursor, OriginRangeWire, OriginReadBudget,
@@ -154,14 +154,20 @@ pub struct OriginHeldReport {
 }
 
 /// A live origin-existence answer (#1766), distinguishing a genuine negative
-/// from a backend fault. It is the target of the two-way collapse in
-/// `crate::origin_probe::Presence`: `Present`/`Absent` map straight across,
-/// and `Fault` is folded into "don't advertise" — see
+/// from a backend fault, and a sized hold from an unsized one. It mirrors
+/// `crate::origin_probe::Presence` variant for variant; the size-only collapse
+/// (`Fault`, `PresentUnsized` and `Absent` all advertise no size) lives in
 /// [`CacheEngine::origin_probe_size`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginPresence {
     /// A configured origin holds the blob; carries the total byte size.
     Present(u64),
+    /// A configured origin holds the blob but cannot state its canonical
+    /// byte size ([`OriginSize::Unsized`] — a `Content-Encoding` backend, or
+    /// a 200 without a parsable `Content-Length`). Present for the
+    /// origin-only serve gate (the pull path serves it whole-blob); sizeless
+    /// for probe coverage and the announce set, which need a size to sign.
+    PresentUnsized,
     /// No configured origin holds the blob: a genuine `HEAD`/`HeadObject`
     /// 404, or no origin is configured at all ([`CacheError::NoOrigin`] — a
     /// node with nothing configured genuinely holds nothing; that is not a
@@ -179,6 +185,7 @@ impl From<Presence> for OriginPresence {
     fn from(presence: Presence) -> Self {
         match presence {
             Presence::Present(size) => OriginPresence::Present(size),
+            Presence::PresentUnsized => OriginPresence::PresentUnsized,
             Presence::Absent => OriginPresence::Absent,
             Presence::Fault => OriginPresence::Fault,
         }
@@ -1828,10 +1835,16 @@ impl CacheEngine {
     /// `decdn_cache_origin_enumerate_failures_total` and rides the same
     /// snapshot.
     ///
-    /// Every adapter reserves [`Origin::size`]'s `Ok(None)` for an
+    /// Every adapter reserves [`Origin::size`]'s [`OriginSize::Absent`] for an
     /// authoritative absence (a genuine 404): an HTTP or S3 5xx/408/429
     /// surfaces as a transient fault and carries forward, a permission decline
-    /// as a permanent one — so no outage is dropped here as an absence.
+    /// as a permanent one — so no outage is dropped here as an absence. A
+    /// present object whose canonical size the origin cannot state
+    /// ([`OriginSize::Unsized`] — a `Content-Encoding` backend, a 200 without
+    /// a `Content-Length`) is also left out of the index, deliberately: every
+    /// entry's size backs a signed probe-coverage answer, and an unsized entry
+    /// would announce content the probe handler can never confirm. The serve
+    /// path still admits it through the live presence probe.
     ///
     /// **Cost:** one origin probe per deduped candidate — every listed entry and
     /// every pin, including the ones that resolve absent and never enter the
@@ -2033,7 +2046,16 @@ impl CacheEngine {
                 OriginPresence::Present(size) => {
                     out.held.insert(hash, size);
                 }
-                OriginPresence::Absent => {}
+                // A present-but-unsized object stays out of the index like an
+                // absent one: the index maps each hash to the byte size the
+                // probe `has_blob` answer and the announce set sign coverage
+                // from, and an entry with no size would advertise content
+                // this node's probe handler can never confirm — "announced
+                // but probe-denied", a pure reputation cost. The serve path
+                // still admits the hash (the live probe memoises
+                // `PresentUnsized`), so the object is servable, just not
+                // announced.
+                OriginPresence::PresentUnsized | OriginPresence::Absent => {}
                 OriginPresence::Fault => {
                     out.faults = out.faults.saturating_add(1);
                     // Carry forward only what a later pass might resolve. A
@@ -2110,16 +2132,19 @@ impl CacheEngine {
     /// first (zero I/O) and only fall back here on its miss.
     ///
     /// A thin wrapper over [`Self::origin_probe_presence`]: `Present(size)`
-    /// advertises `Some(size)`, and both `Absent` and `Fault` advertise `None`
-    /// — a probing caller (the `probe` handler's `has_blob`, DHT announce)
-    /// never distinguishes "genuinely missing" from "backend unreachable
-    /// right now"; either way it must not advertise the blob.
+    /// advertises `Some(size)`; `PresentUnsized`, `Absent` and `Fault` all
+    /// advertise `None`. A probing caller (the `probe` handler's `has_blob`,
+    /// DHT announce) never distinguishes the three: origin-sourced probe
+    /// coverage needs the blob's full block count, which only a sized answer
+    /// yields, so a present-but-unsized object cannot be advertised either —
+    /// announcing what the probe cannot then confirm would only cost
+    /// reputation.
     ///
     /// **Never fetches the body** — existence and size only.
     pub async fn origin_probe_size(&self, hash: Hash) -> Option<u64> {
         match self.origin_probe_presence(hash).await {
             OriginPresence::Present(size) => Some(size),
-            OriginPresence::Absent | OriginPresence::Fault => None,
+            OriginPresence::PresentUnsized | OriginPresence::Absent | OriginPresence::Fault => None,
         }
     }
 
@@ -2132,15 +2157,23 @@ impl CacheEngine {
     /// folds a fault into a negative. A fault-aware caller needs the raw
     /// per-origin outcomes instead.
     ///
-    /// - ANY origin answering `Ok(Some(size))` is `Present(size)` — the first
-    ///   such answer wins, same order as [`Self::origin_size`];
+    /// Precedence is `Present > PresentUnsized > Fault > Absent`:
+    ///
+    /// - ANY origin answering [`OriginSize::Known`] is `Present(size)` — the
+    ///   first such answer wins, same order as [`Self::origin_size`];
+    /// - failing that, ANY origin answering [`OriginSize::Unsized`] is
+    ///   `PresentUnsized`. The walk keeps going past an `Unsized` answer
+    ///   because a sibling origin may hold the same object *with* a size —
+    ///   but once one origin confirmed the hold, a later origin's fault
+    ///   cannot demote the answer to `Fault`: the object is known present;
     /// - failing that, ANY origin answering `Err(_)` (a transport error), or
     ///   the whole walk overrunning `timeout`, is `Fault`;
-    /// - only when every configured origin answered `Ok(None)` — or no origin
-    ///   is configured at all, a node that genuinely holds nothing — is the
-    ///   answer `Absent`. This is deliberately the lowest-precedence outcome:
-    ///   if at least one origin is unreachable and none confirmed the object,
-    ///   the honest answer is "unknown", never an authoritative `NotFound`.
+    /// - only when every configured origin answered [`OriginSize::Absent`] —
+    ///   or no origin is configured at all, a node that genuinely holds
+    ///   nothing — is the answer `Absent`. This is deliberately the
+    ///   lowest-precedence outcome: if at least one origin is unreachable and
+    ///   none confirmed the object, the honest answer is "unknown", never an
+    ///   authoritative `NotFound`.
     ///
     /// One `timeout` covers the whole chain rather than resetting per origin,
     /// so a chain of slow origins cannot add up past the caller's budget.
@@ -2160,16 +2193,20 @@ impl CacheEngine {
             let mut cause = None;
             let mut kept_permanent_cause = false;
             let mut any_transient = false;
+            let mut any_unsized = false;
             for origin in &self.inner.origins {
                 match origin.size(hash).await {
-                    Ok(Some(size)) => {
+                    Ok(OriginSize::Known(size)) => {
                         return ChainProbe {
                             presence: OriginPresence::Present(size),
                             transient: false,
                             cause: None,
                         };
                     }
-                    Ok(None) => {}
+                    // Keep walking: a sibling origin may state the size this
+                    // one cannot.
+                    Ok(OriginSize::Unsized) => any_unsized = true,
+                    Ok(OriginSize::Absent) => {}
                     Err(e) => {
                         tracing::debug!(
                             %hash,
@@ -2188,6 +2225,16 @@ impl CacheEngine {
                         any_transient |= e.is_transient();
                     }
                 }
+            }
+            // An unsized hold outranks a sibling origin's fault: one origin
+            // confirmed the object is present, so the chain's answer is not
+            // "unknown".
+            if any_unsized {
+                return ChainProbe {
+                    presence: OriginPresence::PresentUnsized,
+                    transient: false,
+                    cause: None,
+                };
             }
             match cause {
                 Some(cause) => ChainProbe {
@@ -2227,6 +2274,10 @@ impl CacheEngine {
     /// live one — and this layer decides what to remember:
     ///
     /// - `Present(size)` is memoised under the positive TTL;
+    /// - `PresentUnsized` is memoised under the positive TTL too: it is a
+    ///   confirmed hold, as stable as a sized one — only the length is
+    ///   missing — and the graded `negative <= fault <= positive` rule wants
+    ///   a confirmed presence to stand the longest;
     /// - `Fault` is memoised under the fault TTL (#1789 item 6). The memo is
     ///   keyed per hash, so this bounds repeat probes OF THE SAME HASH to one
     ///   live `HEAD` per fault TTL — the common shape when a client retries a
@@ -2239,13 +2290,14 @@ impl CacheEngine {
     ///   client-visible availability, since the origin-only serve gate answers
     ///   `InternalError` and the probe/DHT paths report this node holds nothing
     ///   for as long as it stands.
-    /// - `Absent` — every configured origin answered `Ok(None)`, or none is
-    ///   configured at all (a node with nothing configured genuinely holds
-    ///   nothing, which is not transient) — is memoised under the short
-    ///   negative TTL. Every adapter reserves `Ok(None)` for an authoritative
-    ///   absence (a genuine 404) — an outage or a permission decline is an
-    ///   `Err`, which reaches the `Fault` arm instead — so this arm never
-    ///   caches a 5xx as an absence.
+    /// - `Absent` — every configured origin answered [`OriginSize::Absent`],
+    ///   or none is configured at all (a node with nothing configured
+    ///   genuinely holds nothing, which is not transient) — is memoised under
+    ///   the short negative TTL. Every adapter reserves `Absent` for an
+    ///   authoritative absence (a genuine 404): a present-but-unsized object
+    ///   answers [`OriginSize::Unsized`], and an outage or a permission
+    ///   decline is an `Err`, which reaches the `Fault` arm instead — so this
+    ///   arm never caches a 5xx, or a compressed hold, as an absence.
     ///
     /// **Never fetches the body** — existence and size only.
     pub async fn origin_probe_presence(&self, hash: Hash) -> OriginPresence {
@@ -2265,6 +2317,7 @@ impl CacheEngine {
         let presence = probe.presence;
         let memo_presence = match presence {
             OriginPresence::Present(size) => Presence::Present(size),
+            OriginPresence::PresentUnsized => Presence::PresentUnsized,
             OriginPresence::Absent => Presence::Absent,
             OriginPresence::Fault => Presence::Fault,
         };
@@ -4336,8 +4389,9 @@ impl CacheEngine {
     /// size to align + verify a sub-range against the root `H`, and the
     /// `{H}.obao4` outboard alone doesn't pin the final chunk's length). Walks
     /// the origin fallback chain ([`Origin::size`] — HTTP `HEAD` / S3
-    /// `HeadObject` / `fs` metadata) and returns the first known size; a
-    /// per-origin `Ok(None)` (no object / compressed / unsupported) or a
+    /// `HeadObject` / `fs` metadata) and returns the first [`OriginSize::Known`]
+    /// answer; a per-origin [`OriginSize::Absent`] (no object),
+    /// [`OriginSize::Unsized`] (held compressed / without a stated length) or a
     /// transport error advances the chain.
     ///
     /// Returns `Ok(None)` when every origin cleanly declines — the caller MUST
@@ -4364,8 +4418,11 @@ impl CacheEngine {
         let mut last_err: Option<CacheError> = None;
         for origin in &self.inner.origins {
             match origin.size(hash).await {
-                Ok(Some(size)) => return Ok(Some(size)),
-                Ok(None) => {}
+                Ok(OriginSize::Known(size)) => return Ok(Some(size)),
+                // Unsized and absent both advance the chain: either way this
+                // origin cannot scope a range pull, and the caller's
+                // whole-blob fallback handles both without distinction.
+                Ok(OriginSize::Unsized | OriginSize::Absent) => {}
                 Err(e) => {
                     tracing::debug!(
                         %hash,

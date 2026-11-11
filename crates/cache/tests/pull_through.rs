@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use decdn_cache::{
     CacheEngine, CacheError, CacheMetrics, DecompressMode, FilesystemOrigin, Hash, HttpOrigin,
-    Origin, OriginError, OriginFetch, OriginKind, OriginPullError, PinnedHashes, RetryPolicy,
-    SupportedEncoding,
+    Origin, OriginError, OriginFetch, OriginKind, OriginPullError, OriginSize, PinnedHashes,
+    RetryPolicy, SupportedEncoding,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{header, method, path};
@@ -4073,30 +4073,33 @@ async fn http_size_returns_content_length_via_head() -> anyhow::Result<()> {
     let origin = HttpOrigin::parse(&server.uri())?;
 
     anyhow::ensure!(
-        origin.size(hash).await? == Some(payload.len() as u64),
+        origin.size(hash).await? == OriginSize::Known(payload.len() as u64),
         "HEAD Content-Length must be the canonical size",
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn http_size_missing_object_is_none() -> anyhow::Result<()> {
+async fn http_size_missing_object_is_absent() -> anyhow::Result<()> {
     let hash = Hash::new(b"absent");
     let server = MockServer::start().await;
-    // No mounted HEAD route → wiremock answers 404 → unknown size.
+    // No mounted HEAD route → wiremock answers 404 → authoritative absence.
     let origin = HttpOrigin::parse(&server.uri())?;
     anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
-        "404 HEAD must degrade to None"
+        origin.size(hash).await? == OriginSize::Absent,
+        "404 HEAD must answer Absent"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn http_size_compressed_object_is_unknown() -> anyhow::Result<()> {
+async fn http_size_compressed_object_is_unsized() -> anyhow::Result<()> {
     // A `Content-Encoding` HEAD advertises the *encoded* length, not the
-    // canonical blob size — `size` must degrade to `None` so a wrong length
-    // never reaches bao alignment. Mirrors the S3 adapter's coverage.
+    // canonical blob size — `size` must answer `Unsized`, never a wrong
+    // length (bao alignment) and never `Absent` (#2827: the object is
+    // present; an absence would be memoised, decline the serve gate, and
+    // drop the hash from the announce set). Mirrors the S3 adapter's
+    // coverage.
     let payload: &[u8] = b"compressed body";
     let hash = Hash::new(payload);
     let server = MockServer::start().await;
@@ -4111,8 +4114,8 @@ async fn http_size_compressed_object_is_unknown() -> anyhow::Result<()> {
         .await;
     let origin = HttpOrigin::parse(&server.uri())?;
     anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
-        "a compressed HEAD must degrade to None"
+        origin.size(hash).await? == OriginSize::Unsized,
+        "a compressed HEAD must answer Unsized (present, no canonical length)"
     );
     Ok(())
 }
@@ -4142,7 +4145,7 @@ impl Origin for FaultingSizeOrigin {
     fn size(
         &self,
         _hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, OriginPullError>> + Send + '_>> {
         Box::pin(async {
             Err(OriginPullError::Transient(anyhow::anyhow!(
                 "synthetic size-probe transport fault"
@@ -4196,9 +4199,9 @@ impl Origin for FixedSizeOrigin {
     fn size(
         &self,
         _hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, OriginPullError>> + Send + '_>> {
         let size = self.0;
-        Box::pin(async move { Ok(Some(size)) })
+        Box::pin(async move { Ok(OriginSize::Known(size)) })
     }
 }
 
@@ -4334,13 +4337,13 @@ async fn fs_size_returns_on_disk_length() -> anyhow::Result<()> {
     let origin = FilesystemOrigin::new(origin_dir.path()).await?;
 
     anyhow::ensure!(
-        origin.size(hash).await? == Some(payload.len() as u64),
+        origin.size(hash).await? == OriginSize::Known(payload.len() as u64),
         "fs size must be the file length",
     );
-    // A blob that isn't on disk has no size.
+    // A blob that isn't on disk is an authoritative absence.
     anyhow::ensure!(
-        origin.size(Hash::new(b"never seeded")).await?.is_none(),
-        "absent fs object must be None",
+        origin.size(Hash::new(b"never seeded")).await? == OriginSize::Absent,
+        "absent fs object must be Absent",
     );
     Ok(())
 }

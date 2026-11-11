@@ -21,7 +21,8 @@ use super::fs::OBAO4_SUFFIX;
 use super::io_runtime::IoRuntime;
 use super::{
     DEFAULT_USER_AGENT, DecompressMode, Origin, OriginFetch, OriginKind, OriginRangeFetch,
-    OriginRangeRequest, OriginUrl, OutboardFetch, decompress, parse_origin_url, redact_for_log,
+    OriginRangeRequest, OriginSize, OriginUrl, OutboardFetch, decompress, parse_origin_url,
+    redact_for_log,
 };
 use crate::error::{OriginError, OriginPullError};
 
@@ -483,7 +484,7 @@ impl Origin for HttpOrigin {
     fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             let hex = hash.to_hex();
             let url = self
@@ -500,15 +501,15 @@ impl Origin for HttpOrigin {
                 .await?;
             let status = resp.status();
             // Status classification mirrors `fetch` and the S3 adapter's
-            // `classify_head_object_error`: only a 404 asserts absence and
-            // degrades to `Ok(None)`; every other non-success is a fault the
-            // caller must not read as "the origin does not hold the object".
-            // The distinction is load-bearing well beyond the range-pull
-            // degrade: `probe_origin_chain` feeds the origin-only serve gate
-            // and the DHT announce set, and an `Ok(None)` there is an
-            // authoritative absence — memoised under the negative TTL, signed
-            // as `NotFound` to a paying client, and grounds for the
-            // republisher to unschedule the hash. A 503 must never do that.
+            // `classify_head_object_error`: only a 404 asserts absence;
+            // every other non-success is a fault the caller must not read as
+            // "the origin does not hold the object". The distinction is
+            // load-bearing well beyond the range-pull degrade:
+            // `probe_origin_chain` feeds the origin-only serve gate and the
+            // DHT announce set, and an `Absent` there is an authoritative
+            // negative — memoised under the negative TTL, signed as
+            // `NotFound` to a paying client, and grounds for the republisher
+            // to unschedule the hash. A 503 must never do that.
             // Redirects stay disabled (SSRF, #579); a 3xx is a deterministic
             // origin misconfiguration, so it classifies as permanent like the
             // other non-transient statuses. Callers that only wanted the
@@ -516,7 +517,7 @@ impl Origin for HttpOrigin {
             // whole-blob `fetch`, which re-surfaces a persistent fault at
             // full severity.
             if status == StatusCode::NOT_FOUND {
-                return Ok(None);
+                return Ok(OriginSize::Absent);
             }
             if !status.is_success() {
                 let err = anyhow::anyhow!("origin HEAD {url_log} returned {status}");
@@ -528,29 +529,31 @@ impl Origin for HttpOrigin {
             }
             // A `Content-Encoding` response advertises the *encoded* length in
             // `Content-Length`, not the canonical blob size the bao tree needs
-            // — the same trap `fetch` sidesteps for `size_hint`. Treat as
-            // unknown so a compressed origin degrades to a whole-blob pull
-            // rather than feeding a wrong size into bao alignment. (A compressed
-            // *ranged* fetch is separately caught downstream: the S3 adapter
-            // refuses it explicitly, and the HTTP adapter's exact-length gate +
-            // bao verification reject it — either way it degrades, never serves.)
+            // — the same trap `fetch` sidesteps for `size_hint`. The object is
+            // present but unsized: the serve gate admits it, and size callers
+            // degrade to a whole-blob pull rather than feeding a wrong size
+            // into bao alignment. (A compressed *ranged* fetch is separately
+            // caught downstream: the S3 adapter refuses it explicitly, and the
+            // HTTP adapter's exact-length gate + bao verification reject it —
+            // either way it degrades, never serves.)
             if resp
                 .headers()
                 .get(CONTENT_ENCODING)
                 .is_some_and(|v| !v.is_empty())
             {
-                return Ok(None);
+                return Ok(OriginSize::Unsized);
             }
             // Read the `Content-Length` header directly rather than
             // `resp.content_length()`: the latter reflects the (empty) HEAD
             // response body, not the header, so it cannot surface the object's
-            // true length; the header carries it. A malformed/absent header →
-            // unknown size, degrade.
+            // true length; the header carries it. A 200 proves presence either
+            // way; a malformed/absent header only loses the size.
             Ok(resp
                 .headers()
                 .get(CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok()))
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map_or(OriginSize::Unsized, OriginSize::Known))
         })
     }
 }

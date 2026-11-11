@@ -20,7 +20,10 @@ use iroh_blobs::Hash;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
+use super::{
+    Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OriginSize,
+    OutboardFetch,
+};
 use crate::error::OriginPullError;
 
 /// Sibling-key suffix for the published pre-order bao outboard (`{H}.obao4`),
@@ -513,16 +516,16 @@ impl Origin for FilesystemOrigin {
     fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             // The local data object's on-disk length IS the canonical blob size
             // (filesystem origins never compress), so a stat is an exact,
-            // body-free answer. A missing data object is `Ok(None)`, which the
-            // trait contract reads as an authoritative absence; a dangling
-            // symlink is a permanent fault from `resolve_regular`, never an
-            // absence.
+            // body-free answer — this adapter never answers `Unsized`. A
+            // missing data object is `Absent`, the authoritative negative of
+            // the trait contract; a dangling symlink is a permanent fault from
+            // `resolve_regular`, never an absence.
             let Some((canonical, _)) = self.resolve_regular(&self.path_for(hash)).await? else {
-                return Ok(None);
+                return Ok(OriginSize::Absent);
             };
             // Open the file once, and drop it, so an object the process cannot
             // read (mode 0600 under another user) is a fault here rather than
@@ -533,7 +536,9 @@ impl Origin for FilesystemOrigin {
             // was opened and gives the size of that inode.
             let file = match tokio::fs::File::open(&canonical).await {
                 Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(OriginSize::Absent);
+                }
                 Err(err) => {
                     let msg = format!("cache.origin.path open failed for {}", canonical.display());
                     return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
@@ -549,7 +554,7 @@ impl Origin for FilesystemOrigin {
                     canonical.display()
                 )));
             }
-            Ok(Some(meta.len()))
+            Ok(OriginSize::Known(meta.len()))
         })
     }
 

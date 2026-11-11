@@ -335,6 +335,33 @@ impl std::fmt::Debug for OutboardFetch {
     }
 }
 
+/// Result of an [`Origin::size`] probe — the tri-state answer that keeps
+/// "the origin holds the object but cannot state its canonical length" apart
+/// from "the origin does not hold the object". The probe paths memoise
+/// [`Self::Absent`] as an authoritative negative (the origin-only serve gate
+/// declines, the DHT announce set drops the hash), so an adapter must never
+/// answer `Absent` for an object it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginSize {
+    /// The origin holds the object and states its canonical blob length in
+    /// bytes — the exact total the bao tree needs to verify a sub-range
+    /// against the root `H`.
+    Known(u64),
+    /// The origin holds the object but cannot state the canonical length: a
+    /// backend reporting a `Content-Encoding` advertises the *encoded* size
+    /// (not the canonical blob length — the same trap as [`Origin::fetch`]'s
+    /// `size_hint`), and a 200 without a parsable `Content-Length` states no
+    /// size at all. Present for the serve gate and the presence memo; sizeless
+    /// for range-pull scoping and probe coverage, so those callers degrade to
+    /// the whole-blob path.
+    Unsized,
+    /// The origin does not hold the object — an authoritative negative (a
+    /// genuine HTTP 404 / S3 `NotFound`, a missing filesystem entry). Callers
+    /// may memoise it, sign it as `NotFound` to a paying client, and
+    /// unschedule the hash from republish.
+    Absent,
+}
+
 /// An origin backend. Implementors fetch a blob identified by its BLAKE3 hash.
 ///
 /// The origin is **not** responsible for verifying the hash — the cache engine
@@ -429,41 +456,53 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         Box::pin(async { Ok(OutboardFetch::Unsupported) })
     }
 
-    /// Best-effort total byte size of the blob `hash`, used to scope a
-    /// range-pull ([`Self::fetch_range_data`], #823): the bao tree needs the blob's
-    /// **exact** total length to verify a sub-range against the root `H`, and
-    /// the `{H}.obao4` outboard alone only pins the size to within one chunk
-    /// group (`IROH_BLOCK_SIZE`, 16 KiB — the final group's true length isn't in
-    /// the tree). The
-    /// `cdn/client/v1` serving handler calls this on a cold cache miss — via
+    /// Best-effort presence-and-size probe for the blob `hash`. The size
+    /// scopes a range-pull ([`Self::fetch_range_data`], #823): the bao tree
+    /// needs the blob's **exact** total length to verify a sub-range against
+    /// the root `H`, and the `{H}.obao4` outboard alone only pins the size to
+    /// within one chunk group (`IROH_BLOCK_SIZE`, 16 KiB — the final group's
+    /// true length isn't in the tree). The `cdn/client/v1` serving handler
+    /// calls this on a cold cache miss — via
     /// [`crate::CacheEngine::origin_size`] — before it signs a response and
     /// runs the two-leg serve-miss spine over
     /// [`crate::CacheEngine::origin_range_wire`].
     ///
-    /// The probe is cheap (HTTP `HEAD` / S3 `HeadObject` / `fs` metadata), and
-    /// `Ok(None)` is an **authoritative** "this origin does not hold the
-    /// object — or holds it in a shape the caller cannot range against": a
-    /// genuine 404 / not-found, or a backend reporting a `Content-Encoding`
-    /// whose advertised length is the *encoded* size (not the canonical blob
-    /// length, same trap as [`Self::fetch`]'s `size_hint`). Anything that
-    /// answers neither way — a transport failure, a 5xx/408/429 outage, a
-    /// permission decline, a disabled redirect — surfaces as
-    /// [`OriginPullError`] (`Transient` for the retriable statuses and
-    /// transport faults, `Permanent` for the rest) and must NOT degrade to
-    /// `None` inside the adapter. Fault-aware callers depend on the split: the
-    /// origin-only serve gate and the DHT announce set read `Ok(None)` as an
-    /// absence they may memoise, sign as `NotFound` to a paying client, and
-    /// unschedule from republish — an outage folded into `None` does all
-    /// three. `CacheEngine::origin_size` advances the origin chain past a
-    /// per-origin fault, but a probe that ends on faults surfaces the last one
-    /// (#1129): the serve path must report a degraded node, not an empty one.
-    /// The default returns `Ok(None)`, so a custom [`Origin`] needs no change
-    /// and simply never range-pulls.
+    /// The probe is cheap (HTTP `HEAD` / S3 `HeadObject` / `fs` metadata) and
+    /// answers one of three ways:
+    ///
+    /// - [`OriginSize::Known`] — the origin holds the object and states its
+    ///   canonical blob length. Callers may range-pull against it, advertise
+    ///   it, and sign origin-sourced probe coverage from it.
+    /// - [`OriginSize::Unsized`] — the origin holds the object but cannot
+    ///   state the canonical length (a `Content-Encoding` backend, or a 200
+    ///   without a parsable `Content-Length`). Presence callers (the
+    ///   origin-only serve gate, the presence memo) read it as present; size
+    ///   callers degrade to the whole-blob path and must not memoise or sign
+    ///   it as an absence.
+    /// - [`OriginSize::Absent`] — an **authoritative** "this origin does not
+    ///   hold the object": a genuine 404 / not-found. Only this answer may be
+    ///   memoised as a negative, signed as `NotFound` to a paying client, or
+    ///   unscheduled from republish.
+    ///
+    /// Anything that answers none of the three — a transport failure, a
+    /// 5xx/408/429 outage, a permission decline, a disabled redirect —
+    /// surfaces as [`OriginPullError`] (`Transient` for the retriable statuses
+    /// and transport faults, `Permanent` for the rest) and must NOT degrade to
+    /// `Absent` or `Unsized` inside the adapter. Fault-aware callers depend on
+    /// the split — an outage folded into `Absent` declines serves, drops the
+    /// announce entry, and caches the lie. `CacheEngine::origin_size` advances
+    /// the origin chain past a per-origin fault, but a probe that ends on
+    /// faults surfaces the last one (#1129): the serve path must report a
+    /// degraded node, not an empty one.
+    ///
+    /// The default returns `Absent`, so a custom [`Origin`] that implements
+    /// only [`Self::fetch`] needs no change: it never range-pulls, and the
+    /// probe paths never read it as holding content it cannot confirm.
     fn size(
         &self,
         _hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        Box::pin(async { Ok(None) })
+    ) -> Pin<Box<dyn Future<Output = Result<OriginSize, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(OriginSize::Absent) })
     }
 
     /// Enumerate the hashes this origin currently holds, so a node can
