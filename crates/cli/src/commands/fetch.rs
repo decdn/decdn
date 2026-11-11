@@ -477,8 +477,10 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 }
 
 /// The largest bundle manifest that the gateway and
-/// `decdn get decdn:<hash>/<path> -o -` read into memory.
-pub(crate) const MAX_MANIFEST_BYTES: usize = 64 << 20;
+/// `decdn get decdn:<hash>/<path> -o -` read into memory, in bytes and in MiB
+/// (the unit of `--max-blob-mb`). A bundle pull's manifest fetch takes the
+/// same cap.
+pub(crate) use decdn_client::bundle::{MAX_MANIFEST_BYTES, MAX_MANIFEST_MB};
 
 /// The context of a [`MalformedManifest`] error: the raw blob is the same
 /// manifest bytes, so only the publisher can fix it.
@@ -497,9 +499,6 @@ where
         err.context(not_a_manifest)
     }
 }
-
-/// [`MAX_MANIFEST_BYTES`] in MiB, the unit of `--max-blob-mb`.
-pub(crate) const MAX_MANIFEST_MB: u64 = 64;
 
 /// The `--max-blob-mb` a manifest fetch runs with, given the caller's. The cap
 /// bounds what the lanes request, and so pay for, to the largest manifest.

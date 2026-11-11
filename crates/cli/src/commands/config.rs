@@ -547,6 +547,42 @@ fn parse_origin_spec(raw: &str) -> anyhow::Result<OriginSpec> {
     }
 }
 
+/// Write `contents` to the config file `output` owner-only: on unix the file
+/// is mode 0600, an overwritten one included, and each directory created for
+/// it is mode 0700. The file is the home of a provider `rpc_url`, which can
+/// carry an API key.
+fn write_private_config(output: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = output.parent() {
+        let mut dirs = std::fs::DirBuilder::new();
+        dirs.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            dirs.mode(0o700);
+        }
+        dirs.create(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create directory {}: {e}", parent.display()))?;
+    }
+    let write_err = |e: std::io::Error| {
+        anyhow::anyhow!("failed to write config file {}: {e}", output.display())
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(output).map_err(write_err)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(write_err)?;
+    }
+    std::io::Write::write_all(&mut file, contents).map_err(write_err)
+}
+
 /// Write a default TOML configuration file.
 pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
     let output = args
@@ -563,17 +599,11 @@ pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
         );
     }
 
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("failed to create directory {}: {e}", parent.display()))?;
-    }
-
     let role = resolve_role(args)?;
     let chain = known_chains::resolve(args.chain.as_deref())?;
     let contents = render_config(chain, &role)?;
 
-    std::fs::write(&output, &contents)
-        .map_err(|e| anyhow::anyhow!("failed to write config file {}: {e}", output.display()))?;
+    write_private_config(&output, contents.as_bytes())?;
 
     let role_word = match &role {
         Role::Relay => "relay-node",

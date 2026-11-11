@@ -140,7 +140,7 @@ impl FilesystemOrigin {
                         "cache.origin.path entry {} is a symlink whose target does not exist",
                         link.display()
                     ))),
-                    None => Ok(None),
+                    None => self.absent_unless_base_gone().await,
                 };
             }
             Err(err) => {
@@ -174,6 +174,23 @@ impl FilesystemOrigin {
             )));
         }
         Ok(Some((canonical, meta)))
+    }
+
+    /// The answer for a path that does not resolve and is no dangling link:
+    /// an absence while the base still exists, else a permanent failure. The
+    /// base is checked once at construction, so a base directory deleted or
+    /// unmounted later would otherwise read as every hash being absent. A
+    /// stat error other than `NotFound` keeps the absence.
+    async fn absent_unless_base_gone<T>(&self) -> Result<Option<T>, OriginPullError> {
+        match tokio::fs::metadata(&self.base).await {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "cache.origin.path base {} no longer exists",
+                    self.base.display()
+                )))
+            }
+            _ => Ok(None),
+        }
     }
 }
 

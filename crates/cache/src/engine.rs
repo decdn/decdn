@@ -3858,11 +3858,24 @@ impl CacheEngine {
 
     /// [`Self::origin_fetch_outboard_bytes`], with the index of the origin whose
     /// copy it is — the cached entry's origin, or the origin that served it.
+    ///
+    /// `total_bytes` is the origin's own size claim, so it bounds the outboard
+    /// read only after it passes the engine's blob cap: a claim past the cap
+    /// reads no outboard and answers `Ok(None)`.
     async fn outboard_with_origin(
         &self,
         hash: Hash,
         total_bytes: u64,
     ) -> CacheResult<Option<(Bytes, usize)>> {
+        if total_bytes > self.inner.max_blob_bytes {
+            tracing::debug!(
+                %hash,
+                total_bytes,
+                max_blob_bytes = self.inner.max_blob_bytes,
+                "origin size claim exceeds the blob cap; reading no outboard",
+            );
+            return Ok(None);
+        }
         let expected_len = expected_outboard_len(total_bytes);
         if let Some(cached) = self.inner.outboards.get(hash, expected_len) {
             return Ok(Some((cached.bytes, cached.origin_ix)));

@@ -416,6 +416,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The instrumented build, the llvm-cov profraw merge and the cache repack
+      # on main overflow a 72 GB runner (#2828).
+      - uses: ./.github/actions/free-disk-space
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.1
@@ -544,6 +547,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - uses: ./.github/actions/free-disk-space
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.1
@@ -633,6 +637,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - uses: ./.github/actions/free-disk-space
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.1
@@ -714,6 +719,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - uses: ./.github/actions/free-disk-space
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.1

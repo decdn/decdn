@@ -88,8 +88,8 @@ use super::landing::Landing;
 use super::skip_cache::{self, SavedManifest, SavedMtime};
 use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
-    FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, Selection, format_hash,
-    manifest_cache, parse_hash, path_key,
+    FileObserver, MAX_MANIFEST_MB, ManifestEntry, NodeSelection, STAGING_DIR, Selection,
+    format_hash, manifest_cache, parse_hash, path_key,
 };
 use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
@@ -324,7 +324,7 @@ async fn resolve_disk_state(
         let Ok(dest) = safe_join(out_root, &en.path) else {
             continue; // a bad path fails later in plan_slots; not skippable
         };
-        if dest.starts_with(out_root.join(STAGING_DIR)) {
+        if in_staging(out_root, &dest) {
             continue;
         }
         // `symlink_metadata` does not follow links: a symlink or any
@@ -404,7 +404,7 @@ async fn resolve_disk_state(
         let Ok(src) = safe_join(out_root, path) else {
             continue;
         };
-        if src.starts_with(out_root.join(STAGING_DIR)) {
+        if in_staging(out_root, &src) {
             continue;
         }
         let Ok(meta) = std::fs::symlink_metadata(&src) else {
@@ -464,20 +464,41 @@ pub(super) fn writable_dest(out_root: &Path, path: &str) -> anyhow::Result<PathB
     // `<out_root>/.decdn-partial/` would collide with a per-hash staging
     // file, and `remove_staging` could then delete a materialized output.
     anyhow::ensure!(
-        !dest.starts_with(out_root.join(STAGING_DIR)),
+        !in_staging(out_root, &dest),
         "manifest path {path:?} is inside the reserved staging directory {STAGING_DIR}/"
     );
     // Reserve the pull's own state: an entry at the skip-cache file would be
     // overwritten by the run's skip-cache flush, and an entry inside the
     // manifest cache would collide with a cached manifest.
+    let is_skip_cache = reserved_under(out_root, &dest, skip_cache::SAVED_MANIFEST_NAME)
+        .is_some_and(|mut rest| rest.next().is_none());
     anyhow::ensure!(
-        dest != out_root.join(skip_cache::SAVED_MANIFEST_NAME)
-            && !dest.starts_with(out_root.join(manifest_cache::CACHE_DIR)),
+        !is_skip_cache && reserved_under(out_root, &dest, manifest_cache::CACHE_DIR).is_none(),
         "manifest path {path:?} is reserved for the pull's own state ({} or {}/)",
         skip_cache::SAVED_MANIFEST_NAME,
         manifest_cache::CACHE_DIR,
     );
     Ok(dest)
+}
+
+/// The components of `dest` past `out_root/<name>`, when `dest` is that path
+/// or lies inside it; `None` otherwise. The component under `out_root`
+/// compares by [`path_key`], so on a file system that ignores case or Unicode
+/// normalization every spelling of a reserved name is reserved too.
+fn reserved_under<'a>(
+    out_root: &Path,
+    dest: &'a Path,
+    name: &str,
+) -> Option<std::path::Components<'a>> {
+    let mut rest = dest.strip_prefix(out_root).ok()?.components();
+    let first = rest.next()?.as_os_str().to_str()?;
+    (path_key(first) == path_key(name)).then_some(rest)
+}
+
+/// Whether `dest` is the staging directory under `out_root` or lies inside it
+/// ([`reserved_under`]).
+fn in_staging(out_root: &Path, dest: &Path) -> bool {
+    reserved_under(out_root, dest, STAGING_DIR).is_some()
 }
 
 /// Resolve each entry's on-disk destination and classify it — a resolve failure,
@@ -1795,7 +1816,8 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// [`Self::acquire_entry`] for the fetch itself and what it returns.
     ///
     /// `slot` is the caller's jobs permit; the fetch runs under it, and stops
-    /// on `stop`.
+    /// on `stop`. `max_blob_bytes` caps the blob's size claim (`0` for no cap).
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],
@@ -1804,11 +1826,21 @@ impl<P: Provider + Clone> PullCtx<P> {
         progress: Option<&ProgressCallback>,
         slot: &FetchSlot<'_>,
         stop: &StopPolicy,
+        max_blob_bytes: u64,
     ) -> anyhow::Result<bool> {
         slot.ensure().await?;
         let targets = self.entry_targets(hash, total).await?;
-        self.acquire_entry(&targets, hash, staging, total, None, progress, stop)
-            .await
+        self.acquire_entry(
+            &targets,
+            hash,
+            staging,
+            total,
+            None,
+            progress,
+            stop,
+            max_blob_bytes,
+        )
+        .await
     }
 
     /// One entry's holders: the pinned node, probed for the blob's size when
@@ -1923,6 +1955,10 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// the fetch dropped every byte the store held and fetched the blob again
     /// ([`Downloader::refetched_targets`]). A prefix an earlier run left is
     /// then fetched and paid again.
+    ///
+    /// `max_blob_bytes` caps the blob's size claim (`0` for no cap): an entry
+    /// runs under the run's [`Self::max_blob_bytes`], a manifest under
+    /// [`manifest_cap_bytes`].
     #[allow(clippy::too_many_arguments)]
     async fn acquire_entry(
         &self,
@@ -1933,8 +1969,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         ranges: Option<&[(u64, u64)]>,
         progress: Option<&ProgressCallback>,
         stop: &StopPolicy,
+        max_blob_bytes: u64,
     ) -> anyhow::Result<bool> {
-        let max_blob_bytes = self.max_blob_bytes;
         let deps = self.drive_deps(max_blob_bytes)?;
         let sources = LaneSources::new(
             &deps,
@@ -2156,6 +2192,8 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// health table and progress clock, as every entry. A manifest has no
     /// manifest size, so the fetch takes the first size claim (the probe hint,
     /// a pinned node's included, or a whole-blob open when there is none).
+    /// The fetch runs under [`manifest_cap_bytes`], so a size claim past the
+    /// largest manifest fails before any voucher.
     /// The staging file is removed once read back — a manifest fetch has
     /// nothing further to resume once its bytes are safely in memory.
     async fn fetch_to_memory(&self, hash: [u8; 32], out_root: &Path) -> anyhow::Result<Vec<u8>> {
@@ -2166,7 +2204,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         // A manifest belongs to no pass: a halt a pull left set, by a caller
         // that dropped it mid-drain, does not stop it.
         let stop = self.stop.next_pass();
-        self.fetch_to_staging(hash, &staging, None, None, &slot, &stop)
+        let cap = manifest_cap_bytes(self.max_blob_bytes);
+        self.fetch_to_staging(hash, &staging, None, None, &slot, &stop, cap)
             .await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
@@ -2576,7 +2615,15 @@ impl<P: Provider + Clone> PullCtx<P> {
             // manifest's `size`, when it gives one, is the entry's first size claim,
             // a hint; the paid count is the verified blob's length.
             let refetched = self
-                .fetch_to_staging(hash, staging, total, progress, slot, &self.stop)
+                .fetch_to_staging(
+                    hash,
+                    staging,
+                    total,
+                    progress,
+                    slot,
+                    &self.stop,
+                    self.max_blob_bytes,
+                )
                 .await?;
             index.register(hints, staging);
             let len = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
@@ -3129,6 +3176,7 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, '_, P> {
                     Some(ranges),
                     self.progress,
                     &self.ctx.stop,
+                    self.ctx.max_blob_bytes,
                 )
                 .await?;
             if refetched {
@@ -4155,6 +4203,16 @@ fn promote_partial(partial: &Path, staging: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The blob cap a manifest fetch runs under, given the run's `max_blob_bytes`:
+/// the lower of the two, with [`MAX_MANIFEST_MB`] for a run with no cap (`0`).
+fn manifest_cap_bytes(max_blob_bytes: u64) -> u64 {
+    let cap = MAX_MANIFEST_MB << 20;
+    match max_blob_bytes {
+        0 => cap,
+        run => run.min(cap),
+    }
 }
 
 /// Per-hash staging file an entry's fetch finalizes to before `fetch_group`

@@ -1,4 +1,6 @@
-use super::super::{BundleManifest, MalformedManifest, ManifestChunk, NotAManifest};
+use super::super::{
+    BundleManifest, MAX_MANIFEST_BYTES, MalformedManifest, ManifestChunk, NotAManifest,
+};
 use super::*;
 use alloy::signers::local::PrivateKeySigner;
 use iroh::PublicKey;
@@ -4010,6 +4012,39 @@ fn plan_slots_rejects_the_pull_state_paths() {
     assert!(matches!(slots[2], Slot::Write { .. }));
 }
 
+/// Every case spelling of a reserved pull-state name is reserved: on a file
+/// system that ignores case, `.DECDN-PARTIAL` is the staging directory. A
+/// path that only starts with a reserved name, or nests the skip-cache name
+/// below the root, stays writable.
+#[test]
+fn writable_dest_reserves_every_case_of_the_pull_state_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for reserved in [
+        ".DECDN-PARTIAL/deadbeef".to_owned(),
+        ".Decdn-Partial".to_owned(),
+        ".DECDN-MANIFEST.JSON".to_owned(),
+        ".Decdn-Bundles/x.json".to_owned(),
+        format!("{STAGING_DIR}/x"),
+    ] {
+        assert!(
+            writable_dest(root, &reserved).is_err(),
+            "{reserved} must be reserved"
+        );
+    }
+    for writable in [
+        ".decdn-partial-notes/x",
+        "sub/.decdn-manifest.json",
+        "sub/.DECDN-PARTIAL/x",
+        ".decdn-manifest.json.bak",
+    ] {
+        assert!(
+            writable_dest(root, writable).is_ok(),
+            "{writable} must stay writable"
+        );
+    }
+}
+
 /// An entry whose parent chain leads out of the root fails before its fetch
 /// is paid for; its sibling is still written.
 #[cfg(unix)]
@@ -5361,4 +5396,16 @@ async fn planned_work_leaves_out_colliding_entries() {
             "overwrite={overwrite}"
         );
     }
+}
+
+/// A manifest fetch never runs under the run-wide blob cap: a 1 TiB run cap,
+/// or none, still caps the manifest at the largest manifest, and a lower run
+/// cap stays.
+#[test]
+fn a_manifest_fetch_runs_under_the_manifest_cap() {
+    let manifest_cap = u64::try_from(MAX_MANIFEST_BYTES).unwrap();
+    assert_eq!(manifest_cap, MAX_MANIFEST_MB << 20);
+    assert_eq!(manifest_cap_bytes(1 << 40), manifest_cap);
+    assert_eq!(manifest_cap_bytes(0), manifest_cap);
+    assert_eq!(manifest_cap_bytes(1 << 20), 1 << 20);
 }

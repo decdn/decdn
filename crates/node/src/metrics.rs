@@ -17,7 +17,7 @@ use decdn_protocol::Region;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use iroh::Endpoint;
 use iroh::metrics::EndpointMetrics;
 use iroh_metrics::{
@@ -56,6 +56,15 @@ const RPC_REQUEST_BUCKETS: [f64; 10] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 
 /// peer opens many sockets to the operational-data endpoint and exhausts
 /// tasks.
 const MAX_METRICS_CONNECTIONS: usize = 32;
+
+/// How long a `/metrics` client has to send a request's headers. A peer that
+/// sends nothing, or trickles a header, loses its connection and its permit.
+const METRICS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest one `/metrics` connection lives, keep-alive included. A scrape
+/// takes milliseconds and a scraper reconnects on its next interval, so the
+/// bound only frees the permits of peers that hold idle connections open.
+const METRICS_CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Every counter that names why an inbound `cdn/client/v1` stream failed. Each
 /// failed inbound stream counts on exactly one of them, so
@@ -4316,11 +4325,14 @@ pub async fn serve(
                 let metrics = Arc::clone(&metrics);
                 async move { handle(req, metrics) }
             });
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, svc)
-                .await
-            {
-                tracing::debug!(error = %err, "metrics connection ended");
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(METRICS_HEADER_READ_TIMEOUT)
+                .serve_connection(io, svc);
+            match tokio::time::timeout(METRICS_CONNECTION_LIFETIME, conn).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::debug!(error = %err, "metrics connection ended"),
+                Err(_) => tracing::debug!(%peer, "metrics connection reached its lifetime"),
             }
         });
     }
