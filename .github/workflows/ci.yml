@@ -90,6 +90,20 @@ jobs:
           --features buyer-store-core
         env:
           CARGO_BUILD_WARNINGS: deny
+      # `decdn-cache` without its `s3` feature: the store-only build that
+      # links no AWS SDK. The node turns `s3` on, so `--workspace` never
+      # compiles this configuration. The tree check keeps the AWS SDK and
+      # aws-lc out of it.
+      - run: cargo clippy -p decdn-cache --no-default-features --all-targets
+        env:
+          CARGO_BUILD_WARNINGS: deny
+      - name: decdn-cache without s3 links no AWS SDK
+        run: |
+          if cargo tree -p decdn-cache --no-default-features -e normal --prefix none \
+              | grep -E '^(aws-sdk-|aws-smithy-|aws-config |aws-lc-)'; then
+            echo "decdn-cache --no-default-features links the crates above"
+            exit 1
+          fi
       # A feature that no dev-dependency turns on is invisible to the
       # `--workspace --all-targets` run above: `anvil-e2e` (all 15
       # `crates/e2e/tests/*` + the two gated `decdn-node` tests),
