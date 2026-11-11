@@ -505,8 +505,8 @@ impl<'a, P, F> Streamer<'a, P, F> {
     /// what the window can reach under the cap (the cap itself for the whole
     /// blob, the window's offset plus the cap otherwise) is clamped before the
     /// fill store is sized — with no cap, the claim is clamped to what the
-    /// window can reach under a finite sizing ceiling instead, and a fetch
-    /// that runs to the blob's end grows its bound as bytes verify — and a
+    /// window can reach under a finite sizing ceiling instead, and the bound
+    /// grows past it as bytes verify — and a
     /// blob that holds bytes past the cap ends the stream with
     /// [`crate::BlobTooLarge`] ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
@@ -718,12 +718,19 @@ where
         config: &PullConfig,
         stop: StopPolicy,
     ) -> anyhow::Result<Option<u64>> {
-        let ceiling = if self.max_blob_bytes > 0 {
-            self.max_blob_bytes
-        } else {
-            crate::scheduler::UNCAPPED_SIZING_CEILING
-        };
-        if claim == 0 || claim > ceiling {
+        if claim == 0 {
+            return Ok(None);
+        }
+        let ceiling = crate::scheduler::claim_reach(&[], self.max_blob_bytes);
+        if claim > ceiling {
+            tracing::info!(
+                blob = %blake3::Hash::from_bytes(hash).to_hex(),
+                claim,
+                ceiling,
+                cap = self.max_blob_bytes,
+                "no size proof attempted: the claim lies past the cap on held bytes, or with \
+                 no cap past the sizing ceiling; set a cap at least the claim to prove it"
+            );
             return Ok(None);
         }
         let (mut reader, mut drive) = self

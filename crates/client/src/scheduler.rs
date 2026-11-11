@@ -241,16 +241,34 @@ pub(crate) fn grown_bound(bound: u64, c0: u64, extra: u64) -> u64 {
 /// state. Planning is linear in blocks, and a claim is unverified — the
 /// unsigned probe hint, or a signed `StreamResponse` size no proof backs —
 /// so the claim alone never sizes the work. The ceiling bounds only the
-/// sizing: for a fetch that runs to the blob's end, the bound still grows
-/// past it as bytes verify ([`next_bound`], [`growth_limit`]), so a
-/// genuinely larger blob completes with memory proportional to verified
-/// progress. An explicit range is served to at most the ceiling past its
-/// start; one longer than that needs a real cap.
+/// sizing: with no cap, the bound grows without limit as bytes verify, so a
+/// larger blob or a longer range completes with memory proportional to
+/// verified progress.
 pub(crate) const UNCAPPED_SIZING_CEILING: u64 = 1 << 40;
+
+#[cfg(test)]
+mod ceiling_override;
+#[cfg(test)]
+pub(crate) use ceiling_override::override_uncapped_sizing_ceiling;
+
+/// The active [`UNCAPPED_SIZING_CEILING`]. Test builds read an overridable
+/// value instead, so a test can run a fetch past the ceiling with a small
+/// blob.
+#[cfg(not(test))]
+pub(crate) const fn uncapped_sizing_ceiling() -> u64 {
+    UNCAPPED_SIZING_CEILING
+}
+
+/// The active [`UNCAPPED_SIZING_CEILING`], or the value a test set through
+/// [`override_uncapped_sizing_ceiling`].
+#[cfg(test)]
+pub(crate) fn uncapped_sizing_ceiling() -> u64 {
+    ceiling_override::current()
+}
 
 /// The furthest a size claim can usefully reach for `ranges` under a cap of
 /// `cap` bytes held: the furthest range start plus the cap, or plus
-/// [`UNCAPPED_SIZING_CEILING`] when `cap` is `0` (no cap). A store that holds
+/// [`uncapped_sizing_ceiling`] when `cap` is `0` (no cap). A store that holds
 /// no more than the cap holds no byte past it, so a claim beyond it sizes no
 /// work or coverage bitmap; with no cap, the ceiling keeps the first sizing
 /// finite whatever the claim. A whole-blob fetch, from offset `0`, reaches
@@ -258,30 +276,11 @@ pub(crate) const UNCAPPED_SIZING_CEILING: u64 = 1 << 40;
 pub(crate) fn claim_reach(ranges: &[(u64, u64)], cap: u64) -> u64 {
     let furthest = ranges.iter().map(|&(start, _)| start).max().unwrap_or(0);
     let reach = if cap == 0 {
-        UNCAPPED_SIZING_CEILING
+        uncapped_sizing_ceiling()
     } else {
         cap
     };
     furthest.saturating_add(reach)
-}
-
-/// The most the bound may grow to under `cap`, with `reach` its
-/// [`claim_reach`]: the reach under a real cap, `u64::MAX` with none. With no
-/// cap the reach is only a sizing ceiling; a growth clamped to it would leave
-/// a larger blob's grow step empty with no size proven, and the fetch would
-/// never end.
-pub(crate) const fn growth_limit(cap: u64, reach: u64) -> u64 {
-    if cap > 0 { reach } else { u64::MAX }
-}
-
-/// The next bound after every byte below `bound` is present and no size is
-/// proven: [`grown_bound`] clamped to the growth `limit` — never to the
-/// cap-free sizing reach. At `limit == u64::MAX` (no cap) the bound passes
-/// [`UNCAPPED_SIZING_CEILING`]; clamped there instead, a blob past the
-/// ceiling would leave the grow step with `grown == bound`, an empty regrow,
-/// and a fetch that spins forever.
-pub(crate) fn next_bound(bound: u64, c0: u64, extra: u64, limit: u64) -> u64 {
-    grown_bound(bound, c0, extra).min(limit)
 }
 
 /// The end of the blob as the fetch knows it: the proven size, or with none
@@ -364,8 +363,10 @@ pub struct AcquireTarget<'a, St> {
     /// and a leg that verifies the final chunk proves the size.
     pub total_bytes: u64,
     /// The `(offset, len)` byte ranges to fill. Unless `bounded`, a range that
-    /// reaches `total_bytes` or the store's bound, or has a zero length, is a
-    /// tail: it follows the bound as it grows or shrinks. Bytes outside the
+    /// reaches `total_bytes`, or has a zero length, is a tail: it follows the
+    /// bound as it grows or shrinks. Every other range ends where it asks or
+    /// at `total_bytes`, whichever is nearer; one that ends past the bound
+    /// grows it as bytes verify, never past that end. Bytes outside the
     /// ranges and their tail are never fetched.
     pub ranges: &'a [(u64, u64)],
     /// The ranges are exact: none is a tail, even one that reaches the end
@@ -3037,68 +3038,72 @@ impl std::fmt::Debug for ConsumptionPacing<'_> {
 /// The byte ranges one [`acquire`] fills, fitted to the store's bound as it
 /// moves (ADR 039 § Dynamic segmentation and tail-stealing).
 struct Want {
-    /// The `(offset, len)` ranges still to fill, each inside `bound`.
+    /// The requested `(start, end)` byte spans. A tail's end is `u64::MAX`:
+    /// it runs to the end of the blob, wherever that turns out to be.
+    asks: Vec<(u64, u64)>,
+    /// The `(offset, len)` ranges to fill: each ask clipped to `bound`.
     ranges: Vec<(u64, u64)>,
-    /// The ranges reach the bound's end: a whole-blob target, or explicit
-    /// ranges that hold the tail. Such a target follows the bound as it grows
-    /// and needs a proven size to complete.
-    tail: bool,
     /// The bound the ranges were last fitted to.
     bound: u64,
 }
 
 impl Want {
-    /// `ranges` against a first bound of `bound`, cut from a first claim of
-    /// `c0`. Unless `bounded`, a range that reaches the end of the blob as the
-    /// caller knows it, `min(c0, bound)`, or has a zero length, is a tail: it
-    /// runs to `bound`. Every other range is clipped to `bound`. A resumed
-    /// record's bound can be past `c0`, so a whole-blob target cut from `c0`
-    /// still reaches it.
-    fn new(ranges: &[(u64, u64)], bound: u64, c0: u64, bounded: bool) -> Self {
-        let end = c0.min(bound);
-        let reaches_end =
-            |start: u64, len: u64| !bounded && (len == 0 || start.saturating_add(len) >= end);
-        let tail = ranges.iter().any(|&(start, len)| reaches_end(start, len));
-        let ranges: Vec<(u64, u64)> = ranges
+    /// `ranges` against a first bound of `bound`, requested by a caller whose
+    /// size claim is `claim`. Unless `bounded`, a range that reaches the
+    /// claim, or has a zero length, is a tail: it runs to the end of the blob.
+    /// Every other range ends where the caller asked or at the claim, the end
+    /// of the blob as the caller knows it, whichever is nearer. Each is
+    /// clipped to `bound`. The claim is the caller's own, before any clamp,
+    /// so a range that ends short of it stays exact even when the bound is
+    /// short of both.
+    fn new(ranges: &[(u64, u64)], bound: u64, claim: u64, bounded: bool) -> Self {
+        let asks = ranges
             .iter()
-            .filter(|&&(start, _)| start < bound)
             .map(|&(start, len)| {
-                let room = bound - start;
-                let len = if reaches_end(start, len) {
-                    room
+                let end = start.saturating_add(len);
+                if !bounded && (len == 0 || end >= claim) {
+                    (start, u64::MAX)
                 } else {
-                    len.min(room)
-                };
-                (start, len)
+                    (start, end.min(claim))
+                }
             })
             .collect();
-        Self {
-            ranges,
-            tail,
+        let mut want = Self {
+            asks,
+            ranges: Vec::new(),
             bound,
-        }
+        };
+        want.clip();
+        want
     }
 
-    /// Fit the ranges to a new `bound`. A tail target gains `[old, bound)`
-    /// when the bound grows; every range is clipped when it shrinks. Returns
-    /// whether the bound moved.
+    /// Recompute `ranges` from the asks under the current bound.
+    fn clip(&mut self) {
+        let bound = self.bound;
+        self.ranges = self
+            .asks
+            .iter()
+            .filter(|&&(start, end)| start < bound && start < end)
+            .map(|&(start, end)| (start, end.min(bound) - start))
+            .collect();
+    }
+
+    /// Fit the ranges to a new `bound`: each ask runs to its own end or the
+    /// bound, whichever is nearer. Returns whether the bound moved.
     fn fit(&mut self, bound: u64) -> bool {
         if bound == self.bound {
             return false;
         }
-        if bound > self.bound && self.tail {
-            self.ranges.push((self.bound, bound - self.bound));
-        }
-        if bound < self.bound {
-            self.ranges = self
-                .ranges
-                .iter()
-                .filter(|&&(start, _)| start < bound)
-                .map(|&(start, len)| (start, len.min(bound - start)))
-                .collect();
-        }
         self.bound = bound;
+        self.clip();
         true
+    }
+
+    /// Some ask wants bytes at or past `bound`: a tail, which runs to the end
+    /// of the blob, or a range that ends past the bound. With no proven size,
+    /// such a target grows the bound as its bytes verify.
+    fn wants_past(&self, bound: u64) -> bool {
+        self.asks.iter().any(|&(_, end)| end > bound)
     }
 }
 
@@ -3653,28 +3658,41 @@ where
     let AcquireTarget {
         store,
         hash,
-        total_bytes: c0,
+        total_bytes: claim,
         ranges,
         bounded,
     } = target;
     let health = Arc::clone(sources.health());
     // A claim is peer- or manifest-controlled: clamp it to the furthest the
     // cap on held bytes lets the ranges reach before it sizes any work or
-    // coverage bitmap. A proven size stands: it is verified. The growth
-    // limit is kept apart from the sizing reach: with no cap the reach is a
-    // ceiling on the first sizing only, and the bound grows past it as
-    // bytes verify.
+    // coverage bitmap. A proven size stands: it is verified. Under a cap the
+    // bound grows to the reach at most; with none it grows as bytes verify.
     let cap = env.max_blob_bytes;
     let reach = claim_reach(ranges, cap);
-    let limit = growth_limit(cap, reach);
-    let capped = |size: u64| size.min(reach);
-    let c0 = capped(c0);
-    if store.total_bytes() > reach {
-        store.set_bound(reach);
+    let limit = if cap > 0 { reach } else { u64::MAX };
+    let c0 = claim.min(reach);
+    // A store under a cap holds no byte past the reach. With no cap, a bound
+    // past the reach stands as far as the bytes the store already holds: a
+    // resumed record keeps its verified progress, and a bare size sizes no
+    // work.
+    let opened_bound = store.total_bytes();
+    if opened_bound > reach {
+        let floor = if cap > 0 {
+            reach
+        } else {
+            let present = store.present_ranges().await?;
+            contiguous_byte_ranges(&present, opened_bound)
+                .last()
+                .map_or(0, |&(start, len)| start.saturating_add(len))
+                .max(reach)
+        };
+        if opened_bound > floor {
+            store.set_bound(floor);
+        }
     }
     // A resumed record's bound wins over the caller's hint.
     let first_bound = store.total_bytes();
-    let mut want = Want::new(ranges, first_bound, c0, bounded);
+    let mut want = Want::new(ranges, first_bound, claim, bounded);
     let missing = missing_chunks(store, &want.ranges).await?;
     let mut pending = VecDeque::new();
     for (start, len) in contiguous_byte_ranges(&missing, first_bound) {
@@ -3897,7 +3915,7 @@ where
                     };
                     return Err(anyhow::Error::new(too_large));
                 }
-                if store.proven().is_some() || !want.tail {
+                if store.proven().is_some() || !want.wants_past(bound) {
                     // Land the write in flight first, so it cannot rename an
                     // older snapshot over the final one. Its failure is only
                     // logged: the final write below supersedes it, and its
@@ -3913,11 +3931,12 @@ where
                     store.flush_present_record().await?;
                     return Ok(());
                 }
-                // Every byte below the bound is present and no leg proved a
-                // size: the claim was short. Grow and plan the new region, but
-                // never past the cap: a store already holding the cap's worth,
-                // or a bound at the claim's reach, with no proof means the blob
-                // holds bytes the store cannot take.
+                // Every wanted byte below the bound is present, some ask wants
+                // more past it, and no leg proved a size: the claim was short.
+                // Grow and plan the new region, but never past the cap: a
+                // store already holding the cap's worth, or a bound at the
+                // claim's reach, with no proof means the blob holds bytes the
+                // store cannot take.
                 if cap > 0 && (held >= cap || bound >= reach) {
                     let too_large = crate::BlobTooLarge {
                         reached: held.saturating_add(1),
@@ -3926,7 +3945,7 @@ where
                     return Err(anyhow::Error::new(too_large));
                 }
                 let extra = bytes_past(&store.present_ranges().await?, c0, bound);
-                let grown = next_bound(bound, c0, extra, limit);
+                let grown = grown_bound(bound, c0, extra).min(limit);
                 tracing::debug!(
                     hash = %blake3::Hash::from_bytes(hash).to_hex(),
                     bound,

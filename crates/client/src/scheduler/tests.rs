@@ -5765,36 +5765,189 @@ fn an_uncapped_reach_is_the_sizing_ceiling_not_unbounded() {
     );
 }
 
-/// The growth limit is unbounded with no cap: the sizing ceiling bounds only
-/// the first sizing, so the bound grows past it as bytes verify and a blob
-/// larger than the ceiling still completes. Under a real cap the limit is
-/// the reach itself.
-#[test]
-fn the_growth_limit_is_unbounded_with_no_cap() {
-    use super::{UNCAPPED_SIZING_CEILING, claim_reach, growth_limit};
-    let ranges = [(0, 100)];
-    assert_eq!(growth_limit(0, claim_reach(&ranges, 0)), u64::MAX);
-    assert_eq!(growth_limit(0, UNCAPPED_SIZING_CEILING), u64::MAX);
-    assert_eq!(
-        growth_limit(8 * MIB, claim_reach(&ranges, 8 * MIB)),
-        8 * MIB
-    );
+/// The cap-free sizing ceiling the past-the-ceiling tests run under: four
+/// chunk groups, so a blob a few groups long already crosses it.
+const SMALL_CEILING: u64 = 64 * 1024;
+
+/// Acquire `ranges` of `data`'s blob at cap 0 from one honest lane, under a
+/// sizing ceiling of [`SMALL_CEILING`], with the caller's own `claim`, into a
+/// store sized as a caller sizes it: `claim` clamped to the ranges' reach.
+/// Returns the result, every progress total, every range the lane opened,
+/// and the store.
+async fn acquire_past_ceiling(
+    data: &[u8],
+    claim: u64,
+    ranges: &[(u64, u64)],
+    bounded: bool,
+) -> anyhow::Result<(
+    anyhow::Result<()>,
+    Vec<u64>,
+    Vec<(u64, u64)>,
+    ClientRangedStore,
+    tempfile::TempDir,
+)> {
+    let root = ScriptedSource::new(data.to_vec())?.root();
+    let sized = {
+        let _ceiling = super::override_uncapped_sizing_ceiling(SMALL_CEILING);
+        claim.min(super::claim_reach(ranges, 0))
+    };
+    let (store, dir) = fresh_store(root, sized);
+    let (result, totals, opened) =
+        acquire_past_ceiling_into(&store, data, claim, ranges, bounded).await?;
+    Ok((result, totals, opened, store, dir))
 }
 
-/// The grow step clamps to the growth limit, not the sizing reach: with no
-/// cap (`limit == u64::MAX`) a bound at the sizing ceiling grows past it, so
-/// a blob larger than the ceiling completes; under a real cap the limit
-/// clamps the grown bound.
-#[test]
-fn the_grow_step_passes_the_sizing_ceiling_with_no_cap() {
-    use super::{UNCAPPED_SIZING_CEILING, next_bound};
-    let at_ceiling = next_bound(UNCAPPED_SIZING_CEILING, MIB, 0, u64::MAX);
-    assert!(at_ceiling > UNCAPPED_SIZING_CEILING, "{at_ceiling}");
-    assert_eq!(
-        next_bound(UNCAPPED_SIZING_CEILING, MIB, 0, UNCAPPED_SIZING_CEILING),
-        UNCAPPED_SIZING_CEILING,
-        "a finite limit clamps the grown bound"
+/// [`acquire_past_ceiling`] into an existing `store`.
+async fn acquire_past_ceiling_into(
+    store: &ClientRangedStore,
+    data: &[u8],
+    claim: u64,
+    ranges: &[(u64, u64)],
+    bounded: bool,
+) -> anyhow::Result<(anyhow::Result<()>, Vec<u64>, Vec<(u64, u64)>)> {
+    let _ceiling = super::override_uncapped_sizing_ceiling(SMALL_CEILING);
+    let (sources, provider) = honest_lanes(data, &[0xA1])?;
+    let source = sources
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("one honest lane"))?;
+    let root = source.root();
+    let totals: Arc<Mutex<Vec<u64>>> = Arc::default();
+    let seen = Arc::clone(&totals);
+    let on_progress: Box<crate::ProgressCallback> = Box::new(move |_, total| {
+        if let Ok(mut t) = seen.lock() {
+            t.push(total);
+        }
+    });
+    let mut set = SourceSet::new(&provider, root, Arc::default(), provider.holders());
+    let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+    let gate = recovery_gate();
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
+    let env = AcquireEnv {
+        pacer: &pacer,
+        funder: &funder,
+        recovery: &gate,
+        credentials: None,
+        max_lanes: 1,
+        stop: &stop,
+        on_progress: Some(&on_progress),
+        ledgers: None,
+        pacing: None,
+        max_blob_bytes: 0,
+        run: None,
+    };
+    let target = AcquireTarget {
+        bounded,
+        store,
+        hash: root,
+        total_bytes: claim,
+        ranges,
+    };
+    let result = tokio::time::timeout(Duration::from_mins(2), acquire(target, &mut set, &env))
+        .await
+        .map_err(|_| anyhow::anyhow!("the acquire did not end within 2 min"))
+        .and_then(|r| r);
+    let totals = totals.lock().map(|t| t.clone()).unwrap_or_default();
+    Ok((result, totals, source.opened_ranges()))
+}
+
+/// With no cap, a whole-blob fetch of a blob past the sizing ceiling grows
+/// its bound past the ceiling as bytes verify and completes byte-exact. A
+/// grow step clamped to the ceiling would leave the bound where it is and
+/// never end.
+#[tokio::test(start_paused = true)]
+async fn an_uncapped_blob_past_the_ceiling_completes() -> anyhow::Result<()> {
+    let data = blob(4 * SMALL_CEILING as usize);
+    let claim = 4 * SMALL_CEILING;
+    let (result, totals, _, store, dir) =
+        acquire_past_ceiling(&data, claim, &[(0, claim)], false).await?;
+    result?;
+    assert!(totals.iter().any(|&t| t > SMALL_CEILING), "{totals:?}");
+    assert_eq!(store.proven(), Some(claim));
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    Ok(())
+}
+
+/// With no cap, an explicit range that ends past the sizing ceiling but
+/// short of the claim stays exact: the bound grows to cover it as bytes
+/// verify, and no byte past the range's end is opened or paid for.
+#[tokio::test(start_paused = true)]
+async fn an_uncapped_range_past_the_ceiling_fetches_only_itself() -> anyhow::Result<()> {
+    let data = blob(8 * SMALL_CEILING as usize);
+    let end = 2 * SMALL_CEILING;
+    let (result, _, opened, store, _dir) =
+        acquire_past_ceiling(&data, 8 * SMALL_CEILING, &[(0, end)], false).await?;
+    result?;
+    assert!(
+        opened.iter().all(|&(start, len)| start + len <= end),
+        "a leg opened past the range's end: {opened:?}"
     );
+    let present = store.present_ranges().await?;
+    assert_eq!(
+        crate::driver::ranges_content_len(&present, store.total_bytes()),
+        end,
+        "the store holds exactly the range"
+    );
+    Ok(())
+}
+
+/// With no cap, a bounded window longer than the sizing ceiling completes
+/// in full rather than stopping at the ceiling.
+#[tokio::test(start_paused = true)]
+async fn an_uncapped_window_past_the_ceiling_completes() -> anyhow::Result<()> {
+    let data = blob(8 * SMALL_CEILING as usize);
+    let window = (SMALL_CEILING / 2, 3 * SMALL_CEILING);
+    let (result, _, opened, store, _dir) =
+        acquire_past_ceiling(&data, 8 * SMALL_CEILING, &[window], true).await?;
+    result?;
+    let (start, len) = window;
+    let present = store.present_ranges().await?;
+    let held = crate::driver::contiguous_byte_ranges(&present, store.total_bytes());
+    assert!(
+        held.iter()
+            .any(|&(s, l)| s <= start && s + l >= start + len),
+        "the window is not held whole: {held:?}"
+    );
+    assert!(
+        opened.iter().all(|&(s, l)| s + l <= 4 * SMALL_CEILING),
+        "a leg opened well past the window: {opened:?}"
+    );
+    Ok(())
+}
+
+/// With no cap, a resumed record whose unproven bound already grew past the
+/// sizing ceiling keeps it as far as the bytes it holds: a second run never
+/// plans a bound below them and never refetches them.
+#[tokio::test(start_paused = true)]
+async fn an_uncapped_resumed_bound_past_the_ceiling_is_kept() -> anyhow::Result<()> {
+    let data = blob(4 * SMALL_CEILING as usize);
+    let claim = 4 * SMALL_CEILING;
+    let held = 3 * SMALL_CEILING;
+    // The first run holds `[0, held)` and leaves the bound past the ceiling,
+    // unproven: the range stops short of the blob's last chunk group.
+    let (first, _, _, store, dir) = acquire_past_ceiling(&data, claim, &[(0, held)], false).await?;
+    first?;
+    assert!(
+        store.total_bytes() > SMALL_CEILING,
+        "{}",
+        store.total_bytes()
+    );
+    assert_eq!(store.proven(), None);
+    let (second, totals, opened) =
+        acquire_past_ceiling_into(&store, &data, claim, &[(0, claim)], false).await?;
+    second?;
+    assert!(
+        totals.iter().all(|&t| t >= held),
+        "the resumed bound shrank below the held bytes: {totals:?}"
+    );
+    assert!(
+        opened.iter().all(|&(start, _)| start >= held),
+        "the second run refetched held bytes: {opened:?}"
+    );
+    assert_eq!(store.proven(), Some(claim));
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    Ok(())
 }
 
 /// With no cap, a huge unverified claim never sizes the work: every planned

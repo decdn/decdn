@@ -1397,8 +1397,8 @@ pub(crate) async fn fetch_on(
                     Ok(None) => tracing::info!(
                         %blob,
                         claim = total_bytes,
-                        "a size proof proved nothing: the claim's last chunk group is not the \
-                         blob's last"
+                        "a size proof proved nothing: the claim lies past the cap or the \
+                         sizing ceiling, or its last chunk group is not the blob's last"
                     ),
                     Err(err) if proof_ends_fetch(&err) => return Err(err),
                     Err(err) => tracing::info!(
