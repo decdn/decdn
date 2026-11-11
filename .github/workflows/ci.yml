@@ -100,7 +100,7 @@ jobs:
       - name: decdn-cache without s3 links no AWS SDK
         run: |
           if cargo tree -p decdn-cache --no-default-features -e normal --prefix none \
-              | grep -E '^(aws-sdk-|aws-smithy-|aws-config |aws-lc-)'; then
+              | grep -E '^aws-'; then
             echo "decdn-cache --no-default-features links the crates above"
             exit 1
           fi
