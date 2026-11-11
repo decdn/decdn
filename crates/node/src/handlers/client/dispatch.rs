@@ -1142,10 +1142,13 @@ impl ClientHandler {
                 // Serviceability is confirmed before the response is signed, by
                 // `origin_size` (a live probe of the data object) and
                 // `origin_range_serviceable` (an origin publishes the outboard AND
-                // serves ranged reads of the data). The range half reads one chunk
-                // group until the origin has served a clean range window once, then
-                // reads nothing. So an origin that publishes an outboard but declines
-                // `Range` degrades here instead of failing a signed stream.
+                // serves ranged reads of the data). The range half reads the last
+                // chunk group under the origin's stated size and verifies it, which
+                // proves that size, so everything the serve signs, gates and reads
+                // below rests on a proven size. The proof is memoized per hash. An
+                // origin that publishes an outboard but declines `Range`, or whose
+                // stated size is wrong, degrades here instead of failing a signed
+                // stream.
                 //
                 // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
                 // published outboard / no ranged reads / no origin size / no origins
@@ -1189,13 +1192,13 @@ impl ClientHandler {
                                     ))
                                     .await;
                                 }
-                                // Size known but no origin publishes the outboard
-                                // and serves ranges — not serviceable via the range
-                                // encoder. Degrade to the buffered local populate
-                                // below.
+                                // No origin publishes the outboard and serves
+                                // ranges, or the stated size does not verify — not
+                                // serviceable via the range encoder. Degrade to the
+                                // buffered local populate below.
                                 Ok(false) => {}
                                 // A genuine origin fault while probing the outboard
-                                // or the first range window. Latch it (#1129) so a
+                                // or the last range window. Latch it (#1129) so a
                                 // later-tier miss reports InternalError not NotFound,
                                 // then fall through — another source may still serve.
                                 Err(e) => {

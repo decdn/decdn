@@ -413,25 +413,31 @@ async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("write frame: {e}"))
 }
 
-/// Serve the own-origin serviceability probe: the ranged GET of the blob's first
-/// chunk group, which the node reads before it signs a two-leg serve. Mount it
-/// before a test's own data mocks, so the probe wins over a mock that fails
-/// every ranged GET.
+/// Serve the own-origin serviceability probe: the ranged GET of the blob's last
+/// chunk group, which the node reads and verifies before it signs a two-leg
+/// serve, proving the size. Mount it before a test's own data mocks, so the
+/// probe wins over a mock that fails every ranged GET.
 async fn mount_range_probe(server: &MockServer, hex: &str, blob: &[u8]) {
-    let end = blob.len().min(16 * 1024);
+    let start = probe_range_start(blob.len());
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(header("range", probe_range_val(blob.len()).as_str()))
         .respond_with(
-            ResponseTemplate::new(206).set_body_bytes(blob.get(..end).unwrap_or_default().to_vec()),
+            ResponseTemplate::new(206)
+                .set_body_bytes(blob.get(start..).unwrap_or_default().to_vec()),
         )
         .mount(server)
         .await;
 }
 
+/// The start of the last chunk group of a `len`-byte blob.
+const fn probe_range_start(len: usize) -> usize {
+    len.saturating_sub(1) / (16 * 1024) * (16 * 1024)
+}
+
 /// The `Range` header value of the serviceability probe for a `len`-byte blob.
 fn probe_range_val(len: usize) -> String {
-    format!("bytes=0-{}", len.min(16 * 1024).saturating_sub(1))
+    format!("bytes={}-{}", probe_range_start(len), len.saturating_sub(1))
 }
 
 /// Count `received_requests` matching a predicate, failing loudly if wiremock

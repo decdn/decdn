@@ -4050,25 +4050,44 @@ async fn stub_engine(
     Ok((engine, tmp))
 }
 
-/// The serviceability probe confirms an origin that serves the outboard and
-/// ranges with one chunk-group read, then answers the next probe from the
-/// latch without a read.
+/// The serviceability probe reads the last chunk group under the stated
+/// size and verifies it, which proves the size; the next probe of the blob
+/// answers from the memo without a read.
 #[tokio::test]
-async fn origin_range_serviceable_probes_one_group_then_latches() -> anyhow::Result<()> {
+async fn origin_range_serviceable_proves_the_size_then_memoizes() -> anyhow::Result<()> {
     let (data, hash, origin, _) = multi_window_stub();
     let total = u64::try_from(data.len())?;
     let fetches = Arc::clone(&origin.range_fetches);
     let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    anyhow::ensure!(engine.origin_size_proven(hash).is_none());
     anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
     anyhow::ensure!(
         fetches.load(Ordering::SeqCst) == 1,
         "the first probe reads one window"
     );
+    anyhow::ensure!(engine.origin_size_proven(hash) == Some(total));
     anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
     anyhow::ensure!(
         fetches.load(Ordering::SeqCst) == 1,
-        "a confirmed origin is not probed again"
+        "a proven size is not probed again"
     );
+    Ok(())
+}
+
+/// A stated size short of the blob's real one does not verify at its last
+/// group: the probe proves nothing, and the miss degrades to the whole-blob
+/// path.
+#[tokio::test]
+async fn origin_range_serviceable_proves_no_wrong_size() -> anyhow::Result<()> {
+    let (data, hash, origin, _) = multi_window_stub();
+    let total = u64::try_from(data.len())?;
+    let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    let probed = engine.origin_range_serviceable(hash, total - 1).await;
+    anyhow::ensure!(
+        !matches!(probed, Ok(true)),
+        "a wrong size must not prove, got {probed:?}"
+    );
+    anyhow::ensure!(engine.origin_size_proven(hash).is_none());
     Ok(())
 }
 
@@ -4101,8 +4120,8 @@ async fn origin_range_serviceable_faults_on_a_short_first_window() -> anyhow::Re
 }
 
 /// A blob of one chunk group has an empty outboard, which the outboard cache
-/// never holds. The latch still keys on the origin that served it, so the
-/// second probe reads no range.
+/// never holds. Its one group is its last, so the probe proves its size, and
+/// the second probe reads no range.
 #[tokio::test]
 async fn origin_range_serviceable_latches_a_small_blob() -> anyhow::Result<()> {
     use bao_tree::io::outboard::PreOrderMemOutboard;
@@ -4119,7 +4138,7 @@ async fn origin_range_serviceable_latches_a_small_blob() -> anyhow::Result<()> {
     anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
     anyhow::ensure!(
         fetches.load(Ordering::SeqCst) == 1,
-        "a confirmed origin is probed once, got {}",
+        "a proven size is probed once, got {}",
         fetches.load(Ordering::SeqCst)
     );
     Ok(())

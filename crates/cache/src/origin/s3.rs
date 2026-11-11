@@ -619,7 +619,9 @@ impl Origin for S3Origin {
     fn fetch(
         &self,
         hash: Hash,
-        max_bytes: u64,
+        // The engine caps the bytes the body delivers; the advertised length
+        // caps nothing.
+        _max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             let key = key_for(&self.prefix, hash);
@@ -676,13 +678,11 @@ impl Origin for S3Origin {
                 },
             };
 
-            // Fast-path size check from the SDK-parsed Content-Length.
-            // `content_length()` returns `Option<i64>` — negative is
-            // a deterministic protocol violation; `> max_bytes` saves
-            // us streaming bytes we'll throw away. The engine still
-            // re-checks the running total via `count_and_cap_stream`
-            // as the body arrives, so an origin that lies in the
-            // header is caught mid-flight.
+            // The SDK-parsed Content-Length, a size hint that only picks the
+            // engine's buffered or streamed path. `content_length()` returns
+            // `Option<i64>`; a negative one is a deterministic protocol
+            // violation. The cap binds on the bytes the body delivers: the
+            // engine counts them via `count_and_cap_stream` as they arrive.
             let advertised_size: Option<u64> = match resp.content_length() {
                 Some(len) if len < 0 => {
                     return Err(OriginPullError::Permanent(anyhow::anyhow!(
@@ -692,11 +692,6 @@ impl Origin for S3Origin {
                 Some(len) => {
                     #[allow(clippy::cast_sign_loss)] // checked >= 0 above.
                     let len_u64 = len as u64;
-                    if len_u64 > max_bytes {
-                        return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                            "{log_target}: Content-Length={len} exceeds max {max_bytes}"
-                        )));
-                    }
                     Some(len_u64)
                 }
                 None => None,

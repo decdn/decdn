@@ -27,7 +27,6 @@ use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
 
-use crate::CHUNK_GROUP_BYTES;
 use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
@@ -92,6 +91,12 @@ const RESCAN_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// among blobs of equal frequency. The pre-open blobs tie on recency, and both
 /// policies break that tie largest first.
 const COLD_SEED_AGE: Duration = Duration::from_secs(1);
+
+/// The most own-origin blob sizes the engine remembers as proven
+/// ([`CacheEngine::origin_size_proven`]). Each entry is a hash and a size, so
+/// the memo stays under a megabyte; a forgotten size is proven again with one
+/// ranged read.
+const ORIGIN_PROVEN_SIZES_MAX: usize = 16_384;
 
 /// The origin-held index and what the rescan that built it could not resolve.
 ///
@@ -524,13 +529,10 @@ struct Inner {
     /// (#2065); each holds a permit for its whole span and `O(window + outboard)`
     /// bytes, so the bound caps their sum.
     own_origin_range_pulls: Arc<tokio::sync::Semaphore>,
-    /// Per configured origin (same index as `origins`): whether the origin has
-    /// served a clean first range window. Set on the first such window, by the
-    /// serviceability probe ([`CacheEngine::origin_range_serviceable`]) or a
-    /// draw, and never cleared, so the probe's range half reads nothing for a
-    /// confirmed origin. An origin that later stops serving ranges fails its
-    /// draw like any other mid-life origin fault.
-    origin_range_confirmed: Box<[AtomicBool]>,
+    /// The sizes a verified last chunk group from an own origin proved, keyed
+    /// by hash ([`CacheEngine::origin_range_serviceable`]). Bounded at
+    /// [`ORIGIN_PROVEN_SIZES_MAX`] hashes.
+    origin_proven_sizes: Mutex<HashMap<Hash, u64>>,
     /// Origin `{H}.obao4` outboards already read, keyed by hash, tagged with
     /// the serving origin, and bounded by bytes. The serviceability probe's
     /// outboard half ([`CacheEngine::origin_fetch_outboard_bytes`]) and every
@@ -1571,7 +1573,6 @@ impl CacheEngine {
             .iter()
             .map(|_| OriginBreaker::new(circuit_breaker, Arc::clone(&clock), metrics.clone()))
             .collect::<Vec<_>>();
-        let origin_range_confirmed = origins.iter().map(|_| AtomicBool::new(false)).collect();
 
         // `checked_sub` fails only within `COLD_SEED_AGE` of the monotonic
         // clock's origin (near boot). Seeding at `opened` then still sorts at or
@@ -1627,7 +1628,7 @@ impl CacheEngine {
                 own_origin_range_pulls: Arc::new(tokio::sync::Semaphore::new(
                     MAX_CONCURRENT_RANGE_PULLS,
                 )),
-                origin_range_confirmed,
+                origin_proven_sizes: Mutex::new(HashMap::new()),
                 outboards: OutboardCache::new(OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES),
                 outboard_flights: Mutex::new(HashMap::new()),
                 origin_read_head_start_ms: AtomicU64::new(0),
@@ -3960,17 +3961,23 @@ impl CacheEngine {
     /// has stopped since: it fails its draw like any other mid-life origin
     /// fault.
     ///
-    /// The range half reads the first chunk group through the same origin
-    /// chain a draw walks, starting at the origin that served the outboard. It
-    /// reads nothing when that origin has already served a clean range window.
-    /// The 0-byte blob has no data to range, so its outboard alone answers.
+    /// The range half reads the LAST chunk group under `total_bytes` through
+    /// the same origin chain a draw walks, starting at the origin that served
+    /// the outboard, and verifies it against `H`. Only the true size verifies
+    /// a final chunk, so `true` also proves `total_bytes` is the blob's size:
+    /// the origin's stated size is a claim, and this one ranged read turns it
+    /// into verified knowledge before the serve signs it. The proof is
+    /// memoized per hash, so a later probe of the same blob at the same size
+    /// reads nothing. A last group that does not verify degrades the miss to
+    /// the whole-blob path. The 0-byte blob has no data to range: its outboard
+    /// alone answers, and the empty root proves its size.
     ///
     /// # Errors
     ///
     /// - [`CacheError::OriginError`] — no origin serves both halves, and at
     ///   least one failed with a transport fault or a timeout.
     /// - [`CacheError::VerifyFailed`] — no origin serves both halves, and an
-    ///   origin served a wrong-length outboard or first window, which cannot
+    ///   origin served a wrong-length outboard or last window, which cannot
     ///   verify.
     pub async fn origin_range_serviceable(
         &self,
@@ -3980,33 +3987,74 @@ impl CacheEngine {
         let Some((outboard, ix)) = self.outboard_with_origin(hash, total_bytes).await? else {
             return Ok(false);
         };
-        if total_bytes == 0 || self.range_confirmed(ix) {
+        if total_bytes == 0 || self.origin_size_proven(hash) == Some(total_bytes) {
             return Ok(true);
         }
-        let first_group =
-            align_range(0, CHUNK_GROUP_BYTES.min(total_bytes), total_bytes).map_err(|e| {
-                CacheError::Internal(anyhow::Error::from(e).context("range probe alignment"))
-            })?;
-        let opened = self
-            .open_range_cursor(hash, &first_group, Some((ix, outboard)))
+        let last_group = align_range(total_bytes - 1, 1, total_bytes).map_err(|e| {
+            CacheError::Internal(anyhow::Error::from(e).context("range probe alignment"))
+        })?;
+        let Some(mut cursor) = self
+            .open_range_cursor(hash, &last_group, Some((ix, outboard)))
             .await?
-            .is_some();
-        if !opened {
+        else {
             tracing::debug!(
                 %hash,
                 "no own origin serves ranged reads of this blob; the miss degrades to a \
                  whole-blob origin pull",
             );
+            return Ok(false);
+        };
+        let proven = match cursor.next_window().await? {
+            Some(crate::origin_range::WindowFetch::Window(window)) => {
+                crate::range_pull::encode_verified_range(
+                    *hash.as_bytes(),
+                    &last_group,
+                    &window.data,
+                    cursor.outboard(),
+                )
+                .is_ok()
+            }
+            _ => false,
+        };
+        if !proven {
+            tracing::debug!(
+                %hash,
+                total_bytes,
+                "the origin's last chunk group does not verify under its stated size; the \
+                 miss degrades to a whole-blob origin pull",
+            );
+            return Ok(false);
         }
-        Ok(opened)
+        self.remember_origin_size(hash, total_bytes);
+        Ok(true)
     }
 
-    /// Whether the origin at `ix` has served a clean first range window.
-    fn range_confirmed(&self, ix: usize) -> bool {
+    /// The size a verified last chunk group proved for `hash` from an own
+    /// origin ([`Self::origin_range_serviceable`]), if one did.
+    #[must_use]
+    pub fn origin_size_proven(&self, hash: Hash) -> Option<u64> {
         self.inner
-            .origin_range_confirmed
-            .get(ix)
-            .is_some_and(|c| c.load(Ordering::Relaxed))
+            .origin_proven_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&hash)
+            .copied()
+    }
+
+    /// Remember that a verified last chunk group proved `size` for `hash`.
+    /// The memo is bounded: once it holds [`ORIGIN_PROVEN_SIZES_MAX`] hashes it
+    /// starts over, and a forgotten hash proves its size again on its next
+    /// probe.
+    fn remember_origin_size(&self, hash: Hash, size: u64) {
+        let mut sizes = self
+            .inner
+            .origin_proven_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sizes.len() >= ORIGIN_PROVEN_SIZES_MAX {
+            sizes.clear();
+        }
+        sizes.insert(hash, size);
     }
 
     /// Open a cursor on the first origin that serves both the outboard and a
@@ -4076,12 +4124,7 @@ impl CacheEngine {
                     );
                     wrong_length = true;
                 }
-                Ok(Some(cursor)) => {
-                    if let Some(confirmed) = self.inner.origin_range_confirmed.get(ix) {
-                        confirmed.store(true, Ordering::Relaxed);
-                    }
-                    return Ok(Some(cursor));
-                }
+                Ok(Some(cursor)) => return Ok(Some(cursor)),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
@@ -5510,17 +5553,9 @@ impl CacheEngine {
             crate::origin::OriginFetch::Found { stream, size_hint } => (stream, size_hint),
         };
 
-        // Pre-stream cap: if the adapter advertised a length, reject
-        // before reading the first byte. The post-stream cap below is
-        // load-bearing too — origins can lie or omit the hint. This
-        // is a deterministic operator-visible cap breach; surface as
-        // `BlobTooLarge` directly without burning retry budget.
-        if let Some(advertised) = size_hint
-            && advertised > max_blob_bytes
-        {
-            return Ok(PullThroughOutcome::BlobTooLarge);
-        }
-
+        // The advertised length only picks the path. The cap binds on the
+        // bytes the stream delivers: both paths below count them and end
+        // with `BlobTooLarge` once they pass `max_blob_bytes`.
         if should_buffer(size_hint, policy.buffered_max_bytes) {
             let drain_cap = policy.buffered_max_bytes.min(max_blob_bytes);
             let bytes = match drain_to_bytes(stream, drain_cap, self.inner.metrics.as_ref()).await {

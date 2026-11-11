@@ -450,17 +450,18 @@ async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Res
         .respond_with(ResponseTemplate::new(206).set_body_bytes(gap_bytes))
         .mount(&server)
         .await;
-    // The serviceability probe reads group 0 once, before the node signs, to
-    // confirm the origin serves ranges. It is no draw: the count below leaves it
-    // out.
-    let probe_val = format!("bytes=0-{}", group - 1);
+    // The serviceability probe reads the last group once, before the node
+    // signs, to confirm the origin serves ranges and to prove the size. It is
+    // no draw: the count below leaves it out.
+    let last = total - group;
+    let probe_val = format!("bytes={last}-{}", total - 1);
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(wiremock::matchers::header("range", probe_val.as_str()))
         .respond_with(
             ResponseTemplate::new(206).set_body_bytes(
                 plaintext
-                    .get(..usize::try_from(group)?)
+                    .get(usize::try_from(last)?..)
                     .unwrap_or_default()
                     .to_vec(),
             ),
