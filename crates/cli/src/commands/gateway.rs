@@ -3107,10 +3107,12 @@ fn preflight(origin: Option<&str>) -> Response<Body> {
 /// The response headers a page on another origin may read from a public
 /// gateway: the body's length and type, the hash (`ETag`), the window
 /// (`Content-Range`, `Accept-Ranges`) and, on a 402 or 503, when to retry and
-/// where to fetch instead (`Retry-After`, `Link`).
+/// where to fetch instead (`Retry-After`, `Link`). `Content-Encoding` tells the
+/// page that a proxy in front encoded the body, so `Content-Length` counts the
+/// encoded bytes rather than the decoded body.
 const PUBLIC_EXPOSED: header::HeaderValue = header::HeaderValue::from_static(
-    "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, ETag, \
-     Retry-After, Link",
+    "Content-Length, Content-Encoding, Content-Range, Accept-Ranges, Content-Type, \
+     Content-Disposition, ETag, Retry-After, Link",
 );
 
 /// The origins that may read a public gateway's answers: all of them.
