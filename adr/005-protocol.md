@@ -35,7 +35,7 @@ sequenceDiagram
     participant C as Candidate Node
 
     R->>C: ProbeRequest {hash, timestamp_us}
-    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {total_bytes?}
+    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {total_bytes?, size_proof?}
 
     Note over R: RTT = receive_time - timestamp_us
     Note over R: Score = unified selection score (see ADR 001)
@@ -103,7 +103,7 @@ sequenceDiagram
     participant D as Delivering Node
 
     P->>D: StreamRequest {hash, namespace_id, pool_id, byte_offset, timestamp_us}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {error?, origin_attestation?}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {error?, origin_attestation?, size_proof?}
 
     alt ok = true
         P->>D: Voucher {sig, amt, chain_root, chunk_price} (opens the chain)
@@ -161,7 +161,13 @@ Like `byte_len`, `namespace_id` is part of the base `StreamRequest` (every node 
 
 `byte_offset` is the start of a request; `byte_len` bounds its **end**. A request expresses the half-open range `[byte_offset, byte_offset + byte_len)`, with `byte_len == 0` meaning "to end-of-blob" (whole-tail behavior, so an absent or zero value is the default). A bounded range lets a node scope a cache-miss **origin** fetch to exactly the requested bytes rather than pulling the whole blob to serve a fraction of it — see [ADR 037 § Origin-tier pull-through](037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard). It also scopes payment: `total_bytes` in `StreamResponse` stays the **full blob size** — the buyer derives remaining bytes as `total_bytes - byte_offset`, and the serving node needs the blob size to frame bao verification of the range — while the **delivered, metered** byte count for a bounded request is `min(byte_len, total_bytes - byte_offset)`, or the whole tail (`total_bytes - byte_offset`) when `byte_len == 0`.
 
-`byte_len` is part of the base `StreamRequest` (not an optional extension): it is billing-relevant. A node that ignored it would over-deliver and over-bill with no slash evidence. Every node must understand it. Because `cdn/client/v1` is pre-finalisation (no testnet deployment), this is a **straight in-place addition** to the message, not a Tier-3 evolution: there is no version bump and no compatibility shim ([ADR 013 § Schema evolution](013-schema-evolution.md#adr-013-schema-evolution)). A claimed blob size is a hint. The node MUST reject a `byte_offset` at or past the blob end with a `StreamError`. When a range's end overflows or runs past the blob end, the node serves the range up to the blob end. A leg that reaches the true end proves the true size to the receiver.
+`byte_len` is part of the base `StreamRequest` (not an optional extension): it is billing-relevant. A node that ignored it would over-deliver and over-bill with no slash evidence. Every node must understand it. Because `cdn/client/v1` is pre-finalisation (no testnet deployment), this is a **straight in-place addition** to the message, not a Tier-3 evolution: there is no version bump and no compatibility shim ([ADR 013 § Schema evolution](013-schema-evolution.md#adr-013-schema-evolution)). The node MUST reject a `byte_offset` at or past the blob end with a `StreamError`. When a range's end overflows or runs past the blob end, the node serves the range up to the blob end.
+
+**A node proves the blob size.** A `StreamResponse` with `ok = true`, and a `ProbeResponse` that states `total_bytes`, carries a **size proof** in its extension. The proof is the final BLAKE3 chunk of the blob (at most 1 KiB) and the parent hashes on the path from that chunk to the root ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)). BLAKE3 binds the length of the input into the tree, so only the true size verifies a final chunk under the root. The receiver MUST verify the proof against the content hash before it uses the size: before it plans or splits ranges, allocates, compares the size with a cap, or pays against it. A receiver that gets a size with no proof, or with a proof that does not verify, treats the response as a fault of that node.
+
+A size proof depends on the hash alone. It names no node and carries no signature, so any party that holds one can pass it on. An origin makes the proof when it imports the blob and stores it beside the outboard. A node that pulls a blob keeps the proof that it verified from its upstream, and it serves that proof before it holds the tail of the blob. A node states no size that it cannot prove.
+
+The proof carries the last bytes of the blob, unpaid: at most 1 KiB, and the whole blob when the blob is no longer than one BLAKE3 chunk.
 
 #### Payment quantum and credit window
 
