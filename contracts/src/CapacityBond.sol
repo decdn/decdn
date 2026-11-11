@@ -784,9 +784,9 @@ contract CapacityBond is
     // Region self-attestation (ADR 030)
     // -----------------------------------------------------------------
 
-    /// @notice Update the operator's region. The first call has no cooldown
-    ///         (operators may correct their initial `registerNode` region);
-    ///         every subsequent call is gated by `regionStabilityWindow`.
+    /// @notice Update the operator's region. Every call is gated by
+    ///         `regionStabilityWindow`, counted from the registration or the
+    ///         change that set the current region.
     /// @dev    The new region is stored in the operator's `NodeInfo.regionHint`
     ///         so all downstream readers (`getRegisteredNodes`, off-chain DHT)
     ///         see the same source of truth. `regionPrev` retains the prior
