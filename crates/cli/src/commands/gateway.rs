@@ -252,10 +252,17 @@ const MANIFEST_CACHE_BYTES: usize = 64 << 20;
 /// The most hashes the gateway remembers as no bundle manifest.
 const MAX_NOT_MANIFESTS: usize = 1024;
 
-/// The most manifest fills that run at once. Each fill buffers up to
-/// [`MAX_MANIFEST_BYTES`] in memory, and the fill locks are per hash, so this
-/// is what bounds the buffers rather than the fills of distinct hashes.
+/// The most manifest fills that buffer bytes at once. Fill locks are per
+/// hash, so fills of distinct hashes run in parallel; each holds a buffer of
+/// at most [`MAX_MANIFEST_BYTES`], and this bounds how many such buffers
+/// exist. A fill takes its slot once its first bytes arrive, so a pull still
+/// looking for a holder takes none. A fill whose bytes stall keeps its slot
+/// until its pull gives up.
 const MAX_MANIFEST_FILLS: usize = 4;
+
+/// The size at which the manifest fill map first prunes the locks of
+/// finished fills ([`ManifestFills::prune_at`]).
+const FLIGHT_PRUNE_FLOOR: usize = 16;
 
 /// The most bytes of text a not-manifest verdict keeps. A parse error quotes
 /// the publisher's paths and hash strings, which a manifest under the cap can
@@ -369,7 +376,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         pulls,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
-        manifest_fills: std::sync::Mutex::new(HashMap::new()),
+        manifest_fills: std::sync::Mutex::default(),
         manifest_fill_slots: Semaphore::new(MAX_MANIFEST_FILLS),
         hosts: allowed_hosts(args.listen),
         sites,
@@ -929,16 +936,11 @@ struct Gateway {
     /// Hashes a pull found to be no manifest, so a repeat request pays for
     /// no second pull.
     not_manifests: std::sync::Mutex<NotManifests>,
-    /// One async lock per manifest hash with a fill in flight: held while
-    /// that missing manifest is pulled, so concurrent requests for it pull
-    /// and pay once, and a stalled pull of one hash delays no other. Each
-    /// entry is `Weak`; waiters hold `Arc` clones, so an entry lives while a
-    /// fill holds or waits on its lock and is pruned on a later lookup. Cache
-    /// hits never wait on a fill.
-    manifest_fills: std::sync::Mutex<HashMap<[u8; 32], Weak<Mutex<()>>>>,
-    /// Bounds the manifest fills running at once to [`MAX_MANIFEST_FILLS`],
-    /// and so the fill buffers held in memory. Taken after the hash's fill
-    /// lock, so only fills of distinct hashes compete for its permits.
+    /// The fill locks of the manifests being pulled, one per hash.
+    manifest_fills: std::sync::Mutex<ManifestFills>,
+    /// Bounds the manifest fills buffering at once to [`MAX_MANIFEST_FILLS`].
+    /// A fill takes a slot once its first bytes arrive, under its hash's fill
+    /// lock, so only fills of distinct hashes compete for the slots.
     manifest_fill_slots: Semaphore,
     hosts: Vec<String>,
     /// Where site origins live, and what a `Host` names.
@@ -1144,6 +1146,26 @@ fn clip(mut text: String) -> String {
         text.push_str(MARK);
     }
     text
+}
+
+/// The fill lock of a manifest hash. It holds the upstream failure of a
+/// pool-paid fill, so the requests that waited on that fill answer with it
+/// instead of each pulling again.
+type FillLock = Mutex<Option<String>>;
+
+/// One async lock per manifest hash with a fill in flight: held while that
+/// missing manifest is pulled, so concurrent requests for it pull and pay
+/// once, and a stalled pull of one hash delays no other. Cache hits never
+/// wait on a fill.
+#[derive(Default)]
+struct ManifestFills {
+    /// Each lock by its hash, held as `Weak`. Requests hold `Arc` clones, so
+    /// an entry lives while a request holds or waits on its lock.
+    flights: HashMap<[u8; 32], Weak<FillLock>>,
+    /// The map size at which the next new entry first prunes the dead ones,
+    /// then moves to twice what is left (at least [`FLIGHT_PRUNE_FLOOR`]), so
+    /// pruning costs amortized O(1) per new entry.
+    prune_at: usize,
 }
 
 /// Hashes found to be no bundle manifest, with their verdicts, least recently
@@ -2327,7 +2349,9 @@ impl Gateway {
     /// and so pays for, at most the manifest cap. A blob that is no manifest
     /// is remembered as such (up to [`MAX_NOT_MANIFESTS`] hashes), so a repeat
     /// request answers without a pull. A pull that ends for any other reason
-    /// is not, and a later request pulls again.
+    /// is not, and a later request pulls again. Only the pool-paid requests
+    /// that waited on a pool-paid fill which failed upstream share its
+    /// failure: one payer pays them all, so their pulls would end the same.
     async fn manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2346,17 +2370,16 @@ impl Gateway {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
         let flight = self.manifest_flight(hash);
-        let _fill = flight.lock().await;
+        let mut fill = flight.lock().await;
         // A request that waited on the fill lock finds what the one before it
         // pulled.
         if let Some(known) = self.cached_manifest(&hash) {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
-        let _slot = self
-            .manifest_fill_slots
-            .acquire()
-            .await
-            .map_err(|e| PullError::Other(e.into()))?;
+        let pool = matches!(paying, Payment::Pool { .. });
+        if pool && let Some(failed) = fill.as_deref() {
+            return Err(PullError::Other(anyhow::anyhow!("{failed}")));
+        }
         match self.pull_manifest(hash, namespace, paying, cap_mb).await {
             Ok((manifest, size)) => {
                 self.manifests
@@ -2373,24 +2396,36 @@ impl Gateway {
                     .insert(hash, verdict);
                 Err(error)
             }
-            Err(ManifestStop::Pull(e)) => Err(e),
+            Err(ManifestStop::Pull(e)) => {
+                if pool && let PullError::Other(cause) = &e {
+                    *fill = Some(format!("{cause:#}"));
+                }
+                Err(e)
+            }
         }
     }
 
     /// The async lock that serializes fills of the manifest `hash`
     /// ([`Gateway::manifest_fills`]). The caller locks it, re-checks the
     /// cache, and only then pulls.
-    fn manifest_flight(&self, hash: [u8; 32]) -> Arc<Mutex<()>> {
+    fn manifest_flight(&self, hash: [u8; 32]) -> Arc<FillLock> {
         let mut fills = self
             .manifest_fills
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(live) = fills.get(&hash).and_then(Weak::upgrade) {
+        if let Some(live) = fills.flights.get(&hash).and_then(Weak::upgrade) {
             return live;
         }
-        fills.retain(|_, w| w.strong_count() > 0);
-        let flight = Arc::new(Mutex::new(()));
-        fills.insert(hash, Arc::downgrade(&flight));
+        if fills.flights.len() >= fills.prune_at {
+            fills.flights.retain(|_, w| w.strong_count() > 0);
+            fills.prune_at = fills
+                .flights
+                .len()
+                .saturating_mul(2)
+                .max(FLIGHT_PRUNE_FLOOR);
+        }
+        let flight = Arc::new(Mutex::new(None));
+        fills.flights.insert(hash, Arc::downgrade(&flight));
         flight
     }
 
@@ -2407,6 +2442,11 @@ impl Gateway {
             .start_pull(hash, namespace, paying, cap_mb, None, None)
             .await
             .map_err(|e| over_manifest_cap(e.into()))?;
+        // Bytes have arrived, so the fill buffers from here: it takes a slot.
+        // Nothing closes the semaphore, so the acquire cannot fail.
+        let _slot = self.manifest_fill_slots.acquire().await.map_err(|_| {
+            PullError::Other(anyhow::anyhow!("the gateway's manifest fill slots closed"))
+        })?;
         // Every byte pulled is charged as it lands, whether or not it parses:
         // a blob that is no manifest was paid for all the same. The read stops
         // where the allowance does, instead of draining to the manifest cap.
@@ -2428,14 +2468,24 @@ impl Gateway {
                 if !self.charge(bucket, n) {
                     return Err(PullError::Allowance.into());
                 }
-                bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
                 // A backstop: the manifest cap ends the pull before this.
-                if bytes.len() > MAX_MANIFEST_BYTES {
+                let len = bytes.len().saturating_add(n);
+                if len > MAX_MANIFEST_BYTES {
                     return Err(ManifestStop::Not(NotManifest::Plain(format!(
                         "the blob is larger than {MAX_MANIFEST_BYTES} bytes, the most this \
                          gateway reads as a bundle manifest"
                     ))));
                 }
+                // Grown by hand so the buffer's capacity stays within the cap.
+                if len > bytes.capacity() {
+                    let grown = bytes
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(len)
+                        .min(MAX_MANIFEST_BYTES);
+                    bytes.reserve_exact(grown.saturating_sub(bytes.len()));
+                }
+                bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
             }
             finished(done).await.map_err(ManifestStop::from)
         }
