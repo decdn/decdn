@@ -34,6 +34,13 @@ fn num_blocks_zero_for_empty_blob() {
 }
 
 #[test]
+fn num_blocks_saturates_instead_of_wrapping() {
+    // 2^58 bytes is 2^32 blocks of 64 MiB: one past `u32::MAX`.
+    assert_eq!(num_blocks(1 << 58), u32::MAX);
+    assert_eq!(num_blocks(u64::MAX), u32::MAX);
+}
+
+#[test]
 fn covered_blocks_walks_set_bits_in_order() {
     let cov = Coverage::from_block_indices(20, [3, 5, 17].into_iter());
     assert_eq!(cov.covered_blocks().collect::<Vec<_>>(), vec![3, 5, 17]);

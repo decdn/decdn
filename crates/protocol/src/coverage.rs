@@ -78,12 +78,22 @@ pub const fn discovery_block_bytes() -> u64 {
 /// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans.
 ///
 /// The empty blob spans zero blocks (`num_blocks(0) == 0`), not one — an
-/// empty [`Coverage`] over it is trivially complete.
+/// empty [`Coverage`] over it is trivially complete. The count saturates at
+/// `u32::MAX`: a size past `u32::MAX` blocks (256 PiB at 64 MiB blocks)
+/// names the most blocks a `u32` holds, never a count that wraps.
 #[cfg(not(feature = "test-support"))]
 #[must_use]
-#[allow(clippy::cast_possible_truncation)] // a blob would need to be ~256 EiB to truncate here
 pub const fn num_blocks(total_bytes: u64) -> u32 {
-    total_bytes.div_ceil(DISCOVERY_BLOCK_BYTES) as u32
+    let blocks = total_bytes.div_ceil(DISCOVERY_BLOCK_BYTES);
+    if blocks > u32::MAX as u64 {
+        return u32::MAX;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the check above keeps `blocks` within u32"
+    )]
+    let blocks = blocks as u32;
+    blocks
 }
 
 /// The active discovery-block size in bytes — the `test-support` twin whose
@@ -97,12 +107,12 @@ pub fn discovery_block_bytes() -> u64 {
 
 /// Number of [`discovery_block_bytes`] blocks a blob of `total_bytes` spans —
 /// the `test-support` twin, which reads the overridable block size rather than
-/// the constant. Same arithmetic as the production `const fn`.
+/// the constant. Same arithmetic as the production `const fn`, saturating at
+/// `u32::MAX` the same way.
 #[cfg(feature = "test-support")]
 #[must_use]
-#[allow(clippy::cast_possible_truncation)] // a blob would need to be ~256 EiB to truncate here
 pub fn num_blocks(total_bytes: u64) -> u32 {
-    total_bytes.div_ceil(discovery_block_bytes()) as u32
+    u32::try_from(total_bytes.div_ceil(discovery_block_bytes())).unwrap_or(u32::MAX)
 }
 
 /// The overridable discovery-block size, compiled only under `test-support`.
