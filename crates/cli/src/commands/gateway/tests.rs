@@ -379,10 +379,20 @@ async fn test_gateway_with(
     backend: impl worker::Backend,
     common: cli::ClientFetchArgs,
 ) -> Arc<Gateway> {
+    test_gateway_slots(backend, common, 1).await
+}
+
+/// [`test_gateway_with`] whose worker runs `slots` pulls at once, for tests
+/// where a held pull must not take the only slot.
+async fn test_gateway_slots(
+    backend: impl worker::Backend,
+    common: cli::ClientFetchArgs,
+    slots: usize,
+) -> Arc<Gateway> {
     let sites = SiteDomain::Loopback {
         listen: "127.0.0.1:8484".parse().unwrap(),
     };
-    test_gateway_in(backend, common, sites, None).await
+    test_gateway_in(backend, common, sites, None, slots).await
 }
 
 /// The registry address a test's public gateway verifies pointers against.
@@ -407,6 +417,7 @@ async fn test_gateway_in(
     common: cli::ClientFetchArgs,
     sites: SiteDomain,
     public: Option<Public>,
+    slots: usize,
 ) -> Arc<Gateway> {
     let token = matches!(sites, SiteDomain::Loopback { .. }).then(|| TEST_TOKEN.to_owned());
     assert_eq!(matches!(sites, SiteDomain::Public { .. }), public.is_some());
@@ -424,10 +435,11 @@ async fn test_gateway_in(
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: Mutex::new(HashMap::new()),
-        pulls: PullWorker::start(backend, 1).await.unwrap(),
+        pulls: PullWorker::start(backend, slots).await.unwrap(),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
-        manifest_fill: Mutex::new(()),
+        manifest_fills: std::sync::Mutex::new(HashMap::new()),
+        manifest_fill_slots: Semaphore::new(MAX_MANIFEST_FILLS),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
         sites,
         metrics: Metrics::default(),
@@ -672,7 +684,16 @@ async fn recording_gateway_of(
     replies: HashMap<[u8; 32], Reply>,
     args: &[&str],
 ) -> (Arc<Gateway>, Arc<std::sync::Mutex<Vec<u64>>>) {
-    let (gateway, caps, _) = recording_gateway_proving(replies, HashMap::new(), args).await;
+    recording_gateway_slots(replies, args, 1).await
+}
+
+/// [`recording_gateway_of`] whose worker runs `slots` pulls at once.
+async fn recording_gateway_slots(
+    replies: HashMap<[u8; 32], Reply>,
+    args: &[&str],
+    slots: usize,
+) -> (Arc<Gateway>, Arc<std::sync::Mutex<Vec<u64>>>) {
+    let (gateway, caps, _) = recording_gateway_proving(replies, HashMap::new(), args, slots).await;
     (gateway, caps)
 }
 
@@ -682,6 +703,7 @@ async fn recording_gateway_proving(
     replies: HashMap<[u8; 32], Reply>,
     proves: HashMap<[u8; 32], u64>,
     args: &[&str],
+    slots: usize,
 ) -> (Arc<Gateway>, Log<u64>, Log<[u8; 32]>) {
     let (caps, proofs) = (Arc::default(), Log::default());
     let backend = Recording {
@@ -693,7 +715,7 @@ async fn recording_gateway_proving(
         sizes: std::sync::Mutex::default(),
         proves,
     };
-    let gateway = test_gateway_with(backend, flags(args)).await;
+    let gateway = test_gateway_slots(backend, flags(args), slots).await;
     insert(
         &mut *gateway.delegates.lock().await,
         delegate(None, Some(registered("*", None, Instant::now()))),
@@ -1766,7 +1788,7 @@ async fn public_gateway_proving(
         origin: "https://decdn.test".parse().unwrap(),
     };
     let public = public_with(allowance, logs.pointers_dir.path());
-    let gateway = test_gateway_in(backend, flags(&[]), sites, Some(public)).await;
+    let gateway = test_gateway_in(backend, flags(&[]), sites, Some(public), 1).await;
     let host = gateway.sites.site_host(&Site {
         hash: BLOB,
         namespace: None,
@@ -3919,7 +3941,7 @@ async fn a_sized_raw_blob_whose_pull_cannot_be_paid_answers_503() {
 async fn a_loopback_raw_blob_answers_with_its_proven_length() {
     let replies = HashMap::from([(BLOB, Reply::Bytes(b"raw".to_vec()))]);
     let (gateway, caps, proofs) =
-        recording_gateway_proving(replies, HashMap::from([(BLOB, 3)]), &[]).await;
+        recording_gateway_proving(replies, HashMap::from([(BLOB, 3)]), &[], 1).await;
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("/{}", alloy::hex::encode(BLOB)))
@@ -3946,10 +3968,78 @@ async fn a_loopback_raw_blob_answers_with_its_proven_length() {
 #[tokio::test]
 async fn a_capability_that_runs_out_at_a_proof_is_retired() {
     let replies = HashMap::from([(BLOB, Reply::Funding)]);
-    let (gateway, caps, proofs) = recording_gateway_proving(replies, HashMap::new(), &[]).await;
+    let (gateway, caps, proofs) = recording_gateway_proving(replies, HashMap::new(), &[], 1).await;
     let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(BLOB))).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
     assert!(body.contains("no capability covers"), "{body}");
     assert_eq!(*proofs.lock().unwrap(), [BLOB]);
     assert!(caps.lock().unwrap().is_empty(), "nothing was pulled");
+}
+
+/// `GET /{hash}/` as its own task, so the test can run other requests while
+/// this one's pull holds.
+fn spawn_get(gateway: &Arc<Gateway>, hash: [u8; 32]) -> tokio::task::JoinHandle<()> {
+    let gateway = Arc::clone(gateway);
+    tokio::spawn(async move {
+        let _ = get(&gateway, &format!("/{}/", alloy::hex::encode(hash))).await;
+    })
+}
+
+/// Wait until the pulls in `caps` reach `count`.
+async fn pulls_reach(caps: &Log<u64>, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while caps.lock().unwrap().len() < count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the pull starts");
+}
+
+/// A stalled manifest pull of one hash delays no other hash: the fill lock is
+/// per hash.
+#[tokio::test]
+async fn a_stalled_manifest_pull_does_not_block_another_hash() {
+    let replies = HashMap::from([
+        (HELD, Reply::Hold),
+        (BLOB, Reply::Bytes(noindex_manifest())),
+    ]);
+    let (gateway, caps) = recording_gateway_slots(replies, &[], 2).await;
+    let stalled = spawn_get(&gateway, HELD);
+    // The held pull is in flight, with its hash's fill lock held.
+    pulls_reach(&caps, 1).await;
+    let blob = alloy::hex::encode(BLOB);
+    let (status, body) = tokio::time::timeout(Duration::from_secs(10), async {
+        get(&gateway, &format!("/{blob}/")).await
+    })
+    .await
+    .expect("a request for another hash does not wait on the stalled fill");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    stalled.abort();
+    let _ = stalled.await;
+}
+
+/// Concurrent requests for one missing manifest still pull once: the second
+/// waits on the hash's fill lock. A dropped puller frees the lock, and the
+/// waiter pulls itself.
+#[tokio::test]
+async fn concurrent_requests_for_one_manifest_pull_once() {
+    let replies = HashMap::from([(HELD, Reply::Hold)]);
+    let (gateway, caps) = recording_gateway_slots(replies, &[], 2).await;
+    let first = spawn_get(&gateway, HELD);
+    pulls_reach(&caps, 1).await;
+    let second = spawn_get(&gateway, HELD);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        caps.lock().unwrap().len(),
+        1,
+        "the second request waits on the fill lock instead of pulling"
+    );
+    first.abort();
+    let _ = first.await;
+    // The dropped request's lock frees: the waiter re-checks the cache,
+    // misses, and runs its own pull.
+    pulls_reach(&caps, 2).await;
+    second.abort();
+    let _ = second.await;
 }

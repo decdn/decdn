@@ -144,8 +144,8 @@ use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
@@ -170,7 +170,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Semaphore, oneshot};
 
 use super::fetch::{
     BlobFetch, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb, resolve_chain,
@@ -251,6 +251,11 @@ const MANIFEST_CACHE_BYTES: usize = 64 << 20;
 
 /// The most hashes the gateway remembers as no bundle manifest.
 const MAX_NOT_MANIFESTS: usize = 1024;
+
+/// The most manifest fills that run at once. Each fill buffers up to
+/// [`MAX_MANIFEST_BYTES`] in memory, and the fill locks are per hash, so this
+/// is what bounds the buffers rather than the fills of distinct hashes.
+const MAX_MANIFEST_FILLS: usize = 4;
 
 /// The most bytes of text a not-manifest verdict keeps. A parse error quotes
 /// the publisher's paths and hash strings, which a manifest under the cap can
@@ -364,7 +369,8 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         pulls,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
-        manifest_fill: Mutex::new(()),
+        manifest_fills: std::sync::Mutex::new(HashMap::new()),
+        manifest_fill_slots: Semaphore::new(MAX_MANIFEST_FILLS),
         hosts: allowed_hosts(args.listen),
         sites,
         metrics: Metrics::default(),
@@ -923,9 +929,17 @@ struct Gateway {
     /// Hashes a pull found to be no manifest, so a repeat request pays for
     /// no second pull.
     not_manifests: std::sync::Mutex<NotManifests>,
-    /// Held while a missing manifest is pulled, so concurrent requests for it
-    /// pull and pay once. Cache hits never wait on it.
-    manifest_fill: Mutex<()>,
+    /// One async lock per manifest hash with a fill in flight: held while
+    /// that missing manifest is pulled, so concurrent requests for it pull
+    /// and pay once, and a stalled pull of one hash delays no other. Each
+    /// entry is `Weak`; waiters hold `Arc` clones, so an entry lives while a
+    /// fill holds or waits on its lock and is pruned on a later lookup. Cache
+    /// hits never wait on a fill.
+    manifest_fills: std::sync::Mutex<HashMap<[u8; 32], Weak<Mutex<()>>>>,
+    /// Bounds the manifest fills running at once to [`MAX_MANIFEST_FILLS`],
+    /// and so the fill buffers held in memory. Taken after the hash's fill
+    /// lock, so only fills of distinct hashes compete for its permits.
+    manifest_fill_slots: Semaphore,
     hosts: Vec<String>,
     /// Where site origins live, and what a `Host` names.
     sites: SiteDomain,
@@ -2331,12 +2345,18 @@ impl Gateway {
         if let Some(known) = self.cached_manifest(&hash) {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
-        let _fill = self.manifest_fill.lock().await;
+        let flight = self.manifest_flight(hash);
+        let _fill = flight.lock().await;
         // A request that waited on the fill lock finds what the one before it
         // pulled.
         if let Some(known) = self.cached_manifest(&hash) {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
+        let _slot = self
+            .manifest_fill_slots
+            .acquire()
+            .await
+            .map_err(|e| PullError::Other(e.into()))?;
         match self.pull_manifest(hash, namespace, paying, cap_mb).await {
             Ok((manifest, size)) => {
                 self.manifests
@@ -2355,6 +2375,23 @@ impl Gateway {
             }
             Err(ManifestStop::Pull(e)) => Err(e),
         }
+    }
+
+    /// The async lock that serializes fills of the manifest `hash`
+    /// ([`Gateway::manifest_fills`]). The caller locks it, re-checks the
+    /// cache, and only then pulls.
+    fn manifest_flight(&self, hash: [u8; 32]) -> Arc<Mutex<()>> {
+        let mut fills = self
+            .manifest_fills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(live) = fills.get(&hash).and_then(Weak::upgrade) {
+            return live;
+        }
+        fills.retain(|_, w| w.strong_count() > 0);
+        let flight = Arc::new(Mutex::new(()));
+        fills.insert(hash, Arc::downgrade(&flight));
+        flight
     }
 
     /// Pull `hash` under the manifest cap of `cap_mb` and parse it. Returns
