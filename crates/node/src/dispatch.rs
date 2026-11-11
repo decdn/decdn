@@ -30,8 +30,8 @@ use decdn_common::config::ResolvedSecurity;
 
 /// Reason a connection was rejected.
 ///
-/// Each variant increments its own unlabeled counter
-/// (`decdn_dispatch_rejected_global_total`), per the sibling-counter convention
+/// The rejection increments the unlabeled counter
+/// `decdn_dispatch_rejected_global_total`, per the sibling-counter convention
 /// settled in #1475.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {

@@ -276,11 +276,10 @@ impl ClientHandler {
         first_byte: FirstByteClock,
         paid: &mut u64,
     ) -> anyhow::Result<ServeEnd> {
-        // Owned here so the pool floor reservation reconciles at every exit —
-        // success, `?`, disconnect, panic. The serve loop
-        // below releases it once the stream repays a floor; on any other exit the
-        // guard's `Drop` frees the pool's live floor headroom.
-        let floor_reservation = floor_reservation;
+        // This call owns `floor_reservation`, so the pool floor reservation
+        // reconciles at every exit — success, `?`, disconnect, panic. The serve
+        // loop below releases it once the stream repays a floor; on any other
+        // exit the guard's `Drop` frees the pool's live floor headroom.
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
         // side, AC#4). `export_bao_range_stream` reads the persisted outboard and

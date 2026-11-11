@@ -307,7 +307,7 @@ impl ClientHandler {
 }
 
 /// One capability signer's slice of a pool's floor accounting (ADR 003 §Pool
-/// solvency, per-signer floor isolation). Two independent concerns live here.
+/// solvency, per-signer floor isolation).
 ///
 /// `live_reservation` is the `µUSDC` this signer's in-flight streams currently
 /// reserve — un-vouchered floor delivered ahead of payment, released as each stream
