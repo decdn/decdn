@@ -356,7 +356,8 @@ pub enum OriginSize {
     /// `size_hint`), and a 2xx without a parsable `Content-Length` states no
     /// size at all. Present for the serve gate and the presence memo; sizeless
     /// for range-pull scoping (which degrades to the whole-blob path) and for
-    /// probe coverage (which leaves the hash unannounced).
+    /// probe coverage (which signs only when something else states the length
+    /// — a previous index entry, or a complete local hold of the blob).
     Unsized,
     /// The origin does not hold the object — an authoritative negative (a
     /// genuine HTTP 404 / S3 `NotFound`, a missing filesystem entry). Callers

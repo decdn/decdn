@@ -537,10 +537,12 @@ impl HolderSnapshot {
 /// from before the toggle was set, and announcing it would advertise blobs the
 /// serve gate now declines. Each stored hash is instead put to
 /// `origin_probe_presence`, the same question the origin-only serve gate asks,
-/// so the snapshot advertises only what this node would serve — and, of that,
-/// only the holds with a stated size, because every announce entry backs a
-/// signed probe-coverage answer: a `PresentUnsized` hold is served but not
-/// announced.
+/// so the snapshot advertises only what this node would serve. Every announce
+/// entry backs a signed probe-coverage answer, which needs a size: a sized
+/// backend answer carries its own, and a `PresentUnsized` hold is announced
+/// when the blob is complete in the local store (the store states the length
+/// the backend cannot — a blob's length is immutable under its BLAKE3 hash),
+/// and skipped only while it is not.
 ///
 /// That check is what recovers a node's *own* store-only content. The
 /// origin-held index covers enumerable origins plus present pins, and a remote
@@ -556,9 +558,10 @@ impl HolderSnapshot {
 /// holds and does not announce, so each one counts toward
 /// `origin_probe_faults` — otherwise an origin-only node drops its own
 /// store-only content on a blip and reports a healthy snapshot. A
-/// `PresentUnsized` skip is the other, deliberate kind: the hold is confirmed
-/// and nothing is degraded, the probe simply has no size to sign coverage
-/// from, so it stays out of the set without counting as a fault.
+/// `PresentUnsized` hold the store does not hold complete is the other,
+/// deliberate skip: the hold is confirmed and nothing is degraded, there is
+/// simply no size anywhere to sign coverage from, so it stays out of the set
+/// without counting as a fault.
 ///
 /// Never fails: a store-walk error degrades to the origin-held half rather than
 /// yielding nothing, because a partial announce strictly beats none. Every way
@@ -589,16 +592,27 @@ pub(crate) async fn holder_snapshot(
                     decdn_cache::OriginPresence::Present(_) => {
                         hashes.insert(hash);
                     }
-                    // A present-but-unsized hold is skipped like an absent
-                    // one — not announced and not a fault: origin-sourced
-                    // probe coverage needs the blob's full block count to
-                    // sign, which only a sized answer gives, so announcing
-                    // the hash would create an "announced but probe-denied"
-                    // entry — a pure reputation cost. The serve gate still
-                    // admits it; it is only undiscoverable through this
-                    // node's announcements.
-                    decdn_cache::OriginPresence::PresentUnsized
-                    | decdn_cache::OriginPresence::Absent => {}
+                    // A present-but-unsized hold is announced when the local
+                    // store can state the length the backend cannot: probe
+                    // coverage needs the blob's full block count to sign, a
+                    // blob's length is immutable under its BLAKE3 hash, and
+                    // every hash in this walk is store-held — so a complete
+                    // hold (`serve_audit`, whose refusal gate matches the
+                    // serve path's) sizes the probe answer, and the probe
+                    // handler confirms the announce from the same audit. A
+                    // partial or unreadable hold has no length to sign from,
+                    // so it is skipped — not announced and not a fault: the
+                    // serve gate still admits it, it is only undiscoverable
+                    // through this node's announcements.
+                    decdn_cache::OriginPresence::PresentUnsized => {
+                        if matches!(
+                            cache.serve_audit(hash).await,
+                            Ok(decdn_cache::ServeAudit::Serveable { .. })
+                        ) {
+                            hashes.insert(hash);
+                        }
+                    }
+                    decdn_cache::OriginPresence::Absent => {}
                     decdn_cache::OriginPresence::Fault => {
                         ownership_probe_faults = ownership_probe_faults.saturating_add(1);
                     }

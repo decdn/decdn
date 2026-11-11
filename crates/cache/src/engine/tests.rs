@@ -797,6 +797,115 @@ async fn rescan_carries_a_previous_size_over_an_unsized_answer() -> anyhow::Resu
     Ok(())
 }
 
+/// A `PresentUnsized` established during a DEGRADED walk — a sibling origin
+/// faulted along the way — is memoised under the FAULT TTL, not the positive
+/// one: the faulted sibling may hold the same object WITH a size, so the
+/// chain must be re-probed as soon as a plain fault would be. A clean unsized
+/// hold keeps the positive TTL.
+#[tokio::test]
+async fn degraded_unsized_hold_expires_on_the_fault_ttl() -> anyhow::Result<()> {
+    // Zero fault TTL: a degraded answer expires immediately, so a second
+    // probe must re-walk the chain. The positive TTL stays long, so a clean
+    // answer under the same policy is served from the memo instead.
+    let policy = OriginProbePolicy {
+        positive_ttl: Duration::from_secs(600),
+        negative_ttl: Duration::ZERO,
+        fault_ttl: Duration::ZERO,
+        timeout: Duration::from_secs(2),
+        capacity: 16,
+    };
+    let hash = Hash::new(b"unsized next to a flaky sized sibling");
+
+    let tmp = tempfile::tempdir()?;
+    let (faulting, _fault_calls) = FailingSizeOrigin::new();
+    let (unsized_origin, unsized_calls) = UnsizedOrigin::new(hash);
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![
+            Arc::new(faulting) as Arc<dyn Origin>,
+            Arc::new(unsized_origin) as Arc<dyn Origin>,
+        ],
+        10,
+    )
+    .await?;
+    engine.set_origin_probe_config(policy);
+    assert_eq!(
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::PresentUnsized,
+    );
+    assert_eq!(
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::PresentUnsized,
+    );
+    assert_eq!(
+        unsized_calls.load(Ordering::SeqCst),
+        2,
+        "the degraded answer expired on the (zero) fault TTL, so the second \
+         probe re-walked the chain instead of serving the memo",
+    );
+
+    let tmp2 = tempfile::tempdir()?;
+    let (clean_origin, clean_calls) = UnsizedOrigin::new(hash);
+    let clean_engine = CacheEngine::open(
+        tmp2.path(),
+        vec![Arc::new(clean_origin) as Arc<dyn Origin>],
+        10,
+    )
+    .await?;
+    clean_engine.set_origin_probe_config(policy);
+    assert_eq!(
+        clean_engine.origin_probe_presence(hash).await,
+        OriginPresence::PresentUnsized,
+    );
+    assert_eq!(
+        clean_engine.origin_probe_presence(hash).await,
+        OriginPresence::PresentUnsized,
+    );
+    assert_eq!(
+        clean_calls.load(Ordering::SeqCst),
+        1,
+        "a clean unsized hold stays under the positive TTL",
+    );
+    Ok(())
+}
+
+/// With no previous index entry, the rescan sizes a present-but-unsized hold
+/// from the local store when a pull has landed the blob complete there: a
+/// blob's length is immutable under its BLAKE3 hash, so the stored length
+/// signs the same coverage the origin's own statement would. This closes the
+/// restart gap — an empty previous index no longer drops a warm unsized hold
+/// from the announce set.
+#[tokio::test]
+async fn rescan_sizes_an_unsized_hold_from_the_complete_store_blob() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let payload = b"compressed at the origin, complete in the store";
+    let hash = Hash::new(payload);
+    // The enumerable origin confirms the hold but never states a size; the
+    // second origin only serves the pull that lands the blob in the store
+    // (its `size` keeps the trait default, `Absent`).
+    let (unsized_origin, answers_unsized) = SwitchableSizeOrigin::new(hash, 0);
+    answers_unsized.store(true, Ordering::SeqCst);
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![
+            Arc::new(unsized_origin) as Arc<dyn Origin>,
+            Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>,
+        ],
+        10,
+    )
+    .await?;
+    engine.get(hash).await?;
+
+    engine.rescan_origins().await;
+    assert_eq!(
+        engine.origin_held_size(hash),
+        Some(u64::try_from(payload.len())?),
+        "the complete stored blob states the length the origin cannot, so \
+         the hash is indexed with the store's size",
+    );
+    Ok(())
+}
+
 /// `origin_size` answers `Ok(None)` for an origin that holds the object
 /// without a stated length: an unsized hold cannot scope a range pull, so
 /// the caller takes the silent whole-blob fallback.

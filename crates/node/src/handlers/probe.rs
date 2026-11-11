@@ -7,7 +7,7 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::B256;
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{CacheEngine, Hash, ProbeHoldOutcome};
+use decdn_cache::{CacheEngine, Hash, OriginPresence, ProbeHoldOutcome, ServeAudit};
 use decdn_incentive::ProbeSlashData;
 use decdn_protocol::{
     ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, EMPTY_ROOT, FrameError, ProbeMessage,
@@ -603,12 +603,44 @@ impl ProbeHandler {
             // serve decline reads as "advertised but didn't serve" (the reputation
             // hazard this policy closes). This short-circuits the entire
             // store-present / probe-hold / origin-held-index derivation above —
-            // presence is decided purely by the backend probe (index-or-live-HEAD,
-            // memoised) — and, like every other path here, still answers `false`
-            // for a `refuses`-listed hash (`origin_probe_size` checks it first).
-            match self.cache.origin_probe_size(hash).await {
+            // presence is decided by the node's own backends: the rescan-built
+            // index first (zero I/O, and it may carry a size for a hold the
+            // live probe can no longer state one for), then the live, memoised
+            // backend probe (`HEAD`/`HeadObject`). Like every other path here,
+            // a `refuses`-listed hash answers `false` (`origin_held_size` and
+            // `origin_probe_presence` both check it first).
+            //
+            // A `PresentUnsized` backend hold is still own content the serve
+            // gate admits; only the backend's length statement is missing. A
+            // blob's length is immutable under its BLAKE3 hash, so once a pull
+            // has landed it complete, the local store states the length
+            // instead (`serve_audit` — one `BlobStatus` call whose refusal
+            // gate matches the serve path's). With no complete local hold
+            // there is no size to sign coverage from, so the hash stays
+            // unadvertised until a direct fetch warms it — which the serve
+            // gate admits.
+            match self.cache.origin_held_size(hash) {
                 Some(size) => (true, Some(size)),
-                None => (false, None),
+                None => match self.cache.origin_probe_presence(hash).await {
+                    OriginPresence::Present(size) => (true, Some(size)),
+                    OriginPresence::PresentUnsized => match self.cache.serve_audit(hash).await {
+                        Ok(ServeAudit::Serveable { size }) => (true, Some(size)),
+                        Ok(ServeAudit::Unavailable { .. }) => (false, None),
+                        // Same posture as the store-fault arms above: a store
+                        // it cannot read is one it cannot size, but a
+                        // degrading backend must stay operator-visible.
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e.display_chain(),
+                                %hash,
+                                "cache error sizing an unsized backend hold; \
+                                 answering has_blob:false"
+                            );
+                            (false, None)
+                        }
+                    },
+                    OriginPresence::Absent | OriginPresence::Fault => (false, None),
+                },
             }
         };
 

@@ -570,8 +570,7 @@ impl ClientHandler {
         // node's cache (e.g. seeded by an earlier relay) is still declined, so
         // the policy is categorical rather than "foreign misses only".
         //
-        // Four-way outcome (#1766 split presence from fault; #2827 split
-        // sized from unsized): `Present` and `PresentUnsized` are own content
+        // Four-way outcome (#1766, #2827): `Present` and `PresentUnsized` are own content
         // and fall through to the normal serve path — a backend that holds
         // the object but cannot state its canonical length (a
         // `Content-Encoding` origin, a 2xx without a `Content-Length`) still

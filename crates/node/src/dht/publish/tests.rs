@@ -600,13 +600,14 @@ async fn holder_snapshot_unions_store_and_origin_held() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A present-but-unsized hold (#2827) stays out of the announce set — there
-/// is no size to sign coverage from — but it is NOT a fault: nothing is
-/// degraded, so `ownership_probe_faults` stays 0 and the snapshot reads
-/// healthy. (The serve gate still admits the hash; it is only undiscoverable
-/// through this node's announcements.)
+/// A present-but-unsized hold (#2827/#2869) whose blob is complete in the
+/// local store IS announced: probe coverage needs a size, the backend cannot
+/// state one, but a blob's length is immutable under its BLAKE3 hash — so the
+/// complete stored blob states it instead, and the probe handler confirms the
+/// announce from the same store audit. Nothing is degraded, so
+/// `ownership_probe_faults` stays 0 and the snapshot reads healthy.
 #[tokio::test]
-async fn holder_snapshot_skips_an_unsized_hold_without_counting_a_fault() -> anyhow::Result<()> {
+async fn holder_snapshot_announces_a_store_complete_unsized_hold() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let unsized_hold = decdn_cache::Hash::new(b"holder-unsized");
     let cache = decdn_cache::CacheEngine::open(
@@ -621,13 +622,13 @@ async fn holder_snapshot_skips_an_unsized_hold_without_counting_a_fault() -> any
     let snap = holder_snapshot(&cache, false).await;
 
     assert!(
-        !snap.hashes.contains(&unsized_hold),
-        "an unsized hold has no size to sign coverage from, so it must not \
-         be announced"
+        snap.hashes.contains(&unsized_hold),
+        "a complete local hold states the length the backend cannot, so the \
+         hash signs coverage and must be announced"
     );
     assert_eq!(
         snap.ownership_probe_faults, 0,
-        "a confirmed unsized hold is a deliberate skip, not a degraded probe"
+        "a confirmed unsized hold is not a degraded probe"
     );
     Ok(())
 }

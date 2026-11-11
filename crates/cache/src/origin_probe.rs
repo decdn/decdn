@@ -85,8 +85,10 @@ struct Entry {
 /// absence stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginProbePolicy {
-    /// TTL for a memoised `Present` or `PresentUnsized` answer
-    /// (`cache.origin_probe_ttl_sec`).
+    /// TTL for a memoised `Present` answer, and for a `PresentUnsized` one
+    /// established by a clean walk (`cache.origin_probe_ttl_sec`). A degraded
+    /// walk's `PresentUnsized` goes in under `fault_ttl` instead
+    /// ([`OriginProbeMemo::insert_degraded`]).
     pub positive_ttl: Duration,
     /// TTL for a memoised `Absent` answer
     /// (`cache.origin_probe_negative_ttl_sec`).
@@ -161,12 +163,33 @@ impl OriginProbeMemo {
     /// can never exceed `capacity` distinct hashes regardless of probe volume.
     pub fn insert(&mut self, hash: Hash, presence: OriginPresence, now: Instant) {
         let ttl = match presence {
-            // An unsized hold is as stable as a sized one — only the length
-            // is missing — so it shares the positive TTL.
+            // A cleanly-established unsized hold is as stable as a sized one —
+            // only the length is missing — so it shares the positive TTL. One
+            // established during a degraded walk goes through
+            // [`Self::insert_degraded`] instead.
             OriginPresence::Present(_) | OriginPresence::PresentUnsized => self.positive_ttl,
             OriginPresence::Absent => self.negative_ttl,
             OriginPresence::Fault => self.fault_ttl,
         };
+        self.insert_for(hash, presence, ttl, now);
+    }
+
+    /// Record `presence` for `hash` under the **fault TTL** regardless of
+    /// variant: for an answer established during a degraded chain walk — a
+    /// sibling origin faulted, or the walk overran its ceiling. The sibling
+    /// that faulted may hold the same object *with* a size, so the chain must
+    /// be re-probed as soon as a plain fault would be; keeping the answer for
+    /// the whole positive TTL would shadow the recovered sibling's
+    /// `Present(size)` — and with it probe/announce discoverability — for the
+    /// longest window the memo has.
+    pub fn insert_degraded(&mut self, hash: Hash, presence: OriginPresence, now: Instant) {
+        self.insert_for(hash, presence, self.fault_ttl, now);
+    }
+
+    /// Shared insert body behind [`Self::insert`] / [`Self::insert_degraded`]:
+    /// records `presence` for exactly `ttl` from `now` under the capacity
+    /// bound.
+    fn insert_for(&mut self, hash: Hash, presence: OriginPresence, ttl: Duration, now: Instant) {
         let expires_at = now + ttl;
         // Refreshing an existing key never grows the map.
         if let std::collections::hash_map::Entry::Occupied(mut occupied) = self.entries.entry(hash)

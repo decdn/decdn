@@ -187,6 +187,34 @@ fn present_unsized_is_memoised_under_the_positive_ttl() {
 }
 
 #[test]
+fn degraded_insert_expires_on_the_fault_ttl() {
+    // positive 10s, fault 5s: a hold recorded through `insert_degraded`
+    // (established while a sibling origin faulted) must expire with the
+    // fault window, not the positive one, so the faulted sibling — which may
+    // state the size — is re-probed as soon as a plain fault would be.
+    let mut memo = OriginProbeMemo::new(OriginProbePolicy {
+        positive_ttl: Duration::from_secs(10),
+        negative_ttl: Duration::from_secs(2),
+        fault_ttl: Duration::from_secs(5),
+        timeout: Duration::from_secs(2),
+        capacity: 16,
+    });
+    let t0 = Instant::now();
+    memo.insert_degraded(hash(60), OriginPresence::PresentUnsized, t0);
+
+    assert_eq!(
+        memo.get(hash(60), t0 + Duration::from_secs(4)),
+        Some(OriginPresence::PresentUnsized),
+        "live within the fault TTL",
+    );
+    assert_eq!(
+        memo.get(hash(60), t0 + Duration::from_secs(6)),
+        None,
+        "expires on the fault TTL, not the positive one",
+    );
+}
+
+#[test]
 fn fault_answer_is_memoised_under_the_fault_ttl() {
     // fault 5s, negative 2s, positive 100s.
     let mut memo = OriginProbeMemo::new(OriginProbePolicy {

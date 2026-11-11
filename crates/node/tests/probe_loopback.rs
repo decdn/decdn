@@ -2077,6 +2077,132 @@ async fn origin_only_probe_advertises_backend_only() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A backend that confirms the hold but states no canonical size — a
+/// `Content-Encoding` bucket, or an origin that strips `Content-Length`
+/// (#2827/#2869). `fetch` still serves the body, so a pull can land the blob
+/// complete in the local store.
+#[derive(Debug)]
+struct UnsizedStubOrigin {
+    hash: Hash,
+    data: bytes::Bytes,
+}
+
+impl decdn_cache::Origin for UnsizedStubOrigin {
+    fn kind(&self) -> decdn_cache::OriginKind {
+        decdn_cache::OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        hash: Hash,
+        _max_bytes: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let result = if hash == self.hash {
+            Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
+        } else {
+            Ok(decdn_cache::OriginFetch::NotFound)
+        };
+        Box::pin(async move { result })
+    }
+
+    fn size(
+        &self,
+        hash: Hash,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<decdn_cache::OriginSize, decdn_cache::OriginPullError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let answer = if hash == self.hash {
+            decdn_cache::OriginSize::Unsized
+        } else {
+            decdn_cache::OriginSize::Absent
+        };
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// Origin-only node whose backend confirms a hold without stating its size
+/// (#2827/#2869): once a pull has landed the blob complete in the local
+/// store, the store states the length — the probe advertises `has_blob: true`
+/// with the store's size, matching the serve gate that admits the hash and
+/// the DHT announce that includes it. A cold unsized hash (not in the store)
+/// still answers `false`: there is no length anywhere to sign coverage from.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_probe_advertises_a_store_complete_unsized_hold() -> anyhow::Result<()> {
+    let warm_payload = b"origin-only: warm unsized backend object";
+    let cold_payload = b"origin-only: cold unsized backend object";
+    let warm_hash = Hash::new(warm_payload);
+    let cold_hash = Hash::new(cold_payload);
+    let cache_dir = tempfile::tempdir()?;
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![
+            Arc::new(UnsizedStubOrigin {
+                hash: warm_hash,
+                data: bytes::Bytes::from_static(warm_payload),
+            }) as Arc<dyn decdn_cache::Origin>,
+            Arc::new(UnsizedStubOrigin {
+                hash: cold_hash,
+                data: bytes::Bytes::from_static(cold_payload),
+            }) as Arc<dyn decdn_cache::Origin>,
+        ],
+        16,
+    )
+    .await?;
+    let _ = cache.get(warm_hash).await?; // lands complete in the local store
+
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _signer, _domain) = build_handler_origin_only(
+        fresh_key().public(),
+        7,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+    );
+
+    let warm_req = ProbeRequest {
+        hash: *warm_hash.as_bytes(),
+        timestamp_us: now_us(),
+    };
+    let (warm_resp, warm_ext) = run_one_probe(fresh_key(), Arc::clone(&handler), warm_req).await?;
+    anyhow::ensure!(
+        warm_resp.body.has_blob,
+        "a store-complete unsized backend hold must be advertised"
+    );
+    anyhow::ensure!(
+        warm_ext.total_bytes == Some(warm_payload.len() as u64),
+        "total_bytes must carry the store's length for the unsized hold, got {:?}",
+        warm_ext.total_bytes
+    );
+
+    let cold_req = ProbeRequest {
+        hash: *cold_hash.as_bytes(),
+        timestamp_us: now_us(),
+    };
+    let (cold_resp, cold_ext) = run_one_probe(fresh_key(), handler, cold_req).await?;
+    anyhow::ensure!(
+        !cold_resp.body.has_blob,
+        "a cold unsized hold has no size anywhere to sign coverage from"
+    );
+    anyhow::ensure!(
+        cold_ext.total_bytes.is_none(),
+        "a non-advertised hash must carry no total_bytes hint, got {:?}",
+        cold_ext.total_bytes
+    );
+    Ok(())
+}
+
 /// A node with the eviction-hold path **disabled by config**
 /// (`max_probe_holds == 0`) holds the blob but answers `has_blob: false` with a
 /// valid `slash_sig` over `has_blob=false`. The reason is the operator opt-out,
