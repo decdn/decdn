@@ -521,7 +521,7 @@ pub(crate) fn classify_probe(
         timestamp_us,
     ) {
         // The answer counts as none: discovery drops the candidate from
-        // selection, and a pinned node keeps no size hint. The operator needs
+        // selection, and a pinned node keeps no coverage. The operator needs
         // told why, so log it at `warn`.
         tracing::warn!(
             "ignoring an unverifiable probe response from {}: {e}",

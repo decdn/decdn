@@ -25,12 +25,12 @@
 //! ALPN bump. ADR 013 freezes a signed field set at the protocol version that
 //! introduces it; `cdn/probe/v1` had no prior signed `ProbeResponse`, so the
 //! set `{hash, has_blob, rate_per_mb, timestamp_us}` is the v1 baseline (ADR
-//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` and `coverage` ride in
+//! 005 §`cdn/probe/v1`, ADR 014 §1). `coverage` rides in
 //! [`ProbeResponseExt`] as the ADR 013 Tier-1 unsigned-evolution exemplar (ADR
-//! 005 §`cdn/probe/v1`) and are deliberately NOT covered by `slash_sig`. A
-//! size claim only picks the tree shape a leg verifies under, so a requester
-//! learns the size from the bytes it pulls. The `ProbeMessage` variant order
-//! is unchanged.
+//! 005 §`cdn/probe/v1`) and is deliberately NOT covered by `slash_sig`. A
+//! probe carries no blob size: a size claim only picks the tree shape a leg
+//! verifies under, so a requester learns the size from the bytes it pulls.
+//! The `ProbeMessage` variant order is unchanged.
 //!
 //! This crate deliberately does not depend on any crypto library. The caller
 //! (`decdn_incentive::ProbeSlashData` and the probe handler/CLI) computes and
@@ -283,12 +283,6 @@ pub struct ProbeResponse {
 /// have a meaningful `Default`. Insertions and reordering are Tier-3.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProbeResponseExt {
-    /// Blob size in bytes when the sender knows it. Unsigned and a hint only.
-    /// A size claim only picks the tree shape a leg verifies under, so no
-    /// fetch plans, caps, prices or ends on this field. Its one reader is a
-    /// node's coverage-union probe gather, which counts the blocks a union of
-    /// partial holders must span before it stops probing.
-    pub total_bytes: Option<u64>,
     /// Which discovery blocks (`decdn_protocol::coverage`) this node will
     /// serve. Unsigned: treat it as a hint, never as a commitment. A
     /// requester MUST check it against the signed body (`hash` and
@@ -320,10 +314,9 @@ impl ProbeResponseExt {
     /// The empty blob ([`EMPTY_ROOT`]) spans zero blocks, so its coverage is
     /// empty on a holder and a non-holder alike. For that hash the coverage
     /// must be empty and `has_blob` alone says whether the node serves it
-    /// (#2471). The rule keys on `body.hash`, which the signature covers,
-    /// never on the unsigned `total_bytes` hint.
+    /// (#2471). The rule keys on `body.hash`, which the signature covers.
     ///
-    /// Neither `coverage` nor `total_bytes` is in the signed set, so a mismatch
+    /// `coverage` is not in the signed set, so a mismatch
     /// has no attributable author to slash: a requester finding `false` here
     /// MUST drop the candidate rather than admit it, and must NOT score it to
     /// local reputation — the same treatment an unrecovered `slash_sig` gets.
@@ -391,7 +384,7 @@ pub fn encode_probe_response(
 /// Parse the trailing [`ProbeResponseExt`] bytes returned as the remainder by
 /// [`crate::decode_message`] after a `ProbeMessage::Response`.
 ///
-/// An empty remainder ⇒ [`ProbeResponseExt::default`] (no size hint). Trailing
+/// An empty remainder ⇒ [`ProbeResponseExt::default`] (empty coverage). Trailing
 /// bytes beyond the known fields are tolerated for forward compatibility (ADR
 /// 013 §Tier 1): a future optional field appended to [`ProbeResponseExt`] is
 /// read by new receivers and skipped by old ones.

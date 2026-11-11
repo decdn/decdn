@@ -361,8 +361,8 @@ async fn run() -> anyhow::Result<()> {
         got.len(),
         streamed.len()
     );
-    // The fetch timings name a probe round only when one ran, and a probe's
-    // size hint would skip the size open.
+    // The fetch timings name a probe round only when one ran, and the size
+    // open runs on a fetch with no probe round.
     anyhow::ensure!(
         log.contains("fetch timings") && !log.contains("probe_start_ms"),
         "the streamed fetch probed, so no size open ran:\n{log}"

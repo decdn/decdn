@@ -914,7 +914,7 @@ fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
 
 /// #2471: a holder of the empty root answers `has_blob: true` over an empty
 /// coverage, because the blob spans no block. The consumer takes that answer
-/// as a holder with a size hint of 0 for the empty root, takes a node that
+/// as a holder for the empty root, takes a node that
 /// signs `has_blob: false` over the same coverage as a non-holder, and drops
 /// the `has_blob: true` pairing as malformed for every other hash.
 #[test]
@@ -955,7 +955,6 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
         Ok((
             ProbeResponse { body, slash_sig },
             ProbeResponseExt {
-                total_bytes: Some(0),
                 coverage: Coverage::empty(),
             },
             crate::probe::ProbeRtt {

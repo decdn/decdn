@@ -382,14 +382,8 @@ async fn answer_probe_with_coverage(
     .as_bytes()
     .to_vec();
     let resp = ProbeResponse { body, slash_sig };
-    let payload = encode_probe_response(
-        &resp,
-        Some(&ProbeResponseExt {
-            total_bytes: Some(total_bytes),
-            coverage,
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
+    let payload = encode_probe_response(&resp, Some(&ProbeResponseExt { coverage }))
+        .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
     write_frame(&mut send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write probe response: {e}"))?;
@@ -1014,8 +1008,6 @@ async fn build_origin_seeded_ranking(
                 // Whole-blob coverage — these fixtures serve the whole blob, so a
                 // cache-hit candidate must range-plan as covering everything.
                 coverage: decdn_protocol::Coverage::full(1),
-                // No size hint: the pull leg's first open reads the size.
-                total_bytes_hint: None,
             })
             .collect(),
     );
@@ -16206,7 +16198,6 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
         rate_per_mb: RATE,
         rtt_ms: 1,
         coverage,
-        total_bytes_hint: Some(total_bytes),
     };
 
     // Directories are keyed under `NO_NAMESPACE`, like the leaf's request
@@ -16694,7 +16685,6 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
         rate_per_mb: RATE,
         rtt_ms,
         coverage,
-        total_bytes_hint: Some(total_bytes),
     };
     let probe_cache = PositiveProbeCache::new();
     let mut discovery = FixtureDiscovery {

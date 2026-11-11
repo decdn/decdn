@@ -246,7 +246,6 @@ fn make_candidate(node_id: u8, rate: u64, rtt: u32, rep: f32) -> Candidate {
         region: "US".to_string(),
         stake: 0,
         coverage: Coverage::empty(),
-        total_bytes_hint: None,
     }
 }
 

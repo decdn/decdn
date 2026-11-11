@@ -281,7 +281,6 @@ async fn probe_message_full_stack_roundtrip() -> Result<(), FrameError> {
     // agnostic to it, so the base still decodes and the remainder is the ext
     // — which is the property the two-phase pattern rests on end to end.
     let ext = crate::message::ProbeResponseExt {
-        total_bytes: Some(1_700_000),
         coverage: crate::Coverage::empty(),
     };
     let ProbeMessage::Response(body) = &resp else {

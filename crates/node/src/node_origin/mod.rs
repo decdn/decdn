@@ -158,97 +158,48 @@ pub(crate) enum ProbeGather {
     /// Single-source failover: stop once [`PROBE_EARLY_EXIT_CANDIDATES`] holders
     /// answer, because the single-source pull loop tries at most that many.
     EarlyExit,
-    /// Ranged assembly: stop once the admitted holders' coverage UNION spans the
-    /// blob, so a set of partial holders whose fastest answers all cover the same
-    /// discovery block is not mistaken for enough. A holder that reports its blob
-    /// size (`ProbeResponseExt.total_bytes`) pins the block count the union must
-    /// span; absent any size the round drains to the probe-fanout ceiling. The
-    /// empty root has no block, so its first admitted holder spans it (#2526).
+    /// Ranged assembly: the round probes up to its `probe_fanout` limit, so a set
+    /// of partial holders whose fastest answers all cover the same discovery
+    /// block is not mistaken for enough. A probe carries no blob size, so no
+    /// answer can say the holders' coverage UNION spans the blob; the round
+    /// drains instead (#1506).
     ///
-    /// A round whose holders cannot span the blob is followed by a second round
-    /// over the namespace's origin-directory candidates it did not probe (#2195).
-    /// An origin advertises every block, so its answer normally closes the union.
-    /// Each round takes its own `probe_fanout`, so a gather sends at most twice
-    /// that many probes and stays bounded.
+    /// Once the header handshake reads the size the upstream signs, a union
+    /// that does not span that many blocks is followed by a second round over
+    /// the namespace's origin-directory candidates the first round did not
+    /// probe ([`supplement_from_directory`], #2195). An origin advertises every
+    /// block, so its answer normally closes the union. Each round takes its own
+    /// `probe_fanout`, so a gather sends at most twice that many probes and
+    /// stays bounded.
     CoverageUnion,
 }
 
-/// The coverage union of a set of probed holders, and whether it spans the blob
-/// (#1506).
-///
-/// A holder's own reported size pins how many blocks the blob has. Its coverage
-/// bits past that count are ignored, because an untrusted wire bitmap may set
-/// spurious high bits (see `Coverage`). A holder that reports no size adds
-/// nothing, and the union spans nothing until some holder reports one.
+/// Whether `candidates`' coverage union spans every discovery block of a
+/// `total_bytes` blob `hash_bytes` (#1506). `total_bytes` is the size the
+/// upstream signs in the header handshake: it is the tree the pull verifies
+/// under, and it sets how many blocks the union must cover. A coverage bit
+/// past that count is ignored, because an untrusted wire bitmap may set
+/// spurious high bits (see `Coverage`).
 ///
 /// The empty blob ([`decdn_protocol::EMPTY_ROOT`]) spans zero blocks, so no
 /// holder reports a block for the union to cover. For that hash the union
 /// spans the blob once one holder is admitted (#2526). The rule keys on the
-/// requested hash, never on the unsigned `total_bytes` hint.
-/// `ProbeResponseExt::consistent_with` keys on the hash the same way. A holder
-/// that reports `Some(0)` for a real blob therefore closes nothing.
-struct CoverageUnionTracker {
-    /// Whether the requested hash is [`decdn_protocol::EMPTY_ROOT`].
-    empty_root: bool,
-    /// Holders admitted so far, a holder without a size hint included. Read
-    /// only when `empty_root` is set.
-    holders: usize,
-    /// Covered discovery blocks seen so far.
-    blocks: std::collections::BTreeSet<u32>,
-    /// The largest block count any holder has reported for this blob.
-    target: u32,
-}
-
-impl CoverageUnionTracker {
-    /// An empty union over the blob `hash_bytes`.
-    fn new(hash_bytes: [u8; 32]) -> Self {
-        Self {
-            empty_root: hash_bytes == decdn_protocol::EMPTY_ROOT,
-            holders: 0,
-            blocks: std::collections::BTreeSet::new(),
-            target: 0,
-        }
+/// requested hash, which `ProbeResponseExt::consistent_with` keys on too.
+pub(super) fn coverage_spans(
+    hash_bytes: [u8; 32],
+    candidates: &[Candidate],
+    total_bytes: u64,
+) -> bool {
+    if hash_bytes == decdn_protocol::EMPTY_ROOT {
+        return !candidates.is_empty();
     }
-
-    /// The union of `candidates`' coverage over the blob `hash_bytes`.
-    fn from_candidates(hash_bytes: [u8; 32], candidates: &[Candidate]) -> Self {
-        let mut union = Self::new(hash_bytes);
-        for candidate in candidates {
-            union.add(candidate);
-        }
-        union
-    }
-
-    /// Fold `candidate`'s coverage into the union.
-    fn add(&mut self, candidate: &Candidate) {
-        self.holders += 1;
-        let Some(bytes) = candidate.total_bytes_hint else {
-            return;
-        };
-        let holder_blocks = decdn_protocol::num_blocks(bytes);
-        self.target = self.target.max(holder_blocks);
-        self.blocks.extend(
-            candidate
-                .coverage
-                .covered_blocks()
-                .filter(|&block| block < holder_blocks),
-        );
-    }
-
-    /// Every block `0..target` is in the union. False while no holder has
-    /// reported a size. For the empty root, true once one holder is admitted.
-    fn spans(&self) -> bool {
-        if self.empty_root {
-            return self.holders > 0;
-        }
-        self.target > 0 && (0..self.target).all(|block| self.blocks.contains(&block))
-    }
-}
-
-/// Whether `candidates`' coverage union spans the blob `hash_bytes` — see
-/// [`CoverageUnionTracker`].
-pub(super) fn coverage_spans(hash_bytes: [u8; 32], candidates: &[Candidate]) -> bool {
-    CoverageUnionTracker::from_candidates(hash_bytes, candidates).spans()
+    let blocks = decdn_protocol::num_blocks(total_bytes);
+    let covered: std::collections::BTreeSet<u32> = candidates
+        .iter()
+        .flat_map(|candidate| candidate.coverage.covered_blocks())
+        .filter(|&block| block < blocks)
+        .collect();
+    blocks > 0 && (0..blocks).all(|block| covered.contains(&block))
 }
 
 /// Which arm of the pool-open ladder an error falls in, decided from its typed
@@ -1051,13 +1002,11 @@ impl Origin for NodeOrigin {
                 }
                 // Writes the probe cache at its tail. The buffered fill is a
                 // single-source pull (`try_pull`), so one working holder is enough.
-                let ranked = probe_and_rank(
+                let (ranked, _resolved) = probe_and_rank(
                     deps,
                     providers,
-                    &discovered.attested,
                     hash_bytes,
                     ProbeGather::EarlyExit,
-                    U256::ZERO,
                     &mut ProbeTally::default(),
                 )
                 .await;
@@ -1293,8 +1242,6 @@ struct ProbeTally {
     dropped: u16,
     /// Candidates admitted.
     holders: u16,
-    /// Whether the admitted holders' coverage union spans the blob.
-    spans: bool,
 }
 
 impl ProbeTally {
@@ -1320,7 +1267,6 @@ impl ProbeTally {
         trail.absent = self.absent;
         trail.dropped = self.dropped;
         trail.holders = self.holders;
-        trail.spans = self.spans;
     }
 }
 
@@ -1331,64 +1277,94 @@ fn count_u16(len: usize) -> u16 {
 
 /// Probe up to `probe_fanout` providers for rate + RTT, build a [`Candidate`]
 /// for each that reports holding the blob, and rank them by the combined
-/// reputation-weighted selection score. `tally` receives what the rounds saw.
-///
-/// Under [`ProbeGather::CoverageUnion`], a round whose holders cannot span the
-/// blob also probes the `attested` origins and the origin directory's
-/// candidates for `namespace_id` that the first round did not resolve (ADR 022
-/// §`FIND_VALUE` Flow, #2195). A DHT answer can
-/// hold only partial holders, and the ranged assembly needs a candidate set that
-/// covers every block. An origin past the first round's `probe_fanout` cut is
-/// probed here even when `providers` named it; an origin the first round skipped
-/// as suppressed or wedged is not asked again.
+/// reputation-weighted selection score. `tally` receives what the round saw.
+/// Returns the ranked candidates and the peers the round resolved
+/// ([`probe_round`]), for a later [`supplement_from_directory`].
 async fn probe_and_rank(
     deps: &NodeOriginDeps,
     providers: Vec<DhtNodeId>,
-    attested: &[DhtNodeId],
     hash_bytes: [u8; 32],
     gather: ProbeGather,
+    tally: &mut ProbeTally,
+) -> (Vec<Candidate>, Vec<DhtNodeId>) {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let resolved = probe_round(deps, &providers, hash_bytes, gather, &mut candidates, tally).await;
+    tally.holders = count_u16(candidates.len());
+    (rank_and_cache(deps, hash_bytes, candidates), resolved)
+}
+
+/// The supplement for ranked `candidates` whose coverage does not span a
+/// `total_bytes` blob: probe the `attested` origins and the origin
+/// directory's candidates for `namespace_id` that the first round did not
+/// resolve, and rank the union (ADR 022 §`FIND_VALUE` Flow, #2195). A DHT
+/// answer can hold only partial holders, and the ranged assembly needs a
+/// candidate set that covers every block. An origin past the first round's
+/// `probe_fanout` cut is probed here even when the first round's providers
+/// named it; an origin the first round skipped as suppressed or wedged is not
+/// asked again. `total_bytes` is the size the upstream signed in the header
+/// handshake.
+#[allow(clippy::too_many_arguments)] // the gather's inputs, threaded from the pull leg
+async fn supplement_from_directory(
+    deps: &NodeOriginDeps,
+    candidates: Vec<Candidate>,
+    resolved: &[DhtNodeId],
+    attested: &[DhtNodeId],
+    hash_bytes: [u8; 32],
+    total_bytes: u64,
     namespace_id: U256,
     tally: &mut ProbeTally,
 ) -> Vec<Candidate> {
-    let target = DhtHash::from_bytes(hash_bytes);
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let resolved = probe_round(deps, &providers, hash_bytes, gather, &mut candidates, tally).await;
-    if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
-        // The supplement can list the requester; the pull leg drops it from the
-        // ranked list after this round.
-        let directory = fallback_origins(deps, namespace_id, attested, None).await;
-        let listed = directory.len();
-        let origins: Vec<DhtNodeId> = directory
-            .into_iter()
-            .filter(|origin| !resolved.contains(origin))
-            .collect();
-        let hash = Hash::from_bytes(hash_bytes);
-        let holders = candidates.len();
-        if origins.is_empty() {
-            debug!(
-                %hash,
-                %namespace_id,
-                holders,
-                listed,
-                "node-origin: probed holders do not span the blob and the origin directory \
-                 adds no unprobed candidate"
-            );
-        } else {
-            probe_round(deps, &origins, hash_bytes, gather, &mut candidates, tally).await;
-            debug!(
-                %hash,
-                %namespace_id,
-                holders,
-                origins = origins.len(),
-                admitted = candidates.len().saturating_sub(holders),
-                spans = coverage_spans(hash_bytes, &candidates),
-                "node-origin: probed holders did not span the blob; probed origin-directory \
-                 candidates"
-            );
-        }
+    // The supplement can list the requester; the pull leg drops it from the
+    // ranked list after this round.
+    let directory = fallback_origins(deps, namespace_id, attested, None).await;
+    let listed = directory.len();
+    let origins: Vec<DhtNodeId> = directory
+        .into_iter()
+        .filter(|origin| !resolved.contains(origin))
+        .collect();
+    let hash = Hash::from_bytes(hash_bytes);
+    let holders = candidates.len();
+    if origins.is_empty() {
+        debug!(
+            %hash,
+            %namespace_id,
+            holders,
+            listed,
+            "node-origin: probed holders do not span the blob and the origin directory adds \
+             no unprobed candidate"
+        );
+        return candidates;
     }
+    let mut candidates = candidates;
+    probe_round(
+        deps,
+        &origins,
+        hash_bytes,
+        ProbeGather::CoverageUnion,
+        &mut candidates,
+        tally,
+    )
+    .await;
+    debug!(
+        %hash,
+        %namespace_id,
+        holders,
+        origins = origins.len(),
+        admitted = candidates.len().saturating_sub(holders),
+        spans = coverage_spans(hash_bytes, &candidates, total_bytes),
+        "node-origin: probed holders did not span the blob; probed origin-directory candidates"
+    );
     tally.holders = count_u16(candidates.len());
-    tally.spans = coverage_spans(hash_bytes, &candidates);
+    rank_and_cache(deps, hash_bytes, candidates)
+}
+
+/// Rank `candidates` and write the probe cache for `hash_bytes`.
+fn rank_and_cache(
+    deps: &NodeOriginDeps,
+    hash_bytes: [u8; 32],
+    candidates: Vec<Candidate>,
+) -> Vec<Candidate> {
+    let target = DhtHash::from_bytes(hash_bytes);
     let ranked = rank(candidates);
     // ADR 001 §Probe cache: retain the top 10 by selection score, so a repeat
     // miss for this hash inside the TTL skips the lookup and the probe fanout.
@@ -1409,7 +1385,6 @@ async fn probe_and_rank(
                 rate_per_mb: c.rate_per_mb,
                 rtt_ms: c.rtt_ms,
                 coverage: c.coverage.clone(),
-                total_bytes_hint: c.total_bytes_hint,
             })
             .collect(),
     );
@@ -1425,9 +1400,8 @@ async fn probe_and_rank(
 /// candidate; a probe still pending when the stop condition holds counts as
 /// sent and nothing else.
 ///
-/// Under [`ProbeGather::CoverageUnion`] the stop condition counts the holders
-/// already in `candidates`, so a second round stops as soon as its answers close
-/// the union the first round left open.
+/// Under [`ProbeGather::CoverageUnion`] the round has no stop condition: it
+/// drains to its `probe_fanout` limit.
 async fn probe_round(
     deps: &NodeOriginDeps,
     peers: &[DhtNodeId],
@@ -1437,7 +1411,6 @@ async fn probe_round(
     tally: &mut ProbeTally,
 ) -> Vec<DhtNodeId> {
     use futures_util::stream::StreamExt;
-    let mut union = CoverageUnionTracker::from_candidates(hash_bytes, candidates);
     let now_secs = crate::payment_settlement::unix_now();
     let target = DhtHash::from_bytes(hash_bytes);
     // Probe candidates CONCURRENTLY so the probe phase is bounded by a single
@@ -1494,10 +1467,10 @@ async fn probe_round(
     // of its fastest good answers.
     //
     // The stop condition depends on `gather`: [`ProbeGather::EarlyExit`] stops at a fixed
-    // count of holders (single-source failover), while [`ProbeGather::CoverageUnion`] stops
-    // once the admitted holders' coverage union spans the blob (ranged assembly, #1506) — a
-    // set of partial holders whose fastest answers all cover the same block must not stop
-    // short of the holders that cover the rest.
+    // count of holders (single-source failover), while [`ProbeGather::CoverageUnion`] drains
+    // to the fanout limit (ranged assembly, #1506): a probe carries no size, so no answer
+    // says the union spans the blob, and a set of partial holders whose fastest answers all
+    // cover the same block must not stop short of the holders that cover the rest.
     while let Some(result) = probes.next().await {
         let candidate = match result {
             Ok(candidate) => candidate,
@@ -1512,12 +1485,8 @@ async fn probe_round(
                 candidates.len() >= PROBE_EARLY_EXIT_CANDIDATES
             }
             ProbeGather::CoverageUnion => {
-                // `union` also carries every holder an earlier round admitted.
-                union.add(&candidate);
                 candidates.push(candidate);
-                // With no holder-reported size this stays false and the round
-                // drains to the probe-fanout ceiling.
-                union.spans()
+                false
             }
         };
         if done {
@@ -1583,10 +1552,8 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
         .collect()
 }
 
-/// Probe a single provider, returning a ranked-ready [`Candidate`], carrying
-/// the holder's reported blob size (`ProbeResponseExt.total_bytes`) as its
-/// [`Candidate::total_bytes_hint`], iff it responds, validates, and reports
-/// holding the blob; otherwise the [`ProbeDrop`] that says why not. Side
+/// Probe a single provider, returning a ranked-ready [`Candidate`] iff it
+/// responds, validates, and reports holding the blob; otherwise the [`ProbeDrop`] that says why not. Side
 /// effects: a failed probe scores the provider [`Outcome::Unreachable`],
 /// except a probe the provider shed with `APP_ERR_RATE_LIMITED`, which suppresses
 /// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986), and a
@@ -1740,10 +1707,6 @@ async fn probe_candidate(
         // way execution reaches here), except for the empty root: its zero
         // blocks leave the coverage empty on a holder too (#2471).
         coverage: resp_ext.coverage,
-        // The holder's reported blob size. The coverage-union gather (#1506)
-        // reads it to know how many discovery blocks the union must span.
-        // The pull plans nothing from it.
-        total_bytes_hint: resp_ext.total_bytes,
     })
 }
 
@@ -1828,7 +1791,6 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             // evidence-retention the cache's module doc forbids — coverage is
             // outside the `slash_sig` set and has no author to slash.
             coverage: provider.coverage.clone(),
-            total_bytes_hint: provider.total_bytes_hint,
         });
     }
     if candidates.is_empty() {

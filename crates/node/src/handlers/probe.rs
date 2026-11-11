@@ -637,28 +637,24 @@ impl ProbeHandler {
         //   unaffected — it never reaches this arm because it is already
         //   `is_origin_sourced`).
         let is_origin_sourced = has_blob && !store_present;
-        // The coverage and the size the response advertises, bound together: a
-        // partial holder reads its size from the same bitfield as its blocks
-        // (#2195), because the store branch above sizes only a `Complete` blob and
-        // ADR 005 asks a node to include the size whenever it knows it.
-        let (coverage, total_bytes) = if chain_stale {
+        // The coverage the response advertises. A probe carries no size: a
+        // size claim only picks the tree shape a leg verifies under, so the
+        // requester learns the size from the bytes it pulls.
+        let coverage = if chain_stale {
             // Chain-stale (above): advertise no coverage, so the re-derived
             // `has_blob` below stays false. This arm binds the stale answer for
             // every blob with a block; the presence gate above binds it for the
             // empty root (#2471).
-            (Coverage::empty(), total_bytes)
+            Coverage::empty()
         } else if is_origin_sourced {
             // The origin's own size names its blocks, up to the most a
             // well-formed coverage names on the wire: a larger bitmap is
             // rejected at decode, so it would advertise nothing.
-            (
-                total_bytes.map_or_else(Coverage::empty, |size| {
-                    Coverage::full(num_blocks(
-                        size.min(decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES),
-                    ))
-                }),
-                total_bytes,
-            )
+            total_bytes.map_or_else(Coverage::empty, |size| {
+                Coverage::full(num_blocks(
+                    size.min(decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES),
+                ))
+            })
         } else if holds_disabled || !self.relay_foreign_namespaces {
             // `holds_disabled`: the operator's explicit store opt-out (above).
             // `!self.relay_foreign_namespaces`: the origin-only policy (ADR
@@ -668,17 +664,17 @@ impl ProbeHandler {
             // would read as "advertised but didn't serve", the reputation
             // hazard that policy closes). Consulting the cache's coverage
             // here would leak exactly that hit back in.
-            (Coverage::empty(), total_bytes)
+            Coverage::empty()
         } else {
             match self.cache.coverage_sized(hash).await {
-                Ok((c, size)) => (c, total_bytes.or(size)),
+                Ok((c, _size)) => c,
                 Err(e) => {
                     tracing::warn!(
                         error = %e.display_chain(),
                         %hash,
                         "cache error deriving probe coverage; advertising none"
                     );
-                    (Coverage::empty(), total_bytes)
+                    Coverage::empty()
                 }
             }
         };
@@ -698,7 +694,6 @@ impl ProbeHandler {
             || (has_blob && *hash.as_bytes() == EMPTY_ROOT && !self.cache.refuses(hash));
         debug_assert!(
             ProbeResponseExt {
-                total_bytes,
                 coverage: coverage.clone(),
             }
             .consistent_with(&ProbeResponseBody {
@@ -750,14 +745,10 @@ impl ProbeHandler {
         };
 
         let resp = ProbeResponse { body, slash_sig };
-        // `total_bytes` and `coverage` are unsigned, so they ride in the trailing
-        // extension rather than the signed base (ADR 013 §Tier 1). Two-phase
-        // encode: a receiver that predates a future extension field stops at the
-        // end of the base.
-        let ext = ProbeResponseExt {
-            total_bytes,
-            coverage,
-        };
+        // `coverage` is unsigned, so it rides in the trailing extension rather
+        // than the signed base (ADR 013 §Tier 1). Two-phase encode: a receiver
+        // that predates a future extension field stops at the end of the base.
+        let ext = ProbeResponseExt { coverage };
 
         let payload = encode_probe_response(&resp, Some(&ext))
             .map_err(|e| anyhow::anyhow!("probe encode failed: {e}"))?;

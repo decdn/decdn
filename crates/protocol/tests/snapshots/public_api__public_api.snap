@@ -306,7 +306,6 @@ pub decdn_protocol::message::ProbeResponseBody::rate_per_mb: u64
 pub decdn_protocol::message::ProbeResponseBody::timestamp_us: u64
 pub struct decdn_protocol::message::ProbeResponseExt
 pub decdn_protocol::message::ProbeResponseExt::coverage: decdn_protocol::coverage::Coverage
-pub decdn_protocol::message::ProbeResponseExt::total_bytes: core::option::Option<u64>
 impl decdn_protocol::message::ProbeResponseExt
 pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, &decdn_protocol::message::ProbeResponseBody) -> bool
 pub const decdn_protocol::message::EMPTY_ROOT: [u8; 32]
@@ -527,7 +526,6 @@ pub decdn_protocol::ProbeResponseBody::rate_per_mb: u64
 pub decdn_protocol::ProbeResponseBody::timestamp_us: u64
 pub struct decdn_protocol::ProbeResponseExt
 pub decdn_protocol::ProbeResponseExt::coverage: decdn_protocol::coverage::Coverage
-pub decdn_protocol::ProbeResponseExt::total_bytes: core::option::Option<u64>
 impl decdn_protocol::message::ProbeResponseExt
 pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, &decdn_protocol::message::ProbeResponseBody) -> bool
 pub struct decdn_protocol::Provider

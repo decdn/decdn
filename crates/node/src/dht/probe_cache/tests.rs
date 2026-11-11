@@ -15,7 +15,6 @@ fn p(byte: u8) -> ProbedProvider {
         // A distinct one-block coverage per provider, so a round-trip that
         // dropped or aliased the field fails the `PartialEq` assertions.
         coverage: Coverage::from_block_indices(8, std::iter::once(u32::from(byte % 8))),
-        total_bytes_hint: Some(u64::from(byte)),
     }
 }
 

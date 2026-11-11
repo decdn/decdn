@@ -99,11 +99,6 @@ pub struct ProbedProvider {
     /// range-planned against this ≤15s-fresh value rather than reading as
     /// covering nothing.
     pub coverage: Coverage,
-    /// The blob size the provider reported on that probe
-    /// (`ProbeResponseExt.total_bytes`), when it knew it. UNSIGNED, like
-    /// `coverage`, so it carries no slashable author either: a hint only the
-    /// coverage-union probe gather reads.
-    pub total_bytes_hint: Option<u64>,
 }
 
 // The guard against retaining slashable evidence is the exhaustive struct

@@ -70,7 +70,7 @@ use super::{
     PullVerdict, SettleOnDrop, bind_upstream_ctx, cached_candidates, classify_pool_open_arm,
     classify_pull_failure, count_u16, coverage_spans, discover, economic_ceiling, heat_of,
     lane_ledger, mb_of, probe_and_rank, record_backpressure_exhausted, record_backpressure_refusal,
-    record_outcome, record_pool_open_failure,
+    record_outcome, record_pool_open_failure, supplement_from_directory,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
@@ -516,31 +516,22 @@ fn is_bao_corruption(err: &anyhow::Error) -> bool {
     })
 }
 
-/// The probe-cache candidates for `target`, when their coverage spans the blob.
+/// The probe-cache candidates for `target`, the requester left out.
 ///
-/// A cached list that cannot span the blob is no hit for the ranged assembly: a
-/// partial holder can win the handshake, and the blocks no cached holder covers
-/// would then stay unfilled (#2195). The caller's cold path re-runs discovery, and
-/// its probe round adds the directory's origins when the discovered holders do not
-/// span the blob. The entry is not invalidated here: that probe round overwrites
-/// it.
-async fn spanning_cached_candidates(
+/// Whether they span the blob is known only once the header handshake reads
+/// the size the upstream signs. A cached list that cannot span the blob is no
+/// hit for the ranged assembly: a partial holder can win the handshake, and
+/// the blocks no cached holder covers would then stay unfilled (#2195). The
+/// caller then re-runs discovery, and adds the directory's origins when the
+/// discovered holders do not span the blob either.
+async fn cached_candidates_for(
     deps: &NodeOriginDeps,
     target: DhtHash,
-    hash: Hash,
     requester: [u8; 32],
 ) -> Option<Vec<Candidate>> {
     let mut cached = cached_candidates(deps, target).await?;
     cached.retain(|candidate| candidate.node_id != requester);
-    if coverage_spans(*hash.as_bytes(), &cached) {
-        return Some(cached);
-    }
-    debug!(
-        %hash,
-        cached = cached.len(),
-        "node-origin: probe-cache entry does not span the blob; running a fresh lookup"
-    );
-    None
+    Some(cached)
 }
 
 /// Where the pull leg's last candidate list came from (#2366).
@@ -610,7 +601,9 @@ pub(crate) struct PullLegTrail {
     /// Candidates the handshake walk has: admitted by the rounds, less the
     /// requester.
     pub(crate) holders: u16,
-    /// Whether those candidates' coverage union spans the blob.
+    /// Whether those candidates' coverage union spans the size a header
+    /// handshake signed. A probe carries no size, so a walk whose every
+    /// handshake failed reads `false`.
     pub(crate) spans: bool,
     /// Candidates the handshake walks tried.
     pub(crate) handshakes: u16,
@@ -674,6 +667,10 @@ impl NodeOrigin {
     /// every candidate declined — with the [`PullLegTrail`] of the walk. A
     /// [`PullMiss::LocalFault`] must not be signed to the client as a clean
     /// `NotFound` about the content (#1560).
+    // One walk: the cached list, then discovery, the probe round, the
+    // handshake and the directory supplement the signed size calls for. Each
+    // step reads and writes the same trail and budget.
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     pub(crate) async fn open_pull_leg(
         &self,
         hash: Hash,
@@ -696,23 +693,23 @@ impl NodeOrigin {
         let mut attempt_metered = false;
         let mut miss = PullMiss::Clean;
 
-        if let Some(cached) = spanning_cached_candidates(deps, target, hash, requester).await {
-            deps.metrics.probe_cache_hit();
+        let cached = cached_candidates_for(deps, target, requester).await;
+        if let Some(cached) = cached.filter(|cached| !cached.is_empty()) {
             deps.metrics.node_pull_attempt();
             attempt_metered = true;
-            // A cached list is admitted as it stands, and it spans the blob by
-            // construction (`spanning_cached_candidates`).
+            // A cached list is admitted as it stands. Whether it spans the blob
+            // is known once the handshake reads the signed size.
             trail.source = CandidateSource::Cache;
             trail.discovered = count_u16(cached.len());
             trail.holders = trail.discovered;
-            trail.spans = true;
             let outcome = self
                 .handshake_from_candidates(deps, &cached, hash_bytes, namespace_id, budget, prime)
                 .await;
             trail.handshakes = count_u16(outcome.attempts);
             trail.last_fault = outcome.last_fault;
             match outcome.payload {
-                Ok((total_bytes, primed)) => {
+                Ok((total_bytes, primed)) if coverage_spans(hash_bytes, &cached, total_bytes) => {
+                    deps.metrics.probe_cache_hit();
                     return Ok(PullLegTarget {
                         total_bytes,
                         namespace_id: namespace_bytes,
@@ -720,7 +717,22 @@ impl NodeOrigin {
                         primed,
                     });
                 }
-                Err(failed) => miss = miss.or(failed),
+                Ok((total_bytes, _primed)) => {
+                    // The handshake's pull is closed with `_primed`: the run
+                    // that would adopt it comes from a fresh candidate list.
+                    deps.metrics.probe_cache_miss();
+                    debug!(
+                        %hash,
+                        cached = cached.len(),
+                        total_bytes,
+                        "node-origin: probe-cache entry does not span the blob; running a \
+                         fresh lookup"
+                    );
+                }
+                Err(failed) => {
+                    deps.metrics.probe_cache_hit();
+                    miss = miss.or(failed);
+                }
             }
             budget = budget.saturating_sub(outcome.attempts);
             deps.probe_cache.invalidate(&target);
@@ -754,28 +766,19 @@ impl NodeOrigin {
             deps.metrics.node_pull_attempt();
         }
         // The ranged-drive assembly (#1506) plans over the coverage UNION of these
-        // candidates, so the probe round must gather holders until their union spans
-        // the blob — not stop at a fixed count that could miss the holders of the
-        // still-uncovered blocks — and adds the origin-directory candidates when the
-        // discovered holders cannot span it (#2195).
-        // The origin-directory supplement inside the probe round can list the
-        // requester too.
-        let mut ranked = probe_and_rank(
+        // candidates, so the probe round drains to its fanout limit rather than
+        // stop at a fixed count that could miss the holders of the still-uncovered
+        // blocks.
+        let (mut ranked, resolved) = probe_and_rank(
             deps,
             providers,
-            &attested,
             hash_bytes,
             ProbeGather::CoverageUnion,
-            namespace_id,
             &mut tally,
         )
         .await;
-        tally.fold_into(&mut trail);
         ranked.retain(|candidate| candidate.node_id != requester);
-        // The requester can answer the directory supplement's probe as a
-        // holder; the walk drops it, so the trail counts what the walk has.
-        trail.holders = count_u16(ranked.len());
-        trail.spans = coverage_spans(hash_bytes, &ranked);
+        let first_round_holders = count_u16(ranked.len());
         let outcome = self
             .handshake_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget, prime)
             .await;
@@ -784,16 +787,49 @@ impl NodeOrigin {
             trail.last_fault = outcome.last_fault;
         }
         match outcome.payload {
-            Ok((total_bytes, primed)) => Ok(PullLegTarget {
-                total_bytes,
-                namespace_id: namespace_bytes,
-                candidates: ranked,
-                primed,
-            }),
-            Err(failed) => Err(PullLegMiss {
-                miss: miss.or(failed),
-                trail,
-            }),
+            Ok((total_bytes, primed)) if coverage_spans(hash_bytes, &ranked, total_bytes) => {
+                Ok(PullLegTarget {
+                    total_bytes,
+                    namespace_id: namespace_bytes,
+                    candidates: ranked,
+                    primed,
+                })
+            }
+            Ok((total_bytes, primed)) => {
+                // The holders do not span the signed size: add the origin
+                // directory's candidates (#2195). The handshake's pull was
+                // cut for a run over the first list, so it is closed.
+                drop(primed);
+                let mut supplemented = supplement_from_directory(
+                    deps,
+                    ranked,
+                    &resolved,
+                    &attested,
+                    hash_bytes,
+                    total_bytes,
+                    namespace_id,
+                    &mut tally,
+                )
+                .await;
+                // The supplement can list the requester too.
+                supplemented.retain(|candidate| candidate.node_id != requester);
+                Ok(PullLegTarget {
+                    total_bytes,
+                    namespace_id: namespace_bytes,
+                    candidates: supplemented,
+                    primed: None,
+                })
+            }
+            Err(failed) => {
+                tally.fold_into(&mut trail);
+                // The requester can answer a probe as a holder; the walk drops
+                // it, so the trail counts what the walk has.
+                trail.holders = first_round_holders;
+                Err(PullLegMiss {
+                    miss: miss.or(failed),
+                    trail,
+                })
+            }
         }
     }
 

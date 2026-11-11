@@ -288,7 +288,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
-| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
+| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `coverage` |
 | `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `timestamp_us` | `error`, `origin_attestation` |
 
 #### Implementation note — separating signed and unsigned fields
@@ -315,7 +315,7 @@ struct ProbeResponse {
 /// Unsigned fields — a separate postcard value appended after the base.
 #[derive(Serialize, Deserialize, Default)]
 struct ProbeResponseExt {
-    total_bytes: Option<u64>,
+    coverage: Coverage,
 }
 ```
 

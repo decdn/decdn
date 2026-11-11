@@ -217,12 +217,6 @@ pub struct Candidate {
     /// verified. Ranking itself ignores this field; it rides alongside the
     /// rank/RTT/rate fields for a range-aware caller to read after selection.
     pub coverage: Coverage,
-    /// The blob size the candidate reported on that probe
-    /// (`ProbeResponseExt.total_bytes`), when it knows it. UNSIGNED: a sizing
-    /// hint, never a commitment. Only the coverage-union probe gather reads it,
-    /// to count the blocks a union of partial holders must span; the pull
-    /// plans nothing from it.
-    pub total_bytes_hint: Option<u64>,
 }
 
 /// A candidate paired with its computed selection score. Lower score is better.

@@ -963,8 +963,8 @@ fn a_reputation_penalty_names_the_peer_and_its_new_score() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A probed holder with `coverage` over a blob of `total_bytes_hint` bytes.
-fn holder(coverage: Coverage, total_bytes_hint: Option<u64>) -> Candidate {
+/// A probed holder with `coverage`.
+fn holder(coverage: Coverage) -> Candidate {
     Candidate {
         node_id: [0; 32],
         rate_per_mb: 1,
@@ -973,68 +973,55 @@ fn holder(coverage: Coverage, total_bytes_hint: Option<u64>) -> Candidate {
         region: String::new(),
         stake: 0,
         coverage,
-        total_bytes_hint,
     }
 }
 
 /// #2195: the span check that decides whether the ranged path adds the
-/// origin-directory candidates. Three blocks, sized by the holders' own
-/// hints.
+/// origin-directory candidates. Three blocks, counted from the size the
+/// upstream signs in the header handshake.
 #[test]
-fn coverage_spans_needs_every_block_from_a_sized_holder() {
+fn coverage_spans_needs_every_block_of_the_signed_size() {
     let hash = [7u8; 32];
     let size = 3 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
     let blocks = |set: &[u32]| Coverage::from_block_indices(3, set.iter().copied());
 
     assert!(
-        coverage_spans(hash, &[holder(Coverage::full(3), Some(size))]),
+        coverage_spans(hash, &[holder(Coverage::full(3))], size),
         "one whole holder spans the blob"
     );
     assert!(
-        coverage_spans(
-            hash,
-            &[
-                holder(blocks(&[0, 1]), Some(size)),
-                holder(blocks(&[2]), Some(size)),
-            ]
-        ),
+        coverage_spans(hash, &[holder(blocks(&[0, 1])), holder(blocks(&[2]))], size),
         "partials whose union covers every block span the blob"
     );
     assert!(
-        !coverage_spans(
-            hash,
-            &[
-                holder(blocks(&[0]), Some(size)),
-                holder(blocks(&[0, 1]), Some(size)),
-            ]
-        ),
+        !coverage_spans(hash, &[holder(blocks(&[0])), holder(blocks(&[0, 1]))], size),
         "partials that leave a block uncovered do not span the blob"
     );
     assert!(
-        !coverage_spans(hash, &[holder(blocks(&[0, 1]), None)]),
-        "a holder that reports no size spans nothing"
-    );
-    assert!(
-        !coverage_spans(hash, &[]),
+        !coverage_spans(hash, &[], size),
         "an empty candidate set spans nothing"
     );
-    // A two-block holder whose wire bitmap also sets bit 2 claims nothing
-    // past its own size, so a third block stays uncovered.
-    let spurious = holder(
-        Coverage::full(3),
-        Some(2 * decdn_protocol::DISCOVERY_BLOCK_BYTES),
+    assert!(
+        !coverage_spans(hash, &[holder(Coverage::full(3))], 0),
+        "a real blob signed at size 0 spans nothing"
+    );
+    // A two-block blob: a wire bitmap that also sets bit 2 claims nothing past
+    // the signed size, and a third-block-only holder adds nothing.
+    let two = 2 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
+    assert!(
+        !coverage_spans(hash, &[holder(blocks(&[0, 2]))], two),
+        "a coverage bit past the signed block count does not count"
     );
     assert!(
-        !coverage_spans(hash, &[spurious, holder(blocks(&[0]), Some(size))]),
-        "a coverage bit past the holder's own block count does not count"
+        coverage_spans(hash, &[holder(Coverage::full(3))], two),
+        "spurious high bits neither help nor hurt a holder of every real block"
     );
 }
 
 /// #2526: the empty blob spans zero discovery blocks, so no holder can report a
 /// block for the union to cover. For `EMPTY_ROOT` one admitted holder spans
-/// the blob. The rule keys on the requested hash, never on the unsigned
-/// `total_bytes` hint: a holder of a real blob that reports `Some(0)` closes
-/// nothing.
+/// the blob. The rule keys on the requested hash: a real blob signed at size 0
+/// spans nothing.
 #[test]
 fn coverage_spans_for_the_empty_root_needs_one_admitted_holder() {
     let empty_root = decdn_protocol::EMPTY_ROOT;
@@ -1042,38 +1029,28 @@ fn coverage_spans_for_the_empty_root_needs_one_admitted_holder() {
     let size = decdn_protocol::DISCOVERY_BLOCK_BYTES;
 
     assert!(
-        coverage_spans(empty_root, &[holder(Coverage::empty(), Some(0))]),
+        coverage_spans(empty_root, &[holder(Coverage::empty())], 0),
         "one holder of the empty blob spans it"
     );
     assert!(
-        coverage_spans(empty_root, &[holder(Coverage::empty(), None)]),
-        "the empty-root rule reads the hash, not the size hint"
-    );
-    assert!(
-        coverage_spans(empty_root, &[holder(Coverage::empty(), Some(size))]),
-        "an empty-root holder that reports a size still spans it: the hint is ignored"
-    );
-    assert!(
-        !coverage_spans(empty_root, &[]),
+        !coverage_spans(empty_root, &[], 0),
         "no admitted holder spans nothing, the empty root included"
     );
     assert!(
-        !coverage_spans(other, &[holder(Coverage::empty(), Some(0))]),
-        "a lying zero-size hint on a real blob closes nothing"
+        !coverage_spans(other, &[holder(Coverage::empty())], 0),
+        "a real blob signed at size 0 closes nothing"
     );
     assert!(
-        coverage_spans(other, &[holder(Coverage::full(1), Some(size))]),
-        "a sized one-block holder spans a one-block blob"
+        coverage_spans(other, &[holder(Coverage::full(1))], size),
+        "a one-block holder spans a one-block blob"
     );
     assert!(
         coverage_spans(
             other,
-            &[
-                holder(Coverage::empty(), Some(0)),
-                holder(Coverage::full(1), Some(size)),
-            ]
+            &[holder(Coverage::empty()), holder(Coverage::full(1))],
+            size
         ),
-        "a lying zero-size hint beside a real holder neither helps nor hurts"
+        "an empty-coverage holder beside a real holder neither helps nor hurts"
     );
 }
 
@@ -1098,10 +1075,10 @@ fn each_probe_drop_lands_in_one_trail_count() {
     tally.skipped = 1;
     tally.probed = 7;
     tally.holders = 2;
-    tally.spans = true;
     let mut trail = PullLegTrail {
         source: CandidateSource::Dht,
         discovered: 7,
+        spans: true,
         handshakes: 1,
         last_fault: Some("declined"),
         ..PullLegTrail::EMPTY
