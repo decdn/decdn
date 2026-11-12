@@ -80,8 +80,10 @@ pub trait StreamStores {
 
     /// Open the store for `hash`, sized to the stream's size claim
     /// `total_bytes`. A store that already holds verified bytes of `hash`
-    /// keeps them, and the stream fetches only what is missing. Each call
-    /// returns a store that no other open stream fills.
+    /// keeps them, and the stream fetches only what is missing. Two streams
+    /// must not fill one store at the same time: an implementation either
+    /// returns a distinct store per call, or documents which calls share one
+    /// so its caller keeps those streams apart.
     fn open(
         &self,
         hash: [u8; 32],
@@ -108,8 +110,8 @@ impl<T: StreamStores + Sync> StreamStores for &T {
 /// kept, so a temporary directory is the usual choice. The store's `.partial`
 /// grows to the whole blob as the stream advances (a window's `.partial` is
 /// sparse outside the window), so the directory needs room for all of it.
-/// Two streams of one blob in one directory would share a store: give each
-/// stream its own directory.
+/// Every call for one hash returns the same store, so two concurrent streams
+/// of one blob need two directories.
 #[derive(Debug, Clone, Copy)]
 pub struct ScratchStores<'a> {
     scratch: &'a Path,
