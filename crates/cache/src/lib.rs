@@ -17,8 +17,9 @@
 //! | Export a stored range as the bao wire encoding | [`CacheEngine::export_bao_range_stream`] |
 //! | Admit a verified bao stream into the store | [`CacheEngine::admit_bao_stream`] |
 //! | Share one in-progress fill between several readers | [`FillRegistry`], [`FillSession`] |
-//! | Pick an origin backend | [`FilesystemOrigin`], [`HttpOrigin`], [`S3Origin`], or your own [`Origin`] |
+//! | Pick an origin backend | [`FilesystemOrigin`], [`HttpOrigin`], `S3Origin` (feature `s3`), or your own [`Origin`] |
 //! | Choose what to admit and what to evict | [`AdmissionPolicy`], [`EvictionPolicy`] ([ADR 040]) |
+//! | Hold the store under its size ceiling | [`eviction_driver::run`] |
 //! | Bound a failing origin | [`OriginBreaker`], [`RetryPolicy`] |
 //!
 //! # Seams
@@ -26,8 +27,17 @@
 //! This crate has no payment logic, so it runs on its own for local
 //! development and tests. A paid node-to-node pull is one more [`Origin`]: the
 //! node supplies an origin that pays a peer over `cdn/client/v1`. The crate has
-//! no mode branching and no feature flags. The node's wiring layer picks the
-//! backends ([PoC/production seams]).
+//! no mode branching. The node's wiring layer picks the backends
+//! ([PoC/production seams]).
+//!
+//! # Features
+//!
+//! | Feature | Default | Builds |
+//! |---|---|---|
+//! | `s3` | on | `S3Origin` and the AWS SDK it links |
+//!
+//! With `default-features = false` the crate links no AWS SDK and no
+//! `aws-lc`, so a binary that only stores and serves blobs stays small.
 //!
 //! [ADR 040]: https://github.com/decdn/decdn/blob/main/adr/040-cache-policy.md
 //! [PoC/production seams]: https://github.com/decdn/decdn/blob/main/adr/appendix-poc-production-seams.md
@@ -35,6 +45,7 @@
 pub mod circuit_breaker;
 pub mod engine;
 pub mod error;
+pub mod eviction_driver;
 pub mod fill_session;
 pub mod metrics;
 pub mod origin;
@@ -65,6 +76,7 @@ pub use engine::{
 pub use error::{
     CacheError, CacheResult, ErrorChain, OriginError, OriginPullError, SupportedEncoding,
 };
+pub use eviction_driver::EvictionParams;
 pub use fill_session::{
     Demand, DemandSlot, DownstreamWatch, FillClaim, FillError, FillRegistry, FillSession, Frontier,
     HashOutboard, ObserverLease, SessionOutboardReader, ended_at_held_bytes_cap, is_unlanded,
@@ -79,8 +91,10 @@ pub use iroh_blobs::Hash;
 pub use metrics::CacheMetrics;
 pub use origin::{
     FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest,
-    OriginSize, OutboardFetch, S3Credentials, S3Origin, S3OriginConfig,
+    OriginSize, OutboardFetch,
 };
+#[cfg(feature = "s3")]
+pub use origin::{S3Credentials, S3Origin, S3OriginConfig};
 pub use origin_range::{MAX_CONCURRENT_RANGE_PULLS, OriginRangeWire, RANGE_PULL_WINDOW_BYTES};
 pub use policy::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AlwaysAdmit, EvictionContext,

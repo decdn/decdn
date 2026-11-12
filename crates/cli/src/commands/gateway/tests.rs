@@ -3365,8 +3365,8 @@ async fn the_metrics_listener_serves_the_exposition() {
 }
 
 /// The headers a cross-origin page may read from a public gateway.
-const READABLE: &str = "Content-Length, Content-Range, Accept-Ranges, Content-Type, \
-                        Content-Disposition, ETag, Retry-After, Link";
+const READABLE: &str = "Content-Length, Content-Encoding, Content-Range, Accept-Ranges, \
+                        Content-Type, Content-Disposition, ETag, Retry-After, Link";
 
 /// Whether `answer` is readable by any origin.
 fn readable_anywhere(answer: &Answer) -> bool {

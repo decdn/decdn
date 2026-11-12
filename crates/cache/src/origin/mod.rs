@@ -1,8 +1,9 @@
 //! Origin backends — the source of truth a node falls back to on a cache miss.
 //!
-//! [`Origin`] is the seam. Three concrete implementations ship today:
-//! [`HttpOrigin`] (generic HTTP/S), [`FilesystemOrigin`] (local disk), and
-//! [`S3Origin`] (S3-compatible object stores: AWS S3, R2, B2, `MinIO`).
+//! [`Origin`] is the seam. Three concrete implementations ship:
+//! `HttpOrigin` (generic HTTP/S), `FilesystemOrigin` (local disk), and
+//! `S3Origin` (S3-compatible object stores: AWS S3, R2, B2, `MinIO`). The
+//! `s3` feature, on by default, builds `S3Origin` and links the AWS SDK.
 
 pub(crate) mod decompress;
 pub mod fs;
@@ -10,6 +11,7 @@ pub mod http;
 pub(crate) mod io_runtime;
 #[cfg(test)]
 mod log_capture;
+#[cfg(feature = "s3")]
 pub mod s3;
 
 use std::future::Future;
@@ -21,6 +23,7 @@ use iroh_blobs::Hash;
 
 pub use fs::FilesystemOrigin;
 pub use http::HttpOrigin;
+#[cfg(feature = "s3")]
 pub use s3::{S3Credentials, S3Origin, S3OriginConfig};
 // `OriginKind`, `OriginUrl`, `DecompressMode`, `parse_origin_url`, and
 // `DEFAULT_USER_AGENT` moved to the `decdn-config-types` leaf crate

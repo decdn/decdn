@@ -11,6 +11,7 @@
 //!
 //! See `crates/cache/tests/pull_through.rs` for the equivalent `wiremock`
 //! suite covering [`decdn_cache::HttpOrigin`].
+#![cfg(feature = "s3")]
 
 use std::io::Write;
 use std::sync::Arc;
