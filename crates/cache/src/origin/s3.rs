@@ -936,8 +936,8 @@ impl Origin for S3Origin {
                 .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
             {
                 Ok(r) => r,
-                // A missing proof is expected for a blob imported without
-                // one; the engine builds it.
+                // A missing proof means the origin proves no size for the
+                // blob.
                 Err(e) => match classify_get_object_error(e, &log_target)? {
                     OriginFetch::NotFound
                     | OriginFetch::Found { .. }

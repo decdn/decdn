@@ -439,8 +439,8 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     ///
     /// `Ok(None)` means the origin serves no proof for the hash: the object is
     /// missing, larger than the cap, or the backend does not serve siblings.
-    /// The engine then builds the proof from the outboard and the last chunk
-    /// group. Like every origin byte, a returned proof is **untrusted** until
+    /// The engine then has no provable size for an origin-only blob, and the
+    /// node states none. Like every origin byte, a returned proof is **untrusted** until
     /// it verifies against `H`. A transport fault surfaces as
     /// [`OriginPullError`]. The default returns `Ok(None)`.
     fn fetch_size_proof(
