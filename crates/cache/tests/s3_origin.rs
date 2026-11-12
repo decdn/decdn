@@ -1161,6 +1161,60 @@ async fn size_compressed_object_is_unsized() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn size_identity_encoding_keeps_the_length() -> anyhow::Result<()> {
+    // `identity` is no encoding: `fetch` streams the body unchanged, so the
+    // reported length is canonical and `size` must state it.
+    let hash = Hash::new(b"identity");
+    let rule = mock!(Client::head_object).then_output(|| {
+        HeadObjectOutput::builder()
+            .content_length(1024)
+            .content_encoding("identity")
+            .build()
+    });
+    let client = mock_s3_client_match_any(&[&rule]);
+    let origin = s3_origin(client, "")?;
+
+    anyhow::ensure!(
+        origin.size(hash).await? == OriginSize::Known(1024),
+        "identity encoding must keep the canonical length"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn size_rejected_encoding_is_a_permanent_fault() -> anyhow::Result<()> {
+    // An encoding `fetch` permanently rejects (`br`, or gzip under `Strict`)
+    // must fault permanently, never read as present: the origin-only gate
+    // would otherwise admit a pull that always fails.
+    let hash = Hash::new(b"brotli");
+    let br = mock!(Client::head_object).then_output(|| {
+        HeadObjectOutput::builder()
+            .content_length(1024)
+            .content_encoding("br")
+            .build()
+    });
+    let origin = s3_origin(mock_s3_client_match_any(&[&br]), "")?;
+    anyhow::ensure!(
+        matches!(origin.size(hash).await, Err(OriginPullError::Permanent(_))),
+        "an unknown encoding must be a permanent fault"
+    );
+
+    let gz = mock!(Client::head_object).then_output(|| {
+        HeadObjectOutput::builder()
+            .content_length(1024)
+            .content_encoding("gzip")
+            .build()
+    });
+    let strict = s3_origin(mock_s3_client_match_any(&[&gz]), "")?
+        .with_decompress_mode(DecompressMode::Strict);
+    anyhow::ensure!(
+        matches!(strict.size(hash).await, Err(OriginPullError::Permanent(_))),
+        "gzip under Strict must be a permanent fault"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn size_missing_content_length_is_unsized() -> anyhow::Result<()> {
     // A successful HeadObject proves presence even when the SDK carries no
     // Content-Length — only the size is lost, so the answer is `Unsized`,

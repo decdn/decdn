@@ -2203,6 +2203,58 @@ async fn origin_only_probe_advertises_a_store_complete_unsized_hold() -> anyhow:
     Ok(())
 }
 
+/// Relay mode with store advertisement opted out (`max_probe_holds == 0`):
+/// the store branch declines, so the live-origin fallback decides. A
+/// present-but-unsized backend hold whose blob is complete in the store is
+/// still origin content this node serves, and the store states the length the
+/// backend cannot — so it is advertised with the store's size, the same way
+/// the origin-only branch answers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_probe_advertises_a_store_complete_unsized_hold_with_holds_disabled()
+-> anyhow::Result<()> {
+    let payload = b"relay: warm unsized backend object";
+    let hash = Hash::new(payload);
+    let cache_dir = tempfile::tempdir()?;
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![Arc::new(UnsizedStubOrigin {
+            hash,
+            data: bytes::Bytes::from_static(payload),
+        }) as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let _ = cache.get(hash).await?; // lands complete in the local store
+    cache.set_max_probe_holds(0);
+
+    let server_sk = fresh_key();
+    let metrics = Arc::new(Metrics::new());
+    let (handler, signer, domain) = build_handler(
+        server_sk.public(),
+        7,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+    );
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: now_us(),
+    };
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
+    anyhow::ensure!(
+        resp.body.has_blob,
+        "a store-complete unsized backend hold must be advertised through the \
+         live-origin fallback"
+    );
+    anyhow::ensure!(
+        resp_ext.total_bytes == Some(payload.len() as u64),
+        "total_bytes must carry the store's length, got {:?}",
+        resp_ext.total_bytes
+    );
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
 /// A node with the eviction-hold path **disabled by config**
 /// (`max_probe_holds == 0`) holds the blob but answers `has_blob: false` with a
 /// valid `slash_sig` over `has_blob=false`. The reason is the operator opt-out,

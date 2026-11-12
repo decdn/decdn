@@ -527,21 +527,35 @@ impl Origin for HttpOrigin {
                     OriginPullError::Permanent(err)
                 });
             }
-            // A `Content-Encoding` response advertises the *encoded* length in
-            // `Content-Length`, not the canonical blob size the bao tree needs
-            // — the same trap `fetch` sidesteps for `size_hint`. The object is
+            // Resolve `Content-Encoding` exactly as `fetch` does, so `size` never
+            // promises a hold `fetch` will refuse. Identity (or no header)
+            // leaves `Content-Length` as the canonical length. An encoding
+            // `fetch` decodes advertises the *encoded* length, not the
+            // canonical blob size the bao tree needs, so the object is
             // present but unsized: the serve gate admits it, and size callers
             // degrade to a whole-blob pull rather than feeding a wrong size
-            // into bao alignment. (A compressed *ranged* fetch is separately
-            // caught downstream: the S3 adapter refuses it explicitly, and the
-            // HTTP adapter's exact-length gate + bao verification reject it —
-            // either way it degrades, never serves.)
-            if resp
-                .headers()
-                .get(CONTENT_ENCODING)
-                .is_some_and(|v| !v.is_empty())
-            {
-                return Ok(OriginSize::Unsized);
+            // into bao alignment. An encoding `fetch` rejects (unknown, e.g.
+            // `br`, any non-identity one under `Strict`, or a malformed
+            // header) is a permanent fault: the object can never be served
+            // from this origin, so admitting it would route a client in for
+            // a pull that always fails.
+            let encoding = match resp.headers().get(CONTENT_ENCODING) {
+                None => None,
+                Some(v) => match v.to_str() {
+                    Ok(s) => Some(s.trim().to_owned()),
+                    Err(_) => {
+                        return Err(OriginPullError::Permanent(
+                            OriginError::MalformedEncoding.into(),
+                        ));
+                    }
+                },
+            };
+            if let Some(encoding) = encoding {
+                match decompress::resolve_encoding(&encoding, self.decompress) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => return Ok(OriginSize::Unsized),
+                    Err(err) => return Err(OriginPullError::Permanent(err.into())),
+                }
             }
             // Read the `Content-Length` header directly rather than
             // `resp.content_length()`: the latter reflects the (empty) HEAD

@@ -223,6 +223,40 @@ impl ProbeHandler {
         }
     }
 
+    /// Live-origin size for `hash`, for the probe's origin-sourced
+    /// advertisement: the memoised backend probe
+    /// ([`CacheEngine::origin_probe_presence`]), with a `PresentUnsized` hold
+    /// sized from the local store when a pull landed the blob complete there.
+    ///
+    /// A blob's length is immutable under its BLAKE3 hash, so the stored
+    /// length signs the same coverage the backend's own statement would.
+    /// [`CacheEngine::serve_audit`] is one `BlobStatus` call whose refusal
+    /// gate matches the serve path's. With no complete local hold there is no
+    /// size to sign coverage from, so the hash stays unadvertised until a
+    /// direct fetch warms it — which the serve gate admits. `Absent` and
+    /// `Fault` advertise nothing.
+    async fn live_origin_size(&self, hash: Hash) -> Option<u64> {
+        match self.cache.origin_probe_presence(hash).await {
+            OriginPresence::Present(size) => Some(size),
+            OriginPresence::PresentUnsized => match self.cache.serve_audit(hash).await {
+                Ok(ServeAudit::Serveable { size }) => Some(size),
+                Ok(ServeAudit::Unavailable { .. }) => None,
+                // A store it cannot read is one it cannot size, but a
+                // degrading backend must stay operator-visible.
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e.display_chain(),
+                        %hash,
+                        "cache error sizing an unsized backend hold; \
+                         answering has_blob:false"
+                    );
+                    None
+                }
+            },
+            OriginPresence::Absent | OriginPresence::Fault => None,
+        }
+    }
+
     /// The advertised `total_bytes` for a blob already established as present.
     ///
     /// `total_bytes` is an unsigned, optional hint outside the `slash_sig`
@@ -587,13 +621,14 @@ impl ProbeHandler {
             // non-pinned remote object is discoverable on the first probe rather than
             // never. Skipped once `has_blob` is already true — no point paying a HEAD
             // for a blob the store or the index already backs.
+            // A present-but-unsized backend hold is sized from a complete
+            // local blob here too (`live_origin_size`), so a store-complete
+            // compressed-origin hold stays advertised when the store branch
+            // above declined it (`max_probe_holds == 0`, or a hold fault).
             if has_blob {
                 (has_blob, total_bytes)
             } else {
-                fold_origin_held(
-                    (has_blob, total_bytes),
-                    self.cache.origin_probe_size(hash).await,
-                )
+                fold_origin_held((has_blob, total_bytes), self.live_origin_size(hash).await)
             }
         } else {
             // Origin-only nodes (ADR 002 origin-only node policy): advertise
@@ -611,37 +646,13 @@ impl ProbeHandler {
             // `origin_probe_presence` both check it first).
             //
             // A `PresentUnsized` backend hold is still own content the serve
-            // gate admits; only the backend's length statement is missing. A
-            // blob's length is immutable under its BLAKE3 hash, so once a pull
-            // has landed it complete, the local store states the length
-            // instead (`serve_audit` — one `BlobStatus` call whose refusal
-            // gate matches the serve path's). With no complete local hold
-            // there is no size to sign coverage from, so the hash stays
-            // unadvertised until a direct fetch warms it — which the serve
-            // gate admits.
-            match self.cache.origin_held_size(hash) {
-                Some(size) => (true, Some(size)),
-                None => match self.cache.origin_probe_presence(hash).await {
-                    OriginPresence::Present(size) => (true, Some(size)),
-                    OriginPresence::PresentUnsized => match self.cache.serve_audit(hash).await {
-                        Ok(ServeAudit::Serveable { size }) => (true, Some(size)),
-                        Ok(ServeAudit::Unavailable { .. }) => (false, None),
-                        // Same posture as the store-fault arms above: a store
-                        // it cannot read is one it cannot size, but a
-                        // degrading backend must stay operator-visible.
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e.display_chain(),
-                                %hash,
-                                "cache error sizing an unsized backend hold; \
-                                 answering has_blob:false"
-                            );
-                            (false, None)
-                        }
-                    },
-                    OriginPresence::Absent | OriginPresence::Fault => (false, None),
-                },
-            }
+            // gate admits; only the backend's length statement is missing, and
+            // `live_origin_size` takes it from a complete local blob.
+            let size = match self.cache.origin_held_size(hash) {
+                Some(size) => Some(size),
+                None => self.live_origin_size(hash).await,
+            };
+            (size.is_some(), size)
         };
 
         // Final will-serve coverage (#1506): `has_blob` is redefined from

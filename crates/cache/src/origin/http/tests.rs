@@ -353,6 +353,69 @@ async fn size_reads_content_length_on_success() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `Content-Encoding: identity` is no encoding: `fetch` streams the body
+/// unchanged, so `Content-Length` is the canonical length and `size` must
+/// state it rather than answer `Unsized`.
+#[tokio::test]
+async fn size_identity_encoding_keeps_the_length() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let hash = Hash::new(b"http-size-identity-marker");
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "4096")
+                .insert_header("content-encoding", "identity"),
+        )
+        .mount(&server)
+        .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+
+    anyhow::ensure!(
+        origin.size(hash).await? == OriginSize::Known(4096),
+        "identity encoding must keep the canonical length",
+    );
+    Ok(())
+}
+
+/// An encoding `fetch` permanently rejects — unknown (`br`), or a known one
+/// under `DecompressMode::Strict` — is a permanent fault from `size`, never
+/// `Unsized`: answering present would admit the hash at the origin-only
+/// serve gate and route a client into a pull that always fails.
+#[tokio::test]
+async fn size_rejected_encoding_is_a_permanent_fault() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let br = Hash::new(b"http-size-br-marker");
+    let gz = Hash::new(b"http-size-strict-gzip-marker");
+    for (hash, enc) in [(br, "br"), (gz, "gzip")] {
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{}", hash.to_hex())))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "512")
+                    .insert_header("content-encoding", enc),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let auto = HttpOrigin::parse(&server.uri())?;
+    anyhow::ensure!(
+        matches!(auto.size(br).await, Err(OriginPullError::Permanent(_))),
+        "an unknown encoding must be a permanent fault",
+    );
+    anyhow::ensure!(
+        auto.size(gz).await? == OriginSize::Unsized,
+        "gzip under Auto is decodable, so present but unsized",
+    );
+    let strict = HttpOrigin::parse(&server.uri())?.with_decompress_mode(DecompressMode::Strict);
+    anyhow::ensure!(
+        matches!(strict.size(gz).await, Err(OriginPullError::Permanent(_))),
+        "gzip under Strict must be a permanent fault",
+    );
+    Ok(())
+}
+
 /// `DEFAULT_USER_AGENT` (#435, now in the `decdn-config-types` leaf
 /// crate per #578) embeds that crate's `CARGO_PKG_VERSION` so origin
 /// operators can attribute pull-through traffic. The `decdn-node/`

@@ -561,7 +561,8 @@ impl HolderSnapshot {
 /// `PresentUnsized` hold the store does not hold complete is the other,
 /// deliberate skip: the hold is confirmed and nothing is degraded, there is
 /// simply no size anywhere to sign coverage from, so it stays out of the set
-/// without counting as a fault.
+/// without counting as a fault. A store audit that fails while sizing such a
+/// hold does count: the walk could not settle a hash this node holds.
 ///
 /// Never fails: a store-walk error degrades to the origin-held half rather than
 /// yielding nothing, because a partial announce strictly beats none. Every way
@@ -600,16 +601,30 @@ pub(crate) async fn holder_snapshot(
                     // hold (`serve_audit`, whose refusal gate matches the
                     // serve path's) sizes the probe answer, and the probe
                     // handler confirms the announce from the same audit. A
-                    // partial or unreadable hold has no length to sign from,
-                    // so it is skipped — not announced and not a fault: the
-                    // serve gate still admits it, it is only undiscoverable
-                    // through this node's announcements.
+                    // partial hold has no length to sign from, so it is
+                    // skipped — not announced and not a fault: the serve gate
+                    // still admits it, it is only undiscoverable through this
+                    // node's announcements. A failed audit is a fault.
                     decdn_cache::OriginPresence::PresentUnsized => {
-                        if matches!(
-                            cache.serve_audit(hash).await,
-                            Ok(decdn_cache::ServeAudit::Serveable { .. })
-                        ) {
-                            hashes.insert(hash);
+                        match cache.serve_audit(hash).await {
+                            Ok(decdn_cache::ServeAudit::Serveable { .. }) => {
+                                hashes.insert(hash);
+                            }
+                            Ok(decdn_cache::ServeAudit::Unavailable { .. }) => {}
+                            // A store read that failed is a held hash this
+                            // walk could not settle, not a healthy skip: count
+                            // it, or a degraded store reads as a complete
+                            // snapshot.
+                            Err(err) => {
+                                tracing::debug!(
+                                    %hash,
+                                    error = %err.display_chain(),
+                                    "holder snapshot: store audit of an unsized \
+                                     backend hold failed; counting it as an \
+                                     ownership probe fault",
+                                );
+                                ownership_probe_faults = ownership_probe_faults.saturating_add(1);
+                            }
                         }
                     }
                     decdn_cache::OriginPresence::Absent => {}

@@ -354,7 +354,8 @@ pub enum OriginSize {
     /// against the root `H`.
     Known(u64),
     /// The origin holds the object but cannot state the canonical length: a
-    /// backend reporting a `Content-Encoding` advertises the *encoded* size
+    /// backend reporting a `Content-Encoding` that [`Origin::fetch`] decodes
+    /// advertises the *encoded* size
     /// (not the canonical blob length — the same trap as [`Origin::fetch`]'s
     /// `size_hint`), and a 2xx without a parsable `Content-Length` states no
     /// size at all. Present for the serve gate and the presence memo; sizeless
@@ -481,11 +482,14 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     ///   canonical blob length. Callers may range-pull against it, advertise
     ///   it, and sign origin-sourced probe coverage from it.
     /// - [`OriginSize::Unsized`] — the origin holds the object but cannot
-    ///   state the canonical length (a `Content-Encoding` backend, or a 2xx
-    ///   without a parsable `Content-Length`). Presence callers (the
-    ///   origin-only serve gate, the presence memo) read it as present; size
-    ///   callers degrade to the whole-blob path and must not memoise or sign
-    ///   it as an absence.
+    ///   state the canonical length (a `Content-Encoding` that `fetch`
+    ///   decodes, or a 2xx without a parsable `Content-Length`). Presence
+    ///   callers (the origin-only serve gate, the presence memo) read it as
+    ///   present; size callers degrade to the whole-blob path and must not
+    ///   memoise or sign it as an absence. An encoding `fetch` rejects (an
+    ///   unknown one, or any non-identity one under `DecompressMode::Strict`)
+    ///   is a permanent fault, never `Unsized`: the object cannot be served
+    ///   from this origin, so it must not read as present.
     /// - [`OriginSize::Absent`] — an **authoritative** "this origin does not
     ///   hold the object": a genuine 404 / not-found. Only this answer may be
     ///   memoised as a negative, signed as `NotFound` to a paying client, or

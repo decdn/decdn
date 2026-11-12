@@ -937,15 +937,29 @@ impl Origin for S3Origin {
                 Ok(r) => r,
                 Err(e) => return classify_head_object_error(e, &log_target),
             };
-            // A `Content-Encoding` object advertises the *encoded* length here,
-            // not the canonical blob size — present but unsized, consistent
-            // with `fetch_range_data` refusing compressed ranges: size callers
-            // degrade to the whole-blob path, presence callers admit it.
-            if resp
-                .content_encoding()
-                .is_some_and(|e| !e.trim().is_empty())
-            {
-                return Ok(OriginSize::Unsized);
+            // Resolve `Content-Encoding` exactly as `fetch` does, so `size` never
+            // promises a hold `fetch` will refuse. Identity (or none) leaves
+            // the reported length canonical. An encoding `fetch` decodes
+            // reports the *encoded* length, not the canonical blob size —
+            // present but unsized, consistent with `fetch_range_data` refusing
+            // compressed ranges: size callers degrade to the whole-blob path,
+            // presence callers admit it. An encoding `fetch` rejects (unknown,
+            // e.g. `br`, or any non-identity one under `Strict`) is a
+            // permanent fault: admitting it would route a client in for a
+            // pull that always fails.
+            if let Some(enc) = resp.content_encoding() {
+                match decompress::resolve_encoding(enc.trim(), self.decompress) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => return Ok(OriginSize::Unsized),
+                    Err(err) => {
+                        return Err(OriginPullError::Permanent(
+                            anyhow::Error::from(err).context(format!(
+                                "{log_target}: S3 HeadObject reports a Content-Encoding \
+                                 the fetch path rejects"
+                            )),
+                        ));
+                    }
+                }
             }
             // `content_length()` is `Option<i64>`; a negative or absent value
             // is unusable — the `HeadObject` success proves presence either
