@@ -1,14 +1,11 @@
 use super::*;
 
 /// Write `payload` into an `Origin`-shaped on-disk layout (`<origin_dir>/<2-hex
-/// shard>/<full-hex hash>`) so a [`decdn_cache::FilesystemOrigin`] pointed at
+/// shard>/<full-hex hash>`) so a [`crate::FilesystemOrigin`] pointed at
 /// `origin_dir` can serve it. Shared by the ADR 040 end-to-end policy tests
 /// below — each needs several distinct one-off blobs.
-fn write_origin_blob(
-    origin_dir: &std::path::Path,
-    payload: &[u8],
-) -> anyhow::Result<decdn_cache::Hash> {
-    let hash = decdn_cache::Hash::new(payload);
+fn write_origin_blob(origin_dir: &std::path::Path, payload: &[u8]) -> anyhow::Result<crate::Hash> {
+    let hash = crate::Hash::new(payload);
     let hex = hash.to_hex();
     let shard = hex
         .get(..2)
@@ -161,14 +158,14 @@ fn partial_gc_reclaim_credits_only_the_observed_drop() {
 
 /// Proves `sweep` delegates victim ordering to the injected policy rather
 /// than sorting inline. `NewestFirst` reverses LRU order, so with a
-/// budget of 1 the most-recently-touched hash must be the one released —
-/// the opposite of what the old inline oldest-first sort would pick.
+/// budget of 1 the most-recently-touched hash must be the one released,
+/// the opposite of what LRU would pick, and `on_release` must see it.
 #[tokio::test]
 async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
     #[derive(Debug)]
     struct NewestFirst;
-    impl decdn_cache::EvictionPolicy for NewestFirst {
-        fn plan(&self, ctx: &decdn_cache::EvictionContext<'_>) -> decdn_cache::EvictionPlan {
+    impl crate::EvictionPolicy for NewestFirst {
+        fn plan(&self, ctx: &crate::EvictionContext<'_>) -> crate::EvictionPlan {
             let mut v: Vec<_> = ctx.candidates.iter().map(|(h, t)| (*h, *t)).collect();
             v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
             let mut evict = Vec::new();
@@ -183,7 +180,7 @@ async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
                 freed = freed.saturating_add(ctx.sizes.get(&h).copied().unwrap_or(0));
                 evict.push(h);
             }
-            decdn_cache::EvictionPlan {
+            crate::EvictionPlan {
                 evict,
                 promote: Vec::new(),
             }
@@ -192,8 +189,8 @@ async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
 
     let older_payload = b"eviction policy test: older blob";
     let newer_payload = b"eviction policy test: newer blob";
-    let older_hash = decdn_cache::Hash::new(older_payload);
-    let newer_hash = decdn_cache::Hash::new(newer_payload);
+    let older_hash = crate::Hash::new(older_payload);
+    let newer_hash = crate::Hash::new(newer_payload);
 
     let origin_dir = tempfile::tempdir()?;
     for (hash, payload) in [(older_hash, older_payload), (newer_hash, newer_payload)] {
@@ -207,10 +204,10 @@ async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
     }
 
     let cache_dir = tempfile::tempdir()?;
-    let origin = std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
     let cache = CacheEngine::open(
         cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+        vec![origin as std::sync::Arc<dyn crate::Origin>],
         16,
     )
     .await?;
@@ -221,12 +218,17 @@ async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
 
     let sizes = cache.size_snapshot().await?;
     let metrics = CacheMetrics::default();
-    let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(NewestFirst);
+    let policy: Arc<dyn crate::EvictionPolicy> = Arc::new(NewestFirst);
 
     // target_bytes = 0 keeps the sweep over target for the whole pass;
     // budget = 1 stops it after exactly one release, so only the
     // policy's first-ranked victim gets evicted.
-    let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0));
+    let released = std::sync::Mutex::new(Vec::new());
+    let on_release = |hash: Hash| {
+        if let Ok(mut v) = released.lock() {
+            v.push(hash);
+        }
+    };
     sweep(
         &cache,
         &metrics,
@@ -236,7 +238,7 @@ async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
         u64::MAX,
         &sizes,
         &policy,
-        &warming,
+        &on_release,
     )
     .await;
 
@@ -248,6 +250,11 @@ async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
     assert!(
         !remaining.contains_key(&newer_hash),
         "newer hash must be the one released under NewestFirst"
+    );
+    assert_eq!(
+        *released.lock().map_err(|_| anyhow::anyhow!("poisoned"))?,
+        vec![newer_hash],
+        "on_release must see exactly the released hash"
     );
     Ok(())
 }
@@ -268,10 +275,10 @@ async fn disk_clamp_drives_eviction_below_configured_size() -> anyhow::Result<()
         hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
     }
 
-    let origin = std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
     let cache = CacheEngine::open(
         cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+        vec![origin as std::sync::Arc<dyn crate::Origin>],
         16,
     )
     .await?;
@@ -280,8 +287,8 @@ async fn disk_clamp_drives_eviction_below_configured_size() -> anyhow::Result<()
     }
 
     let metrics = CacheMetrics::default();
-    let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(decdn_cache::LruEviction);
-    let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0));
+    let policy: Arc<dyn crate::EvictionPolicy> = Arc::new(crate::LruEviction);
+    let on_release = |_: Hash| {};
     let mut state = DriverState::default();
 
     // config budget is effectively unbounded, so on its own it would never
@@ -294,7 +301,14 @@ async fn disk_clamp_drives_eviction_below_configured_size() -> anyhow::Result<()
         target_pct: 80,
     };
     tick(
-        &cache, &metrics, ceiling, 0, 16, &mut state, &policy, &warming,
+        &cache,
+        &metrics,
+        ceiling,
+        0,
+        16,
+        &mut state,
+        &policy,
+        &on_release,
     )
     .await;
 
@@ -325,11 +339,10 @@ async fn restarted_over_limit_cache_evicts_without_traffic() -> anyhow::Result<(
         hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
     }
     {
-        let origin =
-            std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+        let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
         let cache = CacheEngine::open(
             cache_dir.path(),
-            vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+            vec![origin as std::sync::Arc<dyn crate::Origin>],
             16,
         )
         .await?;
@@ -343,8 +356,8 @@ async fn restarted_over_limit_cache_evicts_without_traffic() -> anyhow::Result<(
     // the restart.
     let cache = CacheEngine::open(cache_dir.path(), Vec::new(), 16).await?;
     let metrics = CacheMetrics::default();
-    let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(decdn_cache::LruEviction);
-    let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0));
+    let policy: Arc<dyn crate::EvictionPolicy> = Arc::new(crate::LruEviction);
+    let on_release = |_: Hash| {};
     let mut state = DriverState::default();
 
     // A 1-byte budget puts the reopened cache over high water. free_bytes =
@@ -363,7 +376,7 @@ async fn restarted_over_limit_cache_evicts_without_traffic() -> anyhow::Result<(
         16,
         &mut state,
         &policy,
-        &warming,
+        &on_release,
     )
     .await;
 
@@ -384,9 +397,9 @@ async fn restarted_over_limit_cache_evicts_without_traffic() -> anyhow::Result<(
 
 /// ADR 040 end-to-end coverage: `tinylfu` admission + eviction,
 /// wired the way `crates/node/src/runtime/mod.rs` wires them — one shared
-/// [`decdn_cache::policy::TinyLfuEstimator`] feeding both a
-/// [`decdn_cache::policy::ProbationAdmission`] and the
-/// [`decdn_cache::policy::TinyLfuEviction`] sweep policy. Admits many
+/// [`crate::policy::TinyLfuEstimator`] feeding both a
+/// [`crate::policy::ProbationAdmission`] and the
+/// [`crate::policy::TinyLfuEviction`] sweep policy. Admits many
 /// distinct one-hit blobs (real `populate_local` misses through a real
 /// `CacheEngine` + `FilesystemOrigin`), drives one real [`sweep`] under a
 /// small `probation_target_pct`, and asserts the probation footprint the
@@ -394,8 +407,8 @@ async fn restarted_over_limit_cache_evicts_without_traffic() -> anyhow::Result<(
 /// graduated to `Main` — the observable [`CacheEngine::segment_of`] exposes.
 #[tokio::test]
 async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
-    use decdn_cache::Segment;
-    use decdn_cache::policy::{ProbationAdmission, TinyLfuEstimator, TinyLfuEviction};
+    use crate::Segment;
+    use crate::policy::{ProbationAdmission, TinyLfuEstimator, TinyLfuEviction};
 
     let promotion_threshold: u32 = 2;
     let probation_target_pct: u64 = 10;
@@ -411,15 +424,15 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
     }
     let hot_hash = write_origin_blob(origin_dir.path(), b"probation cap test: hot blob")?;
 
-    let origin = std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
     let cache = CacheEngine::open(
         cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+        vec![origin as std::sync::Arc<dyn crate::Origin>],
         16,
     )
     .await?;
 
-    let freq: std::sync::Arc<dyn decdn_cache::FrequencyEstimator> =
+    let freq: std::sync::Arc<dyn crate::FrequencyEstimator> =
         std::sync::Arc::new(TinyLfuEstimator::new(4096));
     cache.set_frequency_estimator(freq.clone());
     cache.set_admission_policy(std::sync::Arc::new(ProbationAdmission {
@@ -456,7 +469,7 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
 
     let sizes = cache.size_snapshot().await?;
     let metrics = CacheMetrics::default();
-    let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(TinyLfuEviction::new(
+    let policy: Arc<dyn crate::EvictionPolicy> = Arc::new(TinyLfuEviction::new(
         freq.clone(),
         promotion_threshold,
         probation_target_pct,
@@ -467,7 +480,7 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
     // (phase 3) inert, so only the probation cap (phase 2) drives
     // eviction here; a wide budget lets the whole cap overage clear in
     // one sweep.
-    let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0));
+    let on_release = |_: Hash| {};
     sweep(
         &cache,
         &metrics,
@@ -477,7 +490,7 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
         cache_bytes,
         &sizes,
         &policy,
-        &warming,
+        &on_release,
     )
     .await;
 
@@ -506,7 +519,7 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
 /// colds land after it).
 #[tokio::test]
 async fn hot_set_survives_cold_scan() -> anyhow::Result<()> {
-    use decdn_cache::policy::{TinyLfuEstimator, TinyLfuEviction};
+    use crate::policy::{TinyLfuEstimator, TinyLfuEviction};
 
     let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
@@ -518,15 +531,15 @@ async fn hot_set_survives_cold_scan() -> anyhow::Result<()> {
         cold_hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
     }
 
-    let origin = std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
     let cache = CacheEngine::open(
         cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+        vec![origin as std::sync::Arc<dyn crate::Origin>],
         16,
     )
     .await?;
 
-    let freq: std::sync::Arc<dyn decdn_cache::FrequencyEstimator> =
+    let freq: std::sync::Arc<dyn crate::FrequencyEstimator> =
         std::sync::Arc::new(TinyLfuEstimator::new(4096));
     cache.set_frequency_estimator(freq.clone());
     // Admission stays default (`AlwaysAdmit`) — this test exercises the
@@ -547,7 +560,7 @@ async fn hot_set_survives_cold_scan() -> anyhow::Result<()> {
 
     let sizes = cache.size_snapshot().await?;
     let metrics = CacheMetrics::default();
-    let policy: Arc<dyn decdn_cache::EvictionPolicy> =
+    let policy: Arc<dyn crate::EvictionPolicy> =
         Arc::new(TinyLfuEviction::new(freq.clone(), 2, 100));
 
     let effective: u64 = sizes.values().sum();
@@ -565,7 +578,7 @@ async fn hot_set_survives_cold_scan() -> anyhow::Result<()> {
         effective,
         &sizes,
         &policy,
-        &Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
+        &|_: Hash| {},
     )
     .await;
 
@@ -598,10 +611,10 @@ async fn lru_default_unchanged() -> anyhow::Result<()> {
     let c = write_origin_blob(origin_dir.path(), b"lru golden test: blob C")?;
     let d = write_origin_blob(origin_dir.path(), b"lru golden test: blob D")?;
 
-    let origin = std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
     let cache = CacheEngine::open(
         cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+        vec![origin as std::sync::Arc<dyn crate::Origin>],
         16,
     )
     .await?;
@@ -617,7 +630,7 @@ async fn lru_default_unchanged() -> anyhow::Result<()> {
 
     let sizes = cache.size_snapshot().await?;
     let metrics = CacheMetrics::default();
-    let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(decdn_cache::LruEviction);
+    let policy: Arc<dyn crate::EvictionPolicy> = Arc::new(crate::LruEviction);
     let effective: u64 = sizes.values().sum();
 
     // budget = 2, target = 0: evicts exactly the two oldest-by-access —
@@ -631,7 +644,7 @@ async fn lru_default_unchanged() -> anyhow::Result<()> {
         effective,
         &sizes,
         &policy,
-        &Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
+        &|_: Hash| {},
     )
     .await;
 
