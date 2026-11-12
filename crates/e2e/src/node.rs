@@ -1429,13 +1429,19 @@ fn line_with_all<'a>(log: &'a str, needles: &[&str]) -> Option<&'a str> {
         .find(|line| needles.iter().all(|needle| line.contains(needle)))
 }
 
-/// Write `blob` into a filesystem-origin shard layout (`{root}/{hex[..2]}/{hex}`).
+/// Write `blob` into a filesystem-origin shard layout (`{root}/{hex[..2]}/{hex}`)
+/// with its `{hex}.sizeproof` sibling, as `decdn origin import` writes it.
 fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> anyhow::Result<()> {
     let hex = hash.to_hex();
     let shard = hex.as_str().get(..2).context("blob hex too short")?;
     let dir = root.join(shard);
     std::fs::create_dir_all(&dir).context("create origin shard dir")?;
     std::fs::write(dir.join(hex.as_str()), blob).context("write origin blob")?;
+    let size = u64::try_from(blob.len()).context("blob length")?;
+    let encoded =
+        decdn_bao_range::encode_outboard(blob, size).context("encode origin size proof")?;
+    std::fs::write(dir.join(encoded.size_proof_name()), &encoded.size_proof)
+        .context("write origin size proof")?;
     Ok(())
 }
 

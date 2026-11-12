@@ -305,7 +305,10 @@ pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{Funder, PeerSource, PoolReplaced, Recovery, SourceFuture};
 pub use source_set::{Holder, NoAffordableSource, NoNodeWillServe, NoSourceHasBlob, StaticSources};
 pub use stop::{ClockHold, GaveUp, ProgressClock, StopPolicy};
-pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
+pub use streamer::{
+    LiveReader, ScratchStores, StreamCandidate, StreamDrive, StreamStore, StreamStores, Streamer,
+    VerifiedReader,
+};
 
 // The engine seams the node and the `decdn` CLI drive directly. They are
 // public so those crates can reach them, hidden from the docs and the

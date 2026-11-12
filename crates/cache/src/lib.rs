@@ -19,6 +19,7 @@
 //! | Share one in-progress fill between several readers | [`FillRegistry`], [`FillSession`] |
 //! | Pick an origin backend | [`FilesystemOrigin`], [`HttpOrigin`], `S3Origin` (feature `s3`), or your own [`Origin`] |
 //! | Choose what to admit and what to evict | [`AdmissionPolicy`], [`EvictionPolicy`] ([ADR 040]) |
+//! | Hold the store under its size ceiling | [`eviction_driver::run`] |
 //! | Bound a failing origin | [`OriginBreaker`], [`RetryPolicy`] |
 //!
 //! # Seams
@@ -44,6 +45,7 @@
 pub mod circuit_breaker;
 pub mod engine;
 pub mod error;
+pub mod eviction_driver;
 pub mod fill_session;
 pub mod metrics;
 pub mod origin;
@@ -75,6 +77,7 @@ pub use engine::{
 pub use error::{
     CacheError, CacheResult, ErrorChain, OriginError, OriginPullError, SupportedEncoding,
 };
+pub use eviction_driver::EvictionParams;
 pub use fill_session::{
     Demand, DemandSlot, DownstreamWatch, FillClaim, FillError, FillRegistry, FillSession, Frontier,
     HashOutboard, ObserverLease, SessionOutboardReader, ended_at_held_bytes_cap, is_unlanded,

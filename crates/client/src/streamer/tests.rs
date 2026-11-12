@@ -9,10 +9,10 @@ use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use tokio::io::AsyncReadExt;
 
-use super::{StreamCandidate, Streamer, VerifiedReader};
+use super::{ScratchStores, StreamCandidate, StreamStore, StreamStores, Streamer, VerifiedReader};
 use crate::pacer::PULL_WINDOW_FLOOR;
 use crate::sink::MemoryBlobCache;
-use crate::source::{BlobSource, FakeFunder, Recovery, ScriptedSource, SourceFuture};
+use crate::source::{BlobSource, FakeFunder, IngestStore, Recovery, ScriptedSource, SourceFuture};
 use crate::{
     BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, ProgressClock, PullConfig,
     StaticSources, StopPolicy, UpstreamPullHeader, VoucherProgress,
@@ -1208,6 +1208,129 @@ async fn a_lying_source_is_passed_over_for_an_honest_one() -> anyhow::Result<()>
     anyhow::ensure!(
         !asked_liar.opened_ranges().is_empty(),
         "the liar was asked and refused"
+    );
+    Ok(())
+}
+
+/// A store type other than the default, delegating to a [`ClientRangedStore`].
+struct WrappedStore(crate::ClientRangedStore);
+
+impl decdn_bao_range::RangedStore for WrappedStore {
+    fn total_bytes(&self) -> u64 {
+        self.0.total_bytes()
+    }
+    fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+        self.0.present_ranges()
+    }
+    fn missing_ranges(
+        &self,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+        self.0.missing_ranges(byte_offset, byte_len)
+    }
+    fn admit(
+        &self,
+        range: AlignedRange,
+        bao_bytes: Bytes,
+    ) -> decdn_bao_range::RangedFuture<'_, ()> {
+        self.0.admit(range, bao_bytes)
+    }
+    fn read(&self, byte_offset: u64, byte_len: u64) -> decdn_bao_range::RangedFuture<'_, Bytes> {
+        self.0.read(byte_offset, byte_len)
+    }
+    fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
+        self.0.is_complete()
+    }
+    fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
+        self.0.finalize()
+    }
+}
+
+impl IngestStore for WrappedStore {
+    fn ingest_stream<'a, R>(
+        &'a self,
+        range: &'a AlignedRange,
+        reader: R,
+        on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+        claimed_total: u64,
+        stop_at: Option<&'a std::sync::atomic::AtomicU64>,
+    ) -> crate::source::IngestFuture<'a, R>
+    where
+        R: crate::source::BaoRangeReader + 'a,
+    {
+        IngestStore::ingest_stream(&self.0, range, reader, on_progress, claimed_total, stop_at)
+    }
+    fn flush_present_record(&self) -> SourceFuture<'_, ()> {
+        IngestStore::flush_present_record(&self.0)
+    }
+    fn proven(&self) -> Option<u64> {
+        IngestStore::proven(&self.0)
+    }
+    fn set_bound(&self, bound: u64) {
+        IngestStore::set_bound(&self.0, bound);
+    }
+    fn prove_size(&self, size: u64) {
+        IngestStore::prove_size(&self.0, size);
+    }
+}
+
+impl StreamStore for WrappedStore {
+    fn present_grew(&self) -> &tokio::sync::Notify {
+        StreamStore::present_grew(&self.0)
+    }
+}
+
+/// Opens a [`WrappedStore`] in `dir` and counts the opens.
+struct WrappedStores {
+    dir: std::path::PathBuf,
+    opened: std::sync::atomic::AtomicUsize,
+}
+
+impl StreamStores for WrappedStores {
+    type Store = WrappedStore;
+
+    async fn open(&self, hash: [u8; 32], total_bytes: u64) -> anyhow::Result<WrappedStore> {
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let store = ScratchStores::new(&self.dir)
+            .open(hash, total_bytes)
+            .await?;
+        Ok(WrappedStore(store))
+    }
+}
+
+/// A streamer built with caller-supplied stores fills the store they open,
+/// and the stream it reads back is the blob.
+#[tokio::test]
+async fn a_stream_fills_the_store_its_stores_open() -> anyhow::Result<()> {
+    let blob = payload(1_500_000);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let root = source.root();
+    let scratch = tempfile::tempdir()?;
+    let stores = WrappedStores {
+        dir: scratch.path().to_path_buf(),
+        opened: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let sources = StaticSources::new(vec![candidate(source, ledger, 0xA1)])?;
+    let holders = sources.holders();
+    let streamer = Streamer::with_stores(sources, funder(), &stores).holders(holders);
+    let (mut reader, mut drive) = streamer
+        .open(
+            root,
+            u64::try_from(blob.len())?,
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    drive.finish().await?;
+    anyhow::ensure!(out == blob, "the stream must be byte-identical");
+    anyhow::ensure!(
+        stores.opened.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "the stream opens exactly one store through its stores"
     );
     Ok(())
 }
