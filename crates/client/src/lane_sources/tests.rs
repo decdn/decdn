@@ -685,8 +685,25 @@ fn a_size_open_pulls_the_streamed_first_leg_except_for_the_empty_blob() -> anyho
     Ok(())
 }
 
-/// The primed leg carries the size the streamer sizes its store at: the
-/// signed size, or the cap's reach when the blob runs past it (#2644).
+/// A size lookup streams the blob's first byte, so its open asks for one
+/// chunk group however large the blob is.
+#[test]
+fn a_first_byte_size_open_asks_for_one_chunk_group() -> anyhow::Result<()> {
+    use super::{FirstLeg, size_open_span};
+    let lookup = FirstLeg::Streamed {
+        window: (0, 1),
+        read_ahead: 0,
+    };
+    let span = size_open_span([7; 32], lookup, 0).ok_or_else(|| anyhow::anyhow!("no span"))?;
+    anyhow::ensure!(
+        span.fetch_start() == 0 && span.fetch_end() == decdn_bao_range::CHUNK_GROUP_BYTES,
+        "{span:?}"
+    );
+    Ok(())
+}
+
+/// The primed leg carries the proven size the streamer sizes its store at
+/// (#2644).
 #[test]
 fn the_primed_first_leg_carries_the_streamers_store_size() -> anyhow::Result<()> {
     use super::{FirstLeg, primed_first_leg, size_open_span};
@@ -696,17 +713,14 @@ fn the_primed_first_leg_carries_the_streamers_store_size() -> anyhow::Result<()>
         read_ahead: 0,
     };
     let total = 3 * window + 1234;
-    for (cap, store_bytes) in [(0, total), (2 * window, 2 * window)] {
-        let span =
-            size_open_span([7; 32], streamed, cap).ok_or_else(|| anyhow::anyhow!("no span"))?;
-        let leg = primed_first_leg(streamed, cap, &span, total)
-            .ok_or_else(|| anyhow::anyhow!("cap {cap}: the pull is not the leg"))?;
-        anyhow::ensure!(leg.blob_size() == store_bytes, "cap {cap}: {leg:?}");
-        anyhow::ensure!(
-            (leg.fetch_start(), leg.fetch_end()) == (span.fetch_start(), span.fetch_end()),
-            "cap {cap}: {leg:?} vs {span:?}"
-        );
-    }
+    let span = size_open_span([7; 32], streamed, 0).ok_or_else(|| anyhow::anyhow!("no span"))?;
+    let leg = primed_first_leg(streamed, 0, &span, total)
+        .ok_or_else(|| anyhow::anyhow!("the pull is not the leg"))?;
+    anyhow::ensure!(leg.blob_size() == total, "{leg:?}");
+    anyhow::ensure!(
+        (leg.fetch_start(), leg.fetch_end()) == (span.fetch_start(), span.fetch_end()),
+        "{leg:?} vs {span:?}"
+    );
     // A blob shorter than the window: the node clamps the pull, which is then
     // the whole blob.
     let short = window / 2;

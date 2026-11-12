@@ -398,9 +398,9 @@ pub struct ProbeOpts<'a> {
     pub marks: Option<&'a dyn FetchMarks>,
     /// How the probe round ends.
     pub round: ProbeRound,
-    /// The blob's size as the caller knows it (a bundle manifest's entry
-    /// size, or one an earlier fetch verified): the fetch's first size claim,
-    /// in place of any probe's hint. A pinned node is not probed for it.
+    /// A size of the blob an earlier fetch proved or verified: the fetch's
+    /// first size when no probe answer proves one. A pinned node is not
+    /// probed for it. A declared size (a bundle manifest's) is never one.
     pub known_size: Option<u64>,
 }
 
@@ -547,7 +547,7 @@ pub(crate) fn classify_probe(
         timestamp_us,
     ) {
         // The answer counts as none: discovery drops the candidate from
-        // selection, and a pinned node keeps no size hint. The operator needs
+        // selection, and a pinned node gives no size. The operator needs
         // told why, so log it at `warn`.
         tracing::warn!(
             "ignoring an unverifiable probe response from {}: {e}",
@@ -771,8 +771,8 @@ where
     })
 }
 
-/// The size hint of the nearest holder that gave one: the fetch's first size
-/// claim ([`ResolvedTargets::size_hint`]).
+/// The proven size of the nearest holder that gave one: the fetch's first
+/// size ([`ResolvedTargets::size_hint`]).
 fn nearest_size_hint(holders: &[discovery::Probed]) -> Option<u64> {
     holders
         .iter()
@@ -1298,11 +1298,12 @@ pub struct ResolvedTargets {
     /// The one candidate is the `--node-id` the user pinned. It counts as a
     /// holder, as a probe-reported holder does.
     pub(crate) pinned: bool,
-    /// The blob size the nearest probed holder reported, an unsigned hint
-    /// ([`discovery::Probed::total_bytes`]). `None` when nothing was probed
-    /// (the peer-store fast path, a pinned rediscovery, a pinned bundle entry
-    /// whose manifest gives its size), when no holder knew it, or when a
-    /// pinned `--node-id`'s probe failed or named no size.
+    /// The blob size the nearest probed holder proved
+    /// ([`discovery::Probed::total_bytes`]), or else a size an earlier fetch
+    /// proved or verified ([`ProbeOpts::known_size`]). `None` when nothing was
+    /// probed and no size is known (the peer-store fast path, a pinned
+    /// rediscovery), when no holder stated it, or when a pinned `--node-id`'s
+    /// probe failed or named no size.
     pub(crate) size_hint: Option<u64>,
     /// The probes a streamed round left pending ([`ProbeRound::Stream`]).
     /// Empty on every other path.
@@ -1348,9 +1349,9 @@ impl ResolvedTargets {
     }
 }
 
-/// The one holder of a pinned `--node-id` at `provider`, with no size hint.
-/// A fetch that knows the blob's size (a manifest's entry size) takes that
-/// as its hint; any other fetch takes one from a probe of the node
+/// The one holder of a pinned `--node-id` at `provider`, with no size.
+/// A fetch that knows the blob's size ([`ProbeOpts::known_size`]) takes that
+/// as its first size; any other fetch takes one from a probe of the node
 /// ([`probe_pinned`]).
 pub(crate) fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
     ResolvedTargets {
@@ -1373,7 +1374,7 @@ pub(crate) fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedT
 }
 
 /// Resolve the holders to fetch from (#1174): the pinned node as the one
-/// holder, with the size its probe reports as the first size claim, or
+/// holder, with the size its probe proves as the fetch's size, or
 /// auto-discovery (#936) when nothing is pinned (deriving each provider from
 /// its node's registry entry), nearest first. The acquire loop stripes across
 /// them; a set that goes stale is refreshed by a later discovery with
@@ -1394,7 +1395,7 @@ pub async fn resolve_target_node(
     hash: [u8; 32],
     probe: ProbeOpts<'_>,
 ) -> anyhow::Result<ResolvedTargets> {
-    // The pinned probe reads a size hint and is no reachability pre-check: a
+    // The pinned probe reads a proven size and is no reachability pre-check: a
     // failed probe ends nothing, and a known size needs no probe. The endpoint
     // is discovery-enabled, so a node id resolves through its discovery and
     // default relays even with no direct address or configured relay. A
@@ -1443,8 +1444,8 @@ pub async fn resolve_target_node(
         probe,
     )
     .await?;
-    if let Some(size) = probe.known_size {
-        order.size_hint = Some(size);
+    if order.size_hint.is_none() {
+        order.size_hint = probe.known_size;
     }
     if !order.candidates.is_empty() {
         // A header event, then one event per candidate — the log-side shape of
@@ -1503,16 +1504,16 @@ pub(crate) fn pinned_target(
     (cand, target)
 }
 
-/// How long the size probe of a pinned node may take. The hint saves at most
+/// How long the size probe of a pinned node may take. The size saves at most
 /// the credit window a header-only open makes the node write, so a slow probe
 /// is not worth the wait: the fetch takes its size from that open instead.
 const PINNED_PROBE_TIMEOUT_MS: u64 = 2_000;
 
-/// The pinned node as its own only holder, with the size its probe reports as
-/// the first size claim. Without a size, the fetch reads one from the header
+/// The pinned node as its own only holder, with the size its probe proves as
+/// the fetch's size. Without a size, the fetch reads one from the header
 /// of a paid open, and the node can write up to a credit window into that
 /// stream before the fetch drops it. A probe that fails, that does not verify,
-/// or whose node does not hold the blob or names no size leaves the claim to
+/// or whose node does not hold the blob or names no size leaves the size to
 /// that header: the node stays the fetch's only holder either way. One
 /// attempt, with no backoff on a shed probe: a pinned client sends every
 /// probe to the one node, and a shed one costs only the header open. The
@@ -1563,8 +1564,8 @@ pub(crate) async fn probe_pinned(
     targets
 }
 
-/// The size a probe outcome offers as a first size claim: the unsigned size a
-/// holder reports in an answer whose signature verifies, else none.
+/// The size a probe outcome offers as the fetch's size: the size a holder
+/// proves in an answer whose signature and size proof verify, else none.
 const fn probed_size_hint(outcome: &ProbeOutcome) -> Option<u64> {
     match outcome {
         ProbeOutcome::Holder(probed, _) => probed.total_bytes,

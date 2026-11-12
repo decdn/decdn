@@ -399,8 +399,8 @@ pub fn align_range(
 }
 
 /// [`align_range`], but an end past the blob clamps to the blob's end instead
-/// of being refused: a claimed size is a hint, and the planner's bound can
-/// overshoot it. Only `byte_offset >= blob_size` (for a non-empty blob) is
+/// of being refused: a request may ask past the end, and a node serves up to
+/// it. Only `byte_offset >= blob_size` (for a non-empty blob) is
 /// refused, with [`RangeVerifyError::RangeOutOfBounds`]: a start past the end
 /// has no chunk group to anchor, clamped or not. `(0, 0)` means the whole
 /// blob, and the empty blob is addressable only as `(0, 0)`, exactly as in

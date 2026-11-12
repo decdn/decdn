@@ -115,8 +115,8 @@ pub(crate) struct PullLegTarget {
     candidates: Vec<Candidate>,
     /// The handshake's pull, opened at the first leg the pull leg is expected to
     /// open, for that leg to adopt (#2063). `None` when the handshake kept no
-    /// first-leg pull: no prime or size hint, no predictable leg, a bounded open
-    /// past the blob's end, or a signed size that differs from the hint.
+    /// first-leg pull: no prime or probed size, no predictable leg, a bounded
+    /// open past the blob's end, or a signed size that differs from the probed one.
     primed: Option<PrimedHandshake>,
 }
 
@@ -127,8 +127,7 @@ impl PullLegTarget {
     }
 
     /// The part of `gap` no candidate covers ([`super::ranged_pull::uncovered`]),
-    /// judged against the signed `total_bytes` rather than any candidate's
-    /// unsigned size hint.
+    /// judged against the handshake's proven `total_bytes`.
     pub(crate) fn uncovered(&self, gap: &ChunkRanges) -> ChunkRanges {
         let coverages: Vec<decdn_protocol::Coverage> =
             self.candidates.iter().map(|c| c.coverage.clone()).collect();
@@ -208,10 +207,10 @@ impl PrimeLeg {
         let request_end = if self.len == 0 {
             total_bytes
         } else {
-            // `saturating_add`, not `checked_add`: an overflowing end (a grown
-            // size claim can widen `self.len` toward `u64::MAX`) primes a
-            // first leg too; the `.min(total_bytes)` below clamps it back down
-            // regardless of how far the raw sum overshot.
+            // `saturating_add`, not `checked_add`: an overflowing end (a request
+            // may ask for a `self.len` near `u64::MAX`) primes a first leg too;
+            // the `.min(total_bytes)` below clamps it back down regardless of
+            // how far the raw sum overshot.
             self.offset
                 .saturating_add(self.len)
                 .div_ceil(CHUNK_GROUP_BYTES)
@@ -684,7 +683,8 @@ impl NodeOrigin {
     /// therefore opens the pull leg's own first leg and parks the pull in the
     /// target for that leg to adopt (#2063). Otherwise it opens one chunk group
     /// of a block the candidate advertised, reads the header, and drops the pull;
-    /// only without a size hint it can trust does it open the whole blob.
+    /// only without a probed size to cut a range from does it open the whole
+    /// blob.
     ///
     /// `requester` is the node the serve answers. It is never a candidate: pulling
     /// from it would hand it back its own bytes, and two nodes that each lack part
@@ -853,8 +853,9 @@ impl NodeOrigin {
         let mut last_fault = None;
         let coverages: Vec<decdn_protocol::Coverage> =
             ranked.iter().map(|c| c.coverage.clone()).collect();
-        // The size the order plans over is a probe hint; each candidate's own
-        // hint cuts its primed leg in `handshake_total_bytes`.
+        // The size the order plans over is the first probed size; each
+        // candidate's own probed size cuts its primed leg in
+        // `handshake_total_bytes`.
         let total_hint = ranked.iter().find_map(|c| c.total_bytes_hint);
         let visits = handshake_order(&coverages, total_hint, prime)
             .into_iter()
@@ -906,10 +907,10 @@ impl NodeOrigin {
     /// pull's first lane to this provider reuses it.
     ///
     /// With a `prime` and the candidate's probe-reported size, the handshake opens
-    /// [`PrimeLeg::predicted_leg`]. The size is unsigned, so a bounded open that
-    /// fails (a range past a smaller blob's end) is asked again for the whole blob
-    /// before the candidate counts as failed, and a pull whose signed size differs
-    /// from the hint is dropped: its range was cut from the wrong size.
+    /// [`PrimeLeg::predicted_leg`]. A bounded open that fails anyway (a range past
+    /// the blob's end) is asked again for the whole blob before the candidate
+    /// counts as failed, and a pull whose signed size differs from the probed one
+    /// is dropped: its range was cut from another size.
     // Straight-line resolve → gate → open → bind → handshake; the bounded first
     // attempt adds one branch to a flow that reads best in one piece.
     #[allow(clippy::too_many_lines)]

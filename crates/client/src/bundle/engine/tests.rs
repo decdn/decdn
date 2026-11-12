@@ -5362,3 +5362,24 @@ async fn planned_work_leaves_out_colliding_entries() {
         );
     }
 }
+
+/// Dedup ranges planned from a manifest's declared size drive the entry only
+/// when the size is the proven one: a declared size above or below it, or
+/// none, fetches the whole blob.
+#[test]
+fn dedup_ranges_hold_only_at_the_proven_size() {
+    let ranges: &[(u64, u64)] = &[(0, 1024), (8192, 4096)];
+    let proven = 16_384;
+    assert_eq!(
+        ranges_at_proven_size(Some(ranges), Some(proven), proven),
+        Some(ranges)
+    );
+    for declared in [Some(1 << 60), Some(proven - 1), Some(0), None] {
+        assert_eq!(
+            ranges_at_proven_size(Some(ranges), declared, proven),
+            None,
+            "{declared:?}"
+        );
+    }
+    assert_eq!(ranges_at_proven_size(None, Some(proven), proven), None);
+}

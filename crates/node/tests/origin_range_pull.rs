@@ -810,6 +810,7 @@ async fn range_request_with_outboard_outage_falls_back_to_whole_blob() -> anyhow
     let (req_off, req_len) = (16 * 1024u64, 32 * 1024u64);
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // HEAD answers and a plain whole-blob GET is served, but `{H}.obao4`
     // answers 503: the outboard half of the probe faults.
     Mock::given(method("HEAD"))
@@ -912,6 +913,7 @@ async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> a
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // The size answers but the outboard answers 503. Nothing else is mounted:
     // no fill tier can serve.
     Mock::given(method("HEAD"))
@@ -1010,6 +1012,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // Mount the full range-pull surface; the assertion is that NONE of it is hit.
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
@@ -1317,6 +1320,7 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
@@ -1411,6 +1415,7 @@ async fn end_past_the_blob_is_served_clamped_not_refused() -> anyhow::Result<()>
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
@@ -1518,6 +1523,7 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
@@ -1858,6 +1864,7 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -2022,6 +2029,7 @@ async fn tail_open_ahead_of_a_stalled_owner_does_not_starve() -> anyhow::Result<
     let tail_off = 2 * 1024 * 1024u64;
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -2149,6 +2157,7 @@ async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Res
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -2289,6 +2298,7 @@ async fn no_range_origin_degrades_to_buffered_before_signing() -> anyhow::Result
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -2482,6 +2492,7 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // The size and the outboard answer, but the probe's ranged read of the first
     // chunk group hangs past the origin read budget set below: a transport-class
     // timeout fault, unlike a decline. Nothing else is mounted: no fill tier can
@@ -2954,6 +2965,7 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
         .to_vec();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
@@ -3146,6 +3158,7 @@ async fn a_bounded_miss_seeds_only_the_held_ranges_inside_it() -> anyhow::Result
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -3305,6 +3318,7 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // (1) HEAD → size probe SUCCEEDS (serviceability).
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
@@ -3513,6 +3527,7 @@ async fn mid_blob_open_behind_a_paying_owners_frontier_attaches() -> anyhow::Res
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(

@@ -97,6 +97,26 @@ fn gap_extent(gap: &ChunkRanges, lo: u64, hi: u64) -> Option<(u64, u64)> {
     (end > start).then_some((start, end))
 }
 
+/// The discovery blocks, below `blocks`, that `gap` can touch: from the block
+/// of its first chunk through the block of its last. A planner walks only
+/// these, so its work tracks the gap, never the size of the blob. An
+/// open-ended gap runs to `blocks`.
+fn touched_blocks(gap: &ChunkRanges, blocks: u32) -> std::ops::Range<u32> {
+    let bounds = gap.boundaries();
+    let Some(first) = bounds.first() else {
+        return 0..0;
+    };
+    let per = chunks_per_block();
+    let lo = u32::try_from(first.0 / per).unwrap_or(u32::MAX).min(blocks);
+    let hi = match bounds.last() {
+        Some(end) if bounds.len().is_multiple_of(2) => {
+            u32::try_from(end.0.div_ceil(per)).unwrap_or(u32::MAX)
+        }
+        _ => blocks,
+    };
+    lo..hi.min(blocks)
+}
+
 /// The chunk-range span of discovery block `block`: `block * 65536` through
 /// `(block + 1) * 65536`, exclusive, in [`ChunkNum`] units.
 fn block_chunks(block: u32) -> ChunkRanges {
@@ -199,7 +219,7 @@ pub(crate) fn covered_part(
     total_bytes: u64,
 ) -> ChunkRanges {
     let mut held = ChunkRanges::empty();
-    for block in (0..num_blocks(total_bytes)).filter(|&b| coverage.covers(b)) {
+    for block in touched_blocks(chunks, num_blocks(total_bytes)).filter(|&b| coverage.covers(b)) {
         held |= block_chunks(block);
     }
     chunks & &held
@@ -226,8 +246,9 @@ pub(crate) fn covering_sources(
 /// Node planner: concentrate on as few sources as possible, minimizing flips
 /// (#1506, ADR 001).
 ///
-/// Walks discovery blocks `0..num_blocks(total_bytes)` in offset order,
-/// considering only blocks that intersect `gap`. For each such block, the
+/// Walks the discovery blocks below `num_blocks(total_bytes)` that `gap`
+/// touches, in offset order, considering only blocks that intersect `gap`.
+/// For each such block, the
 /// CURRENT run's source is kept if it still covers this block — sticky, no
 /// flip — even when a higher-ranked source also covers it; only when the
 /// current source's coverage ends does `covering_sources` pick a
@@ -244,13 +265,12 @@ pub fn plan_covered_runs(
     sources: &[SourceCoverage],
     rank: &[usize],
 ) -> (Vec<CoveredRun>, ChunkRanges) {
-    let n = num_blocks(total_bytes);
     let mut runs = Vec::new();
     let mut uncovered = ChunkRanges::empty();
     // Active run: (source_ix, first_block, last_block_so_far).
     let mut current: Option<(usize, u32, u32)> = None;
 
-    for block in 0..n {
+    for block in touched_blocks(gap, num_blocks(total_bytes)) {
         let chunks = block_chunks(block);
         if !gap.intersects(&chunks) {
             continue;
@@ -321,12 +341,12 @@ pub(crate) fn spread_segments(
     sources: &[SourceCoverage],
     rank: &[usize],
 ) -> (Vec<CoveredRun>, ChunkRanges) {
-    let n = num_blocks(total_bytes);
+    let touched = touched_blocks(gap, num_blocks(total_bytes));
     let mut uncovered = ChunkRanges::empty();
     let mut candidates_by_block: Vec<(u32, Vec<usize>)> = Vec::new();
     let mut is_uncovered: HashSet<u32> = HashSet::new();
 
-    for block in 0..n {
+    for block in touched.clone() {
         let chunks = block_chunks(block);
         if !gap.intersects(&chunks) {
             continue;
@@ -382,7 +402,7 @@ pub(crate) fn spread_segments(
 
     let mut runs = Vec::new();
     let mut current: Option<(usize, u32, u32)> = None;
-    for block in 0..n {
+    for block in touched {
         if let Some(&src) = assignment.get(&block) {
             current = match current {
                 Some((cur_src, start, last))

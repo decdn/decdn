@@ -748,13 +748,12 @@ fn size_hints_forget_the_oldest_past_the_bound() {
 }
 
 /// A blob an earlier fetch verified starts the next fetch at its size, so a
-/// pinned node is not probed for it; a declared size still comes first.
+/// pinned node is not probed for it.
 #[test]
 fn a_verified_size_is_the_next_fetchs_known_size() {
     let sizes = Mutex::new(SizeHints::default());
-    assert_eq!(known_size(&[5; 32], None, &sizes), None);
+    assert_eq!(known_size(&[5; 32], &sizes), None);
     sizes.lock().unwrap().insert([5; 32], 4096);
-    assert_eq!(known_size(&[5; 32], None, &sizes), Some(4096));
-    assert_eq!(known_size(&[6; 32], None, &sizes), None);
-    assert_eq!(known_size(&[5; 32], Some(10), &sizes), Some(10));
+    assert_eq!(known_size(&[5; 32], &sizes), Some(4096));
+    assert_eq!(known_size(&[6; 32], &sizes), None);
 }

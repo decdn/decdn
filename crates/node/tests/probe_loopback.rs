@@ -1705,6 +1705,39 @@ async fn probe_has_blob_false_for_a_chain_denied_empty_blob() -> anyhow::Result<
     Ok(())
 }
 
+/// A held blob the chain blacklist denies is probed as not held: no size, no
+/// proof, no coverage, though the store holds it and proves its size.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_states_no_size_or_proof_for_a_denied_held_blob() -> anyhow::Result<()> {
+    let payload = vec![0x3Cu8; 9000];
+    let (cache, hash, _cache_tmp) = support::cache_with_blob(&payload).await?;
+    anyhow::ensure!(
+        cache.size_proof(hash, payload.len() as u64).await.is_some(),
+        "precondition: the store proves the size"
+    );
+    cache.set_chain_denied_one(hash, true);
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (handler, signer, domain) = build_handler(server_id, 7, &metrics, limiter, cache);
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: now_us(),
+    };
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(!resp.body.has_blob, "a denied blob is not advertised");
+    anyhow::ensure!(
+        resp_ext.total_bytes.is_none() && resp_ext.size_proof.is_none(),
+        "a denied blob states no size and no proof: {resp_ext:?}"
+    );
+    anyhow::ensure!(resp_ext.coverage.is_empty(), "no block to advertise");
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
 /// #2471 with `max_probe_holds == 0`: the operator's store opt-out hides the
 /// empty root like every other store-backed blob. The `HoldsDisabled` arm
 /// settles presence as `false`, so the empty-root term never sees a holder.
@@ -2030,6 +2063,49 @@ async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow:
         resp_ext.consistent_with(&resp.body),
         "has_blob and coverage.is_empty() must be a biconditional"
     );
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// An origin object with its outboard but no `{H}.sizeproof` proves no size,
+/// so the probe states none and advertises no block of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_of_an_origin_object_without_a_size_proof_states_nothing() -> anyhow::Result<()> {
+    let payload = b"origin content imported before its size proof was written";
+    let origin_dir = tempfile::tempdir()?;
+    let hash = Hash::new(payload);
+    let eo = decdn_bao_range::encode_outboard(&payload[..], u64::try_from(payload.len())?)?;
+    let dir = origin_dir.path().join(eo.shard());
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(&eo.hash_hex), payload)?;
+    std::fs::write(dir.join(eo.obao4_name()), &eo.outboard)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (handler, signer, domain) = build_handler(server_id, 7, &metrics, limiter, cache);
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: now_us(),
+    };
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        resp_ext.total_bytes.is_none() && resp_ext.size_proof.is_none(),
+        "no proof, no size: {resp_ext:?}"
+    );
+    anyhow::ensure!(resp_ext.coverage.is_empty(), "no block without a size");
+    anyhow::ensure!(resp_ext.consistent_with(&resp.body));
     assert_slash_sig_valid(&resp, &signer, &domain)?;
     Ok(())
 }

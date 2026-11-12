@@ -10384,18 +10384,9 @@ async fn cache_with_two_blobs(
     decdn_cache::Hash,
     tempfile::TempDir,
 )> {
-    let hash_a = support::register_payload(a);
-    let hash_b = support::register_payload(b);
     let origin_dir = tempfile::tempdir()?;
-    for (payload, hash) in [(a, hash_a), (b, hash_b)] {
-        let hex = hash.to_hex();
-        let shard = hex
-            .get(..2)
-            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-        let dir = origin_dir.path().join(shard);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(hex.as_str()), payload)?;
-    }
+    let hash_a = support::seed_origin_object(origin_dir.path(), a)?;
+    let hash_b = support::seed_origin_object(origin_dir.path(), b)?;
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
@@ -11587,15 +11578,8 @@ async fn empty_cache_with_fs_origin(
     tempfile::TempDir,
     tempfile::TempDir,
 )> {
-    let hash = support::register_payload(payload);
     let origin_dir = tempfile::tempdir()?;
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let dir = origin_dir.path().join(shard);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(hex.as_str()), payload)?;
+    let hash = support::seed_origin_object(origin_dir.path(), payload)?;
     open_empty_cache_over_fs_origin(hash, origin_dir).await
 }
 
@@ -11611,17 +11595,16 @@ async fn empty_cache_with_fs_origin_and_outboard(
     tempfile::TempDir,
     tempfile::TempDir,
 )> {
-    let hash = support::register_payload(payload);
-    let encoded = decdn_bao_range::encode_outboard(payload, payload.len() as u64)?;
-    anyhow::ensure!(
-        encoded.hash_hex == hash.to_hex().as_str(),
-        "encoder hash mismatch"
-    );
     let origin_dir = tempfile::tempdir()?;
-    let shard = origin_dir.path().join(encoded.shard());
-    std::fs::create_dir_all(&shard)?;
-    std::fs::write(shard.join(&encoded.hash_hex), payload)?;
-    std::fs::write(shard.join(encoded.obao4_name()), &encoded.outboard)?;
+    let hash = support::seed_origin_object(origin_dir.path(), payload)?;
+    let encoded = decdn_bao_range::encode_outboard(payload, payload.len() as u64)?;
+    std::fs::write(
+        origin_dir
+            .path()
+            .join(encoded.shard())
+            .join(encoded.obao4_name()),
+        &encoded.outboard,
+    )?;
     open_empty_cache_over_fs_origin(hash, origin_dir).await
 }
 
@@ -11885,15 +11868,8 @@ async fn cache_with_foreign_blob_imported(
     Arc<CacheMetrics>,
     tempfile::TempDir,
 )> {
-    let hash = support::register_payload(payload);
     let origin_dir = tempfile::tempdir()?;
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let dir = origin_dir.path().join(shard);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(hex.as_str()), payload)?;
+    let hash = support::seed_origin_object(origin_dir.path(), payload)?;
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
@@ -12881,6 +12857,7 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
         let shard = origin_dir.path().join(encoded.shard());
         std::fs::create_dir_all(&shard)?;
         std::fs::write(shard.join(&encoded.hash_hex), &payload)?;
+        std::fs::write(shard.join(encoded.size_proof_name()), &encoded.size_proof)?;
         if holds == OriginHolds::BlobAndOutboard {
             std::fs::write(shard.join(encoded.obao4_name()), &encoded.outboard)?;
         }

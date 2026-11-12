@@ -457,8 +457,7 @@ fn probe_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::er
     let response = encode_probe_response(&response, Some(&ext))?;
     assert_eq!(response.len(), 4808, "ProbeResponse + ext at full width");
 
-    for len in [request.len(), response.len()] {
-        assert!(len <= MAX_PROBE_FRAME as usize);
-    }
+    assert!(request.len() <= MAX_PROBE_REQUEST_FRAME as usize);
+    assert!(response.len() <= MAX_PROBE_FRAME as usize);
     Ok(())
 }

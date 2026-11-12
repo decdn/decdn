@@ -220,9 +220,14 @@ pub fn size_proof_from_tail_wire(
         return Err(SizeProofError::Verification { blob_size: size });
     }
     let mut pairs = pairs.iter();
-    build_proof(root, size, tail, |_left| {
+    let proof = build_proof(root, size, tail, |_left| {
         pairs.next().map(<[u8; PAIR_BYTES]>::as_slice)
-    })
+    })?;
+    // A wire for this size carries exactly the pairs the walk takes.
+    if pairs.next().is_some() {
+        return Err(SizeProofError::Verification { blob_size: size });
+    }
+    Ok(proof)
 }
 
 /// Walk the right edge of the tree of a `size`-byte blob from the root to its

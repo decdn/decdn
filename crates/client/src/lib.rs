@@ -2245,10 +2245,9 @@ async fn fetch_inner(
 /// ([`UpstreamPull::next_chunk`] under a [`PullReader`]) with an in-memory `Vec`
 /// standing in for the ranged store / cache admit; there is no second receive
 /// implementation. A corrupt chunk group therefore aborts the pull at that group
-/// (ADR 038 §Receive side), before the rest of the stream is pulled or paid for —
-/// so a peer that signs an inflated `total_bytes` and streams framed garbage can
-/// bill at most the bytes that arrived before the first unverifiable group, never
-/// its claim.
+/// (ADR 038 §Receive side), before the rest of the stream is pulled or paid for,
+/// so a peer that streams framed garbage can bill at most the bytes that arrived
+/// before the first unverifiable group, never the whole blob.
 ///
 /// # Errors
 ///

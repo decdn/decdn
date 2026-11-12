@@ -4,7 +4,7 @@
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover the holders, #936),
 //! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, take the
-//! first size claim (the probe hint, or the header of a whole-blob open
+//! blob's proven size (a probe answer's, or the header of a whole-blob open
 //! when there is none), and fetch it through the acquire loop
 //! ([`decdn_client::acquire`]) across one [`decdn_client::PeerSource`] lane
 //! per holder (signing cumulative vouchers, resuming each lane's persisted
@@ -854,20 +854,14 @@ impl SizeHints {
     }
 }
 
-/// The size a fetch of `hash` starts from: `size_cap`, the caller's declared
-/// size (a bundle manifest's entry size), else one an earlier fetch on the
-/// host verified. Only the declared size caps the fetch ([`held_cap`]).
-pub(crate) fn known_size(
-    hash: &[u8; 32],
-    size_cap: Option<u64>,
-    sizes: &Mutex<SizeHints>,
-) -> Option<u64> {
-    size_cap.or_else(|| {
-        sizes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(hash)
-    })
+/// The size a fetch of `hash` starts from: one a holder proved, or a whole
+/// fetch verified, on this host. A declared size (a bundle manifest's entry
+/// size) only caps the fetch ([`held_cap`]).
+pub(crate) fn known_size(hash: &[u8; 32], sizes: &Mutex<SizeHints>) -> Option<u64> {
+    sizes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(hash)
 }
 
 impl FetchHost {
@@ -952,7 +946,7 @@ impl FetchHost {
     /// The size of `hash` a whole fetch on this host verified, or a size
     /// proof on it proved, if one did.
     pub(crate) fn verified_size(&self, hash: &[u8; 32]) -> Option<u64> {
-        known_size(hash, None, &self.sizes)
+        known_size(hash, &self.sizes)
     }
 
     /// Wait for every queued peer-record and watermark write to land, then
@@ -1149,8 +1143,8 @@ impl Payer {
 }
 
 /// Fetch the blob `args` names on `host`, paid by `payer`, with its verified
-/// bytes going to `sink`: resolve the holders, take the first size claim (the
-/// probe hint, or the header of a whole-blob open when there is none), then fetch it
+/// bytes going to `sink`: resolve the holders, take the proven size (a probe
+/// answer's, or the header of a whole-blob open when there is none), then fetch it
 /// through the acquire loop. `--output` names the destination only for
 /// [`Sink::Output`]. The fetch ends on done, a fault only the user can fix,
 /// or the stop policy: a terminal waits for Ctrl-C, a script gives up after
@@ -1198,13 +1192,12 @@ pub(crate) async fn fetch_on(
     // first open discovers them. The round streams: the fetch starts at the
     // first verified holder, and the holders that answer later join it.
     let discovery = discovery_options(common)?;
-    // A known size (a gateway's manifest entry, or a size an earlier fetch
-    // on the host verified) is the first size claim, and a pinned node is not
-    // probed for it.
+    // A size an earlier fetch on the host proved is the first size, and a
+    // pinned node is not probed for it.
     let probe = ProbeOpts {
         marks: Some(timings),
         round: ProbeRound::Stream,
-        known_size: known_size(&hash, args.size_cap, sizes),
+        known_size: known_size(&hash, sizes),
     };
     let resolved = holders_or_none(
         resolve_target_node(
@@ -1350,8 +1343,15 @@ pub(crate) async fn fetch_on(
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The blob's size, proven: the probe's answer, or the header of an
-            // open of the drive's first leg, which that leg then adopts.
-            let first_leg = if streams {
+            // open of the drive's first leg, which that leg then adopts. A
+            // size lookup's leg is the blob's first byte, so its open pays
+            // for one chunk group at most.
+            let first_leg = if args.size_only {
+                FirstLeg::Streamed {
+                    window: (0, 1),
+                    read_ahead: 0,
+                }
+            } else if streams {
                 FirstLeg::Streamed {
                     window: args.range.unwrap_or((0, 0)),
                     read_ahead: stream_read_ahead(args.read_ahead),
@@ -1415,7 +1415,7 @@ pub(crate) async fn fetch_on(
             };
             // A whole blob that landed verified against its hash is a receipt
             // entry, and the size a later fetch of it starts from, at the
-            // length it verified to (the first claim is only a hint); a byte
+            // length it verified to; a byte
             // window is not the blob.
             if let Ok(verified) = landed
                 && args.range.is_none()
@@ -1851,7 +1851,7 @@ where
     bar.finish_and_clear();
     result?;
     // The finished file holds exactly the proven size, which can differ from
-    // the first claim the fetch started from.
+    // a declared size the fetch started from.
     let proven = tokio::fs::metadata(target.dest)
         .await
         .map_or(target.total_bytes, |m| m.len());

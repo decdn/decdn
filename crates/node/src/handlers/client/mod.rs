@@ -923,16 +923,14 @@ enum ServeRejectReason {
     /// A cache-MISS serve shed under node overload — concurrency pressure,
     /// per-client fairness, or egress saturation. See [`Self::LoadShedHit`].
     LoadShedMiss,
-    /// The requested range starts at or past this node's size claim for the
-    /// blob. Ships [`StreamError::Declined`]: the size is this node's claim,
-    /// and another node can disagree (ADR 005 §Open-time refusal classes).
+    /// The requested range starts at or past the blob's proven size. Ships
+    /// [`StreamError::Declined`] (ADR 005 §Open-time refusal classes).
     RangeNotSatisfiable,
     /// A pull-through request this node cannot land under its `max_blob_size`
     /// cap on bytes held for one blob (ADR 005 §`max_blob_size` enforcement):
     /// the node already holds the cap's worth before it commits, or its fill
-    /// ends at the cap mid-stream. The node reads only its own store, never the
-    /// upstream's unverified `total_bytes` claim (#1895), and never the
-    /// request's offset. Ships the wire [`StreamError::Declined`] (see
+    /// ends at the cap mid-stream. The node reads only its own store, never
+    /// the upstream's `total_bytes` (#1895), and never the request's offset. Ships the wire [`StreamError::Declined`] (see
     /// [`Self::wire_error`]), so the requester drops this node for the blob.
     BlobTooLarge,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).

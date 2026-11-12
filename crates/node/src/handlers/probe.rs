@@ -225,9 +225,9 @@ impl ProbeHandler {
 
     /// The advertised `total_bytes` for a blob already established as present.
     ///
-    /// `total_bytes` is an unsigned, optional hint outside the `slash_sig`
-    /// typehash, so `None` degrades cleanly to "unknown but fetchable" — no
-    /// consumer treats it as a presence signal. An `Err` here is still worth a
+    /// `total_bytes` sits outside the `slash_sig` typehash and goes out only
+    /// with its size proof, so `None` degrades cleanly to "unknown but
+    /// fetchable": no consumer treats it as a presence signal. An `Err` here is still worth a
     /// log: every caller has *just* proven the blob present, so a failing
     /// `inspect` means the store started degrading in between, which is a
     /// strictly stronger signal than the plain miss the `Err` arms warn about.
@@ -256,6 +256,10 @@ impl ProbeHandler {
         let Some(size) = size else {
             return (None, None);
         };
+        // A refused hash states no size and reads no proof.
+        if self.cache.refuses(hash) {
+            return (None, None);
+        }
         let proof = self
             .cache
             .size_proof(hash, size)
@@ -663,7 +667,11 @@ impl ProbeHandler {
         // A node states no size it cannot prove (ADR 005 § A node proves the
         // blob size). Prove the size before an origin-sourced coverage is
         // sized from it: an origin size with no proof advertises nothing.
-        let (total_bytes, size_proof) = self.proven_size(hash, total_bytes).await;
+        let (total_bytes, size_proof) = if chain_stale {
+            (None, None)
+        } else {
+            self.proven_size(hash, total_bytes).await
+        };
         // The coverage and the size the response advertises, bound together: a
         // partial holder reads its size from the same bitfield as its blocks
         // (#2195), because the store branch above sizes only a `Complete` blob.
@@ -719,8 +727,23 @@ impl ProbeHandler {
         // `coverage_sized`'s own refusal gate, and the empty root must not
         // bypass that, because signing `has_blob: true` for a blacklisted
         // hash is a blacklist-violation offense (ADR 014).
+        // A holder serves under a size it proves, so coverage it cannot size
+        // with a proof is no coverage (ADR 005 § A node proves the blob size).
+        let coverage = if total_bytes.is_none() && *hash.as_bytes() != EMPTY_ROOT {
+            Coverage::empty()
+        } else {
+            coverage
+        };
         let has_blob = !coverage.is_empty()
             || (has_blob && *hash.as_bytes() == EMPTY_ROOT && !self.cache.refuses(hash));
+        // A size, and the proof that carries up to 1 KiB of the blob's tail,
+        // goes only with an advertised blob: never for a refused hash, a
+        // chain-stale answer or an opted-out store.
+        let (total_bytes, size_proof) = if has_blob {
+            (total_bytes, size_proof)
+        } else {
+            (None, None)
+        };
         debug_assert!(
             ProbeResponseExt {
                 total_bytes,
@@ -893,11 +916,11 @@ async fn read_probe_request(
         let _ = recv.stop(v);
     };
 
-    // A probe request is at most 43 bytes; the ceiling refuses a larger frame before it
-    // is buffered (ADR 013 § Wire Framing).
+    // A probe request is at most 43 bytes; the request ceiling refuses a larger
+    // frame before it is buffered (ADR 013 § Wire Framing).
     let frame = match tokio::time::timeout(
         PROBE_READ_TIMEOUT,
-        read_frame(recv, decdn_protocol::MAX_PROBE_FRAME),
+        read_frame(recv, decdn_protocol::MAX_PROBE_REQUEST_FRAME),
     )
     .await
     {

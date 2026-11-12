@@ -1223,13 +1223,7 @@ async fn throwaway_engine() -> Result<(CacheEngine, tempfile::TempDir)> {
 async fn cache_with_blobs(payloads: &[&[u8]]) -> Result<(CacheEngine, tempfile::TempDir)> {
     let origin_dir = tempfile::tempdir()?;
     for payload in payloads {
-        let hex = support::register_payload(payload).to_hex();
-        let shard = hex
-            .get(..2)
-            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-        let dir = origin_dir.path().join(shard);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(hex.as_str()), payload)?;
+        support::seed_origin_object(origin_dir.path(), payload)?;
     }
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
@@ -1257,15 +1251,8 @@ async fn cache_with_fs_origin_only(
     tempfile::TempDir,
     tempfile::TempDir,
 )> {
-    let hash = support::register_payload(payload);
     let origin_dir = tempfile::tempdir()?;
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let dir = origin_dir.path().join(shard);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(hex.as_str()), payload)?;
+    let hash = support::seed_origin_object(origin_dir.path(), payload)?;
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);

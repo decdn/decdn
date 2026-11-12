@@ -51,7 +51,9 @@ order — field declaration order is load-bearing, see
   file's BLAKE3. See [Hash format](#hash-format).
 - `size`: file size in bytes, unsigned 64-bit integer. Optional and
   declared, not proven, on the read side. A bundle pull uses it for the
-  dry-run plan and as the first size of the entry, and fetches without it.
+  dry-run plan and progress totals, and fetches without it. It sizes no
+  store and plans no range: chunk-dedup ranges apply only when it equals
+  the proven size, and otherwise the entry fetches its whole blob.
   The first holder that serves the entry proves the true size with its size
   proof ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)),
   and the fetch works to the proven size
@@ -429,9 +431,9 @@ The rules below apply to every pull:
   its ranges to the other holders. When the cooldown ends, the holder comes
   back into the same loop. A holder that faults for one entry also cools for
   every other entry. A failed entry does not retry in rounds. The size in
-  the manifest is the first size of the entry, declared and not proven. A
-  holder that proves a different size stays a holder of the entry, and its
-  proven size replaces the declared one. A holder that states a size it
+  the manifest is declared and not proven, and the entry's fetch works to
+  the size its holders prove. A holder that proves a size other than the
+  manifest's stays a holder of the entry. A holder that states a size it
   cannot prove is a fault of that holder. An entry
   whose proven size differs from its manifest size succeeds with a warning
   line. A blob over the client's size cap fails only its entry.

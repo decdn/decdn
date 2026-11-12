@@ -56,9 +56,11 @@ use serde::{Deserialize, Serialize};
 /// substitute for safe math.
 pub const MAX_RATE_PER_MB: u64 = 1000;
 
-/// Frame ceiling for `cdn/probe/v1`, in payload bytes (ADR 013 § Wire Framing).
+/// Frame ceiling for the [`ProbeResponse`] a requester reads on
+/// `cdn/probe/v1`, in payload bytes (ADR 013 § Wire Framing). A node reads
+/// requests against [`MAX_PROBE_REQUEST_FRAME`].
 ///
-/// Every probe read passes this to [`crate::read_frame`]. The largest legitimate
+/// The largest legitimate
 /// message is a [`ProbeResponse`] with its [`ProbeResponseExt`] at full width:
 /// 4,808 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap
 /// and its 2-byte length) and the size proof up to 4,483 (a
@@ -68,6 +70,13 @@ pub const MAX_RATE_PER_MB: u64 = 1000;
 /// buffers it. The `probe_frame_ceiling_holds_the_largest_message` test pins
 /// the margin.
 pub const MAX_PROBE_FRAME: u32 = 8 * 1024;
+
+/// Frame ceiling for the [`ProbeRequest`] a node reads, in payload bytes (ADR
+/// 013 § Wire Framing). A request is at most 43 bytes; the ceiling leaves
+/// headroom for Tier-1 fields and keeps the node's per-probe read buffer
+/// small. The `probe_frame_ceiling_holds_the_largest_message` test pins the
+/// margin.
+pub const MAX_PROBE_REQUEST_FRAME: u32 = 1024;
 
 /// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
 ///
@@ -393,7 +402,7 @@ pub fn encode_probe_response(
 /// Parse the trailing [`ProbeResponseExt`] bytes returned as the remainder by
 /// [`crate::decode_message`] after a `ProbeMessage::Response`.
 ///
-/// An empty remainder ⇒ [`ProbeResponseExt::default`] (no size hint). Trailing
+/// An empty remainder ⇒ [`ProbeResponseExt::default`] (no size). Trailing
 /// bytes beyond the known fields are tolerated for forward compatibility (ADR
 /// 013 §Tier 1): a future optional field appended to [`ProbeResponseExt`] is
 /// read by new receivers and skipped by old ones.

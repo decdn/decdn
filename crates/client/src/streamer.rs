@@ -69,8 +69,8 @@ struct StreamState {
     /// The byte the window ends before, or `None` for a tail that ends at the
     /// size a leg proves. The stream ends at the smaller of the two.
     end: Option<u64>,
-    /// The caller's size hint: the fetch's first claim. The stream ends at the
-    /// size a leg proves ([`ClientRangedStore::proven`]), whatever this says.
+    /// The caller's first size. The stream ends at the size a leg proves
+    /// ([`ClientRangedStore::proven`]), whatever this says.
     hint: u64,
     /// Woken by the reader when `cursor` advances, so a pull parked on a full
     /// read-ahead window ([`PaceDecision::Wait`](crate::pacer::PaceDecision::Wait))
@@ -499,7 +499,7 @@ impl<'a, P, F> Streamer<'a, P, F> {
         self
     }
 
-    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim past
+    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A first size past
     /// what the window can reach under the cap (the cap itself for the whole
     /// blob, the window's offset plus the cap otherwise) is clamped before the
     /// fill store is sized, and a blob that holds bytes past the cap ends the
@@ -543,8 +543,8 @@ where
     /// of the consumer's cursor, and the verified blob is teed to `cache` for the
     /// next revisit.
     ///
-    /// `total_bytes` is the first size claim, a hint. A resumed store's bound
-    /// wins, and a leg that verifies the final chunk proves the size. `hash` is
+    /// `total_bytes` is the first size. A resumed store's bound wins, and the
+    /// first paid leg's size proof sets the size. `hash` is
     /// the bao root every byte is verified against; a wrong hash surfaces as a
     /// read error, never as silent corruption.
     ///
@@ -630,12 +630,6 @@ where
         }
 
         let stem = blake3::Hash::from_bytes(hash).to_hex();
-        // A claim past what the cap on held bytes lets the window reach never
-        // sizes the store.
-        let total_bytes = total_bytes.min(crate::scheduler::claim_reach(
-            &[window],
-            self.max_blob_bytes,
-        ));
         // Off the runtime: opening a finalized blob hashes its final file.
         let store = {
             let (scratch, stem) = (self.scratch.to_path_buf(), stem.to_string());

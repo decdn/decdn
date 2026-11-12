@@ -214,7 +214,7 @@ impl ClientHandler {
         // path runs only for a range with a byte the node lacks, so a node that
         // already holds the cap's worth of the blob cannot land it: it refuses
         // before discovery and the upstream handshake. The gate reads only this
-        // node's own store, never the upstream's unverified size claim. A store
+        // node's own store, never the upstream's size. A store
         // that cannot answer leaves the gate open; the pull's own meter on the
         // bytes it stores still binds. `0` is unlimited.
         let cap = origin.max_blob_size_bytes();
@@ -358,6 +358,16 @@ impl ClientHandler {
             }
         };
 
+        // The response states `total_bytes`, so its proof must be at hand before
+        // the fill is claimed: a coalescing request reads the proof the live
+        // fill kept. With none, refuse now with a signed miss rather than let the
+        // signing fail after the claim (ADR 005 § A node proves the blob size).
+        if self.cache.size_proof(hash, total_bytes).await.is_none() {
+            release_reservation_unspent(floor_reservation.as_ref());
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::CacheMiss, rate_per_mb)
+                .await;
+        }
         // (4) `total_bytes` is proven (the upstream's size proof, or the live fill's
         // kept proof). A request whose start has no byte of the blob refuses
         // `RangeNotSatisfiable` before the response is signed, as on every other
@@ -755,9 +765,8 @@ impl ClientHandler {
         // exactly as on the direct-serve path: never `InsufficientDeposit` (the
         // range, not the pool, is the problem), and never a signed `ok: true`
         // that turns a bad range into a stream failure. An end past the blob is
-        // NOT out of bounds: it is served clamped to the blob's end (a claimed
-        // size is a hint). This total is the node's OWN origin probe, so unlike the peer
-        // twin the gate cannot be steered by a lying counterparty (#1895).
+        // NOT out of bounds: it is served clamped to the blob's end. This total is
+        // the node's OWN origin probe, so no counterparty steers the gate (#1895).
         if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
             release_reservation_unspent(floor_reservation.as_ref());
             return self

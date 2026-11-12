@@ -158,3 +158,27 @@ fn parse_hash_rejects_wrong_length() {
     assert!(parse_hash("abc").is_err());
     assert!(parse_hash(&"ab".repeat(33)).is_err());
 }
+
+/// `decdn probe` fails on an answer whose stated size has no proof, or a
+/// proof of another size, and passes a proven size or no size at all.
+#[test]
+fn a_stated_size_must_carry_its_proof() {
+    let data = vec![0x11u8; 5000];
+    let size = data.len() as u64;
+    let eo = decdn_bao_range::encode_outboard(data.as_slice(), size).unwrap();
+    let hash = *blake3::hash(&data).as_bytes();
+    let proof = decdn_protocol::SizeProof::new(eo.size_proof.to_vec()).unwrap();
+    let ext = |total_bytes, size_proof| decdn_protocol::ProbeResponseExt {
+        total_bytes,
+        coverage: decdn_protocol::Coverage::empty(),
+        size_proof,
+    };
+    assert!(check_stated_size(hash, &ext(Some(size), Some(proof.clone()))).is_ok());
+    assert!(check_stated_size(hash, &ext(None, None)).is_ok());
+    let unproven = check_stated_size(hash, &ext(Some(size), None)).unwrap_err();
+    assert!(
+        format!("{unproven:#}").contains("rejecting probe response"),
+        "{unproven:#}"
+    );
+    assert!(check_stated_size(hash, &ext(Some(size + 1), Some(proof))).is_err());
+}

@@ -92,8 +92,8 @@ pub use framing::{
 };
 pub use identity::{ContentHash, ID_LEN, NodeId};
 pub use message::{
-    EMPTY_ROOT, MAX_PROBE_FRAME, MAX_RATE_PER_MB, MessageValidationError, ProbeMessage,
-    ProbeRequest, ProbeResponse, ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN,
+    EMPTY_ROOT, MAX_PROBE_FRAME, MAX_PROBE_REQUEST_FRAME, MAX_RATE_PER_MB, MessageValidationError,
+    ProbeMessage, ProbeRequest, ProbeResponse, ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN,
     encode_probe_response, parse_probe_response_ext,
 };
 pub use region::{InvalidRegion, Region, is_valid_region};

@@ -102,18 +102,26 @@ pub async fn probe(
     // registry client, so it enforces presence/shape only.
     resp.validate()
         .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
-    // A stated size is shown only once its proof verifies against the hash
-    // (ADR 005 § A node proves the blob size). A node that states a size it
-    // cannot prove gives a faulty answer.
-    if let Some(total_bytes) = resp_ext.total_bytes {
-        decdn_client::check_size_proof(hash, total_bytes, resp_ext.size_proof.as_ref())
-            .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
-    }
+    check_stated_size(hash, &resp_ext)?;
 
     let mut stdout = std::io::stdout().lock();
     write_probe_response(&mut stdout, &resp, &resp_ext, rtt.ms, args.json)
         .map_err(|e| anyhow::anyhow!("failed to write probe response: {e}"))?;
     Ok(())
+}
+
+/// Refuse a probe answer that states a size its proof does not prove against
+/// `hash` (ADR 005 § A node proves the blob size): such an answer is faulty,
+/// and the probe shows none of it. An answer that states no size passes.
+pub(crate) fn check_stated_size(
+    hash: [u8; 32],
+    resp_ext: &decdn_protocol::ProbeResponseExt,
+) -> anyhow::Result<()> {
+    let Some(total_bytes) = resp_ext.total_bytes else {
+        return Ok(());
+    };
+    decdn_client::check_size_proof(hash, total_bytes, resp_ext.size_proof.as_ref())
+        .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))
 }
 
 /// Render a successful probe response to `w` in pretty or JSON form.

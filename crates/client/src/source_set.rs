@@ -98,11 +98,10 @@ pub struct LaneRange {
     /// queue: what the other lanes still fetch. For a range the store held
     /// no byte of at the pick, `landed` and `requeued` add up to `len`.
     pub requeued: u64,
-    /// The piece that faulted starts at or past the end the fetch knows: the
-    /// proven size, or with none proven the smaller of the first size claim
-    /// and the bound. The bound can overshoot the blob, so a `NotFound` for
-    /// such a piece is an overshoot refusal: it cools the provider and never
-    /// counts toward marking it absent ([`ABSENT_AFTER_NOT_FOUND`]).
+    /// The piece that faulted starts at or past the blob's proven end. A
+    /// `NotFound` for such a piece is an overshoot refusal: it cools the
+    /// provider and never counts toward marking it absent
+    /// ([`ABSENT_AFTER_NOT_FOUND`]).
     pub past_end: bool,
     /// The range as the lane picked it holds a chunk outside the coverage of
     /// the lane: the lane took it for its node to serve that part by

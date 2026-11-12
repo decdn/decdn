@@ -184,13 +184,13 @@ pub(crate) enum ProbeGather {
 /// The empty blob ([`decdn_protocol::EMPTY_ROOT`]) spans zero blocks, so no
 /// holder reports a block for the union to cover. For that hash the union
 /// spans the blob once one holder is admitted (#2526). The rule keys on the
-/// requested hash, never on the unsigned `total_bytes` hint.
+/// requested hash, never on a holder's stated `total_bytes`.
 /// `ProbeResponseExt::consistent_with` keys on the hash the same way. A holder
 /// that reports `Some(0)` for a real blob therefore closes nothing.
 struct CoverageUnionTracker {
     /// Whether the requested hash is [`decdn_protocol::EMPTY_ROOT`].
     empty_root: bool,
-    /// Holders admitted so far, a holder without a size hint included. Read
+    /// Holders admitted so far, a holder that stated no size included. Read
     /// only when `empty_root` is set.
     holders: usize,
     /// Covered discovery blocks seen so far.
@@ -514,7 +514,7 @@ pub struct NodeOriginConfig {
     /// offsets served: the miss-pull leg lands a range anywhere in a larger blob
     /// while the bytes held fit, and ends with `BlobTooLarge` once a missing byte
     /// could only land past the cap. Metered on the bytes that ACTUALLY arrive and
-    /// are stored, never on the peer's unverified `total_bytes` claim (#1895).
+    /// are stored, never on the peer's `total_bytes` (#1895).
     pub max_blob_size_bytes: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling (`cache.max_rate_per_mb`), `0` =
     /// unlimited (#1375). Combined via [`effective_rate_ceiling`] with the

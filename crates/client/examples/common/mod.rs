@@ -201,6 +201,12 @@ impl Buyer {
             if verified.is_err() || !ext.consistent_with(&resp.body) || !resp.body.has_blob {
                 continue;
             }
+            // A stated size counts only once its proof verifies.
+            if let Some(size) = ext.total_bytes
+                && decdn_client::check_size_proof(hash, size, ext.size_proof.as_ref()).is_err()
+            {
+                continue;
+            }
             total_bytes = total_bytes.or(ext.total_bytes);
             holders.push(Holder {
                 candidate,

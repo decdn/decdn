@@ -229,8 +229,7 @@ impl<P, F> Downloader<P, F> {
     /// Cap the bytes held for every target at `max_blob_bytes` (`0` for no
     /// cap). A target's ranges are fetched at any offset while the bytes held
     /// fit; ranges that would hold more fail with [`crate::BlobTooLarge`]
-    /// ([`crate::AcquireEnv::max_blob_bytes`]). A size claim past the
-    /// furthest range start plus the cap never sizes the store.
+    /// ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
         self.max_blob_bytes = max_blob_bytes;
@@ -313,8 +312,8 @@ where
     /// correctly. The whole blob is fetched at full throughput, with no
     /// read-ahead bound.
     ///
-    /// `total_bytes` is the first size claim, a hint: a resumed store's bound
-    /// wins over it, and a leg that verifies the final chunk proves the size.
+    /// `total_bytes` is the blob's proven size; the store records it before
+    /// the first leg opens.
     /// The target `hash` is the bao root every ingested byte is verified
     /// against: a wrong hash surfaces as a verification failure, never as
     /// silent corruption. A finalize whose whole-file hash does not match
@@ -384,9 +383,6 @@ where
             let store = {
                 let (dir, stem) = (dir.clone(), stem.clone());
                 let (hash, total) = (target.hash, target.total_bytes);
-                // A claim past what the cap on held bytes lets the ranges
-                // reach never sizes the store.
-                let total = total.min(crate::scheduler::claim_reach(ranges, self.max_blob_bytes));
                 tokio::task::spawn_blocking(move || {
                     ClientRangedStore::open_or_create(&dir, &stem, hash, total)
                 })

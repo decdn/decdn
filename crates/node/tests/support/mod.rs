@@ -154,6 +154,20 @@ pub(crate) fn honest_bao_wire_range(
         .to_vec())
 }
 
+/// Seed `payload` into the filesystem origin at `root` as `decdn origin
+/// import` does with no outboard: the object at `{hex[0..2]}/{hex}` and its
+/// `{hex}.sizeproof` sibling, which proves the size the node states for it.
+/// Registers the payload ([`register_payload`]) and returns its hash.
+pub(crate) fn seed_origin_object(root: &std::path::Path, payload: &[u8]) -> anyhow::Result<Hash> {
+    let hash = register_payload(payload);
+    let encoded = decdn_bao_range::encode_outboard(payload, u64::try_from(payload.len())?)?;
+    let shard = root.join(encoded.shard());
+    std::fs::create_dir_all(&shard)?;
+    std::fs::write(shard.join(&encoded.hash_hex), payload)?;
+    std::fs::write(shard.join(encoded.size_proof_name()), &encoded.size_proof)?;
+    Ok(hash)
+}
+
 /// Open an empty cache (no origins) in a fresh temp dir.
 pub(crate) async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
@@ -167,15 +181,8 @@ pub(crate) async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::Temp
 pub(crate) async fn cache_with_blob(
     payload: &[u8],
 ) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
-    let hash = register_payload(payload);
     let origin_dir = tempfile::tempdir()?;
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let dir = origin_dir.path().join(shard);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(hex.as_str()), payload)?;
+    let hash = seed_origin_object(origin_dir.path(), payload)?;
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);

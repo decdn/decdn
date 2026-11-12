@@ -454,22 +454,20 @@ async fn fetch_ranges(
     Ok((probe, paths))
 }
 
-/// A resumed record whose bound is past the first claim finishes: the
-/// whole-blob target reaches the record's bound, the file is the blob, and
-/// no byte the record holds is opened again.
+/// A resumed record finishes under the proven size: the file is the blob,
+/// and no byte the record holds is opened again.
 #[tokio::test]
-async fn a_resumed_record_with_a_bound_past_the_claim_finishes() -> anyhow::Result<()> {
+async fn a_resumed_record_opens_only_what_it_lacks() -> anyhow::Result<()> {
     let blob = payload(3 * 1024 * 1024);
     let total = u64::try_from(blob.len())?;
     let held = 1024 * 1024;
     let dir = tempfile::tempdir()?;
     let dest = dir.path().join("model.bin");
-    // A first run under the true size lands `[0, held)` and proves nothing.
+    // A first run lands `[0, held)` only.
     let (_, paths) = fetch_ranges(&blob, &dest, total, Some(&[(0, held)])).await?;
     anyhow::ensure!(paths.is_empty(), "the first run leaves a partial");
 
-    // The rerun claims only `held` bytes: the record's bound wins.
-    let (probe, paths) = fetch_ranges(&blob, &dest, held, None).await?;
+    let (probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
     anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
     let opened = probe.opened_ranges();
@@ -480,22 +478,22 @@ async fn a_resumed_record_with_a_bound_past_the_claim_finishes() -> anyhow::Resu
     Ok(())
 }
 
-/// A resumed record whose proven size is past the first claim finishes
-/// the same way, and opens only the bytes the record lacks.
+/// A resumed record that holds its head and its final group opens only the
+/// missing middle.
 #[tokio::test]
-async fn a_resumed_record_with_a_proven_size_past_the_claim_finishes() -> anyhow::Result<()> {
+async fn a_resumed_record_with_its_tail_opens_only_the_middle() -> anyhow::Result<()> {
     let blob = payload(3 * 1024 * 1024);
     let total = u64::try_from(blob.len())?;
     let held = 1024 * 1024;
     let group = decdn_bao_range::CHUNK_GROUP_BYTES;
     let dir = tempfile::tempdir()?;
     let dest = dir.path().join("model.bin");
-    // A first run lands the head and the final group, which proves the size.
+    // A first run lands the head and the final group.
     let first = [(0, held), (total - group, group)];
     let (_, paths) = fetch_ranges(&blob, &dest, total, Some(&first)).await?;
     anyhow::ensure!(paths.is_empty(), "the first run leaves a partial");
 
-    let (probe, paths) = fetch_ranges(&blob, &dest, held, None).await?;
+    let (probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
     anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
     let opened = probe.opened_ranges();

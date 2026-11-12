@@ -1132,7 +1132,7 @@ where
 
         // The cap on bytes held (#1895): the source's `max_blob_size_bytes` bounds
         // the content of this blob the store holds, BLAKE3-verified, never the
-        // offsets a leg reads and never the peer's unverified signed `total_bytes`.
+        // offsets a leg reads and never the peer's `total_bytes`.
         // `room` is the new bytes the store may still take. The Draw arm cuts
         // each leg to it, so a range anywhere in a blob larger than the cap lands
         // while it fits. `None` = no cap (and own-origin, whose engine store

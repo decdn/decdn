@@ -267,6 +267,13 @@ fn a_tampered_or_short_tail_wire_proves_nothing() {
     );
     assert!(size_proof_from_tail_wire(root, size, &wire[..10]).is_err());
     assert!(size_proof_from_tail_wire(root, size + 1, &wire).is_err());
+    let mut padded = vec![0u8; 64];
+    padded.extend_from_slice(&wire);
+    assert_eq!(
+        size_proof_from_tail_wire(root, size, &padded),
+        Err(SizeProofError::Verification { blob_size: size }),
+        "an extra leading pair is refused"
+    );
 }
 
 #[test]

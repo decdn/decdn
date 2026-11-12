@@ -78,12 +78,12 @@ needs no pull.
 
 Before it answers a raw blob of unknown size, the gateway learns its size. It
 resolves the holders of the blob and takes the first size that one of them
-proves: a probe answer, or the header of the first leg's open. It pays for
-no byte and charges the allowance nothing. The gateway keeps the size as a
-verified size. A blob whose size no holder proves streams whole, with no
-length. A funding stop ends the request as it ends a pull. A fault before any
-holder states a size, such as no holder, also ends the request as it ends a
-pull.
+proves: a probe answer, or the header of an open of the blob's first byte.
+That open pays for one chunk group at most, and the lookup charges the
+allowance nothing. The gateway keeps the size as a verified size. A blob
+whose proven size passes `--max-blob-mb` answers 413 before any pull. A
+funding stop ends the request as it ends a pull. A fault before any holder
+proves a size, such as no holder, also ends the request as it ends a pull.
 
 A blob that is not a manifest does not become one. Its hash fixes its bytes.
 The manifest cap stops a pull only on verified bytes or a proven size. The
@@ -186,8 +186,7 @@ BEP 19 webseed is a plain URL with ranges, so it needs nothing more.
 hash, at no pull of the entry. `HEAD` on a raw blob, on the bare host or under
 a site's `/_decdn/`, answers from the verified size, at no pull. `HEAD` on a
 raw blob of unknown size learns its size first, as its `GET` does. A spent
-allowance refuses the `HEAD` with 402. A blob whose size no holder proves
-gives a `HEAD` with no length. A fault that ends the size lookup ends the
+allowance refuses the `HEAD` with 402. A fault that ends the size lookup ends the
 `HEAD` with the status that it gives a `GET`. `HEAD`
 of a bundle or an entry under a site's `/_decdn/` redirects to the site of
 that bundle.

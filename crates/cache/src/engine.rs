@@ -543,6 +543,12 @@ struct Inner {
     /// named tags ([`CacheEngine::size_proof`]). Evicting a blob drops its
     /// proof from both.
     size_proofs: SizeProofMemo,
+    /// One async lock per hash whose `{H}.sizeproof` an origin read is
+    /// fetching ([`CacheEngine::size_proof`]), held as `Weak` like
+    /// `outboard_flights`.
+    size_proof_flights: Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>,
+    /// `(hash, size)` pairs no origin proved, and when a lookup found that.
+    size_proof_misses: Mutex<HashMap<(Hash, u64), Instant>>,
     /// One async lock per hash whose outboard an origin read is fetching, so
     /// concurrent cold misses of one hash wait for the first read and reuse its
     /// cached copy instead of each downloading it. Held as `Weak`: an entry
@@ -1635,6 +1641,8 @@ impl CacheEngine {
                 origin_range_confirmed,
                 outboards: OutboardCache::new(OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES),
                 size_proofs: SizeProofMemo::new(SIZE_PROOF_ENTRIES),
+                size_proof_flights: Mutex::new(HashMap::new()),
+                size_proof_misses: Mutex::new(HashMap::new()),
                 outboard_flights: Mutex::new(HashMap::new()),
                 origin_read_head_start_ms: AtomicU64::new(0),
                 origin_read_min_bps: AtomicU64::new(0),
@@ -1934,7 +1942,7 @@ impl CacheEngine {
 
     /// One rescan pass: gather candidates, resolve them, publish the index.
     async fn rescan_once(&self) {
-        self.lift_reclaimed_quarantines().await;
+        self.tidy_store().await;
         let (candidates, enumerate_failures) = self.rescan_candidates().await;
         let RescanResolution {
             held,
@@ -1968,6 +1976,16 @@ impl CacheEngine {
             );
         }
         tracing::debug!(count, "rescan_origins: refreshed origin-held index");
+    }
+
+    /// The store upkeep each rescan runs first: lift the quarantines GC
+    /// reclaimed, and delete the size proof tags of blobs the store no longer
+    /// holds ([`Self::sweep_orphan_size_proofs`]).
+    async fn tidy_store(&self) {
+        self.lift_reclaimed_quarantines().await;
+        if let Err(err) = self.sweep_orphan_size_proofs().await {
+            tracing::warn!(error = %err.display_chain(), "size proof sweep failed in a rescan");
+        }
     }
 
     /// Every hash [`Self::rescan_origins`] considers: each enumerable origin's
@@ -2864,6 +2882,16 @@ impl CacheEngine {
                 CacheError::Store(anyhow::Error::from(e).context("protect_partial: tags().set"))
             })?;
         self.inner.partial_protected.insert(hash, ());
+        // The pull has landed its first bytes: a proof kept from its upstream
+        // goes to the store now.
+        if let Some(kept) = self.inner.size_proofs.get(&hash)
+            && !kept.stored
+            && self
+                .store_size_proof_if_held(hash, kept.size, &kept.proof)
+                .await
+        {
+            self.inner.size_proofs.mark_stored(&hash);
+        }
         Ok(())
     }
 
@@ -2886,8 +2914,15 @@ impl CacheEngine {
     /// tag lookup, so this lists every tag and filters in Rust. Fine at
     /// operator-evict / mismatch rates; not something to call on a hot path.
     async fn drop_named_tags_for(&self, hash: Hash) -> CacheResult<u64> {
-        // The blob goes, so its size proof goes with it.
+        // The blob goes, so its size proof goes with it: from memory, and from
+        // the store by its tag name prefix, with no scan.
         self.inner.size_proofs.remove(&hash);
+        self.inner
+            .store
+            .tags()
+            .delete_prefix(size_proof_tag_prefix(hash))
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
         // Invalidate the partial-protection memo before touching the store, so a
         // later admit re-issues the protecting tag rather than trusting a stale
         // "already protected" entry for the tag we are removing. Clearing it up
@@ -4021,39 +4056,50 @@ impl CacheEngine {
     /// The engine looks in turn at:
     ///
     /// 1. the proof it holds in memory for the hash;
-    /// 2. the proof it keeps in its store (see [`Self::keep_size_proof`]);
+    /// 2. the proof it keeps in its store;
     /// 3. the last chunk group in its own store, for a complete blob or a
     ///    partial blob that holds its tail;
-    /// 4. the `{H}.sizeproof` object of each origin;
-    /// 5. the outboard and the last chunk group of each origin, for a blob an
-    ///    origin holds with no stored proof.
+    /// 4. the `{H}.sizeproof` object of each origin. An origin blob with no
+    ///    such object has no provable size here: `decdn origin import` writes
+    ///    it beside the outboard.
     ///
     /// Every proof it finds is verified against `hash` and `size` before it
     /// is kept and returned. A proof that does not verify is skipped, so a
     /// wrong `size` gives `None`. An origin fault gives `None` for that
-    /// origin. A proof that steps 3 to 5 find is kept in the store too.
+    /// origin.
+    ///
+    /// Callers ask for a proof only after their gates passed (blacklist,
+    /// deny set, offset), so a proof is kept only for a request the node
+    /// answers. A proof of a blob the store holds and tracks is written to
+    /// the store too ([`Self::keep_size_proof`] says how).
     pub async fn size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
-        let root = *hash.as_bytes();
         if let Some(kept) = self.inner.size_proofs.get(&hash) {
-            if kept.size == size {
-                return Some(kept.proof);
+            if kept.size != size {
+                // The kept proof proves another size, so this size is wrong.
+                return None;
             }
-            // The kept proof proves another size, so this size is wrong.
-            return None;
+            if !kept.stored && self.store_size_proof_if_held(hash, size, &kept.proof).await {
+                self.inner.size_proofs.mark_stored(&hash);
+            }
+            return Some(kept.proof);
         }
         if let Some(proof) = self.stored_size_proof(hash, size).await {
-            self.inner.size_proofs.insert(hash, size, proof.clone());
+            self.inner
+                .size_proofs
+                .insert(hash, size, proof.clone(), true);
             return Some(proof);
         }
         let proof = match self.local_size_proof(hash, size).await {
-            Some(proof) => Some(proof),
-            None => self.origin_size_proof(hash, size).await,
-        }?;
-        if !decdn_bao_range::verify_size_proof(root, size, &proof) {
+            Some(proof) => proof,
+            None => self.origin_size_proof(hash, size).await?,
+        };
+        if !decdn_bao_range::verify_size_proof(*hash.as_bytes(), size, &proof) {
             return None;
         }
-        self.store_size_proof(hash, size, &proof).await;
-        self.inner.size_proofs.insert(hash, size, proof.clone());
+        let stored = self.store_size_proof_if_held(hash, size, &proof).await;
+        self.inner
+            .size_proofs
+            .insert(hash, size, proof.clone(), stored);
         Some(proof)
     }
 
@@ -4072,34 +4118,57 @@ impl CacheEngine {
     /// before it holds the tail of the blob. Returns whether the proof
     /// verified and was kept.
     ///
-    /// The proof is kept in memory and in the store, under a named tag whose
-    /// name carries the proof and whose value is `hash` itself
-    /// (`decdn-sizeproof-{hex}/{size}/{proof}`). It survives a restart. Evicting the blob
-    /// drops every tag on `hash`, this one with it. A proof never becomes a
-    /// blob of its own, so it never counts as cached content.
+    /// The proof is kept in memory at once. It is written to the store once
+    /// the store holds bytes of the blob: when the pull admits its first
+    /// bytes, or at the next lookup. So a pull that lands nothing leaves no
+    /// proof in the store. A stored proof is a named tag
+    /// `decdn-sizeproof-{hex}/{size}/{proof}` whose value is the empty blob,
+    /// so it never keeps the content blob from GC and never counts as cached
+    /// content. It survives a restart. Evicting or quarantining the blob
+    /// deletes it, and a rescan deletes a proof whose blob the store no
+    /// longer tracks.
     pub async fn keep_size_proof(&self, hash: Hash, size: u64, proof: &[u8]) -> bool {
         if !decdn_bao_range::verify_size_proof(*hash.as_bytes(), size, proof) {
             return false;
         }
-        self.store_size_proof(hash, size, proof).await;
-        self.inner
-            .size_proofs
-            .insert(hash, size, Bytes::copy_from_slice(proof));
+        let proof = Bytes::copy_from_slice(proof);
+        let stored = self.store_size_proof_if_held(hash, size, &proof).await;
+        self.inner.size_proofs.insert(hash, size, proof, stored);
         true
     }
 
-    /// Write the size proof tag of `hash`. A store fault only logs: the proof
-    /// stays in memory, and the next lookup builds it again when it can.
-    async fn store_size_proof(&self, hash: Hash, size: u64, proof: &[u8]) {
+    /// Whether the store holds bytes of `hash` and tracks it: it has an
+    /// access time or a pin, so a released blob counts as gone.
+    async fn tracks(&self, hash: Hash) -> bool {
+        if !self.inner.access_times.contains_key(&hash) && !self.is_pinned(hash) {
+            return false;
+        }
+        matches!(
+            self.inner.store.blobs().status(hash).await,
+            Ok(status) if !matches!(status, iroh_blobs::api::blobs::BlobStatus::NotFound)
+        )
+    }
+
+    /// Write the size proof tag of `hash` when the store holds and tracks the
+    /// blob. Returns whether it wrote the tag. A store fault only logs: the
+    /// proof stays in memory, and a later lookup writes it.
+    async fn store_size_proof_if_held(&self, hash: Hash, size: u64, proof: &[u8]) -> bool {
+        if self.refuses(hash) || !self.tracks(hash).await {
+            return false;
+        }
         let name = size_proof_tag(hash, size, proof);
-        if let Err(err) = self
+        match self
             .inner
             .store
             .tags()
-            .set(name, HashAndFormat::raw(hash))
+            .set(name, HashAndFormat::raw(Hash::EMPTY))
             .await
         {
-            tracing::warn!(%hash, error = %err, "could not keep the size proof in the store");
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(%hash, error = %err, "could not keep the size proof in the store");
+                false
+            }
         }
     }
 
@@ -4120,10 +4189,12 @@ impl CacheEngine {
         None
     }
 
-    /// Delete each size proof tag whose blob the store does not hold: the
-    /// proof of a pull that never landed a byte. Eviction drops the tags of
-    /// a blob it removes, so this only catches proofs kept ahead of a pull.
-    /// Returns how many tags it deleted.
+    /// Delete each size proof tag whose blob the store no longer holds or
+    /// tracks (no access time and no pin). Eviction deletes the proof of a
+    /// blob it removes, so this catches the rest: a blob GC reclaimed, or a
+    /// proof left by a crash between a release and its tag delete. It runs at
+    /// open and in every origin rescan, so the stored proofs stay bounded by
+    /// the blobs the store tracks. Returns how many tags it deleted.
     ///
     /// # Errors
     ///
@@ -4138,8 +4209,11 @@ impl CacheEngine {
                 .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
             while let Some(info) = stream.next().await {
                 let info = info.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
-                let status = self.inner.store.blobs().status(info.hash).await;
-                if matches!(status, Ok(iroh_blobs::api::blobs::BlobStatus::NotFound)) {
+                let held = match size_proof_tag_hash(info.name.as_ref()) {
+                    Some(hash) => self.tracks(hash).await,
+                    None => false,
+                };
+                if !held {
                     orphans.push(info.name);
                 }
             }
@@ -4167,9 +4241,23 @@ impl CacheEngine {
         decdn_bao_range::size_proof_from_tail_wire(*hash.as_bytes(), size, &wire).ok()
     }
 
-    /// Read the stored proof of an origin, or build one from its outboard and
-    /// its last chunk group.
+    /// Read the `{H}.sizeproof` object of each origin until one proves
+    /// `size`. One read runs per hash at a time: a concurrent lookup waits
+    /// and takes its proof from the memo. A lookup that finds none is
+    /// remembered for [`SIZE_PROOF_MISS_TTL`], so a probe flood for a blob no
+    /// origin proves reads no origin again within that time.
     async fn origin_size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
+        if self.inner.origins.is_empty() || self.size_proof_missed(hash, size) {
+            return None;
+        }
+        let flight = self.size_proof_flight(hash);
+        let _reading = flight.lock().await;
+        if let Some(kept) = self.inner.size_proofs.get(&hash) {
+            return (kept.size == size).then_some(kept.proof);
+        }
+        if self.size_proof_missed(hash, size) {
+            return None;
+        }
         let root = *hash.as_bytes();
         for origin in &*self.inner.origins {
             match origin.fetch_size_proof(hash).await {
@@ -4182,26 +4270,53 @@ impl CacheEngine {
                 }
             }
         }
-        if self.inner.origins.is_empty() {
-            return None;
+        self.note_size_proof_miss(hash, size);
+        None
+    }
+
+    /// The per-hash lock of the origin `.sizeproof` read.
+    fn size_proof_flight(&self, hash: Hash) -> Arc<tokio::sync::Mutex<()>> {
+        let mut flights = self
+            .inner
+            .size_proof_flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(live) = flights.get(&hash).and_then(Weak::upgrade) {
+            return live;
         }
-        // No origin stores a proof that verifies: build one from the range
-        // wire of the last chunk group, which the outboard proves.
-        let tail_start = decdn_bao_range::size_proof_tail_start(size);
-        let aligned = align_range(tail_start, size - tail_start, size).ok()?;
-        let mut wire = match self.origin_range_wire(hash, &aligned).await {
-            Ok(Some(wire)) => wire,
-            Ok(None) => return None,
-            Err(e) => {
-                tracing::debug!(%hash, error = %e, "origin tail read for a size proof failed");
-                return None;
+        flights.retain(|_, w| w.strong_count() > 0);
+        let flight = Arc::new(tokio::sync::Mutex::new(()));
+        flights.insert(hash, Arc::downgrade(&flight));
+        flight
+    }
+
+    /// Whether a lookup of `(hash, size)` found no origin proof within the
+    /// last [`SIZE_PROOF_MISS_TTL`].
+    fn size_proof_missed(&self, hash: Hash, size: u64) -> bool {
+        self.inner
+            .size_proof_misses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(hash, size))
+            .is_some_and(|at| at.elapsed() < SIZE_PROOF_MISS_TTL)
+    }
+
+    /// Remember that no origin proves `(hash, size)`. The memo holds at most
+    /// [`SIZE_PROOF_MISS_ENTRIES`]; a full memo drops its expired entries,
+    /// then all of them.
+    fn note_size_proof_miss(&self, hash: Hash, size: u64) {
+        let mut misses = self
+            .inner
+            .size_proof_misses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if misses.len() >= SIZE_PROOF_MISS_ENTRIES {
+            misses.retain(|_, at| at.elapsed() < SIZE_PROOF_MISS_TTL);
+            if misses.len() >= SIZE_PROOF_MISS_ENTRIES {
+                misses.clear();
             }
-        };
-        let mut bytes = Vec::new();
-        while let Some(chunk) = wire.next_chunk().await {
-            bytes.extend_from_slice(&chunk.ok()?);
         }
-        decdn_bao_range::size_proof_from_tail_wire(root, size, &bytes).ok()
+        misses.insert((hash, size), Instant::now());
     }
 
     /// Whether the origin at `ix` has served a clean first range window.
@@ -5067,8 +5182,8 @@ impl CacheEngine {
     ///
     /// The range widens to enclosing 16 KiB chunk-group boundaries
     /// ([`align_range_clamped`]) because a bao proof anchors whole groups; an
-    /// end past the blob clamps to it rather than being refused: a claimed
-    /// size is a hint. The serve side does **not** trim back to the requested offset
+    /// end past the blob clamps to it rather than being refused: a request may
+    /// ask past the end. The serve side does **not** trim back to the requested offset
     /// (trimming would break verification). The receiver discards the
     /// group-aligned prefix. The outboard is read from the store (built at
     /// import).
@@ -6204,8 +6319,28 @@ fn record_origin_pull<T>(span: &tracing::Span, result: &CacheResult<T>) {
 
 /// Name prefix of every size proof tag. A tag is
 /// `decdn-sizeproof-{hex}/{size}/{proof}`: the blob hash in hex, the size in
-/// decimal, then the proof bytes. Its value is the blob hash.
+/// decimal, then the proof bytes. Its value is the empty blob, so the tag
+/// keeps no content from GC.
 const SIZE_PROOF_TAG_PREFIX: &str = "decdn-sizeproof-";
+
+/// How long a lookup that found no origin `{H}.sizeproof` is remembered, so a
+/// probe flood for an unprovable blob reads no origin again in that time.
+const SIZE_PROOF_MISS_TTL: Duration = Duration::from_secs(5);
+
+/// Most `(hash, size)` misses the engine remembers.
+const SIZE_PROOF_MISS_ENTRIES: usize = 4096;
+
+/// The blob hash a size proof tag names, from its 64 hex characters.
+fn size_proof_tag_hash(name: &[u8]) -> Option<Hash> {
+    let hex = name.get(SIZE_PROOF_TAG_PREFIX.len()..)?.get(..64)?;
+    let mut bytes = [0u8; 32];
+    let (pairs, _) = hex.as_chunks::<2>();
+    for (slot, pair) in bytes.iter_mut().zip(pairs) {
+        let text = std::str::from_utf8(pair).ok()?;
+        *slot = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(Hash::from_bytes(bytes))
+}
 
 /// The tag name prefix of the size proofs of `hash`: `decdn-sizeproof-{hex}/`.
 fn size_proof_tag_prefix(hash: Hash) -> Vec<u8> {

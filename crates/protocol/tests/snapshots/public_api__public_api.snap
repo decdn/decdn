@@ -314,6 +314,7 @@ impl decdn_protocol::message::ProbeResponseExt
 pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, &decdn_protocol::message::ProbeResponseBody) -> bool
 pub const decdn_protocol::message::EMPTY_ROOT: [u8; 32]
 pub const decdn_protocol::message::MAX_PROBE_FRAME: u32
+pub const decdn_protocol::message::MAX_PROBE_REQUEST_FRAME: u32
 pub const decdn_protocol::message::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::message::SLASH_SIG_LEN: usize
 pub fn decdn_protocol::message::encode_probe_response(&decdn_protocol::message::ProbeResponse, core::option::Option<&decdn_protocol::message::ProbeResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
@@ -635,6 +636,7 @@ pub const decdn_protocol::MAX_CLIENT_CONTROL_FRAME: u32
 pub const decdn_protocol::MAX_CLOSER_NODES: usize
 pub const decdn_protocol::MAX_DHT_FRAME: u32
 pub const decdn_protocol::MAX_PROBE_FRAME: u32
+pub const decdn_protocol::MAX_PROBE_REQUEST_FRAME: u32
 pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::MAX_SIZE_PROOF_BYTES: usize

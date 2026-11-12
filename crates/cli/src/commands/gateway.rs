@@ -76,9 +76,8 @@
 //! which the fetch verifies against the hash before it uses the size (ADR
 //! 005 § A node proves the blob size). Before the response, the gateway
 //! resolves the holders of a raw blob of unknown size and takes the first
-//! size one proves, at no paid byte. A loopback gateway does the same, on the
-//! capability that pays. A blob whose size no holder proves streams with no
-//! length. A sized response takes one
+//! size one proves, paying for one chunk group at most. A loopback gateway
+//! does the same, on the capability that pays. A sized response takes one
 //! `Range`: the response is `206` over exactly that window, the pull pays
 //! only for the chunk-group-aligned span around it (ADR 038), the allowance
 //! admits and charges the request by that span, and a window past the end is
@@ -1250,6 +1249,23 @@ impl Gateway {
     /// length itself; the refusal log then says so.
     /// Refusing before the pull costs nothing; cutting it after would waste
     /// what it paid for.
+    /// A 413 for a blob whose proven `size` passes `--max-blob-mb` (`0` for
+    /// no cap): the pull would end at the cap, so the gateway pays for no
+    /// byte of it.
+    fn over_blob_cap(&self, size: Option<u64>) -> Option<Response<Body>> {
+        let cap = self.common.max_blob_mb.saturating_mul(1024 * 1024);
+        let size = size?;
+        (cap != 0 && size > cap).then(|| {
+            text(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!(
+                    "the blob is {size} bytes, past this gateway's {} MiB cap\n",
+                    self.common.max_blob_mb
+                ),
+            )
+        })
+    }
+
     fn too_large(
         &self,
         bucket: Option<u64>,
@@ -2032,8 +2048,9 @@ impl Gateway {
     /// A blob by its hash. Its verified size ([`Self::blob_size`], else
     /// [`Self::learn_size`]) gives the response its length, admits the
     /// request against the allowance, caps the pull and lets one `Range`
-    /// through, as an entry's declared size does. A blob whose size no holder
-    /// proved streams whole, with no length. A `HEAD` answers with the
+    /// through, as an entry's declared size does. A proven size past
+    /// `--max-blob-mb` answers 413 before any pull. A blob the gateway
+    /// rewrites streams whole, with no length. A `HEAD` answers with the
     /// headers once the size is known.
     async fn blob(
         self: &Arc<Self>,
@@ -2047,6 +2064,9 @@ impl Gateway {
         let mut size = self.blob_size(uri.hash).await;
         if size.is_none() && !rewritten {
             size = self.learn_size(uri, paying).await?;
+        }
+        if let Some(refused) = self.over_blob_cap(size) {
+            return Ok(refused);
         }
         let range = match ask {
             Ask::Get(range) => range,
@@ -2089,8 +2109,9 @@ impl Gateway {
     /// on `paying`'s lanes: the worker runs a fetch that resolves the holders
     /// and takes the first size one proves, and writes no byte. The size
     /// joins the verified sizes ([`PullWorker::size`]). The allowance it
-    /// waited behind refuses it at its slot, as a pull's does. It pays for no
-    /// byte, so it charges the allowance nothing.
+    /// waited behind refuses it at its slot, as a pull's does. When no probe
+    /// answer proves the size, it opens the blob's first byte, which pays for
+    /// one chunk group at most; the lookup charges the allowance nothing.
     ///
     /// # Errors
     ///

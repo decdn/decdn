@@ -1730,6 +1730,16 @@ async fn public_gateway_proving(
     found: HashMap<[u8; 32], u64>,
     proves: HashMap<[u8; 32], u64>,
 ) -> (Arc<Gateway>, Logs, String) {
+    public_gateway_flagged(allowance, found, proves, flags(&[])).await
+}
+
+/// [`public_gateway_proving`] run with the fetch flags `common`.
+async fn public_gateway_flagged(
+    allowance: Allowance,
+    found: HashMap<[u8; 32], u64>,
+    proves: HashMap<[u8; 32], u64>,
+    common: cli::ClientFetchArgs,
+) -> (Arc<Gateway>, Logs, String) {
     let replies = HashMap::from([
         (BLOB, Reply::Bytes(public_manifest())),
         (ENTRY, Reply::Bytes(b"abc".to_vec())),
@@ -1763,7 +1773,7 @@ async fn public_gateway_proving(
         origin: "https://decdn.test".parse().unwrap(),
     };
     let public = public_with(allowance, logs.pointers_dir.path());
-    let gateway = test_gateway_in(backend, flags(&[]), sites, Some(public)).await;
+    let gateway = test_gateway_in(backend, common, sites, Some(public)).await;
     let host = gateway.sites.site_host(&Site {
         hash: BLOB,
         namespace: None,
@@ -2937,6 +2947,23 @@ async fn a_raw_blob_of_known_size_answers_with_its_length() {
         logs.proofs.lock().unwrap().is_empty(),
         "a verified size needs no proof"
     );
+}
+
+/// A raw blob whose proven size passes `--max-blob-mb` answers 413 before
+/// any pull.
+#[tokio::test]
+async fn a_raw_blob_past_the_blob_cap_answers_413_with_no_pull() {
+    let (gateway, logs, _) = public_gateway_flagged(
+        Allowance::with_namespaces(u64::MAX, []),
+        HashMap::from([(OTHER, 3 << 20)]),
+        HashMap::new(),
+        flags(&["--max-blob-mb", "2"]),
+    )
+    .await;
+    let path = format!("/{}", alloy::hex::encode(OTHER));
+    let answer = request(&gateway, "decdn.test", &path, &[]).await;
+    assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(logs.caps.lock().unwrap().is_empty(), "no pull runs");
 }
 
 /// A raw blob of verified size takes one `Range`, as a sized entry does: 206

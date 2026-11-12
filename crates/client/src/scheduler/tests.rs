@@ -5421,37 +5421,9 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- the size is a hint: grow and shrink the bound ----
+// ---- the size is proven: the first leg's proof sets the bound ----
 
 const MIB: u64 = 1024 * 1024;
-
-#[test]
-fn a_claim_with_nothing_past_it_grows_by_one_seed() {
-    use super::{SEED, grown_bound};
-    let gib = 1 << 30;
-    assert_eq!(grown_bound(gib, gib, 0), gib + SEED);
-    // A claim off the SEED grid rounds up to it.
-    let gb = 1_000_000_000;
-    let want = (gb + SEED).div_ceil(SEED) * SEED;
-    assert_eq!(grown_bound(gb, gb, 0), want);
-    assert_eq!(want % SEED, 0);
-}
-
-#[test]
-fn bytes_past_the_claim_grow_the_bound_twice_as_far() {
-    use super::{SEED, grown_bound};
-    let (gb, mb): (u64, u64) = (1_000_000_000, 1_000_000);
-    let want = (gb + 100 * mb).div_ceil(SEED) * SEED;
-    assert_eq!(grown_bound(gb, gb, 50 * mb), want);
-}
-
-#[test]
-fn a_grown_bound_saturates_near_the_top() {
-    use super::grown_bound;
-    assert_eq!(grown_bound(u64::MAX - 10, 0, 0), u64::MAX);
-    assert_eq!(grown_bound(1, 0, u64::MAX), u64::MAX);
-    assert_eq!(grown_bound(1, u64::MAX, 1), u64::MAX);
-}
 
 /// Acquire the whole blob into `store` from `provider`, recording every
 /// `(position, total)` the progress callback reports.
@@ -5682,9 +5654,9 @@ async fn blocks_no_lane_covers_are_taken_by_a_partial_holder() -> anyhow::Result
 
 // ---- the caller's size cap bounds every claim ----
 
-/// Acquire `data`'s blob from one honest lane into a store sized by
-/// `claim`, under `cap`. Returns the result, every progress total, and
-/// the store.
+/// Acquire `data`'s blob from one honest lane into a store sized by the
+/// proven size `claim`, under `cap`. Returns the result, every progress
+/// total, and the store.
 async fn acquire_capped(
     data: &[u8],
     claim: u64,
@@ -5725,14 +5697,12 @@ async fn acquire_capped(
     Ok((result, totals, store, dir))
 }
 
-/// A first claim above the cap is clamped to it before any work is sized:
-/// no bound past the cap is ever planned, and a blob within the cap
-/// completes.
+/// A blob within the cap completes, and no progress total passes the cap.
 #[tokio::test(start_paused = true)]
-async fn a_claim_above_the_cap_is_clamped_to_it() -> anyhow::Result<()> {
+async fn a_blob_within_the_cap_completes() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
-    let cap = 8 * MIB;
-    let (result, totals, store, dir) = acquire_capped(&data, u64::MAX / 2, cap).await?;
+    let cap = 5 * MIB;
+    let (result, totals, store, dir) = acquire_capped(&data, 3 * MIB, cap).await?;
     result?;
     assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
     assert_eq!(store.proven(), Some(3 * MIB));
@@ -5741,37 +5711,22 @@ async fn a_claim_above_the_cap_is_clamped_to_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A short first size under a cap: the first leg proves the true size, the
-/// bound never passes the cap, and a blob within it completes.
-#[tokio::test(start_paused = true)]
-async fn a_short_first_size_proves_within_the_cap() -> anyhow::Result<()> {
-    let data = blob(3 * MIB as usize);
-    let cap = 5 * MIB;
-    let (result, totals, store, _dir) = acquire_capped(&data, MIB, cap).await?;
-    result?;
-    assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
-    assert_eq!(store.proven(), Some(3 * MIB));
-    Ok(())
-}
-
-/// A blob larger than the cap ends the item with `BlobTooLarge` once a leg
-/// proves its size, whether the first size was short or above the cap.
+/// A proven size past the cap ends the item with `BlobTooLarge` before any
+/// leg opens.
 #[tokio::test(start_paused = true)]
 async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
     let cap = 2 * MIB;
-    for claim in [MIB, 3 * MIB] {
-        let (result, totals, _store, _dir) = acquire_capped(&data, claim, cap).await?;
-        let err = result
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("a blob past the cap must fail"))?;
-        assert!(
-            err.downcast_ref::<crate::BlobTooLarge>().is_some(),
-            "{err:#}"
-        );
-        assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
-        assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
-    }
+    let (result, totals, _store, _dir) = acquire_capped(&data, 3 * MIB, cap).await?;
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a blob past the cap must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::BlobTooLarge>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
+    assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
     Ok(())
 }
 
@@ -5780,20 +5735,19 @@ async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
 #[tokio::test(start_paused = true)]
 async fn a_blob_exactly_at_the_cap_completes() -> anyhow::Result<()> {
     let data = blob(2 * MIB as usize);
-    let (result, _, store, _dir) = acquire_capped(&data, 3 * MIB, 2 * MIB).await?;
+    let (result, _, store, _dir) = acquire_capped(&data, 2 * MIB, 2 * MIB).await?;
     result?;
     assert_eq!(store.proven(), Some(2 * MIB));
     Ok(())
 }
 
-/// A cap off the chunk-group grid: a leg that ends at the cap is served to
-/// its group's end and can prove a size past the cap. That proven size
-/// still ends the item with `BlobTooLarge`.
+/// A cap off the chunk-group grid: a proven size between the cap and the
+/// end of its chunk group still ends the item with `BlobTooLarge`.
 #[tokio::test(start_paused = true)]
 async fn a_proven_size_past_an_unaligned_cap_ends_the_item() -> anyhow::Result<()> {
     let data = blob(2 * MIB as usize + 100);
     let cap = 2 * MIB + 50;
-    let (result, _, store, _dir) = acquire_capped(&data, 3 * MIB, cap).await?;
+    let (result, _, store, _dir) = acquire_capped(&data, 2 * MIB + 100, cap).await?;
     let err = result
         .err()
         .ok_or_else(|| anyhow::anyhow!("a proven size past the cap must fail"))?;
@@ -7555,18 +7509,15 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     Ok(())
 }
 
-/// With no size proven, the end the fetch knows is the smaller of the
-/// first claim and the bound; a proven size replaces both.
+/// An acquire records its proven size before it plans, and a leg's proof of
+/// the true size replaces a wrong one: the store ends at the true size.
 #[tokio::test]
-async fn the_known_end_is_the_claim_or_bound_until_a_size_is_proven() -> anyhow::Result<()> {
+async fn the_store_ends_at_the_size_a_leg_proves() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let src = ScriptedSource::new(data)?.paying(Arc::clone(&ledger));
     let root = src.root();
     let (store, _dir) = fresh_store(root, 8 * MIB);
-    assert_eq!(super::known_end(&store, MIB), MIB, "a short claim");
-    assert_eq!(super::known_end(&store, 16 * MIB), 8 * MIB, "the bound");
-
     let provider = StaticSources::new(vec![candidate(src, ledger, 0xA1, None)])?;
     run_acquire(
         &store,
@@ -7579,7 +7530,8 @@ async fn the_known_end_is_the_claim_or_bound_until_a_size_is_proven() -> anyhow:
         None,
     )
     .await?;
-    assert_eq!(super::known_end(&store, MIB), 3 * MIB, "the proven size");
+    assert_eq!(store.proven(), Some(3 * MIB));
+    assert_eq!(store.bound(), 3 * MIB);
     Ok(())
 }
 

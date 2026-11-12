@@ -32,7 +32,8 @@ Each read has a frame ceiling. The ceiling is at least the largest legitimate me
 
 | Ceiling | Value | Reads | Largest legitimate message |
 | --- | --- | --- | --- |
-| `MAX_PROBE_FRAME` | 8 KiB | Every `cdn/probe/v1` read | `ProbeResponse` with its extension and a full size proof: 4,808 B |
+| `MAX_PROBE_REQUEST_FRAME` | 1 KiB | `ProbeRequest`, which the node reads | `ProbeRequest`: 43 B |
+| `MAX_PROBE_FRAME` | 8 KiB | `ProbeResponse`, which the requester reads | `ProbeResponse` with its extension and a full size proof: 4,808 B |
 | `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding and a capability: 301 B |
 | `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a refusal code, an origin attestation and a full size proof: under 5 KiB |
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |

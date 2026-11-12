@@ -587,9 +587,9 @@ fn b3_hex_str_from_hex(hex: &str) -> String {
 }
 
 /// Import a single source file into the filesystem origin `base`. Streams the
-/// file once to compute its hash + outboard; copies (default) or moves
-/// (`--move`) the data object into `{base}/{hex[0..2]}/{hex}` and writes the
-/// `{hex}.obao4` and `{hex}.sizeproof` siblings, each atomically. Idempotent: a data object already
+/// file once to compute its hash + outboard; writes the `{hex}.obao4` and
+/// `{hex}.sizeproof` siblings, then copies (default) or moves (`--move`) the
+/// data object into `{base}/{hex[0..2]}/{hex}`, each atomically. Idempotent: a data object already
 /// present at its content address is left as-is (a matching hash is matching
 /// bytes); a size mismatch is refused unless `--force`.
 fn import_one_file(
@@ -630,6 +630,10 @@ fn import_one_file(
     let (shard_dir, data_path) = object_paths(base, &eo);
     std::fs::create_dir_all(&shard_dir)
         .map_err(|e| anyhow!("create shard dir {}: {e}", shard_dir.display()))?;
+    // The siblings land before the data object, so a `--move` cut short
+    // between the two still has its source, and the next import of it
+    // finishes the object. A data object never sits without its proof.
+    ensure_siblings(&shard_dir, &eo)?;
 
     if data_slot_needs_write(&data_path, size, force, &eo.hash_hex)? {
         if move_source {
@@ -658,8 +662,6 @@ fn import_one_file(
             .map_err(|e| anyhow!("remove moved source {}: {e}", source.display()))?;
     }
 
-    ensure_siblings(&shard_dir, &eo)?;
-
     Ok(ImportedBlob {
         hash_hex: eo.hash_hex,
         size,
@@ -675,6 +677,7 @@ fn import_bytes(base: &Path, bytes: &[u8], force: bool) -> anyhow::Result<Import
     let (shard_dir, data_path) = object_paths(base, &eo);
     std::fs::create_dir_all(&shard_dir)
         .map_err(|e| anyhow!("create shard dir {}: {e}", shard_dir.display()))?;
+    ensure_siblings(&shard_dir, &eo)?;
 
     if data_slot_needs_write(&data_path, size, force, &eo.hash_hex)? {
         let mut tmp = tempfile::NamedTempFile::new_in(&shard_dir)
@@ -688,7 +691,6 @@ fn import_bytes(base: &Path, bytes: &[u8], force: bool) -> anyhow::Result<Import
             .map_err(|e| anyhow!("persist data object {}: {}", data_path.display(), e.error))?;
     }
 
-    ensure_siblings(&shard_dir, &eo)?;
     Ok(ImportedBlob {
         hash_hex: eo.hash_hex,
         size,

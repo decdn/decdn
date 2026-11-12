@@ -256,11 +256,7 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     {
         return Fault::Fatal(FatalScope::Item);
     }
-    // A size with no valid proof is a fault of the node that stated it: its
-    // ranges move to other sources.
-    if err.downcast_ref::<HealExhausted>().is_some()
-        || err.downcast_ref::<crate::UnprovenSize>().is_some()
-    {
+    if err.downcast_ref::<HealExhausted>().is_some() {
         return Fault::Source;
     }
     if err.downcast_ref::<LocalPullFault>().is_some() || is_local_disk_fault(err) {

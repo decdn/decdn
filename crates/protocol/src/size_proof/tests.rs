@@ -15,6 +15,22 @@ fn new_refuses_a_proof_past_the_bound() {
     assert_eq!(err.len, MAX_SIZE_PROOF_BYTES + 1);
 }
 
+/// A length prefix far past the bound, with no bytes behind it, is refused on
+/// the prefix alone.
+#[test]
+#[allow(clippy::cast_possible_truncation)] // varint bytes are masked to 7 bits
+fn decode_refuses_a_huge_declared_length() {
+    // postcard varint of 2^40, then nothing.
+    let mut bytes = Vec::new();
+    let mut n: u64 = 1 << 40;
+    while n >= 0x80 {
+        bytes.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    bytes.push(n as u8);
+    assert!(postcard::from_bytes::<SizeProof>(&bytes).is_err());
+}
+
 #[test]
 fn decode_refuses_a_proof_past_the_bound() {
     // Encode the raw vector with the same layout as a `SizeProof`: one

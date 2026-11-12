@@ -1250,6 +1250,30 @@ async fn the_record_wins_over_a_new_hint() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A resumed record that names another proven size, above or below the true
+/// one, gives way to a fresh proof: the store's proven size and bound become
+/// the proven one.
+#[tokio::test]
+async fn a_fresh_proof_replaces_a_wrong_recorded_size() -> anyhow::Result<()> {
+    let truth = 3 * GROUP + 7;
+    for recorded in [truth + GROUP, truth - GROUP] {
+        let data = blob(usize::try_from(truth)?);
+        let (root, _) = bao_root_and_outboard(&data);
+        let dir = tmp_dir();
+        {
+            let store = ClientRangedStore::open_or_create(dir.path(), "blob", root, recorded)?;
+            store.prove_size(recorded);
+            crate::source::IngestStore::flush_present_record(&store).await?;
+        }
+        let store = ClientRangedStore::open_or_create(dir.path(), "blob", root, truth)?;
+        assert_eq!(store.proven(), Some(recorded), "the record holds its size");
+        store.prove_size(truth);
+        assert_eq!(store.proven(), Some(truth));
+        assert_eq!(store.bound(), truth);
+    }
+    Ok(())
+}
+
 /// Every byte of the bound present is not enough: `finalize` needs a
 /// proven size, and keeps the partial without one.
 #[tokio::test]

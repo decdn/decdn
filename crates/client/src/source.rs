@@ -130,7 +130,7 @@ pub trait BlobSource: Send + Sync {
     /// leg to the room the store's BLAKE3-verified bytes leave under it, and ends
     /// with [`crate::BlobTooLarge`] once a missing byte could only land past it.
     /// The cap bounds bytes held, never the offsets read, and never reads the
-    /// peer's unverified signed `total_bytes`. `0` = unlimited — the default, and
+    /// peer's `total_bytes`. `0` = unlimited — the default, and
     /// correct for an own-origin source whose engine store already caps on stored
     /// bytes.
     fn max_blob_size_bytes(&self) -> u64 {
@@ -235,9 +235,9 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     }
 
     /// Move the planner's bound ([`total_bytes`](decdn_bao_range::RangedStore::total_bytes))
-    /// to `bound`. [`crate::acquire`] grows the bound this way while no size is
-    /// proven. A store keyed by a fixed size keeps it, so the default does
-    /// nothing.
+    /// to `bound`. [`crate::acquire`] clamps a first size to the cap's reach
+    /// this way while no size is proven. A store keyed by a fixed size keeps
+    /// it, so the default does nothing.
     fn set_bound(&self, bound: u64) {
         let _ = bound;
     }

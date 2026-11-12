@@ -58,20 +58,45 @@ impl SizeProof {
     }
 }
 
-/// Bounds a wire proof to [`MAX_SIZE_PROOF_BYTES`] at decode. The enclosing
-/// frame ceiling and serde's cautious capacity hint bound the allocation
-/// before this check, so the wire length prefix never sizes a buffer.
+/// Bounds a wire proof to [`MAX_SIZE_PROOF_BYTES`] at decode. The visitor
+/// refuses a declared length past the bound before it allocates, and sizes
+/// its buffer by the smaller of the declared length and the bound, so the
+/// wire length prefix never allocates more than one proof.
 fn deserialize_bounded_proof<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let bytes = Vec::<u8>::deserialize(d)?;
-    if bytes.len() > MAX_SIZE_PROOF_BYTES {
-        return Err(serde::de::Error::custom(SizeProofTooLong {
-            len: bytes.len(),
-        }));
+    d.deserialize_seq(BoundedProof)
+}
+
+/// The visitor of [`deserialize_bounded_proof`].
+struct BoundedProof;
+
+impl<'de> serde::de::Visitor<'de> for BoundedProof {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "at most {MAX_SIZE_PROOF_BYTES} proof bytes")
     }
-    Ok(bytes)
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Vec<u8>, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let too_long = |len| serde::de::Error::custom(SizeProofTooLong { len });
+        let declared = seq.size_hint().unwrap_or(0);
+        if declared > MAX_SIZE_PROOF_BYTES {
+            return Err(too_long(declared));
+        }
+        let mut bytes = Vec::with_capacity(declared);
+        while let Some(byte) = seq.next_element::<u8>()? {
+            if bytes.len() >= MAX_SIZE_PROOF_BYTES {
+                return Err(too_long(bytes.len().saturating_add(1)));
+            }
+            bytes.push(byte);
+        }
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]

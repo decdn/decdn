@@ -1156,20 +1156,26 @@ impl ClientHandler {
                 // streams the same filling cache to its own client (no double origin
                 // egress). The registry is range-aware, so this coalescing is not
                 // limited to the whole-blob case.
+                // The node serves an origin blob only under a size its origin's
+                // `{H}.sizeproof` proves (ADR 005 § A node proves the blob size).
+                // The proof comes first; only a proven size sizes the outboard
+                // read of the range probe. An origin blob with no proof is not
+                // served from the origin, by the range encoder or by the
+                // buffered populate below.
+                let mut origin_unprovable = false;
                 if let Some((lk, ln)) = authority {
                     match self.cache.origin_size(hash).await {
+                        Ok(Some(total)) if self.cache.size_proof(hash, total).await.is_none() => {
+                            origin_unprovable = true;
+                        }
                         Ok(Some(total)) => {
                             match self.cache.origin_range_serviceable(hash, total).await {
-                                // Serviceable: size known and an origin publishes the
-                                // outboard and serves ranges. Enter the orchestration
-                                // directly — it claims the fill (owner-or-attach)
-                                // internally after signing the response, so no
-                                // coalescing decision happens here. The origin size
-                                // must prove first (ADR 005 § A node proves the blob
-                                // size): an origin size with no proof degrades to the
-                                // buffered populate below, whose complete blob proves
-                                // its own size.
-                                Ok(true) if self.cache.size_proof(hash, total).await.is_some() => {
+                                // Serviceable: the size is proven and an origin
+                                // publishes the outboard and serves ranges. Enter the
+                                // orchestration directly — it claims the fill
+                                // (owner-or-attach) internally after signing the
+                                // response, so no coalescing decision happens here.
+                                Ok(true) => {
                                     // Boxed: the serve future is large
                                     // (clippy::large_futures).
                                     return Box::pin(self.serve_via_backend_origin(
@@ -1193,11 +1199,11 @@ impl ClientHandler {
                                     ))
                                     .await;
                                 }
-                                // Size known but no origin publishes the outboard
-                                // and serves ranges, or the size does not prove —
-                                // not serviceable via the range encoder. Degrade to
-                                // the buffered local populate below.
-                                Ok(_) => {}
+                                // Size proven but no origin publishes the outboard
+                                // and serves ranges — not serviceable via the range
+                                // encoder. Degrade to the buffered local populate
+                                // below.
+                                Ok(false) => {}
                                 // A genuine origin fault while probing the outboard
                                 // or the first range window. Latch it (#1129) so a
                                 // later-tier miss reports InternalError not NotFound,
@@ -1249,6 +1255,7 @@ impl ClientHandler {
                 // client-attributable and would refuse regardless of origin
                 // health.)
                 if !locally_filled
+                    && !origin_unprovable
                     && let Some(timeout) = self.local_populate
                     && authority.is_some()
                 {
@@ -1392,6 +1399,20 @@ impl ClientHandler {
                     &mut send,
                     &req,
                     ServeRejectReason::RangeNotSatisfiable,
+                    rate_per_mb,
+                )
+                .await;
+        }
+        // The response states `total_bytes`, so its proof must be at hand
+        // before any reservation: a complete blob or a covering partial built
+        // or kept it above. With none, refuse now with a signed answer rather
+        // than fail the signing later (ADR 005 § A node proves the blob size).
+        if self.cache.size_proof(hash, total_bytes).await.is_none() {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::InternalError,
                     rate_per_mb,
                 )
                 .await;
@@ -1594,9 +1615,8 @@ pub(super) fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) ->
 /// (the direct-serve gate and the own-origin twin) refuses the same starts with
 /// `RangeNotSatisfiable` BEFORE it signs a response. A whole-blob request
 /// (`0, 0`) is always in bounds, including for the empty blob. An end past the
-/// blob is NOT out of bounds here: it is served clamped to the blob's end (a
-/// claimed size is a hint), so only a start at or past a non-empty blob's end
-/// refuses.
+/// blob is NOT out of bounds here: it is served clamped to the blob's end, so
+/// only a start at or past a non-empty blob's end refuses.
 pub(super) fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: u64) -> bool {
     decdn_bao_range::align_range_clamped(byte_offset, byte_len, total_bytes).is_err()
 }

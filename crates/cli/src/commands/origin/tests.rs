@@ -291,3 +291,48 @@ fn is_cross_device_matches_a_raw_exdev() {
     // 18 == EXDEV on Linux and macOS: the error `rename` returns across mounts.
     assert!(is_cross_device(&std::io::Error::from_raw_os_error(18)));
 }
+
+/// A `--move` import of `bytes` from a fresh source file: the source, its
+/// encoding, and the store's object directory.
+fn move_fixture(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, EncodedOutboard, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("store");
+    std::fs::create_dir_all(&base).unwrap();
+    let source = dir.path().join("model.bin");
+    std::fs::write(&source, bytes).unwrap();
+    let eo = encode_outboard(bytes, bytes.len() as u64).unwrap();
+    let shard = base.join(eo.shard());
+    (dir, source, eo, shard)
+}
+
+/// A `--move` import leaves the object with both siblings and no source.
+#[test]
+fn a_move_import_lands_the_object_with_both_siblings() {
+    let bytes = vec![0x5a; 40_000];
+    let (dir, source, eo, shard) = move_fixture(&bytes);
+    import_one_file(&dir.path().join("store"), &source, true, false).unwrap();
+    assert!(!source.exists(), "the source moved");
+    assert_eq!(std::fs::read(shard.join(&eo.hash_hex)).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(shard.join(eo.obao4_name())).unwrap(),
+        eo.outboard
+    );
+    assert_eq!(
+        std::fs::read(shard.join(eo.size_proof_name())).unwrap(),
+        eo.size_proof.as_ref()
+    );
+}
+
+/// A `--move` cut short after the siblings landed still has its source, and
+/// the next import of it moves the object into place.
+#[test]
+fn a_move_cut_after_the_siblings_finishes_on_the_next_import() {
+    let bytes = vec![0xa5; 40_000];
+    let (dir, source, eo, shard) = move_fixture(&bytes);
+    std::fs::create_dir_all(&shard).unwrap();
+    ensure_siblings(&shard, &eo).unwrap();
+    assert!(source.exists() && !shard.join(&eo.hash_hex).exists());
+    import_one_file(&dir.path().join("store"), &source, true, false).unwrap();
+    assert!(!source.exists());
+    assert_eq!(std::fs::read(shard.join(&eo.hash_hex)).unwrap(), bytes);
+}
