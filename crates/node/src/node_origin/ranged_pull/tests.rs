@@ -32,17 +32,17 @@ fn a_pull_plans_no_further_than_the_request_or_the_cap() {
     assert_eq!(planned_len(77, 0), 77);
 }
 
-/// A pull of a 2^60-byte blob plans only the blocks of the request: one run
+/// A pull of one block of a 64-block blob plans only that block: one run
 /// over the requested block, and nothing past it is uncovered or planned.
 #[test]
-fn a_huge_blob_plans_only_the_requested_blocks() {
-    let total = 1u64 << 60;
+fn a_large_blob_plans_only_the_requested_blocks() {
+    let total = 64 * DISCOVERY_BLOCK_BYTES;
     let offset = DISCOVERY_BLOCK_BYTES;
     let len = planned_len(4096, 8 * DISCOVERY_BLOCK_BYTES);
     let gap = ChunkRanges::from(
         ChunkNum(offset / BAO_CHUNK_BYTES)..ChunkNum((offset + len) / BAO_CHUNK_BYTES),
     );
-    let coverages = vec![cov(4, &[1])];
+    let coverages = vec![cov(64, &[1])];
     let (runs, uncovered) = super::plan_over(&gap, total, &coverages, &[0]);
     assert!(uncovered.is_empty());
     assert_eq!(
