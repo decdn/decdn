@@ -170,7 +170,7 @@ A size proof depends on the hash alone. It names no node and carries no signatur
 - A node builds a proof from the last chunk group when it holds that group, or when its own origin serves the outboard and the last chunk group. It keeps the proof with the blob. When the node evicts the blob, it drops the proof.
 - A probe answer states `total_bytes` only with its proof. A node that cannot prove the size answers with no size.
 - A partial holder that has no proof and does not hold the last chunk group serves the request as a cache miss. Its upstream pull brings the proof.
-- A node keeps a bounded number of proofs. A partial holder that lost a proof and does not hold the last chunk group gets the proof again from its next upstream pull.
+- A node keeps each proof in its store, so the proof survives a restart. At startup the node deletes each kept proof whose blob it does not hold: the proof of a pull that landed no byte.
 
 The proof carries the last bytes of the blob, unpaid: at most 1 KiB, and the whole blob when the blob is no longer than one BLAKE3 chunk.
 

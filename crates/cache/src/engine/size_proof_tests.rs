@@ -109,12 +109,102 @@ async fn keep_size_proof_refuses_a_mismatched_proof() -> anyhow::Result<()> {
     let proof = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof;
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
-    anyhow::ensure!(!engine.keep_size_proof(hash, size + 1, &proof));
-    anyhow::ensure!(!engine.keep_size_proof(Hash::new(b"other"), size, &proof));
-    anyhow::ensure!(!engine.keep_size_proof(hash, 1 << 60, &[]));
+    anyhow::ensure!(!engine.keep_size_proof(hash, size + 1, &proof).await);
+    anyhow::ensure!(
+        !engine
+            .keep_size_proof(Hash::new(b"other"), size, &proof)
+            .await
+    );
+    anyhow::ensure!(!engine.keep_size_proof(hash, 1 << 60, &[]).await);
     anyhow::ensure!(engine.kept_size_proof(hash).is_none());
-    anyhow::ensure!(engine.keep_size_proof(hash, size, &proof));
+    anyhow::ensure!(engine.keep_size_proof(hash, size, &proof).await);
     anyhow::ensure!(engine.kept_size_proof(hash).map(|(s, _)| s) == Some(size));
+    Ok(())
+}
+
+/// A proof kept from an upstream, for a partial blob that does not hold its
+/// tail, survives a restart: the reopened engine, with no origin, still
+/// proves the size, and proves no other.
+#[tokio::test]
+async fn a_kept_proof_survives_a_restart() -> anyhow::Result<()> {
+    let data = blob();
+    let size = u64::try_from(data.len())?;
+    let hash = Hash::new(&data);
+    let proof = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof;
+    let tmp = tempfile::tempdir()?;
+    {
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
+        // Hold the first chunk group only, as a pull-through partial does.
+        let first = crate::range_pull::align_range(0, CHUNK_GROUP_BYTES, size)?;
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+            &data,
+            crate::range_pull::IROH_BLOCK_SIZE,
+        );
+        let wire = crate::range_pull::encode_verified_range(
+            *hash.as_bytes(),
+            &first,
+            data.get(..usize::try_from(CHUNK_GROUP_BYTES)?)
+                .ok_or_else(|| anyhow::anyhow!("first group"))?,
+            Bytes::from(ob.data),
+        )?;
+        engine
+            .admit_bao(hash, first.chunk_ranges().clone(), wire)
+            .await?;
+        anyhow::ensure!(engine.keep_size_proof(hash, size, &proof).await);
+        engine.shutdown().await?;
+    }
+    let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
+    anyhow::ensure!(
+        engine.kept_size_proof(hash).is_none(),
+        "memory starts empty"
+    );
+    anyhow::ensure!(
+        engine.size_proof(hash, size).await.as_deref() == Some(proof.as_ref()),
+        "the stored proof proves the size"
+    );
+    anyhow::ensure!(engine.size_proof(hash, size + 1).await.is_none());
+    anyhow::ensure!(
+        engine.sweep_orphan_size_proofs().await? == 0,
+        "a held blob's proof is no orphan"
+    );
+    Ok(())
+}
+
+/// A proof kept ahead of a pull that never landed a byte is an orphan: the
+/// sweep at open deletes it, and a later lookup has nothing to read.
+#[tokio::test]
+async fn the_sweep_deletes_a_proof_whose_blob_never_landed() -> anyhow::Result<()> {
+    let data = blob();
+    let size = u64::try_from(data.len())?;
+    let hash = Hash::new(&data);
+    let proof = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof;
+    let tmp = tempfile::tempdir()?;
+    {
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
+        anyhow::ensure!(engine.keep_size_proof(hash, size, &proof).await);
+        engine.shutdown().await?;
+    }
+    let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
+    anyhow::ensure!(
+        engine.sweep_orphan_size_proofs().await? == 0,
+        "open already swept it"
+    );
+    Ok(())
+}
+
+/// Evicting a blob drops its stored proof tag with the blob's other tags.
+#[tokio::test]
+async fn evicting_a_blob_drops_its_stored_proof() -> anyhow::Result<()> {
+    let data = blob();
+    let size = u64::try_from(data.len())?;
+    let hash = Hash::new(&data);
+    let proof = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof;
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
+    anyhow::ensure!(engine.keep_size_proof(hash, size, &proof).await);
+    engine.release_for_eviction(hash).await?;
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
     Ok(())
 }
 

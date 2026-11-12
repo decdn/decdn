@@ -1,12 +1,11 @@
-//! The size proof the engine keeps for each blob it can state a size for
-//! (ADR 005 § A node proves the blob size).
+//! The in-memory cache of the size proofs the engine keeps (ADR 005 § A node
+//! proves the blob size).
 //!
-//! A proof is a few KiB, and the memo holds at most [`SIZE_PROOF_ENTRIES`]
-//! of them, so it stays under about 300 MiB at the longest proof and far
-//! less at a typical one. When it is full, the oldest entry goes. A blob that
-//! holds its last chunk group, or that an origin backs, rebuilds its proof on
-//! demand. A partial blob without its tail whose proof went states no size
-//! until a pull from its upstream brings the proof again.
+//! The store holds every kept proof under a named tag, so this memo is a
+//! cache in front of it. A proof is a few KiB, and the memo holds at most
+//! [`SIZE_PROOF_ENTRIES`] of them, so it stays under about 300 MiB at the
+//! longest proof and far less at a typical one. When it is full, the oldest
+//! entry goes, and the next lookup reads the proof from the store again.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;

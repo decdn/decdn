@@ -3074,7 +3074,7 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
     let data = vec![7u8; 1024];
     let proof = decdn_bao_range::encode_outboard(data.as_slice(), 1024)?.size_proof;
     let hash = Hash::new(&data);
-    assert!(handler.cache.keep_size_proof(hash, 1024, &proof));
+    assert!(handler.cache.keep_size_proof(hash, 1024, &proof).await);
     let body = StreamResponseBody {
         hash: *hash.as_bytes(),
         ok: true,
@@ -3102,7 +3102,7 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
     let size = u64::try_from(data.len())?;
     let proof = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof;
     let hash = Hash::new(&data);
-    assert!(handler.cache.keep_size_proof(hash, size, &proof));
+    assert!(handler.cache.keep_size_proof(hash, size, &proof).await);
     let body = |hash: [u8; 32], total_bytes| StreamResponseBody {
         hash,
         ok: true,

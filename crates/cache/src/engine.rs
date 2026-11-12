@@ -539,8 +539,9 @@ struct Inner {
     /// [`OriginRangeWire`] holds a handle and evicts the copy it used when the
     /// range fails bao verification.
     outboards: OutboardCache,
-    /// The verified size proof of each blob the engine states a size for
-    /// ([`CacheEngine::size_proof`]). Evicting a blob drops its proof.
+    /// In-memory cache of the verified size proofs the store keeps under
+    /// named tags ([`CacheEngine::size_proof`]). Evicting a blob drops its
+    /// proof from both.
     size_proofs: SizeProofMemo,
     /// One async lock per hash whose outboard an origin read is fetching, so
     /// concurrent cold misses of one hash wait for the first read and reuse its
@@ -1640,6 +1641,11 @@ impl CacheEngine {
             }),
         };
         engine.seed_access_times_from_store().await;
+        // A size proof kept ahead of a pull that never landed would otherwise
+        // stay in the store with no blob to evict it.
+        if let Err(err) = engine.sweep_orphan_size_proofs().await {
+            tracing::warn!(error = %err.display_chain(), "size proof sweep failed at open");
+        }
         Ok(engine)
     }
 
@@ -4014,17 +4020,18 @@ impl CacheEngine {
     ///
     /// The engine looks in turn at:
     ///
-    /// 1. the proof it keeps for the hash;
-    /// 2. the last chunk group in its own store, for a complete blob or a
+    /// 1. the proof it holds in memory for the hash;
+    /// 2. the proof it keeps in its store (see [`Self::keep_size_proof`]);
+    /// 3. the last chunk group in its own store, for a complete blob or a
     ///    partial blob that holds its tail;
-    /// 3. the `{H}.sizeproof` object of each origin;
-    /// 4. the outboard and the last chunk group of each origin, for a blob an
+    /// 4. the `{H}.sizeproof` object of each origin;
+    /// 5. the outboard and the last chunk group of each origin, for a blob an
     ///    origin holds with no stored proof.
     ///
     /// Every proof it finds is verified against `hash` and `size` before it
     /// is kept and returned. A proof that does not verify is skipped, so a
     /// wrong `size` gives `None`. An origin fault gives `None` for that
-    /// origin.
+    /// origin. A proof that steps 3 to 5 find is kept in the store too.
     pub async fn size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
         let root = *hash.as_bytes();
         if let Some(kept) = self.inner.size_proofs.get(&hash) {
@@ -4034,6 +4041,10 @@ impl CacheEngine {
             // The kept proof proves another size, so this size is wrong.
             return None;
         }
+        if let Some(proof) = self.stored_size_proof(hash, size).await {
+            self.inner.size_proofs.insert(hash, size, proof.clone());
+            return Some(proof);
+        }
         let proof = match self.local_size_proof(hash, size).await {
             Some(proof) => Some(proof),
             None => self.origin_size_proof(hash, size).await,
@@ -4041,6 +4052,7 @@ impl CacheEngine {
         if !decdn_bao_range::verify_size_proof(root, size, &proof) {
             return None;
         }
+        self.store_size_proof(hash, size, &proof).await;
         self.inner.size_proofs.insert(hash, size, proof.clone());
         Some(proof)
     }
@@ -4059,14 +4071,87 @@ impl CacheEngine {
     /// keeps the proof it verified from its upstream, so it serves the proof
     /// before it holds the tail of the blob. Returns whether the proof
     /// verified and was kept.
-    pub fn keep_size_proof(&self, hash: Hash, size: u64, proof: &[u8]) -> bool {
+    ///
+    /// The proof is kept in memory and in the store, under a named tag whose
+    /// name carries the proof and whose value is `hash` itself
+    /// (`decdn-sizeproof-{hex}/{size}/{proof}`). It survives a restart. Evicting the blob
+    /// drops every tag on `hash`, this one with it. A proof never becomes a
+    /// blob of its own, so it never counts as cached content.
+    pub async fn keep_size_proof(&self, hash: Hash, size: u64, proof: &[u8]) -> bool {
         if !decdn_bao_range::verify_size_proof(*hash.as_bytes(), size, proof) {
             return false;
         }
+        self.store_size_proof(hash, size, proof).await;
         self.inner
             .size_proofs
             .insert(hash, size, Bytes::copy_from_slice(proof));
         true
+    }
+
+    /// Write the size proof tag of `hash`. A store fault only logs: the proof
+    /// stays in memory, and the next lookup builds it again when it can.
+    async fn store_size_proof(&self, hash: Hash, size: u64, proof: &[u8]) {
+        let name = size_proof_tag(hash, size, proof);
+        if let Err(err) = self
+            .inner
+            .store
+            .tags()
+            .set(name, HashAndFormat::raw(hash))
+            .await
+        {
+            tracing::warn!(%hash, error = %err, "could not keep the size proof in the store");
+        }
+    }
+
+    /// The size proof of `size` that the store keeps for `hash`, verified.
+    async fn stored_size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
+        let prefix = size_proof_tag_prefix(hash);
+        let mut tags = self.inner.store.tags().list_prefix(&prefix).await.ok()?;
+        while let Some(info) = tags.next().await {
+            let Ok(info) = info else { continue };
+            let Some((stored, proof)) = parse_size_proof_tag(info.name.as_ref(), prefix.len())
+            else {
+                continue;
+            };
+            if stored == size && decdn_bao_range::verify_size_proof(*hash.as_bytes(), size, proof) {
+                return Some(Bytes::copy_from_slice(proof));
+            }
+        }
+        None
+    }
+
+    /// Delete each size proof tag whose blob the store does not hold: the
+    /// proof of a pull that never landed a byte. Eviction drops the tags of
+    /// a blob it removes, so this only catches proofs kept ahead of a pull.
+    /// Returns how many tags it deleted.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] when the store cannot list or delete tags.
+    pub async fn sweep_orphan_size_proofs(&self) -> CacheResult<u64> {
+        let tags = self.inner.store.tags();
+        let mut orphans = Vec::new();
+        {
+            let mut stream = tags
+                .list_prefix(SIZE_PROOF_TAG_PREFIX)
+                .await
+                .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+            while let Some(info) = stream.next().await {
+                let info = info.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+                let status = self.inner.store.blobs().status(info.hash).await;
+                if matches!(status, Ok(iroh_blobs::api::blobs::BlobStatus::NotFound)) {
+                    orphans.push(info.name);
+                }
+            }
+        }
+        let mut deleted = 0u64;
+        for name in orphans {
+            deleted += tags
+                .delete(name)
+                .await
+                .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        }
+        Ok(deleted)
     }
 
     /// Build the proof from the last chunk group in the local store.
@@ -6115,6 +6200,33 @@ fn record_origin_pull<T>(span: &tracing::Span, result: &CacheResult<T>) {
             span.record("otel.status_code", "ERROR");
         }
     }
+}
+
+/// Name prefix of every size proof tag. A tag is
+/// `decdn-sizeproof-{hex}/{size}/{proof}`: the blob hash in hex, the size in
+/// decimal, then the proof bytes. Its value is the blob hash.
+const SIZE_PROOF_TAG_PREFIX: &str = "decdn-sizeproof-";
+
+/// The tag name prefix of the size proofs of `hash`: `decdn-sizeproof-{hex}/`.
+fn size_proof_tag_prefix(hash: Hash) -> Vec<u8> {
+    format!("{SIZE_PROOF_TAG_PREFIX}{}/", hash.to_hex()).into_bytes()
+}
+
+/// The tag name that keeps `proof` as the proof that `hash` is `size` bytes.
+fn size_proof_tag(hash: Hash, size: u64, proof: &[u8]) -> Vec<u8> {
+    let mut name = size_proof_tag_prefix(hash);
+    name.extend_from_slice(format!("{size}/").as_bytes());
+    name.extend_from_slice(proof);
+    name
+}
+
+/// The size and proof in a size proof tag name, past its `prefix_len`-byte
+/// hash prefix. `None` for a name not in that shape.
+fn parse_size_proof_tag(name: &[u8], prefix_len: usize) -> Option<(u64, &[u8])> {
+    let rest = name.get(prefix_len..)?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let size = std::str::from_utf8(rest.get(..slash)?).ok()?.parse().ok()?;
+    Some((size, rest.get(slash.saturating_add(1)..)?))
 }
 
 #[cfg(test)]

@@ -326,9 +326,14 @@ impl ClientHandler {
                         // Keep the upstream's proof, which its open verified, so
                         // this node serves it before it holds the tail (ADR 005 §
                         // A node proves the blob size).
-                        let kept = opened.size_proof.as_ref().is_some_and(|proof| {
-                            self.cache.keep_size_proof(hash, total, proof.as_bytes())
-                        });
+                        let kept = match opened.size_proof.as_ref() {
+                            Some(proof) => {
+                                self.cache
+                                    .keep_size_proof(hash, total, proof.as_bytes())
+                                    .await
+                            }
+                            None => false,
+                        };
                         if !kept {
                             release_reservation_unspent(floor_reservation.as_ref());
                             return self
