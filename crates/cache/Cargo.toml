@@ -33,7 +33,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-chacha20poly1305 = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
@@ -60,15 +59,28 @@ dashmap = { workspace = true }
 # Jitter for the origin retry/backoff loop (#285). Uses `rand::random::<f64>()`
 # only; no per-call state, so no RNG instance is held.
 rand = { workspace = true }
-# AWS SDK pieces for the S3 origin (#437). See the workspace
-# `[workspace.dependencies]` block for the rationale on each
+# AWS SDK pieces for the S3 origin (#437), behind the `s3` feature. See the
+# workspace `[workspace.dependencies]` block for the rationale on each
 # `default-features = false` choice and the hyper-1 + aws-lc-rs binding.
-aws-config = { workspace = true }
-aws-sdk-s3 = { workspace = true }
-aws-smithy-http-client = { workspace = true }
-aws-credential-types = { workspace = true }
-aws-smithy-runtime-api = { workspace = true }
-aws-smithy-types = { workspace = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-smithy-http-client = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+
+[features]
+default = ["s3"]
+# `S3Origin`. Off, the crate links no AWS SDK and no `aws-lc`, for a binary
+# that stores and serves blobs without an S3 origin.
+s3 = [
+    "dep:aws-config",
+    "dep:aws-sdk-s3",
+    "dep:aws-smithy-http-client",
+    "dep:aws-credential-types",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+]
 
 [dev-dependencies]
 # Shared RangedStore conformance suite, run against a concrete backend
