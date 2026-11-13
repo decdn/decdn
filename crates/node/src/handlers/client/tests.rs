@@ -2579,18 +2579,72 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
         .is_some(),
         "the timestamp must sit beyond the admission bound for this test to mean anything"
     );
-    let body = StreamResponseBody {
-        hash: [7; 32],
-        ok: true,
-        rate_per_mb: 1,
-        total_bytes: 1024,
+    let data = vec![7u8; 1024];
+    let proof = decdn_bao_range::encode_outboard(data.as_slice(), 1024)?.size_proof;
+    let hash = Hash::new(&data);
+    assert!(handler.cache.keep_size_proof(hash, 1024, &proof).await);
+    let req = decdn_protocol::client::StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: [0; 32],
+        pool_id: [0; 32],
+        byte_offset: 0,
+        byte_len: 0,
         timestamp_us: an_hour_ago,
     };
-    let (resp, _ext) = handler.sign_response(body.clone(), None)?;
+    let (resp, _ext) = handler.sign_served(&req, 1, 1024).await?;
     assert_eq!(resp.body.timestamp_us, an_hour_ago);
     let sig = alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?;
-    let recovered =
-        StreamSlashData::from_response_body(&body).recover_signer(&sig, &handler.slash_domain)?;
+    let recovered = StreamSlashData::from_response_body(&resp.body)
+        .recover_signer(&sig, &handler.slash_domain)?;
     assert_eq!(recovered, handler.eth_signer.address());
+    Ok(())
+}
+
+/// A success response carries the proof of its size, and the node signs no
+/// success for a size it cannot prove: a size the kept proof does not prove,
+/// or a 2^60 size for a hash the node knows nothing of.
+#[tokio::test]
+async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests(&metrics).await;
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let size = u64::try_from(data.len())?;
+    let proof = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof;
+    let hash = Hash::new(&data);
+    assert!(handler.cache.keep_size_proof(hash, size, &proof).await);
+    let req = |hash: [u8; 32]| decdn_protocol::client::StreamRequest {
+        hash,
+        namespace_id: [0; 32],
+        pool_id: [0; 32],
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: crate::handlers::timestamp_skew::now_us(),
+    };
+
+    let (resp, ext) = handler.sign_served(&req(*hash.as_bytes()), 1, size).await?;
+    assert!(resp.body.ok);
+    assert_eq!(ext.validate(resp.body.ok), Ok(()));
+    let sent = ext
+        .size_proof()
+        .ok_or_else(|| anyhow::anyhow!("no proof sent"))?;
+    assert_eq!(sent.size(), size);
+    assert!(decdn_bao_range::verify_size_proof(
+        *hash.as_bytes(),
+        size,
+        sent.as_bytes()
+    ));
+
+    assert!(
+        handler
+            .sign_served(&req(*hash.as_bytes()), 1, size + 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        handler
+            .sign_served(&req([9; 32]), 1, 1 << 60)
+            .await
+            .is_err()
+    );
     Ok(())
 }

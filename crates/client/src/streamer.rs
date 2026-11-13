@@ -78,7 +78,7 @@ pub trait StreamStores {
     /// The store each stream fills.
     type Store: StreamStore;
 
-    /// Open the store for `hash`, sized to the stream's size claim
+    /// Open the store for `hash`, sized to the stream's proven size
     /// `total_bytes`. A store that already holds verified bytes of `hash`
     /// keeps them, and the stream fetches only what is missing. Two streams
     /// must not fill one store at the same time: an implementation either
@@ -157,9 +157,9 @@ struct StreamState<S> {
     /// The byte the window ends before, or `None` for a tail that ends at the
     /// size a leg proves. The stream ends at the smaller of the two.
     end: Option<u64>,
-    /// The caller's size hint: the fetch's first claim. The stream ends at the
-    /// size a leg proves ([`IngestStore::proven`]), whatever this says.
-    hint: u64,
+    /// The caller's proven size, which the acquire loop records in the store
+    /// ([`IngestStore::prove_size`]).
+    size: crate::ProvenSize,
     /// Woken by the reader when `cursor` advances, so a pull parked on a full
     /// read-ahead window ([`PaceDecision::Wait`](crate::pacer::PaceDecision::Wait))
     /// re-decides.
@@ -411,7 +411,6 @@ where
         state.start,
         state.end.map_or(0, |end| end.saturating_sub(state.start)),
     )];
-    let bounded = state.end.is_some();
     // Under consumption pacing `acquire` turns its lane watchdog off: a lane
     // parked on the consumer cursor is waiting, not stalled. A genuinely silent
     // source trips its own per-stream idle window mid-read instead.
@@ -434,9 +433,8 @@ where
         AcquireTarget {
             store: &state.store,
             hash,
-            total_bytes: state.hint,
+            total_bytes: state.size,
             ranges: &ranges,
-            bounded,
         },
         &mut sources,
         &env,
@@ -484,15 +482,16 @@ where
 ///
 /// use decdn_client::source::BlobSource;
 /// use decdn_client::{
-///     Funder, NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, StreamCandidate,
-///     Streamer,
+///     Funder, NoCache, ProgressClock, ProvenSize, PullConfig, StaticSources, StopPolicy,
+///     StreamCandidate, Streamer,
 /// };
 ///
+/// // `total_bytes` comes from `check_size_proof` on a node's size proof.
 /// async fn stream<S: BlobSource, F: Funder>(
 ///     candidates: Vec<StreamCandidate<S>>,
 ///     funder: F,
 ///     hash: [u8; 32],
-///     total_bytes: u64,
+///     total_bytes: ProvenSize,
 ///     scratch: &Path,
 /// ) -> anyhow::Result<()> {
 ///     let streamer = Streamer::new(StaticSources::new(candidates)?, funder, scratch);
@@ -597,10 +596,8 @@ impl<P, F, O> Streamer<'_, P, F, O> {
         self
     }
 
-    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim past
-    /// what the window can reach under the cap (the cap itself for the whole
-    /// blob, the window's offset plus the cap otherwise) is clamped before the
-    /// fill store is sized, and a blob that holds bytes past the cap ends the
+    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A window whose
+    /// bytes under the proven size would hold more than the cap ends the
     /// stream with [`crate::BlobTooLarge`]
     /// ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
@@ -642,9 +639,10 @@ where
     /// of the consumer's cursor, and the verified blob is teed to `cache` for the
     /// next revisit.
     ///
-    /// `total_bytes` is the first size claim, a hint. A resumed store's bound
-    /// wins, and a leg that verifies the final chunk proves the size. `hash` is
-    /// the bao root every byte is verified against; a wrong hash surfaces as a
+    /// `total_bytes` is the first size, a size a node proved. The fetch
+    /// records it as proven before any leg opens, so a resumed store that
+    /// records another size takes it. `hash` is the bao root every byte is
+    /// verified against; a wrong hash surfaces as a
     /// read error, never as silent corruption.
     ///
     /// # Errors
@@ -655,7 +653,7 @@ where
     pub async fn open<'a>(
         self,
         hash: [u8; 32],
-        total_bytes: u64,
+        total_bytes: crate::ProvenSize,
         config: &PullConfig,
         cache: Arc<dyn BlobCache>,
         stop: StopPolicy,
@@ -681,11 +679,9 @@ where
     /// revisit is served the whole blob; a cache that holds exactly the window
     /// serves it with no fetch.
     ///
-    /// `total_bytes` is the end of the blob as the caller knows it. A window
+    /// `total_bytes` is the end of the blob, a size a node proved. A window
     /// past it is clipped to it, and the stream then ends with an error naming
-    /// the shortfall; a window whose offset lies past the blob's real size,
-    /// under a claim that overstated it, ends with the fetch's error, as no
-    /// leg can verify it.
+    /// the shortfall.
     ///
     /// # Errors
     ///
@@ -695,7 +691,7 @@ where
     pub async fn open_range<'a>(
         self,
         hash: [u8; 32],
-        total_bytes: u64,
+        size: crate::ProvenSize,
         window: (u64, u64),
         config: &PullConfig,
         cache: Arc<dyn BlobCache>,
@@ -705,6 +701,7 @@ where
         P: 'a,
         F: 'a,
     {
+        let total_bytes = size.get();
         let (offset, len) = window;
         anyhow::ensure!(
             offset == 0 || offset < total_bytes,
@@ -728,19 +725,13 @@ where
             ));
         }
 
-        // A claim past what the cap on held bytes lets the window reach never
-        // sizes the store.
-        let total_bytes = total_bytes.min(crate::scheduler::claim_reach(
-            &[window],
-            self.max_blob_bytes,
-        ));
         let store = self.stores.open(hash, total_bytes).await?;
         let state = Arc::new(StreamState {
             store,
             cursor: AtomicU64::new(offset),
             start: offset,
             end,
-            hint: total_bytes,
+            size,
             consumed: Notify::new(),
             progressed: Notify::new(),
             outcome: Mutex::new(None),
@@ -774,56 +765,6 @@ where
                 error: None,
             },
         ))
-    }
-
-    /// Prove the size of `hash` before any of its bytes are handed out: fetch,
-    /// and pay for, the last byte under the size `claim` (the aligned chunk
-    /// group that holds it and its proof, ADR 038), and return the size a leg
-    /// proved.
-    ///
-    /// Only the true size verifies a final chunk (ADR 039), so the size this
-    /// returns is the blob's own, whatever a node claimed: a `claim` off by
-    /// less than one chunk group still proves the true size. A leg whose
-    /// sender signs any other size fails to verify, and its range moves to
-    /// another source. `None` is "no proof": `claim` is `0`, it lies past the
-    /// cap on held bytes (a blob that large is not held whole, and its claim
-    /// never sizes the work), or the chunk group under it is not the blob's
-    /// last.
-    ///
-    /// # Errors
-    ///
-    /// The fetch's error: every source failed or declined, including when the
-    /// chunk group under `claim` starts past the true size, so that no holder
-    /// can serve it.
-    pub async fn prove_size(
-        self,
-        hash: [u8; 32],
-        claim: u64,
-        config: &PullConfig,
-        stop: StopPolicy,
-    ) -> anyhow::Result<Option<u64>> {
-        if claim == 0 || (self.max_blob_bytes > 0 && claim > self.max_blob_bytes) {
-            return Ok(None);
-        }
-        let (mut reader, mut drive) = self
-            .open_range(
-                hash,
-                claim,
-                (claim - 1, 1),
-                config,
-                Arc::new(crate::NoCache),
-                stop,
-            )
-            .await?;
-        let mut last = Vec::new();
-        let read = drive
-            .alongside(tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut last))
-            .await;
-        // The fetch's own typed error comes first: a read error that follows
-        // a failed fetch carries only its message.
-        drive.finish().await?;
-        read?;
-        Ok(drive.state.as_ref().and_then(|state| state.store.proven()))
     }
 }
 

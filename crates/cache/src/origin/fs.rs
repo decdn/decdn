@@ -30,6 +30,7 @@ use crate::error::OriginPullError;
 /// the sibling key from, so an operator `aws s3 sync`-ing between backends keeps
 /// the same object names.
 pub(super) use decdn_bao_range::OBAO4_SUFFIX;
+use decdn_bao_range::{MAX_SIZE_PROOF_OBJECT_BYTES, SIZE_PROOF_SUFFIX};
 
 /// Origin backed by a local filesystem directory. Blobs live at
 /// `{base}/{hex[0..2]}/{hex}`; the engine is responsible for BLAKE3
@@ -95,6 +96,15 @@ impl FilesystemOrigin {
         self.base
             .join(shard)
             .join(format!("{}{OBAO4_SUFFIX}", hex.as_str()))
+    }
+
+    /// Build the sibling size proof path: `{base}/{hex[0..2]}/{hex}.sizeproof`.
+    fn size_proof_path_for(&self, hash: Hash) -> PathBuf {
+        let hex = hash.to_hex();
+        let shard = hex.get(..2).unwrap_or("");
+        self.base
+            .join(shard)
+            .join(format!("{}{SIZE_PROOF_SUFFIX}", hex.as_str()))
     }
 
     /// Resolve `path` to a regular file inside `base`, before anything
@@ -502,6 +512,45 @@ impl Origin for FilesystemOrigin {
                 Err(err) => {
                     let msg = format!(
                         "cache.origin.path outboard read failed for {}",
+                        canonical.display()
+                    );
+                    Err(classify_io_error(err).map_inner(|e| e.context(msg)))
+                }
+            }
+        })
+    }
+
+    fn fetch_size_proof(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let Some((canonical, meta)) = self
+                .resolve_regular(&self.size_proof_path_for(hash))
+                .await?
+            else {
+                return Ok(None);
+            };
+            let max = MAX_SIZE_PROOF_OBJECT_BYTES as u64;
+            if meta.len() > max {
+                return Ok(None);
+            }
+            let file = match tokio::fs::File::open(&canonical).await {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path size proof open failed for {}",
+                        canonical.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+            match read_capped(file, meta.len(), max).await {
+                Ok(proof) => Ok(proof.map(Bytes::from)),
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path size proof read failed for {}",
                         canonical.display()
                     );
                     Err(classify_io_error(err).map_inner(|e| e.context(msg)))

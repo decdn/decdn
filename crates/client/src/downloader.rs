@@ -45,8 +45,8 @@ pub struct DownloadTarget<'a> {
     /// The blob's BLAKE3 content address (its bao root); every ingested byte is
     /// verified against it.
     pub hash: [u8; 32],
-    /// The blob's content length in bytes.
-    pub total_bytes: u64,
+    /// The blob's proven content length in bytes.
+    pub total_bytes: crate::ProvenSize,
     /// Where to write the finished blob. The `.partial` store and the promoted
     /// final file are keyed by this path, so the finished file IS `dest`.
     pub dest: &'a Path,
@@ -83,13 +83,16 @@ pub struct DownloadTarget<'a> {
 /// use std::path::Path;
 ///
 /// use decdn_client::source::BlobSource;
-/// use decdn_client::{DownloadTarget, Downloader, Funder, StaticSources, StreamCandidate};
+/// use decdn_client::{
+///     DownloadTarget, Downloader, Funder, ProvenSize, StaticSources, StreamCandidate,
+/// };
 ///
+/// // `total_bytes` comes from `check_size_proof` on a node's size proof.
 /// async fn download<S: BlobSource, F: Funder>(
 ///     candidates: Vec<StreamCandidate<S>>,
 ///     funder: F,
 ///     hash: [u8; 32],
-///     total_bytes: u64,
+///     total_bytes: ProvenSize,
 ///     dest: &Path,
 /// ) -> anyhow::Result<()> {
 ///     let downloader = Downloader::new(StaticSources::new(candidates)?, funder);
@@ -229,8 +232,7 @@ impl<P, F> Downloader<P, F> {
     /// Cap the bytes held for every target at `max_blob_bytes` (`0` for no
     /// cap). A target's ranges are fetched at any offset while the bytes held
     /// fit; ranges that would hold more fail with [`crate::BlobTooLarge`]
-    /// ([`crate::AcquireEnv::max_blob_bytes`]). A size claim past the
-    /// furthest range start plus the cap never sizes the store.
+    /// ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
         self.max_blob_bytes = max_blob_bytes;
@@ -258,7 +260,7 @@ where
     /// Any error [`Self::fetch_to_paths`] returns.
     pub async fn fetch_to_dir(
         &self,
-        entries: &[([u8; 32], u64)],
+        entries: &[([u8; 32], crate::ProvenSize)],
         dir: &Path,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ) -> anyhow::Result<Vec<PathBuf>> {
@@ -313,8 +315,8 @@ where
     /// correctly. The whole blob is fetched at full throughput, with no
     /// read-ahead bound.
     ///
-    /// `total_bytes` is the first size claim, a hint: a resumed store's bound
-    /// wins over it, and a leg that verifies the final chunk proves the size.
+    /// `total_bytes` is the blob's proven size; the store records it before
+    /// the first leg opens.
     /// The target `hash` is the bao root every ingested byte is verified
     /// against: a wrong hash surfaces as a verification failure, never as
     /// silent corruption. A finalize whose whole-file hash does not match
@@ -376,15 +378,14 @@ where
             tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
-            let whole = [(0, target.total_bytes)];
+            // The whole blob is one tail: it runs to the end the store's bound
+            // names, which a leg's proven size sets.
+            let whole = [(0, 0)];
             let ranges = target.ranges.unwrap_or(&whole);
             // Off the runtime: opening a finalized blob hashes its final file.
             let store = {
                 let (dir, stem) = (dir.clone(), stem.clone());
-                let (hash, total) = (target.hash, target.total_bytes);
-                // A claim past what the cap on held bytes lets the ranges
-                // reach never sizes the store.
-                let total = total.min(crate::scheduler::claim_reach(ranges, self.max_blob_bytes));
+                let (hash, total) = (target.hash, target.total_bytes.get());
                 tokio::task::spawn_blocking(move || {
                     ClientRangedStore::open_or_create(&dir, &stem, hash, total)
                 })
@@ -424,7 +425,6 @@ where
                 let flush_on_drop = store.flush_on_drop();
                 let fetched = acquire(
                     AcquireTarget {
-                        bounded: false,
                         store: &store,
                         hash: target.hash,
                         total_bytes: target.total_bytes,

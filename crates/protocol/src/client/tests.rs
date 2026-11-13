@@ -1,5 +1,5 @@
 use super::*;
-use crate::framing::{FrameError, decode_message, encode_message, read_frame, write_frame};
+use crate::framing::{decode_message, encode_message, read_frame, write_frame};
 use std::assert_matches;
 
 fn sample_body() -> StreamResponseBody {
@@ -7,7 +7,6 @@ fn sample_body() -> StreamResponseBody {
         hash: [7u8; 32],
         ok: true,
         rate_per_mb: 10,
-        total_bytes: 4096,
         timestamp_us: 1_700_000_000_000_000,
     }
 }
@@ -194,10 +193,7 @@ fn stream_response_error_roundtrip() -> Result<(), postcard::Error> {
         },
         ..sample_response()
     };
-    let ext = StreamResponseExt {
-        error: Some(StreamError::Declined),
-        origin_attestation: None,
-    };
+    let ext = StreamResponseExt::refused(StreamError::Declined);
     let buf = encode_stream_response(&resp, Some(&ext))?;
     let (decoded, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
     assert_eq!(decoded, ClientMessage::StreamResponse(resp));
@@ -496,13 +492,12 @@ fn client_message_unknown_discriminant_is_flagged_unsupported() {
 
 #[allow(clippy::cast_possible_truncation)]
 #[test]
-fn stream_response_wire_format_is_stable() -> Result<(), postcard::Error> {
+fn stream_response_wire_format_is_stable() -> Result<(), Box<dyn std::error::Error>> {
     let resp = StreamResponse {
         body: StreamResponseBody {
             hash: [3u8; 32],
             ok: true,
             rate_per_mb: 4,
-            total_bytes: 5,
             timestamp_us: 7,
         },
         slash_sig: vec![0xABu8; SLASH_SIG_LEN],
@@ -512,7 +507,6 @@ fn stream_response_wire_format_is_stable() -> Result<(), postcard::Error> {
     expected.extend_from_slice(&[3u8; 32]); // body.hash
     expected.push(1u8); // body.ok = true
     expected.push(4u8); // body.rate_per_mb varint
-    expected.push(5u8); // body.total_bytes varint
     expected.push(7u8); // body.timestamp_us varint
     expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
     expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
@@ -523,17 +517,30 @@ fn stream_response_wire_format_is_stable() -> Result<(), postcard::Error> {
     // followed.
     let framed = encode_stream_response(
         &resp,
-        Some(&StreamResponseExt {
-            error: Some(StreamError::NotFound),
-            origin_attestation: None,
-        }),
+        Some(&StreamResponseExt::served(
+            crate::SizeProof::new(5, vec![0x11, 0x22])?,
+            None,
+        )),
     )?;
     let mut expected_framed = vec![1u8]; // ClientMessage::StreamResponse discriminant
     expected_framed.extend_from_slice(&expected);
-    expected_framed.push(1u8); // error = Some
-    expected_framed.push(0u8); // StreamError::NotFound discriminant
+    expected_framed.push(0u8); // outcome = StreamOutcome::Served
+    expected_framed.push(5u8); // size_proof.size varint
+    expected_framed.push(2u8); // size_proof length prefix
+    expected_framed.extend_from_slice(&[0x11, 0x22]); // size_proof bytes
     expected_framed.push(0u8); // origin_attestation = None
     assert_eq!(framed, expected_framed);
+
+    let refused = encode_stream_response(
+        &resp,
+        Some(&StreamResponseExt::refused(StreamError::NotFound)),
+    )?;
+    let mut expected_refused = vec![1u8];
+    expected_refused.extend_from_slice(&expected);
+    expected_refused.push(1u8); // outcome = StreamOutcome::Refused
+    expected_refused.push(0u8); // StreamError::NotFound discriminant
+    expected_refused.push(0u8); // origin_attestation = None
+    assert_eq!(refused, expected_refused);
     Ok(())
 }
 
@@ -1021,43 +1028,48 @@ fn client_binding_validate_rejects_wrong_len() {
 
 #[test]
 fn stream_response_ext_validate_rejects_error_with_ok() {
-    let ext = StreamResponseExt {
-        error: Some(StreamError::NotFound),
-        origin_attestation: None,
-    };
+    let ext = StreamResponseExt::refused(StreamError::NotFound);
     assert_eq!(
         ext.validate(true),
         Err(MessageValidationError::StreamErrorWithOk)
     );
 }
 
+/// An absent extension is a `NotFound` refusal, so an `ok == true` response
+/// that carries none states no size proof and fails validation.
 #[test]
-fn stream_response_ext_validate_rejects_failure_without_error() {
+fn stream_response_ext_validate_rejects_ok_without_ext() {
     assert_eq!(
-        StreamResponseExt::default().validate(false),
-        Err(MessageValidationError::MissingStreamError)
+        StreamResponseExt::default().validate(true),
+        Err(MessageValidationError::StreamErrorWithOk)
     );
 }
 
 #[test]
+fn stream_response_ext_validate_rejects_failure_with_served_outcome()
+-> Result<(), crate::SizeProofTooLong> {
+    let ext = StreamResponseExt::served(crate::SizeProof::new(1, vec![0u8])?, None);
+    assert_eq!(
+        ext.validate(false),
+        Err(MessageValidationError::MissingStreamError)
+    );
+    assert_eq!(ext.validate(true), Ok(()));
+    Ok(())
+}
+
+#[test]
 fn stream_response_ext_validate_accepts_failure_with_delivery_error() {
-    let ext = StreamResponseExt {
-        error: Some(StreamError::Unfunded),
-        origin_attestation: None,
-    };
+    let ext = StreamResponseExt::refused(StreamError::Unfunded);
     assert_eq!(ext.validate(false), Ok(()));
 }
 
 #[test]
 fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
     // VoucherRejected is mid-stream-only; it must never ride in the response.
-    let ext = StreamResponseExt {
-        error: Some(StreamError::VoucherRejected {
-            reason: VoucherRejectReason::SpendingCapExhausted,
-            bundle: None,
-        }),
-        origin_attestation: None,
-    };
+    let ext = StreamResponseExt::refused(StreamError::VoucherRejected {
+        reason: VoucherRejectReason::SpendingCapExhausted,
+        bundle: None,
+    });
     assert_eq!(
         ext.validate(false),
         Err(MessageValidationError::VoucherRejectedInResponse)
@@ -1071,10 +1083,7 @@ fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
 #[test]
 fn stream_response_base_validate_cannot_see_the_ext() -> Result<(), MessageValidationError> {
     sample_response().validate()?;
-    let stray = StreamResponseExt {
-        error: Some(StreamError::NotFound),
-        origin_attestation: None,
-    };
+    let stray = StreamResponseExt::refused(StreamError::NotFound);
     assert_eq!(
         stray.validate(sample_response().body.ok),
         Err(MessageValidationError::StreamErrorWithOk)
@@ -1109,10 +1118,7 @@ fn stream_response_two_phase_no_ext() -> Result<(), postcard::Error> {
 
 #[test]
 fn stream_response_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::Error> {
-    let ext = StreamResponseExt {
-        error: Some(StreamError::Declined),
-        origin_attestation: None,
-    };
+    let ext = StreamResponseExt::refused(StreamError::Declined);
     let mut bytes = postcard::to_allocvec(&ext)?;
     bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
     assert_eq!(parse_stream_response_ext(&bytes)?, ext);
@@ -1236,14 +1242,69 @@ fn widest_bundle() -> WatermarkBundle {
     }
 }
 
-/// Every `cdn/client/v1` control message at its widest legitimate encoding fits
-/// [`MAX_CLIENT_CONTROL_FRAME`] (ADR 013 § Wire Framing). The node reads the
-/// request and every payment proof against that ceiling, and the payer reads the
-/// response against it, so a message that outgrew it would be refused on the
-/// wire. The `StreamRequest` size is pinned exactly so the ceiling's headroom
-/// stays visible.
+/// The widest legitimate `StreamResponse` fits [`MAX_STREAM_RESPONSE_FRAME`]
+/// (ADR 013 § Wire Framing): a served outcome with a full size proof, and an
+/// origin attestation. The widest refusal is far smaller. The payer reads
+/// every response against that ceiling.
 #[test]
-fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), FrameError> {
+fn stream_response_frame_ceiling_holds_the_largest_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let response = StreamResponse {
+        body: StreamResponseBody {
+            hash: [0x07; 32],
+            ok: true,
+            rate_per_mb: MAX_RATE_PER_MB,
+            timestamp_us: u64::MAX,
+        },
+        slash_sig: vec![0x09; SLASH_SIG_LEN],
+    };
+    let attestation = crate::dht::OriginAttestation {
+        rate_per_mb: u64::MAX,
+        timestamp_us: u64::MAX,
+        slash_sig: vec![0x0D; SLASH_SIG_LEN],
+    };
+    let response_len = encode_stream_response(
+        &response,
+        Some(&StreamResponseExt::served(
+            crate::SizeProof::new(u64::MAX, vec![0x0E; crate::MAX_SIZE_PROOF_BYTES])?,
+            Some(attestation.clone()),
+        )),
+    )?
+    .len();
+    let refusal_len = encode_stream_response(
+        &StreamResponse {
+            body: StreamResponseBody {
+                ok: false,
+                ..response.body.clone()
+            },
+            ..response.clone()
+        },
+        Some(&StreamResponseExt {
+            outcome: StreamOutcome::Refused(StreamError::VoucherRejected {
+                reason: VoucherRejectReason::BytesRegression,
+                bundle: Some(widest_bundle()),
+            }),
+            origin_attestation: Some(attestation),
+        }),
+    )?
+    .len();
+    assert!(refusal_len < response_len);
+    assert!(response_len > MAX_CLIENT_CONTROL_FRAME as usize);
+    assert!(
+        response_len <= MAX_STREAM_RESPONSE_FRAME as usize,
+        "StreamResponse = {response_len} B exceeds MAX_STREAM_RESPONSE_FRAME"
+    );
+    Ok(())
+}
+
+/// Every `cdn/client/v1` message the node reads, at its widest legitimate
+/// encoding, fits [`MAX_CLIENT_CONTROL_FRAME`] (ADR 013 § Wire Framing). The
+/// node reads the request and every payment proof against that ceiling, so a
+/// message that outgrew it would be refused on the wire. The `StreamRequest`
+/// size is pinned exactly so the ceiling's headroom stays visible.
+#[test]
+fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::error::Error>>
+{
     let ceiling = MAX_CLIENT_CONTROL_FRAME as usize;
     let request = StreamRequest {
         hash: [0x01; 32],
@@ -1267,33 +1328,10 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), FrameE
     let request_len = encode_stream_request(&request, Some(&ext))?.len();
     assert_eq!(request_len, 301, "StreamRequest + ext at full width");
 
-    let response = StreamResponse {
-        body: StreamResponseBody {
-            hash: [0x07; 32],
-            ok: false,
-            rate_per_mb: MAX_RATE_PER_MB,
-            total_bytes: u64::MAX,
-            timestamp_us: u64::MAX,
-        },
-        slash_sig: vec![0x09; SLASH_SIG_LEN],
-    };
     let rejected = StreamError::VoucherRejected {
         reason: VoucherRejectReason::BytesRegression,
         bundle: Some(widest_bundle()),
     };
-    let response_len = encode_stream_response(
-        &response,
-        Some(&StreamResponseExt {
-            error: Some(rejected.clone()),
-            origin_attestation: Some(crate::dht::OriginAttestation {
-                rate_per_mb: u64::MAX,
-                total_bytes: u64::MAX,
-                timestamp_us: u64::MAX,
-                slash_sig: vec![0x0D; SLASH_SIG_LEN],
-            }),
-        }),
-    )?
-    .len();
     let voucher_len = encode_message(&ClientMessage::Voucher(Voucher {
         signature: vec![0x0A; VOUCHER_SIG_LEN],
         amount: u64::MAX,
@@ -1311,7 +1349,6 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), FrameE
 
     for (what, len) in [
         ("StreamRequest", request_len),
-        ("StreamResponse", response_len),
         ("Voucher", voucher_len),
         ("ChunkPreimage", preimage_len),
         ("StreamError", error_len),

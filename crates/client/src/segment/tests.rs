@@ -379,7 +379,8 @@ fn steal_split_second_half_never_exceeds_group_aligned_end_of_source_range() -> 
 }
 
 #[test]
-fn steal_split_rejects_a_range_starting_at_or_past_total_bytes() {
+fn steal_split_takes_nothing_from_a_range_at_or_past_the_bound() -> anyhow::Result<()> {
+    // A range that starts at or past the bound holds nothing to split.
     let total = 4 * 1024 * 1024;
     let result = super::steal_split(
         &[(total, 16 * 1024 * 1024)],
@@ -388,26 +389,23 @@ fn steal_split_rejects_a_range_starting_at_or_past_total_bytes() {
         |s, _| Some(s),
         None,
         |_| None,
-    );
-    assert!(
-        result.is_err(),
-        "range starting at total_bytes must be rejected, not dropped"
-    );
+    )?;
+    assert!(result.is_none());
+    Ok(())
 }
 
 #[test]
-fn steal_split_rejects_a_range_extending_past_total_bytes() {
+fn steal_split_clips_a_range_past_the_bound_to_it() -> anyhow::Result<()> {
     let total = 20 * 1024 * 1024;
-    let result = super::steal_split(
-        &[(total - 1024, 16 * 1024 * 1024)],
+    let (_, stolen) = super::steal_split(
+        &[(0, total + 16 * 1024 * 1024)],
         ALL,
         total,
         |s, _| Some(s),
         None,
         |_| None,
-    );
-    assert!(
-        result.is_err(),
-        "range whose raw end exceeds total_bytes must be rejected, not truncated"
-    );
+    )?
+    .ok_or_else(|| anyhow::anyhow!("a range above the floor splits"))?;
+    assert_eq!(stolen.fetch_end(), total, "the tail ends at the bound");
+    Ok(())
 }

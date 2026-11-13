@@ -94,12 +94,10 @@ pub fn sign_attestation<S: alloy::signers::SignerSync>(
     domain: &Eip712Domain,
     hash: [u8; 32],
     rate_per_mb: u64,
-    total_bytes: u64,
     timestamp_us: u64,
 ) -> anyhow::Result<OriginAttestation> {
     let mut attestation = OriginAttestation {
         rate_per_mb,
-        total_bytes,
         timestamp_us,
         slash_sig: Vec::new(),
     };

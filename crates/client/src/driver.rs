@@ -844,7 +844,7 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
 ///
 /// The streamed counterpart of [`first_leg`], for a size open that runs before
 /// the store exists ([`crate::lane_sources::LaneSources::first_claim`]): the
-/// open reads the signed size from the header of a pull of this range, and the
+/// open reads the proven size from the header of a pull of this range, and the
 /// pull stays primed for the drive's first leg to adopt. The draw is what
 /// `pacer` decides on a fresh state, so a size open and the drive it primes
 /// cannot disagree on the window. The gap is the window widened to whole
@@ -1132,7 +1132,7 @@ where
 
         // The cap on bytes held (#1895): the source's `max_blob_size_bytes` bounds
         // the content of this blob the store holds, BLAKE3-verified, never the
-        // offsets a leg reads and never the peer's unverified signed `total_bytes`.
+        // offsets a leg reads and never the peer's `total_bytes`.
         // `room` is the new bytes the store may still take. The Draw arm cuts
         // each leg to it, so a range anywhere in a blob larger than the cap lands
         // while it fits. `None` = no cap (and own-origin, whose engine store
@@ -1375,6 +1375,11 @@ where
                 let generation_at_open = ledger.generation();
                 let leg: anyhow::Result<()> = match source.open(hash, aligned.clone()).await {
                     Ok((header, reader)) => {
+                        // A paid open verified the header's size proof: the
+                        // size is the blob's, and the planner works to it.
+                        if let Some(size) = header.proven_size(hash) {
+                            store.prove_size(size);
+                        }
                         counters.next_voucher_cost = voucher_cost(&header);
                         if let Some(quotes) = pool.and_then(|p| p.quotes) {
                             quotes.observe(header.rate_per_mb, header.interval_bytes);

@@ -1,9 +1,10 @@
 //! `decdn origin import` — seed a cache origin store with local content
 //! (issue #1904).
 //!
-//! For every blob it writes the sharded data object `{base}/{hex[0..2]}/{hex}`
-//! and its sibling pre-order bao outboard `{hex}.obao4` — the exact layout the
-//! daemon reads back (ADR 037 §Origin-tier pull-through).
+//! For every blob it writes the sharded data object `{base}/{hex[0..2]}/{hex}`,
+//! its sibling pre-order bao outboard `{hex}.obao4` and its sibling size proof
+//! `{hex}.sizeproof` — the exact layout the daemon reads back (ADR 037
+//! §Origin-tier pull-through, ADR 005 § Bounded byte ranges).
 //!
 //! `--to` is a local filesystem directory: the store is written to disk and
 //! nowhere else. Populating an S3 origin needs no separate writer, because the
@@ -586,9 +587,9 @@ fn b3_hex_str_from_hex(hex: &str) -> String {
 }
 
 /// Import a single source file into the filesystem origin `base`. Streams the
-/// file once to compute its hash + outboard; copies (default) or moves
-/// (`--move`) the data object into `{base}/{hex[0..2]}/{hex}` and writes the
-/// `{hex}.obao4` sibling, both atomically. Idempotent: a data object already
+/// file once to compute its hash + outboard; writes the `{hex}.obao4` and
+/// `{hex}.sizeproof` siblings, then copies (default) or moves (`--move`) the
+/// data object into `{base}/{hex[0..2]}/{hex}`, each atomically. Idempotent: a data object already
 /// present at its content address is left as-is (a matching hash is matching
 /// bytes); a size mismatch is refused unless `--force`.
 fn import_one_file(
@@ -626,9 +627,13 @@ fn import_one_file(
         (eo, Some(tmp))
     };
 
-    let (shard_dir, data_path, obao4_path) = object_paths(base, &eo);
+    let (shard_dir, data_path) = object_paths(base, &eo);
     std::fs::create_dir_all(&shard_dir)
         .map_err(|e| anyhow!("create shard dir {}: {e}", shard_dir.display()))?;
+    // The siblings land before the data object, so a `--move` cut short
+    // between the two still has its source, and the next import of it
+    // finishes the object. A data object never sits without its proof.
+    ensure_siblings(&shard_dir, &eo)?;
 
     if data_slot_needs_write(&data_path, size, force, &eo.hash_hex)? {
         if move_source {
@@ -657,8 +662,6 @@ fn import_one_file(
             .map_err(|e| anyhow!("remove moved source {}: {e}", source.display()))?;
     }
 
-    ensure_obao4(&shard_dir, &obao4_path, &eo.outboard)?;
-
     Ok(ImportedBlob {
         hash_hex: eo.hash_hex,
         size,
@@ -671,9 +674,10 @@ fn import_bytes(base: &Path, bytes: &[u8], force: bool) -> anyhow::Result<Import
     let size = u64::try_from(bytes.len()).map_err(|_| anyhow!("blob length exceeds u64"))?;
     let eo = encode_outboard(bytes, size).map_err(|e| anyhow!("encode outboard for blob: {e}"))?;
 
-    let (shard_dir, data_path, obao4_path) = object_paths(base, &eo);
+    let (shard_dir, data_path) = object_paths(base, &eo);
     std::fs::create_dir_all(&shard_dir)
         .map_err(|e| anyhow!("create shard dir {}: {e}", shard_dir.display()))?;
+    ensure_siblings(&shard_dir, &eo)?;
 
     if data_slot_needs_write(&data_path, size, force, &eo.hash_hex)? {
         let mut tmp = tempfile::NamedTempFile::new_in(&shard_dir)
@@ -687,19 +691,17 @@ fn import_bytes(base: &Path, bytes: &[u8], force: bool) -> anyhow::Result<Import
             .map_err(|e| anyhow!("persist data object {}: {}", data_path.display(), e.error))?;
     }
 
-    ensure_obao4(&shard_dir, &obao4_path, &eo.outboard)?;
     Ok(ImportedBlob {
         hash_hex: eo.hash_hex,
         size,
     })
 }
 
-/// Build the `(shard_dir, data_path, obao4_path)` triple for a blob under `base`.
-fn object_paths(base: &Path, eo: &EncodedOutboard) -> (PathBuf, PathBuf, PathBuf) {
+/// Build the `(shard_dir, data_path)` pair for a blob under `base`.
+fn object_paths(base: &Path, eo: &EncodedOutboard) -> (PathBuf, PathBuf) {
     let shard_dir = base.join(eo.shard());
     let data_path = shard_dir.join(&eo.hash_hex);
-    let obao4_path = shard_dir.join(eo.obao4_name());
-    (shard_dir, data_path, obao4_path)
+    (shard_dir, data_path)
 }
 
 /// Decide whether the data object at `data_path` must be written. Returns
@@ -732,32 +734,49 @@ fn data_slot_needs_write(
     }
 }
 
-/// Ensure the `{hex}.obao4` outboard sibling holds exactly `outboard`. Writes it
-/// when missing, and replaces it when a present sibling's bytes differ — a stale
-/// or foreign outboard from a partial prior import must not be left in place,
-/// because the node rejects a mismatching `.obao4` and drops to whole-blob range
-/// serving. A byte-identical present sibling is left untouched, so a clean
-/// re-import stays a no-op. The outboard is small (~1/256 of the blob), so the
-/// read-and-compare is cheap.
-fn ensure_obao4(shard_dir: &Path, obao4_path: &Path, outboard: &[u8]) -> anyhow::Result<()> {
-    match std::fs::read(obao4_path) {
+/// Write a blob's two siblings: the `{hex}.obao4` outboard and the
+/// `{hex}.sizeproof` size proof.
+fn ensure_siblings(shard_dir: &Path, eo: &EncodedOutboard) -> anyhow::Result<()> {
+    ensure_sibling(
+        shard_dir,
+        &shard_dir.join(eo.obao4_name()),
+        &eo.outboard,
+        "outboard",
+    )?;
+    ensure_sibling(
+        shard_dir,
+        &shard_dir.join(eo.size_proof_name()),
+        &eo.size_proof_object(),
+        "size proof",
+    )
+}
+
+/// Ensure the sibling at `path` holds exactly `bytes`. Writes it when missing,
+/// and replaces it when a present sibling's bytes differ — a stale or foreign
+/// sibling from a partial prior import must not be left in place, because the
+/// node rejects a mismatching `.obao4` or `.sizeproof`. A byte-identical
+/// present sibling is left untouched, so a clean re-import stays a no-op. Both
+/// siblings are small (the outboard is ~1/256 of the blob, the proof under
+/// 5 KiB), so the read-and-compare is cheap.
+fn ensure_sibling(shard_dir: &Path, path: &Path, bytes: &[u8], what: &str) -> anyhow::Result<()> {
+    match std::fs::read(path) {
         // Present and already correct — nothing to do.
-        Ok(existing) if existing == outboard => return Ok(()),
+        Ok(existing) if existing == bytes => return Ok(()),
         // Present but stale/foreign — fall through and replace atomically.
         Ok(_) => {}
         // Missing — fall through and write.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(anyhow!("read outboard {}: {e}", obao4_path.display())),
+        Err(e) => return Err(anyhow!("read {what} {}: {e}", path.display())),
     }
     let mut tmp = tempfile::NamedTempFile::new_in(shard_dir)
-        .map_err(|e| anyhow!("stage temp outboard in {}: {e}", shard_dir.display()))?;
-    tmp.write_all(outboard)
-        .map_err(|e| anyhow!("write outboard: {e}"))?;
+        .map_err(|e| anyhow!("stage temp {what} in {}: {e}", shard_dir.display()))?;
+    tmp.write_all(bytes)
+        .map_err(|e| anyhow!("write {what}: {e}"))?;
     tmp.as_file()
         .sync_all()
-        .map_err(|e| anyhow!("sync outboard: {e}"))?;
-    tmp.persist(obao4_path)
-        .map_err(|e| anyhow!("persist outboard {}: {}", obao4_path.display(), e.error))?;
+        .map_err(|e| anyhow!("sync {what}: {e}"))?;
+    tmp.persist(path)
+        .map_err(|e| anyhow!("persist {what} {}: {}", path.display(), e.error))?;
     Ok(())
 }
 
