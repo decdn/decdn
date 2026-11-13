@@ -920,8 +920,14 @@ impl TwoBlockBlob {
         iroh_blobs::Hash::from_bytes(self.root)
     }
 
-    /// Admit `[off, off + len)` of the blob into `cache`.
+    /// Admit `[off, off + len)` of the blob into `cache`, keeping the blob's
+    /// size proof first as a pull-through keeps its upstream's: a node
+    /// advertises no coverage it cannot size under a proof.
     async fn admit(&self, cache: &decdn_cache::CacheEngine, off: u64, len: u64) {
+        let proof = decdn_bao_range::encode_outboard(self.plaintext.as_slice(), self.total)
+            .unwrap()
+            .size_proof;
+        assert!(cache.keep_size_proof(self.hash(), self.total, &proof).await);
         let (hash, ranges, bao) = bao_for(
             self.root,
             &self.plaintext,

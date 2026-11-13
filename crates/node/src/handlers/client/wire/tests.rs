@@ -64,6 +64,7 @@ fn a_miss_refusal_carries_the_fault_reason_and_a_stable_path_name() {
         (MissPath::BufferedMiss, "buffered_miss"),
         (MissPath::NoPullThrough, "no_pull_through"),
         (MissPath::NoLane, "no_lane"),
+        (MissPath::UnprovenSize, "unproven_size"),
     ];
     for (path, name) in paths {
         assert_eq!(path.as_str(), name);

@@ -18,7 +18,7 @@ use crate::source_set::{NoAffordableSource, NoSourceHasBlob, SourceSet, StaticSo
 use crate::stop::{GaveUp, StopPolicy};
 use crate::streamer::StreamCandidate;
 use crate::{
-    ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamRefused,
+    ClientRangedStore, Cumulative, PoolContext, PoolLedger, ProvenSize, UpstreamRefused,
     UpstreamVoucherRejected,
 };
 use decdn_bao_range::RangedStore;
@@ -159,11 +159,11 @@ async fn run_acquire_with<S: BlobSource>(
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
-            total_bytes: total,
-            ranges: &[(0, total)],
+            total_bytes: ProvenSize::assume_for_tests(total),
+            // The whole blob: one tail that runs to the end the bound names.
+            ranges: &[(0, 0)],
         },
         &mut set,
         &AcquireEnv {
@@ -988,6 +988,7 @@ fn one_victim_work(total: u64, coverage: &Coverage) -> super::Work {
         no_uncovered: vec![false; 3],
         front_first: false,
         hash: [0; 32],
+        coverage_reach: u64::MAX,
     }
 }
 
@@ -3013,10 +3014,9 @@ async fn acquire_bounded<St: crate::source::IngestStore>(
         run: None,
     };
     let target = AcquireTarget {
-        bounded: false,
         store,
         hash: root,
-        total_bytes: total,
+        total_bytes: ProvenSize::assume_for_tests(total),
         ranges: &ranges,
     };
     tokio::time::timeout(Duration::from_mins(2), acquire(target, &mut set, &env))
@@ -3616,10 +3616,9 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
     let gate = recovery_gate();
     let err = acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -3662,10 +3661,9 @@ async fn acquire_under<S: BlobSource>(
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
     acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -4322,10 +4320,9 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -4403,10 +4400,9 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -4829,10 +4825,9 @@ async fn acquire_with_late_builds_halted(
         run: None,
     };
     let target = AcquireTarget {
-        bounded: false,
         store: &store,
         hash: root,
-        total_bytes: total,
+        total_bytes: ProvenSize::assume_for_tests(total),
         ranges: &ranges,
     };
     let (result, ()) = tokio::join!(acquire(target, &mut set, &env), halt);
@@ -5184,10 +5179,9 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -5247,10 +5241,9 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -5310,10 +5303,9 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -5357,10 +5349,9 @@ async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -5398,10 +5389,9 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
     let mib = 1024 * 1024;
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, mib), (4 * mib, mib)],
         },
         &mut set,
@@ -5432,50 +5422,9 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- the size is a hint: grow and shrink the bound ----
+// ---- the size is proven: the first leg's proof sets the bound ----
 
 const MIB: u64 = 1024 * 1024;
-
-#[test]
-fn a_claim_with_nothing_past_it_grows_by_one_seed() {
-    use super::{SEED, grown_bound};
-    let gib = 1 << 30;
-    assert_eq!(grown_bound(gib, gib, 0), gib + SEED);
-    // A claim off the SEED grid rounds up to it.
-    let gb = 1_000_000_000;
-    let want = (gb + SEED).div_ceil(SEED) * SEED;
-    assert_eq!(grown_bound(gb, gb, 0), want);
-    assert_eq!(want % SEED, 0);
-}
-
-#[test]
-fn bytes_past_the_claim_grow_the_bound_twice_as_far() {
-    use super::{SEED, grown_bound};
-    let (gb, mb): (u64, u64) = (1_000_000_000, 1_000_000);
-    let want = (gb + 100 * mb).div_ceil(SEED) * SEED;
-    assert_eq!(grown_bound(gb, gb, 50 * mb), want);
-}
-
-#[test]
-fn a_grown_bound_saturates_near_the_top() {
-    use super::grown_bound;
-    assert_eq!(grown_bound(u64::MAX - 10, 0, 0), u64::MAX);
-    assert_eq!(grown_bound(1, 0, u64::MAX), u64::MAX);
-    assert_eq!(grown_bound(1, u64::MAX, 1), u64::MAX);
-}
-
-/// The bounds the growth rule steps through from a first claim of `c0`
-/// while every source honestly serves a `truth`-byte blob: each round
-/// fetches up to the bound, so everything past `c0` below it is present.
-fn predicted_growth(c0: u64, truth: u64) -> Vec<u64> {
-    let mut bounds = Vec::new();
-    let mut bound = c0;
-    while bound < truth {
-        bound = super::grown_bound(bound, c0, bound.saturating_sub(c0));
-        bounds.push(bound);
-    }
-    bounds
-}
 
 /// Acquire the whole blob into `store` from `provider`, recording every
 /// `(position, total)` the progress callback reports.
@@ -5524,10 +5473,11 @@ fn honest_lanes(
     Ok((sources, StaticSources::new(candidates)?))
 }
 
-/// A first claim far below the blob grows by the rule until a leg
-/// verifies the true final chunk, and the fetch completes byte-identical.
+/// A first size far below the blob (a declared size) is replaced by the size
+/// the first leg's proof proves: the bound moves straight to the true size,
+/// with no growth round, and the fetch completes byte-identical.
 #[tokio::test(start_paused = true)]
-async fn a_too_small_claim_grows_until_the_true_end_is_proven() -> anyhow::Result<()> {
+async fn a_too_small_first_size_is_replaced_by_the_proven_size() -> anyhow::Result<()> {
     let (c0, truth) = (MIB, 70 * MIB);
     let data = blob(truth as usize);
     let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
@@ -5546,12 +5496,7 @@ async fn a_too_small_claim_grows_until_the_true_end_is_proven() -> anyhow::Resul
         .map(|&(_, total)| total)
         .filter(|&total| total != c0 && total != truth)
         .collect();
-    let predicted: std::collections::BTreeSet<u64> = predicted_growth(c0, truth)
-        .into_iter()
-        .filter(|&b| b != truth)
-        .collect();
-    assert_eq!(grown, predicted, "one growth round per the rule");
-    assert_eq!(predicted.len(), 1);
+    assert!(grown.is_empty(), "no growth round: {grown:?}");
     Ok(())
 }
 
@@ -5710,9 +5655,9 @@ async fn blocks_no_lane_covers_are_taken_by_a_partial_holder() -> anyhow::Result
 
 // ---- the caller's size cap bounds every claim ----
 
-/// Acquire `data`'s blob from one honest lane into a store sized by
-/// `claim`, under `cap`. Returns the result, every progress total, and
-/// the store.
+/// Acquire `data`'s blob from one honest lane into a store sized by the
+/// proven size `claim`, under `cap`. Returns the result, every progress
+/// total, the store, and the bytes the source opened.
 async fn acquire_capped(
     data: &[u8],
     claim: u64,
@@ -5722,6 +5667,7 @@ async fn acquire_capped(
     Vec<u64>,
     ClientRangedStore,
     tempfile::TempDir,
+    u64,
 )> {
     let (sources, provider) = honest_lanes(data, &[0xA1])?;
     let root = sources
@@ -5750,17 +5696,16 @@ async fn acquire_capped(
     )
     .await;
     let totals = totals.lock().map(|t| t.clone()).unwrap_or_default();
-    Ok((result, totals, store, dir))
+    let opened = sources.first().map_or(0, ScriptedSource::opened_bytes);
+    Ok((result, totals, store, dir, opened))
 }
 
-/// A first claim above the cap is clamped to it before any work is sized:
-/// no bound past the cap is ever planned, and a blob within the cap
-/// completes.
+/// A blob within the cap completes, and no progress total passes the cap.
 #[tokio::test(start_paused = true)]
-async fn a_claim_above_the_cap_is_clamped_to_it() -> anyhow::Result<()> {
+async fn a_blob_within_the_cap_completes() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
-    let cap = 8 * MIB;
-    let (result, totals, store, dir) = acquire_capped(&data, u64::MAX / 2, cap).await?;
+    let cap = 5 * MIB;
+    let (result, totals, store, dir, _) = acquire_capped(&data, 3 * MIB, cap).await?;
     result?;
     assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
     assert_eq!(store.proven(), Some(3 * MIB));
@@ -5769,42 +5714,23 @@ async fn a_claim_above_the_cap_is_clamped_to_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Growth never raises the bound past the cap: a short claim grows to the
-/// cap at most, and a blob within it completes.
-#[tokio::test(start_paused = true)]
-async fn growth_stops_at_the_cap() -> anyhow::Result<()> {
-    let data = blob(3 * MIB as usize);
-    let cap = 5 * MIB;
-    let (result, totals, store, _dir) = acquire_capped(&data, MIB, cap).await?;
-    result?;
-    assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
-    assert!(
-        totals.contains(&cap),
-        "the claim grew to the cap: {totals:?}"
-    );
-    assert_eq!(store.proven(), Some(3 * MIB));
-    Ok(())
-}
-
-/// A blob that holds bytes past the cap ends the item with `BlobTooLarge`
-/// once the bound reaches the cap with no size proven, whether the claim
-/// was short or above the cap.
+/// A proven size past the cap ends the item with `BlobTooLarge` before any
+/// leg opens.
 #[tokio::test(start_paused = true)]
 async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
     let cap = 2 * MIB;
-    for claim in [MIB, 3 * MIB] {
-        let (result, totals, _store, _dir) = acquire_capped(&data, claim, cap).await?;
-        let err = result
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("a blob past the cap must fail"))?;
-        assert!(
-            err.downcast_ref::<crate::BlobTooLarge>().is_some(),
-            "{err:#}"
-        );
-        assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
-        assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
-    }
+    let (result, totals, _store, _dir, opened) = acquire_capped(&data, 3 * MIB, cap).await?;
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a blob past the cap must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::BlobTooLarge>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
+    assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
+    assert_eq!(opened, 0, "no leg opens");
     Ok(())
 }
 
@@ -5813,20 +5739,19 @@ async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
 #[tokio::test(start_paused = true)]
 async fn a_blob_exactly_at_the_cap_completes() -> anyhow::Result<()> {
     let data = blob(2 * MIB as usize);
-    let (result, _, store, _dir) = acquire_capped(&data, 3 * MIB, 2 * MIB).await?;
+    let (result, _, store, _dir, _) = acquire_capped(&data, 2 * MIB, 2 * MIB).await?;
     result?;
     assert_eq!(store.proven(), Some(2 * MIB));
     Ok(())
 }
 
-/// A cap off the chunk-group grid: a leg that ends at the cap is served to
-/// its group's end and can prove a size past the cap. That proven size
-/// still ends the item with `BlobTooLarge`.
+/// A cap off the chunk-group grid: a proven size between the cap and the
+/// end of its chunk group still ends the item with `BlobTooLarge`.
 #[tokio::test(start_paused = true)]
 async fn a_proven_size_past_an_unaligned_cap_ends_the_item() -> anyhow::Result<()> {
     let data = blob(2 * MIB as usize + 100);
     let cap = 2 * MIB + 50;
-    let (result, _, store, _dir) = acquire_capped(&data, 3 * MIB, cap).await?;
+    let (result, _, store, _dir, _) = acquire_capped(&data, 2 * MIB + 100, cap).await?;
     let err = result
         .err()
         .ok_or_else(|| anyhow::anyhow!("a proven size past the cap must fail"))?;
@@ -5886,10 +5811,9 @@ async fn acquire_capped_into(
     let gate = recovery_gate();
     let result = acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
-            total_bytes: u64::try_from(data.len())?,
+            total_bytes: ProvenSize::assume_for_tests(u64::try_from(data.len())?),
             ranges,
         },
         &mut set,
@@ -6474,10 +6398,9 @@ async fn acquire_over<P: crate::SourceProvider>(
     let whole = [(0, total)];
     acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &whole,
         },
         &mut set,
@@ -7015,10 +6938,9 @@ async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
     let runs: Vec<(u64, u64)> = (0..6).map(|i| (i * 2 * MIB, MIB)).collect();
     acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &runs,
         },
         &mut set,
@@ -7559,10 +7481,9 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     };
     let fetch = acquire(
         AcquireTarget {
-            bounded: false,
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &whole,
         },
         &mut set,
@@ -7592,18 +7513,15 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     Ok(())
 }
 
-/// With no size proven, the end the fetch knows is the smaller of the
-/// first claim and the bound; a proven size replaces both.
+/// An acquire records its proven size before it plans, and a leg's proof of
+/// the true size replaces a wrong one: the store ends at the true size.
 #[tokio::test]
-async fn the_known_end_is_the_claim_or_bound_until_a_size_is_proven() -> anyhow::Result<()> {
+async fn the_store_ends_at_the_size_a_leg_proves() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let src = ScriptedSource::new(data)?.paying(Arc::clone(&ledger));
     let root = src.root();
     let (store, _dir) = fresh_store(root, 8 * MIB);
-    assert_eq!(super::known_end(&store, MIB), MIB, "a short claim");
-    assert_eq!(super::known_end(&store, 16 * MIB), 8 * MIB, "the bound");
-
     let provider = StaticSources::new(vec![candidate(src, ledger, 0xA1, None)])?;
     run_acquire(
         &store,
@@ -7616,7 +7534,8 @@ async fn the_known_end_is_the_claim_or_bound_until_a_size_is_proven() -> anyhow:
         None,
     )
     .await?;
-    assert_eq!(super::known_end(&store, MIB), 3 * MIB, "the proven size");
+    assert_eq!(store.proven(), Some(3 * MIB));
+    assert_eq!(store.bound(), 3 * MIB);
     Ok(())
 }
 
@@ -7768,10 +7687,9 @@ async fn acquire_delegated_in_run(
     let gate = RecoveryGate::with_settle(Duration::ZERO);
     acquire(
         AcquireTarget {
-            bounded: false,
             store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -8281,4 +8199,22 @@ async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_o
         b_probe.opened_ranges()
     );
     Ok(())
+}
+
+/// A lane without a probed bitmap covers the blocks up to the requested
+/// reach, not the whole proven size: a 1 MiB window of a 2^60-byte blob
+/// sizes a one-block bitmap.
+#[test]
+fn whole_blob_coverage_stops_at_the_requested_reach() {
+    let want = super::Want::new(&[(0, MIB)], 1 << 60);
+    let mut work = super::Work::new(std::collections::VecDeque::new(), [0; 32], false);
+    work.set_coverage_reach(want.reach());
+    assert_eq!(want.reach(), MIB);
+    let coverage = work.whole_coverage(1 << 60);
+    assert_eq!(coverage.covered_blocks().count(), 1);
+    let slot = work.add_lane(None, 1 << 60);
+    assert_eq!(work.coverage[slot].covered_blocks().count(), 1);
+    // A tail runs to the end of the blob, so it covers every block.
+    let tail = super::Want::new(&[(0, 0)], 3 * MIB);
+    assert_eq!(tail.reach(), 3 * MIB);
 }

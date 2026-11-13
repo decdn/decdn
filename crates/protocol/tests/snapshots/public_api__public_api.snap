@@ -26,6 +26,11 @@ pub decdn_protocol::client::StreamError::VoucherRejected::reason: decdn_protocol
 impl decdn_protocol::client::StreamError
 pub const fn decdn_protocol::client::StreamError::is_delivery_side(&self) -> bool
 pub const fn decdn_protocol::client::StreamError::is_mid_stream(&self) -> bool
+pub enum decdn_protocol::client::StreamOutcome
+pub decdn_protocol::client::StreamOutcome::Refused(decdn_protocol::client::StreamError)
+pub decdn_protocol::client::StreamOutcome::Served(decdn_protocol::size_proof::SizeProof)
+impl core::default::Default for decdn_protocol::client::StreamOutcome
+pub fn decdn_protocol::client::StreamOutcome::default() -> Self
 pub enum decdn_protocol::client::VoucherRejectReason
 pub decdn_protocol::client::VoucherRejectReason::AmountRegression
 pub decdn_protocol::client::VoucherRejectReason::BadPreimage
@@ -83,11 +88,14 @@ pub decdn_protocol::client::StreamResponseBody::hash: [u8; 32]
 pub decdn_protocol::client::StreamResponseBody::ok: bool
 pub decdn_protocol::client::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::client::StreamResponseBody::timestamp_us: u64
-pub decdn_protocol::client::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::client::StreamResponseExt
-pub decdn_protocol::client::StreamResponseExt::error: core::option::Option<decdn_protocol::client::StreamError>
 pub decdn_protocol::client::StreamResponseExt::origin_attestation: core::option::Option<decdn_protocol::dht::OriginAttestation>
+pub decdn_protocol::client::StreamResponseExt::outcome: decdn_protocol::client::StreamOutcome
 impl decdn_protocol::client::StreamResponseExt
+pub const fn decdn_protocol::client::StreamResponseExt::error(&self) -> core::option::Option<&decdn_protocol::client::StreamError>
+pub const fn decdn_protocol::client::StreamResponseExt::refused(decdn_protocol::client::StreamError) -> Self
+pub const fn decdn_protocol::client::StreamResponseExt::served(decdn_protocol::size_proof::SizeProof, core::option::Option<decdn_protocol::dht::OriginAttestation>) -> Self
+pub const fn decdn_protocol::client::StreamResponseExt::size_proof(&self) -> core::option::Option<&decdn_protocol::size_proof::SizeProof>
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::Voucher
 pub decdn_protocol::client::Voucher::amount: u64
@@ -119,6 +127,7 @@ pub const decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX: usize
 pub const decdn_protocol::client::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::client::MAX_CHUNK_FRAME: u32
 pub const decdn_protocol::client::MAX_CLIENT_CONTROL_FRAME: u32
+pub const decdn_protocol::client::MAX_STREAM_RESPONSE_FRAME: u32
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
@@ -197,7 +206,6 @@ pub struct decdn_protocol::dht::OriginAttestation
 pub decdn_protocol::dht::OriginAttestation::rate_per_mb: u64
 pub decdn_protocol::dht::OriginAttestation::slash_sig: alloc::vec::Vec<u8>
 pub decdn_protocol::dht::OriginAttestation::timestamp_us: u64
-pub decdn_protocol::dht::OriginAttestation::total_bytes: u64
 impl decdn_protocol::dht::OriginAttestation
 pub fn decdn_protocol::dht::OriginAttestation::from_response(&decdn_protocol::client::StreamResponse) -> core::option::Option<Self>
 pub const fn decdn_protocol::dht::OriginAttestation::signed_body(&self, [u8; 32]) -> decdn_protocol::client::StreamResponseBody
@@ -306,11 +314,12 @@ pub decdn_protocol::message::ProbeResponseBody::rate_per_mb: u64
 pub decdn_protocol::message::ProbeResponseBody::timestamp_us: u64
 pub struct decdn_protocol::message::ProbeResponseExt
 pub decdn_protocol::message::ProbeResponseExt::coverage: decdn_protocol::coverage::Coverage
-pub decdn_protocol::message::ProbeResponseExt::total_bytes: core::option::Option<u64>
+pub decdn_protocol::message::ProbeResponseExt::size_proof: core::option::Option<decdn_protocol::size_proof::SizeProof>
 impl decdn_protocol::message::ProbeResponseExt
 pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, &decdn_protocol::message::ProbeResponseBody) -> bool
 pub const decdn_protocol::message::EMPTY_ROOT: [u8; 32]
 pub const decdn_protocol::message::MAX_PROBE_FRAME: u32
+pub const decdn_protocol::message::MAX_PROBE_REQUEST_FRAME: u32
 pub const decdn_protocol::message::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::message::SLASH_SIG_LEN: usize
 pub fn decdn_protocol::message::encode_probe_response(&decdn_protocol::message::ProbeResponse, core::option::Option<&decdn_protocol::message::ProbeResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
@@ -338,6 +347,15 @@ pub fn decdn_protocol::region::Region::serialize<S: serde_core::ser::Serializer>
 impl<'de> serde_core::de::Deserialize<'de> for decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub fn decdn_protocol::region::is_valid_region(&str) -> bool
+pub mod decdn_protocol::size_proof
+pub struct decdn_protocol::size_proof::SizeProof
+impl decdn_protocol::size_proof::SizeProof
+pub fn decdn_protocol::size_proof::SizeProof::as_bytes(&self) -> &[u8]
+pub fn decdn_protocol::size_proof::SizeProof::new(u64, impl core::convert::Into<alloc::vec::Vec<u8>>) -> core::result::Result<Self, decdn_protocol::size_proof::SizeProofTooLong>
+pub const fn decdn_protocol::size_proof::SizeProof::size(&self) -> u64
+pub struct decdn_protocol::size_proof::SizeProofTooLong
+pub decdn_protocol::size_proof::SizeProofTooLong::len: usize
+pub const decdn_protocol::size_proof::MAX_SIZE_PROOF_BYTES: usize
 pub enum decdn_protocol::ClientMessage
 pub decdn_protocol::ClientMessage::ChunkData(decdn_protocol::client::ChunkData)
 pub decdn_protocol::ClientMessage::ChunkPreimage(decdn_protocol::client::ChunkPreimage)
@@ -508,7 +526,6 @@ pub struct decdn_protocol::OriginAttestation
 pub decdn_protocol::OriginAttestation::rate_per_mb: u64
 pub decdn_protocol::OriginAttestation::slash_sig: alloc::vec::Vec<u8>
 pub decdn_protocol::OriginAttestation::timestamp_us: u64
-pub decdn_protocol::OriginAttestation::total_bytes: u64
 impl decdn_protocol::dht::OriginAttestation
 pub fn decdn_protocol::dht::OriginAttestation::from_response(&decdn_protocol::client::StreamResponse) -> core::option::Option<Self>
 pub const fn decdn_protocol::dht::OriginAttestation::signed_body(&self, [u8; 32]) -> decdn_protocol::client::StreamResponseBody
@@ -527,7 +544,7 @@ pub decdn_protocol::ProbeResponseBody::rate_per_mb: u64
 pub decdn_protocol::ProbeResponseBody::timestamp_us: u64
 pub struct decdn_protocol::ProbeResponseExt
 pub decdn_protocol::ProbeResponseExt::coverage: decdn_protocol::coverage::Coverage
-pub decdn_protocol::ProbeResponseExt::total_bytes: core::option::Option<u64>
+pub decdn_protocol::ProbeResponseExt::size_proof: core::option::Option<decdn_protocol::size_proof::SizeProof>
 impl decdn_protocol::message::ProbeResponseExt
 pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, &decdn_protocol::message::ProbeResponseBody) -> bool
 pub struct decdn_protocol::Provider
@@ -551,6 +568,13 @@ impl serde_core::ser::Serialize for decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 impl<'de> serde_core::de::Deserialize<'de> for decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+pub struct decdn_protocol::SizeProof
+impl decdn_protocol::size_proof::SizeProof
+pub fn decdn_protocol::size_proof::SizeProof::as_bytes(&self) -> &[u8]
+pub fn decdn_protocol::size_proof::SizeProof::new(u64, impl core::convert::Into<alloc::vec::Vec<u8>>) -> core::result::Result<Self, decdn_protocol::size_proof::SizeProofTooLong>
+pub const fn decdn_protocol::size_proof::SizeProof::size(&self) -> u64
+pub struct decdn_protocol::SizeProofTooLong
+pub decdn_protocol::SizeProofTooLong::len: usize
 pub struct decdn_protocol::StoreAck
 pub decdn_protocol::StoreAck::accepted: bool
 pub decdn_protocol::StoreAck::hash: decdn_protocol::identity::ContentHash
@@ -582,11 +606,14 @@ pub decdn_protocol::StreamResponseBody::hash: [u8; 32]
 pub decdn_protocol::StreamResponseBody::ok: bool
 pub decdn_protocol::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::StreamResponseBody::timestamp_us: u64
-pub decdn_protocol::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::StreamResponseExt
-pub decdn_protocol::StreamResponseExt::error: core::option::Option<decdn_protocol::client::StreamError>
 pub decdn_protocol::StreamResponseExt::origin_attestation: core::option::Option<decdn_protocol::dht::OriginAttestation>
+pub decdn_protocol::StreamResponseExt::outcome: decdn_protocol::client::StreamOutcome
 impl decdn_protocol::client::StreamResponseExt
+pub const fn decdn_protocol::client::StreamResponseExt::error(&self) -> core::option::Option<&decdn_protocol::client::StreamError>
+pub const fn decdn_protocol::client::StreamResponseExt::refused(decdn_protocol::client::StreamError) -> Self
+pub const fn decdn_protocol::client::StreamResponseExt::served(decdn_protocol::size_proof::SizeProof, core::option::Option<decdn_protocol::dht::OriginAttestation>) -> Self
+pub const fn decdn_protocol::client::StreamResponseExt::size_proof(&self) -> core::option::Option<&decdn_protocol::size_proof::SizeProof>
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::TestBlockSizeGuard
 impl core::ops::drop::Drop for decdn_protocol::coverage::TestBlockSizeGuard
@@ -616,8 +643,11 @@ pub const decdn_protocol::MAX_CLIENT_CONTROL_FRAME: u32
 pub const decdn_protocol::MAX_CLOSER_NODES: usize
 pub const decdn_protocol::MAX_DHT_FRAME: u32
 pub const decdn_protocol::MAX_PROBE_FRAME: u32
+pub const decdn_protocol::MAX_PROBE_REQUEST_FRAME: u32
 pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
+pub const decdn_protocol::MAX_SIZE_PROOF_BYTES: usize
+pub const decdn_protocol::MAX_STREAM_RESPONSE_FRAME: u32
 pub const decdn_protocol::MB_BYTES: u64
 pub const decdn_protocol::SLASH_SIG_LEN: usize
 pub const decdn_protocol::VOUCHER_SIG_LEN: usize

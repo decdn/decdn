@@ -42,7 +42,7 @@ use crate::{
 };
 
 /// The first leg the drive after a [`LaneSources::first_claim`] opens, so the
-/// claim's size open pulls that leg and the drive adopts the pull.
+/// size open pulls that leg and the drive adopts the pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstLeg {
     /// A download under a [`crate::BudgetPacer`]: the whole blob.
@@ -62,24 +62,25 @@ pub enum FirstLeg {
 /// every larger size, and a node clamps a pull that runs past the end.
 const UNBOUNDED_SIZE: u64 = 1 << 62;
 
-/// A fetch's first size claim ([`LaneSources::first_claim`]): a hint the fetch
-/// grows or shrinks as verified bytes land.
+/// A fetch's first size ([`LaneSources::first_claim`]): a size a holder
+/// proved, in a probe answer or in a header.
 #[derive(Debug)]
 pub struct FirstClaim {
-    /// The claimed size.
-    pub total_bytes: u64,
-    /// Every holder known when the claim was made.
+    /// The proven size.
+    pub total_bytes: crate::ProvenSize,
+    /// Every holder known when the size was proven.
     pub holders: Vec<Holder>,
 }
 
-/// `hint` as the first claim over `holders`, or, with no hint, what `open`
-/// learns from the header of a whole-blob open. A hint needs no open.
+/// `hint` (a probe's proven size) as the first size over `holders`, or, with
+/// none, what `open` learns from the proven header of a whole-blob open. A
+/// probe's size needs no open.
 ///
 /// # Errors
 ///
 /// The error `open` ends with.
 async fn first_claim_or_open<F, Fut>(
-    hint: Option<u64>,
+    hint: Option<crate::ProvenSize>,
     holders: Vec<Holder>,
     open: F,
 ) -> anyhow::Result<FirstClaim>
@@ -126,13 +127,12 @@ pub(crate) fn size_open_span(
 }
 
 /// The range the streamed drive's first leg asks for, when the pull of `span`
-/// at the signed `total_bytes` is that leg; `None` otherwise.
+/// at the proven `total_bytes` is that leg; `None` otherwise.
 ///
-/// The streamer sizes its store at the size the cap on held bytes lets the
-/// window reach ([`crate::scheduler::claim_reach`]), and the leg's range
+/// The streamer sizes its store at the proven size, and the leg's range
 /// carries that size, so the range is built against it. The pull is the leg
 /// only when the node served exactly the leg's span: the span clamped to the
-/// signed size.
+/// proven size.
 pub(crate) fn primed_first_leg(
     first_leg: FirstLeg,
     max_blob_bytes: u64,
@@ -142,12 +142,11 @@ pub(crate) fn primed_first_leg(
     let FirstLeg::Streamed { window, read_ahead } = first_leg else {
         return None;
     };
-    let store_bytes = total_bytes.min(crate::scheduler::claim_reach(&[window], max_blob_bytes));
     streamed_first_leg(
         &stream_pacer(read_ahead),
         window,
         max_blob_bytes,
-        store_bytes,
+        total_bytes,
     )
     .filter(|leg| {
         leg.fetch_start() == span.fetch_start()
@@ -223,9 +222,9 @@ pub struct LaneSources<'a, P> {
     /// start of its provider ([`SourceProvider::built`]), or to the first
     /// `connect` for it.
     parked: Mutex<HashMap<Address, StreamCandidate<PrimedSource<PeerSource<'a>>>>>,
-    /// The size hint of the last probe that gave one
-    /// ([`ResolvedTargets::size_hint`]): the fetch's first claim.
-    size_hint: Mutex<Option<u64>>,
+    /// The proven size of the last probe that gave one
+    /// ([`ResolvedTargets::size_hint`]): the fetch's first size.
+    size_hint: Mutex<Option<crate::ProvenSize>>,
     /// The pending probes of the streamed round the holders came from
     /// ([`ResolvedTargets::late`]), until [`SourceProvider::arrivals`] takes
     /// them.
@@ -280,7 +279,7 @@ where
     }
 
     /// The holders `targets` names, indexing each one's node for `connect`.
-    /// A probe's size hint is kept for [`Self::first_claim`], a streamed
+    /// A probe's proven size is kept for [`Self::first_claim`], a streamed
     /// round's pending probes for [`SourceProvider::arrivals`], and each
     /// probed rate for the lane's stream-rate ceiling (`lane_rate_ceiling`).
     pub fn holders_from(&self, targets: &ResolvedTargets) -> Vec<Holder> {
@@ -405,9 +404,9 @@ where
         self.recovery
     }
 
-    /// The fetch's first size claim (#2218): the probe's size hint when a
-    /// probe gave one ([`Self::holders_from`]), with no open at all. Without a
-    /// hint (the peer-store fast path, or a pinned `--node-id` whose probe gave
+    /// The fetch's first size (#2218): the probe's proven size when a
+    /// probe gave one ([`Self::holders_from`]), with no open at all. Without
+    /// one (the peer-store fast path, or a pinned `--node-id` whose probe gave
     /// no size), an open of `first_leg` on one of `holders` learns the size one
     /// holder signs from its header ([`first_open`]), with the acquire loop's
     /// recovery: a holder that faults cools and another is tried until one
@@ -422,7 +421,7 @@ where
     /// answered is parked for the fetch, which starts it with no build
     /// ([`SourceProvider::built`]) before any other lane builds, so the
     /// fetch plans the first leg for that lane alone; every other lane the
-    /// open built drops, and with it any stream permit it held. Returns the claim
+    /// open built drops, and with it any stream permit it held. Returns the size
     /// and every holder known, those the open's discovery found included.
     ///
     /// # Errors
@@ -476,7 +475,11 @@ where
                     .unwrap_or_else(PoisonError::into_inner)
                     .provider;
                 self.record_open(provider, header.rate_per_mb);
-                let total_bytes = header.total_bytes;
+                // The open checked the header's proof; a header without one
+                // is that source's fault.
+                let total_bytes = header.proven_size(hash).ok_or(crate::UnprovenSize {
+                    total_bytes: header.total_bytes,
+                })?;
                 // The node has already written into the pull, so it is parked
                 // for the drive's first leg to adopt instead of dropped unread;
                 // another first leg closes it first. A pull with no range to
@@ -485,7 +488,7 @@ where
                     lane.source.prime_next(hash, range, header, pull, opened_at);
                 } else {
                     tracing::debug!(
-                        total_bytes,
+                        total_bytes = total_bytes.get(),
                         "the size open's pull is not the drive's first leg; not primed"
                     );
                     drop((header, pull));
@@ -784,7 +787,7 @@ where
     fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>> {
         Box::pin(async move {
             // A pinned node is the only holder a rediscovery can find, and only
-            // the first size claim reads a probe's hint, so it probes nothing.
+            // the fetch's first size reads a probe's size, so it probes nothing.
             if let Some(pinned) = self.discovery.pinned {
                 return Ok(self.holders_from(&pinned_targets(pinned.node_id, pinned.provider)));
             }

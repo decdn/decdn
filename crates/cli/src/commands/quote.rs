@@ -461,7 +461,7 @@ pub(crate) fn view(
         // size, a bundle blob's from its planned download ranges.
         let wire = match plan {
             Plan::Blob(_) => {
-                blob_size = probed.size_hint();
+                blob_size = probed.size_hint().map(decdn_client::ProvenSize::get);
                 blob_size.map(wire_bytes).transpose()?
             }
             Plan::Bundle { blobs, .. } => {

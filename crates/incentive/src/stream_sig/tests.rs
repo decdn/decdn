@@ -8,7 +8,6 @@ fn sample_data() -> StreamSlashData {
         hash: B256::repeat_byte(0x7A),
         ok: true,
         rate_per_mb: 10_000,
-        total_bytes: 1_048_576,
         timestamp_us: 1_700_000_000_000_000,
     }
 }
@@ -122,7 +121,7 @@ fn tampered_fields_rejected() -> anyhow::Result<()> {
     let data = sample_data();
     let sig = data.sign(&signer, &domain)?;
 
-    let mutations: [StreamSlashData; 5] = [
+    let mutations: [StreamSlashData; 4] = [
         StreamSlashData {
             hash: B256::ZERO,
             ..data
@@ -130,10 +129,6 @@ fn tampered_fields_rejected() -> anyhow::Result<()> {
         StreamSlashData { ok: false, ..data },
         StreamSlashData {
             rate_per_mb: data.rate_per_mb + 1,
-            ..data
-        },
-        StreamSlashData {
-            total_bytes: data.total_bytes + 1,
             ..data
         },
         StreamSlashData {
@@ -159,7 +154,8 @@ fn tampered_fields_rejected() -> anyhow::Result<()> {
 #[test]
 fn stream_response_type_hash_matches_adr_014() -> anyhow::Result<()> {
     use alloy::primitives::keccak256;
-    let canonical: &[u8] = b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,uint64 timestampUs)";
+    let canonical: &[u8] =
+        b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)";
     anyhow::ensure!(
         keccak256(canonical) == STREAM_RESPONSE_TYPEHASH,
         "pinned STREAM_RESPONSE_TYPEHASH does not match the ADR 014 type string"
@@ -187,14 +183,13 @@ fn signing_hash_matches_eip712_canonical() -> anyhow::Result<()> {
 
     // EIP-712 encodeData: each field as a 32-byte ABI word, prefixed by the
     // pinned type hash. All fields here are static, so abi_encode of the
-    // tuple is exactly 6 × 32 bytes.
+    // tuple is exactly 5 × 32 bytes.
     let struct_hash = keccak256(
         (
             STREAM_RESPONSE_TYPEHASH,
             data.hash,
             data.ok,
             data.rate_per_mb,
-            data.total_bytes,
             data.timestamp_us,
         )
             .abi_encode(),
@@ -222,7 +217,6 @@ fn from_response_body_maps_fields() {
         hash: [0x7Au8; 32],
         ok: true,
         rate_per_mb: 10_000,
-        total_bytes: 1_048_576,
         timestamp_us: 1_700_000_000_000_000,
     };
     assert_eq!(StreamSlashData::from_response_body(&body), sample_data());

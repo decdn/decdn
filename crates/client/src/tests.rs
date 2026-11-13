@@ -1203,6 +1203,91 @@ async fn decode_to_vec_rejects_wrong_root() -> anyhow::Result<()> {
 /// constructor the open stage uses — rather
 /// than a hand-built value, which #1377's newtype now makes impossible outside
 /// this crate anyway.
+/// The wire bound on a size proof is the codec's longest proof: a proof the
+/// codec builds always decodes, and the decode bound admits no longer one.
+#[test]
+fn the_wire_bounds_a_size_proof_at_the_codecs_longest() {
+    assert_eq!(
+        decdn_protocol::MAX_SIZE_PROOF_BYTES,
+        decdn_bao_range::MAX_SIZE_PROOF_BYTES
+    );
+}
+
+/// The open stage takes a node's size only from a proof that verifies. A
+/// wrong size with real proof bytes of another size and a 2^60 size with
+/// garbage proof bytes fail with [`super::UnprovenSize`] before any caller
+/// sees the size; an `ok = true` answer with no proof (a refused outcome)
+/// fails validation. Every case is the source's fault.
+#[test]
+fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::slash_judge_domain;
+    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_protocol::SizeProof;
+    use decdn_protocol::client::{
+        StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
+    };
+
+    let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let size = u64::try_from(blob.len())?;
+    let hash = *blake3::hash(&blob).as_bytes();
+    let proof_bytes = decdn_bao_range::encode_outboard(blob.as_slice(), size)?
+        .size_proof
+        .to_vec();
+    let operator = PrivateKeySigner::random();
+    let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
+    let ts = 1_700_000_000_000_000;
+    let verify = |ext: StreamResponseExt| -> anyhow::Result<Option<super::ProvenSize>> {
+        let body = StreamResponseBody {
+            hash,
+            ok: true,
+            rate_per_mb: 10,
+            timestamp_us: ts,
+        };
+        let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+        let resp = StreamResponse {
+            body,
+            slash_sig: sig.as_bytes().to_vec(),
+        };
+        super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts)
+    };
+
+    let proven = verify(StreamResponseExt::served(
+        SizeProof::new(size, proof_bytes.clone())?,
+        None,
+    ))?;
+    anyhow::ensure!(proven.map(super::ProvenSize::get) == Some(size));
+    for (what, size_proof) in [
+        (
+            "a wrong size",
+            SizeProof::new(size - 1, proof_bytes.clone())?,
+        ),
+        ("a huge size", SizeProof::new(1u64 << 60, vec![0xCD; 4000])?),
+    ] {
+        let err = verify(StreamResponseExt::served(size_proof, None))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("{what} must not open"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<super::UnprovenSize>().is_some(),
+            "{what}: {err}"
+        );
+        anyhow::ensure!(
+            matches!(crate::fault::classify(&err), crate::fault::Fault::Source),
+            "{what} is the source's fault"
+        );
+    }
+    let err = verify(StreamResponseExt::refused(StreamError::NotFound))
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("ok without a proof must not open"))?;
+    let expected = decdn_protocol::MessageValidationError::StreamErrorWithOk.to_string();
+    anyhow::ensure!(err.to_string().contains(&expected), "no proof: {err}");
+    anyhow::ensure!(
+        matches!(crate::fault::classify(&err), crate::fault::Fault::Source),
+        "no proof is the source's fault"
+    );
+    Ok(())
+}
+
 #[test]
 fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
@@ -1220,7 +1305,6 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         hash: [0x5Au8; 32],
         ok: false,
         rate_per_mb: 10,
-        total_bytes: 0,
         timestamp_us: 1_700_000_000_000_000,
     };
     let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
@@ -1228,10 +1312,7 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         body: body.clone(),
         slash_sig: sig.as_bytes().to_vec(),
     };
-    let response_ext = decdn_protocol::StreamResponseExt {
-        error: Some(StreamError::Declined),
-        origin_attestation: None,
-    };
+    let response_ext = decdn_protocol::StreamResponseExt::refused(StreamError::Declined);
     // Preconditions the real open stage enforces before ever calling `open`.
     response.validate()?;
     response_ext.validate(response.body.ok)?;
@@ -1255,10 +1336,10 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
     // #1377: `error()` is now DERIVED from the evidence by `open()`, so the two
     // legs cannot desync by construction. This pins that they agree.
     anyhow::ensure!(
-        response_ext.error.as_ref() == Some(refused.error()),
+        response_ext.error() == Some(refused.error()),
         "the derived wire code {:?} must match the code the extension carried {:?}",
         refused.error(),
-        response_ext.error,
+        response_ext.error(),
     );
     // The whole point: the surviving signature still recovers to the operator,
     // so it can be replayed to `SlashJudge` with no re-signing by the observer.
@@ -1286,12 +1367,16 @@ fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {
             hash: [0x5Au8; 32],
             ok: false,
             rate_per_mb: 10,
-            total_bytes: 0,
             timestamp_us: 1_700_000_000_000_000,
         },
         slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
     };
-    let err = UpstreamRefused::open(response, &decdn_protocol::StreamResponseExt::default());
+    // A served outcome on `ok == false` names no refusal class.
+    let served = decdn_protocol::StreamResponseExt::served(
+        decdn_protocol::SizeProof::new(0, Vec::new()).unwrap_or_default(),
+        None,
+    );
+    let err = UpstreamRefused::open(response, &served);
     assert!(
         err.downcast_ref::<UpstreamRefused>().is_none(),
         "a response with no error code must not become a typed refusal"

@@ -6,10 +6,54 @@ use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
 use super::{
     AssembleOutcome, MAX_BACKPRESSURE_RETRIES, MAX_REASSIGN_ATTEMPTS, RecoveryEnd, RunOutcome,
-    RunSink, UnavailableCause, assemble,
+    RunSink, UnavailableCause, assemble, planned_len,
 };
 
 const BAO_CHUNK_BYTES: u64 = 1024;
+
+/// A pull plans no further than the request's end or the cap on bytes a node
+/// holds: a whole-blob request (`0`) plans the cap's reach, a longer request
+/// is cut to it, a shorter one keeps its length, and with no cap the request
+/// stands.
+#[test]
+fn a_pull_plans_no_further_than_the_request_or_the_cap() {
+    let cap = 4 * DISCOVERY_BLOCK_BYTES;
+    // One chunk group past the cap, so a pull past it meets the held-bytes
+    // meter.
+    let reach = cap + decdn_bao_range::CHUNK_GROUP_BYTES;
+    assert_eq!(
+        planned_len(0, cap),
+        reach,
+        "a whole-blob request plans the reach"
+    );
+    assert_eq!(planned_len(u64::MAX, cap), reach, "a longer request is cut");
+    assert_eq!(planned_len(1024, cap), 1024, "a shorter request stands");
+    assert_eq!(planned_len(0, 0), 0, "no cap: to the end");
+    assert_eq!(planned_len(77, 0), 77);
+}
+
+/// A pull of one block of a 64-block blob plans only that block: one run
+/// over the requested block, and nothing past it is uncovered or planned.
+#[test]
+fn a_large_blob_plans_only_the_requested_blocks() {
+    let total = 64 * DISCOVERY_BLOCK_BYTES;
+    let offset = DISCOVERY_BLOCK_BYTES;
+    let len = planned_len(4096, 8 * DISCOVERY_BLOCK_BYTES);
+    let gap = ChunkRanges::from(
+        ChunkNum(offset / BAO_CHUNK_BYTES)..ChunkNum((offset + len) / BAO_CHUNK_BYTES),
+    );
+    let coverages = vec![cov(64, &[1])];
+    let (runs, uncovered) = super::plan_over(&gap, total, &coverages, &[0]);
+    assert!(uncovered.is_empty());
+    assert_eq!(
+        runs,
+        vec![CoveredRun {
+            offset,
+            len,
+            source_ix: 0,
+        }]
+    );
+}
 
 fn cov(nb: u32, blocks: &[u32]) -> Coverage {
     Coverage::from_block_indices(nb, blocks.iter().copied())

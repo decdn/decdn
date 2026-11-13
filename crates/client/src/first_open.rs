@@ -1,9 +1,9 @@
 //! The first open of a blob: learn a size one source signs before
 //! [`crate::acquire`] runs, with the same recovery as [`crate::acquire`].
 //!
-//! A caller with no size hint for a blob opens one source's pull for its
-//! header, and the size it signs is the fetch's first claim: a hint the fetch
-//! grows or shrinks as verified bytes land. That open is a delivery
+//! A caller with no proven size for a blob opens one source's pull for its
+//! header, and the size its proof proves is the fetch's size. That open is a
+//! delivery
 //! like any other: a source that faults cools and another is tried, a lane
 //! build that fails backs off, a pull-through target that keeps saying it
 //! lacks the blob is marked absent ([`crate::Holder::probed_holder`]), and

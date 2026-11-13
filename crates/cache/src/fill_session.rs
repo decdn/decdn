@@ -1527,7 +1527,7 @@ impl FillRegistry {
     /// identical claims registers an owner and the other attaches.
     ///
     /// `R = align_range_clamped(offset, len, total)`: an end past `total` clamps to
-    /// it, so a request whose claimed size grows still coalesces
+    /// it, so a request whose end runs past the blob still coalesces
     /// with a live fill instead of always falling to Owner. On an align error (a
     /// start at or past `total`) or empty `R`, the caller takes the Owner path (its
     /// own fetch surfaces any out-of-bounds error).

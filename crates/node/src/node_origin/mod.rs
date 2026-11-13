@@ -45,6 +45,7 @@ mod backend_source;
 mod funder;
 mod pull_leg;
 mod ranged_pull;
+pub(crate) use ranged_pull::planned_len;
 mod timed_source;
 
 pub(crate) use admit_store::NodeAdmitStore;
@@ -183,13 +184,13 @@ pub(crate) enum ProbeGather {
 /// The empty blob ([`decdn_protocol::EMPTY_ROOT`]) spans zero blocks, so no
 /// holder reports a block for the union to cover. For that hash the union
 /// spans the blob once one holder is admitted (#2526). The rule keys on the
-/// requested hash, never on the unsigned `total_bytes` hint.
+/// requested hash, never on a holder's stated `total_bytes`.
 /// `ProbeResponseExt::consistent_with` keys on the hash the same way. A holder
 /// that reports `Some(0)` for a real blob therefore closes nothing.
 struct CoverageUnionTracker {
     /// Whether the requested hash is [`decdn_protocol::EMPTY_ROOT`].
     empty_root: bool,
-    /// Holders admitted so far, a holder without a size hint included. Read
+    /// Holders admitted so far, a holder that stated no size included. Read
     /// only when `empty_root` is set.
     holders: usize,
     /// Covered discovery blocks seen so far.
@@ -513,7 +514,7 @@ pub struct NodeOriginConfig {
     /// offsets served: the miss-pull leg lands a range anywhere in a larger blob
     /// while the bytes held fit, and ends with `BlobTooLarge` once a missing byte
     /// could only land past the cap. Metered on the bytes that ACTUALLY arrive and
-    /// are stored, never on the peer's unverified `total_bytes` claim (#1895).
+    /// are stored, never on the peer's `total_bytes` (#1895).
     pub max_blob_size_bytes: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling (`cache.max_rate_per_mb`), `0` =
     /// unlimited (#1375). Combined via [`effective_rate_ceiling`] with the
@@ -1701,6 +1702,13 @@ async fn probe_candidate(
         );
         return Err(ProbeDrop::Inconsistent);
     }
+    // A stated size is a fact only with its proof (ADR 005 § Bounded byte
+    // ranges). A size with no valid proof is the holder's fault: drop
+    // the answer before the size can size a coverage union or a pull leg.
+    if let Err(e) = probe_size_proven(hash_bytes, &resp_ext) {
+        debug!(error = %e, "node-origin: dropping a probe response with an unproven size");
+        return Err(ProbeDrop::Inconsistent);
+    }
     if !resp.body.has_blob {
         // Reachable but does not hold the blob — not a reputation event (no
         // delivery attempted); cache the negative so the next lookup for this
@@ -1739,10 +1747,30 @@ async fn probe_candidate(
         // way execution reaches here), except for the empty root: its zero
         // blocks leave the coverage empty on a holder too (#2471).
         coverage: resp_ext.coverage,
-        // The holder's reported blob size. The coverage-union gather (#1506)
-        // reads it to know how many discovery blocks the union must span,
-        // and the pull leg cuts its first upstream open from it.
-        total_bytes_hint: resp_ext.total_bytes,
+        // The holder's blob size, proven above. The coverage-union gather
+        // (#1506) reads it to know how many discovery blocks the union must
+        // span, and the pull leg cuts its first upstream open from it.
+        total_bytes_hint: resp_ext
+            .size_proof
+            .as_ref()
+            .map(decdn_protocol::SizeProof::size),
+    })
+}
+
+/// Whether a probe answer's size, when it states one, is proven for `hash`
+/// (ADR 005 § Bounded byte ranges). An answer that states no size
+/// passes.
+///
+/// # Errors
+///
+/// [`decdn_client::UnprovenSize`] when the answer states a size with no
+/// valid proof.
+pub(super) fn probe_size_proven(
+    hash: [u8; 32],
+    ext: &decdn_protocol::ProbeResponseExt,
+) -> Result<(), decdn_client::UnprovenSize> {
+    ext.size_proof.as_ref().map_or(Ok(()), |proof| {
+        decdn_client::check_size_proof(hash, proof).map(drop)
     })
 }
 

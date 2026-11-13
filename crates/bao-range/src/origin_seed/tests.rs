@@ -52,7 +52,64 @@ fn obao4_name_appends_suffix() {
     let ob = EncodedOutboard {
         hash_hex: "ab".repeat(32),
         outboard: Vec::new(),
+        size: 0,
+        size_proof: Bytes::new(),
     };
     assert_eq!(ob.shard(), "ab");
     assert_eq!(ob.obao4_name(), format!("{}{OBAO4_SUFFIX}", ob.hash_hex));
+    assert_eq!(
+        ob.size_proof_name(),
+        format!("{}{SIZE_PROOF_SUFFIX}", ob.hash_hex)
+    );
+}
+
+/// The single-pass encoder emits a size proof that verifies the true size,
+/// for sizes on and off every boundary, and no other size.
+#[test]
+fn encode_outboard_proves_the_size() {
+    for size in [
+        0u64,
+        1,
+        1023,
+        1024,
+        1025,
+        16 * 1024,
+        16 * 1024 + 1,
+        200 * 1024 + 7,
+    ] {
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let got = encode_outboard(payload.as_slice(), size).unwrap();
+        let root: [u8; 32] = *bao_tree::blake3::hash(&payload).as_bytes();
+        assert!(
+            crate::verify_size_proof(root, size, &got.size_proof),
+            "size {size}"
+        );
+        assert!(
+            !crate::verify_size_proof(root, size + 1, &got.size_proof),
+            "size {size} + 1"
+        );
+        // The `{H}.sizeproof` object carries the size beside the proof.
+        let object = got.size_proof_object();
+        assert_eq!(
+            crate::parse_size_proof_object(&object),
+            Some((size, got.size_proof.as_ref())),
+            "size {size}"
+        );
+    }
+}
+
+/// An object shorter than its size field is no size proof object.
+#[test]
+fn a_short_size_proof_object_parses_to_nothing() {
+    assert_eq!(crate::parse_size_proof_object(&[1, 2, 3]), None);
+    assert_eq!(
+        crate::parse_size_proof_object(&7u64.to_le_bytes()),
+        Some((7, &[][..]))
+    );
+}
+
+/// A reader shorter than the stated size fails rather than proving a size.
+#[test]
+fn encode_outboard_refuses_a_short_reader() {
+    assert!(encode_outboard([1u8; 10].as_slice(), 20).is_err());
 }

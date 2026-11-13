@@ -237,7 +237,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     let payload: Vec<u8> = (0..PAYLOAD_LEN)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
-    let hash = decdn_cache::Hash::new(&payload);
+    let hash = support::register_payload(&payload);
 
     // --- Node A: upstream holder + server ---------------------------------
     let (cache_a, hash_a, _cache_a_tmp) = cache_with_blob(&payload).await?;
@@ -471,7 +471,7 @@ async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
 #[allow(clippy::too_many_lines)]
 async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<()> {
     let payload = vec![0x6Du8; PAYLOAD_LEN];
-    let hash = decdn_cache::Hash::new(&payload);
+    let hash = support::register_payload(&payload);
     let (cache, hash_b, _cache_tmp) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_b == hash, "fixture hash mismatch");
 
@@ -634,12 +634,12 @@ async fn lying_upstream(
     let ClientMessage::StreamRequest(req) = read_client_msg(&mut recv).await? else {
         anyhow::bail!("lying upstream: expected a StreamRequest");
     };
+    let total_bytes =
+        u64::try_from(served.len()).map_err(|_| anyhow::anyhow!("served len overflows u64"))?;
     let body = StreamResponseBody {
         hash: req.hash,
         ok: true,
         rate_per_mb,
-        total_bytes: u64::try_from(served.len())
-            .map_err(|_| anyhow::anyhow!("served len overflows u64"))?,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -650,7 +650,7 @@ async fn lying_upstream(
     let resp = StreamResponse { body, slash_sig };
     let payload = decdn_protocol::encode_stream_response(
         &resp,
-        Some(&decdn_protocol::StreamResponseExt::default()),
+        Some(&support::proven_ext(&resp, total_bytes)),
     )?;
     write_frame(&mut send, &payload)
         .await
@@ -720,12 +720,12 @@ fn peer_closed(conn: &Connection) -> bool {
 async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
     // What the downstream asks for...
     let honest = vec![0x11u8; 4096];
-    let requested_hash = decdn_cache::Hash::new(&honest);
-    // ...vs. what the lying upstream actually serves (different content, sized
-    // under one chunk).
-    let served = vec![0x22u8; 2048];
+    let requested_hash = support::register_payload(&honest);
+    // ...vs. what the lying upstream actually serves: different content of the
+    // same length, so the size proves and the content check is what fails.
+    let served = vec![0x22u8; 4096];
     anyhow::ensure!(
-        decdn_cache::Hash::new(&served) != requested_hash,
+        support::register_payload(&served) != requested_hash,
         "the two fixture payloads must differ"
     );
 

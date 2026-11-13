@@ -537,7 +537,7 @@ async fn open_and_hold(
 
     let first = tokio::time::timeout(
         FIRST_FRAME_BUDGET,
-        decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME),
+        decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_STREAM_RESPONSE_FRAME),
     )
     .await
     .context("node sent no open frame within budget")?
@@ -554,7 +554,7 @@ async fn open_and_hold(
     if !resp.body.ok {
         conn.close(0u32.into(), b"refused");
         return Ok(OpenOutcome::Refused(
-            resp_ext.error.unwrap_or(StreamError::Declined),
+            resp_ext.error().cloned().unwrap_or(StreamError::Declined),
         ));
     }
 

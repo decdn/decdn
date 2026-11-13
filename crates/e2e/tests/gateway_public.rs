@@ -10,8 +10,8 @@
 //!      206 over exactly that window, and a range past the end is 416. (That
 //!      the pull pays for the aligned span alone is the client's unit tests'
 //!      to pin down.)
-//!   2. The bare host serves a blob no pull has verified once a size proof
-//!      proves its size (#2645): its first request, a `Range`, is 206 over
+//!   2. The bare host serves a blob no pull has verified once a holder
+//!      proves its size, at no paid byte: its first request, a `Range`, is 206 over
 //!      exactly that window, a `GET` then streams it with its length, and a
 //!      `HEAD` answers that length.
 //!   3. Four pulls run at once on the one pool payer, and the node rejects
@@ -63,7 +63,7 @@ const MIB: usize = 1024 * 1024;
 /// The gateway's working deposit: 10 USDC.
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// The day's allowance: six 4 MiB pulls, a 1.5 MiB range, a one-chunk-group
-/// range, a size proof and the manifest fit, a further 4 MiB entry does not.
+/// range and the manifest fit, a further 4 MiB entry does not.
 const ALLOWANCE: &str = "27MiB";
 const KEYSTORE_PASSWORD: &str = "gateway-public-e2e-password";
 /// The public origin the gateway serves. Nothing resolves it: every request
@@ -319,8 +319,8 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- (2) A blob from the bare host ----
-    // No pull here has verified b, so its first request proves b's size
-    // first: one paid chunk group at the end of the node's claim. The
+    // No pull here has verified b, so its first request learns b's size
+    // first, from the size proof the holder sends, at no paid byte. The
     // proven size lets a `Range` through.
     let b_path = format!("/{}", hash_b.to_hex());
     let (b_first, b_last) = (1_000usize, 2_999usize);
@@ -469,13 +469,12 @@ async fn run() -> anyhow::Result<()> {
         counter("decdn_gateway_bytes_served_total")? >= 6 * a.len() as u64,
         "bytes served: {exposition}"
     );
-    // a.bin three times, b three times, the two ranges, b's size proof (its
-    // last byte's chunk group) and the manifest.
+    // a.bin three times, b three times, the two ranges and the manifest.
+    // Learning b's size pulls no byte.
     let pulled = 3 * wire_bytes(0, 0, a.len())?
         + 3 * wire_bytes(0, 0, b.len())?
         + wire_bytes(first, last - first + 1, a.len())?
         + wire_bytes(b_first, b_last - b_first + 1, b.len())?
-        + wire_bytes(b.len() - 1, 1, b.len())?
         + wire_bytes(0, 0, manifest.len())?;
     let served = node
         .scrape_metric(SERVED)

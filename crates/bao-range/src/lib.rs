@@ -45,9 +45,17 @@ use positioned_io::ReadAt;
 pub mod conformance;
 pub mod origin_seed;
 pub mod ranged_store;
+pub mod size_proof;
 pub mod streaming;
-pub use origin_seed::{EncodedOutboard, OBAO4_SUFFIX, encode_outboard, shard_prefix};
+pub use origin_seed::{
+    EncodedOutboard, MAX_SIZE_PROOF_OBJECT_BYTES, OBAO4_SUFFIX, SIZE_PROOF_SUFFIX, encode_outboard,
+    parse_size_proof_object, shard_prefix, size_proof_object,
+};
 pub use ranged_store::{RangedFuture, RangedStore, RangedStoreError};
+pub use size_proof::{
+    MAX_SIZE_PROOF_BYTES, SizeProofError, encode_size_proof, size_proof_from_tail_wire,
+    size_proof_tail_start, verify_size_proof,
+};
 
 /// `iroh-blobs`' canonical on-disk block size (16 KiB chunk groups,
 /// `from_chunk_log(4)`). Declared from the `bao-tree` primitive rather than
@@ -392,8 +400,8 @@ pub fn align_range(
 }
 
 /// [`align_range`], but an end past the blob clamps to the blob's end instead
-/// of being refused: a claimed size is a hint, and the planner's bound can
-/// overshoot it. Only `byte_offset >= blob_size` (for a non-empty blob) is
+/// of being refused: a request may ask past the end, and a node serves up to
+/// it. Only `byte_offset >= blob_size` (for a non-empty blob) is
 /// refused, with [`RangeVerifyError::RangeOutOfBounds`]: a start past the end
 /// has no chunk group to anchor, clamped or not. `(0, 0)` means the whole
 /// blob, and the empty blob is addressable only as `(0, 0)`, exactly as in

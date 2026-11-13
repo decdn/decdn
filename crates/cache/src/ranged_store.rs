@@ -90,8 +90,9 @@ impl RangedStore for NodeRangedStore {
             // Validate + align locally so a start at or past the blob end is a
             // typed `Alignment` error, not an opaque backend fault (a bad start is
             // an argument error, and the client backend classifies it the same
-            // way). An end past the blob clamps to it rather than erroring: the caller here is a pull leg driving a request whose
-            // claimed size can grow, so its gap computation must clamp exactly as
+            // way). An end past the blob clamps to it rather than erroring: the caller
+            // here is a pull leg driving a request that may ask past the end, so its
+            // gap computation must clamp exactly as
             // the serve tiers do, or a signed `ok: true` response then faults
             // fetching its own pull range.
             let aligned =

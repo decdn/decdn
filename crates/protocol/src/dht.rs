@@ -54,7 +54,7 @@ use crate::message::SLASH_SIG_LEN;
 
 /// Wire-level maximum number of providers a [`FindValueResponse`] may carry
 /// (ADR 022 §Content Records and TTL). With 200-byte coverage bitmaps and full
-/// origin attestations it bounds a full response to the 17,175 bytes in
+/// origin attestations it bounds a full response to the 16,675 bytes in
 /// ADR 022 §DHT Bandwidth Analysis, inside [`MAX_DHT_FRAME`].
 ///
 /// Enforced at the wire boundary by `deserialize_providers`; oversize values
@@ -83,8 +83,8 @@ pub const MAX_BATCH_STORE_HASHES: usize = 192;
 /// responses alike. The largest legitimate message is a full
 /// [`BatchStoreRequest`]: [`MAX_BATCH_STORE_HASHES`] entries, each a 32-byte
 /// hash, a [`Coverage`] of up to 202 bytes and an [`OriginAttestation`] of up
-/// to 96 bytes, plus the holder — 63,395 bytes. The largest response is a full
-/// [`FindValueResponse`] at 17,175 bytes. The
+/// to 86 bytes, plus the holder — 61,475 bytes. The largest response is a full
+/// [`FindValueResponse`] at 16,675 bytes. The
 /// `dht_frame_ceiling_holds_the_largest_message` test pins the margin.
 pub const MAX_DHT_FRAME: u32 = 64 * 1024;
 
@@ -101,8 +101,6 @@ pub const MAX_DHT_FRAME: u32 = 64 * 1024;
 pub struct OriginAttestation {
     /// The origin's quoted rate in its signed response.
     pub rate_per_mb: u64,
-    /// The blob size the origin signed.
-    pub total_bytes: u64,
     /// The timestamp the origin signed. Validity never reads it.
     pub timestamp_us: u64,
     /// The origin's 65-byte EIP-712 `StreamResponse` signature. Any other
@@ -118,7 +116,6 @@ impl OriginAttestation {
     pub fn from_response(resp: &StreamResponse) -> Option<Self> {
         resp.body.ok.then(|| Self {
             rate_per_mb: resp.body.rate_per_mb,
-            total_bytes: resp.body.total_bytes,
             timestamp_us: resp.body.timestamp_us,
             slash_sig: resp.slash_sig.clone(),
         })
@@ -132,7 +129,6 @@ impl OriginAttestation {
             hash,
             ok: true,
             rate_per_mb: self.rate_per_mb,
-            total_bytes: self.total_bytes,
             timestamp_us: self.timestamp_us,
         }
     }
@@ -309,7 +305,7 @@ pub struct Provider {
 /// in XOR keyspace, used by the requester to continue iterative lookup.
 ///
 /// Responders MUST NOT emit more than [`MAX_PROVIDERS_PER_HASH`] providers or
-/// more than [`MAX_CLOSER_NODES`] closer nodes — the 17,175-byte worst case in
+/// more than [`MAX_CLOSER_NODES`] closer nodes — the 16,675-byte worst case in
 /// ADR 022 §DHT Bandwidth Analysis, and so [`MAX_DHT_FRAME`], depend on these
 /// bounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

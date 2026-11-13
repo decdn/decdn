@@ -102,11 +102,27 @@ pub async fn probe(
     // registry client, so it enforces presence/shape only.
     resp.validate()
         .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
+    check_stated_size(hash, &resp_ext)?;
 
     let mut stdout = std::io::stdout().lock();
     write_probe_response(&mut stdout, &resp, &resp_ext, rtt.ms, args.json)
         .map_err(|e| anyhow::anyhow!("failed to write probe response: {e}"))?;
     Ok(())
+}
+
+/// Refuse a probe answer that states a size its proof does not prove against
+/// `hash` (ADR 005 § Bounded byte ranges): such an answer is faulty,
+/// and the probe shows none of it. An answer that states no size passes.
+pub(crate) fn check_stated_size(
+    hash: [u8; 32],
+    resp_ext: &decdn_protocol::ProbeResponseExt,
+) -> anyhow::Result<()> {
+    let Some(proof) = resp_ext.size_proof.as_ref() else {
+        return Ok(());
+    };
+    decdn_client::check_size_proof(hash, proof)
+        .map(drop)
+        .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))
 }
 
 /// Render a successful probe response to `w` in pretty or JSON form.
@@ -147,7 +163,7 @@ pub(crate) fn write_probe_response(
             "hash": hash_hex,
             "has_blob": resp.body.has_blob,
             "rate_per_mb": resp.body.rate_per_mb,
-            "total_bytes": resp_ext.total_bytes,
+            "total_bytes": resp_ext.size_proof.as_ref().map(decdn_protocol::SizeProof::size),
             "timestamp_us": resp.body.timestamp_us,
             "rtt_ms": rtt_ms_quantized,
             "slash_sig": slash_sig_hex,
@@ -157,7 +173,11 @@ pub(crate) fn write_probe_response(
         writeln!(w, "hash:          {hash_hex}")?;
         writeln!(w, "has_blob:      {}", resp.body.has_blob)?;
         writeln!(w, "rate_per_mb:   {} (base units)", resp.body.rate_per_mb)?;
-        match resp_ext.total_bytes {
+        match resp_ext
+            .size_proof
+            .as_ref()
+            .map(decdn_protocol::SizeProof::size)
+        {
             Some(n) => writeln!(w, "total_bytes:   {n}")?,
             None => writeln!(w, "total_bytes:   (unknown)")?,
         }

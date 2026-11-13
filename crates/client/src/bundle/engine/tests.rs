@@ -1,5 +1,6 @@
 use super::super::{BundleManifest, MalformedManifest, ManifestChunk, NotAManifest};
 use super::*;
+use crate::ProvenSize;
 use alloy::signers::local::PrivateKeySigner;
 use iroh::PublicKey;
 use std::assert_matches;
@@ -5126,7 +5127,7 @@ async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
         .fetch_to_paths_until(
             &[DownloadTarget {
                 hash: root(&blob),
-                total_bytes: u64::try_from(blob.len())?,
+                total_bytes: ProvenSize::assume_for_tests(u64::try_from(blob.len())?),
                 dest: &dest,
                 ranges: Some(&ranges),
             }],
@@ -5361,4 +5362,26 @@ async fn planned_work_leaves_out_colliding_entries() {
             "overwrite={overwrite}"
         );
     }
+}
+
+/// Dedup ranges planned from a manifest's declared size drive the entry only
+/// when the size is the proven one: a declared size above or below it, or
+/// none, fetches the whole blob.
+#[test]
+fn dedup_ranges_hold_only_at_the_proven_size() {
+    let ranges: &[(u64, u64)] = &[(0, 1024), (8192, 4096)];
+    let size = 16_384;
+    let proven = ProvenSize::assume_for_tests(size);
+    assert_eq!(
+        ranges_at_proven_size(Some(ranges), Some(size), proven),
+        Some(ranges)
+    );
+    for declared in [Some(1 << 60), Some(size - 1), Some(0), None] {
+        assert_eq!(
+            ranges_at_proven_size(Some(ranges), declared, proven),
+            None,
+            "{declared:?}"
+        );
+    }
+    assert_eq!(ranges_at_proven_size(None, Some(size), proven), None);
 }

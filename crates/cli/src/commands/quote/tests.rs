@@ -1,4 +1,5 @@
 use alloy::primitives::Address;
+use decdn_client::ProvenSize;
 use decdn_client::bundle::ManifestEntry;
 use decdn_client::discovery::NodeCandidate;
 use decdn_client::quote::{HashCensus, NodeAnswer};
@@ -24,7 +25,7 @@ fn answer(seed: u8, rtt_ms: f64, rate_per_mb: u64, has_blob: bool, size: u64) ->
         rtt_ms,
         rate_per_mb,
         has_blob,
-        total_bytes: has_blob.then_some(size),
+        total_bytes: has_blob.then_some(ProvenSize::assume_for_tests(size)),
         coverage: decdn_protocol::Coverage::empty(),
     }
 }
