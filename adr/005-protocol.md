@@ -19,7 +19,7 @@ Three core protocols negotiated via ALPN:
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | `cdn/dht/v1` | any node ↔ any node | Kademlia content discovery (FIND_VALUE / STORE / FIND_NODE) — see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
 
-There is no protocol-level role for settlement monitoring — settlement events are public on the L2 chain, so anyone may analyze them off-chain.
+There is no protocol-level role for settlement monitoring — settlement events are public on the payment chain and vote-weight sweeps are public on the governance chain, so anyone may analyze them off-chain.
 
 ### Rate discovery
 
@@ -35,7 +35,7 @@ sequenceDiagram
     participant C as Candidate Node
 
     R->>C: ProbeRequest {hash, timestamp_us}
-    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {total_bytes?}
+    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {total_bytes?, payment_chains?}
 
     Note over R: RTT = receive_time - timestamp_us
     Note over R: Score = unified selection score (see ADR 001)
@@ -46,6 +46,8 @@ sequenceDiagram
 `slash_sig` is the candidate node's EIP-712 secp256k1 signature over `{hash, has_blob, rate_per_mb, timestamp_us}`, signed with the operator's Ethereum key registered in `CapacityBond` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change to this set is a Tier 3 ALPN bump. The signature makes the probe response cryptographically attributable to a registered node and underpins probe-derived slash evidence. It enables **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and the stream is a delivery (`ok: true`) at `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch — and it also underpins **blacklist-violation** evidence, attributing service of a blacklisted hash to the registered node. Evidence age is bounded by the existing `Max evidence age` parameter ([ADR 009](009-governance.md#adr-009-governance-model)) so honest operators are never exposed to indefinite slash risk from old probes. Both `timestamp_us` values are requester-generated (the probe timestamp echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference. **Submitting slash evidence requires a 100 TOKEN challenge bond** — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — returned if the challenge succeeds, forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
 
 **Signer binding:** Connection-level peer identity is authenticated by the iroh QUIC handshake against the registered NodeId (Ed25519). Message-body attribution and on-chain slash evidence both rely on `slash_sig`: verifiers recover the Ethereum address via `ecrecover` (3,000 gas on-chain) and confirm it maps to the expected NodeId via `CapacityBond.nodeIdOf` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse` — no opt-out. Requesters MUST reject responses with missing or zero-length `slash_sig`, and MUST recover the signature to the peer's registered operator address before acting on the response. A length check alone leaves the quote unattributed: selection reads `has_blob` and `rate_per_mb` off the response, and neither binds the peer to anything until the signature recovers. A response that fails to verify is dropped as requester-local policy — it MUST NOT be scored against the peer, because a signature that does not recover attributes nothing to anyone. See [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) for the EIP-712 type definitions and `SlashJudge` contract interface.
+
+**Accepted payment chains.** The unsigned extension field `payment_chains` lists the EIP-155 chain ids of the payment chains on which the node redeems vouchers ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)). The list holds at most 16 entries, and a receiver ignores any entry past the sixteenth. The field is a hint. A wrong hint costs the requester one refusal, because the node checks `chain_id` on every `StreamRequest` ([§ Payment chain routing](#payment-chain-routing)). A requester picks a payment chain that is in both its own pool chains and this list. A node that omits the field accepts only the payment chain the requester already knows from its pinned configuration.
 
 **Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) is half this 30-second window (15 seconds), keeping any stream opened from a cache hit within the slashable window; `probe_hold_duration` (see below) is this window plus 5-second margin. Changing the slashing window requires updating both.
 
@@ -102,7 +104,7 @@ sequenceDiagram
     participant P as Payer
     participant D as Delivering Node
 
-    P->>D: StreamRequest {hash, namespace_id, pool_id, byte_offset, timestamp_us}
+    P->>D: StreamRequest {hash, namespace_id, chain_id, pool_id, byte_offset, timestamp_us}
     D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {error?, origin_attestation?}
 
     alt ok = true
@@ -124,6 +126,7 @@ For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see
 struct StreamRequest {
     hash: Hash,
     namespace_id: U256,  // 0 = namespace not named (DHT and attesting origins only); non-zero also routes to that namespace's authorized origins
+    chain_id: u64,       // EIP-155 id of the payment chain that holds `pool_id`
     pool_id: PoolId,
     byte_offset: u64,
     byte_len: u64,       // 0 = to end-of-blob; else bound the range to [byte_offset, byte_offset + byte_len)
@@ -152,6 +155,15 @@ The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer 
 `namespace_id` is a **routing hint, not a trust anchor**: the returned bytes are verified against the BLAKE3 `hash` independently ([ADR 002](002-content-addressing.md#adr-002-content-addressing)), so a wrong or hostile `namespace_id` can only cause a failed fetch, never corrupt or mis-attributed delivery. The requester supplies the `(namespace_id, hash)` association, which the application already knows.
 
 Like `byte_len`, `namespace_id` is part of the base `StreamRequest` (every node routes on it), and because `cdn/client/v1` is pre-finalisation it is a straight in-place addition with no version bump or compatibility shim.
+
+#### Payment chain routing
+
+A pool id is unique only inside one `PaymentPool` deployment, and many payment chains run at once. `StreamRequest` therefore carries `chain_id`, the EIP-155 id of the payment chain that holds `pool_id`. The node routes on it:
+
+- **A chain the node accepts.** The node reads the pool, checks the voucher domain and redeems on that chain. The voucher domain binds that chain id and that chain's `PaymentPool` address ([ADR 003 § PaymentPool](003-payments.md#paymentpool)).
+- **A chain the node does not accept.** The node answers `Declined` before it reads any pool state.
+
+`chain_id` is part of the base `StreamRequest`. Every node routes on it, and the voucher it selects has no meaning without it. Because `cdn/client/v1` is pre-finalisation, it is a straight in-place addition with no version bump and no compatibility shim. A request is not signed, so `chain_id` adds no signed field. The signed `StreamResponse` fields do not change.
 
 #### Seek and resume
 
@@ -347,7 +359,7 @@ Every refusal scopes to the node that sent it, for the current fetch. A requeste
 | Class | Meaning to the requester | Node reasons |
 |---|---|---|
 | `NotFound` | Try other nodes. Rediscovery can return this node, and it can serve later. | Cache miss. Load shed, on a hit or on a miss. Chain reads stale past the grace window ([ADR 011 § Serving while chain-stale](011-content-takedown.md#serving-while-chain-stale)). Pull-loop guard ([ADR 037 § Node serving](037-regional-proxy-warming.md#node-serving-window-paced-pull-through)). Unknown lane. A failed binding or lane-ownership proof. A pool or signer check that the node cannot complete because its RPC faults. The signer's live floor plus floor debt at its cap on this node ([ADR 003 § Per-signer floor isolation](003-payments.md#pool-solvency-and-the-refundable-floor-m)). The live part clears as the signer's streams pay. A cap that floor debt alone fills holds until the node restarts or the pool is reclaimed. No upstream route at or below the node's buy ceiling ([ADR 041](041-refuse-to-serve.md#no-route-is-a-valid-outcome)). The node's own upstream fill ends with "funding needed": the funding problem is the node's, not the requester's. A pool with no on-chain record, or a `Closed` pool: the node cannot tell either from an RPC fault or from a pool that its chain view has not caught up with ([ADR 003 § Funding recovery](003-payments.md#funding-recovery)). |
-| `Declined` | Remove this node from the candidates for this hash for the rest of the fetch. | A foreign namespace that the node does not relay ([ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace)). A blob from this node's own origin that is larger than its `max_blob_size`, or a pull-through range that this node cannot land without holding more than `max_blob_size` of the blob (**`max_blob_size` enforcement** below). A hash on the governance blacklist or the local denylist. An origin on the on-chain origin blacklist or the local origin denylist ([ADR 011 § StreamRequest Response](011-content-takedown.md#streamrequest-response)). An internal error. A range that starts at or past the node's own size claim: `total_bytes` is this node's claim, and other nodes can disagree. A blob that the node withdrew after its probe ([ADR 040](040-cache-policy.md#pinning-durable-operator-evict-and-the-probe-hold-stay-engine-enforced)). |
+| `Declined` | Remove this node from the candidates for this hash for the rest of the fetch. | A foreign namespace that the node does not relay ([ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace)). A `chain_id` that the node does not accept ([§ Payment chain routing](#payment-chain-routing)). A blob from this node's own origin that is larger than its `max_blob_size`, or a pull-through range that this node cannot land without holding more than `max_blob_size` of the blob (**`max_blob_size` enforcement** below). A hash on the governance blacklist or the local denylist. An origin on the on-chain origin blacklist or the local origin denylist ([ADR 011 § StreamRequest Response](011-content-takedown.md#streamrequest-response)). An internal error. A range that starts at or past the node's own size claim: `total_bytes` is this node's claim, and other nodes can disagree. A blob that the node withdrew after its probe ([ADR 040](040-cache-policy.md#pinning-durable-operator-evict-and-the-probe-hold-stay-engine-enforced)). |
 | `Unfunded` | Park this node at the current funding for the rest of the fetch. It is asked again only after a funding recovery step ([ADR 003 § Funding recovery](003-payments.md#funding-recovery)). | The pool's remaining deposit minus the node's floor `M` cannot cover a credit window. The signer's `cap − spent` is below the serve floor. The signer's capability has expired. The owner revoked the signer key ([ADR 003 § Revocation](003-payments.md#revocation)). The pool is `Closing` ([ADR 003 § Pool solvency](003-payments.md#pool-solvency-and-the-refundable-floor-m)). |
 
 **`Unfunded` is gated on a proven requester.** The node speaks `Unfunded` only to a requester that passed the lane-ownership proof or holds a verified signer binding. Any other requester gets `NotFound` for the same state. So a prober cannot tell "no such content" from "this pool cannot pay", and pool and signer state stay unmappable off the wire ([ADR 003 § Pool solvency](003-payments.md#pool-solvency-and-the-refundable-floor-m)).

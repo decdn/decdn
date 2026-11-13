@@ -9,51 +9,77 @@ The deCDN deploys multiple interacting smart contracts with cross-contract calls
 
 This ADR consolidates that analysis into a single reference for security audits and implementation. It does not introduce new functionality — it systematizes what other ADRs already specify.
 
-> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) driver.** `FeeRouter` is a three-bucket settlement distributor; `CapacityBond` is the operator-registry contract (capacity-bond curve, escrow-on-slash, NodeId binding); `SlashAppeal` and `BuybackBurner` integrate with it. Read [ADR 026](026-tokenomics.md#adr-026-tokenomics) first for the economic model; this ADR is the integration view.
+> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) driver.** `FeeRouter` is the governance-chain receiver of payment-chain sweeps; `CapacityBond` is the operator-registry contract (capacity-bond curve, escrow-on-slash, NodeId binding); `SlashAppeal` and `BuybackBurner` integrate with it. Read [ADR 026](026-tokenomics.md#adr-026-tokenomics) first for the economic model; this ADR is the integration view.
 
 ## Decision
 
+### Deployment Tiers
+
+The contracts run on two kinds of chain.
+
+- **Governance chain.** Ethereum L1. It holds TOKEN, the bond, slashing, governance, the treasury, and buyback.
+- **Payment chain.** Any EVM chain with native 6-decimal USDC and Circle CCTP V2 with hooks. It holds only `PaymentPool` and USDC. Many payment chains run at the same time.
+
+| Chain | Contracts |
+| --- | --- |
+| Governance chain | `Token`, `CapacityBond`, `Ed25519Verifier`, `SlashJudge`, `SlashAppeal`, `ContentBlacklist`, `OriginAssignment`, `PublisherRegistry`, vetting policies, `DecdnGovernor`, `TimelockController`, `FeeRouter`, the `BuybackBurner` stack |
+| Payment chain | `PaymentPool` |
+
+Two interfaces cross between the tiers. Both ride in one message.
+
+1. **The sweep.** A CCTP burn-and-mint message from a payment chain to the governance chain. It carries the protocol share (USDC).
+2. **The bytes feed.** The served-bytes record `(operator, bytes)` in the sweep's hook data. There is no other bytes path.
+
+`PaymentPool.sweep(operator)` sends the sweep. `FeeRouter` is the CCTP destination and receives it ([§ Contract: FeeRouter](#contract-feerouter)). The protocol share is the part of each redemption that is not paid to the operator on the payment chain.
+
+A chain becomes a payment chain when it meets the rule in [the admission appendix](appendix-l2-deployment.md#appendix-governance-chain-and-payment-chain-admission). No per-chain list lives in this ADR.
+
+The payment side has no governance. Every `PaymentPool` parameter is a constructor argument and is immutable. A `PaymentPool` reads no `CapacityBond` state. Governance tunes payment chains only through the split and the bytes weight on the governance-chain `FeeRouter` ([§ Tunable Economics](#tunable-economics)).
+
 ### Contract Inventory
 
-deCDN contracts use audited [OpenZeppelin Contracts](https://docs.openzeppelin.com/contracts/) components where applicable, to minimize custom security-critical code. The `OZ Base Contracts` column below records what each contract inherits. `Ed25519Verifier` is the one exception in this table: it is a stateless `view` verifier that holds no storage, no funds, and no roles, so no OZ base contract applies. The full surface ships in a single audit pass; per-bucket economics are governance-tunable from day one (see [§ Tunable Economics](#tunable-economics) below), so the network launches with the buyback bucket dormant and governance activates the burn leg as the dependent infrastructure stabilizes.
+deCDN contracts use audited [OpenZeppelin Contracts](https://docs.openzeppelin.com/contracts/) components where applicable, to minimize custom security-critical code. The `OZ Base Contracts` column below records what each contract inherits. `Ed25519Verifier` is the one exception in this table: it is a stateless `view` verifier that holds no storage, no funds, and no roles, so no OZ base contract applies. The full surface ships in a single audit pass. The split of each sweep is governance-tunable from day one (see [§ Tunable Economics](#tunable-economics) below).
 
-| Contract | ADR | Holds Funds | Token Types | OZ Base Contracts |
-| --- | --- | --- | --- | --- |
-| TOKEN (ERC-20) | [026](026-tokenomics.md#adr-026-tokenomics) | No (fungible token) | — | `ERC20`, `ERC20Burnable`, `ERC20Permit` (fixed-supply per [ADR 026 § Supply and distribution](026-tokenomics.md#supply-and-distribution); no post-genesis mint function; `ERC20Burnable` is the sink for the 50% burn leg of the slashing path — 50% challenger / 50% burn at finality — per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); `ERC20Votes` is intentionally omitted because Governor vote weight is derived from `FeeRouter` epoch accounting, not from per-account checkpoint structures, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), so the per-transfer checkpoint cost is not earned) |
-| CapacityBond | [003](003-payments.md#adr-003-payment-model), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` (operator-registry contract. Exposes the lock-to-capacity curve `bond = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), `isActive(operator)` per [ADR 003](003-payments.md#adr-003-payment-model) `ICapacityBond`, `declaredMbps(operator)` for capacity-tier checks, `firstBondedAt(operator)` for the `age_ramp` source on `DecdnGovernor` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), the per-operator slash records (`operatorSlashCount` / `operatorSlashIdAt` / `getSlashRecord`) for the slash-aware voting-weight zero-out per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out), and `bindNodeId` / `reclaimNodeId` for the NodeId↔Ethereum-address binding) |
-| PaymentPool | [003](003-payments.md#adr-003-payment-model) | Yes | USDC | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` (USDC-only; the USDC address is fixed at deployment; one funded pool backs many capped signers to many nodes; redemption forwards each batch's paid total to `FeeRouter.routeSettlement` rather than skimming inline) |
-| FeeRouter | [026](026-tokenomics.md#adr-026-tokenomics) | Yes (transient) | USDC (transient; all three buckets transfer same-tx) | `AccessControl`, `ReentrancyGuard`, `Pausable` (three-bucket settlement distributor: 60% operator base / 30% buyback-and-burn / 10% treasury per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split); no epoch buckets, no claim windows) |
-| SlashAppeal | [026](026-tokenomics.md#adr-026-tokenomics), [028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) | Yes (TOKEN appeal bonds only) | TOKEN (appeal bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable` (slash-appeal state machine per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation): `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `grantAppeal` / `upholdAppeal` / `cleanupExpiredAppeal`; drives `CapacityBond`'s escrow-on-slash settle hooks) |
-| BuybackBurner (abstract) + GuardedBuybackBurner (abstract) + BuybackBurnerUniswapV3 | [018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` via the shared `SunsettingPausable` base (swap-and-burn path; receives 30% of every settlement. `BuybackBurner` is the venue-neutral abstract base and owns the shared surface, the abstract `GuardedBuybackBurner` adds the MEV-defense stack once for every venue, and the concrete `BuybackBurnerUniswapV3` binds the live venue per [ADR 018 § Venue-neutral burner selection](018-liquidity-strategy.md#venue-neutral-burner-selection)) |
-| ContentBlacklist | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` — not `Pausable`, because the unlawful-content-removal duty is permanent and must survive the pause sunset ([§ Emergency Multisig](#emergency-multisig-production)) (full surface: hash-level — global + regional — operator-level — `addOperator` / `removeOperator` — origin-level — `isOriginBlacklisted` / `setOriginBlacklist` — plus the enumeration views `getScopeRegions` / `blacklistedHashCount` / `blacklistedHashes` / `blacklistedAddressCount` / `blacklistedAddresses` that let the compliance layer rebuild blacklist state without replaying takedown events) |
-| PublisherRegistry | [002](002-content-addressing.md#adr-002-content-addressing) | No | — | `AccessControl` (no `ReentrancyGuard`: the contract makes no external calls and holds no funds, so a reentrancy guard would be dead weight — every function is pure storage bookkeeping) |
-| OriginAssignment | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` (delegates the vetting decision to a swappable `IVettingPolicy` set via `setVettingPolicy`; `addOrigin` reads `vettingPolicy.isVetted(msg.sender)`) |
-| ManualVettingPolicy | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl` (the genesis `IVettingPolicy`: a `VETTER_ROLE` holder approves publishers via `setVetted`; `VETTER_ROLE`'s admin is `GOVERNANCE_ROLE`, so governance moves *who* vets without a contract swap. Alternative policies — `OpenVettingPolicy` (testnet-only) or a future attestation policy — implement the same one-function seam and are installed by `OriginAssignment.setVettingPolicy`. No `ReentrancyGuard`: pure storage bookkeeping, no external calls) |
-| SlashJudge | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` |
-| Ed25519Verifier | [003](003-payments.md#nodeid-ownership-verification), [019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow) | No | — | None — a stateless `view` verifier behind the frozen `IEd25519Verifier` interface. It holds no storage, no funds, and no roles, so no OZ base contract applies. It performs the RFC 8032 PureEdDSA check that `CapacityBond` runs on the NodeId ownership proof in `registerNode`, `bindNodeId`, and `reclaimNodeId`. The contract delegates the core group check to the audited Smoo.th Crypto Lib EIP-6565 routine and adds the public-key decompression plus the strict guards — reject small-order points, non-canonical `y`, off-curve keys. [ADR 003 § On-chain verification](003-payments.md#on-chain-verification) covers why parity with `ed25519-dalek::verify_strict` is the security bar |
-| DecdnGovernor | [009](009-governance.md#adr-009-governance-model), [036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) | No | — | OZ `Governor` + `GovernorCountingSimple` + `GovernorTimelockControl` with a custom served-bytes vote source: reads `FeeRouter.bytesInWindow(operator, epoch(ts), windowEpochs)` and `FeeRouter.totalBytesInWindow(epoch(ts), windowEpochs)` for the bytes-weighted weight basis, and `CapacityBond.firstBondedAt(operator)` + the operator's `CapacityBond` slash records for the tenure ramp and slash zero-out per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). Vote weight is derived from FeeRouter epoch accounting, not per-account checkpoints, so OZ's `GovernorVotes` / `GovernorVotesQuorumFraction` are not used. Thin wrapper supplying fixed deCDN defaults: timestamp clock, 1-day voting delay, 7-day vote, 0.1% proposal threshold, 4% quorum, 10% per-operator voting cap (launch value, decrease-only, applied against bytes-weighted total). EIP-712 delegation per Governor Bravo (voting power delegable, bond non-delegable) per [ADR 026 § Governance](026-tokenomics.md#governance). |
-| TimelockController | [009](009-governance.md#adr-009-governance-model) | Yes (treasury custodian) | USDC | OZ `TimelockController` (no custom code; 48h delay; holds the 10% protocol-treasury bucket per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) and holds `GOVERNANCE_ROLE` on every contract above; `DEFAULT_ADMIN_ROLE` is renounced to no one at deploy end so no master admin key survives — see [§ Access Control Matrix](#access-control-matrix)) |
+| Contract | Deploys on | ADR | Holds Funds | Token Types | OZ Base Contracts |
+| --- | --- | --- | --- | --- | --- |
+| TOKEN (ERC-20) | Governance chain | [026](026-tokenomics.md#adr-026-tokenomics) | No (fungible token) | — | `ERC20`, `ERC20Burnable`, `ERC20Permit` (fixed-supply per [ADR 026 § Supply and distribution](026-tokenomics.md#supply-and-distribution); no post-genesis mint function; `ERC20Burnable` is the sink for the 50% burn leg of the slashing path — 50% challenger / 50% burn at finality — per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); `ERC20Votes` is intentionally omitted because Governor vote weight is derived from `FeeRouter` epoch accounting, not from per-account checkpoint structures, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), so the per-transfer checkpoint cost is not earned) |
+| CapacityBond | Governance chain | [003](003-payments.md#adr-003-payment-model), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` (operator-registry contract. Exposes the lock-to-capacity curve `bond = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), `isActive(operator)` per [ADR 003](003-payments.md#adr-003-payment-model) `ICapacityBond`, `declaredMbps(operator)` for capacity-tier checks, `firstBondedAt(operator)` for the `age_ramp` source on `DecdnGovernor` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), the per-operator slash records (`operatorSlashCount` / `operatorSlashIdAt` / `getSlashRecord`) for the slash-aware voting-weight zero-out per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out), and `bindNodeId` / `reclaimNodeId` for the NodeId↔Ethereum-address binding) |
+| PaymentPool | Payment chain | [003](003-payments.md#adr-003-payment-model) | Yes | USDC | `ReentrancyGuard`, `EIP712`, `SunsettingPausable` with an immutable `pauser` (USDC-only; the USDC address is fixed at deployment; one funded pool backs many capped signers to many nodes; no bond read, no governance, no roles; `redeemMany` pays `operatorBps` to the operator and accrues the protocol share in `pending`; `sweep(operator)` sends it to `FeeRouter` over CCTP) |
+| FeeRouter | Governance chain | [026](026-tokenomics.md#adr-026-tokenomics) | Yes (within the receive transaction only) | USDC (receives sweeps; rebate, buyback, and treasury legs transfer in the same transaction) | `AccessControl`, `ReentrancyGuard`, `Pausable` (receives CCTP sweeps, splits the minted USDC into rebate / buyback / treasury per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split), and keeps the served-bytes ledger) |
+| SlashAppeal | Governance chain | [026](026-tokenomics.md#adr-026-tokenomics), [028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) | Yes (TOKEN appeal bonds only) | TOKEN (appeal bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable` (slash-appeal state machine per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation): `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `grantAppeal` / `upholdAppeal` / `cleanupExpiredAppeal`; drives `CapacityBond`'s escrow-on-slash settle hooks) |
+| BuybackBurner (abstract) + GuardedBuybackBurner (abstract) + BuybackBurnerUniswapV3 | Governance chain | [018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` via the shared `SunsettingPausable` base (swap-and-burn path; receives the `buybackBps` share of every sweep. `BuybackBurner` is the venue-neutral abstract base and owns the shared surface, the abstract `GuardedBuybackBurner` adds the MEV-defense stack once for every venue, and the concrete `BuybackBurnerUniswapV3` binds the live venue per [ADR 018 § Venue-neutral burner selection](018-liquidity-strategy.md#venue-neutral-burner-selection)) |
+| ContentBlacklist | Governance chain | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` — not `Pausable`, because the unlawful-content-removal duty is permanent and must survive the pause sunset ([§ Emergency Multisig](#emergency-multisig-production)) (full surface: hash-level — global + regional — operator-level — `addOperator` / `removeOperator` — origin-level — `isOriginBlacklisted` / `setOriginBlacklist` — plus the enumeration views `getScopeRegions` / `blacklistedHashCount` / `blacklistedHashes` / `blacklistedAddressCount` / `blacklistedAddresses` that let the compliance layer rebuild blacklist state without replaying takedown events) |
+| PublisherRegistry | Governance chain | [002](002-content-addressing.md#adr-002-content-addressing) | No | — | `AccessControl` (no `ReentrancyGuard`: the contract makes no external calls and holds no funds, so a reentrancy guard would be dead weight — every function is pure storage bookkeeping) |
+| OriginAssignment | Governance chain | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` (delegates the vetting decision to a swappable `IVettingPolicy` set via `setVettingPolicy`; `addOrigin` reads `vettingPolicy.isVetted(msg.sender)`) |
+| ManualVettingPolicy | Governance chain | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl` (the genesis `IVettingPolicy`: a `VETTER_ROLE` holder approves publishers via `setVetted`; `VETTER_ROLE`'s admin is `GOVERNANCE_ROLE`, so governance moves *who* vets without a contract swap. Alternative policies — `OpenVettingPolicy` (testnet-only) or a future attestation policy — implement the same one-function seam and are installed by `OriginAssignment.setVettingPolicy`. No `ReentrancyGuard`: pure storage bookkeeping, no external calls) |
+| SlashJudge | Governance chain | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` |
+| Ed25519Verifier | Governance chain | [003](003-payments.md#nodeid-ownership-verification), [019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow) | No | — | None — a stateless `view` verifier behind the frozen `IEd25519Verifier` interface. It holds no storage, no funds, and no roles, so no OZ base contract applies. It performs the RFC 8032 PureEdDSA check that `CapacityBond` runs on the NodeId ownership proof in `registerNode`, `bindNodeId`, and `reclaimNodeId`. The contract delegates the core group check to the audited Smoo.th Crypto Lib EIP-6565 routine and adds the public-key decompression plus the strict guards — reject small-order points, non-canonical `y`, off-curve keys. [ADR 003 § On-chain verification](003-payments.md#on-chain-verification) covers why parity with `ed25519-dalek::verify_strict` is the security bar |
+| DecdnGovernor | Governance chain | [009](009-governance.md#adr-009-governance-model), [036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) | No | — | OZ `Governor` + `GovernorCountingSimple` + `GovernorTimelockControl` with a custom served-bytes vote source: reads `FeeRouter.bytesInWindow(operator, epoch(ts), windowEpochs)` and `FeeRouter.totalBytesInWindow(epoch(ts), windowEpochs)` for the bytes-weighted weight basis, and `CapacityBond.firstBondedAt(operator)` + the operator's `CapacityBond` slash records for the tenure ramp and slash zero-out per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). Vote weight is derived from FeeRouter epoch accounting, not per-account checkpoints, so OZ's `GovernorVotes` / `GovernorVotesQuorumFraction` are not used. Thin wrapper supplying fixed deCDN defaults: timestamp clock, 1-day voting delay, 7-day vote, 0.1% proposal threshold, 4% quorum, 10% per-operator voting cap (launch value, decrease-only, applied against bytes-weighted total). EIP-712 delegation per Governor Bravo (voting power delegable, bond non-delegable) per [ADR 026 § Governance](026-tokenomics.md#governance). |
+| TimelockController | Governance chain | [009](009-governance.md#adr-009-governance-model) | Yes (treasury custodian) | USDC | OZ `TimelockController` (no custom code; 48h delay; holds the treasury remainder of each sweep per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) and holds `GOVERNANCE_ROLE` on every contract above; `DEFAULT_ADMIN_ROLE` is renounced to no one at deploy end so no master admin key survives — see [§ Access Control Matrix](#access-control-matrix)) |
 
 #### Contract Architecture (classDiagram)
 
-The diagram below shows the full contract surface and its primary call relationships. `FeeRouter` is the canonical served-bytes accountant; `Governor` reads `bytesInWindow` and `totalBytesInWindow` from it as the voting-weight basis per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), and reads `firstBondedAt` + the operator's slash records from `CapacityBond` for the tenure ramp and slash zero-out. `CapacityBond` is the operator-registry contract. There is no separate emissions contract.
+The diagram below shows the full contract surface and its primary call relationships. `PaymentPool` lives on a payment chain; every other contract lives on the governance chain. `FeeRouter` is the canonical served-bytes accountant; `Governor` reads `bytesInWindow` and `totalBytesInWindow` from it as the voting-weight basis per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), and reads `firstBondedAt` + the operator's slash records from `CapacityBond` for the tenure ramp and slash zero-out. `CapacityBond` is the operator-registry contract. There is no separate emissions contract.
 
 ```mermaid
 classDiagram
     class PaymentPool {
         +openPool(deposit)
         +redeemMany(batches) : voucher + optional chain preimage
+        +sweep(operator)
         +closePool(poolId)
         +reclaim(poolId)
+        immutables : usdc, tokenMessenger, feeRouter, disputeWindow, operatorBps, minSweep, minDeposit, pauser
     }
     class FeeRouter {
-        +routeSettlement(op, bytes, amount)
+        +receiveSweep(message, attestation)
         +bytesPerEpoch(op, epoch)
         +totalBytesPerEpoch(epoch)
         +bytesInWindow(op, endEpoch, N)
         +totalBytesInWindow(endEpoch, N)
         +windowEpochs()
         +setWindowEpochs(n)
+        +setSplit(rebateBps, buybackBps)
     }
     class CapacityBond {
         +bond(amount)
@@ -85,9 +111,10 @@ classDiagram
     class Treasury
     class UniswapV3Pool
 
-    PaymentPool ..> FeeRouter : routeSettlement
-    FeeRouter ..> BuybackBurner : 30% USDC (same-tx)
-    FeeRouter ..> Treasury : 10% USDC (same-tx)
+    PaymentPool ..> FeeRouter : CCTP sweep (cross-chain: USDC + bytes feed)
+    FeeRouter ..> CapacityBond : isActive(operator)
+    FeeRouter ..> BuybackBurner : buybackBps USDC (same-tx)
+    FeeRouter ..> Treasury : remainder USDC (same-tx)
     BuybackBurner ..> UniswapV3Pool : swap USDC→TOKEN
     Governor ..> FeeRouter : bytesInWindow / totalBytesInWindow (voting weight)
     Governor ..> CapacityBond : firstBondedAt / slash records (age_ramp, slash zero-out)
@@ -95,53 +122,75 @@ classDiagram
     Governor ..> SlashAppeal : grantAppeal / upholdAppeal
 ```
 
-The full FeeRouter three-bucket split — the activated steady-state target 60/30/10 — is specified in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split). All three legs transfer in the settlement transaction; there are no epoch buckets, no pull-claim windows, no gauge formula. This ADR does not duplicate the bucket table; the launch-default share configuration and the tunability mechanism are in [§ Tunable Economics](#tunable-economics) below.
+The split of each sweep is specified in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split). All legs transfer in the receive transaction. This ADR does not duplicate the split table; the tunability mechanism is in [§ Tunable Economics](#tunable-economics) below.
 
 #### Tunable Economics
 
-The three-bucket structure ships from day one, but every bucket share and every dependency address is governance-mutable. The network launches with the buyback bucket dormant: the split is `[9000, 0, 1000]` — 90% operator / 0% buyback / 10% treasury. Governance then activates the buyback leg to the steady-state target `[6000, 3000, 1000]` — 60% / 30% / 10% — once `BuybackBurner` is deployed and wired, and once the dependent ADRs ([026](026-tokenomics.md#adr-026-tokenomics), [028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)) settle into operational defaults. The dormant launch and the activated target are the only two configurations this ADR specifies.
+Every knob is a governance-chain parameter on `FeeRouter`, under `GOVERNANCE_ROLE` (the `TimelockController`). A payment chain has no knob.
 
-The pattern has three knobs, all under `GOVERNANCE_ROLE` (i.e. the `TimelockController`):
+| Knob | Meaning |
+| --- | --- |
+| `rebateBps` | Share of each sweep's minted USDC `U` that returns to the operator. |
+| `buybackBps` | Share of `U` that goes to the `BuybackBurner`. |
+| `buybackBurner` | Burner address. |
+| `treasury` | Treasury address (the `TimelockController`). It receives the remainder of `U`. |
+| `windowEpochs` | Trailing-window length of the served-bytes vote weight. Bounds 4-26 per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds). |
+| `deliveryFloor` | Net USDC micro-units per MB of weight credit. Bounds 1-1000, launch value 1. |
 
-1. **Bucket shares.** `FeeRouter.setShares([operatorBaseBps, buybackBps, treasuryBps])` updates the three-bucket split in basis points. Sum-to-10000 invariant enforced; cross-validated against dependency addresses (see knob 2). Per-share bounds enforced per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds): operator [40, 90], burn [5, 50], treasury [0, 30]. The burn floor applies only when that bucket is active — a zero buyback share is permitted, which is what makes the dormant launch split `9000 / 0 / 1000` legal. The activated steady-state target is `6000 / 3000 / 1000`.
-2. **Dependency addresses.** `FeeRouter.setBuybackBurner(addr)`, `setTreasury(addr)` may be called any time. **Cross-validation:** `setShares(...)` reverts if any non-zero share has its destination set to `address(0)` — so a bucket can only become live once its sink contract is wired in. Same applies in reverse: `set*(address(0))` reverts if the corresponding share is non-zero.
-3. **Sybil-economics floor on `PaymentPool`.** `PaymentPool.setMinDeposit(uint64)` sets the minimum credited `openPool` deposit, bounded [0, $100] with the ceiling hardcoded. The launch value is 0 — the knob ships dormant and any non-zero deposit opens a pool; governance arms it to price cross-pool Sybil fan-out (see [ADR 003 § Minimum deposit](003-payments.md#minimum-deposit)).
+The split has no bounds beyond two checks. A non-zero `buybackBps` needs a non-zero burner address. A non-zero treasury remainder needs a non-zero treasury address. `setSplit` and the address setters apply the same checks.
 
-**Inactive buckets accumulate zero with no reverts.** All three legs execute inline against their `safeTransfer` paths; at zero share, the leg short-circuits before the transfer call. No code path reverts when a bucket is off — the contract is uniformly dormant on the disabled legs. There are no epoch buckets, claim functions, sweep paths, or USDC→TOKEN swap pipelines on `FeeRouter`.
+**Buyback is a setting.** Governance deploys the `BuybackBurner` stack when it wants one. It then sets `buybackBps` above 0 and the burner address. It can set `buybackBps` back to 0 at any time. The standard 48h timelock makes each change observable in advance. Buyback inflow arrives in lumps, one per sweep. The per-epoch spend cap and the keeper cadence in [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol) are sized for lumpy inflow.
 
-**Activation sequence is governance-driven.** When `BuybackBurner` is deployed and audited, governance calls `setBuybackBurner(addr)` then `setShares(...)` to allocate the bucket. Because share updates pass through the standard 48h timelock, bucket activations are externally observable in advance.
+**Operator share.** The operator receives `operatorBps` (immutable on the payment chain, 6000 in the reference deployment) at redemption, plus the rebate part of the protocol share. Example values, not defaults in code: `rebateBps` 7500 and `buybackBps` 0 give the operator 60% + 30% = 90% and the treasury 10%. `rebateBps` 0 and `buybackBps` 7500 give the operator 60%, the buyback 30%, and the treasury 10%.
 
-**Launch deployment.** `FeeRouter` deploys with a zero-address dependency for `BuybackBurner` if it isn't co-deployed (see [§ Deployment Order](#deployment-order-and-initialization-dependencies) below). The launch share configuration honors the cross-validation invariant — only buckets whose destinations are wired may be set non-zero. The buyback bucket is dormant by default: `buybackBurner == address(0)` and the split is `[9000, 0, 1000]`.
+**Net share zero.** With `buybackBps` and the treasury remainder both zero, the router mints no new weight. When the trailing window empties, quorum and proposal threshold reach 0. This is a governance decision that the same governance can reverse.
 
-**Optional deploy-time genesis activation.** The deploy script carries an off-by-default option to activate the buyback bucket at genesis. With it off, the launch is dormant exactly as above. With it on, the script runs the governance activation bundle in-script — seed the venue pool, deploy the concrete burner with Timelock-held roles, `setSharesAndDestinations([6000, 3000, 1000], {buybackBurner, treasury})`, grant the keeper `KEEPER_ROLE` — before the [§ Deployment Order](#deployment-order-and-initialization-dependencies) role handoff, so the burner is handed to the Timelock alongside every other target. This exists because at genesis the served-bytes voting weight that gates the governance path (and therefore governance quorum per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) is zero, so the standard activation cannot run until the network has served bytes. The venue pool is a Uniswap V3 50/50 pool, behind the venue-neutral `BuybackBurner` (see [ADR 018 § Venue-neutral burner selection](018-liquidity-strategy.md#venue-neutral-burner-selection)). It is a testnet/genesis convenience; production activation stays governance-gated (see [ADR 018 § Activation Criteria](018-liquidity-strategy.md#activation-criteria-production) and [§ Deploy-time genesis activation](018-liquidity-strategy.md#deploy-time-genesis-activation)). No new contract surface, fallback path, or privileged role is introduced — activation is the same `setSharesAndDestinations` call, run before the deployer's `GOVERNANCE_ROLE` is handed off.
+`PaymentPool` has no tunable. Its `minDeposit` (dormant at 0, see [ADR 003 § Minimum deposit](003-payments.md#minimum-deposit)) is an immutable.
 
 #### Contract: FeeRouter
 
 ```solidity
 interface IFeeRouter {
-    // Called by `PaymentPool.redeem`. Forwards the operator's
-    // full USDC balance through the three-bucket split per ADR 026
-    // § FeeRouter split: 60% operator base, 30% buyback, 10% treasury.
-    // All three legs transfer same-tx. Derives the current
-    // epoch as `uint64(block.timestamp / EPOCH_LENGTH)`, increments both
-    // `bytesPerEpoch[operator][epoch]` and `totalBytesPerEpoch[epoch]`
-    // (the governance-canonical vote-weight source per ADR 036).
-    // Reverts if paused.
-    function routeSettlement(
-        address operator,
-        uint256 bytesDelivered,
-        uint256 amount
-    ) external;
+    // Receives one CCTP sweep. Permissionless. FeeRouter is the
+    // `destinationCaller`: it calls `MessageTransmitterV2.receiveMessage`
+    // and reads `sourceDomain`, `messageSender` (the sweeping pool), the
+    // minted USDC amount `U` (after the CCTP fee), and
+    // `hookData = abi.encode(operator, bytes)`. Any pool on any chain may
+    // sweep; there is no pool allowlist. FeeRouter accepts a message only
+    // if the outer `recipient` is the local `TokenMessengerV2`, the outer
+    // `sender` equals that messenger's `remoteTokenMessengers(sourceDomain)`,
+    // and the burn body's `mintRecipient` is FeeRouter. These checks reject
+    // a generic CCTP message that only names FeeRouter as `destinationCaller`.
+    // `U = amount - feeExecuted`, both read from the signed burn body.
+    //   1. Active at arrival: the rebate and the weight credit go to the
+    //      operator only if `CapacityBond.isActive(operator)`. Otherwise
+    //      the rebate goes to the treasury and the credit is 0.
+    //   2. USDC-backed credit: `credit = min(bytes, net * 1 MiB /
+    //      deliveryFloor)`, where `net` is the USDC that goes to the
+    //      buyback and the treasury (not the rebate).
+    //   3. Capacity clamp: the credit cannot exceed `CapacityBond.
+    //      declaredMbps(operator) * EPOCH_LENGTH * 125_000` minus what
+    //      `bytesPerEpoch[operator][epoch]` already holds. The clamp binds
+    //      the operator counter and the network total alike.
+    //   4. Arrival-epoch stamping: the credit is written to
+    //      `uint64(block.timestamp / EPOCH_LENGTH)`, so a late sweep never
+    //      changes a closed epoch.
+    // Split of `U`: `rebateBps` to the operator, `buybackBps` to the
+    // burner, the remainder to the treasury. A failed rebate transfer
+    // falls back to the treasury. CCTP replay protection makes a sweep
+    // credit once. Reverts if paused; attested messages stay valid and
+    // anyone can receive them after unpause.
+    function receiveSweep(bytes calldata message, bytes calldata attestation) external;
 
-    // Per-operator, per-epoch served bytes — populated inline by
-    // routeSettlement. The governance vote-weight source per ADR 036:
+    // Per-operator, per-epoch served bytes — written by
+    // receiveSweep. The governance vote-weight source per ADR 036:
     // DecdnGovernor sums this counter over the trailing `windowEpochs`
     // epochs via `bytesInWindow` to derive an operator's served-bytes
     // weight. Also used off-chain for dashboards.
     function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
 
-    // Global per-epoch served bytes — populated inline by
-    // routeSettlement alongside `bytesPerEpoch`. Used by DecdnGovernor
+    // Global per-epoch served bytes — written by
+    // receiveSweep alongside `bytesPerEpoch`. Used by DecdnGovernor
     // via `totalBytesInWindow` for the bytes-weighted total in the
     // per-operator vote cap, quorum, and proposal-threshold checks per
     // ADR 036.
@@ -170,52 +219,39 @@ interface IFeeRouter {
     function windowEpochs() external view returns (uint64);
     function setWindowEpochs(uint64 n) external;
 
-    // Configured shares (bps) and dependency addresses. INVARIANT: these
-    // are governance-set state (via `setShares` / `setSharesAndDestinations`),
-    // NOT operator-asserted and NOT derived from settlement state. Array
-    // order matches `setShares`: [operatorBase, buyback, treasury].
-    function getShares() external view returns (uint256[3] memory);
+    // Governance-set state. The cross-validation in
+    // [§ Tunable Economics](#tunable-economics) holds on every setter:
+    // a non-zero `buybackBps` needs a non-zero burner and a non-zero
+    // treasury remainder needs a non-zero treasury.
+    function rebateBps() external view returns (uint256);
+    function buybackBps() external view returns (uint256);
     function buybackBurner() external view returns (address);
     function treasury() external view returns (address);
+    function deliveryFloor() external view returns (uint256);
+    function epochLength() external view returns (uint64);
 
-    // Atomic shares + dependency-address update in one timelock proposal,
-    // so the cross-validation invariant ([§ Tunable Economics](#tunable-economics)
-    // — non-zero share requires non-zero destination) holds at every
-    // observable state. Use for activation flips; per-knob setters below
-    // are for routine post-wiring governance.
-    struct ShareDestinations {
-        address buybackBurner;
-        address treasury;
-    }
-    function setSharesAndDestinations(
-        uint256[3] calldata sharesBps,
-        ShareDestinations calldata dests
-    ) external;
-
-    // Per-knob setters. Each must satisfy the cross-validation invariant:
-    // `setShares` reverts if any non-zero share targets `address(0)`;
-    // each `set*(address(0))` reverts if the corresponding share is
-    // non-zero. Order of operations: zero out the share first, then
-    // re-point the destination.
-    function setShares(uint256[3] calldata sharesBps) external;
+    // Atomic split + destination update in one timelock proposal.
+    function setSplit(uint256 rebateBps, uint256 buybackBps) external;
     function setBuybackBurner(address newBuybackBurner) external;
     function setTreasury(address newTreasury) external;
+    function setDeliveryFloor(uint256 newFloor) external;
 
-    // `pause()` blocks `routeSettlement`. `PaymentPool`
-    // close/dispute are independent and remain available — settlement
-    // queues until `unpause`.
+    // `pause()` blocks `receiveSweep`. Attested messages stay valid.
     function pause() external;
     function unpause() external;
 
     // ─── Events ───────────────────────────────────────────────────────
-    // `epoch` is FeeRouter-derived as `uint64(block.timestamp / EPOCH_LENGTH)`.
-    event Settled(
+    // `epoch` is `uint64(block.timestamp / EPOCH_LENGTH)` at arrival.
+    event SweepReceived(
+        uint32 indexed sourceDomain,
+        address indexed pool,
         address indexed operator,
-        uint256 bytesDelivered,
         uint256 amount,
-        uint64 indexed epoch
+        uint256 credit,
+        uint64 epoch
     );
-    event SharesUpdated(uint256[3] newShares);
+    event SplitUpdated(uint256 rebateBps, uint256 buybackBps);
+    event DeliveryFloorUpdated(uint256 oldValue, uint256 newValue);
     event BuybackBurnerUpdated(address indexed oldAddr, address indexed newAddr);
     event TreasuryUpdated(address indexed oldAddr, address indexed newAddr);
     event WindowEpochsUpdated(uint64 oldValue, uint64 newValue);
@@ -224,16 +260,45 @@ interface IFeeRouter {
 
 **Notes:**
 
-- **Epoch length is immutable** (1 week, constructor-set, [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). Changing it post-deploy shifts every stored epoch index; a change ships as a fresh `FeeRouter` with state migration ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)). The three-bucket split is per-byte at settlement time (no epoch-bucket payouts); `bytesPerEpoch` and `totalBytesPerEpoch` are governance-canonical because `DecdnGovernor` derives served-bytes vote weight from them per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). A `FeeRouter` migration therefore resets the governance vote-weight history — operator vote weight is zero until traffic refills the trailing window post-migration. Operational consideration documented in [ADR 036 § Consequences > Negative](036-served-bytes-voting-weight.md#negative).
-- **`bytesPerEpoch` and `totalBytesPerEpoch` are the governance vote-weight source.** Under [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), `DecdnGovernor._getVotes` calls `bytesInWindow(operator, endEpoch, windowEpochs)` and `totalBytesInWindow(endEpoch, windowEpochs)` for the per-operator served-bytes weight and the cap denominator. Per-byte settlement does the inline write; off-chain dashboards continue to read the same counters.
-- **Wash-trading defense.** Faking bytes does not increase revenue (operator base is per-byte at settlement, paid by the client; wash trades don't bring in real USDC). Governance vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — proven delivered bytes, not declared capacity — so an over-declared tier cannot translate into governance influence either. The super-linear capacity-bond curve makes over-declared capacity a dead-capital drag with no governance or revenue upside.
-- **No `initialize(...)` helper** — proxies are forbidden ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)); constructor + post-deploy `setSharesAndDestinations` from `TimelockController` suffices.
+- **Epoch length is immutable** (1 week, constructor-set, the one `EPOCH_LENGTH` shared with `CapacityBond` on the same chain; [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). `bytesPerEpoch` and `totalBytesPerEpoch` are governance-canonical because `DecdnGovernor` derives served-bytes vote weight from them per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). A `FeeRouter` migration resets the vote-weight history until traffic refills the trailing window ([ADR 036 § Consequences > Negative](036-served-bytes-voting-weight.md#negative)).
+- **`bytesPerEpoch` and `totalBytesPerEpoch` are the governance vote-weight source.** `DecdnGovernor._getVotes` calls `bytesInWindow(operator, endEpoch, windowEpochs)` and `totalBytesInWindow(endEpoch, windowEpochs)` for the per-operator weight and the cap denominator. `DecdnGovernor` takes the `FeeRouter` address as its constructor argument and reads the same interface as before.
+- **Wash-trading defense.** The credit is priced on USDC that stays with the protocol. A pool with a low or zero protocol share earns little or no weight, and forged weight costs real USDC at a price set on the governance chain. The credit never exceeds `bytes`, so an over-declared tier does not translate into governance influence.
+- **No `initialize(...)` helper.** Proxies are forbidden ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)). The constructor plus post-deploy setters from `TimelockController` suffice.
+
+##### Interface: PaymentPool (payment chain)
+
+```solidity
+interface IPaymentPool {
+    // Pays `operatorBps` of each paid amount to `msg.sender` in the same
+    // transaction. The rest accrues in `pending[msg.sender]` as
+    // `(bytes, usdc)`. The pool does not clamp bytes.
+    function redeemMany(Batch[] calldata batches) external;
+
+    // Permissionless. Needs `pending[operator].usdc >= minSweep`. Calls
+    // CCTP V2 `depositForBurnWithHook` (`minFinalityThreshold` 2000) with
+    // `mintRecipient` and `destinationCaller` set to the governance-chain
+    // FeeRouter and `hookData = abi.encode(operator, bytes)`, then resets
+    // `pending[operator]`. The operator has its own reason to sweep: the
+    // sweep carries its rebate and its vote weight.
+    function sweep(address operator) external;
+
+    function pending(address operator) external view returns (uint256 bytes_, uint256 usdc);
+
+    // Immutables: usdc, tokenMessenger, feeRouter, feeRouterDomain
+    // (Ethereum is domain 0), disputeWindow, operatorBps, minSweep,
+    // minDeposit, pauser.
+}
+```
+
+`PaymentPool` has no `capacityBond`, no `feeRouter` setter, no roles, and no governance. `disputeWindow` exceeds the chain's sequencer forced-inclusion delay. The pool holds deposits plus the unswept protocol share, which `pending` tracks. `pause()` by the immutable `pauser` blocks `openPool` and `topUp`. `redeemMany` and `sweep` never pause. [ADR 003](003-payments.md#adr-003-payment-model) specifies the payment model.
 
 ##### No proxy deployment patterns
 
-No deCDN contract uses proxy (upgradeable) deployment patterns. Production contract upgrades deploy new contracts at new addresses with state migration as described in Section 6. This constraint ensures that EIP-712 domain separators computed in constructors (as `immutable`) remain valid for the contract's lifetime — a proxy migration to a different address or chain would invalidate all existing voucher signatures.
+No deCDN contract uses proxy (upgradeable) deployment patterns. Production contract upgrades deploy new contracts at new addresses with state migration. This constraint ensures that EIP-712 domain separators computed in constructors (as `immutable`) remain valid for the contract's lifetime. A proxy migration to a different address or chain would invalidate all existing voucher signatures.
 
-**Carve-out for non-signing helper addresses.** The immutability constraint applies only to fields included in voucher / challenge domain separators on the signing contracts (`PaymentPool`, `SlashJudge`, `CapacityBond.bindNodeId` / `CapacityBond.registerNode`). Some helper-contract addresses referenced by signing contracts — `capacityBond` on `SlashJudge`, and the `setBuybackBurner` / `setTreasury` setters on `FeeRouter` — may be re-pointed via `GOVERNANCE_ROLE`-gated setters under the standard 48h timelock, because helper addresses are not domain-separator inputs and re-pointing them does not invalidate any existing signatures. `feeRouter` on `PaymentPool` is the exception: it is `immutable` and fixed at construction. It carries the `bytesPerEpoch` vote-weight feed that the `immutable` `DecdnGovernor.feeRouter` reads, so a re-pointable pool router could sever that feed and permanently brick governance.
+Payment-side contracts are not upgradeable and have no admin. Their domain binds the payment chain id and the pool address.
+
+**Carve-out for non-signing helper addresses.** The immutability constraint applies only to fields included in voucher / challenge domain separators on the signing contracts (`PaymentPool`, `SlashJudge`, `CapacityBond.bindNodeId` / `CapacityBond.registerNode`). Some helper-contract addresses referenced by governance-chain signing contracts, such as `capacityBond` on `SlashJudge` and the `setBuybackBurner` / `setTreasury` setters on `FeeRouter`, may be re-pointed via `GOVERNANCE_ROLE`-gated setters under the standard 48h timelock. Helper addresses are not domain-separator inputs, so re-pointing them invalidates no signature.
 
 **Build toolchain:** [Foundry](https://book.getfoundry.sh/) (forge, cast, anvil) for compilation, testing, and deployment.
 
@@ -254,7 +319,9 @@ The parameter carries no `[floor, ceiling]` safety rail, because a hash has no m
 
 ### Deployment Order and Initialization Dependencies
 
-Contracts must be deployed in dependency order — each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `BuybackBurner` at construction; the cross-validation invariant in [§ Tunable Economics](#tunable-economics) ensures any non-zero share has a non-zero destination, so the launch share configuration determines which dependencies must already be wired.
+Each tier has its own deployment order. Each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `BuybackBurner` at construction; the cross-validation in [§ Tunable Economics](#tunable-economics) requires a non-zero burner whenever `buybackBps` is non-zero.
+
+**Governance chain.**
 
 ```mermaid
 graph TD
@@ -266,7 +333,6 @@ graph TD
     SA["6. SlashAppeal"]
     BB["7. BuybackBurner (optional)"]
     FR["8. FeeRouter"]
-    SPC["9. PaymentPool"]
     PR["10. PublisherRegistry"]
     MVP["11. ManualVettingPolicy"]
     OA["12. OriginAssignment"]
@@ -284,9 +350,6 @@ graph TD
     FR --> TL
     FR --> CBOND
     FR -.->|"optional at deploy"| BB
-    SPC --> USDC
-    SPC --> CBOND
-    SPC --> FR
     OA --> CBOND
     OA --> PR
     OA -.->|"optional at deploy"| CB
@@ -300,19 +363,21 @@ graph TD
     GOV --> TL
 ```
 
+**Payment chain.** `PaymentPool` (step 9 below) is the only contract. It needs only USDC, the CCTP token messenger, the `FeeRouter` address and CCTP domain, and its constants. It deploys after `FeeRouter` because it takes the `FeeRouter` address. It needs no role grant and no other contract.
+
 #### Constructor Dependencies
 
 | Step | Contract | Constructor Requires |
 | --- | --- | --- |
 | 1 | TOKEN | Initial holder, initial supply (1B fixed per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Supply and distribution](026-tokenomics.md#supply-and-distribution)), owner. No `mint()` function; testnet seeding happens via the constructor `_mint(initialHolder, 1_000_000_000e18)`. |
 | 2 | USDC | External (testnet faucet or mainnet address) |
-| 3 | TimelockController | OZ `TimelockController(minDelay, proposers, executors, admin)` — `minDelay` is 48h ([ADR 009](009-governance.md#adr-009-governance-model)). Deployed early so its address is available to `FeeRouter` as the treasury bucket destination and to every `AccessControl`-bearing contract as the eventual `GOVERNANCE_ROLE` holder (`DEFAULT_ADMIN_ROLE` is renounced to no one at deploy end, not handed to the Timelock — see [§ Access Control Matrix](#access-control-matrix)). `proposers` is initialized empty and `PROPOSER_ROLE` is granted post-deploy (step 15) — to `DecdnGovernor` by default, or to the bootstrap multisig instead during the [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase); `executors` is `[address(0)]` (anyone may execute after the delay). |
+| 3 | TimelockController | OZ `TimelockController(minDelay, proposers, executors, admin)` — `minDelay` is 48h ([ADR 009](009-governance.md#adr-009-governance-model)). Deployed early so its address is available to `FeeRouter` as the treasury destination and to every `AccessControl`-bearing contract as the eventual `GOVERNANCE_ROLE` holder (`DEFAULT_ADMIN_ROLE` is renounced to no one at deploy end, not handed to the Timelock — see [§ Access Control Matrix](#access-control-matrix)). `proposers` is initialized empty and `PROPOSER_ROLE` is granted post-deploy (step 15) — to `DecdnGovernor` by default, or to the bootstrap multisig instead during the [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase); `executors` is `[address(0)]` (anyone may execute after the delay). |
 | 4 | Ed25519Verifier | None. The verifier is stateless and takes no constructor arguments; the deploy links the Smoo.th Crypto Lib EIP-6565 library into it. It must exist before `CapacityBond`, whose constructor takes its address and rejects the zero address (`ZeroAddress`). A later verifier revision deploys as a fresh contract, so a `CapacityBond` that adopts it deploys fresh too — the address is a constructor immutable, not a setter (see [ADR 003 § NodeId Ownership Verification](003-payments.md#nodeid-ownership-verification)). |
 | 5 | CapacityBond | TOKEN address, Ed25519Verifier address, admin address, `minBond`, `unbondingPeriod` (14 days per [ADR 026 § Capacity-bond curve — Bond lifecycle](026-tokenomics.md#capacity-bond-curve)), `multiaddrUpdateCooldown`, `maxMultiaddrSize`, `regionStabilityWindow`, `currentTermsHash`. The TOKEN, verifier, and admin addresses are rejected as zero, and each numeric parameter is bounds-checked in the constructor with the same rail its governance setter enforces. `currentTermsHash` is the genesis operator-terms hash new registrants must accept per [§ Operator-terms acceptance](#operator-terms-acceptance) below; the constructor rejects the zero sentinel (`ZeroTermsHash`), so a terms-disabled deployment is not reachable. The capacity-curve coefficients (`kConstant`/`alphaWad`; defaults `k=12.6`, `α=1.2`) and the declared-capacity band (`minCapacityMbps`/`maxCapacityMbps`; defaults 10 Mbps / 200 Gbps) per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve) are **not** constructor arguments — they are storage initialized to these defaults in the constructor and governance-tunable post-deploy via `setK` / `setAlpha` / `setMinCapacityMbps` / `setMaxCapacityMbps`. `age_ramp_months` is **not** a `CapacityBond` parameter at all; it lives on `DecdnGovernor` (`setAgeRampMonths`, step 15). Exposes `bindNodeId` / `reclaimNodeId` for NodeId rebinding. |
-| 6 | SlashAppeal | TOKEN address, CapacityBond address, admin address, emergency-multisig address (fast-track approver), `appealBond` (default 1000 TOKEN, bounded `[100, 10_000]e18`) per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation). Drives `CapacityBond`'s escrow-on-slash settle hooks via `SLASH_APPEAL_ROLE` (granted post-deploy, step 4 of [§ Post-Deployment Initialization](#post-deployment-initialization)). |
+| 6 | SlashAppeal | TOKEN address, CapacityBond address, admin address, emergency-multisig address (fast-track approver), `appealBond` (default 1000 TOKEN, bounded `[100, 10_000]e18`) per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation). Drives `CapacityBond`'s escrow-on-slash settle hooks via `SLASH_APPEAL_ROLE` (granted post-deploy, step 3 of [§ Post-Deployment Initialization](#post-deployment-initialization)). |
 | 7 | BuybackBurnerUniswapV3 (optional) | USDC address, TOKEN address, admin address, then the `Config` struct. The abstract `BuybackBurner` base is not deployable — the deployment binds the concrete venue per [ADR 018 § Venue-neutral burner selection](018-liquidity-strategy.md#venue-neutral-burner-selection). Position 7 records the constructor dependency on TOKEN and USDC; it is not the wall-clock position, because the burner ships in the optional genesis-activation bundle that runs after step 15. See [§ BuybackBurner construction notes](#buybackburner-construction-notes) and [ADR 003](003-payments.md#buybackburner) for the interface. |
-| 8 | FeeRouter | USDC address, **CapacityBond address**, **`TimelockController` address** (treasury bucket destination), `epochLength` (1 week; the canonical served-bytes voting-weight clock per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), `windowEpochs` (initial trailing-window length, default 13, bounds-checked `[4, 26]` per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds)), admin address, launch split shares per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds). The USDC, CapacityBond, treasury, and admin addresses are rejected as zero, and `epochLength` is rejected as zero. See [§ FeeRouter construction notes](#feerouter-construction-notes). |
-| 9 | PaymentPool | USDC address, CapacityBond address, FeeRouter address, `disputeWindow` (48h grace window), `deliveryFloor`, `minDeposit` (0 at launch — dormant Sybil floor per [ADR 003 § Minimum deposit](003-payments.md#minimum-deposit)) ([ADR 003](003-payments.md#adr-003-payment-model)). A pool is one deposit backing many capped signers to many nodes; Redemption does not skim a protocol fee inline — it transfers each batch's paid total to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. The `FeeRouter` address is `immutable`, fixed at construction per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
+| 8 | FeeRouter | USDC address, CCTP `MessageTransmitterV2` address, **CapacityBond address**, **`TimelockController` address** (treasury destination), `epochLength` (1 week; the canonical served-bytes voting-weight clock per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), `windowEpochs` (initial trailing-window length, default 13, bounds-checked `[4, 26]` per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds)), `deliveryFloor` (bounds-checked `[1, 1000]`), admin address, launch `rebateBps` and `buybackBps`. The USDC, transmitter, CapacityBond, treasury, and admin addresses are rejected as zero, and `epochLength` is rejected as zero. See [§ FeeRouter construction notes](#feerouter-construction-notes). |
+| 9 (payment chain) | PaymentPool | USDC address, CCTP `tokenMessenger`, governance-chain FeeRouter address and CCTP domain, `disputeWindow` (larger than the chain's forced-inclusion delay; 48h in the reference deployment), `operatorBps` (6000 in the reference deployment), `minSweep`, `minDeposit` (0, dormant Sybil floor per [ADR 003 § Minimum deposit](003-payments.md#minimum-deposit)), `pauser` ([ADR 003](003-payments.md#adr-003-payment-model)). Every value is immutable. A pool is one deposit backing many capped signers to many nodes. |
 | 10 | PublisherRegistry | None. Permissionless namespace creation (publisher identity is implicit on first call); namespace cap and ownership-transfer timelock are stored on `PublisherRegistry` itself and updated via governable setters (`setMaxNamespacesPerPublisher`, `setNamespaceTransferTimelock`) per [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
 | 11 | ManualVettingPolicy | `ManualVettingPolicy(address admin, address initialVetter)`. The genesis `IVettingPolicy`. `admin` holds `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` at construction; the handoff hands `GOVERNANCE_ROLE` to the Timelock and renounces `DEFAULT_ADMIN_ROLE` to no one, like every target. `initialVetter` is seeded with `VETTER_ROLE`, whose admin is `GOVERNANCE_ROLE`. A production deploy rejects a zero `initialVetter` (`MissingInitialVetter`) — a network with no vetter can onboard no publisher, and served-bytes governance cannot start until data is published, so the deploy fails fast rather than shipping that deadlock. No other dependencies. Deployed just before `OriginAssignment`, which takes it as a constructor argument. See [ADR 011 § Vetting policies](011-content-takedown.md#vetting-policies). |
 | 12 | OriginAssignment | CapacityBond, PublisherRegistry, and the vetting policy (`ManualVettingPolicy` at genesis; non-zero and required to be a contract, swappable via `setVettingPolicy`). No `ContentBlacklist` binding — the seat set is a routing hint and consumers filter against the blacklist themselves. The per-namespace origin cap is governance-controlled; vetting parameters, if any, live on the installed policy. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
@@ -322,16 +387,16 @@ graph TD
 
 #### BuybackBurner construction notes
 
-- **Optional, and deployed last.** The burner is not part of the mandatory pipeline. It ships only when the deploy-time genesis-activation option is enabled (off by default, see [§ Tunable Economics](#tunable-economics)), in a bundle that runs after the Governor and before the admin handoff. With the option off, genesis is dormant: `buybackBurner == address(0)` and the split is `[9000, 0, 1000]`.
+- **Optional.** The burner is not part of the mandatory pipeline. Governance deploys it when wanted and then sets `buybackBps` and the burner address ([§ Tunable Economics](#tunable-economics)). Until then `buybackBurner == address(0)` and `buybackBps == 0`.
 - **Constructor `Config`.** USDC, TOKEN, and admin are zero-rejected by the abstract base. For `BuybackBurnerUniswapV3` the struct carries the `SwapRouter02` address (zero-rejected), the initial pool `address`, and the `GuardedBuybackBurner` band (`twapMinWindow`, `maxBuybackAmount`, `minBuybackAmount`, `slippageBps`, `epochLiquidityCapFraction`).
 - **Deferred venue wiring.** The pool may be zero at deploy, and governance wires it later via `setPool(address)`. `executeBuyback` reverts `PoolNotWired` until the pool and the Router are set. A `Config` that supplies a non-zero pool is validated at construction: the pool must read as a USDC/TOKEN pair with a live price.
-- **Inflow source.** `FeeRouter`, 30% of every settlement per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn).
+- **Inflow source.** `FeeRouter`, the `buybackBps` share of every sweep per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split).
 - **Approvals.** The approval target is the `SwapRouter02` itself, via a plain ERC20 allowance scoped per swap. [ADR 018 § Buyback execution via Uniswap V3](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3) is authoritative for the mechanism and for the Router address.
 
 #### FeeRouter construction notes
 
-- **CapacityBond is a deploy-time dependency, not a stored one.** The constructor reads `CapacityBond.epochLength()` once and reverts `EpochLengthMismatch` unless it equals the `epochLength` the deployer passes, then drops the reference. This holds both contracts on one epoch clock, so `CapacityBond` slash timestamps and `FeeRouter.bytesPerEpoch` epochs line up for the [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out).
-- **Deferred burner address.** `buybackBurner` may be `address(0)` at deploy, and governance sets it later through the setter in [§ Tunable Economics](#tunable-economics). The launch shares are cross-validated against the dependency addresses, so any non-zero share must have a non-zero destination at construction time. Steady-state target shares are `6000 / 3000 / 1000` in basis points.
+- **CapacityBond is a stored dependency.** `receiveSweep` reads `CapacityBond.isActive(operator)` on each sweep. `FeeRouter` and `CapacityBond` share the one 7-day `EPOCH_LENGTH` on the same chain, so `CapacityBond` slash timestamps and `FeeRouter.bytesPerEpoch` epochs line up for the [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out).
+- **Deferred burner address.** `buybackBurner` may be `address(0)` at deploy, and governance sets it later through the setter in [§ Tunable Economics](#tunable-economics). A non-zero `buybackBps` needs a non-zero burner at construction time.
 
 #### OriginAssignment construction notes
 
@@ -357,15 +422,7 @@ After all contracts are deployed, the deployer must execute these transactions b
 
    This authorizes `SlashJudge` to call `CapacityBond.slash`, which reduces the operator's bond and escrows the slashed TOKEN in `CapacityBond` (escrow-on-slash per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)). Nothing is redirected to another contract at slash time — the escrow is distributed (50% challenger / 50% burn) or refunded to the operator at appeal finality.
 
-3. **Grant `ROUTER_CALLER_ROLE` on FeeRouter to PaymentPool:**
-
-   ```solidity
-   feeRouter.grantRole(ROUTER_CALLER_ROLE, address(paymentPool));
-   ```
-
-   This authorizes `PaymentPool.redeem` to invoke `FeeRouter.routeSettlement(operator, bytesDelivered, amount)`. Without this grant the redemption path reverts.
-
-4. **Grant `SLASH_APPEAL_ROLE` on CapacityBond to SlashAppeal:**
+3. **Grant `SLASH_APPEAL_ROLE` on CapacityBond to SlashAppeal:**
 
    ```solidity
    capacityBond.grantRole(SLASH_APPEAL_ROLE, address(slashAppeal));
@@ -373,7 +430,7 @@ After all contracts are deployed, the deployer must execute these transactions b
 
    This authorizes `SlashAppeal` to drive the escrow-on-slash settle hooks on `CapacityBond` — `markAppealOpen` (lock the escrow when an appeal is filed), `settleAppealUpheld` (distribute 50/50 when the slash stands), and `settleAppealGranted` (refund the operator's escrowed TOKEN and recompute the multi-slash `slashedAtEpoch` watermark, restoring served-bytes voting weight per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out)) — per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface). Without this grant no appeal can lock or resolve a slash's escrow.
 
-5. **Register regional governance bodies** (when jurisdictional bodies are constituted):
+4. **Register regional governance bodies** (when jurisdictional bodies are constituted):
 
    ```solidity
    contentBlacklist.registerRegionalBody(regionCode, bodyAddress, emergencyMultisig);
@@ -386,7 +443,7 @@ After all contracts are deployed, the deployer must execute these transactions b
    succeeds with `RegionalBodyRegistered.signersVerified == false`, and the
    proposal must document the off-chain disjointness check.
 
-6. **Hand off governance and renounce the admin key.** Each `AccessControl`
+5. **Hand off governance and renounce the admin key.** Each `AccessControl`
    contract hands `GOVERNANCE_ROLE` to the `TimelockController`, then renounces
    `DEFAULT_ADMIN_ROLE` to no one:
 
@@ -414,9 +471,7 @@ After all contracts are deployed, the deployer must execute these transactions b
 > can succeed, so the `GOVERNANCE_ROLE` grant to the Timelock and its revoke from
 > the deployer both precede it.
 
-> **Deployment atomicity.** The post-deployment initialization steps (1–6) SHOULD be executed atomically via a multicall contract or a deployment script that reverts on any failure. A partially initialized system (e.g., `SLASH_ROLE` granted but `BLACKLIST_ROLE` not yet, or `ROUTER_CALLER_ROLE` not yet granted to `PaymentPool`) could create a window where some security mechanisms work but settlements revert or land in the wrong contract. Between deployment and initialization completion, `CapacityBond` SHOULD reject `bond` / `registerNode` calls (e.g., via a `paused` initial state or a deployment flag) to prevent nodes from registering before the security infrastructure is fully wired. A Foundry deployment script with sequential `vm.broadcast()` calls provides sufficient atomicity at launch scale.
-
-> **Optional genesis buyback activation.** When the deploy-time genesis-activation option is enabled (off by default; see [§ Tunable Economics](#tunable-economics)), the buyback bundle — seed the venue pool, deploy the concrete burner (Timelock-held roles, emergency-multisig pauser), `setSharesAndDestinations([6000, 3000, 1000], …)`, grant the keeper — runs after the peer-role wiring and before step 6 (the admin/GOVERNANCE_ROLE handoff), so the deployer's still-held `GOVERNANCE_ROLE` on `FeeRouter` and on the new burner can flip the split and set the keeper, and the burner is then handed to the Timelock in step 6 with every other target. With the option off, this step is skipped and genesis is dormant (`buybackBurner == address(0)`, split `[9000, 0, 1000]`). The venue is a Uniswap V3 50/50 pool.
+> **Deployment atomicity.** The post-deployment initialization steps (1–5) SHOULD be executed atomically via a multicall contract or a deployment script that reverts on any failure. A partially initialized system (e.g., `SLASH_ROLE` granted but `BLACKLIST_ROLE` not yet) could create a window where some security mechanisms work and others do not. The payment chain needs no initialization. Between deployment and initialization completion, `CapacityBond` SHOULD reject `bond` / `registerNode` calls (e.g., via a `paused` initial state or a deployment flag) to prevent nodes from registering before the security infrastructure is fully wired. A Foundry deployment script with sequential `vm.broadcast()` calls provides sufficient atomicity at launch scale.
 
 ### Cross-Contract Call Graph
 
@@ -437,16 +492,16 @@ graph LR
     UNI["Uniswap V3 SwapRouter02"]
     ED["Ed25519Verifier"]
 
-    SPC -->|"isActive(provider)"| CBOND
     SPC -->|"safeTransferFrom / safeTransfer"| ERC
-    SPC -->|"routeSettlement(op, bytes, amount)"| FR
-    FR -->|"30% USDC same-tx"| BB
-    FR -->|"10% USDC same-tx"| GOV
-    FR -->|"safeTransfer (60% operator base)"| ERC
+    SPC -.->|"CCTP sweep (cross-chain): USDC + bytes feed"| FR
+    FR -->|"isActive(operator)"| CBOND
+    FR -->|"buybackBps USDC same-tx"| BB
+    FR -->|"remainder USDC same-tx"| GOV
+    FR -->|"safeTransfer (operator rebate)"| ERC
     GOV -->|"bytesInWindow / totalBytesInWindow (vote weight)"| FR
     GOV -->|"firstBondedAt / slash records (age_ramp, slash zero-out)"| CBOND
     GOV -->|"grantAppeal / upholdAppeal"| SA
-    GOV -->|"setShares / setBuybackBurner / setTreasury / setWindowEpochs"| FR
+    GOV -->|"setSplit / setBuybackBurner / setTreasury / setWindowEpochs / setDeliveryFloor"| FR
     CB -->|"ejectNode / unEjectNode(operatorAddress)"| CBOND
     OA -->|"isActive(operator)"| CBOND
     OA -->|"ownerOf(namespaceId)"| PR
@@ -469,11 +524,12 @@ graph LR
 | --- | --- | --- | --- | --- |
 | PaymentPool | IERC20 (USDC) | `safeTransferFrom()` | Caller must have allowance | Yes |
 | PaymentPool | IERC20 (USDC) | `safeTransfer()` | Caller holds balance | Yes |
-| PaymentPool | FeeRouter | `routeSettlement(operator, bytesDelivered, amount)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) | Yes |
-| FeeRouter | BuybackBurner | `safeTransfer()` (30% USDC same-tx) | Caller holds balance | Yes |
-| FeeRouter | Treasury wallet | `safeTransfer()` (10% USDC same-tx) | Caller holds balance | Yes |
-| FeeRouter | IERC20 (USDC) | `safeTransfer()` (60% operator base, same-tx) | Caller holds balance | Yes |
-| Governor | FeeRouter | `bytesInWindow(operator, endEpoch, N)`, `totalBytesInWindow(endEpoch, N)`, `bytesPerEpoch(operator, epoch)`, `totalBytesPerEpoch(epoch)`, `windowEpochs()` (vote-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)); `setShares([operatorBaseBps, buybackBps, treasuryBps])`, `setBuybackBurner(addr)`, `setTreasury(addr)`, `setWindowEpochs(n)` (parameter updates) | Public (read-only) for views; `GOVERNANCE_ROLE` on FeeRouter for setters; sum-to-10000 invariant; per-share bounds enforced; cross-validated against dependency addresses (see [§ Tunable Economics](#tunable-economics)); `windowEpochs` bounded `[4, 26]` per [ADR 036 § Governable parameters with safety bounds](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds) | View: No / Setters: Yes |
+| PaymentPool | CCTP `TokenMessengerV2` (payment chain) | `depositForBurnWithHook(...)` in `sweep(operator)`; the message mints USDC to FeeRouter on the governance chain with `hookData = abi.encode(operator, bytes)` ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) | Permissionless; `pending[operator].usdc >= minSweep` | Yes |
+| FeeRouter | CapacityBond | `isActive(operator)` (rebate and weight-credit gate) | Public (read-only) | No |
+| FeeRouter | BuybackBurner | `safeTransfer()` (`buybackBps` of `U`, same-tx) | Caller holds balance | Yes |
+| FeeRouter | Treasury wallet | `safeTransfer()` (remainder of `U`, same-tx) | Caller holds balance | Yes |
+| FeeRouter | IERC20 (USDC) | `safeTransfer()` (operator rebate, same-tx; a failed transfer falls back to the treasury) | Caller holds balance | Yes |
+| Governor | FeeRouter | `bytesInWindow(operator, endEpoch, N)`, `totalBytesInWindow(endEpoch, N)`, `bytesPerEpoch(operator, epoch)`, `totalBytesPerEpoch(epoch)`, `windowEpochs()` (vote-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)); `setSplit(rebateBps, buybackBps)`, `setBuybackBurner(addr)`, `setTreasury(addr)`, `setWindowEpochs(n)`, `setDeliveryFloor(n)` (parameter updates, via the Timelock) | Public (read-only) for views; `GOVERNANCE_ROLE` on FeeRouter for setters; cross-validated against destination addresses (see [§ Tunable Economics](#tunable-economics)); `windowEpochs` bounded `[4, 26]` per [ADR 036 § Governable parameters with safety bounds](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds) | View: No / Setters: Yes |
 | Governor | CapacityBond | `firstBondedAt(operator)`, `operatorSlashCount(operator)` / `operatorSlashIdAt(operator, i)` / `getSlashRecord(slashId)` (vote-weight inputs per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)); `declaredMbps(operator)`, `bondRequired(mbps)` (capacity-tier reads only); `setMinBond`, `setMinCapacityMbps`, `setMaxCapacityMbps`, `setUnbondingPeriod`, `setK`, `setAlpha`, `setCurrentTermsHash` (parameter updates). The bond-curve coefficients (`k`, `α`) **are** on-chain-tunable via `setK` / `setAlpha`, and the coupling `activeBond ≥ bondRequired(declaredMbps)` is enforced at `declareMbps` / `requestUnbond` / `registerNode` (curve math in the linked `BondMath` library): α bounded `[1.0, 1.8]`, `k` bounded so the 1 Gbps tier ∈ [10K, 200K TOKEN] per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve). The `age_ramp` months parameter is governable, but on `DecdnGovernor` (`setAgeRampMonths`), not `CapacityBond`. | Public (read-only) for views; `GOVERNANCE_ROLE` for setters | View: No / Setters: Yes |
 | Governor | DecdnGovernor (self) | `setVoteCapBps(bps)`, `setAgeRampMonths(months)` — self-governance of the served-bytes vote-weight tunables ([ADR 036 § Formula](036-served-bytes-voting-weight.md#formula)); both checkpointed via `Checkpoints.Trace208` (snapshots read at proposal time) and emit `VoteCapBpsUpdated` / `AgeRampMonthsUpdated` | `onlyGovernance` (executed through the Governor's own timelock); `voteCapBps` launches at its 10% ceiling and is decrease-only within `[1%, 10%]` (100–1000 bps), `ageRampMonths` bounded `[1, 24]` | View: No / Setters: Yes |
 | Governor | SlashAppeal | `grantAppeal(slashId)`, `upholdAppeal(slashId)`, `setAppealBond(n)` | `GOVERNANCE_ROLE` on SlashAppeal | Yes |
@@ -494,7 +550,7 @@ graph LR
 | BuybackBurner | Uniswap V3 `SwapRouter02` | `exactInputSingle({tokenIn, tokenOut, fee, recipient, amountIn, amountOutMinimum, sqrtPriceLimitX96})` | The Router pulls `tokenIn` through a plain ERC20 allowance, so the burner approves the Router itself, scoped per swap; [ADR 018 § Buyback execution via Uniswap V3](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3) is authoritative | Yes |
 | BuybackBurner | IERC20 (USDC, TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 
-**Note:** No contract calls governance functions on another deCDN contract. Cross-contract state mutations are limited to `ejectNode()`, `unEjectNode()`, `slash()`, `routeSettlement()`, and the escrow-on-slash settle hooks (`markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted`) — each protected by a dedicated role.
+**Note:** No contract calls governance functions on another deCDN contract. Cross-contract state mutations are limited to `ejectNode()`, `unEjectNode()`, `slash()`, `receiveSweep()`, and the escrow-on-slash settle hooks (`markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted`) — each protected by a dedicated role.
 
 #### Off-Chain Read API (Client / Node Bootstrap)
 
@@ -531,37 +587,42 @@ Design principles for forward compatibility:
 1. **Return raw signals, not policy.** Surface registry views; let off-chain decide ranking. New ranking logic ships as client updates, not contract migrations.
 2. **Region is on-chain, but the registry index is not sharded by it.** An operator's declared region is `CapacityBond` state — `NodeInfo.regionHint`, plus `regionPrev` / `regionLastChanged` for the stability window ([ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window)) — and the compliance layer reads it there: `ContentBlacklist.isHashBlacklistedForOperator` and `SlashJudge`'s blacklist-challenge gate ([ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation)) both resolve regional scope on-chain. What stays off-chain is *discovery* ranking: the registry index remains globally flat, `regionHint` rides along in each `getRegisteredNodes` tuple, and clients filter regionally themselves after bootstrap. If a region-keyed index ever becomes necessary for scale, it is an additive `bytes32 region => EnumerableSet` map — non-breaking.
 
-Ranking is entirely a client concern and needs no dedicated on-chain surface. `getRegisteredNodes(...)` returns the registered-operator page `NodeInfo[]` (`nodeId`, `ethAddress`, `active`, `lastMultiaddrUpdate`, `multiaddrs`, `regionHint`) as the cold-start peer set, alongside a parallel `bool[] active` computed on-chain per entry. That `active[]` column is the full `isActive` predicate (registered AND active bond ≥ the operator's floor AND not ejected), which the raw `NodeInfo.active` registration flag is not — an operator whose unbond took its active bond below the floor is `NodeInfo.active == true` but `active[i] == false`. A partial unbond that retains the floor keeps the operator active. A caller derives the true active set from `active[]` in the same call, with no per-entry `isActive` round-trip, and keeps the full page for any node→address binding it must retain past unbonding. Declared capacity is read separately via `declaredMbps(operator)`. From there a client shuffles the set. It orders the set region-first. It probes the first K candidates for liveness and blob-holding. It ranks them by probe result. The shuffle runs before the cut to K. So the client probes a random sample of K candidates. It does not probe the first K entries of the registry array. Operators set that array order. A new operator takes the last position. A leaving operator moves the last operator into its position. [ADR 022 § FIND_VALUE Flow — Lookup integrity](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup) applies the same requester-side defense on the node. The probe result is a strictly fresher signal than any historical on-chain record, since it answers "will this peer serve me *now*" rather than "did this peer serve someone once". A client that wants a settlement-recency prior before spending its first probe can index `FeeRouter.Settled(operator, bytes, amount, epoch)`, which already carries the operator address; that needs no `CapacityBond` surface and no cross-contract call.
+Ranking is entirely a client concern and needs no dedicated on-chain surface. `getRegisteredNodes(...)` returns the registered-operator page `NodeInfo[]` (`nodeId`, `ethAddress`, `active`, `lastMultiaddrUpdate`, `multiaddrs`, `regionHint`) as the cold-start peer set, alongside a parallel `bool[] active` computed on-chain per entry. That `active[]` column is the full `isActive` predicate (registered AND active bond ≥ the operator's floor AND not ejected), which the raw `NodeInfo.active` registration flag is not — an operator whose unbond took its active bond below the floor is `NodeInfo.active == true` but `active[i] == false`. A partial unbond that retains the floor keeps the operator active. A caller derives the true active set from `active[]` in the same call, with no per-entry `isActive` round-trip, and keeps the full page for any node→address binding it must retain past unbonding. Declared capacity is read separately via `declaredMbps(operator)`. From there a client shuffles the set. It orders the set region-first. It probes the first K candidates for liveness and blob-holding. It ranks them by probe result. The shuffle runs before the cut to K. So the client probes a random sample of K candidates. It does not probe the first K entries of the registry array. Operators set that array order. A new operator takes the last position. A leaving operator moves the last operator into its position. [ADR 022 § FIND_VALUE Flow — Lookup integrity](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup) applies the same requester-side defense on the node. The probe result is a strictly fresher signal than any historical on-chain record, since it answers "will this peer serve me *now*" rather than "did this peer serve someone once". A client that wants a settlement-recency prior before spending its first probe can index `FeeRouter.SweepReceived`, which carries the operator address; that needs no `CapacityBond` surface and no cross-contract call.
 
 ### Fund Flow Diagrams
 
 #### USDC Flow (Payments)
 
-The unified payments flow — settlement always passes through `FeeRouter`; bucket-share defaults at launch versus steady state are governance-tunable per [§ Tunable Economics](#tunable-economics):
+The payments flow has two tiers joined by a CCTP sweep. The split of each sweep is governance-tunable per [§ Tunable Economics](#tunable-economics):
 
 ```mermaid
 flowchart TD
-    Client["Client (USDC holder)"]
-    PC["PaymentPool<br/>(escrow)"]
-    FR["FeeRouter<br/>(splits per setShares;<br/>steady-state 60/30/10)"]
-    Provider["Provider (node operator)"]
-    Treasury["Treasury (Timelock-custodied)"]
-    BB["BuybackBurner"]
-    UNI["Uniswap V3 SwapRouter02<br/>(→ 50/50 TOKEN/USDC pool)"]
-    BURN["Burn Address<br/>(0x...dEaD)"]
+    subgraph PCH["Payment chain"]
+        Client["Client (USDC holder)"]
+        PC["PaymentPool<br/>(deposits + unswept protocol share)"]
+    end
+    subgraph GCH["Governance chain"]
+        FR["FeeRouter<br/>(splits U per rebateBps / buybackBps;<br/>no persistent balance)"]
+        Treasury["Treasury (Timelock-custodied)"]
+        BB["BuybackBurner"]
+        UNI["Uniswap V3 SwapRouter02<br/>(→ 50/50 TOKEN/USDC pool)"]
+        BURN["Burn Address<br/>(0x...dEaD)"]
+    end
+    Provider["Provider (node operator EOA)"]
 
     Client -->|"openPool() / topUp()<br/>deposit USDC (one pool)"| PC
-    PC -->|"redeem(): paid amount per node"| FR
+    PC -->|"redeemMany(): operatorBps same-tx"| Provider
     PC -->|"reclaim(): unspent remainder"| Client
-    FR -->|"60% same-tx (per-byte)"| Provider
-    FR -->|"30% same-tx"| BB
-    FR -->|"10% same-tx"| Treasury
+    PC -->|"sweep(operator): CCTP burn + hook<br/>(protocol share + bytes feed)"| FR
+    FR -->|"rebateBps"| Provider
+    FR -->|"buybackBps"| BB
+    FR -->|"remainder"| Treasury
     BB -->|"executeBuyback()"| UNI
     UNI -->|"TOKEN"| BB
     BB -->|"burn()"| BURN
 ```
 
-The canonical three-bucket split is in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split); this ADR does not duplicate the bucket table. All three legs transfer in the settlement transaction — no epoch buckets, no claim windows. Treasury disbursement requires a governance proposal ([ADR 009](009-governance.md#adr-009-governance-model)).
+The split of `U` is in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split); this ADR does not duplicate it. Treasury disbursement requires a governance proposal ([ADR 009](009-governance.md#adr-009-governance-model)).
 
 #### TOKEN Flow (Bonding & Slashing)
 
@@ -599,19 +660,19 @@ flowchart TD
 
 | Contract | Token | Source | Release Condition |
 | --- | --- | --- | --- |
-| PaymentPool | USDC | Owner pool deposits | `redeem()`, `reclaim()` |
-| FeeRouter | None (transient only) | `PaymentPool.redeem` | All three legs (60% operator base, 30% buyback, 10% treasury) transfer same-tx; the contract holds no persistent balance |
+| PaymentPool (payment chain) | USDC | Owner pool deposits plus the unswept protocol share (tracked in `pending`) | `redeemMany()` (operator share), `sweep()` (protocol share), `reclaim()` |
+| FeeRouter | None (transient within the receive transaction) | CCTP sweeps | The rebate, buyback, and treasury legs transfer in the same transaction; the contract holds no persistent balance |
 | CapacityBond | TOKEN | Operator `bond(amount)` deposits + slashed TOKEN held in per-`slashId` escrow until finality (`escrowedTotal`) | `unbond()` after 14-day unbonding window; slash escrow released by `finalizeUnappealedSlash` / the `SLASH_APPEAL_ROLE` settle hooks |
 | SlashAppeal | TOKEN (appeal bonds only) | Appellant `openSlashAppeal` bond deposits | Bond refunded in full on a granted appeal or ratification-window lapse; burned in full on rejection, uphold, or review-window lapse — no slash escrow is held here |
 | SlashJudge | TOKEN | Challenger bond deposits | Synchronous resolution inside each `submit*Challenge` (slash reward + bond return to challenger on success; revert on failed verification) |
-| BuybackBurner | USDC (accumulated), TOKEN (transient) | 30% USDC same-tx from `FeeRouter` ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) | `executeBuyback()` |
-| TimelockController | USDC (10% protocol-treasury bucket) | 10% USDC same-tx from `FeeRouter` | Treasury disbursement requires a `DecdnGovernor` proposal under the standard 48h timelock ([ADR 009](009-governance.md#adr-009-governance-model)) |
+| BuybackBurner | USDC (accumulated), TOKEN (transient) | `buybackBps` of each sweep, same-tx from `FeeRouter` ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) | `executeBuyback()` |
+| TimelockController | USDC (treasury remainder) | Remainder of each sweep, same-tx from `FeeRouter` | Treasury disbursement requires a `DecdnGovernor` proposal under the standard 48h timelock ([ADR 009](009-governance.md#adr-009-governance-model)) |
 
 (`PublisherRegistry` and `OriginAssignment` hold no funds — they are pure registry contracts.)
 
 ### Access Control Matrix
 
-All role-based access uses OpenZeppelin `AccessControl`. `DEFAULT_ADMIN_ROLE` is the admin of every other role — a holder can grant and revoke all of them — so the deploy renounces it to no one and the role table freezes (see [§ Post-Deployment Initialization](#post-deployment-initialization) step 6). The rotatable off-chain-key roles (`PAUSER_ROLE`, `EMERGENCY_MULTISIG_ROLE`, `KEEPER_ROLE`) are instead admined by `GOVERNANCE_ROLE`, so governance can rotate a compromised key through a timelocked proposal without a master key existing anywhere. Named roles below (`KEEPER_ROLE`, `GOVERNANCE_ROLE`, `EMERGENCY_MULTISIG_ROLE`, `PAUSER_ROLE`) formalize the implicit access patterns described across source ADRs into concrete `AccessControl` role identifiers for implementation.
+All role-based access uses OpenZeppelin `AccessControl`. `DEFAULT_ADMIN_ROLE` is the admin of every other role — a holder can grant and revoke all of them — so the deploy renounces it to no one and the role table freezes (see [§ Post-Deployment Initialization](#post-deployment-initialization) step 5). The rotatable off-chain-key roles (`PAUSER_ROLE`, `EMERGENCY_MULTISIG_ROLE`, `KEEPER_ROLE`) are instead admined by `GOVERNANCE_ROLE`, so governance can rotate a compromised key through a timelocked proposal without a master key existing anywhere. Named roles below (`KEEPER_ROLE`, `GOVERNANCE_ROLE`, `EMERGENCY_MULTISIG_ROLE`, `PAUSER_ROLE`) formalize the implicit access patterns described across source ADRs into concrete `AccessControl` role identifiers for implementation.
 
 #### Additive contract surface
 
@@ -630,10 +691,10 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | `SLASH_APPEAL_ROLE` | CapacityBond | `markAppealOpen(slashId)`, `settleAppealUpheld(slashId)`, `settleAppealGranted(slashId)` — the escrow-on-slash settle hooks; `settleAppealGranted` also clears `slashedAtEpoch`, restoring served-bytes voting weight per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out) | SlashAppeal | SlashAppeal; granted post-deploy. Per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) |
 | `EMERGENCY_MULTISIG_ROLE` | SlashAppeal | `fastTrackAppeal(slashId)`, `rejectAppeal(slashId)` | Emergency multisig | 3-of-5 multisig ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)); admined by `GOVERNANCE_ROLE`, so rotatable via timelocked proposal after the admin renounce |
 | `KEEPER_ROLE` | BuybackBurner | `executeBuyback()` | Admin / disabled | Keeper bot or governance; admined by `GOVERNANCE_ROLE`, so rotatable via timelocked proposal after the admin renounce |
-| `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount)` | PaymentPool | PaymentPool (and any future settlement-emitting contract) |
-| `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter, CapacityBond, SlashAppeal, PaymentPool, SlashJudge, BuybackBurner, PublisherRegistry | `addHash()`, `removeHash()`, `addOperator()`, `removeOperator()`, `registerRegionalBody()` (ContentBlacklist); `setShares(...)`, `setBuybackBurner(...)`, `setTreasury(...)`, `setWindowEpochs(...)` (FeeRouter); `setMinBond`, `setMinCapacityMbps`, `setMaxCapacityMbps`, `setUnbondingPeriod`, `setK`, `setAlpha`, `setCurrentTermsHash` (CapacityBond); `grantAppeal`, `upholdAppeal`, `setAppealBond` (SlashAppeal); `setDisputeWindow`, `setRateBounds`, `setMinDeposit` (PaymentPool); `setChallengeBond`, `setMaxEvidenceAge` (SlashJudge); `setKeeper`, `setSlippageTolerance`, `setMinBuybackAmount`, `setMaxBuybackAmount`, `setEpochLiquidityCapFraction`, `rescueUSDC` (BuybackBurner; `rescueUSDC(amount)` returns stranded USDC only to the immutable treasury, never to a caller-supplied address); `setMaxNamespacesPerPublisher`, `setNamespaceTransferTimelock` (PublisherRegistry) | Admin | Governor via timelock |
+| `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter, CapacityBond, SlashAppeal, SlashJudge, BuybackBurner, PublisherRegistry | `addHash()`, `removeHash()`, `addOperator()`, `removeOperator()`, `registerRegionalBody()` (ContentBlacklist); `setSplit(...)`, `setBuybackBurner(...)`, `setTreasury(...)`, `setWindowEpochs(...)`, `setDeliveryFloor(...)` (FeeRouter); `setMinBond`, `setMinCapacityMbps`, `setMaxCapacityMbps`, `setUnbondingPeriod`, `setK`, `setAlpha`, `setCurrentTermsHash` (CapacityBond); `grantAppeal`, `upholdAppeal`, `setAppealBond` (SlashAppeal); `setChallengeBond`, `setMaxEvidenceAge` (SlashJudge); `setKeeper`, `setSlippageTolerance`, `setMinBuybackAmount`, `setMaxBuybackAmount`, `setEpochLiquidityCapFraction`, `rescueUSDC` (BuybackBurner; `rescueUSDC(amount)` returns stranded USDC only to the immutable treasury, never to a caller-supplied address); `setMaxNamespacesPerPublisher`, `setNamespaceTransferTimelock` (PublisherRegistry) | Admin | Governor via timelock |
 | `EMERGENCY_MULTISIG_ROLE` | ContentBlacklist | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` | Emergency multisig | 3-of-5 multisig; permanent, no sunset ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)); admined by `GOVERNANCE_ROLE`, so rotatable via timelocked proposal after the admin renounce |
-| `PAUSER_ROLE` | Every `SunsettingPausable` contract (CapacityBond, PaymentPool, FeeRouter, SlashAppeal, SlashJudge, BuybackBurner) | `pause()`, `unpause()` | Emergency multisig | 3-of-5 multisig; `pause()` reverts after each contract's immutable `pauseDeadline` (12 months from its construction); admined by `GOVERNANCE_ROLE`, so a compromised pauser is rotatable via timelocked proposal after the admin renounce |
+| `PAUSER_ROLE` | Every governance-chain `SunsettingPausable` contract (CapacityBond, FeeRouter, SlashAppeal, SlashJudge, BuybackBurner) | `pause()`, `unpause()` | Emergency multisig | 3-of-5 multisig; `pause()` reverts after each contract's immutable `pauseDeadline` (12 months from its construction); admined by `GOVERNANCE_ROLE`, so a compromised pauser is rotatable via timelocked proposal after the admin renounce |
+| (none) | PaymentPool | `pause()` (blocks `openPool` and `topUp` only) | Immutable `pauser` address (the emergency multisig) | Same address; `PaymentPool` has no roles and no admin, and `pause()` reverts after its 365-day sunset |
 | Regional body | ContentBlacklist | `addHashRegional(region)` | Not registered at launch | Per-jurisdiction multisig |
 
 #### Governance-Controlled Parameters
@@ -643,8 +704,6 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 | Parameter | Min | Max | Contract |
 | --- | --- | --- | --- |
 | Slash % per offense | 5% | 50% | CapacityBond |
-| Dispute window | 48h | 72h | PaymentPool |
-| Minimum pool deposit (`minDeposit`) | 0 (dormant) | $100 | PaymentPool |
 | Challenge bond | 1 TOKEN | 1,000 TOKEN | SlashJudge |
 | **Unbonding period** | **7 days** | **60 days** | **CapacityBond (default 14d)** |
 | **α (capacity-curve exponent)** | **1.0** | **1.8** | **CapacityBond (default 1.2)** |
@@ -655,8 +714,9 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 | **Per-operator voting cap** | **1%** | **10%** | **DecdnGovernor (launches at 10%, decrease-only)** |
 | **`windowEpochs`** (served-bytes voting window) | **4** | **26** | **FeeRouter (default 13 epochs ≈ 1 quarter) per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)** |
 | **`currentTermsHash`** (operator-terms version) | **any non-zero `bytes32`** | | **CapacityBond (`setCurrentTermsHash`, genesis value set in the constructor) — see [§ Operator-terms acceptance](#operator-terms-acceptance)** |
+| **`deliveryFloor`** (net USDC micro-units per MB of weight credit) | **1** | **1000** | **FeeRouter (launch 1)** |
 
-The three FeeRouter shares (with bounds 40–90 / 5–50 / 0–30 and defaults 60/30/10) are governed in `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds); sum-to-100% across the three shares is enforced on every governance update.
+`rebateBps` and `buybackBps` carry no bounds beyond the cross-validation in [§ Tunable Economics](#tunable-economics). `PaymentPool` parameters (`disputeWindow`, `operatorBps`, `minSweep`, `minDeposit`) are immutables with no governance bound.
 
 #### Emergency Multisig (Production)
 
@@ -676,9 +736,10 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `openPool(deposit)` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions. Names no provider — node-active gating is off-chain at node selection, not at open. The credited deposit must meet the governed `minDeposit` (0/dormant at launch — [ADR 003 § Minimum deposit](003-payments.md#minimum-deposit)). |
+| `openPool(deposit)` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions. Names no provider — node-active gating is off-chain at node selection, not at open. The credited deposit must meet the immutable `minDeposit` (dormant at 0 — [ADR 003 § Minimum deposit](003-payments.md#minimum-deposit)). |
 | `topUp()` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions |
-| `redeemMany(batches[])` | `IERC20.safeTransfer()` (the batch's paid total to FeeRouter), `FeeRouter.routeSettlement(operator, totalBytes, totalPaid)` once per batch, where each voucher contributes `paid = min(desired, capRoom, remaining)` (`desired = claimed − lane.paid`, and `claimed = cumulative + chainIndex × chunkPrice` once the packed `chainMeter` word yields `chunkPrice`/`chainIndex` and a bounded walk of at most `MAX_CHAIN_LENGTH` keccaks verifies `preimage` against the voucher's `chainRoot` — see [ADR 003 § Chain walk and redemption cost](003-payments.md#chain-walk-and-redemption-cost)) and `bytesPaid = min(mulDiv(bytesDelta, paid, desired), mulDiv(paid, BYTES_PER_MB, deliveryFloor))` — the **paid-proportional** byte count. Every voucher is redeemed for `msg.sender`, which is what lets one call settle the batch. A call that pays reads `CapacityBond.nodeIdOf(msg.sender)` once: it reverts `ProviderNotBound` unless the payee holds a NodeId binding, and it routes `totalBytes` only when the payee `isActive` (an inactive bound operator is paid but adds no governance bytes), and each `{poolId, capabilities[], vouchers[]}` group gates its pool's status once and advances its `totalRedeemed` in one write. The lane watermark advances by `paid`, not to `claimed`, so a partially-drained draw is retriable; a voucher paying `0` is skipped with no state written, while `BadPreimage` and `ChainIndexZero` are caller errors that revert the whole call. FeeRouter performs the split internally | `nonReentrant`, checks-effects-interactions across the whole batch; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
+| `redeemMany(batches[])` | `IERC20.safeTransfer()` (`operatorBps` of the paid total to `msg.sender`); the rest accrues in `pending[msg.sender]` as `(bytes, usdc)`. Each voucher contributes `paid = min(desired, capRoom, remaining)` (`desired = claimed − lane.paid`, and `claimed = cumulative + chainIndex × chunkPrice` once the packed `chainMeter` word yields `chunkPrice`/`chainIndex` and a bounded walk of at most `MAX_CHAIN_LENGTH` keccaks verifies `preimage` against the voucher's `chainRoot` — see [ADR 003 § Chain walk and redemption cost](003-payments.md#chain-walk-and-redemption-cost)) and the bytes accrued are paid-proportional (`mulDiv(bytesDelta, paid, desired)`); the pool does not clamp them. Every voucher is redeemed for `msg.sender`, which is what lets one call settle the batch. The pool reads no `CapacityBond` state, so any address can be a payee. Each `{poolId, capabilities[], vouchers[]}` group gates its pool's status once and advances its `totalRedeemed` in one write. The lane watermark advances by `paid`, not to `claimed`, so a partially-drained draw is retriable; a voucher paying `0` is skipped with no state written, while `BadPreimage` and `ChainIndexZero` are caller errors that revert the whole call | `nonReentrant`, checks-effects-interactions across the whole batch |
+| `sweep(operator)` | CCTP `TokenMessengerV2.depositForBurnWithHook()` (burns the operator's `pending` USDC; hook data carries `(operator, bytes)`) | `nonReentrant`, checks-effects-interactions (`pending[operator]` resets before the call); permissionless; `pending[operator].usdc >= minSweep`; never pauses |
 | `reclaim()` | `IERC20.safeTransfer()` (remainder to owner) | `nonReentrant`, checks-effects-interactions |
 
 #### CapacityBond
@@ -711,18 +772,16 @@ Every state-mutating function that makes an external call is listed below with i
 
 > **MEV protection (production).** See [ADR 018 — Buyback execution via Uniswap V3](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3) for the authoritative policy. In summary: a full-range 50/50 position is a constant-product curve, so a large buyback still moves price, and `executeBuyback` performs exactly one Router swap per call — the keeper spaces and sizes the sub-swaps across calls per its own off-chain cadence config, not an on-chain parameter. **Direct Router execution with TWAP + `minTokenOut` guards is the primary production path and the required fallback.** Routing through CoW Swap is a conditional add-on that requires operator verification of CoW solver routing against the deployed Uniswap V3 pool (per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)'s activation criteria); if CoW routing is unavailable or regresses, direct Router + TWAP remains correct. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure regardless of venue.
 
-> **Inflow source.** Per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), `BuybackBurner` receives the buyback share (30% of every settlement at steady state) same-tx from `FeeRouter`; the share is governance-tunable per [§ Tunable Economics](#tunable-economics). This inflow rate sets the per-epoch liquidity cap requirement in [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol). The `executeBuyback` mechanics, `KEEPER_ROLE`-gating, and scoped per-swap ERC20 approval are independent of the share value.
+> **Inflow source.** Per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split), `BuybackBurner` receives the `buybackBps` share of each sweep same-tx from `FeeRouter`, in one lump per sweep; the share is governance-tunable per [§ Tunable Economics](#tunable-economics). This inflow rate sets the per-epoch liquidity cap requirement in [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol). The `executeBuyback` mechanics, `KEEPER_ROLE`-gating, and scoped per-swap ERC20 approval are independent of the share value.
 
 #### FeeRouter
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `routeSettlement(operator, bytesDelivered, amount)` | `IERC20.safeTransfer()` × 3 (operator base 60%, BuybackBurner 30%, Treasury 10%; all three legs same-tx). Derives `epoch = uint64(block.timestamp / EPOCH_LENGTH)` and increments both `bytesPerEpoch[operator][epoch]` and `totalBytesPerEpoch[epoch]` inline — the governance-canonical served-bytes vote-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Emits `Settled`, in the same transaction as the `PaymentPool.PoolRedeemed(poolId, signer, provider, ...)` that triggered it, so the pool and lane context of every settlement is publicly recoverable. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
-| `setShares(...)`, `setBuybackBurner(addr)`, `setTreasury(addr)`, `setWindowEpochs(n)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); sum-to-100% across the three router shares enforced; per-share bounds enforced ([ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)); cross-validated against dependency addresses. `setWindowEpochs` bounded `[4, 26]` per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds) |
+| `receiveSweep(message, attestation)` | `MessageTransmitterV2.receiveMessage()`, `CapacityBond.isActive(operator)` and `CapacityBond.declaredMbps(operator)` (reads), `IERC20.safeTransfer()` × up to 3 (operator rebate, BuybackBurner, Treasury; all legs same-tx). Derives `epoch = uint64(block.timestamp / EPOCH_LENGTH)` at arrival and increments both `bytesPerEpoch[operator][epoch]` and `totalBytesPerEpoch[epoch]` by the USDC-backed credit, clamped to the operator's declared capacity for the epoch — the governance-canonical served-bytes vote-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Emits `SweepReceived`. | `nonReentrant`, checks-effects-interactions; permissionless; reverts if paused |
+| `setSplit(...)`, `setBuybackBurner(addr)`, `setTreasury(addr)`, `setWindowEpochs(n)`, `setDeliveryFloor(n)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); cross-validated against destination addresses ([§ Tunable Economics](#tunable-economics)); `setDeliveryFloor` bounded `[1, 1000]`. `setWindowEpochs` bounded `[4, 26]` per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds) |
 
-> **Cashflow invariant.** The 40% lower bound on the operator-base share is enforced at the contract level (`AccessControl` bound check) and guarantees operators always receive enough liquid USDC to cover infrastructure costs even under extreme governance proposals. See [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
-
-> **No claim machinery.** `FeeRouter` has no `claimBoost`, `claimDelegator`, `executeDelegatorSwap`, `sweepUnclaimed`, or other epoch-bucket payout paths. All three bucket transfers happen in `routeSettlement`.
+> **Operator guarantee.** The operator share `operatorBps` is paid on the payment chain at redemption and is immutable. Governance cannot lower it.
 
 #### SlashAppeal
 
@@ -764,7 +823,7 @@ The contract holds no funds and reads no blacklist. It maintains an `EnumerableS
 
 #### Payment-Pool Reentrancy
 
-`PaymentPool` moves USDC on `openPool`, `topUp`, `redeemMany`, and `reclaim`. All such functions use `nonReentrant` guards and follow checks-effects-interactions, and all ERC-20 interactions use OpenZeppelin `SafeERC20` ([ADR 003](003-payments.md#adr-003-payment-model)). The payment token is USDC, fixed at deployment — a standard ERC-20 with no fee-on-transfer, rebase, default-pausable, or transfer-hook behavior.
+`PaymentPool` moves USDC on `openPool`, `topUp`, `redeemMany`, `sweep`, and `reclaim`. All such functions use `nonReentrant` guards and follow checks-effects-interactions, and all ERC-20 interactions use OpenZeppelin `SafeERC20` ([ADR 003](003-payments.md#adr-003-payment-model)). The payment token is USDC, fixed at deployment — a standard ERC-20 with no fee-on-transfer, rebase, default-pausable, or transfer-hook behavior.
 
 ### OpenZeppelin Framework Usage
 
@@ -772,8 +831,8 @@ deCDN contracts use audited OpenZeppelin components where applicable, rather tha
 
 | OZ Contract | Used By | Purpose |
 | --- | --- | --- |
-| `AccessControl` | CapacityBond, PaymentPool, FeeRouter, SlashAppeal, SlashJudge, BuybackBurner, ContentBlacklist, OriginAssignment, ManualVettingPolicy, PublisherRegistry | Role-based function authorization. Every contract other than TOKEN, DecdnGovernor, and the stateless Ed25519Verifier uses it; there is no owner-key surface anywhere in the system — `DEFAULT_ADMIN_ROLE` is renounced to no one at deploy end so no master admin key survives, and the `TimelockController` governs through `GOVERNANCE_ROLE` (which admins the rotatable `PAUSER`/`EMERGENCY_MULTISIG`/`KEEPER` roles) |
-| `ReentrancyGuard` | Every `AccessControl` contract except PublisherRegistry | `nonReentrant` modifier on state-mutating functions with external calls. PublisherRegistry omits it: pure storage bookkeeping with no external calls and no funds |
+| `AccessControl` | CapacityBond, FeeRouter, SlashAppeal, SlashJudge, BuybackBurner, ContentBlacklist, OriginAssignment, ManualVettingPolicy, PublisherRegistry | Role-based function authorization. Every contract other than TOKEN, DecdnGovernor, `PaymentPool` (no roles), and the stateless Ed25519Verifier uses it; there is no owner-key surface anywhere in the system — `DEFAULT_ADMIN_ROLE` is renounced to no one at deploy end so no master admin key survives, and the `TimelockController` governs through `GOVERNANCE_ROLE` (which admins the rotatable `PAUSER`/`EMERGENCY_MULTISIG`/`KEEPER` roles) |
+| `ReentrancyGuard` | Every `AccessControl` contract except PublisherRegistry, plus PaymentPool | `nonReentrant` modifier on state-mutating functions with external calls. PublisherRegistry omits it: pure storage bookkeeping with no external calls and no funds |
 | `Pausable` (via the shared `SunsettingPausable` base) | CapacityBond, PaymentPool, FeeRouter, SlashAppeal, SlashJudge, BuybackBurner | Emergency pause capability, gated by `PAUSER_ROLE` and expiring at each contract's immutable `pauseDeadline` per [§ Emergency Multisig](#emergency-multisig-production). ContentBlacklist is deliberately not pausable — its unlawful-content-removal duty is permanent |
 | `SafeERC20` | All contracts interacting with ERC-20 tokens | Safe wrappers for `transfer`, `transferFrom`, `approve` |
 | `EIP712` | PaymentPool, SlashJudge, CapacityBond (`bindNodeId`, `registerNode`) | Domain separator for voucher/slash/binding signature verification. DecdnGovernor gets its domain separator through OZ `Governor` rather than inheriting `EIP712` directly |
@@ -781,7 +840,7 @@ deCDN contracts use audited OpenZeppelin components where applicable, rather tha
 | `ECDSA` | SlashJudge | Recovers the signer of slash evidence; ERC-1271 is never consulted for evidence ([ADR 024 § The signature partition](024-account-abstraction.md#the-signature-partition)) |
 | `ERC20` + `ERC20Burnable` + `ERC20Permit` | TOKEN | Fixed-supply fungible token; burnable (for the slashing-path burn leg) with gasless approvals. `ERC20Votes` is intentionally omitted — Governor vote weight is derived from `FeeRouter` epoch accounting per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), not from per-account checkpoint structures |
 | `Governor` + `GovernorCountingSimple` + `GovernorTimelockControl` | DecdnGovernor | Served-bytes-weighted voting; voting weight derived from `FeeRouter.bytesInWindow / totalBytesInWindow` × `age_ramp(CapacityBond.firstBondedAt)`, with slashing zero-out via the operator's `CapacityBond` slash records, per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). EIP-712 delegation (Governor Bravo); 10% per-operator voting cap (launch value, decrease-only) applied against bytes-weighted total; OZ's `GovernorVotes` / `GovernorVotesQuorumFraction` are not used because vote weight is derived from FeeRouter epoch accounting rather than per-account checkpoints |
-| `TimelockController` | TimelockController | Queued execution of governance proposals (48h delay); custodian of the protocol-treasury 10% bucket per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) |
+| `TimelockController` | TimelockController | Queued execution of governance proposals (48h delay); custodian of the treasury remainder of each sweep per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) |
 
 **Rationale:** OpenZeppelin Contracts are the most widely audited Solidity library, used by the majority of production DeFi protocols. Using audited primitives for access control, reentrancy protection, token handling, and governance eliminates entire classes of implementation bugs and reduces the surface area that a security audit must cover to deCDN-specific business logic.
 
@@ -791,13 +850,13 @@ The contract surface is identical at launch and at steady state — every contra
 
 | Aspect | At launch (typical) | At steady state |
 | --- | --- | --- |
-| `FeeRouter.setShares` | `9000 / 0 / 1000` (operator / buyback / treasury) — the **buyback bucket is dormant at launch**; only legs whose destinations are wired may be non-zero, and `buybackBurner == address(0)` at a dormant launch, so activate the buyback leg once `BuybackBurner` is wired | `6000 / 3000 / 1000` per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) — the **30% buyback-and-burn leg** is the activated steady-state target the public "30% burned" framing refers to; governance activation reaches it, and it is not active at a dormant launch |
-| `FeeRouter` dependency addresses | `buybackBurner = address(0)` permitted at deploy; `setBuybackBurner(addr)` activates it | All wired |
+| `FeeRouter` split (`rebateBps` / `buybackBps`) | A launch setting, for example `rebateBps` 7500 and `buybackBps` 0 | A steady setting, for example `rebateBps` 0 and `buybackBps` 7500, per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) |
+| `FeeRouter` destination addresses | `buybackBurner = address(0)` permitted at deploy | Set when governance sets `buybackBps` above 0 |
 | `DEFAULT_ADMIN_ROLE` holder | Deployer EOA (transient), renounced to no one at the end of deploy per [§ Post-Deployment Initialization](#post-deployment-initialization) step 6 | **No holder** — the role table is frozen; the `TimelockController` governs through `GOVERNANCE_ROLE` |
 | `DecdnGovernor` activity | Deployed but in bootstrap-multisig phase (first 6–12 months); transition to full operator-weighted DAO voting via a one-shot transition the multisig executes when the operator set is broad enough per [ADR 026 § Governance](026-tokenomics.md#governance) | Active proposal stream under served-bytes-weighted voting per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) |
 | Emergency multisig | Active (capability-split sunset: `pause()` expires at 12 months, unlawful-content removal permanent; fast-track / reject slash appeals on `SlashAppeal`; bootstrap-governance multisig overlaps for the first 6–12 months) | `pause()` sunset; unlawful-content-removal capability permanent |
 | Regional governance bodies | Not registered | Per-jurisdiction multisigs registered as needed |
-| `BuybackBurner.executeBuyback` | Callable from day one; share = 0 means no USDC to swap until `setShares` raises the buyback bucket | Routinely keeper-triggered at steady-state buyback share |
+| `BuybackBurner.executeBuyback` | Callable once deployed; `buybackBps` 0 means no USDC to swap | Keeper-triggered while `buybackBps` is above 0 |
 | Slashing distribution | Escrow-on-slash; at finality 50% challenger / 50% burn, or full refund on a granted appeal ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) | Same |
 | `TOKEN` supply | 1B fixed at genesis; no mint function | Same |
 | Operator bond | `bond_required(declaredMbps) = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve); defaults `k=12.6`, `α=1.2` (≈50K TOKEN at 1 Gbps) | Same; α and k governable within the bounds in [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds) |
@@ -812,22 +871,23 @@ The contract surface is identical at launch and at steady state — every contra
 - Explicit deployment order prevents initialization-order bugs
 - Access control matrix makes privilege escalation paths visible and auditable
 - OZ base contract prescriptions eliminate classes of implementation bugs before code is written
-- Contract surface is intentionally small: `FeeRouter` is a three-bucket settlement distributor with no epoch / claim / snapshot machinery; `CapacityBond` carries the capacity-curve bond and escrow-on-slash; there is no separate emissions contract and no standing insurance reserve
+- Contract surface is intentionally small: `PaymentPool` is the only payment-chain contract and has no governance; `FeeRouter` receives sweeps and keeps the served-bytes ledger with no claim machinery; `CapacityBond` carries the capacity-curve bond and escrow-on-slash; there is no separate emissions contract and no standing insurance reserve
 
 ### Negative
 
 - Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 009, 011, 014, or 026 requires updating this document
 - Does not cover off-chain interaction patterns (voucher exchange, probing, DHT discovery) — those remain in their respective ADRs
-- Five contracts custody funds — `CapacityBond` (operator bonds + slash escrow), `PaymentPool` (USDC pool deposits), `SlashAppeal` (slash-appeal bonds), `SlashJudge` (challenge bonds), and `BuybackBurner` (USDC held between buybacks) — alongside the transient-only `FeeRouter` and the treasury-custodian `TimelockController`, so the audit must cover value flow across the whole surface rather than one or two escrow contracts
+- Five contracts custody funds. `CapacityBond` (operator bonds + slash escrow), `SlashAppeal` (slash-appeal bonds), `SlashJudge` (challenge bonds), and `BuybackBurner` (USDC held between buybacks) sit on the governance chain. `PaymentPool` (USDC deposits and the unswept protocol share) sits on each payment chain. The governance chain also has the receive-transient `FeeRouter` and the treasury-custodian `TimelockController`. The audit covers value flow across the whole surface and across the CCTP sweep
+- Each payment chain adds one `PaymentPool` deployment with its own immutables and its own forced-inclusion assumption
 
 ## References
 
-- [ADR 003 — Payment Model](003-payments.md#adr-003-payment-model): PaymentPool specification, `PaymentPool.redeem` → `FeeRouter` routing
+- [ADR 003 — Payment Model](003-payments.md#adr-003-payment-model): PaymentPool specification, `PaymentPool.sweep` → `FeeRouter` sweep
 - [ADR 009 — Governance Model](009-governance.md#adr-009-governance-model): Safety bounds, Governor, emergency multisig
 - [ADR 002 — Content Addressing](002-content-addressing.md#adr-002-content-addressing): PublisherRegistry, namespaces
 - [ADR 011 — Content Takedown](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting): ContentBlacklist, origin ejection, OriginAssignment, DAO origin authority
 - [ADR 014 — On-Chain Verification](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence): SlashJudge, challenge bonds
 - [ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol): Uniswap V3 50/50 pool, MEV protection, POL custody, BuybackBurner execution
-- [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics): FeeRouter three-bucket split (60/30/10), CapacityBond curve, escrow-on-slash distribution, governable bounds
+- [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics): FeeRouter split of each sweep, CapacityBond curve, escrow-on-slash distribution, governable bounds
 - [ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation): SlashAppeal state machine, escrow-on-slash settle hooks
 - [OpenZeppelin Contracts](https://docs.openzeppelin.com/contracts/): Base contract framework

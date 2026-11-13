@@ -5,7 +5,7 @@
 
 ## Vote window
 
-The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1` (the `∅` epoch-0 case ⇒ empty window ⇒ weight 0; see § Formula) — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter.routeSettlement` only ever increments the *current* epoch's bucket, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violates the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could settle bytes mid-vote and raise its own already-counted weight, and two voters casting at different times would see different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — keeps voting deterministic with no change to `FeeRouter`.
+The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1` (the `∅` epoch-0 case ⇒ empty window ⇒ weight 0; see § Formula) — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter` only ever increments the epoch of the sweep's arrival block, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violates the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could sweep bytes mid-vote and raise its own already-counted weight, and two voters casting at different times would see different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — keeps voting deterministic with no change to `FeeRouter`.
 
 Two effects follow, both bounded by one epoch (≤ 1 week):
 
@@ -16,9 +16,9 @@ Two effects follow, both bounded by one epoch (≤ 1 week):
 
 Declared capacity (`CapacityBond.declaredMbps`) is operator-asserted at registration and only loosely tied to actual delivery. Keying DAO vote weight primarily on it would let a deeply-bonded but lightly-serving operator carry weight that does not reflect their real contribution to the network. But keying it purely on delivered bytes, with no reference to declared capacity, would let a lightly-bonded operator inflate its own weight by self-dealing byte volume — serving traffic to accounts it controls — without committing bonded capacity. Delivered bytes drive vote weight; declared capacity caps it per epoch.
 
-The on-chain raw material to fix this already exists. [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter) populates `bytesPerEpoch[operator][epoch]` inline on every `routeSettlement`. This ADR makes that counter the canonical voting-weight source.
+Served bytes arrive at the governance-chain `FeeRouter` as the bytes feed in the hook data of each sweep ([ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter)). The router writes `bytesPerEpoch[operator][epoch]` from it. This counter is the canonical voting-weight source.
 
-The change is governance-only — no impact on payment-pool mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), on the three-bucket fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), on the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), on `CapacityBond`'s registration / slashing semantics, or on `SlashAppeal` / `BuybackBurner`. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
+The weight rules touch only governance: they leave payment-pool mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), the fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), the the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), on `CapacityBond`'s registration / slashing semantics, or on `SlashAppeal` / `BuybackBurner`. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
 
 ## Decision
 
@@ -60,7 +60,11 @@ Each epoch's counted bytes are capped at what the tier the operator declared at 
 - **A registered operator with zero served bytes in the trailing window has zero vote.** The bond gates eligibility to vote; it does not directly grant weight.
 - **Declared capacity caps vote weight per epoch; it never grants weight.** An operator's counted bytes for epoch `e` cannot exceed what `declaredMbpsAtEpoch(op, e)` could physically deliver over that epoch. This is a deliberate consequence: an operator that declared zero capacity in an epoch contributes zero vote weight for that epoch, however many bytes it served.
 - **A fresh operator who serves heavily on day 1 still ramps in over `age_ramp_months`.** `age_ramp` is the tenure-buy-in defense; it stays defense-in-depth on top of bytes.
-- **Only active operators add served bytes.** `PaymentPool.redeemMany` pays only an operator with a NodeId binding, and routes the redeemed bytes into `FeeRouter`'s counters only while that operator `isActive`. An unbonded or unregistered address cannot raise the quorum total with self-paid bytes.
+- **Four `FeeRouter` checks gate every sweep.** Each check blocks one failure.
+  - *Active at arrival.* The rebate and the weight credit go to the operator only if `CapacityBond.isActive(operator)` is true when the sweep arrives. Otherwise the rebate goes to the treasury and the credit is 0. The USDC is never lost. An unbonded address cannot raise the quorum total.
+  - *USDC-backed credit.* `credit = min(bytes, net × 1 MiB / deliveryFloor)`. Bytes without USDC behind them earn no weight.
+  - *Capacity clamp.* The credit for an operator in one epoch cannot exceed `CapacityBond.declaredMbps(operator) × EPOCH_LENGTH × 125_000` minus what `bytesPerEpoch[operator][epoch]` already holds. The clamp binds the operator's counter and the network total alike, so a byte that no declared capacity could carry enters neither. The total sets quorum, proposal threshold and every operator's share cap, so pumping it needs declared capacity, which needs bond. At 1 Gbps an operator credits at most about 75 TB per epoch. The Governor's per-epoch minimum stays. It reads the tier declared at the epoch's close.
+  - *Arrival-epoch stamping.* The credit goes to the epoch of the arrival block (`block.timestamp / EPOCH_LENGTH`). A late sweep never changes a closed epoch, so proposal snapshots stay immutable.
 - **Tenure starts at the first `minBond` crossing.** `firstBondedAt` records the first time the operator's active bond reached `minBond`. A dust bond below `minBond` does not start the ramp, so an operator cannot pre-age an address for the cost of one base unit.
 - **Per-operator cap is computed against the bytes-weighted total at the same timepoint**, not against any historical or capacity-derived total. The cap clamp applies pre-multiplication by `age_ramp`.
 - **`quorum(t)` and `proposalThreshold(t)` use `FeeRouter.totalBytesInWindow(endEpoch(t), N)` as the denominator — an *upper-bound proxy* for `Σ_op vote_weight(op, t)`, not the exact sum.** The exact sum applies the per-operator cap and the `age_ramp` multiplier (both `≤ 1`), so `Σ_op vote_weight ≤ totalBytesInWindow` always. Calibrating quorum against the proxy is intentionally conservative — it makes quorum strictly harder to reach than against the true Σ — and avoids the gas of summing per-operator capped contributions on every `castVote`. The proxy is exact when no operator is above the cap and all operators are past `age_ramp_months` of tenure (the steady state).
@@ -79,9 +83,9 @@ This restores the immediate-vote-removal-on-slash signal that the bytes window a
 
 The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter) and [ADR 016 § Contract: CapacityBond](016-contract-interactions.md#contract-capacitybond). Highlights:
 
-**`FeeRouter` additions:**
+**Governance-chain `FeeRouter` counters:**
 
-- `mapping(uint64 => uint256) totalBytesPerEpoch` — incremented inline in `routeSettlement` alongside the existing per-operator counter (one warm-slot SSTORE after the first settlement in the epoch).
+- `mapping(uint64 => uint256) totalBytesPerEpoch` — incremented on each sweep alongside the per-operator counter (one warm-slot SSTORE after the first sweep in the epoch).
 - `function totalBytesPerEpoch(uint64 epoch) external view returns (uint256);` — public getter, mirrors the per-operator getter.
 - `function bytesInWindow(address op, uint64 endEpoch, uint64 N) external view returns (uint256);` — O(N) trailing-sum helper.
 - `function totalBytesInWindow(uint64 endEpoch, uint64 N) external view returns (uint256);` — global O(N) trailing-sum helper. Co-locating the loop with the storage keeps `windowEpochs` as a single governance-mutable source of truth and makes `_getVotes` a constant number of external calls.
@@ -121,7 +125,7 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
 }
 ```
 
-`quorum(t)` and `proposalThreshold(t)` use `feeRouter.totalBytesInWindow(endEpoch(t), windowEpochs)` × 4% / 0.1% respectively (both return 0 before the first epoch elapses). The capped-and-ramped total weight (not raw bytes) is the strictly correct denominator, but is O(active_operators × N) to compute; the Governor uses the unramped, uncapped total bytes as a tractable upper bound and accepts the resulting quorum / threshold conservativeness.
+`quorum(t)` and `proposalThreshold(t)` use `feeRouter.totalBytesInWindow(endEpoch(t), windowEpochs)` × 4% / 0.1% respectively (both return 0 before the first epoch elapses). The capped-and-ramped total weight (not raw bytes) is the strictly correct denominator, but is O(active_operators × N) to compute; the Governor uses the unramped total bytes as a tractable upper bound and accepts the resulting quorum / threshold conservativeness. The total holds no share cap, but `FeeRouter` clamps each operator's epoch bytes to its declared capacity before they enter it.
 
 The shipped `CapacityBond` exposes no `totalVotingWeightAt(ts)` aggregate getter. Under this ADR the Governor derives total voting weight from FeeRouter epoch accounting (`totalBytesInWindow`), not from a CapacityBond aggregate read.
 
@@ -131,7 +135,8 @@ The shipped `CapacityBond` exposes no `totalVotingWeightAt(ts)` aggregate getter
 
 | Parameter           | Default | Min | Max  | Rationale |
 | ------------------- | ------: | --: | ---: | --------- |
-| `windowEpochs` (N)  |      13 |   4 |   26 | <4 (1 month) too reactive to single-burst wash-trading and statistically thin for small operators; >26 (6 months) lags actual operator-set composition and pushes `_getVotes` toward ~55K gas of cold SLOADs per voter per `castVote` on L2 |
+| `windowEpochs` (N)  |      13 |   4 |   26 | <4 (1 month) too reactive to single-burst wash-trading and statistically thin for small operators; >26 (6 months) lags actual operator-set composition and pushes `_getVotes` toward ~55K gas of cold SLOADs per voter per `castVote` |
+| `deliveryFloor`     |       1 |   1 | 1000 | Net USDC micro-units per MB of weight, on the governance-chain `FeeRouter`. Prices each credited byte; see [§ Wash-trading as vote-buying](#wash-trading-as-vote-buying) |
 | `voteCapBps`        |   1000  | 100 | 1000 | Launches at the 10% ceiling and is decrease-only: governance can lower it toward the 1% floor but never raise it, so the cap only ever decentralizes vote weight. A higher launch value keeps quorum reachable while the operator set is thin. Cap applied against bytes-weighted total |
 | `age_ramp_months`   |      6  |   1 |   24 | Carry forward from [ADR 009](009-governance.md#governable-parameters-with-safety-bounds) and [ADR 026 § Governable parameters](026-tokenomics.md#governable-parameters-with-safety-bounds) |
 
@@ -141,13 +146,15 @@ Cross-parameter invariant (informational, not enforced at the contract layer): `
 
 ### Wash-trading as vote-buying
 
-Bytes-weighted voting is gameable by operators self-paying for delivery. An attacker who controls a client wallet pays themselves to serve bytes; under the three-bucket FeeRouter split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), 60% of the per-byte USDC fee returns to the operator. The remaining 40% (30% burn + 10% treasury) is real USDC the attacker pays into the protocol with no offsetting revenue.
+Bytes-weighted voting is gameable by operators self-paying for delivery. An attacker who controls a client wallet pays themselves to serve bytes. The operator share returns to the attacker on the payment chain. The rebate returns on the governance chain, so it is not a cost. The attacker's real cost is `net`: the USDC that stays with the protocol (buyback and treasury) after each sweep ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)).
 
-This argument **depends on a minimum price-per-byte being enforced** — otherwise the attacker pays ~0 USDC per byte and the 40% non-refunded cost vanishes. That floor is the `PaymentPool.deliveryFloor` settlement clamp ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)): redemption credits at most `amount × BYTES_PER_MB / deliveryFloor` bytes for a voucher's cumulative `amount`, so each *credited* byte costs `>= deliveryFloor` real USDC. A voucher priced below the floor still settles its `amount`, but its excess bytes earn no vote weight — only floor-priced bytes reach the counter. Without that ceiling the attack is near-free (`amount = 1` wei stamping `bytesDelivered = 2^200`), which the cost estimate below assumes away.
+The governance-chain `FeeRouter` enforces the deterrent in its credit formula, for any pool on any chain: `credit = min(bytes, net × 1 MiB / deliveryFloor)`. Each credited byte costs at least `deliveryFloor` micro-units of `net`. A sweep that carries more bytes than its `net` pays for earns no extra weight. A pool with a low or zero protocol share earns little or no weight. A forged pool must pay real USDC at a price that only governance sets.
 
-**Attack cost to reach the 10% cap from zero.** Let `R` be the network-wide USDC revenue per epoch. An attacker holding `cap` share of the trailing-window bytes generates `R × cap × N` revenue across the window (assuming the attacker pays the *market* per-byte rate). Wash-trading cost is `0.40 × R × cap × N` in attacker-paid USDC across the window. At `R = $25K/week`, `cap = 10%`, `N = 13`: the attacker burns `0.40 × $25K × 0.10 × 13 ≈ $13,000` per quarter to hold full 10% vote.
+**Attack cost to reach the 10% cap from zero.** Let `R` be the network-wide USDC revenue per epoch and `s` the fraction of each redemption that becomes `net`. An attacker holding `cap` share of the trailing-window bytes generates `R × cap × N` revenue across the window (assuming the attacker pays the *market* per-byte rate). Wash-trading cost is `s × R × cap × N` in attacker-paid USDC across the window. With the steady example setting of [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split), `s = 0.40`. At `R = $25K/week`, `cap = 10%`, `N = 13`: the attacker burns `0.40 × $25K × 0.10 × 13 ≈ $13,000` per quarter to hold full 10% vote. With the launch example setting, `s = 0.10` and the cost is `≈ $3,250` per quarter.
 
-This figure is an **upper bound on a naive attacker**. A cost-minimizing attacker pays at `deliveryFloor`, not the market rate — and the default floor sits 10× below market ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)), so the floor-rate cost is ~10× lower (order `$1,300/quarter` at the same parameters). The enforcement converts the attack from *near-free* to *proportional to bytes at ≥ floor rate*; the remaining lever is the floor-to-market gap. Narrowing it (raising `deliveryFloor` toward the market rate via governance) raises the attack cost toward `$13,000`, at the price of constraining legitimate low-rate pricing — a governance trade-off, not a fixed guarantee.
+This figure is an **upper bound on a naive attacker**. A cost-minimizing attacker pays at the `deliveryFloor` rate, not the market rate. Raising `deliveryFloor` toward the market rate raises the attack cost toward the figure above, at the price of constraining legitimate low-rate pricing. This is a governance trade-off.
+
+If `net` is zero (`buybackBps` and the treasury remainder both zero), the router mints no new weight. When the trailing window empties, quorum and proposal threshold reach 0. Governance can reverse this setting.
 
 Cost scales linearly with network revenue and with the cap. Defenses:
 
@@ -155,7 +162,7 @@ Cost scales linearly with network revenue and with the cap. Defenses:
 2. **`age_ramp` floor.** A brand-new bonded operator who wash-trades heavily still votes at a fraction of their bytes-weighted share for the first `age_ramp_months` months. Combined with the cap, this limits the speed-to-influence of a fresh attacker.
 3. **Rolling-window decay.** Sustained wash trading is required across the full window to maintain the cap; a stopping attacker decays out over N epochs.
 
-The attack is bounded but not eliminated. Future tightening options (deferred to a follow-up ADR if observed): raise the burn share, gate vote weight on a probe-verified delivery threshold, introduce a non-linear wash-trade-detection penalty. The current parameters are calibrated for the testnet-and-early-mainnet regime where attacker cost-of-capital is high relative to expected governance return.
+The attack is bounded but not eliminated. Future tightening options (deferred to a follow-up ADR if observed): raise `buybackBps` or `deliveryFloor`, gate vote weight on a probe-verified delivery threshold, introduce a non-linear wash-trade-detection penalty. The current parameters are calibrated for the testnet-and-early-mainnet regime where attacker cost-of-capital is high relative to expected governance return.
 
 ### Instant-governance via bond-then-serve-burst
 
@@ -174,17 +181,17 @@ The per-operator cap (`voteCapBps`, launch 10%) is the primary concentration def
 ### Positive
 
 - **Voting weight tracks demonstrated network contribution.** An operator who isn't serving has no vote; an operator who is serving heavily has weight proportional to that service (up to the cap).
-- **Reuses existing on-chain accounting.** No new fundamental data flow; `bytesPerEpoch` is already populated. Marginal contract surface is two integer mappings, one trailing-sum helper, one tenure-ramp lookup.
+- **Reuses the sweep data flow.** The bytes feed already rides each sweep. Marginal contract surface is two integer mappings, one trailing-sum helper, one tenure-ramp lookup.
 - **Strengthens skin-in-the-game story.** Combined with [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)'s per-byte operator payment, governance influence and economic upside both scale with actual delivery.
 - **Slashing-zero-out tightens response time.** Slash → immediate vote zero, recovers naturally over `windowEpochs`. Cleaner than a declared-capacity-proportional reduction.
 
 ### Negative
 
-- **Wash-trading is bounded but not zero-cost prevented.** ~40% of attacker-paid USDC is forfeit per cycle (30% burn + 10% treasury). At cap floor (1%) and default parameters, attacker cost is non-trivial but not unaffordable. See [§ Threat Model — Wash-trading](#wash-trading-as-vote-buying).
+- **Wash-trading is bounded but not zero-cost prevented.** The `net` share of attacker-paid USDC (buyback and treasury) is forfeit per cycle. At cap floor (1%) and default parameters, attacker cost is non-trivial but not unaffordable. See [§ Threat Model — Wash-trading](#wash-trading-as-vote-buying).
 - **Vote weight is more volatile than capacity-weighted weight.** A heavy traffic week ramps an operator's vote in days; a quiet quarter decays it out. Governance proposers cannot assume a fixed voting set; quorum computations must re-read the FeeRouter window state.
 - **No on-chain aggregate vote-weight getter.** `CapacityBond` exposes no `totalVotingWeightAt(ts)`; indexers and dashboards must compute totals from the FeeRouter-derived window (`totalBytesInWindow`) rather than a single contract read.
-- **`FeeRouter` migration becomes a governance-snapshot reset.** `epochLength` is constructor-immutable per [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns), so any future `FeeRouter` migration starts with empty `bytesPerEpoch`; vote weight resets to zero for all operators until traffic refills the window. Operational consideration, not a soundness concern — the existing `FeeRouter` migration path already requires state migration.
-- **Indexer / off-chain reader impact.** Dashboards tracking `Settled` events need to add a running `totalBytesPerEpoch` aggregate to mirror the contract's new global counter. Minor.
+- **A governance-chain `FeeRouter` replacement resets vote weight.** `epochLength` is constructor-immutable per [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns), so a replacement `FeeRouter` starts with empty `bytesPerEpoch`. Vote weight is zero for all operators until sweeps refill the window. Pools name their `FeeRouter` as an immutable, so each pool deployment also names the replacement.
+- **Indexer / off-chain reader impact.** Dashboards track the router's sweep-receipt event and keep a running `totalBytesPerEpoch` aggregate. Minor.
 
 ### Risks
 
@@ -194,8 +201,8 @@ The per-operator cap (`voteCapBps`, launch 10%) is the primary concentration def
 
 ## Cross-ADR Impact
 
-- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** §Production: Operator-Weighted DAO Governance sources voting weight from this ADR's formula, with its clock anchored to `FeeRouter` epoch accounting and its quorum calibration reading `FeeRouter.totalBytesInWindow`. Its Governable Parameters table carries `windowEpochs`, and its Consequences > Negative notes wash-trading-as-vote-buying.
-- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** Contract Inventory `DecdnGovernor` row reads `FeeRouter` for vote weight. `classDiagram` `FeeRouter` exposes `totalBytesPerEpoch`, `bytesInWindow`, `totalBytesInWindow`; the `Governor` vote-weight edges target `FeeRouter`. `Contract: FeeRouter` section carries the `bytesPerEpoch` / `totalBytesPerEpoch` mappings, getters, and `setWindowEpochs`. `Contract: CapacityBond` section carries `slashedAtEpoch`. Cross-Contract Call Graph + Complete Call Table list `Governor → FeeRouter: bytesInWindow / totalBytesInWindow`. Deployment Order step 14 (`DecdnGovernor`) lists `FeeRouter` as a non-zero constructor input.
+- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** §Production: Operator-Weighted DAO Governance sources voting weight from this ADR's formula, with its clock anchored to governance-chain `FeeRouter` epoch accounting and its quorum calibration reading `FeeRouter.totalBytesInWindow`. Its Governable Parameters table carries `windowEpochs`, and its Consequences > Negative notes wash-trading-as-vote-buying.
+- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** Contract Inventory `DecdnGovernor` row reads `FeeRouter` for vote weight. `classDiagram` `FeeRouter` exposes `totalBytesPerEpoch`, `bytesInWindow`, `totalBytesInWindow`; the `Governor` vote-weight edges target `FeeRouter`. `Contract: FeeRouter` section carries the sweep receiver, the `bytesPerEpoch` / `totalBytesPerEpoch` mappings, getters, `deliveryFloor` and `setWindowEpochs`. `Contract: CapacityBond` section carries `slashedAtEpoch`. Cross-Contract Call Graph + Complete Call Table list `Governor → FeeRouter: bytesInWindow / totalBytesInWindow`. Deployment Order step 14 (`DecdnGovernor`) lists `FeeRouter` as a non-zero constructor input.
 - **[ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics):** §Governance states the served-bytes `vote_weight` formula and points its `Voting source` row at `FeeRouter` + this ADR. §Governable parameters with safety bounds carries `windowEpochs`.
 - **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** the `grantAppeal` path (`settleAppealGranted`) clears `CapacityBond.slashedAtEpoch[op]` alongside refunding the operator's escrowed TOKEN (see [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)); no other appeal-flow change.
 

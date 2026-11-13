@@ -32,8 +32,8 @@ Each read has a frame ceiling. The ceiling is at least the largest legitimate me
 
 | Ceiling | Value | Reads | Largest legitimate message |
 | --- | --- | --- | --- |
-| `MAX_PROBE_FRAME` | 1 KiB | Every `cdn/probe/v1` read | `ProbeResponse` with its extension: 325 B |
-| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher`, `ChunkPreimage` and `StreamResponse` | `StreamRequest` with a binding and a capability: 301 B |
+| `MAX_PROBE_FRAME` | 1 KiB | Every `cdn/probe/v1` read | `ProbeResponse` with its extension and 16 payment chains: 487 B |
+| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher`, `ChunkPreimage` and `StreamResponse` | `StreamRequest` with a binding and a capability: 311 B |
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |
 | `MAX_DHT_FRAME` | 64 KiB | Every `cdn/dht/v1` read, request and response | `BatchStoreRequest` with 256 entries: 59,939 B |
 
@@ -288,7 +288,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
-| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
+| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes`, `payment_chains` |
 | `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `timestamp_us` | `error`, `origin_attestation` |
 
 #### Implementation note — separating signed and unsigned fields
@@ -316,6 +316,7 @@ struct ProbeResponse {
 #[derive(Serialize, Deserialize, Default)]
 struct ProbeResponseExt {
     total_bytes: Option<u64>,
+    payment_chains: Option<Vec<u64>>,  // at most 16 EIP-155 chain ids; a hint
 }
 ```
 

@@ -5,7 +5,7 @@
 
 ## Context
 
-[ADR 026](026-tokenomics.md#adr-026-tokenomics) defines a work-token tokenomics model. The governance-relevant primitives are: (i) a single `CapacityBond` contract that holds operator bonds proportional to declared bandwidth (`bond = k × Mbps^α`), exposes `firstBondedAt(operator)` as the source of the `age_ramp` tenure factor, and exposes `slashedAtEpoch(operator)` for the slash-aware voting-weight zero-out; (ii) a three-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds (no epoch buckets, no claim windows) and whose per-operator `bytesPerEpoch` accounting is the source of served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight); (iii) a `SlashAppeal` contract whose grant/uphold decisions on escrowed slashes are governance- and emergency-multisig-gated per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
+[ADR 026](026-tokenomics.md#adr-026-tokenomics) defines a work-token tokenomics model. The governance-relevant primitives are: (i) a single `CapacityBond` contract that holds operator bonds proportional to declared bandwidth (`bond = k × Mbps^α`), exposes `firstBondedAt(operator)` as the source of the `age_ramp` tenure factor, and exposes `slashedAtEpoch(operator)` for the slash-aware voting-weight zero-out; (ii) a governance-chain `FeeRouter` that receives sweeps from payment-chain pools, splits each swept protocol share by governable `rebateBps`, `buybackBps` and a treasury remainder, and whose per-operator `bytesPerEpoch` accounting is the source of served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight); (iii) a `SlashAppeal` contract whose grant/uphold decisions on escrowed slashes are governance- and emergency-multisig-gated per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
 
 Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. The governance contracts (`DecdnGovernor`, `TimelockController`) ship in the day-one single-audit-pass surface ([ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory)); what differs by phase is the governance *process*, not the contract surface. In the PoC, parameters are changed through a single admin key. At launch, a bootstrap multisig replaces the admin key while the operator set is too thin for operator-weighted DAO voting (served-bytes-weighted per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) to be safe. When the bootstrap multisig judges the operator set broad enough, it executes a one-shot transition to full operator-weighted DAO governance.
 
@@ -14,7 +14,7 @@ This ADR covers:
 1. The PoC governance model (admin key)
 2. The bootstrap-multisig phase (first 6–12 months post-launch, until operator set is large enough)
 3. The production governance model (OpenZeppelin Governor against `CapacityBond`)
-4. Governable parameters and their hardcoded safety bounds (including the three `FeeRouter` shares and `CapacityBond` curve parameters)
+4. Governable parameters and their hardcoded safety bounds (including the `FeeRouter` split and `CapacityBond` curve parameters)
 5. Emergency multisig design
 6. Slash-appeal authorization rules (`SlashAppeal`)
 
@@ -30,7 +30,7 @@ Post-launch, the voting set is narrow (likely <50 active operators in the first 
 
 **Composition.** 5-of-9 multisig (separate from the [emergency multisig](#emergency-multisig)) with geographically and organizationally diverse signers. Signer set publicly disclosed.
 
-**Capabilities.** All parameter updates within the safety bounds; `FeeRouter.setShares` / dependency-address setters; `CapacityBond` parameter setters (α, k, MAX_CAPACITY_PER_OPERATOR, age_ramp_months, unbonding window); slash-appeal grant/uphold on `SlashAppeal` (per [§ Slash-Appeal Authorization](#slash-appeal-authorization)); standard 48-hour timelock on every parameter change.
+**Capabilities.** All parameter updates within the safety bounds; `FeeRouter` split and dependency-address setters; `CapacityBond` parameter setters (α, k, MAX_CAPACITY_PER_OPERATOR, age_ramp_months, unbonding window); slash-appeal grant/uphold on `SlashAppeal` (per [§ Slash-Appeal Authorization](#slash-appeal-authorization)); standard 48-hour timelock on every parameter change.
 
 **Mechanism.** The multisig never holds `GOVERNANCE_ROLE` on the role-gated contracts. The `TimelockController` holds it from deployment onward — in this phase and in production alike — which is what puts the 48-hour delay on every parameter change above regardless of who requested it. What the bootstrap phase confines is the right to *schedule*: `DeployProtocol` (run with `BOOTSTRAP_MULTISIG` set) grants the bootstrap multisig the Timelock's `PROPOSER_ROLE` + `CANCELLER_ROLE` and grants `DecdnGovernor` neither, so no operator vote can reach execution while the voting set is too thin to be safe. `DecdnGovernor.propose` also reverts until the Governor holds the Timelock's `PROPOSER_ROLE`, so no proposal passed by the thin early electorate waits, unqueued and unexpiring, to execute after the transition. The Governor is nonetheless deployed and its vote-weight sources are wired at deployment, not at transition (`FeeRouter.bytesInWindow` + `CapacityBond.firstBondedAt` + the `CapacityBond` slash records per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula)). Deploying without `BOOTSTRAP_MULTISIG` skips the phase entirely and seats the Governor as proposer at genesis.
 
@@ -40,7 +40,7 @@ Post-launch, the voting set is narrow (likely <50 active operators in the first 
 
 ### Production: Operator-Weighted DAO Governance
 
-Based on OpenZeppelin Governor, sourcing voting weight from `FeeRouter` served-bytes accounting and `CapacityBond` tenure data per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):
+Based on OpenZeppelin Governor, on the governance chain (Ethereum L1, [ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)), sourcing voting weight from the governance-chain `FeeRouter` served-bytes accounting (fed by sweeps) and `CapacityBond` tenure data per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):
 
 | Parameter | Value |
 | --- | --- |
@@ -56,15 +56,13 @@ Based on OpenZeppelin Governor, sourcing voting weight from `FeeRouter` served-b
 
 The clock is timestamp-based (ERC-6372 `mode=timestamp`) to align with `FeeRouter`'s epoch-keyed accounting (epoch length immutable, 1 week — see [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter)). Voting weight is computed from `FeeRouter`'s `bytesInWindow` / `totalBytesInWindow` helpers and `CapacityBond.firstBondedAt` / `slashedAtEpoch` directly, not through an `IVotes`/IERC-5805 surface — vote weight is derived from FeeRouter epoch accounting rather than from per-account checkpoint structures, so the Governor supplies the vote source, quorum, and per-operator cap as thin overrides rather than via OZ's `GovernorVotes` / `GovernorVotesQuorumFraction` modules.
 
-Quorum and proposal threshold are calibrated against `FeeRouter.totalBytesInWindow(epoch(ts), windowEpochs)` — the unramped, uncapped sum of served bytes across all operators over the trailing window — **not** total TOKEN supply and **not** the per-operator-capped weighted total. The Governor uses the unramped total as a tractable upper bound for the strictly-correct capped-and-ramped sum (which would be O(active_operators × N) to compute); the resulting quorum / threshold is mildly conservative. Voting weight tracks active operator service delivery rather than passive holdings; calibrating against it avoids the failure mode where the quorum bar trivially exceeds engaged voting power as TOKEN circulates.
+Quorum and proposal threshold are calibrated against `FeeRouter.totalBytesInWindow(epoch(ts), windowEpochs)` — the unramped sum of served bytes across all operators over the trailing window, each operator's epoch bytes clamped to its declared capacity — **not** total TOKEN supply and **not** the per-operator-capped weighted total. The Governor uses the unramped total as a tractable upper bound for the strictly-correct capped-and-ramped sum (which would be O(active_operators × N) to compute); the resulting quorum / threshold is mildly conservative. Voting weight tracks active operator service delivery rather than passive holdings; calibrating against it avoids the failure mode where the quorum bar trivially exceeds engaged voting power as TOKEN circulates.
 
 **Non-operator TOKEN holders carry zero voting weight.** Traders, passive holders, vesting recipients (Core Contributors, Advisors, Seed, Private, Treasury, Public Sale, Airdrop / Testnet, Marketing, LP/MM/POL), and any TOKEN not bonded into `CapacityBond` have no vote. Per [ADR 026 § Governance](026-tokenomics.md#governance), this is the work-token regulatory-cleanliness commitment: passive holding earns nothing — neither revenue nor governance privilege.
 
 #### Non-operator holder protection
 
-Non-operator value accrual is structurally guaranteed at the *contract* level, not at the governance level. Operators cannot vote to push the operator-base share above the 90% upper bound, hold an active burn bucket below the 5% lower bound, or otherwise expropriate non-operator-aligned shares — see the immutable [§ Governable Parameters with Safety Bounds](#governable-parameters-with-safety-bounds) below. The cashflow invariant (40% floor on the operator base) ensures clients still receive paid delivery; the 5% floor on an active burn bucket preserves the deflationary lever; the 0% floor on treasury permits governance to simplify the split without dropping operator-aligned cashflow.
-
-The burn bucket is the one share that also accepts zero. That is the dormant launch configuration — split `[9000, 0, 1000]`, `buybackBurner == address(0)` — which governance later activates to the steady-state target `[6000, 3000, 1000]` per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split). The bucket is therefore either off or at 5% or more; governance cannot leave it nominally on at a negligible share, and turning it off is as observable as any other 48-hour timelocked share change.
+The operator guarantee is contract-level. Each `PaymentPool` fixes `operatorBps` as an immutable, so governance cannot lower the operator's share of a redemption ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). Governance sets only how the swept protocol share divides: see [§ Governable Parameters with Safety Bounds](#governable-parameters-with-safety-bounds).
 
 #### Investor disposition
 
@@ -88,17 +86,18 @@ The one capability retained on-chain in perpetuity is the **narrow unlawful-cont
 
 All economic parameters across the protocol are governable within hardcoded safety bounds. Safety bounds are immutable — even a governance attack cannot set parameters outside these ranges.
 
-#### FeeRouter shares (per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds))
+#### FeeRouter split (per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split))
 
-The three `FeeRouter` shares are governable within the bounds below. **Sum-to-100% invariant:** every governance update that modifies any share **must** leave the three shares summing to exactly 100% (10000 bps); updates that violate the sum or that exceed any individual bound revert at the contract layer.
+The governance-chain `FeeRouter` splits each swept protocol share. Governance sets the split through the Timelock. The split has no bounds.
 
-| Parameter | Default | Min | Max |
-| --- | ---: | ---: | ---: |
-| Operator base share | 60% | 40% | 90% |
-| Burn share | 30% (0% while dormant) | 5% when active | 50% |
-| Treasury share | 10% | 0% | 30% |
+| Parameter | Meaning |
+| --- | --- |
+| `rebateBps` | Share returned to the operator |
+| `buybackBps` | Share sent to `BuybackBurner`; 0 switches buyback off |
+| Treasury remainder | The rest goes to the Timelock treasury |
+| `buybackBurner`, `treasury` | Destination addresses |
 
-The 40% floor on the operator-base share is the cashflow invariant: operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. The 5% floor on burn preserves the deflationary lever and binds whenever the bucket is active; a zero burn share is separately permitted as the dormant launch configuration ([§ Non-operator holder protection](#non-operator-holder-protection) above). The 0% floor on treasury lets governance simplify the split.
+A non-zero `buybackBps` needs a non-zero burner address. A non-zero treasury remainder needs a non-zero treasury address. The operator's own guarantee is the immutable `operatorBps` of each pool, which governance cannot change.
 
 #### CapacityBond curve and governance parameters (per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 
@@ -110,6 +109,7 @@ The 40% floor on the operator-base share is the cashflow invariant: operators al
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 10% | 1% | 10% |
 | `windowEpochs` (served-bytes trailing window, on `FeeRouter`) | 13 | 4 | 26 |
+| `deliveryFloor` (net USDC micro-units per MB of weight, on `FeeRouter`) | 1 | 1 | 1000 |
 | Unbonding window | 14 days | 7 days | 60 days |
 
 The α range upper-bounds at 1.8 to prevent a concentration penalty so steep that mid-tier operators are economically barred from upgrading; the lower bound at 1.0 ensures decentralization pressure is never fully disabled. k is parameterized via the 1G-tier bond range to constrain governance volatility — direct changes to k can shift the entire bond curve, so the bound is on the *resulting bond* rather than on k itself. The per-operator voting cap launches at its 10% ceiling and is decrease-only within `[1%, 10%]`; it is the primary defense against bytes-weighted concentration per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). The `windowEpochs` bounds are pinned in [ADR 036 § Governable parameters with safety bounds](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds): below 4 epochs (~1 month) vote weight is too reactive to single-burst wash trading; above 26 epochs (~6 months) the trailing window lags actual operator-set composition and `DecdnGovernor._getVotes` cold-SLOAD gas rises to ~55K per voter per `castVote`.
@@ -120,8 +120,6 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | --- | --- | --- | --- |
 | Multiaddr update cooldown | CapacityBond | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | CapacityBond | 64 bytes | 1024 bytes |
-| Dispute window (default: 48h) | PaymentPool | 48 hours | 72 hours (3 days) |
-| Rate floor | PaymentPool | 1 base unit | `MAX_RATE_PER_MB` (1000, the [ADR 005](005-protocol.md#adr-005-wire-protocol) wire cap) |
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
 | Max origins per namespace | OriginAssignment | 1 | 50 |
@@ -129,20 +127,19 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |
 | Max evidence age | SlashJudge | 1 day | 30 days |
 
-There is no settlement-time fee skim or discount-stake mechanic on the payment contract. Burn is a fixed share of the `FeeRouter` split (governable within the burn-share bound above). The only TOKEN-side requirement on operators is the capacity bond. At entry, it must meet the larger of the capacity-bond curve and the global `minBond` floor ([ADR 026 § Minimum bond is non-retroactive](026-tokenomics.md#minimum-bond-is-non-retroactive)).
+`PaymentPool` has no governance parameters. Its dispute window and operator share are immutables fixed per deployment (the payment-chain admission rule is in [ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)). There is no settlement-time fee skim or discount-stake mechanic on the payment contract. Buyback is the `buybackBps` share of the `FeeRouter` split. The only TOKEN-side requirement on operators is the capacity bond. At entry, it must meet the larger of the capacity-bond curve and the global `minBond` floor ([ADR 026 § Minimum bond is non-retroactive](026-tokenomics.md#minimum-bond-is-non-retroactive)).
 
 The 7-day voting period balances responsiveness with participation. Combined with the 1-day voting delay and the 48-hour timelock, the total governance delay is ~10 days minimum — longer than the standard OpenZeppelin Governor defaults, reflecting operator-class participation cadence.
 
-CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve) and [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); fee-routing parameters are governed by [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds). Payment pool parameters are defined in [ADR 003](003-payments.md#adr-003-payment-model). This ADR defines the governance mechanism that controls them.
+CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve) and [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); fee-routing parameters are governed by [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds). Payment pool mechanics are defined in [ADR 003](003-payments.md#adr-003-payment-model). This ADR defines the governance mechanism that controls them.
 
-**Treasury disbursement:** Spending from the protocol treasury wallet (the destination of the 10% `FeeRouter` treasury share per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) — including operational expenditures, ecosystem grants, audits, any discretionary incident restitution (per [ADR 026 § Incident recourse](026-tokenomics.md#incident-recourse-no-standing-reserve)), and any onward transfers — requires a standard governance proposal in production. During the bootstrap-multisig phase, the multisig directs treasury spending within the safety bounds. The emergency multisig cannot withdraw treasury funds (see [Emergency Multisig](#emergency-multisig)); it has no fund-movement authority — its only fast-track power is deciding slash appeals on `SlashAppeal`, which moves only escrowed slash funds along the deterministic grant/uphold paths.
+**Treasury disbursement:** Spending from the protocol treasury wallet (the destination of the treasury share of each swept protocol share on the governance chain, per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) — including operational expenditures, ecosystem grants, audits, any discretionary incident restitution (per [ADR 026 § Incident recourse](026-tokenomics.md#incident-recourse-no-standing-reserve)), and any onward transfers — requires a standard governance proposal in production. During the bootstrap-multisig phase, the multisig directs treasury spending within the safety bounds. The emergency multisig cannot withdraw treasury funds (see [Emergency Multisig](#emergency-multisig)); it has no fund-movement authority — its only fast-track power is deciding slash appeals on `SlashAppeal`, which moves only escrowed slash funds along the deterministic grant/uphold paths.
 
 **Safety bound rationale:**
 
 - **Slash ladder (not governable):** `CapacityBond` slashes a fixed 5% / 15% / 50% of the bond on the first, second, and third-or-later offense. The tier is keyed on the operator's lifetime offense counter, which only increases and never resets. The ladder is a compile-time constant with no setter, so governance cannot flatten the anti-gaming curve or confiscate a bond in one step. Full ejection (effectively 100% loss) is still reachable through **cumulative** slashing per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn).
 - **Max evidence age 1–30 days and Unbonding period 7–60 days:** The individual bounds permit a configuration where evidence age ≥ unbonding period, which would let an operator commit any of the three on-chain offenses ([ADR 014 § `Slashed` event and `slashId` allocation](014-on-chain-verification.md#slashed-event-and-slashid-allocation)), initiate unbonding, and complete withdrawal before the evidence window opens. **Cross-parameter invariant:** `SlashJudge` and `CapacityBond` enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod * 1_000_000` at the contract layer on every `setMaxEvidenceAge` / `setUnbondingPeriod` call; updates that would violate this revert. The check applies at deployment as well. See [ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period) for the exact revert conditions.
-- **Rate floor ≥ 1 base unit:** A zero floor allows free-riding nodes that advertise zero rates to attract traffic without generating protocol fees. The minimum of 1 USDC base unit ($0.000001/MB for 6-decimal USDC) is negligibly small but prevents true zero-rate abuse.
-- **Grace window 48h–72h:** A shorter window is too short for a node to redeem outstanding vouchers before the owner reclaims, and it must stay above the L2 force-inclusion delay (≤ 24h) so censorship cannot burn the whole window. A 7-day window locks owner funds for an unacceptably long period. The floor equals the 48h default, so the baseline can only be tightened upward; PoC deploys at 48 hours to guarantee 24 hours of effective redemption time under worst-case L2 sequencer censorship. See [ADR 003](003-payments.md#adr-003-payment-model).
+- **Grace window per payment chain:** The `disputeWindow` of each pool is an immutable set per deployment. It must stay above that chain's sequencer forced-inclusion delay so censorship cannot burn the whole window. A window that is too long locks owner funds for an unacceptably long period. See [ADR 003](003-payments.md#adr-003-payment-model).
 - **Max origins per namespace 1–50:** Upper bound prevents storage-cost griefing and unbounded gas in `getOrigins` view calls.
 - **Max namespaces per publisher 1–1000:** Anti-squatting limit.
 - **Namespace transfer timelock 24 hours–30 days:** Lower bound prevents instant key-compromise transfers; upper bound prevents governance from blocking legitimate ownership changes.
@@ -164,9 +161,9 @@ The emergency multisig moves no protocol funds in this flow — escrow movement 
 
 ### Emergency Multisig
 
-- 3-of-5 multisig with known, trusted signers (separate from the bootstrap-governance multisig above). On Arbitrum One the deploy refuses an emergency multisig that is the deployer or holds no code; testnet deploys may seat the deployer.
+- 3-of-5 multisig with known, trusted signers (separate from the bootstrap-governance multisig above). On Ethereum the deploy refuses an emergency multisig that is the deployer or holds no code; testnet deploys may seat the deployer. The same multisig is the immutable `pauser` of each payment-chain `PaymentPool`. That pauser blocks only `openPool` and `topUp`.
 - Capabilities (exhaustive list):
-  1. **Pause contracts** — halt new intake and serving for exploit response and critical bug mitigation. Pause never halts an exit. A paused `CapacityBond` still accepts `requestUnbond`, `unbond`, `deregisterNode`, and an inactive operator's `declareMbps(0)` tier release, a paused `PaymentPool` still accepts `reclaim` and `closePool`, and a paused `SlashAppeal` still accepts `openSlashAppeal`, so a captured PAUSER cannot trap operator bond, client deposits, or an operator's appeal. Slash safety does not depend on pause: the unbonding period keeps queued bond exposed, and a slash reaches bond already in the unbonding queue, so un-pausable exit takes no shelter from a dishonest operator
+  1. **Pause contracts** — halt new intake and serving for exploit response and critical bug mitigation. Pause never halts an exit. A paused `CapacityBond` still accepts `requestUnbond`, `unbond`, `deregisterNode`, and an inactive operator's `declareMbps(0)` tier release, a paused `PaymentPool` still accepts `reclaim`, `closePool`, `redeemMany` and `sweep`, and a paused `SlashAppeal` still accepts `openSlashAppeal`, so a captured PAUSER cannot trap operator bond, client deposits, or an operator's appeal. Slash safety does not depend on pause: the unbonding period keeps queued bond exposed, and a slash reaches bond already in the unbonding queue, so un-pausable exit takes no shelter from a dishonest operator
   2. **Emergency content blacklisting** — add hashes and origin operators to the `ContentBlacklist` contract via `emergencyAdd` and `emergencyAddOrigin` (see [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting))
   3. **Regional body suspension** — suspend a compromised regional governance body via `suspendRegionalBody` (see [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)); must be ratified or reversed by governance within 14 days
   4. **Slash-appeal fast-track** — `SlashAppeal.fastTrackAppeal(slashId)` (grants interim relief on an open appeal) and `SlashAppeal.rejectAppeal(slashId)` (denies an open appeal). These decide the appeal only; the escrow movement is performed deterministically by `CapacityBond` settle hooks. No fund-movement authority and no USDC hard caps (no reserve exists). See [Slash-Appeal Authorization](#slash-appeal-authorization) and [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)
@@ -187,13 +184,13 @@ The emergency multisig moves no protocol funds in this flow — escrow movement 
 - The governance handoff is irreversible and carries no standing veto, keeping ongoing managerial control out of any single party's hands — the structural basis of the work-token regulatory posture. Legal-compliance authority is held off-chain by the legal wrapper's board and scoped to illegality, not a discretionary override of governance
 - Capability-split sunset: the protocol-wide pause expires, while the only permanent on-chain emergency authority is the narrow unlawful-content-removal power — preventing the emergency role from becoming a standing controller while preserving a permanent, time-critical compliance duty that the ~10-day governance cycle cannot discharge
 - Bootstrap-multisig phase prevents hostile takeover during the thin-operator-set launch window without locking the operator set out of governance forever — the multisig executes the one-shot transition when it judges the operator set ready
-- Operator-only DAO voting structurally enforces the work-token regulatory posture (Howey prong 4); non-operator value accrual is preserved at the contract level via immutable share floors
+- Operator-only DAO voting structurally enforces the work-token regulatory posture (Howey prong 4); non-operator value accrual is preserved at the contract level via the immutable `operatorBps`
 - PoC can operate with a simple admin key; the governance contracts ship day-one in the single-audit-pass surface ([ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model))
 
 ### Negative
 
-- Served-bytes-weighted governance shifts capture risk from large TOKEN holders to high-traffic operators; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the operator base share to the 90% maximum). The 10% per-operator voting cap and the age-ramp partially mitigate concentration. Real CDN traffic skews power-law, so the cap is load-bearing and may need tightening toward the 1% floor during early mainnet per [ADR 036 § Risks](036-served-bytes-voting-weight.md#risks).
-- Served-bytes-weighted voting is gameable by operators self-paying for delivery — an attacker forfeits ~40% of paid USDC (30% buyback-burn + 10% treasury, per the [FeeRouter split](026-tokenomics.md#feerouter-split)) and recoups 60% as the operator base. The attack is bounded by the per-operator cap and `age_ramp`, but cost-to-buy-10%-vote is non-zero. Per [ADR 036 § Threat Model — Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying).
+- Served-bytes-weighted governance shifts capture risk from large TOKEN holders to high-traffic operators; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the treasury remainder of the swept protocol share to its maximum). The 10% per-operator voting cap and the age-ramp partially mitigate concentration. Real CDN traffic skews power-law, so the cap is load-bearing and may need tightening toward the 1% floor during early mainnet per [ADR 036 § Risks](036-served-bytes-voting-weight.md#risks).
+- Served-bytes-weighted voting is gameable by operators self-paying for delivery — the attacker's cost is the USDC that stays with the protocol (buyback and treasury), enforced on the governance chain by the credit formula. The attack is bounded by the per-operator cap and `age_ramp`, but cost-to-buy-10%-vote is non-zero. Per [ADR 036 § Threat Model — Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying).
 - 1-day voting delay + 7-day voting period + 48-hour timelock means ~10 days minimum to respond to non-emergency issues via governance
 - Governance participation typically skews low; 4% quorum (against total voting weight) may be difficult to reach consistently, especially during the bootstrap-multisig phase where served-bytes-weighted voting isn't yet active
 - Non-operator TOKEN holders — including investors, team, treasury, and vesting recipients — have zero DAO vote unless they also operate a node. This is the deliberate regulatory-cleanliness commitment but it materially narrows the political base of the DAO. See [Investor disposition](#investor-disposition) above.

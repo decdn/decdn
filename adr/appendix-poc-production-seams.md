@@ -6,7 +6,7 @@
 
 Several ADRs describe PoC-vs-production differences. They fall into three kinds:
 
-- **Network-scale operational choices:** single RPC endpoint, clients holding ETH for gas, simplified peer bootstrap.
+- **Network-scale operational choices:** two RPC endpoints (governance chain and payment chain), clients holding ETH for gas, simplified peer bootstrap.
 - **Component implementations:** file-based vs platform-keychain key storage.
 - **Governance process:** admin key vs capacity-weighted Governor, with the bootstrap-multisig transition phase per [ADR 009](009-governance.md#adr-009-governance-model).
 
@@ -22,7 +22,7 @@ This appendix answers one question: **how does the codebase express the non-cont
 - **Leaf crates stay pure.** Domain crates carry no mode branching. The two-binary split (`node` daemon, `decdn` CLI) shares config schema and identity loading via `common`. Mode selection is a `node`-wiring concern. The workspace `CLAUDE.md` and [appendix-binaries.md](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split) define the current crate/binary layout and are the source of truth. This appendix does not restate a crate list that would rot.
 - **One source of truth for numeric differences.** Mode-dependent constants live in a single constants type with a per-mode constructor, never as magic numbers in domain logic: challenge bond, dispute window, bootstrap-peer minimum.
 - **Compile-time, not runtime.** No `NetworkMode` enum is threaded through call sites. Selection resolves once, at wiring, so a PoC build cannot run production logic or vice versa. The compile-time mechanism (feature, build profile, or cfg) is a wiring-layer detail kept out of every other crate.
-- **Contracts are not a seam.** The on-chain surface is production-shaped on every network, including the Sepolia testnet PoC. The only contract-side seam is *deployed contract vs in-process test double* for unit/integration harnesses with no chain, never "PoC stub contract → production contract." Simplified launch economics are the same contracts with different governance-set parameters (`FeeRouter.setShares(...)` etc., per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)), not a reduced surface.
+- **Contracts are not a seam.** The on-chain surface is production-shaped on every network, including the Sepolia testnet PoC. The only contract-side seam is *deployed contract vs in-process test double* for unit/integration harnesses with no chain, never "PoC stub contract → production contract." Simplified launch economics are the same contracts with different governance-set parameters (the `FeeRouter` split etc., per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)), not a reduced surface.
 - **Solidity selection is outside Rust.** Which contract addresses a network points at is a Foundry deploy-script / chain-id-keyed-config concern, the standard Foundry pattern, not a Rust feature.
 
 ### Discovery-provider seam
