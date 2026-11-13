@@ -47,7 +47,7 @@ sequenceDiagram
 
 **Signer binding:** Connection-level peer identity is authenticated by the iroh QUIC handshake against the registered NodeId (Ed25519). Message-body attribution and on-chain slash evidence both rely on `slash_sig`: verifiers recover the Ethereum address via `ecrecover` (3,000 gas on-chain) and confirm it maps to the expected NodeId via `CapacityBond.nodeIdOf` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse` — no opt-out. Requesters MUST reject responses with missing or zero-length `slash_sig`, and MUST recover the signature to the peer's registered operator address before acting on the response. A length check alone leaves the quote unattributed: selection reads `has_blob` and `rate_per_mb` off the response, and neither binds the peer to anything until the signature recovers. A response that fails to verify is dropped as requester-local policy — it MUST NOT be scored against the peer, because a signature that does not recover attributes nothing to anyone. See [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) for the EIP-712 type definitions and `SlashJudge` contract interface.
 
-**Accepted payment chains.** The unsigned extension field `payment_chains` lists the EIP-155 chain ids of the payment chains on which the node redeems vouchers ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)). The list holds at most 16 entries, and a receiver ignores any entry past the sixteenth. The field is a hint. A wrong hint costs the requester one refusal, because the node checks `chain_id` on every `StreamRequest` ([§ Payment chain routing](#payment-chain-routing)). A requester picks a payment chain that is in both its own pool chains and this list. A node that omits the field accepts only the payment chain the requester already knows from its pinned configuration.
+**Accepted payment chains.** The unsigned extension field `payment_chains` lists the CAIP-2 chain ids of the payment chains on which the node redeems vouchers ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)). The list holds at most 8 entries, and a receiver ignores any entry past the eighth. The field is a hint. A wrong hint costs the requester one refusal, because the node checks `chain_id` on every `StreamRequest` ([§ Payment chain routing](#payment-chain-routing)). A requester picks a payment chain that is in both its own pool chains and this list. A node that omits the field accepts only the payment chain the requester already knows from its pinned configuration.
 
 **Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) is half this 30-second window (15 seconds), keeping any stream opened from a cache hit within the slashable window; `probe_hold_duration` (see below) is this window plus 5-second margin. Changing the slashing window requires updating both.
 
@@ -125,7 +125,7 @@ For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see
 struct StreamRequest {
     hash: Hash,
     namespace_id: U256,  // 0 = namespace not named (DHT and attesting origins only); non-zero also routes to that namespace's authorized origins
-    chain_id: u64,       // EIP-155 id of the payment chain that holds `pool_id`
+    chain_id: ChainId,   // CAIP-2 id of the payment chain that holds `pool_id`, e.g. "eip155:42161"
     pool_id: PoolId,
     byte_offset: u64,
     byte_len: u64,       // 0 = to end-of-blob; else bound the range to [byte_offset, byte_offset + byte_len)
@@ -157,10 +157,12 @@ Like `byte_len`, `namespace_id` is part of the base `StreamRequest` (every node 
 
 #### Payment chain routing
 
-A pool id is unique only inside one `PaymentPool` deployment, and many payment chains run at once. `StreamRequest` therefore carries `chain_id`, the EIP-155 id of the payment chain that holds `pool_id`. The node routes on it:
+A pool id is unique only inside one `PaymentPool` deployment, and many payment chains run at once. `StreamRequest` therefore carries `chain_id`, the CAIP-2 id of the payment chain that holds `pool_id`. The node routes on it:
 
 - **A chain the node accepts.** The node reads the pool, checks the voucher domain and redeems on that chain. The voucher domain binds that chain id and that chain's `PaymentPool` address ([ADR 003 § PaymentPool](003-payments.md#paymentpool)).
-- **A chain the node does not accept.** The node answers `Declined` before it reads any pool state. The refusal carries the node's accepted chains in the unsigned extension field `payment_chains` of the `StreamResponse`, with the same bound of 16 entries as the probe hint. The node sets the field only on this refusal, and the extension validator rejects the field on any other response. A requester that holds a funded pool on a listed chain retries this node once on that chain. Otherwise it removes the node as for any `Declined`.
+- **A chain the node does not accept.** The node answers `Declined` before it reads any pool state. The refusal carries the node's accepted chains in the unsigned extension field `payment_chains` of the `StreamResponse`, with the same bound of 8 entries as the probe hint. The node sets the field only on this refusal, and the extension validator rejects the field on any other response. A requester that holds a funded pool on a listed chain retries this node once on that chain. Otherwise it removes the node as for any `Declined`.
+
+**Chain identifier.** `ChainId` is a CAIP-2 chain identifier: a namespace, a colon and a reference, such as `eip155:42161`. It holds at most 41 bytes, and the namespace and the reference use the CAIP-2 character sets. A receiver rejects an identifier that breaks these rules. An EVM chain uses the `eip155` namespace and its EIP-155 chain id. Any other kind of chain uses its own namespace, so a non-EVM payment chain needs no change to this message.
 
 `chain_id` is part of the base `StreamRequest`. Every node routes on it, and the voucher it selects has no meaning without it. Because `cdn/client/v1` is pre-finalisation, it is a straight in-place addition with no version bump and no compatibility shim. A request is not signed, so `chain_id` adds no signed field. The signed `StreamResponse` fields do not change.
 

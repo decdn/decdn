@@ -20,9 +20,9 @@ These are one-time or rare actions. The frequent actions, payment and redemption
 A chain is a payment chain when it meets all four rules:
 
 1. It runs the EVM.
-2. It has native USDC with 6 decimals. Bridged USDC.e is not admitted.
+2. It has native USDC with 6 decimals in its ERC-20 interface. The pool uses only that interface, never a native-currency balance. Bridged USDC.e is not admitted.
 3. It supports Circle CCTP V2 with hooks.
-4. Its sequencer forced-inclusion delay is below the pool's `disputeWindow` ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)).
+4. Its censorship window is shorter than the pool's `disputeWindow` ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)). On a rollup, that window is the forced-inclusion delay. On a layer 1, it rests on the validator set.
 
 The ADRs hold the rule, not a list of chains. Pool constants are set per deployment and live in the deployment manifests.
 
