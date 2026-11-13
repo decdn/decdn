@@ -31,7 +31,7 @@ rejects any other format when it parses the document. It has these parts:
 
 | Part | Content | Signed by |
 |------|---------|-----------|
-| `chain` | The chain id, the `PaymentPool` address and the `SlashJudge` address. | Nobody. The EIP-712 domain of each signature below binds it to these values. |
+| `chain` | The payment chain id and the `PaymentPool` address, and the governance chain id and the `SlashJudge` address. | Nobody. The EIP-712 domain of each signature below binds it to these values. |
 | `content` | The requested hash, `blob` or `bundle`, the namespace, the whole blobs that landed with their sizes, the hashes that a node accepted but that did not land (`unlanded`), and whether the pull completed. | Nobody. The client states it. |
 | `window` | The start time and the end time of the pull. | Nobody. The client states it. |
 | `lanes[].responses` | For each hash a node served on the lane, the first accepting `StreamResponse` body and its `slash_sig`. | The node's operator key, under the `SlashJudge` domain. |

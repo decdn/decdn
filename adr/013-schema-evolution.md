@@ -33,8 +33,8 @@ Each read has a frame ceiling. The ceiling is at least the largest legitimate me
 | Ceiling | Value | Reads | Largest legitimate message |
 | --- | --- | --- | --- |
 | `MAX_PROBE_REQUEST_FRAME` | 1 KiB | `ProbeRequest`, which the node reads | `ProbeRequest`: 43 B |
-| `MAX_PROBE_FRAME` | 8 KiB | `ProbeResponse`, which the requester reads | `ProbeResponse` with its extension and a full size proof: 4,807 B |
-| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding and a capability: 301 B |
+| `MAX_PROBE_FRAME` | 8 KiB | `ProbeResponse`, which the requester reads | `ProbeResponse` with its extension, a full size proof and 8 payment chains: 5,145 B |
+| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding, a capability and a chain id: 343 B |
 | `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a refusal code, an origin attestation and a full size proof: under 5 KiB |
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |
 | `MAX_DHT_FRAME` | 64 KiB | Every `cdn/dht/v1` read, request and response | `BatchStoreRequest` with 256 entries: 59,939 B |
@@ -290,8 +290,8 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
-| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `coverage`, `size_proof` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `timestamp_us` | `outcome` (`Served(size_proof)` or `Refused(error)`), `origin_attestation` |
+| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `coverage`, `size_proof`, `payment_chains` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `timestamp_us` | `outcome` (`Served(size_proof)` or `Refused(error)`), `origin_attestation`, `payment_chains` |
 
 An unsigned field is a fact when a proof that the receiver checks makes it one. `size_proof` is such a field: it holds the blob size and proves it against the signed `hash` ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)), so it needs no signature, and no signed field repeats the size. Its decode bounds the proof bytes at 4,480. A `StreamResponse` with `ok = true` must have a served outcome, so it always carries its size proof; a receiver refuses one that does not.
 
@@ -321,6 +321,7 @@ struct ProbeResponse {
 struct ProbeResponseExt {
     coverage: Coverage,
     size_proof: Option<SizeProof>,
+    payment_chains: Option<Vec<ChainId>>,  // at most 8 CAIP-2 chain ids; a hint
 }
 ```
 

@@ -192,31 +192,34 @@ S1 and S2 leave essentially all TOKEN liquid; operators bond TOKEN purchased on 
 
 ### FeeRouter split
 
-`FeeRouter.routeSettlement(operator, bytesDelivered, amount)` splits incoming USDC across three buckets, all transferred in the settlement transaction.
+Each redemption splits in two steps. The split runs on two chains ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
 
-| Destination | Share | Mechanic |
-|---|---:|---|
-| Operator base (direct, per-byte) | 60% | Same-tx USDC transfer to operator |
-| Buyback-and-burn | 30% | TWAP USDC→TOKEN via Uniswap V3 50/50 ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)); TOKEN burned |
-| Protocol treasury | 10% | Same-tx to Timelock-custodied wallet |
-| **Total** | **100%** | |
+1. **Operator share, payment chain.** `PaymentPool.redeemMany` pays `operatorBps` of the paid amount to the operator in the same transaction. The reference deployment sets `operatorBps` to 6000 (60%). `operatorBps` is an immutable of each pool, so governance cannot lower it.
+2. **Protocol share, governance chain.** The rest of the redemption accrues in the pool. A permissionless `sweep` sends it to the governance-chain `FeeRouter` over CCTP, together with the operator's served bytes ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
 
-**The table above is the activated steady-state target; launch is dormant.** The genesis deploy ships the buyback bucket switched off: `FeeRouter.buybackBurner == address(0)` and the split is `[9000, 0, 1000]` — 90% operator / 0% buyback / 10% treasury. The 30% buyback share is routed to operators for as long as the bucket stays dormant, and treasury holds its 10% target throughout. Governance activates the bucket with one `setSharesAndDestinations([6000, 3000, 1000], …)` call through the 48-hour Timelock, which moves the split to the target above; the activation criteria are in [ADR 018 § Activation Criteria (Production)](018-liquidity-strategy.md#activation-criteria-production). The deploy script also carries an off-by-default option that runs the same activation bundle at genesis ([ADR 018 § Deploy-time genesis activation](018-liquidity-strategy.md#deploy-time-genesis-activation), [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)). Every other statement of the split in this ADR refers to the activated target.
+`FeeRouter` splits each swept amount by three governable values. `rebateBps` goes to the operator. `buybackBps` goes to `BuybackBurner` ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)). The treasury (the Timelock) receives the remainder. The split has no bounds. A non-zero `buybackBps` needs a non-zero burner address, and a non-zero treasury remainder needs a non-zero treasury address.
 
-**Same-transaction guarantees.** All three buckets transfer in the settlement transaction. There are no epoch buckets, no pull-based claims, no claim windows. `FeeRouter.routeSettlement` does its full work in one tx, recovering the [ADR 003 § FeeRouter Integration](003-payments.md#feerouter-integration) one-tx invariant for every bucket. Per-epoch byte counters do not drive bucket payouts; they are read by `DecdnGovernor` as the served-bytes voting-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight).
+The operator's total share is `operatorBps` plus the rebate part of the protocol share. The operator is paid on the payment chain where the redemption lands. The rebate arrives on the governance chain.
 
-**No standing safety/insurance bucket.** There is no dedicated safety/insurance reserve; the `SafetyReserve` contract is retired (`ADR 033`). Slash restitution is handled by escrow-on-slash (see [§ Slashing and burn](#slashing-and-burn)) without a standing pool. Buyback-and-burn takes 30% of routed USDC. User-facing incident recourse for downtime or bad-data delivery is **not** a protocol contract surface — see [§ Incident recourse](#incident-recourse-no-standing-reserve).
+| Setting | `rebateBps` | `buybackBps` | Operator | Buyback | Treasury |
+|---|---:|---:|---:|---:|---:|
+| Launch example | 7500 | 0 | 60% + 30% = 90% | 0% | 10% |
+| Steady example | 0 | 7500 | 60% | 30% | 10% |
 
-**Node-to-node cache-miss paid pulls route like every other settlement.** No bypass: operator-to-operator `PaymentPool` settlements forward through `FeeRouter.routeSettlement` and take the same 60/30/10 split. Self-routed pulls therefore pay the 40% non-base skim every cycle — this per-cycle skim is the wash-trading deterrent (see [§ FeeRouter split](#feerouter-split) and [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying)).
+Buyback is a setting. Governance sets `buybackBps` above 0 and the burner address when the venue is ready. Governance sets `buybackBps` to 0 to switch it off. The activation criteria are in [ADR 018 § Activation Criteria (Production)](018-liquidity-strategy.md#activation-criteria-production). The table shows example values, not code defaults.
 
-**Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 4–20× cheaper than major traditional CDNs. No deCDN-specific premium. The router's 40% non-base skim is absorbed by operator net revenue, recovered through TOKEN-economy exposure (capacity-growth lock demand, deflationary burn) and externally-funded pre-seed USDC subsidies.
+The per-epoch served-bytes counters do not drive payouts. `DecdnGovernor` reads them as the voting-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight).
 
-**Operator-aligned share = 90% at the activated target.** 60% direct + 30% burn — a different 90% from the dormant launch's 90% operator base share above. The burn raises TOKEN's mechanical demand and benefits every bond-holder uniformly.
+**No standing safety/insurance bucket.** There is no dedicated safety/insurance reserve; the `SafetyReserve` contract is retired (`ADR 033`). Slash restitution is handled by escrow-on-slash (see [§ Slashing and burn](#slashing-and-burn)) without a standing pool. User-facing incident recourse for downtime or bad-data delivery is **not** a protocol contract surface — see [§ Incident recourse](#incident-recourse-no-standing-reserve).
+
+**Node-to-node cache-miss paid pulls follow the same path as every other redemption.** There is no bypass. A self-routed pull pays the protocol share on every cycle. The USDC that stays with the protocol (buyback and treasury) is the wash-trading deterrent (see [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying)).
+
+**Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 4–20× cheaper than major traditional CDNs. No deCDN-specific premium. The protocol share is absorbed by operator net revenue, recovered through TOKEN-economy exposure (capacity-growth lock demand, deflationary burn) and externally-funded pre-seed USDC subsidies.
 
 **Value accrual mechanism.** Two prongs:
 
 - **Capacity-growth lock demand.** Every new operator or tier upgrade is a new buyer of TOKEN to bond. The demand is mechanically tied to network capacity growth, not to a promise of yield.
-- **Deflationary burn.** 30% of routed USDC is swapped to TOKEN and burned per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol).
+- **Deflationary burn.** The share governance sets as `buybackBps` is swapped to TOKEN and burned per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol). The burn raises TOKEN's mechanical demand and benefits every bond-holder uniformly.
 
 ### Recognizing testnet operators
 
@@ -266,7 +269,7 @@ The appeal state machine lives in the standalone `SlashAppeal` contract, which d
 
 **Slashing distribution at finality.** **50% challenger / 50% burn**. The challenger share is the deterrent that pays for active enforcement; the burn share preserves the deflationary deterrent. (There is no safety-reserve leg; the `SafetyReserve` contract is retired — `ADR 033`. The burn leg takes the full 50%.)
 
-**Buyback-and-burn inflow.** **30% of routed USDC** flows to `BuybackBurner` from `FeeRouter`. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol) specifies the Uniswap V3 50/50 swap, TWAP, `minTokenOut`, POL custody, and per-epoch liquidity cap. The burner snapshots the protocol treasury as an immutable at construction. `rescueUSDC(amount)` recovers USDC that is stranded in the burner — inflow that arrived while the venue was unwired, or the balance held before a `setBuybackBurner` replacement — and sends it only to that fixed treasury. The hatch cannot redirect the buyback bucket to a caller-supplied address, so governance recovers stranded funds without gaining a drain path. TOKEN is always burned and never leaves the contract.
+**Buyback-and-burn inflow.** The share governance sets as `buybackBps` flows to `BuybackBurner` from the governance-chain `FeeRouter` on each sweep. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol) specifies the Uniswap V3 50/50 swap, TWAP, `minTokenOut`, POL custody, and per-epoch liquidity cap. The burner snapshots the protocol treasury as an immutable at construction. `rescueUSDC(amount)` recovers USDC that is stranded in the burner — inflow that arrived while the venue was unwired, or the balance held before a `setBuybackBurner` replacement — and sends it only to that fixed treasury. The hatch cannot redirect the buyback bucket to a caller-supplied address, so governance recovers stranded funds without gaining a drain path. TOKEN is always burned and never leaves the contract.
 
 **Operational constraint.** Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed available market depth, especially at low TOKEN prices — the [ADR 018 § TWAP policy](018-liquidity-strategy.md#twap-policy-multi-call-sub-swaps) governs the per-epoch liquidity ceiling (`epochLiquidityCapFraction`, default 10%, bounded `[1%, 30%]`).
 
@@ -307,7 +310,7 @@ Each epoch's counted bytes are capped at what the operator's declared capacity t
 - Operator-only governance mirrors how Filecoin's storage-provider class and Helium's hotspot class are the load-bearing voting constituency in those networks.
 - It enforces the work-token framing structurally rather than rhetorically.
 
-**Non-operator holder protection** lives at the contract level (immutable share floors per [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds)), not at the governance level. Operators cannot vote to push the operator-base share above 90% or burn below 5%; non-operator value accrual is structurally guaranteed within those bounds.
+**Operator guarantee.** The operator guarantee is the immutable `operatorBps` on each `PaymentPool`. Governance cannot lower it.
 
 **Investor disposition is consistent with the existing entity design.** Per the entity-structure design § Pattern A (Legal Fiction Separation), the existing structure already excludes investors and other non-operator holders from DAO voting by structure — DAO governance is permissionless and no-KYC; investor influence is routed to the Labs (C-Corp) equity layer (Series A+ board seats, standard preferred-stock protective provisions, indirect TOKEN exposure via Labs' ~15% treasury allocation). DAO voting is restricted to operators — a change to who-among-active-participants votes, not a removal of an investor right that ever existed in entity design. Term-sheet language should not promise a ve-lock passive-governance path, because that was never a designed-in investor right.
 
@@ -315,7 +318,7 @@ Each epoch's counted bytes are capped at what the operator's declared capacity t
 
 | Parameter | Value | Source |
 |---|---|---|
-| Voting source | `FeeRouter.bytesInWindow` capped per epoch by `CapacityBond.declaredMbpsAtEpoch`, + `FeeRouter.totalBytesInWindow` × `age_ramp(CapacityBond.firstBondedAt)`; zeroed for `windowEpochs` after slash via `CapacityBond.slashedAtEpoch` | [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) |
+| Voting source | Governance-chain `FeeRouter.bytesInWindow` (fed by sweeps) capped per epoch by `CapacityBond.declaredMbpsAtEpoch`, + `FeeRouter.totalBytesInWindow` × `age_ramp(CapacityBond.firstBondedAt)`; zeroed for `windowEpochs` after slash via `CapacityBond.slashedAtEpoch` | [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) |
 | Proposal threshold | 0.1% of total bytes-weighted weight | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Quorum | 4% of total bytes-weighted weight | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Voting delay | 1 day | matches [ADR 009](009-governance.md#adr-009-governance-model) |
@@ -338,7 +341,7 @@ The voting set is narrow at launch (likely <50 operators in the first 6–12 mon
 
 **Bond is the only TOKEN-side requirement.** There is no optional lock for additional yield. At entry, the bond must meet the larger of the curve and the global `minBond` floor (see [§ Minimum bond is non-retroactive](#minimum-bond-is-non-retroactive)).
 
-**Revenue stream.** **60% of every redemption** — direct USDC, same-tx, per-byte. There is no TOKEN-denominated operator emission or on-chain credit.
+**Revenue stream.** **`operatorBps` (60% in the reference deployment) of every redemption** — direct USDC, same-tx, per-byte, paid on the payment chain where the redemption lands. The rebate arrives on the governance chain. There is no TOKEN-denominated operator emission or on-chain credit.
 
 **Genesis-day operator math (1 Gbps operator, no starting TOKEN).**
 
@@ -350,14 +353,14 @@ The voting set is narrow at launch (likely <50 operators in the first 6–12 mon
 
 ### Incident recourse (no standing reserve)
 
-There is no standing safety/insurance reserve; the `SafetyReserve` contract and its FeeRouter bucket do not exist (`ADR 033`, retired). Incorrect-slashing / appeal reversals are made whole by **escrow-on-slash** ([§ Slashing and burn](#slashing-and-burn)): the operator's own escrowed TOKEN is returned, so no pool is required. Relay / sequencer / payment-pool downtime and bad-data delivery have **no protocol-funded recourse surface** — reputation decay ([ADR 008](008-reputation.md#adr-008-reputation-system)) is the standing deterrent, and any discretionary restitution is a slow DAO Treasury governance action funded from the 10% treasury bucket (no emergency-multisig fast-track). This scope suits the testnet-scale launch; a future ADR may add a funded recourse surface before mainnet carries real customer SLAs.
+There is no standing safety/insurance reserve; the `SafetyReserve` contract and its FeeRouter bucket do not exist (`ADR 033`, retired). Incorrect-slashing / appeal reversals are made whole by **escrow-on-slash** ([§ Slashing and burn](#slashing-and-burn)): the operator's own escrowed TOKEN is returned, so no pool is required. Relay / sequencer / payment-pool downtime and bad-data delivery have **no protocol-funded recourse surface** — reputation decay ([ADR 008](008-reputation.md#adr-008-reputation-system)) is the standing deterrent, and any discretionary restitution is a slow DAO Treasury governance action funded from the treasury share (no emergency-multisig fast-track). This scope suits the testnet-scale launch; a future ADR may add a funded recourse surface before mainnet carries real customer SLAs.
 
 ### Liquidity Provision allocation (POL + Market Making)
 
 The 15% Liquidity Provision category splits across two top-level groups:
 
 - **Market Making — 5pp / 50M TOKEN** (group 7, genesis-liquid). Distributed to vetted market-maker partners under standard MM agreements for two-sided quoting on CEXes and DEX aggregators.
-- **Protocol-Owned Liquidity — 10pp / 100M TOKEN** (group 3, treasury-deployed). Held by DAO Treasury and deployed as a full-range 50/50 position on the Uniswap V3 pool per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol). The USDC arm is funded from the DAO's 10% `FeeRouter` revenue share and the pool is created by the DAO itself; no pre-seed or team/investor capital seeds it. Earns trading fees (yield flows to Treasury, not to per-holder claims). Cannot be withdrawn without a governance proposal (timelock + quorum).
+- **Protocol-Owned Liquidity — 10pp / 100M TOKEN** (group 3, treasury-deployed). Held by DAO Treasury and deployed as a full-range 50/50 position on the Uniswap V3 pool per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol). The USDC arm is funded from the DAO's treasury share of the `FeeRouter` split and the pool is created by the DAO itself; no pre-seed or team/investor capital seeds it. Earns trading fees (yield flows to Treasury, not to per-holder claims). Cannot be withdrawn without a governance proposal (timelock + quorum).
 
 POL is *protocol-owned*; it doesn't create passive yield to any external holder. Trading-fee yield is treasury-direct (not re-routed through `FeeRouter`), preserving the FeeRouter's strict per-byte-settlement accounting. The 15% combined allocation sits at the top of the typical 5–15% DeFi range and is defensible for an infrastructure protocol focused on liquidity depth as a primary value-accrual lever; the absence of a Liquidity Mining program eliminates the residual Howey prong-4 exposure that an LP-token-yield program would carry.
 
@@ -369,7 +372,7 @@ Approximate use of pre-seed USDC:
 
 | Use | Approx allocation | Notes |
 |---|---:|---|
-| Operator infrastructure subsidies (direct USDC) | ~85% | Covers VPS/bandwidth for first 12 months for early operators; the primary lever making first-year operator unit economics positive (there is no on-chain TOKEN credit). Absorbs the whole POL-seed budget: POL is not seeded from pre-seed USDC — the DAO funds it from its 10% `FeeRouter` revenue share and creates the pool itself ([ADR 018 § Protocol-Owned Liquidity mechanics](018-liquidity-strategy.md#protocol-owned-liquidity-mechanics)) |
+| Operator infrastructure subsidies (direct USDC) | ~85% | Covers VPS/bandwidth for first 12 months for early operators; the primary lever making first-year operator unit economics positive (there is no on-chain TOKEN credit). Absorbs the whole POL-seed budget: POL is not seeded from pre-seed USDC — the DAO funds it from the treasury share of the `FeeRouter` split and creates the pool itself ([ADR 018 § Protocol-Owned Liquidity mechanics](018-liquidity-strategy.md#protocol-owned-liquidity-mechanics)) |
 | Treasury incident-contingency buffer (USDC) | ~10% | Discretionary buffer for governance-approved incident restitution before fee inflows reach steady state (no dedicated reserve contract — held by the DAO Treasury) |
 | Audits, legal, contingency | ~5% | Operational, not protocol-bound |
 
@@ -377,13 +380,10 @@ Approximate use of pre-seed USDC:
 
 ### Governable parameters with safety bounds
 
-Router shares and capacity-curve parameters are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model), and bounded as below. Sum-to-100% across the three router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
+Capacity-curve parameters and the `FeeRouter` split are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model). The split (`rebateBps`, `buybackBps`, treasury remainder) has no bounds. The parameters below carry bounds.
 
 | Parameter | Default | Min | Max |
 |---|---:|---:|---:|
-| Operator base share | 60% | 40% | 90% |
-| Burn share | 30% (0% while dormant) | 5% when active | 50% |
-| Treasury share | 10% | 0% | 30% |
 | α (capacity-curve exponent) | 1.2 | 1.0 | 1.8 |
 | k (capacity-curve constant, TOKEN) | 12.6 | bounded by 1G bond ∈ [10K, 200K] | — |
 | `MAX_CAPACITY_PER_OPERATOR` | 200 Gbps | 50 Gbps | 1000 Gbps |
@@ -391,26 +391,25 @@ Router shares and capacity-curve parameters are governable, gated by 48-hour tim
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 10% | 1% | 10% |
 | `windowEpochs` (served-bytes voting window, on `FeeRouter`) | 13 | 4 | 26 |
+| `deliveryFloor` (net USDC micro-units per MB of weight, on `FeeRouter`) | 1 | 1 | 1000 |
 | Unbonding window | 14 days | 7 days | 60 days |
-
-The 40% floor on the operator base share preserves the cashflow invariant — operators always receive enough liquid USDC to cover infrastructure costs even under extreme governance proposals. The 0% floor on treasury lets governance simplify the split without dropping operator-aligned cashflow. The burn floor binds only while the burn bucket is active. `FeeRouter` accepts a zero burn share — this is the dormant launch configuration in [§ FeeRouter split](#feerouter-split) — and rejects any non-zero share below 5%. The burn bucket is therefore either off or at 5% or more; no configuration leaves it nominally on at a negligible share.
 
 #### Setter contract-level bound enforcement
 
-Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessControl` and bound-checked at the contract level — bounds are enforced regardless of caller. A future automated controller granted the parameter-setter role operates within the same bounds; out-of-range writes revert. This makes the bounds above effective for any caller (governance proposals or additive controllers), without trusting the caller to self-clamp.
+Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessControl` and bound-checked at the contract level — bounds are enforced regardless of caller. Out-of-range writes revert.
 
 ## Consequences
 
 ### Positive
 
-- **Smaller contract surface.** The contract set is `CapacityBond` (operator registry, capacity-curve bond, escrow-on-slash), `FeeRouter` (three-bucket same-tx split), `SlashAppeal` (slash-appeal state machine), `BuybackBurner`, `DecdnGovernor`, `TimelockController`, `PaymentPool`, and `TOKEN`. No standing insurance reserve, no on-chain operator-credit grant/vest machinery, no epoch / claim / snapshot machinery, no separate emissions contract.
+- **Smaller contract surface.** The contract set is `CapacityBond` (operator registry, capacity-curve bond, escrow-on-slash), `FeeRouter` (governance-chain sweep receiver and split), `SlashAppeal` (slash-appeal state machine), `BuybackBurner`, `DecdnGovernor`, `TimelockController`, `PaymentPool`, and `TOKEN`. No standing insurance reserve, no on-chain operator-credit grant/vest machinery, no epoch / claim / snapshot machinery, no separate emissions contract.
 - **Cleaner regulatory posture on Howey prong 4.** Passive holding earns nothing. No delegator pool, no ve-lock yield, no per-holder claim on revenue. Operator-only governance + entity design Pattern A's existing exclusion of investors from DAO voting closes both the cashflow-rights and common-enterprise vectors.
-- **Mechanical value-accrual lever.** Capacity-growth lock demand scales with network throughput; the 30% burn share is the second deflationary prong.
-- **No cashflow crisis at the operator layer.** 60% liquid USDC per settlement is comfortably above infrastructure-cost coverage at the reference 1 Gbps / 30K GB/mo node.
+- **Mechanical value-accrual lever.** Capacity-growth lock demand scales with network throughput; the buyback share is the second deflationary prong.
+- **No cashflow crisis at the operator layer.** `operatorBps` (60% in the reference deployment) liquid USDC per redemption is comfortably above infrastructure-cost coverage at the reference 1 Gbps / 30K GB/mo node.
 - **USDC pre-seed eliminates TOKEN-price reflexivity in bootstrap.** Subsidy purchasing power does not collapse with TOKEN price.
 - **Escrow-on-slash eliminates clawback risk and TOKEN-price risk in restitution.** A wrongly-slashed operator is made whole by returning their own escrowed TOKEN — no USDC conversion, no TWAP oracle, no `MAX_APPEAL_RESTITUTION` cap, no standing-pool solvency dependency, and nothing distributed before the appeal window closes.
 - **Slashing distribution is simple and deflationary.** At finality a slash splits 50% challenger (active-enforcement deterrent) / 50% burn. No insurance-pool leg.
-- **Wash-trading is structurally defeated.** Operator revenue is per-byte at the `FeeRouter` (the operator base is paid by the client, not pooled), so faking traffic does not raise revenue. Governance vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — proven delivered bytes, capped per epoch by declared capacity — so over-declaring a tier does not translate into governance influence either; the cap only narrows counted bytes, it never grants weight for capacity that was declared but not delivered. The super-linear bond curve makes over-declared capacity a dead-capital drag with no governance or revenue upside.
+- **Wash-trading is structurally defeated.** Operator revenue is per-byte (the operator share is paid by the client, not pooled), so faking traffic does not raise revenue. Governance vote weight is sourced from the governance-chain `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — proven delivered bytes, capped per epoch by declared capacity — so over-declaring a tier does not translate into governance influence either; the cap only narrows counted bytes, it never grants weight for capacity that was declared but not delivered. The super-linear bond curve makes over-declared capacity a dead-capital drag with no governance or revenue upside.
 
 ### Negative
 
@@ -428,21 +427,21 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 ## Cross-ADR Impact
 
-- **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model):** `FeeRouter.routeSettlement` distributes to three buckets, and the same-tx settlement invariant holds across all three (see §FeeRouter Integration).
-- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is `FeeRouter`-derived served-bytes weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders carry zero weight. The multisig bootstrap phase ends with a manual one-shot transition the multisig executes.
+- **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model):** `PaymentPool` pays `operatorBps` in the redemption transaction and sweeps the protocol share to the governance-chain `FeeRouter` (see [§ FeeRouter Integration](003-payments.md#feerouter-integration)).
+- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is served-bytes weight from the governance-chain `FeeRouter` bytes ledger, fed by sweeps, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders carry zero weight. The multisig bootstrap phase ends with a manual one-shot transition the multisig executes.
 - **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Defines the canonical DAO voting-weight formula the §Governance "Voting weight" section above points to. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, each epoch's bytes capped at what `CapacityBond.declaredMbpsAtEpoch` could physically deliver over that epoch, capped per-operator at `voteCapBps` against the bytes-weighted total, zeroed if `CapacityBond.slashedAtEpoch` falls inside the trailing window. `windowEpochs` (default 13) is a governable parameter. Vote weight derives from proven delivered bytes, capped by declared capacity rather than granted by it, so the design has no capacity-shortfall slashing path, no `min_delivery_ratio`, and no registration probe gate; the `cdn/probe/v1` ALPN serves [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) rate-manipulation slash evidence and operator latency/availability discovery, not declared-capacity enforcement.
-- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** `CapacityBond` is the operator registry / capacity-curve bond and exposes the escrow-on-slash settle hooks consumed by `SlashAppeal`. `FeeRouter` is the three-bucket settlement distributor. Class diagrams reflect this surface.
-- **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol):** POL is 10% (group 3); MM is 5% (group 7); combined Liquidity-Provision category is 15%. `BuybackBurner` receives 30% of routed USDC at every settlement. §POL Governance formalizes rebalance / withdraw / fee-accounting rules.
+- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** `CapacityBond` is the operator registry / capacity-curve bond and exposes the escrow-on-slash settle hooks consumed by `SlashAppeal`. `FeeRouter` is the governance-chain sweep receiver and split. Class diagrams reflect this surface.
+- **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol):** POL is 10% (group 3); MM is 5% (group 7); combined Liquidity-Provision category is 15%. `BuybackBurner` receives the `buybackBps` share of each sweep. §POL Governance formalizes rebalance / withdraw / fee-accounting rules.
 - **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** Slashing applies to the operator's voluntary `CapacityBond` via escrow-on-slash; the `SlashAppeal` contract resolves appeals (a granted appeal refunds the escrowed bond liquid).
 - **`ADR 032` — SafetyReserve Appeal-Surface Contract Surface:** RETIRED. The `SlashAppeal` contract holds the appeal state machine; the contract surface is pinned in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface).
 - **`ADR 033` — Safety and Insurance Reserve:** RETIRED. The `SafetyReserve` contract, its 5% FeeRouter bucket, and the 30% slash-redirect are removed; slash restitution is handled by escrow-on-slash.
 - **`ADR 034` — Gauge Boost and Voting Escrow:** RETIRED. The gauge-boost mechanism, `VotingEscrow` contract, and per-operator gauge-share cap are replaced by the capacity-bond curve.
-- **`ADR 035` — Delegator Pool:** RETIRED. The 7% delegator bucket and `DelegatorBuyer` pipeline do not exist; the router split has three buckets.
+- **`ADR 035` — Delegator Pool:** RETIRED. The 7% delegator bucket and `DelegatorBuyer` pipeline do not exist; the router split has operator rebate, buyback and treasury.
 
 ## Deferred & Open
 
 1. **k governance volatility.** k=12.6 is a discovered constant for the chosen 1G-tier target bond (50K TOKEN). The current bound parameterizes k indirectly via the 1G-tier bond range [10K, 200K TOKEN]; an alternative is to make k immutable post-genesis and only governable via a one-shot setter behind a higher quorum. Recommend modeling impact in finance notebooks before locking the convention.
 2. **App Incentives 15/4 split governance.** The publisher-rebate / integration-grant split (150M / 40M indicative) is a governance norm, not on-chain enforced. Confirm DAO can rebalance within the 19% envelope without requiring an ADR amendment.
 3. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Flag for future ADR if observed.
-4. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the canonical L2 and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Most relevant for any holder cohort distributed without an operating expectation (Public Sale, MM-partner allocations).
-5. **POL trading-fee accounting.** The 10% POL position (group 3) earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the three-bucket split if that improves predictability of treasury yield.
+4. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the governance chain and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Most relevant for any holder cohort distributed without an operating expectation (Public Sale, MM-partner allocations).
+5. **POL trading-fee accounting.** The 10% POL position (group 3) earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the `FeeRouter` split if that improves predictability of treasury yield.

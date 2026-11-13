@@ -37,8 +37,9 @@ Before any on-chain or protocol activity:
 
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with sufficient funds:
    - **TOKEN:** at minimum **`max(minBond, k × declared_Mbps^α)`** for the capacity bond ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), [ADR 026 § Minimum bond is non-retroactive](026-tokenomics.md#minimum-bond-is-non-retroactive)). At defaults `k=12.6`, `α=1.2`, the curve gives ~50K TOKEN for a 1 Gbps tier, ~795K TOKEN for 10 Gbps, and ~12.6M TOKEN for 100 Gbps. `minBond` is the global entry floor, and `registerNode` reverts below it. When the curve value for a tier is below `minBond`, the operator bonds `minBond`. Declared capacity must be at least `MIN_CAPACITY_PER_OPERATOR` (default 10 Mbps, ~200 TOKEN on the curve alone); a declaration below the floor reverts. There is no discount-stake threshold; operators do not earn additional yield by bonding above their declared capacity. Operators lacking the entry-tier bond may qualify for externally-funded operator-onboarding programs (see [ADR 026 § Bootstrap mechanism — pre-seed USDC](026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc)).
-   - **Native gas token:** ~$0.50–$1.00 for the Phase 2 transactions at typical L2 gas prices.
-   - **Optional USDC:** only required if the operator intends to open outbound payment pools immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open pools that pay the node without any USDC on the node side.
+   - **Governance-chain gas:** ETH for the Phase 2 transactions. Registration and bond operations run on the governance chain ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
+   - **Payment-chain gas:** the operator also holds the native gas token on each payment chain where it redeems and sweeps.
+   - **Optional USDC:** only required if the operator intends to open outbound payment pools immediately on a payment chain (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open pools that pay the node without any USDC on the node side.
 
    - **Wallet.** A plain EOA keystore is the documented default, and it is the only wallet that can sign `slash_sig` — a paying client verifies the `StreamResponse` signature off-chain by recovering the signer against the node's registered address, so a Safe-addressed operator cannot complete a paid delivery. A Safe is supported on the cold paths (bond, register, pool open/close, unbond) because every contract verifies through `SignatureChecker`, but a node cannot serve traffic from a Safe: separating a hot serving key from Safe-custodied funds is unimplemented ([ADR 024 § Unimplemented — Operator Custody While Serving](024-account-abstraction.md#unimplemented--operator-custody-while-serving)). Operators hold the native gas token for gas, the same assumption as the fees above. See [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design and the [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) for the optional EOA → Safe migration and its constraints.
 
@@ -69,7 +70,7 @@ Steps 2.1–2.2 assume the operator already holds the TOKEN the bond requires. T
 
 Call `TOKEN.approve(capacityBond, amount)` where `amount ≥ max(minBond, bond_required(declared_Mbps))`. The curve is `bond = k × Mbps^α` ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), and `minBond` is the entry floor ([ADR 026 § Minimum bond is non-retroactive](026-tokenomics.md#minimum-bond-is-non-retroactive)). This ERC-20 approval authorizes `CapacityBond` to pull the bond deposit.
 
-**Gas:** ~$0.03 (one-time; re-registrations reuse the allowance if set high enough).
+**Gas:** one ERC-20 approval, paid as governance-chain gas (one-time; re-registrations reuse the allowance if set high enough).
 
 #### Step 2.2 — Register at declared capacity
 
@@ -79,7 +80,7 @@ The bond locks immediately and is slashable from this point forward, including d
 
 **No separate ve-position exists.** The bond is the only TOKEN-side requirement on operators. There is no optional lock for additional yield; non-operator TOKEN holders earn nothing and have no governance weight ([ADR 026 § Governance](026-tokenomics.md#governance)).
 
-**Gas:** ~$0.05.
+**Gas:** two small governance-chain transactions.
 
 #### Step 2.3 — Register node
 
@@ -110,9 +111,9 @@ ed25519Signature = ed25519 sign(nodePrivKey,
 
 Both signing operations are supported by the `decdn` CLI (`decdn node register` prints the required parameters, signs locally, submits the transaction). The binding signature covers `termsHash`, so registration records the operator's acceptance of the current operator terms in the same signature — see [§ Operator Safety Obligations](#operator-safety-obligations). `registerNode` requires `termsHash == currentTermsHash` and emits `TermsAccepted(nodeId, termsHash, timestamp)` ([ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding)). Rebinding a NodeId later (`bindNodeId`, key rotation) signs the narrower `BindNodeId` payload and carries no `termsHash`.
 
-**Gas:** ~$0.26–$0.46 (includes on-chain ed25519 verification via Solidity library; one-time per node lifetime).
+**Gas:** about 1M governance-chain gas (includes on-chain ed25519 verification via Solidity library; one-time per node lifetime).
 
-**Emitted events:** `NodeRegistered`, `NodeIdBound` — off-chain indexers and other nodes' registry caches reflect the new node within one sub-second L2 block.
+**Emitted events:** `NodeRegistered`, `NodeIdBound`. Off-chain indexers and other nodes' registry caches pick them up from the governance chain.
 
 ### Phase 3 — Node Startup (State Synchronization)
 
@@ -136,7 +137,7 @@ If the read fails, the node retries it as [Boot-time chain reads](#boot-time-cha
 
 #### Boot-time chain reads
 
-Four boot reads must succeed before the node serves: the registry snapshot (Step 3.2), the slash enumeration, the `PaymentPool.usdc()` self-check, and the blacklist enumeration with its enforcement pass (Step 3.1).
+Four boot reads must succeed before the node serves: the registry snapshot (Step 3.2), the slash enumeration, the `PaymentPool.usdc()` self-check, and the blacklist enumeration with its enforcement pass (Step 3.1). The registry, slash, and blacklist reads target the governance chain. The `PaymentPool.usdc()` read targets the payment chain.
 
 - A transient RPC failure does not stop the node. The node retries the read with exponential backoff. The backoff starts at 1 s and doubles on each retry. It does not increase above 60 s.
 - One boot deadline applies to all four reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
@@ -145,7 +146,7 @@ Four boot reads must succeed before the node serves: the registry snapshot (Step
 - The registry, slash, and blacklist enumerations read at one snapshot block. The snapshot block is 256 blocks below the head that the RPC reports. A load-balanced RPC reports the head of its newest upstream. An upstream that is behind that head cannot serve it, but all upstreams can serve an older block. If the contract has no code at the snapshot block, the contract is newer than the margin, and the node reads at the head.
 - Each event tail starts at its snapshot block. The first poll applies the events between the snapshot block and the head again. Each watcher ignores an event that it already has.
 
-The fee-share reads (`PaymentPool.feeRouter()` and `FeeRouter.getShares()`) use the same retry. They retry for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after them. When they fail, the node uses the floor fee share and does not stop.
+The operator-share read (the payment chain pool's immutable `operatorBps`) uses the same retry. It retries for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after it. When it fails, the node does not stop. It holds no operator share and makes no upstream purchase until a later read of `operatorBps` succeeds ([ADR 041](041-refuse-to-serve.md#adr-041-refuse-to-serve-economics)).
 
 #### Step 3.3 — Configure local rate
 
@@ -155,8 +156,7 @@ Set the node's `rate_per_mb`, satisfying `rate_per_mb ≤ MAX_RATE_PER_MB`. This
 
 After Phases 1–3, the node is fully operational and should accept traffic. On-chain registration alone makes the node discoverable: peers reading the `CapacityBond` active set find it and begin probing it for content.
 
-After Phase 3, the node can accept connections immediately, even before every peer's registry view reflects the new registration. Sub-second L2 block times keep that convergence window small.
-
+After Phase 3, the node can accept connections immediately, even before every peer's registry view reflects the new registration.
 **Acceptance criteria (all must hold):**
 
 | # | Check | How to verify |
@@ -281,7 +281,7 @@ Mechanism-specific guidance — particular hash-match databases, reporting endpo
 
 ### Negative
 
-- Phase 2 requires three ordered on-chain transactions (`approve`, `stake`, `registerNode`), each confirmed before the node can start. Sub-second L2 block times keep this fast, but operator tooling must handle nonce management across them.
+- Phase 2 requires three ordered on-chain transactions (`approve`, `stake`, `registerNode`), each confirmed before the node can start. Operator tooling must handle nonce management across them.
 - Multiaddr registration before iroh starts requires either a static IP/port (suitable for most VPS deployments) or a two-step workflow (start node, observe addresses, then register or update).
 - Cold-start reputation (0.5, a 4× score penalty vs. a reputable node) means new nodes must price aggressively or build a track record before they compete for traffic. This is a known and accepted property of [ADR 008](008-reputation.md#adr-008-reputation-system).
 - The `TermsAccepted` record evidences assent, not compliance; substantive screening remains unverifiable on-chain and is enforced only by the operator's jurisdiction.

@@ -119,7 +119,7 @@ The pointer is an EIP-712 record:
 Pointer(uint256 namespaceId,bytes32 root,uint64 seq)
 ```
 
-The domain is `decdn-pointer`, version `1`, with the chain id and the
+The domain is `decdn-pointer`, version `1`, with the governance chain id and the
 `PublisherRegistry` address as `verifyingContract`. A pointer signed for one
 deployment means nothing on another: namespace ids repeat across chains and
 redeploys. `root` is the bundle's manifest hash. `seq` orders the pointers
@@ -166,7 +166,7 @@ key's hold with one `decdn publish point`.
 
 Pointers live in `<data-dir>/pointers/<ns>.json`, one file per namespace,
 with the signer each recovered to, the highest `seq` stored from each
-signer, and the chain id and registry the owner was read on. The gateway
+signer, and the governance chain id and registry the owner was read on. The gateway
 reads them at start and fails to start on a damaged file, or on a file
 stored for another deployment: the same data dir on another chain or
 registry does not serve pointers nobody there signed. A restart changes no
@@ -282,7 +282,7 @@ wants to see how a site is served runs a loopback gateway and
 | `mode` | `loopback` or `public`. |
 | `version` | The `decdn` version. |
 | `started_unix`, `uptime_secs`, `listen` | When the gateway started, and its main listen address. |
-| `chain_id`, `payment_pool` | The deployment the gateway pays on. |
+| `chain_id`, `payment_pool` | The payment chain id and pool the gateway pays on. |
 | `counters` | The [metrics](#metrics) series, each by its name without the `decdn_gateway_` prefix and the `_total` suffix. |
 | `active_pulls` | Each pull in flight: blob hash, namespace, byte window, payer, age, bytes delivered. |
 | `capabilities` | The registered capabilities, in the shape of `GET /_capability`. A public gateway holds none. |

@@ -159,7 +159,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 #### Trusted — the client relies on external guarantees
 
-- **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list.
+- **RPC endpoints:** The governance-chain RPC returns correct registry data. A compromised RPC can return a fabricated node list.
 - **Registry correctness:** The `CapacityBond` contract accurately reflects bonded operators. Enforced by EVM execution — trust in the chain, not any specific party.
 
 #### Not trusted — the client does not rely on these
@@ -219,7 +219,7 @@ Default configuration:
 
 A client and a node share one schema (`decdn_common::config::FileConfig`), and `deny_unknown_fields`
 rejects only unknown keys, not node-only sections a client leaves unused. So a client needs no config
-of its own: `decdn config init --chain <name>` writes a ready-to-run file — chain id, RPC endpoint,
+of its own: `decdn config init --chain <name>` writes a ready-to-run file — chain ids, RPC endpoints,
 and contract addresses baked in from the shipped deployment manifest — and a client uses the same
 file the node does, ignoring `[cache]`, `[payment]`, and the bond. `decdn get` also reads every one
 of these values as a flag, so a client can run with no config file at all. The client-relevant shape,
@@ -227,9 +227,17 @@ in current schema terms:
 
 - `[identity]` — `data_dir` (holds the buyer payment-pool store and, by default, the ETH
   keystore) and an optional ISO 3166-1 alpha-2 `region`.
-- `[blockchain]` — `rpc_url`, `eth_keystore`, `chain_id`, plus the `payment_pool_address` /
-  `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
-  and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
+- `[blockchain]` — `eth_keystore` and two chain coordinate sets. The governance-chain registry
+  set is an RPC endpoint, the chain id, `capacity_bond`, and `slash_judge`. The payment-chain set
+  is an RPC endpoint, the chain id, and `payment_pool`. A client reads the registry from the
+  governance chain and pays on the payment chain ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
+  A client with pools on several payment chains lists one payment-chain set for each. For each
+  candidate node it picks a chain that is in its own list and in the node's `payment_chains` probe
+  hint, and it sets that chain as `chain_id` in the `StreamRequest`
+  ([ADR 005 § Payment chain routing](005-protocol.md#payment-chain-routing)). A node that refuses
+  the chain lists its accepted chains in the refusal, and the client retries that node once on a
+  listed chain where it holds a funded pool.
+  The RPC URLs and keystore live here, **not** under `[network]`/`[keys]`.
 - `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
   probing to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull
   applies it to each entry's candidate sample, with the same widening rule as a single fetch.

@@ -6,7 +6,7 @@
 
 A node serves a cache miss by buying the bytes upstream and reselling them to
 the client. Every settlement, including a node-to-node buy leg, pays the
-`FeeRouter` split. The operator nets the operator share of each sale and pays
+pool's `operatorBps` split. The operator nets the operator share of each sale and pays
 the full upstream price. A single serve therefore clears only when the upstream
 price is far enough below the sell price to cover the skim.
 
@@ -135,9 +135,9 @@ governance concern.
 
 - **Sell rate.** The node's served price, after the on-chain rate-bounds floor
   ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
-- **Operator share.** The operator basis points from the `FeeRouter` shares.
-  The node seeds the value at startup and refreshes it through the shared
-  chain-event poller. The node holds no hardcoded split.
+- **Operator share.** The operator basis points are the payment-chain
+  pool's immutable `operatorBps`. The node reads the value at startup.
+  The node holds no hardcoded split.
 - **Heat.** The frequency estimate from the [ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies)
   `FrequencyEstimator`. That estimator observes one sighting per served request
   at the serve chokepoint. Fills and probes emit no sighting. A node therefore
@@ -307,9 +307,8 @@ deposit.
    node applies the credit cannot redirect it.
 5. `max_buy` composes with `cache.max_rate_per_mb` by the lower-of rule and is
    enforced at buy commit, so a higher rate in a signed response aborts the leg.
-6. The operator share comes from the `FeeRouter` shares, seeded at startup and
-   refreshed through the shared chain-event poller; the node holds no hardcoded
-   split.
+6. The operator share is the pool's immutable `operatorBps`, read at startup;
+   the node holds no hardcoded split.
 7. The heat signal comes from the shared `FrequencyEstimator`
    ([ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies)), which observes only served requests. The
    node builds the estimator when any of `tinylfu` admission, `tinylfu`
