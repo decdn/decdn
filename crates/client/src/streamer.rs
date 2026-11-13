@@ -24,6 +24,7 @@
 
 use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,21 +45,108 @@ use crate::pacer::{DownstreamFrontier, PULL_WINDOW_FLOOR, WindowPacer};
 use crate::recovery::RecoveryGate;
 use crate::scheduler::{AcquireEnv, AcquireTarget, ConsumptionPacing, LaneLease, acquire};
 use crate::sink::BlobCache;
-use crate::source::Funder;
+use crate::source::{Funder, IngestStore};
 use crate::source_set::{Holder, SourceProvider, SourceSet};
 use crate::stop::{ProgressClock, StopPolicy};
-use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig, RangedStore};
+use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig};
 
 /// The most verified bytes one store read hands the reader. It bounds the
 /// reader's buffer independently of the read-ahead window.
 const MAX_READ_CHUNK: u64 = 1024 * 1024;
 
+/// A fill store a [`Streamer`] writes and reads back at the same time: an
+/// [`IngestStore`] that also wakes a waiting reader when an ingest checkpoint
+/// makes more verified bytes present.
+#[doc(hidden)]
+pub trait StreamStore: IngestStore + 'static {
+    /// Woken each time an ingest checkpoint makes more verified bytes
+    /// present. The reader registers on it before it reads the present
+    /// frontier, so a checkpoint that lands between the read and the wait
+    /// still wakes it.
+    fn present_grew(&self) -> &Notify;
+}
+
+impl StreamStore for ClientRangedStore {
+    fn present_grew(&self) -> &Notify {
+        Self::present_grew(self)
+    }
+}
+
+/// Opens the fill store for each stream a [`Streamer`] opens.
+#[doc(hidden)]
+pub trait StreamStores {
+    /// The store each stream fills.
+    type Store: StreamStore;
+
+    /// Open the store for `hash`, sized to the stream's size claim
+    /// `total_bytes`. A store that already holds verified bytes of `hash`
+    /// keeps them, and the stream fetches only what is missing. Two streams
+    /// must not fill one store at the same time: an implementation either
+    /// returns a distinct store per call, or documents which calls share one
+    /// so its caller keeps those streams apart.
+    fn open(
+        &self,
+        hash: [u8; 32],
+        total_bytes: u64,
+    ) -> impl Future<Output = anyhow::Result<Self::Store>> + Send;
+}
+
+impl<T: StreamStores + Sync> StreamStores for &T {
+    type Store = T::Store;
+
+    fn open(
+        &self,
+        hash: [u8; 32],
+        total_bytes: u64,
+    ) -> impl Future<Output = anyhow::Result<Self::Store>> + Send {
+        (**self).open(hash, total_bytes)
+    }
+}
+
+/// The [`Streamer`]'s default fill stores: a [`ClientRangedStore`] named by
+/// the blob's hash in a scratch directory.
+///
+/// The caller owns the directory and its cleanup. A streamed blob is not
+/// kept, so a temporary directory is the usual choice. The store's `.partial`
+/// grows to the whole blob as the stream advances (a window's `.partial` is
+/// sparse outside the window), so the directory needs room for all of it.
+/// Every call for one hash returns the same store, so two concurrent streams
+/// of one blob need two directories.
+#[derive(Debug, Clone, Copy)]
+pub struct ScratchStores<'a> {
+    scratch: &'a Path,
+}
+
+impl<'a> ScratchStores<'a> {
+    /// Fill stores in `scratch`.
+    #[must_use]
+    pub const fn new(scratch: &'a Path) -> Self {
+        Self { scratch }
+    }
+}
+
+impl StreamStores for ScratchStores<'_> {
+    type Store = ClientRangedStore;
+
+    async fn open(&self, hash: [u8; 32], total_bytes: u64) -> anyhow::Result<ClientRangedStore> {
+        let stem = blake3::Hash::from_bytes(hash).to_hex().to_string();
+        let scratch = self.scratch.to_path_buf();
+        // Off the runtime: opening a finalized blob hashes its final file.
+        tokio::task::spawn_blocking(move || {
+            ClientRangedStore::open_or_create(&scratch, &stem, hash, total_bytes)
+                .map_err(|e| anyhow::anyhow!("open stream store for {stem}: {e}"))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("open stream store task: {e}"))?
+    }
+}
+
 /// Shared between the drive future and the [`VerifiedReader`]: the fill store,
 /// the consumer cursor, the drive's outcome, and the wake signals that pace one
 /// against the other.
-struct StreamState {
+struct StreamState<S> {
     /// The bao-verifying fill store the drive future writes and the reader reads.
-    store: ClientRangedStore,
+    store: S,
     /// Content bytes the CONSUMER has read, as a blob offset. It is the
     /// downstream frontier the [`WindowPacer`] gates the pull against, so the
     /// fetch stays within one read-ahead window of it.
@@ -70,7 +158,7 @@ struct StreamState {
     /// size a leg proves. The stream ends at the smaller of the two.
     end: Option<u64>,
     /// The caller's size hint: the fetch's first claim. The stream ends at the
-    /// size a leg proves ([`ClientRangedStore::proven`]), whatever this says.
+    /// size a leg proves ([`IngestStore::proven`]), whatever this says.
     hint: u64,
     /// Woken by the reader when `cursor` advances, so a pull parked on a full
     /// read-ahead window ([`PaceDecision::Wait`](crate::pacer::PaceDecision::Wait))
@@ -85,7 +173,7 @@ struct StreamState {
     outcome: Mutex<Option<Result<(), Arc<anyhow::Error>>>>,
 }
 
-impl StreamState {
+impl<S> StreamState<S> {
     /// Record the drive's outcome once (the first record wins) and wake the reader.
     fn finish(&self, result: anyhow::Result<()>) {
         if let Ok(mut slot) = self.outcome.lock()
@@ -117,12 +205,12 @@ impl StreamState {
 /// pauses is not a source that stalls. Once the consumer has read everything
 /// present, the missing bytes are the fetch's to deliver, so the clock runs
 /// even while a lane waits here.
-struct ConsumedWait {
-    state: Arc<StreamState>,
+struct ConsumedWait<S> {
+    state: Arc<StreamState<S>>,
     clock: Arc<ProgressClock>,
 }
 
-impl ConsumedWait {
+impl<S: StreamStore> ConsumedWait<S> {
     /// Whether verified bytes wait unread ahead of the consumer's `cursor`. A
     /// store fault reads as nothing unread, so the clock runs.
     async fn unread_ahead(&self, cursor: u64) -> bool {
@@ -132,7 +220,7 @@ impl ConsumedWait {
     }
 }
 
-impl PacingWait for ConsumedWait {
+impl<S: StreamStore> PacingWait for ConsumedWait<S> {
     fn wait(
         &self,
         observed: DownstreamFrontier,
@@ -271,8 +359,8 @@ pub(crate) const fn stream_pacer(read_ahead: u64) -> WindowPacer {
 /// A source that faults cools and returns, and its remainder moves to another
 /// meanwhile, resuming from the store's verified frontier so no delivered byte
 /// is re-pulled or re-paid.
-async fn run_drive<P, F>(
-    state: Arc<StreamState>,
+async fn run_drive<P, F, S>(
+    state: Arc<StreamState<S>>,
     inputs: DriveInputs<P, F>,
     read_ahead: u64,
     lane_cap: usize,
@@ -282,6 +370,7 @@ async fn run_drive<P, F>(
 where
     P: SourceProvider,
     F: Funder,
+    S: StreamStore,
 {
     let DriveInputs {
         provider,
@@ -379,8 +468,9 @@ where
 ///
 /// Holds the injected pull machinery — the blob's `holders`, the
 /// [`SourceProvider`] that builds their lanes, the command-wide
-/// [`PeerHealth`], and one `funder` — plus a scratch directory for the fill
-/// store. The front is fetched through [`crate::acquire`] across a small,
+/// [`PeerHealth`], and one `funder` — plus where each stream's fill store
+/// lives: a scratch directory ([`ScratchStores`]) unless the caller supplies
+/// its own stores. The front is fetched through [`crate::acquire`] across a small,
 /// bounded set of lanes; a lane that faults cools and returns.
 /// [`Streamer::open`] consumes it to start one stream.
 ///
@@ -415,7 +505,7 @@ where
 ///     drive.finish().await
 /// }
 /// ```
-pub struct Streamer<'a, P, F> {
+pub struct Streamer<'a, P, F, O = ScratchStores<'a>> {
     provider: P,
     holders: Vec<Holder>,
     health: Arc<PeerHealth>,
@@ -423,37 +513,42 @@ pub struct Streamer<'a, P, F> {
     recovery: Arc<RecoveryGate>,
     /// A delegated stream's swappable voucher credential.
     credentials: Option<CredentialSlot>,
-    /// A scratch directory the fill store's `.partial` lives in for the stream's
-    /// lifetime. The caller owns it (and its cleanup); a streamed blob is not
-    /// kept, so a temporary directory is the usual choice. The `.partial` grows
-    /// to the whole blob as the stream advances (a window's `.partial` is
-    /// sparse outside the window), so the directory needs room for all of it.
-    /// The store is named by the blob's hash, so two streams of one blob in one
-    /// directory would share it: give each stream its own directory.
-    scratch: &'a Path,
+    /// Opens each stream's fill store.
+    stores: O,
     /// The largest blob accepted, in bytes, or `0` for no cap
     /// ([`Self::max_blob_bytes`]).
     max_blob_bytes: u64,
+    /// The borrow the default [`ScratchStores`] holds.
+    scratch: PhantomData<&'a Path>,
 }
 
-impl<P, F> std::fmt::Debug for Streamer<'_, P, F> {
+impl<P, F, O> std::fmt::Debug for Streamer<'_, P, F, O> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Streamer")
             .field("holders", &self.holders.len())
             .field("recovery", &self.recovery)
-            .field("scratch", &self.scratch)
             .finish_non_exhaustive()
     }
 }
 
 impl<'a, P, F> Streamer<'a, P, F> {
     /// Build a streamer whose holders and lanes `provider` finds and builds,
-    /// funded through `funder`, filling into `scratch`.
+    /// funded through `funder`, filling into `scratch` ([`ScratchStores`]).
     ///
     /// The stream starts by discovering its holders, under a fresh
     /// [`RecoveryGate`]. The builder methods change both.
     #[must_use]
     pub fn new(provider: P, funder: F, scratch: &'a Path) -> Self {
+        Self::with_stores(provider, funder, ScratchStores::new(scratch))
+    }
+}
+
+impl<P, F, O> Streamer<'_, P, F, O> {
+    /// Build a streamer as [`Streamer::new`] does, filling each stream into
+    /// the store `stores` opens.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_stores(provider: P, funder: F, stores: O) -> Self {
         Self {
             provider,
             holders: Vec::new(),
@@ -461,8 +556,9 @@ impl<'a, P, F> Streamer<'a, P, F> {
             funder,
             recovery: Arc::default(),
             credentials: None,
-            scratch,
+            stores,
             max_blob_bytes: 0,
+            scratch: PhantomData,
         }
     }
 
@@ -514,10 +610,11 @@ impl<'a, P, F> Streamer<'a, P, F> {
     }
 }
 
-impl<P, F> Streamer<'_, P, F>
+impl<P, F, O> Streamer<'_, P, F, O>
 where
     P: SourceProvider,
     F: Funder,
+    O: StreamStores,
 {
     /// Open a consumption-paced stream over `hash` (whose content length is
     /// `total_bytes`), returning the [`VerifiedReader`] the caller drains and the
@@ -562,7 +659,7 @@ where
         config: &PullConfig,
         cache: Arc<dyn BlobCache>,
         stop: StopPolicy,
-    ) -> anyhow::Result<(VerifiedReader, StreamDrive<'a>)>
+    ) -> anyhow::Result<(VerifiedReader<O::Store>, StreamDrive<'a, O::Store>)>
     where
         P: 'a,
         F: 'a,
@@ -603,7 +700,7 @@ where
         config: &PullConfig,
         cache: Arc<dyn BlobCache>,
         stop: StopPolicy,
-    ) -> anyhow::Result<(VerifiedReader, StreamDrive<'a>)>
+    ) -> anyhow::Result<(VerifiedReader<O::Store>, StreamDrive<'a, O::Store>)>
     where
         P: 'a,
         F: 'a,
@@ -631,23 +728,13 @@ where
             ));
         }
 
-        let stem = blake3::Hash::from_bytes(hash).to_hex();
         // A claim past what the cap on held bytes lets the window reach never
         // sizes the store.
         let total_bytes = total_bytes.min(crate::scheduler::claim_reach(
             &[window],
             self.max_blob_bytes,
         ));
-        // Off the runtime: opening a finalized blob hashes its final file.
-        let store = {
-            let (scratch, stem) = (self.scratch.to_path_buf(), stem.to_string());
-            tokio::task::spawn_blocking(move || {
-                ClientRangedStore::open_or_create(&scratch, &stem, hash, total_bytes)
-                    .map_err(|e| anyhow::anyhow!("open stream store for {stem}: {e}"))
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("open stream store task: {e}"))??
-        };
+        let store = self.stores.open(hash, total_bytes).await?;
         let state = Arc::new(StreamState {
             store,
             cursor: AtomicU64::new(offset),
@@ -748,17 +835,17 @@ where
 /// Poll it for as long as the reader is read, apart from the reads —
 /// [`Self::alongside`] does exactly that. Dropping it before it resolves stops
 /// the fetch and ends the reader with an error.
-pub struct StreamDrive<'a> {
+pub struct StreamDrive<'a, S = ClientRangedStore> {
     /// The fetch. `None` once it has resolved, and for a cache hit.
     fetch: Option<Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>>,
     /// The state the outcome is recorded into. `None` for a cache hit.
-    state: Option<Arc<StreamState>>,
+    state: Option<Arc<StreamState<S>>>,
     /// The typed error the fetch ended with, until [`Self::take_error`] takes
     /// it. The reader carries only its message.
     error: Option<anyhow::Error>,
 }
 
-impl std::fmt::Debug for StreamDrive<'_> {
+impl<S> std::fmt::Debug for StreamDrive<'_, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamDrive")
             .field("running", &self.fetch.is_some())
@@ -766,7 +853,7 @@ impl std::fmt::Debug for StreamDrive<'_> {
     }
 }
 
-impl StreamDrive<'_> {
+impl<S> StreamDrive<'_, S> {
     /// Run `consume` to completion while this drive runs beside it, and return
     /// `consume`'s output. The drive is polled first on every wake, so an open
     /// paid leg is never starved by a slow consumer. If the drive finishes first,
@@ -808,7 +895,7 @@ impl StreamDrive<'_> {
     }
 }
 
-impl Future for StreamDrive<'_> {
+impl<S> Future for StreamDrive<'_, S> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -837,7 +924,7 @@ impl Future for StreamDrive<'_> {
     }
 }
 
-impl Drop for StreamDrive<'_> {
+impl<S> Drop for StreamDrive<'_, S> {
     /// A drive dropped before it resolves records a failure, so a reader still
     /// waiting on it ends with an error instead of hanging.
     fn drop(&mut self) {
@@ -855,7 +942,7 @@ impl Drop for StreamDrive<'_> {
 /// verified frontier by construction (it only reads bytes the engine has already
 /// bao-verified). Its cursor paces the paired [`StreamDrive`].
 #[non_exhaustive]
-pub enum VerifiedReader {
+pub enum VerifiedReader<S = ClientRangedStore> {
     /// A whole-blob cache hit: served straight from memory, no fetch.
     Cached {
         /// The cached blob.
@@ -865,7 +952,7 @@ pub enum VerifiedReader {
     },
     /// A live fetch: the reader waits for the drive to verify bytes into the
     /// fill store and hands out the verified prefix.
-    Live(LiveReader),
+    Live(LiveReader<S>),
 }
 
 /// One in-flight [`next_verified`] read: the next verified span, or `None` at the
@@ -875,8 +962,8 @@ type VerifiedRead = Pin<Box<dyn Future<Output = io::Result<Option<Bytes>>> + Sen
 /// The live half of a [`VerifiedReader`]: it reads the verified prefix out of the
 /// fill store as the paired [`StreamDrive`] lands it, and advances the cursor the
 /// drive paces on.
-pub struct LiveReader {
-    state: Arc<StreamState>,
+pub struct LiveReader<S = ClientRangedStore> {
+    state: Arc<StreamState<S>>,
     /// An in-flight store read of the next verified span: `Some(bytes)`, or
     /// `None` at the end of the stream. It waits inside for bytes to land.
     read: Option<VerifiedRead>,
@@ -894,13 +981,13 @@ pub struct LiveReader {
 /// A store fault reading its present ranges (I/O, a poisoned lock). Surfaced to
 /// the reader rather than masked as "nothing present", so a real fault does not
 /// look like an empty stream that stalls or ends early.
-async fn present_frontier(store: &ClientRangedStore, start: u64) -> anyhow::Result<u64> {
+async fn present_frontier<S: StreamStore>(store: &S, start: u64) -> anyhow::Result<u64> {
     let present = store
         .present_ranges()
         .await
         .context("read present ranges")?;
     Ok(
-        crate::driver::contiguous_byte_ranges(&present, store.bound())
+        crate::driver::contiguous_byte_ranges(&present, store.total_bytes())
             .into_iter()
             .find(|&(run_start, len)| run_start <= start && start < run_start.saturating_add(len))
             .map_or(start, |(run_start, len)| run_start.saturating_add(len)),
@@ -911,7 +998,10 @@ async fn present_frontier(store: &ClientRangedStore, start: u64) -> anyhow::Resu
 /// [`MAX_READ_CHUNK`] of them. `None` is the end of the stream: the cursor has
 /// reached the window's end or the size a leg proved. A drive failure surfaces
 /// only once every verified byte before it has been read.
-async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Option<Bytes>> {
+async fn next_verified<S: StreamStore>(
+    state: Arc<StreamState<S>>,
+    cursor: u64,
+) -> io::Result<Option<Bytes>> {
     loop {
         let limit = [state.end, state.store.proven()]
             .into_iter()
@@ -950,7 +1040,7 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
             Some(Ok(())) => {
                 return Err(io::Error::other(format!(
                     "stream fetch finished with {cursor} of {} bytes readable",
-                    limit.unwrap_or_else(|| state.store.bound())
+                    limit.unwrap_or_else(|| state.store.total_bytes())
                 )));
             }
             None => {}
@@ -963,17 +1053,17 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
     }
 }
 
-impl std::fmt::Debug for LiveReader {
+impl<S: StreamStore> std::fmt::Debug for LiveReader<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveReader")
             .field("cursor", &self.state.cursor.load(Ordering::SeqCst))
-            .field("bound", &self.state.store.bound())
+            .field("bound", &self.state.store.total_bytes())
             .field("buffered", &self.buffered.len())
             .finish_non_exhaustive()
     }
 }
 
-impl std::fmt::Debug for VerifiedReader {
+impl<S> std::fmt::Debug for VerifiedReader<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cached { data, pos } => f
@@ -988,7 +1078,7 @@ impl std::fmt::Debug for VerifiedReader {
     }
 }
 
-impl LiveReader {
+impl<S: StreamStore> LiveReader<S> {
     fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
             // 1. Hand out any bytes already read from the store.
@@ -1035,7 +1125,7 @@ impl LiveReader {
     }
 }
 
-impl AsyncRead for VerifiedReader {
+impl<S: StreamStore> AsyncRead for VerifiedReader<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

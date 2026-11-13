@@ -1,23 +1,24 @@
 //! Cache-eviction driver loop (#1173, ADR 040 §Whole-blob reclaim; range
 //! eviction is upstream-gated).
 //!
-//! A single async task, owned by the node wiring layer (per
-//! `appendix-poc-production-seams.md`), that enforces the cache ceiling the
-//! write path deliberately does not. It periodically measures on-disk footprint
-//! and, once over the high-water mark, releases the blobs the injected
-//! `EvictionPolicy` ranks for eviction (via
+//! A single async task, spawned by the binary that owns the [`CacheEngine`],
+//! that enforces the cache ceiling the write path deliberately does not. It
+//! periodically measures on-disk footprint and, once over the high-water mark,
+//! releases the blobs the injected [`EvictionPolicy`] ranks for eviction (via
 //! [`CacheEngine::release_for_eviction`], the soft-evict path that is *not* the
 //! durable operator-evict) down to the target mark, bounded by a per-sweep
-//! budget.
+//! budget. The caller supplies the free-disk probe and a callback that sees
+//! every released hash, so the driver holds no state of its own beyond the
+//! engine.
 //!
 //! ## The ceiling is disk-aware
 //!
 //! The ceiling is not the static `cache.cache_size_mb`. That is an upper bound;
-//! each tick the driver probes free disk on the `cache_dir` volume and clamps
-//! the ceiling down to keep `cache.disk_headroom_mb` free, defended against any
-//! process (#1930). See `effective_cap`. So a large `cache_size_mb` lets a node
-//! size its cache to whatever disk the machine offers, and the high-water and
-//! target marks track that dynamic ceiling.
+//! each tick the driver calls the free-disk probe for the cache volume and
+//! clamps the ceiling down to keep `cache.disk_headroom_mb` free, defended
+//! against any process (#1930). See `effective_cap`. So a large `cache_size_mb`
+//! lets a node size its cache to whatever disk the machine offers, and the
+//! high-water and target marks track that dynamic ceiling.
 //!
 //! ## The driver's actuator is indirect — hence pending-reclaim accounting
 //!
@@ -56,8 +57,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use decdn_cache::{CacheEngine, CacheMetrics};
 use tokio::sync::oneshot;
+
+use crate::{CacheEngine, CacheMetrics, EvictionPolicy, Hash};
 
 /// One mebibyte, the unit `cache.cache_size_mb` is expressed in.
 const BYTES_PER_MB: u64 = 1_048_576;
@@ -71,8 +73,8 @@ fn as_gauge(v: u64) -> i64 {
 /// resolution (`resolve_cache_into`): `high_water_pct ∈ [60, 95]`,
 /// `target_pct ∈ [40, 90]` **and** `target_pct <= high_water_pct - 5` (the
 /// structural hysteresis gap), `per_sweep_budget ∈ [1, 256]`,
-/// `tick ∈ [1s, 60s]`. The type itself carries no invariant — it is a wiring
-/// DTO with a single production construction site.
+/// `tick ∈ [1s, 60s]`. The type itself carries no invariant: it is a wiring
+/// DTO the caller fills from resolved config.
 #[derive(Debug, Clone, Copy)]
 pub struct EvictionParams {
     /// Configured cache size in MiB; the upper bound on the ceiling (the disk
@@ -170,10 +172,10 @@ const fn effective_cap(
 /// effective footprint is `raw - pending_reclaim`: what disk will look like once
 /// the releases already issued are reclaimed.
 ///
-/// This is the whole fix for the driver's original non-convergence: without it,
-/// releases (which only drop GC protection) never moved the measurement, so the
-/// latch stayed engaged and the driver re-released every tick for the whole GC
-/// interval — ~`gc_interval_sec / eviction_tick_secs` sweeps' worth.
+/// This is what makes the driver converge: releases only drop GC protection
+/// and never move the raw measurement, so without it the latch would stay
+/// engaged and the driver would re-release every tick for the whole GC
+/// interval, ~`gc_interval_sec / eviction_tick_secs` sweeps' worth.
 const fn reconcile(state: &mut DriverState, raw: u64) -> u64 {
     if let Some(prev) = state.last_raw
         && raw < prev
@@ -203,9 +205,9 @@ async fn sweep(
     target_bytes: u64,
     budget: u64,
     cache_bytes: u64,
-    sizes: &HashMap<decdn_cache::Hash, u64>,
-    policy: &Arc<dyn decdn_cache::EvictionPolicy>,
-    warming: &Arc<crate::warming_allowance::WarmingAllowance>,
+    sizes: &HashMap<Hash, u64>,
+    policy: &Arc<dyn EvictionPolicy>,
+    on_release: &(dyn Fn(Hash) + Send + Sync),
 ) -> u64 {
     let candidates = cache.eviction_candidates();
     if candidates.is_empty() {
@@ -218,7 +220,7 @@ async fn sweep(
     // applies the target/budget stop conditions, and returns what to evict and
     // what to promote. The driver is a dumb executor.
     let segments = cache.segments_snapshot();
-    let plan = policy.plan(&decdn_cache::EvictionContext {
+    let plan = policy.plan(&crate::EvictionContext {
         candidates: &candidates,
         sizes,
         segments: &segments,
@@ -247,9 +249,7 @@ async fn sweep(
                 freed = freed.saturating_add(sizes.get(&hash).copied().unwrap_or(0));
                 removed = removed.saturating_add(1);
                 metrics.evictions.inc();
-                // ADR 041: drop the warming tag for the evicted hash, so a later
-                // reuse of this slot can never credit a stale source's allowance.
-                warming.forget(hash);
+                on_release(hash);
             }
             Err(err) => {
                 tracing::warn!(%hash, error = %err.display_chain(), "eviction driver: release_for_eviction failed; skipping hash");
@@ -331,14 +331,13 @@ async fn tick(
     free_bytes: u64,
     budget: u64,
     state: &mut DriverState,
-    policy: &Arc<dyn decdn_cache::EvictionPolicy>,
-    warming: &Arc<crate::warming_allowance::WarmingAllowance>,
+    policy: &Arc<dyn EvictionPolicy>,
+    on_release: &(dyn Fn(Hash) + Send + Sync),
 ) {
     // Exactly ONE store walk per tick: this snapshot is both the footprint
     // source and the sweep's per-hash size lookup, so `sweep` takes it by
-    // reference rather than re-walking. (An earlier shape called `total_bytes()`
-    // here and `size_snapshot()` again in the sweep — two walks under sustained
-    // pressure, and the two readings could disagree.)
+    // reference rather than re-walking, and the footprint and the sizes always
+    // agree.
     //
     // A snapshot failure skips the whole tick rather than evicting blind:
     // without sizes there is no way to know when target is reached, and
@@ -393,34 +392,35 @@ async fn tick(
         cap,
         &sizes,
         policy,
-        warming,
+        on_release,
     )
     .await;
     state.pending_reclaim = state.pending_reclaim.saturating_add(freed);
 }
 
 /// Probe free disk for one tick, or return the `u64::MAX` clamp-disabled
-/// sentinel on a `statvfs` failure (#1930). One cheap syscall, dwarfed by the
-/// store walk `tick` already does. On failure the driver falls back to the
-/// config-only ceiling rather than evicting blind. The failure and recovery
-/// transitions are each logged once, not every tick.
-fn probe_free_bytes(cache_dir: &std::path::Path, state: &mut DriverState) -> u64 {
-    match decdn_common::disk::statvfs_target(cache_dir) {
-        Ok(space) => {
+/// sentinel when the probe fails (#1930). The probe is one cheap syscall,
+/// dwarfed by the store walk `tick` already does. On failure the driver falls
+/// back to the config-only ceiling rather than evicting blind. The failure and
+/// recovery transitions are each logged once, not every tick.
+fn probe_free_bytes(
+    free_space: &mut (dyn FnMut() -> anyhow::Result<u64> + Send),
+    state: &mut DriverState,
+) -> u64 {
+    match free_space() {
+        Ok(avail) => {
             if state.disk_probe_failing {
                 tracing::info!(
-                    cache_dir = %cache_dir.display(),
                     "eviction driver: free-disk probe recovered; disk-headroom clamp re-enabled"
                 );
                 state.disk_probe_failing = false;
             }
-            space.avail
+            avail
         }
         Err(err) => {
             if !state.disk_probe_failing {
                 tracing::warn!(
                     error = %err,
-                    cache_dir = %cache_dir.display(),
                     "eviction driver: free-disk probe failed; disk-headroom clamp disabled \
                      until it recovers (cache.cache_size_mb still enforced)"
                 );
@@ -431,16 +431,20 @@ fn probe_free_bytes(cache_dir: &std::path::Path, state: &mut DriverState) -> u64
     }
 }
 
-/// Run the eviction driver until `shutdown` fires. Intended to be
-/// `tasks.spawn(run(...))`-ed into the runtime `JoinSet`; returns when the
-/// oneshot is dropped or sent.
+/// Run the eviction driver until `shutdown` fires or its sender drops.
+///
+/// - `free_space` returns the bytes an unprivileged process can still write on
+///   the cache volume. The driver calls it once per tick unless
+///   `params.disk_headroom_mb` is `0`.
+/// - `on_release` sees every hash the driver releases, after the release
+///   succeeds, so the caller can drop state it keys by hash.
 pub async fn run(
     cache: CacheEngine,
     metrics: Arc<CacheMetrics>,
     params: EvictionParams,
-    cache_dir: std::path::PathBuf,
-    policy: Arc<dyn decdn_cache::EvictionPolicy>,
-    warming: Arc<crate::warming_allowance::WarmingAllowance>,
+    policy: Arc<dyn EvictionPolicy>,
+    mut free_space: impl FnMut() -> anyhow::Result<u64> + Send,
+    on_release: impl Fn(Hash) + Send + Sync,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let ceiling = Ceiling {
@@ -472,7 +476,7 @@ pub async fn run(
         let free_bytes = if ceiling.headroom_bytes == 0 {
             u64::MAX
         } else {
-            probe_free_bytes(&cache_dir, &mut state)
+            probe_free_bytes(&mut free_space, &mut state)
         };
 
         tick(
@@ -483,7 +487,7 @@ pub async fn run(
             params.per_sweep_budget,
             &mut state,
             &policy,
-            &warming,
+            &on_release,
         )
         .await;
     }

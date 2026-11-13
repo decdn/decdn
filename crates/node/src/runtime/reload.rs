@@ -678,8 +678,6 @@ impl ReloadableSection for SecuritySection {
             section = self.name(),
             security_attached,
             max_concurrent_handlers = resolved.max_concurrent_handlers,
-            per_source_rate_per_sec = resolved.per_source_rate_per_sec,
-            max_tracked_sources = resolved.max_tracked_sources,
             "config reload section applied"
         );
     }
@@ -1061,9 +1059,6 @@ impl RuntimeReloadState {
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
-                per_source_rate_per_sec: 100.0,
-                per_source_burst: 200,
-                max_tracked_sources: 4096,
             },
             load_shed: decdn_common::config::ResolvedLoadShed::default(),
             dht: decdn_common::config::ResolvedDht::default(),

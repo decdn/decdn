@@ -101,7 +101,6 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_client_abandoned_total",
     "decdn_serve_stream_node_fault_total",
     "decdn_serve_rate_limit_rejected_per_peer_total",
-    "decdn_serve_rate_limit_rejected_per_ip_total",
     "decdn_serve_rate_limit_rejected_global_total",
 ];
 
@@ -587,19 +586,8 @@ pub struct DecdnMetrics {
     /// encoder appends it automatically; the operator-visible name is
     /// `decdn_dispatch_rejected_global_total`.
     pub dispatch_rejected_global: Counter,
-    /// Connections rejected by the per-source rate limiter. Operator-
-    /// visible name: `decdn_dispatch_rejected_per_source_total`.
-    pub dispatch_rejected_per_source: Counter,
     /// Currently in-flight QUIC handler tasks holding a dispatch permit.
     pub dispatch_in_flight: Gauge,
-    /// Connections accepted on a relay-only path (no resolvable peer
-    /// IP) while the per-source layer was enabled. The per-source rate
-    /// limit cannot be enforced for these — operators chasing
-    /// `dispatch_rejected_per_source` anomalies need this counter to
-    /// distinguish "the layer didn't fire" from "the layer wasn't
-    /// applicable." Operator-visible name:
-    /// `decdn_dispatch_per_source_skipped_no_addr_total`.
-    pub dispatch_per_source_skipped_no_addr: Counter,
     /// Inbound connections (all ALPNs) that arrived with a direct IP path.
     /// Operator-visible name: `decdn_inbound_connections_direct_total`.
     pub inbound_connections_direct: Counter,
@@ -673,38 +661,27 @@ pub struct DecdnMetrics {
     /// carries no label dimension (a labeled series would need a `Family`). Operator-visible name:
     /// `decdn_dht_rate_limit_rejected_per_peer_total`.
     pub dht_rate_limit_rejected_per_peer: Counter,
-    /// `cdn/dht/v1` requests rejected by the per-IP token bucket. Sibling
-    /// to `dht_rate_limit_rejected_per_peer` — see its docs. Operator-
-    /// visible name: `decdn_dht_rate_limit_rejected_per_ip_total`.
-    pub dht_rate_limit_rejected_per_ip: Counter,
     /// `cdn/dht/v1` requests rejected by the global token bucket. Sibling
     /// to `dht_rate_limit_rejected_per_peer` — see its docs. Operator-
     /// visible name: `decdn_dht_rate_limit_rejected_global_total`.
     pub dht_rate_limit_rejected_global: Counter,
-    /// `retain_recent` sweeps of the per-IP DHT keyed-limiter map that
-    /// actually ran (single-flight CAS won, layer enabled). Bump from
-    /// both the lazy-prune path in `DhtRateLimiter::check` and the
-    /// periodic `gc_per_ip` GC task. Persistent growth without a matching
-    /// drop in `decdn_dht_rate_limit_tracked_per_ip` means the limiter
-    /// is observing churn faster than `retain_recent` can release entries
-    /// — investigate cap saturation. Operator-visible name:
-    /// `decdn_dht_rate_limit_prune_sweeps_per_ip_total` (#645).
-    pub dht_rate_limit_prune_sweeps_per_ip: Counter,
-    /// Sibling of `dht_rate_limit_prune_sweeps_per_ip` for the per-peer
-    /// (`NodeId`) keyed-limiter map. Operator-visible name:
+    /// `retain_recent` sweeps of the per-peer (`NodeId`) DHT keyed-limiter
+    /// map that actually ran (single-flight CAS won, layer enabled). Bumped
+    /// from both the lazy-prune path in `DhtRateLimiter::check` and the
+    /// periodic `gc_per_peer` GC task. Persistent growth without a matching
+    /// drop in `decdn_dht_rate_limit_tracked_per_peer` means the limiter is
+    /// observing churn faster than `retain_recent` can release entries —
+    /// investigate cap saturation. Operator-visible name:
     /// `decdn_dht_rate_limit_prune_sweeps_per_peer_total` (#645).
     pub dht_rate_limit_prune_sweeps_per_peer: Counter,
-    /// Current size of the per-IP DHT keyed-limiter map after the most
+    /// Current size of the per-peer DHT keyed-limiter map after the most
     /// recent prune (lazy or periodic). Pair with
-    /// `decdn_dht_rate_limit_prune_sweeps_per_ip_total` to detect cap
+    /// `decdn_dht_rate_limit_prune_sweeps_per_peer_total` to detect cap
     /// saturation. Updated post-prune so the value is at most one
     /// `DHT_RATE_LIMIT_GC_INTERVAL` stale on quiet nodes; reads `0`
     /// until the first successful prune (lazy or periodic) after
     /// startup. Operator-visible name:
-    /// `decdn_dht_rate_limit_tracked_per_ip` (#645).
-    pub dht_rate_limit_tracked_per_ip: Gauge,
-    /// Sibling of `dht_rate_limit_tracked_per_ip` for the per-peer map.
-    /// Operator-visible name: `decdn_dht_rate_limit_tracked_per_peer` (#645).
+    /// `decdn_dht_rate_limit_tracked_per_peer` (#645).
     pub dht_rate_limit_tracked_per_peer: Gauge,
     /// `cdn/probe/v1` requests rejected by the per-peer (`NodeId`) token
     /// bucket (ADR 005 §Probe rate limiting). One Counter per layer to match
@@ -712,35 +689,24 @@ pub struct DecdnMetrics {
     /// convention; a plain counter field carries no label dimension (a labeled
     /// series would need a `Family`);
     /// operators recover the rolled-up rate with
-    /// `sum(rate({__name__=~"decdn_probe_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
+    /// `sum(rate({__name__=~"decdn_probe_rate_limit_rejected_(per_peer|global)_total"}[1m]))`.
     /// Operator-visible name: `decdn_probe_rate_limit_rejected_per_peer_total`.
     pub probe_rate_limit_rejected_per_peer: Counter,
-    /// `cdn/probe/v1` requests rejected by the per-IP token bucket. Sibling
-    /// to `probe_rate_limit_rejected_per_peer` — see its docs. Operator-
-    /// visible name: `decdn_probe_rate_limit_rejected_per_ip_total`.
-    pub probe_rate_limit_rejected_per_ip: Counter,
     /// `cdn/probe/v1` requests rejected by the global token bucket. Sibling
     /// to `probe_rate_limit_rejected_per_peer` — see its docs. Operator-
     /// visible name: `decdn_probe_rate_limit_rejected_global_total`.
     pub probe_rate_limit_rejected_global: Counter,
-    /// `retain_recent` sweeps of the per-IP probe keyed-limiter map that
-    /// actually ran (single-flight CAS won, layer enabled). Bumped from both
-    /// the lazy-prune path in the limiter's `check` and the periodic
-    /// `gc_per_ip` GC task. Operator-visible name:
-    /// `decdn_probe_rate_limit_prune_sweeps_per_ip_total` (#645).
-    pub probe_rate_limit_prune_sweeps_per_ip: Counter,
-    /// Sibling of `probe_rate_limit_prune_sweeps_per_ip` for the per-peer
-    /// (`NodeId`) keyed-limiter map. Operator-visible name:
+    /// `retain_recent` sweeps of the per-peer (`NodeId`) probe keyed-limiter
+    /// map that actually ran (single-flight CAS won, layer enabled). Bumped
+    /// from both the lazy-prune path in the limiter's `check` and the periodic
+    /// `gc_per_peer` GC task. Operator-visible name:
     /// `decdn_probe_rate_limit_prune_sweeps_per_peer_total` (#645).
     pub probe_rate_limit_prune_sweeps_per_peer: Counter,
-    /// Current size of the per-IP probe keyed-limiter map after the most
+    /// Current size of the per-peer probe keyed-limiter map after the most
     /// recent prune (lazy or periodic). Pair with
-    /// `decdn_probe_rate_limit_prune_sweeps_per_ip_total` to detect cap
+    /// `decdn_probe_rate_limit_prune_sweeps_per_peer_total` to detect cap
     /// saturation. Operator-visible name:
-    /// `decdn_probe_rate_limit_tracked_per_ip` (#645).
-    pub probe_rate_limit_tracked_per_ip: Gauge,
-    /// Sibling of `probe_rate_limit_tracked_per_ip` for the per-peer map.
-    /// Operator-visible name: `decdn_probe_rate_limit_tracked_per_peer` (#645).
+    /// `decdn_probe_rate_limit_tracked_per_peer` (#645).
     pub probe_rate_limit_tracked_per_peer: Gauge,
     /// Inbound `cdn/client/v1` streams refused by the per-peer (`NodeId`) token
     /// bucket before the request was read (ADR 005 §Request rate limiting).
@@ -748,24 +714,16 @@ pub struct DecdnMetrics {
     /// ends exactly one inbound stream as failed. Operator-visible name:
     /// `decdn_serve_rate_limit_rejected_per_peer_total`.
     pub serve_rate_limit_rejected_per_peer: Counter,
-    /// Sibling of `serve_rate_limit_rejected_per_peer` for the per-IP bucket.
-    /// Operator-visible name: `decdn_serve_rate_limit_rejected_per_ip_total`.
-    pub serve_rate_limit_rejected_per_ip: Counter,
     /// Sibling of `serve_rate_limit_rejected_per_peer` for the global bucket.
     /// Operator-visible name: `decdn_serve_rate_limit_rejected_global_total`.
     pub serve_rate_limit_rejected_global: Counter,
-    /// `retain_recent` sweeps of the per-IP serve keyed-limiter map that ran.
-    /// Operator-visible name: `decdn_serve_rate_limit_prune_sweeps_per_ip_total`.
-    pub serve_rate_limit_prune_sweeps_per_ip: Counter,
-    /// Sibling of `serve_rate_limit_prune_sweeps_per_ip` for the per-peer map.
-    /// Operator-visible name:
+    /// `retain_recent` sweeps of the per-peer serve keyed-limiter map that
+    /// ran. Operator-visible name:
     /// `decdn_serve_rate_limit_prune_sweeps_per_peer_total`.
     pub serve_rate_limit_prune_sweeps_per_peer: Counter,
-    /// Current size of the per-IP serve keyed-limiter map after the most recent
-    /// prune. Operator-visible name: `decdn_serve_rate_limit_tracked_per_ip`.
-    pub serve_rate_limit_tracked_per_ip: Gauge,
-    /// Sibling of `serve_rate_limit_tracked_per_ip` for the per-peer map.
-    /// Operator-visible name: `decdn_serve_rate_limit_tracked_per_peer`.
+    /// Current size of the per-peer serve keyed-limiter map after the most
+    /// recent prune. Operator-visible name:
+    /// `decdn_serve_rate_limit_tracked_per_peer`.
     pub serve_rate_limit_tracked_per_peer: Gauge,
     /// `cdn/dht/v1` request handling failed after the request was admitted
     /// by the rate limiter — frame decode error, response write error,
@@ -1546,8 +1504,8 @@ pub struct DecdnMetrics {
     /// transport rate-limit), no other candidate covered the
     /// still-missing gap, and the assembly waited to ask the same upstream again
     /// instead of dropping it. The common cause is this node's own other pulls
-    /// filling the upstream's per-signer floor cap: the live part of it clears as
-    /// those pulls pay.
+    /// filling the upstream's per-signer live cap: the refusal clears as those
+    /// pulls pay.
     ///
     /// Each tick is one completed wait, and each wait follows one refusal already
     /// counted in `node_pull_refused_unattributable` or
@@ -2034,15 +1992,14 @@ pub struct DecdnMetrics {
     /// rising value means clients ask this node for more of a blob than its cap
     /// lets it hold. Visible name: `decdn_serve_stream_midstream_blob_too_large_total`.
     pub serve_stream_midstream_blob_too_large: Counter,
-    /// Delivery refused because ONE capability signer hit its per-signer cap of
-    /// un-vouchered reservation plus floor debt, while the pool itself can still
+    /// Delivery refused because ONE capability signer hit its per-signer live
+    /// concurrency cap of un-vouchered reservation, while the pool itself can still
     /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
-    /// Signed as `NotFound`, because it clears by the signer's own payment, or for a
-    /// cap that floor debt alone fills by a restart or a pool reclaim, rather than
-    /// by funding the pool (ADR 005 §Open-time refusal classes), so this counter
-    /// is the only place the reason survives — a rising value means one signer runs
-    /// or abandons more un-vouchered streams than its share covers while the pool as
-    /// a whole is solvent. The two remedies differ: a pool shortfall clears with a
+    /// Signed as `NotFound`, because it clears by waiting rather than by funding
+    /// (ADR 005 §Open-time refusal classes), so this counter is the only place
+    /// the reason survives — a rising value means one signer runs
+    /// more concurrent un-vouchered streams than its share covers while the pool as a
+    /// whole is solvent. The two remedies differ: a pool shortfall clears with a
     /// top-up, a signer at its share does not. Visible name:
     /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
     pub serve_stream_rejected_signer_floor_at_cap: Counter,
@@ -3600,7 +3557,7 @@ recorders! {
     serve_stream_midstream_blob_too_large => serve_stream_midstream_blob_too_large.inc();
 
     /// Record a `serve_stream` delivery refused because this capability signer hit its
-    /// per-signer cap of un-vouchered reservation plus floor debt, while the pool as a
+    /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
     /// whole can still pay.
     serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
 
@@ -3854,19 +3811,11 @@ recorders! {
     /// Record a connection rejected by the global concurrency semaphore.
     dispatch_rejected_global => dispatch_rejected_global.inc();
 
-    /// Record a connection rejected by the per-source rate limiter.
-    dispatch_rejected_per_source => dispatch_rejected_per_source.inc();
-
     /// Increment the in-flight dispatch permit gauge.
     dispatch_permit_acquired => dispatch_in_flight.inc();
 
     /// Decrement the in-flight dispatch permit gauge.
     dispatch_permit_released => dispatch_in_flight.dec();
-
-    /// Record a relay-only connection accepted while the per-source
-    /// layer was enabled but no peer IP could be resolved at accept
-    /// time.
-    dispatch_per_source_skipped_no_addr => dispatch_per_source_skipped_no_addr.inc();
 
     /// Record an inbound connection that arrived with a direct IP path.
     inbound_connection_direct => inbound_connections_direct.inc();
@@ -3880,25 +3829,12 @@ recorders! {
     /// Record a `cdn/dht/v1` request rejected at the per-peer layer.
     dht_rate_limit_rejected_per_peer => dht_rate_limit_rejected_per_peer.inc();
 
-    /// Record a `cdn/dht/v1` request rejected at the per-IP layer.
-    dht_rate_limit_rejected_per_ip => dht_rate_limit_rejected_per_ip.inc();
-
     /// Record a `cdn/dht/v1` request rejected at the global layer.
     dht_rate_limit_rejected_global => dht_rate_limit_rejected_global.inc();
-
-    /// Record a `retain_recent` sweep of the per-IP DHT keyed-limiter
-    /// map (#645).
-    dht_rate_limit_prune_sweep_per_ip => dht_rate_limit_prune_sweeps_per_ip.inc();
 
     /// Record a `retain_recent` sweep of the per-peer DHT keyed-limiter
     /// map (#645).
     dht_rate_limit_prune_sweep_per_peer => dht_rate_limit_prune_sweeps_per_peer.inc();
-
-    /// Set the per-IP DHT keyed-limiter tracked-size gauge (#645). The
-    /// `try_from(...).unwrap_or(i64::MAX)` clamp matches the existing
-    /// gauge-set pattern elsewhere in this module and stays within the
-    /// workspace's anti-panic policy.
-    dht_rate_limit_tracked_per_ip_set(n: usize) => dht_rate_limit_tracked_per_ip.set(sat(n));
 
     /// Set the per-peer DHT keyed-limiter tracked-size gauge (#645).
     dht_rate_limit_tracked_per_peer_set(n: usize) => dht_rate_limit_tracked_per_peer.set(sat(n));
@@ -3906,22 +3842,12 @@ recorders! {
     /// Record a `cdn/probe/v1` request rejected at the per-peer layer.
     probe_rate_limit_rejected_per_peer => probe_rate_limit_rejected_per_peer.inc();
 
-    /// Record a `cdn/probe/v1` request rejected at the per-IP layer.
-    probe_rate_limit_rejected_per_ip => probe_rate_limit_rejected_per_ip.inc();
-
     /// Record a `cdn/probe/v1` request rejected at the global layer.
     probe_rate_limit_rejected_global => probe_rate_limit_rejected_global.inc();
-
-    /// Record a `retain_recent` sweep of the per-IP probe keyed-limiter
-    /// map (#645).
-    probe_rate_limit_prune_sweep_per_ip => probe_rate_limit_prune_sweeps_per_ip.inc();
 
     /// Record a `retain_recent` sweep of the per-peer probe keyed-limiter
     /// map (#645).
     probe_rate_limit_prune_sweep_per_peer => probe_rate_limit_prune_sweeps_per_peer.inc();
-
-    /// Set the per-IP probe keyed-limiter tracked-size gauge (#645).
-    probe_rate_limit_tracked_per_ip_set(n: usize) => probe_rate_limit_tracked_per_ip.set(sat(n));
 
     /// Set the per-peer probe keyed-limiter tracked-size gauge (#645).
     probe_rate_limit_tracked_per_peer_set(n: usize)
@@ -3930,20 +3856,11 @@ recorders! {
     /// Record an inbound `cdn/client/v1` stream refused at the per-peer layer.
     serve_rate_limit_rejected_per_peer => serve_rate_limit_rejected_per_peer.inc();
 
-    /// Record an inbound `cdn/client/v1` stream refused at the per-IP layer.
-    serve_rate_limit_rejected_per_ip => serve_rate_limit_rejected_per_ip.inc();
-
     /// Record an inbound `cdn/client/v1` stream refused at the global layer.
     serve_rate_limit_rejected_global => serve_rate_limit_rejected_global.inc();
 
-    /// Record a `retain_recent` sweep of the per-IP serve keyed-limiter map.
-    serve_rate_limit_prune_sweep_per_ip => serve_rate_limit_prune_sweeps_per_ip.inc();
-
     /// Record a `retain_recent` sweep of the per-peer serve keyed-limiter map.
     serve_rate_limit_prune_sweep_per_peer => serve_rate_limit_prune_sweeps_per_peer.inc();
-
-    /// Set the per-IP serve keyed-limiter tracked-size gauge.
-    serve_rate_limit_tracked_per_ip_set(n: usize) => serve_rate_limit_tracked_per_ip.set(sat(n));
 
     /// Set the per-peer serve keyed-limiter tracked-size gauge.
     serve_rate_limit_tracked_per_peer_set(n: usize)

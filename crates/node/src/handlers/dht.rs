@@ -27,7 +27,6 @@
 //! - Response variants arriving on a server-accepted stream are
 //!   rejected with `APP_ERR_UNSUPPORTED_MESSAGE`.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -45,7 +44,7 @@ use crate::dht::{
     AttestationVerifier, AttestedBy, AuthenticatedNodeId, DhtRateLimiter, DhtRejectLayer, NodeId,
     RecordStore, RoutingTable, StakerSet,
 };
-use crate::dispatch::{ConnectionLimiter, RejectReason};
+use crate::dispatch::ConnectionLimiter;
 use crate::metrics::Metrics;
 
 /// How long a fresh connection may sit before its first stream. A peer that
@@ -59,7 +58,6 @@ const FIRST_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_BETWEEN_STREAMS: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
-const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Per-connection request cap (#845, ADR 022 §DHT Rate Limiting). The
 /// per-stream rate limiter throttles request *rate*, but a peer holding
@@ -223,9 +221,6 @@ impl DhtHandler {
                     VarInt::from_u32(APP_ERR_RATE_LIMITED),
                     reason.as_str().as_bytes(),
                 );
-                if reason != RejectReason::GlobalFull {
-                    let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
-                }
                 return Ok(());
             }
         };
@@ -233,11 +228,6 @@ impl DhtHandler {
 
         // Resolve the peer's NodeId once (it's the authenticated QUIC
         // identity and cannot change for the lifetime of the connection).
-        // The IP, by contrast, is re-evaluated per stream below — iroh
-        // can switch the selected path mid-connection (e.g. relay → direct
-        // UDP after hole-punching) and caching the initial value would
-        // permanently disable the per-IP rate-limit layer for any
-        // connection that started relay-only.
         // Lift the handshake-bound identity into the trust boundary. From here
         // on the only `NodeId` the handler treats as "who is actually on the
         // other end" flows through this `AuthenticatedNodeId`; wire-provided
@@ -320,12 +310,8 @@ impl DhtHandler {
                     }
                 };
             served = served.saturating_add(1);
-            // Rate-limit per request (ADR 022 §DHT Rate Limiting). Re-read
-            // `peer_ip` here so a relay→direct path switch over the
-            // connection's lifetime engages the per-IP layer for
-            // subsequent streams.
-            let peer_ip = crate::rate_limit::peer_ip(&conn);
-            if let Err(layer) = self.rate_limiter.check(&peer.node_id(), peer_ip) {
+            // Rate-limit per request (ADR 022 §DHT Rate Limiting).
+            if let Err(layer) = self.rate_limiter.check(&peer.node_id()) {
                 Self::close_stream_with_rate_limit(send, recv, layer);
                 continue;
             }
@@ -333,7 +319,7 @@ impl DhtHandler {
             // rate-limit token; `note_peer_seen` adds or refreshes it only if
             // the staker set holds it as bonded (ADR 022 §Routing Table).
             self.note_peer_seen(peer);
-            if let Err(e) = self.handle_one(peer, peer_ip, send, recv).await {
+            if let Err(e) = self.handle_one(peer, send, recv).await {
                 // The per-request error already carries the ADR 013 app
                 // error code via the stream reset inside `handle_one` /
                 // `read_dht_request`; here we surface the failure to
@@ -396,13 +382,11 @@ impl DhtHandler {
     /// response frame back. Each stream carries exactly one
     /// request/response pair. The authenticated `peer_node_id` is
     /// threaded in so `Store` / `BatchStore` admission can compare the
-    /// wire-level `holder` against the QUIC-bound identity; `peer_ip` is
-    /// threaded in for the `BatchStore` stage-2 rate-limit accounting
-    /// (the per-IP layer keys on it).
+    /// wire-level `holder` against the QUIC-bound identity, and the
+    /// `BatchStore` stage-2 rate-limit accounting keys on it.
     async fn handle_one(
         &self,
         peer: AuthenticatedNodeId,
-        peer_ip: Option<IpAddr>,
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> anyhow::Result<()> {
@@ -425,7 +409,7 @@ impl DhtHandler {
         // `serve` bump `dht_requests_failed`, which is reserved for
         // post-admission internal failures (decode/write/timeout), not
         // intentional rejections.
-        let resp = match self.dispatch(peer, peer_ip, req) {
+        let resp = match self.dispatch(peer, req) {
             Ok(resp) => resp,
             Err(app_code) => {
                 let _ = send.reset(VarInt::from_u32(app_code));
@@ -473,7 +457,6 @@ impl DhtHandler {
     fn dispatch(
         &self,
         peer: AuthenticatedNodeId,
-        peer_ip: Option<IpAddr>,
         msg: DhtServerRequest,
     ) -> Result<wire::DhtMessage, u32> {
         Ok(match msg {
@@ -487,7 +470,7 @@ impl DhtHandler {
                 wire::DhtMessage::StoreAck(self.handle_store(peer, req))
             }
             DhtServerRequest::BatchStore(req) => {
-                wire::DhtMessage::BatchStoreAck(self.handle_batch_store(peer, peer_ip, req)?)
+                wire::DhtMessage::BatchStoreAck(self.handle_batch_store(peer, req)?)
             }
         })
     }
@@ -520,7 +503,6 @@ impl DhtHandler {
     fn handle_batch_store(
         &self,
         peer: AuthenticatedNodeId,
-        peer_ip: Option<IpAddr>,
         req: wire::BatchStoreRequest,
     ) -> Result<wire::BatchStoreAck, u32> {
         // Step 1: batch-level holder check. AC 19's size cap (≤ 256) is
@@ -543,9 +525,7 @@ impl DhtHandler {
         // Step 2: stage-2 token accounting. `k` hashes get per-hash
         // processing; the rest are deferred (`false`) by the rate limit.
         let extra = n.saturating_sub(1);
-        let granted = self
-            .rate_limiter
-            .admit_batch_extra(&peer.node_id(), peer_ip, extra);
+        let granted = self.rate_limiter.admit_batch_extra(&peer.node_id(), extra);
         let k = granted.saturating_add(1).min(n);
         let deferred = n.saturating_sub(k);
         if deferred > 0 {

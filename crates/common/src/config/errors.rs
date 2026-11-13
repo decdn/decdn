@@ -65,7 +65,7 @@ pub enum ConfigNoticeLevel {
 /// One non-fatal resolve-time notice: a severity, the label of whatever the
 /// operator wrote, and the operator-facing message text.
 ///
-/// `field` is the dotted config label (`security.max_tracked_sources`),
+/// `field` is the dotted config label (`dht.rate_limit.max_tracked_per_peer`),
 /// matching the problem-label convention so a notice and a problem about the
 /// same field read the same way.
 ///

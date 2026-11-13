@@ -21,6 +21,7 @@
 //!
 //! wiremock does not validate the `SigV4` signature, so static dummy
 //! credentials are sufficient to drive a signed request through.
+#![cfg(feature = "s3")]
 
 use std::io::Write;
 use std::sync::Arc;

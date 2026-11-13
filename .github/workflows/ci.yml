@@ -90,6 +90,20 @@ jobs:
           --features buyer-store-core
         env:
           CARGO_BUILD_WARNINGS: deny
+      # `decdn-cache` without its `s3` feature: the store-only build that
+      # links no AWS SDK. The node turns `s3` on, so `--workspace` never
+      # compiles this configuration. The tree check keeps the AWS SDK and
+      # aws-lc out of it.
+      - run: cargo clippy -p decdn-cache --no-default-features --all-targets
+        env:
+          CARGO_BUILD_WARNINGS: deny
+      - name: decdn-cache without s3 links no AWS SDK
+        run: |
+          if cargo tree -p decdn-cache --no-default-features -e normal --prefix none \
+              | grep -E '^aws-'; then
+            echo "decdn-cache --no-default-features links the crates above"
+            exit 1
+          fi
       # A feature that no dev-dependency turns on is invisible to the
       # `--workspace --all-targets` run above: `anvil-e2e` (all 15
       # `crates/e2e/tests/*` + the two gated `decdn-node` tests),
@@ -129,7 +143,7 @@ jobs:
           toolchain: 1.99.1
       # cargo-deny pinned to an exact version so a release can't silently
       # change the check's behavior.
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           fallback: none
           tool: cargo-deny@0.20.2
@@ -232,7 +246,7 @@ jobs:
           shared-key: public-api
           # Restore-only except on `main`; only `main` writes it (see clippy job).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -441,7 +455,7 @@ jobs:
           # job). This is the largest partition (~1.2 GiB instrumented target),
           # so gating its save is what most relieves the saturated cache store.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           fallback: none
           tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.149
@@ -567,7 +581,7 @@ jobs:
         with:
           shared-key: anvil-e2e-settlement
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -658,7 +672,7 @@ jobs:
         with:
           shared-key: anvil-e2e-journeys
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -728,7 +742,7 @@ jobs:
         with:
           shared-key: anvil-e2e-sponsord
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -1204,7 +1218,7 @@ jobs:
     permissions:
       pull-requests: read
     steps:
-      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+      - uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6.1.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -1295,7 +1309,7 @@ jobs:
       # through the real git-cliff and skips without it; the version matches
       # the release workflow's, so the test sees the binary a release uses.
       - name: Install git-cliff
-        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: git-cliff@2.14.2
           fallback: none
