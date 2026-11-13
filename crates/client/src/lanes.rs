@@ -235,7 +235,10 @@ fn lane_ledger(
     // `U256` is `Copy`; capture the fresh deposit before `ctx` moves into the
     // `get_or_insert` build closure below.
     let fresh_deposit = ctx.deposit;
-    match ledgers {
+    // Every lane at one node operator shares one track record, so the payer's
+    // per-node cap and window ramp count across signers and delegates.
+    let trust = crate::payer_window::PayerWindows::process().node(lane.provider);
+    let (ledger, ctx) = match ledgers {
         Some(reg) => {
             let h = reg.get_or_insert(lane, || LaneHandle {
                 ledger: Arc::new(PoolLedger::new(seed)),
@@ -248,7 +251,9 @@ fn lane_ledger(
             (h.ledger, h.ctx)
         }
         None => (Arc::new(PoolLedger::new(seed)), Arc::new(Mutex::new(ctx))),
-    }
+    };
+    ledger.attach_trust(trust);
+    (ledger, ctx)
 }
 
 /// One built payment lane: the per-provider `PoolContext`/`PoolLedger` and the

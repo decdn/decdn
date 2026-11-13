@@ -2882,6 +2882,7 @@ dependencies = [
  "insta",
  "iroh",
  "iroh-io",
+ "proptest",
  "public-api",
  "rand 0.10.3",
  "rustdoc-json",

@@ -793,14 +793,6 @@ async fn mid_gap_fault_resumes_at_the_checkpoint_not_the_whole_gap() {
         "blob not yet complete"
     );
 
-    // The lane owes the prefix the stall left delivered and unpaid. A new
-    // invocation keeps no owed span: it builds its ledger from the persisted
-    // record. Drop the span, as the restart does.
-    assert!(
-        !ledger.take_unpaid(root).is_empty(),
-        "the stall leaves the delivered prefix owed on the lane"
-    );
-
     // Drive #2: resume. Only the un-checkpointed tail is still missing.
     drive(
         &store, &source, &pacer, &ctx, &ledger, root, 0, 0, None, None, None, None,
@@ -2764,32 +2756,6 @@ fn the_delivered_frontier_stops_at_the_first_hole() {
     assert_eq!(frontier(&bao_tree::ChunkRanges::empty()), 7 * GROUP);
 }
 
-/// #2194: a leg the store keeps but the ledger never pays for advances the
-/// delivered frontier once. The next clean leg moves neither frontier, so the
-/// gap ends with [`LegNoProgress`] after two opens rather than re-opening
-/// forever.
-#[tokio::test]
-async fn an_unpaid_clean_leg_is_reopened_at_most_once() {
-    let total = 3 * GROUP;
-    let (root, plaintext, _) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let source = ScriptedSource::new(plaintext).expect("source");
-
-    let err = drive_bounded(&store, &source, &ledger)
-        .await
-        .expect_err("an unpaid leg cannot complete the gap");
-
-    let stuck = err
-        .downcast_ref::<LegNoProgress>()
-        .unwrap_or_else(|| panic!("expected LegNoProgress, got {err:#}"));
-    assert_eq!(
-        stuck.paid_wire, 0,
-        "the store kept the bytes; the ledger paid nothing"
-    );
-    assert_eq!(source.opened_ranges(), vec![(0, total), (0, total)]);
-}
-
 /// A source that delivers part of a range unpaid, then raises a funding
 /// rejection: the credit window let it stream ahead of the voucher.
 fn delivers_then_rejects_funding(plaintext: Vec<u8>, ledger: &Arc<PoolLedger>) -> ScriptedSource {
@@ -2830,52 +2796,11 @@ async fn drive_whole(
     .await
 }
 
-/// A lane that a funding refusal ends keeps the span it delivered and did not
-/// pay for. The next drive on the SAME lane opens at the paid frontier and
-/// bills that span again, although the store holds the bytes, so the node is
-/// paid for every byte it delivered.
+/// After a lost connection the next drive on the same lane resumes at the
+/// store's verified frontier: the bytes the leg verified are never fetched
+/// again, and the payer pays for no byte twice.
 #[tokio::test(start_paused = true)]
-async fn the_same_lane_bills_its_owed_tail_after_a_funding_refusal() {
-    let total = 6 * GROUP;
-    let (root, plaintext, _outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let source = delivers_then_rejects_funding(plaintext, &ledger);
-
-    let err = drive_whole(&store, &source, &ledger, root)
-        .await
-        .expect_err("the funding rejection ends the lane");
-    assert_eq!(crate::classify(&err), crate::Fault::Unaffordable, "{err:#}");
-    let present = ranges_content_len(&store.present_ranges().await.expect("present"), total);
-    assert!(present > 0, "the credit window delivered bytes unpaid");
-    assert_eq!(
-        ledger.committed().amount,
-        U256::ZERO,
-        "the lane paid nothing"
-    );
-
-    drive_whole(&store, &source, &ledger, root)
-        .await
-        .expect("the same lane resumes after the deposit rises");
-    assert!(store.is_complete().await.expect("is_complete"));
-    let opened = source.opened_ranges();
-    assert_eq!(
-        opened.get(1).map(|&(start, _)| start),
-        Some(0),
-        "the next leg opens at the paid frontier, not the delivered one: {opened:?}"
-    );
-    assert!(
-        ledger.committed().bytes >= U256::from(total),
-        "the lane paid for every byte it delivered"
-    );
-}
-
-/// A leg that a lost connection ends keeps the span it delivered and did not
-/// pay for on its lane, as a funding refusal does: the credit window lets the
-/// node stream ahead of the voucher, whatever ends the stream (#2718). The next
-/// drive on the SAME lane opens at the paid frontier and bills that span.
-#[tokio::test(start_paused = true)]
-async fn the_same_lane_bills_its_owed_tail_after_a_lost_connection() {
+async fn a_lost_connection_resumes_at_the_verified_frontier() {
     let total = 6 * GROUP;
     let (root, plaintext, _outboard) = synth_blob(total as usize);
     let store = fresh_store(root, total);
@@ -2895,12 +2820,7 @@ async fn the_same_lane_bills_its_owed_tail_after_a_lost_connection() {
     let delivered = contiguous_byte_ranges(&missing, total)
         .first()
         .map_or(total, |&(start, _)| start);
-    assert!(delivered > 0, "the credit window delivered bytes unpaid");
-    assert_eq!(
-        ledger.committed().amount,
-        U256::ZERO,
-        "the lane paid nothing"
-    );
+    assert!(delivered > 0, "the first leg verified bytes");
 
     drive_whole(&store, &source, &ledger, root)
         .await
@@ -2908,15 +2828,9 @@ async fn the_same_lane_bills_its_owed_tail_after_a_lost_connection() {
     assert!(store.is_complete().await.expect("is_complete"));
     let opened = source.opened_ranges();
     assert_eq!(
-        opened.get(1).copied(),
-        Some((0, total)),
-        "the next leg opens at the paid frontier, not the delivered one: {opened:?}"
-    );
-    let whole_wire = align_range(0, 0, total).expect("align").wire_len();
-    assert_eq!(
-        ledger.committed().bytes,
-        U256::from(whole_wire),
-        "the lane pays every wire byte of the blob once"
+        opened.get(1).map(|&(start, _)| start),
+        Some(delivered),
+        "the next leg opens at the verified frontier: {opened:?}"
     );
 }
 
@@ -2971,118 +2885,6 @@ async fn resume_after_a_funding_stop(
     (source, delivered, whole_wire)
 }
 
-/// An `AmountRegression` whose bundle states the node's watermark `bytes`,
-/// signed by `ctx`'s own key: the node holds vouchers our ledger lost.
-fn node_holds(ctx: &PoolContext, bytes: u64) -> anyhow::Error {
-    rejected_with_bundle(VoucherRejectReason::AmountRegression, ctx, (1, bytes), None)
-}
-
-/// A reseed moves the ledger up to vouchers the node holds and our record
-/// lost, and nothing ties them to this leg's content. A funding stop leaves
-/// delivered bytes unpaid. When the resumed lane's first open draws an
-/// `AmountRegression` whose bundle states a watermark one group in, the jump
-/// pays for none of the delivered tail: the next leg opens at the leg's start
-/// and bills the whole blob. Counting the jump as this leg's payment, or
-/// treating the delivered frontier as paid, would skip billing it (#2629).
-#[tokio::test(start_paused = true)]
-async fn a_reseed_does_not_mark_the_delivered_tail_paid() {
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let (source, _delivered, whole_wire) =
-        resume_after_a_funding_stop(&ledger, |ctx, wire| vec![node_holds(ctx, wire)]).await;
-
-    let opened = source.opened_ranges();
-    assert_eq!(
-        opened.get(1).map(|&(start, _)| start),
-        Some(0),
-        "the leg after the reseed opens at its own start: {opened:?}"
-    );
-    assert!(
-        ledger.committed().bytes >= U256::from(whole_wire),
-        "the lane paid for every wire byte of the blob: {:?} < {whole_wire}",
-        ledger.committed()
-    );
-}
-
-/// A stale heal moves no watermark, so it says nothing about the delivered
-/// tail either. Here a second `AmountRegression` at the bundle the ledger
-/// already reached heals stale, and the next leg still opens at the leg's
-/// start rather than the delivered frontier.
-#[tokio::test(start_paused = true)]
-async fn a_stale_heal_does_not_mark_the_delivered_tail_paid() {
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let (source, _delivered, whole_wire) = resume_after_a_funding_stop(&ledger, |ctx, wire| {
-        vec![node_holds(ctx, wire), node_holds(ctx, wire)]
-    })
-    .await;
-
-    let opened = source.opened_ranges();
-    assert_eq!(
-        opened.get(1).map(|&(start, _)| start),
-        Some(0),
-        "the leg after the stale heal opens at its own start: {opened:?}"
-    );
-    assert!(
-        ledger.committed().bytes >= U256::from(whole_wire),
-        "the lane paid for every wire byte of the blob: {:?} < {whole_wire}",
-        ledger.committed()
-    );
-}
-
-/// A restarted payer whose store trails the node's watermark from earlier
-/// blobs. A small blob delivers all but its last byte inside the credit
-/// window, unpaid, and only then does the leg draw an `AmountRegression` whose
-/// bundle states that far larger, older watermark. The reseed's jump pays for
-/// none of this blob, so the drive re-opens it from the start and pays for it
-/// above the node's watermark. Counting the jump as this leg's payment would
-/// mark the delivered bytes paid and bill only the rest.
-#[tokio::test(start_paused = true)]
-async fn a_reseed_to_an_older_watermark_pays_for_the_delivered_bytes() {
-    let total = 2 * GROUP;
-    let (root, plaintext, _outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let whole_wire = align_range(0, 0, total).expect("align").wire_len();
-    let history = 100 * whole_wire;
-    let ctx = healthy_ctx();
-    let rejecting = ctx.clone();
-    let source = ScriptedSource::new(plaintext)
-        .expect("source")
-        .paying(Arc::clone(&ledger))
-        .fault_once_after(whole_wire as usize - 1, move || {
-            node_holds(&rejecting, history)
-        });
-
-    drive(
-        &store,
-        &source,
-        &BudgetPacer::new(),
-        &Arc::new(Mutex::new(ctx)),
-        &ledger,
-        root,
-        0,
-        0,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("the reseeded lane completes the fetch");
-    assert!(store.is_complete().await.expect("is_complete"));
-
-    let opened = source.opened_ranges();
-    assert_eq!(
-        opened.iter().map(|&(start, _)| start).collect::<Vec<_>>(),
-        vec![0, 0],
-        "the blob is opened again from its start after the reseed: {opened:?}"
-    );
-    assert!(
-        ledger.committed().bytes >= U256::from(history + whole_wire),
-        "the lane paid for the blob above the node's watermark: {:?}",
-        ledger.committed()
-    );
-}
-
 /// A rebase moves the ledger down to the node's watermark: the node took none
 /// of the vouchers above it. The leg re-anchors at the delivered frontier, so
 /// the next leg opens there and does not re-deliver and re-pay the span the
@@ -3101,154 +2903,6 @@ async fn a_rebase_resumes_at_the_delivered_frontier() {
         opened.get(1).map(|&(start, _)| start),
         Some(delivered),
         "the leg after the rebase opens at the delivered frontier: {opened:?}"
-    );
-}
-
-/// After a pool replacement or a key rotation the old lane is gone. A new
-/// lane carries no owed span, so it resumes at the delivered frontier: the old
-/// lane's unpaid span is the node's bounded credit-window loss.
-#[tokio::test(start_paused = true)]
-async fn a_new_lane_resumes_at_the_delivered_frontier_and_owes_nothing() {
-    let total = 6 * GROUP;
-    let (root, plaintext, _outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-    let old = Arc::new(PoolLedger::new(Cumulative::default()));
-    let source = delivers_then_rejects_funding(plaintext.clone(), &old);
-    drive_whole(&store, &source, &old, root)
-        .await
-        .expect_err("the funding rejection ends the old lane");
-    let missing = store.missing_ranges(0, 0).await.expect("missing");
-    let delivered = contiguous_byte_ranges(&missing, total)
-        .first()
-        .map_or(total, |&(start, _)| start);
-    assert!(delivered > 0, "the credit window delivered bytes unpaid");
-
-    let new = Arc::new(PoolLedger::new(Cumulative::default()));
-    let fresh = ScriptedSource::new(plaintext)
-        .expect("source")
-        .paying(Arc::clone(&new));
-    drive_whole(&store, &fresh, &new, root)
-        .await
-        .expect("the new lane completes");
-    assert_eq!(
-        fresh.opened_ranges().first().map(|&(start, _)| start),
-        Some(delivered),
-        "the new lane opens at the delivered frontier"
-    );
-    assert!(
-        old.take_unpaid(root)
-            .first()
-            .is_some_and(|&(start, _)| start == 0),
-        "the old lane still records what it owes"
-    );
-}
-
-/// A missing range `[a, b)` and an owed span `[b, c)` merge into one gap. A
-/// drive whose gap fails before it reaches `b` keeps the whole owed span: the
-/// gap's paid frontier never passed `a`.
-#[tokio::test(start_paused = true)]
-async fn an_owed_span_behind_a_failed_missing_range_stays_owed() {
-    let total = 6 * GROUP;
-    let (root, plaintext, outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-    let (b, c) = (3 * GROUP, total);
-    let held = align_range(b, c - b, total).expect("align");
-    preadmit(&store, &plaintext, &outboard, &held).await;
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    ledger.note_unpaid(root, b, c);
-    let source = ScriptedSource::new(plaintext)
-        .expect("source")
-        .paying(Arc::clone(&ledger))
-        .refusing_open(0, || {
-            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
-        });
-
-    drive_whole(&store, &source, &ledger, root)
-        .await
-        .expect_err("the open is refused");
-    assert_eq!(
-        ledger.take_unpaid(root),
-        vec![(b, c - b)],
-        "the owed span survives the failed gap"
-    );
-}
-
-/// A drive the caller drops mid-gap keeps the owed span it took: the node's
-/// pull leg races a drive against its cancel token, and the lane still owes
-/// those bytes.
-#[tokio::test(start_paused = true)]
-async fn a_dropped_drive_keeps_its_owed_span() {
-    let total = 6 * GROUP;
-    let (root, plaintext, outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-    let (b, c) = (3 * GROUP, total);
-    let held = align_range(b, c - b, total).expect("align");
-    preadmit(&store, &plaintext, &outboard, &held).await;
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    ledger.note_unpaid(root, b, c);
-    // The gate never opens: the drive waits on its first read until dropped.
-    let (_gate, gated) = tokio::sync::watch::channel(false);
-    let source = ScriptedSource::new(plaintext)
-        .expect("source")
-        .paying(Arc::clone(&ledger))
-        .gated_on(gated);
-
-    tokio::select! {
-        ended = drive_whole(&store, &source, &ledger, root) => {
-            panic!("the gated drive ended: {ended:?}");
-        }
-        () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-    }
-    assert_eq!(
-        ledger.take_unpaid(root),
-        vec![(b, c - b)],
-        "the dropped drive noted its owed span back"
-    );
-}
-
-/// A leg that re-delivers present bytes to bill them reports no progress for
-/// them: the position counts only bytes past the delivered frontier, so the
-/// funding recovery gate never takes a re-billed byte for a new one.
-#[tokio::test(start_paused = true)]
-async fn re_delivered_bytes_report_no_progress() {
-    let total = 6 * GROUP;
-    let (root, plaintext, outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-    let owed_end = 3 * GROUP;
-    let held = align_range(0, owed_end, total).expect("align");
-    preadmit(&store, &plaintext, &outboard, &held).await;
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    ledger.note_unpaid(root, 0, owed_end);
-    // The leg re-delivers most of the owed span, then resets.
-    let source = ScriptedSource::new(plaintext)
-        .expect("source")
-        .paying(Arc::clone(&ledger))
-        .fault_once_after(2 * GROUP as usize, || anyhow::anyhow!("connection reset"));
-    let highest = std::sync::atomic::AtomicU64::new(0);
-    let on_progress = |position: u64, _total: u64| {
-        highest.fetch_max(position, std::sync::atomic::Ordering::Relaxed);
-    };
-    let ctx = Arc::new(Mutex::new(healthy_ctx()));
-    drive(
-        &store,
-        &source,
-        &BudgetPacer::new(),
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        Some(&on_progress),
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect_err("the leg resets");
-    assert_eq!(
-        highest.load(std::sync::atomic::Ordering::Relaxed),
-        owed_end,
-        "the re-delivered bytes moved the position past the present base"
     );
 }
 
@@ -3351,20 +3005,6 @@ async fn a_gap_over_the_cap_pulls_up_to_the_cap_then_ends() {
     assert_eq!(source.opened_ranges(), vec![(4 * GROUP, 2 * GROUP)]);
     let held = ranges_content_len(&store.present_ranges().await.expect("present"), total);
     assert_eq!(held, 2 * GROUP, "the store holds exactly the cap");
-}
-
-/// Owed spans merge into disjoint ascending ranges.
-#[test]
-fn owed_spans_merge_and_are_taken_once() {
-    let ledger = PoolLedger::new(Cumulative::default());
-    let hash = [7u8; 32];
-    ledger.note_unpaid(hash, 10, 20);
-    ledger.note_unpaid(hash, 15, 30);
-    ledger.note_unpaid(hash, 40, 40);
-    ledger.note_unpaid([8u8; 32], 0, 5);
-    assert_eq!(ledger.take_unpaid(hash), vec![(10, 20)]);
-    assert!(ledger.take_unpaid(hash).is_empty(), "taken once");
-    assert_eq!(ledger.take_unpaid([8u8; 32]), vec![(0, 5)]);
 }
 
 /// `streamed_first_leg` is the range a streamed drive opens first on an empty

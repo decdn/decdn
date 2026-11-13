@@ -44,6 +44,7 @@ use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
+use decdn_client::payer_window::PayAheadPolicy;
 use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::session::{
     ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PoolOpen,
@@ -349,6 +350,44 @@ pub(crate) fn proxy_warming(args: &cli::ClientFetchArgs) -> ProxyWarmingParams {
     }
 }
 
+/// The pull tunables the payer-window flags name: how far this payer pays
+/// ahead of delivery, per node, and how it treats a node that loses it credit
+/// (ADR 003 § Credit Window).
+pub(crate) const fn pull_config(args: &cli::ClientFetchArgs) -> PullConfig {
+    PullConfig::new().with_pay_ahead(PayAheadPolicy {
+        cap_micro_usdc: args.pay_ahead_cap,
+        divisor: args.pay_ahead_divisor,
+        loss_weight: args.loss_weight,
+        write_off_budget_micro_usdc: args.write_off_budget,
+    })
+}
+
+/// Seeds the process's payer windows from the peer store when a fetch starts
+/// and writes them back when it ends, so a node's earned window and recorded
+/// losses outlive the process.
+struct PayerTrust {
+    store: PeerStore,
+}
+
+impl PayerTrust {
+    fn open(data_dir: &std::path::Path) -> Self {
+        let store = PeerStore::open(data_dir);
+        store.seed_windows(decdn_client::payer_window::PayerWindows::process());
+        Self { store }
+    }
+}
+
+impl Drop for PayerTrust {
+    fn drop(&mut self) {
+        if let Err(e) = self
+            .store
+            .save_windows(decdn_client::payer_window::PayerWindows::process())
+        {
+            tracing::warn!(error = %format_args!("{e:#}"), "could not save the payer window record");
+        }
+    }
+}
+
 /// How the command finds a blob's holders, from its flags: the `--node-id`
 /// it pins (with `--provider-address` and any `--addr`), or discovery.
 ///
@@ -357,6 +396,7 @@ pub(crate) fn proxy_warming(args: &cli::ClientFetchArgs) -> ProxyWarmingParams {
 /// A [`ResolveConfigFault`] for a malformed `--node-id` or
 /// `--provider-address`, or a `--node-id` without `--provider-address`.
 pub(crate) fn discovery_options(args: &cli::ClientFetchArgs) -> anyhow::Result<DiscoveryOptions> {
+    pull_config(args).apply_pay_ahead();
     Ok(DiscoveryOptions {
         pinned: pinned_node(args)?,
         rediscover: args.rediscover,
@@ -1200,6 +1240,10 @@ pub(crate) async fn fetch_on(
     // first open discovers them. The round streams: the fetch starts at the
     // first verified holder, and the holders that answer later join it.
     let discovery = discovery_options(common)?;
+    // The payer's credit window toward each node follows the track record the
+    // peer store keeps per operator address; the guard writes it back once this
+    // fetch ends, whatever ends it.
+    let _trust = PayerTrust::open(&chain.site.data_dir);
     // A known size (a gateway's manifest entry, or a size an earlier fetch
     // on the host verified) is the first size claim, and a pinned node is not
     // probed for it.
@@ -1739,10 +1783,7 @@ async fn prove_size<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let config = PullConfig {
-        streamer_lane_cap: max_sources.max(1),
-        ..PullConfig::new()
-    };
+    let config = PullConfig::new().with_streamer_lane_cap(max_sources.max(1));
     let scratch = stream_scratch(deps)?;
     streamer_over(deps, sources, holders, health, scratch.path())
         .prove_size(hash, total_bytes, &config, stop)
@@ -1787,10 +1828,9 @@ async fn stream_out<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let pull_config = PullConfig {
-        streamer_lane_cap: max_sources.max(1),
-        read_ahead_bytes: stream_read_ahead(read_ahead),
-    };
+    let pull_config = PullConfig::new()
+        .with_streamer_lane_cap(max_sources.max(1))
+        .with_read_ahead_bytes(stream_read_ahead(read_ahead));
     let scratch = stream_scratch(deps)?;
     let streamer = streamer_over(deps, sources, holders, health, scratch.path());
     // A window streams exactly its bytes, paid for by the aligned span around

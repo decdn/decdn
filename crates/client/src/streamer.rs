@@ -705,6 +705,7 @@ where
         P: 'a,
         F: 'a,
     {
+        config.apply_pay_ahead();
         let (offset, len) = window;
         anyhow::ensure!(
             offset == 0 || offset < total_bytes,
