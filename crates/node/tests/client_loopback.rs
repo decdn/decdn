@@ -3205,14 +3205,8 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
     let reserved_a = min_payment(payload_a.len() as u64, RATE_PER_MB);
     let reserved_b = min_payment(payload_b.len() as u64, RATE_PER_MB);
     let remaining = reserved_a + reserved_b - U256::from(1u64);
-    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        remaining,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, remaining).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3288,14 +3282,8 @@ async fn finished_stream_releases_its_floor_reservation() -> anyhow::Result<()> 
     // one chunk, so a floor costs `min_payment(CHUNK_BYTES, rate)`. Derived
     // rather than hard-coded so it tracks the payment quantum.
     let remaining = min_payment(CHUNK_BYTES, RATE_PER_MB) + U256::from(2u64);
-    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        remaining,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, remaining).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3358,14 +3346,8 @@ async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
     // one chunk, so a floor costs `min_payment(CHUNK_BYTES, rate)`. Derived
     // rather than hard-coded so it tracks the payment quantum.
     let remaining = min_payment(CHUNK_BYTES, RATE_PER_MB) + U256::from(2u64);
-    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        remaining,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, remaining).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3425,14 +3407,8 @@ async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
     // one chunk, so a floor costs `min_payment(CHUNK_BYTES, rate)`. Derived
     // rather than hard-coded so it tracks the payment quantum.
     let remaining = min_payment(CHUNK_BYTES, RATE_PER_MB) + U256::from(2u64);
-    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        remaining,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, remaining).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5467,14 +5443,8 @@ async fn client_underfunded_pool_is_refused_pre_serve() -> anyhow::Result<()> {
     // Pool remaining sits one base unit under the floor's cost. A large
     // `credit_max` makes no difference here — the default (non-zero) ramp
     // divisor prices the gate at the floor, not the ceiling.
-    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        deposit,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, deposit).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5752,14 +5722,8 @@ async fn client_spent_down_pool_is_refused_pre_serve() -> anyhow::Result<()> {
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Gross deposit 100, but the pool has only 5 remaining after prior redeems —
     // the headroom the gate reserves against, ten times under the window cost.
-    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        U256::from(5u64),
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, U256::from(5u64)).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5829,14 +5793,8 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Pool remaining 5 covers the ~0.4 MiB tail (cost 4) but not the whole blob.
-    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        U256::from(5u64),
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, U256::from(5u64)).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5900,14 +5858,8 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Pool remaining exactly equals the floor's cost — the `>=` boundary.
-    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        window_cost,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, window_cost).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -8053,14 +8005,8 @@ async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
     let (store, signers) = store_with_distinct_lanes(affordable_floors + 1)?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
 
-    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        remaining,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, remaining).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let client_node_id = B256::from(*client_ep.id().as_bytes());
@@ -8127,14 +8073,8 @@ async fn topped_up_pool_serves_many_lanes() -> anyhow::Result<()> {
     let (store, signers) = store_with_distinct_lanes(lanes)?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
 
-    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
-        cache,
-        store_dyn,
-        remaining,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-    )
-    .await?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, remaining).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let client_node_id = B256::from(*client_ep.id().as_bytes());

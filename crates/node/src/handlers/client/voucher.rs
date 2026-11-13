@@ -306,28 +306,24 @@ impl ClientHandler {
                 .await;
         }
 
-        let verified = match Self::verify_voucher(
-            &guard.state,
-            guard.paid_bytes,
-            &signed,
-            &wire,
-            rate_per_mb,
-        ) {
-            Ok(v) => v,
-            Err(VerifyStop::Reject(reason, bundle)) => {
-                drop(guard);
-                return self
-                    .reject_proof(send, "voucher", &lane_key, reason, bundle)
-                    .await;
-            }
-            Err(VerifyStop::Bail(e)) => {
-                drop(guard);
-                if e.is::<super::wire::ClientPaymentFault>() {
-                    log_rate_check_reject(&lane_key, &e);
+        let verified =
+            match Self::verify_voucher(&guard.state, guard.paid_bytes, &signed, &wire, rate_per_mb)
+            {
+                Ok(v) => v,
+                Err(VerifyStop::Reject(reason, bundle)) => {
+                    drop(guard);
+                    return self
+                        .reject_proof(send, "voucher", &lane_key, reason, bundle)
+                        .await;
                 }
-                return Err(e);
-            }
-        };
+                Err(VerifyStop::Bail(e)) => {
+                    drop(guard);
+                    if e.is::<super::wire::ClientPaymentFault>() {
+                        log_rate_check_reject(&lane_key, &e);
+                    }
+                    return Err(e);
+                }
+            };
 
         // The voucher's full value is lane credit: the lane's credit is its paid
         // bytes minus its delivered bytes (`LaneState::credit_bytes`), so raising

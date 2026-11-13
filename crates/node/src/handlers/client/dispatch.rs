@@ -4,9 +4,9 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, Hash, LaneKey, MissPath, MissRefusal, OwnedSemaphorePermit, PublicKey, RecvStream, Semaphore, SendStream,
-    ServeRejectReason, StreamReadError, StreamRequest, StreamResponseBody, U256, VarInt,
-    read_first_message, reset_stream, verify_binding,
+    FirstMessage, Hash, LaneKey, MissPath, MissRefusal, OwnedSemaphorePermit, PublicKey,
+    RecvStream, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest,
+    StreamResponseBody, U256, VarInt, read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
@@ -1278,15 +1278,16 @@ impl ClientHandler {
         // `remaining` comes from the cached `getPool` view resolved above; a `None`
         // view fails open (the on-chain `redeem` is the backstop). Either way, refuse
         // `InsufficientDeposit` when the pool can no longer cover the gate.
-        let guard_bytes =
-            aligned_span(req.byte_offset, req.byte_len, total_bytes).min(CHUNK_BYTES);
+        let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes).min(CHUNK_BYTES);
         if let Some(status) = pool_status
             && !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
         {
             self.log_deposit_refusal(
                 B256::from(req.pool_id),
                 hash,
-                status.remaining.saturating_sub(self.pool_min_remaining_deposit),
+                status
+                    .remaining
+                    .saturating_sub(self.pool_min_remaining_deposit),
                 decdn_incentive::min_payment(guard_bytes, rate_per_mb),
             );
             return self

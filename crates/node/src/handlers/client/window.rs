@@ -659,8 +659,7 @@ impl ClientHandler {
         // PROBED total, so a resumed tail near the blob end span-caps too, and a
         // request accepted at dispatch is never refused here for a sub-chunk span.
         // In bounds per the gate above, so `aligned_span` never saturates.
-        let guard_bytes =
-            aligned_span(req.byte_offset, req.byte_len, total_bytes).min(chunk_bytes);
+        let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes).min(chunk_bytes);
         if let Some(remaining) = pool_remaining
             && !self.pool_remaining_covers_window(remaining, guard_bytes, rate_per_mb)
         {

@@ -63,8 +63,7 @@ use super::voucher::StreamAnchor;
 use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
-    Connection, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream,
-    ServeRejectReason,
+    Connection, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, ServeRejectReason,
 };
 
 /// The downstream credit frontier a serve leg publishes to its pull leg.
@@ -167,7 +166,11 @@ impl ClientHandler {
         // rank oldest for eviction while it streams. Recency only: the frequency
         // sighting waits for `StreamEnd`.
         self.cache.touch_recency(hash);
-        Self::log_backfill(lane_key, hash, self.apply_backfill(lane, hash, offset).await);
+        Self::log_backfill(
+            lane_key,
+            hash,
+            self.apply_backfill(lane, hash, offset).await,
+        );
         let ended = self
             .serve_leg_loop(
                 conn,
@@ -325,8 +328,7 @@ impl ClientHandler {
             }
             Ok(other) => Ok(other),
             Err(e) => {
-                if super::wire::is_peer_attributable(&e) && !ProofWaitFault::is_past_ceiling(&e)
-                {
+                if super::wire::is_peer_attributable(&e) && !ProofWaitFault::is_past_ceiling(&e) {
                     self.metrics.node_pull_through_client_abandoned();
                 }
                 Err(e)

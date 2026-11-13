@@ -202,13 +202,7 @@ impl LaneDeliveryState {
     /// stream on the blob is consumed. A start before it returns the gap to the
     /// lane's credit, within the lane's allowance and `window`. Returns the bytes
     /// given back.
-    fn take_backfill(
-        &mut self,
-        hash: Hash,
-        byte_offset: u64,
-        window: u64,
-        divisor: u64,
-    ) -> u64 {
+    fn take_backfill(&mut self, hash: Hash, byte_offset: u64, window: u64, divisor: u64) -> u64 {
         let Some(end_offset) = self.unclean_ends.remove(&hash) else {
             return 0;
         };
@@ -2003,11 +1997,7 @@ impl ClientHandler {
     /// count. Returns the credit the lane holds when it cannot cover `len`, so the
     /// caller reads a proof. Two streams on one lane never spend one payment twice,
     /// because both debit this one balance.
-    async fn debit_lane(
-        &self,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
-        len: u64,
-    ) -> Result<(), u64> {
+    async fn debit_lane(&self, lane: &Arc<Mutex<LaneDeliveryState>>, len: u64) -> Result<(), u64> {
         let mut guard = lane.lock().await;
         guard.state.debit(len)?;
         if let Err(e) = self.pool_state_store.record(&guard.state) {
@@ -2036,8 +2026,12 @@ impl ClientHandler {
         byte_offset: u64,
     ) -> u64 {
         let mut guard = lane.lock().await;
-        let granted =
-            guard.take_backfill(hash, byte_offset, self.backfill_window, self.backfill_divisor);
+        let granted = guard.take_backfill(
+            hash,
+            byte_offset,
+            self.backfill_window,
+            self.backfill_divisor,
+        );
         if granted > 0
             && let Err(e) = self.pool_state_store.record(&guard.state)
         {

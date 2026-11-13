@@ -131,9 +131,7 @@ pub use probe_sig::{
     PROBE_RESPONSE_TYPEHASH, ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME,
     SLASH_JUDGE_DOMAIN_VERSION, slash_judge_domain,
 };
-pub use rate::{
-    BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate,
-};
+pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 pub use store::{
     CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, MemorySettlementLedger,
     PendingSettle, PendingSettleStore, PoolStateStore, SettlementLedger, SettlementRecord,

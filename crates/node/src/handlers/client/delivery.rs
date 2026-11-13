@@ -241,7 +241,8 @@ impl ClientHandler {
             .await;
         if !matches!(ended, Ok(ServeEnd::Completed { .. })) && delivered > 0 {
             let fetch_start = byte_offset - byte_offset % decdn_bao_range::CHUNK_GROUP_BYTES;
-            let end = decdn_client::sink::content_paid_frontier(fetch_start, total_bytes, delivered);
+            let end =
+                decdn_client::sink::content_paid_frontier(fetch_start, total_bytes, delivered);
             self.note_unclean_end(lane, hash, end).await;
         }
         ended.map_err(|e| super::wire::tag_paid_progress(e, paid))

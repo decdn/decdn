@@ -2477,7 +2477,7 @@ fn left(gateway: &Gateway) -> u64 {
 /// may have paid past the bytes that landed.
 #[tokio::test]
 async fn a_blob_that_is_no_manifest_is_still_charged() {
-    let allowance = 64 << 20;
+    let allowance = 256 << 20;
     let (gateway, _, _) = public_gateway_with(allowance).await;
     let site = gateway.sites.site_host(&Site {
         hash: OTHER,
@@ -2507,7 +2507,7 @@ async fn a_blob_that_is_no_manifest_is_still_charged() {
 /// charged its bytes alone.
 #[tokio::test]
 async fn a_dropped_response_is_charged_its_read_ahead() {
-    let allowance = 64 << 20;
+    let allowance = 256 << 20;
     let (gateway, _, _) = public_gateway_with(allowance).await;
     let big = alloy::hex::encode(BIG);
     let req = Request::builder()
@@ -2542,7 +2542,7 @@ async fn a_dropped_response_is_charged_its_read_ahead() {
 /// and no penalty.
 #[tokio::test]
 async fn a_body_delivered_to_its_known_length_pays_no_penalty() {
-    let allowance = 64 << 20;
+    let allowance = 256 << 20;
     let (gateway, _, host) = public_gateway_with(allowance).await;
     let req = Request::builder()
         .method(Method::GET)
@@ -2747,7 +2747,7 @@ async fn a_manifest_read_stops_at_the_allowance() {
 /// early the client leaves.
 #[tokio::test]
 async fn a_request_dropped_before_its_first_byte_is_charged() {
-    let allowance = 64 << 20;
+    let allowance = 256 << 20;
     let (gateway, _, _) = public_gateway_with(allowance).await;
     let held = alloy::hex::encode(HELD);
     let req = Request::builder()
@@ -2918,7 +2918,7 @@ async fn a_range_is_admitted_by_its_aligned_span() {
 /// across a group boundary cost two.
 #[tokio::test]
 async fn a_range_is_charged_by_its_aligned_span() {
-    let allowance = 64 << 20;
+    let allowance = 256 << 20;
     let manifest = u64::try_from(public_manifest().len()).unwrap();
     let group = decdn_bao_range::CHUNK_GROUP_BYTES;
     let (gateway, _, host) = public_gateway_with(allowance).await;

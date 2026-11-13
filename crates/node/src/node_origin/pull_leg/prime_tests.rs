@@ -128,10 +128,7 @@ async fn the_predicted_leg_is_the_first_runs_first_leg() {
         .await
         .unwrap();
         let got = prime.predicted_leg(total, coverages.get(run.source_ix).unwrap(), ceiling);
-        assert_eq!(
-            got, want,
-            "offset {offset}, len {len}, ceiling {ceiling}"
-        );
+        assert_eq!(got, want, "offset {offset}, len {len}, ceiling {ceiling}");
     }
 }
 
