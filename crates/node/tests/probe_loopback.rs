@@ -394,9 +394,6 @@ fn build_handler(
 fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
-        per_source_rate_per_sec: 1_000_000.0,
-        per_source_burst: u32::MAX,
-        max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
 }
@@ -407,11 +404,8 @@ fn permissive_probe_rate_limiter(metrics: &Arc<Metrics>) -> Arc<ProbeRateLimiter
     let cfg = RateLimitConfig {
         per_peer_rate_per_sec: 1e9,
         per_peer_burst: u32::MAX,
-        per_ip_rate_per_sec: 1e9,
-        per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e9,
         global_burst: u32::MAX,
-        max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };
     Arc::new(ProbeRateLimiter::new(&cfg, Arc::clone(metrics)))
@@ -1102,7 +1096,7 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
 
 /// Observe a rate-limit rejection's application close with a bounded retry,
 /// requiring the `APP_ERR_RATE_LIMITED` (`0x10`) code **and** `expected_reason`
-/// (the layer label, e.g. `"per-source"` / `"per_peer"`) at least once (#1594).
+/// (the layer label, e.g. `"global-full"` / `"per_peer"`) at least once (#1594).
 ///
 /// The ADR-005 reject path closes the connection with `0x10` + the layer-label
 /// reason bytes, but QUIC's `CONNECTION_CLOSE` is best-effort and
@@ -1115,7 +1109,7 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
 ///
 /// Requiring `expected_reason` keeps the test proving the reason-byte layering
 /// it exists for: a `0x10` close carrying a *different* label is the also-`0x10`
-/// global / per-IP cap and fails immediately (it is not a transient). `connect`
+/// global cap and fails immediately (it is not a transient). `connect`
 /// yields a fresh `(Endpoint, Connection)` per attempt; the endpoint is kept
 /// alive across `closed()` and closed before the next attempt.
 async fn observe_rate_limit_close<F, Fut>(
@@ -1160,20 +1154,19 @@ where
     )
 }
 
-/// End-to-end check that the per-source rate limiter rejects with
+/// End-to-end check that the connection limiter rejects with
 /// `APP_ERR_RATE_LIMITED` (`0x10`) on the wire. Without this, the dispatch
 /// reject path is dead code under tests — every other test in this file uses
 /// `permissive_limiter`.
 ///
-/// Strict per-IP burst=1 limiter. The bucket for the loopback source key is
-/// drained out-of-band via the limiter's test hook, so the single live client
-/// connection is unconditionally rejected by `ConnectionLimiter::acquire` at
-/// the top of `serve` and observes `APP_ERR_RATE_LIMITED` on its
-/// `CONNECTION_CLOSE`.
+/// A global cap of one handler, held out-of-band through the limiter's test
+/// hook for the whole test, so every live client connection is rejected by
+/// `ConnectionLimiter::acquire` at the top of `serve` and observes
+/// `APP_ERR_RATE_LIMITED` on its `CONNECTION_CLOSE`.
 ///
-/// Draining the bucket out of band is what keeps this deterministic: the test
-/// opens no throwaway connection to charge the bucket, so nothing races the one
-/// live connection's establishment, and the accept loop assumes no connection
+/// Holding the slot out of band is what keeps this deterministic: the test
+/// opens no throwaway connection to fill the cap, so nothing races the live
+/// connection's establishment, and the accept loop assumes no connection
 /// count.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()> {
@@ -1181,30 +1174,14 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
 
-    // burst=1 per-source so the loopback source key rejects after a single
-    // charge. Global is loose so it doesn't interfere.
     let strict = ResolvedSecurity {
-        max_concurrent_handlers: 64,
-        per_source_rate_per_sec: 0.001, // negligible refill within the test window
-        per_source_burst: 1,
-        max_tracked_sources: 32,
+        max_concurrent_handlers: 1,
     };
     let limiter = Arc::new(ConnectionLimiter::new(&strict, Arc::clone(&metrics)));
+    let _held = limiter
+        .acquire_for_test(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        .map_err(|r| anyhow::anyhow!("holding the only slot unexpectedly failed: {r:?}"))?;
 
-    // Pre-drain the per-source bucket for the loopback source key. The client
-    // endpoint binds to 127.0.0.1, so the server resolves the connection's
-    // source key to `127.0.0.1` (`source_key` leaves IPv4 unchanged); charging
-    // it here exhausts the burst-1 budget before the live connection arrives.
-    // Dropping the returned permit releases only the global semaphore slot —
-    // the consumed per-source token is time-based and stays spent for the full
-    // refill period (1 / `per_source_rate_per_sec`, ~1000s here).
-    drop(
-        limiter
-            .acquire_for_test(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)))
-            .map_err(|r| anyhow::anyhow!("pre-drain unexpectedly rejected: {r:?}"))?,
-    );
-
-    let limiter_probe = Arc::clone(&limiter);
     let (cache, _cache_tmp) = empty_cache().await?;
     let (handler, _signer, _domain) = build_handler(server_id, 1, &metrics, limiter, cache);
 
@@ -1230,11 +1207,9 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
 
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
     // Every connection is rejected by `ConnectionLimiter::acquire` at the top of
-    // `serve` and closed with APP_ERR_RATE_LIMITED + the `per-source` layer
-    // label. Observe with a bounded retry to absorb the #1594 close-frame race;
-    // requiring the `per-source` reason bytes still proves the per-source layer
-    // fired rather than the also-0x10 global cap.
-    observe_rate_limit_close(RejectReason::PerSource.as_str().as_bytes(), move || {
+    // `serve` and closed with APP_ERR_RATE_LIMITED + the `global-full` layer
+    // label. Observe with a bounded retry to absorb the #1594 close-frame race.
+    observe_rate_limit_close(RejectReason::GlobalFull.as_str().as_bytes(), move || {
         let target = target.clone();
         async move {
             let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -1252,17 +1227,6 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     })
     .await?;
 
-    // The live connection must have charged the *same* pre-drained key, not a
-    // fresh one: a single tracked source confirms `peer_ip` resolved it to
-    // 127.0.0.1 (a different key would have been admitted, not rejected). Every
-    // retry binds a fresh client endpoint on 127.0.0.1, so the tracked-source
-    // count stays 1 regardless of how many attempts the race required.
-    assert_eq!(
-        limiter_probe.per_source_tracked(),
-        1,
-        "live connection must hit the pre-drained 127.0.0.1 bucket"
-    );
-
     shutdown([accept_task], [&server_ep]).await?;
     Ok(())
 }
@@ -1276,7 +1240,7 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
 /// peer `Unreachable`, the penalty a handler-level load-shed `NotFound` is
 /// exonerated from.
 ///
-/// Same strict per-source fixture as `probe_rate_limit_returns_rate_limited_close_code`,
+/// Same held-cap fixture as `probe_rate_limit_returns_rate_limited_close_code`,
 /// and the same bounded retry over the #1594 close-frame race: an attempt whose
 /// error is NOT the sentinel is retried on a fresh endpoint, and only a `0x10`
 /// carrying the wrong label fails at once.
@@ -1292,17 +1256,12 @@ async fn probe_once_types_a_rate_limit_close_as_upstream_rate_limited() -> anyho
     let metrics = Arc::new(Metrics::new());
 
     let strict = ResolvedSecurity {
-        max_concurrent_handlers: 64,
-        per_source_rate_per_sec: 0.001,
-        per_source_burst: 1,
-        max_tracked_sources: 32,
+        max_concurrent_handlers: 1,
     };
     let limiter = Arc::new(ConnectionLimiter::new(&strict, Arc::clone(&metrics)));
-    drop(
-        limiter
-            .acquire_for_test(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)))
-            .map_err(|r| anyhow::anyhow!("pre-drain unexpectedly rejected: {r:?}"))?,
-    );
+    let _held = limiter
+        .acquire_for_test(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        .map_err(|r| anyhow::anyhow!("holding the only slot unexpectedly failed: {r:?}"))?;
 
     let (cache, _cache_tmp) = empty_cache().await?;
     let (handler, _signer, _domain) = build_handler(server_id, 1, &metrics, limiter, cache);
@@ -1337,7 +1296,7 @@ async fn probe_once_types_a_rate_limit_close_as_upstream_rate_limited() -> anyho
         .await;
         shutdown([], [&client_ep]).await?;
         let Err(err) = res else {
-            anyhow::bail!("a pre-drained per-source bucket must reject every probe");
+            anyhow::bail!("a full global cap must reject every probe");
         };
         match err.downcast_ref::<UpstreamRateLimited>() {
             Some(shed) => {
@@ -1357,15 +1316,15 @@ async fn probe_once_types_a_rate_limit_close_as_upstream_rate_limited() -> anyho
     })?;
     assert_eq!(
         shed.label.as_deref(),
-        Some(RejectReason::PerSource.as_str()),
-        "the sentinel must carry the per-source layer label off the close reason bytes"
+        Some(RejectReason::GlobalFull.as_str()),
+        "the sentinel must carry the layer label off the close reason bytes"
     );
 
     shutdown([accept_task], [&server_ep]).await?;
     Ok(())
 }
 
-/// End-to-end check that the ADR 005 §Probe rate limiting three-layer limiter
+/// End-to-end check that the ADR 005 §Probe rate limiting two-layer limiter
 /// (#982) — distinct from the `ConnectionLimiter` exercised above — rejects a
 /// probe with `APP_ERR_RATE_LIMITED` (`0x10`) and the `per_peer` layer label on
 /// the wire.
@@ -1378,34 +1337,30 @@ async fn probe_once_types_a_rate_limit_close_as_upstream_rate_limited() -> anyho
 /// keeps this deterministic, the same rationale as
 /// `probe_rate_limit_returns_rate_limited_close_code`.
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
+async fn probe_rate_limiter_rejects_per_peer() -> anyhow::Result<()> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
 
-    // Permissive connection limiter so only the probe three-layer limiter can
+    // Permissive connection limiter so only the probe rate limiter can
     // fire; strict per-peer (burst=1, negligible refill) probe limiter.
     let conn_limiter = permissive_limiter(&metrics);
     let strict_probe = RateLimitConfig {
         per_peer_rate_per_sec: 0.001, // negligible refill within the test window
         per_peer_burst: 1,
-        per_ip_rate_per_sec: 1e9,
-        per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e9,
         global_burst: u32::MAX,
-        max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };
     let probe_limiter = Arc::new(ProbeRateLimiter::new(&strict_probe, Arc::clone(&metrics)));
 
     // Pin the client key so we know its NodeId before connecting, then drain
-    // the per-peer bucket for it. `peer_ip = None` skips the (loose) per-IP
-    // layer; the per-peer charge is all we need.
+    // the per-peer bucket for it.
     let client_sk = fresh_key();
     let client_id = client_sk.public();
     let client_node = NodeId::from_bytes(*client_id.as_bytes());
     probe_limiter
-        .check(&client_node, None)
+        .check(&client_node)
         .map_err(|l| anyhow::anyhow!("pre-drain unexpectedly rejected: {l:?}"))?;
 
     let (cache, _cache_tmp) = empty_cache().await?;
@@ -1421,7 +1376,7 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
     let handler_bg = Arc::clone(&handler);
-    // Loop-accept for the same reason as the per-source test, and with the same
+    // Loop-accept for the same reason as the connection-limiter test, and with the same
     // absence of a count assumption: the bounded retry in
     // `observe_rate_limit_close` may open more than one connection to ride out
     // the #1594 close-frame race.
@@ -1443,8 +1398,7 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
     // client endpoint under the *same* pinned `client_sk`, so the requester
     // `NodeId` — and thus the pre-drained per-peer bucket — is unchanged and the
     // rejection is reproduced. Requiring the `per_peer` reason bytes proves the
-    // per-peer layer fired (the gap #982 closed), not the also-0x10 per-IP or
-    // global cap.
+    // per-peer layer fired (the gap #982 closed), not the also-0x10 global cap.
     observe_rate_limit_close(ProbeRejectLayer::PerPeer.as_str().as_bytes(), move || {
         let target = target.clone();
         let client_sk = client_sk.clone();

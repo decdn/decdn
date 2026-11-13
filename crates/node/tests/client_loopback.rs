@@ -2134,239 +2134,6 @@ async fn an_abandoned_stream_forfeits_its_lanes_ramp() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A server with a fixed-`remaining` pool view and a per-signer floor cap of `k`
-/// credit windows, at the default credit window, for the floor-debt tests
-/// (#2767).
-async fn spawn_floor_debt_server(
-    cache: CacheEngine,
-    store: Arc<dyn PoolStateStore>,
-    remaining: U256,
-    k: u64,
-) -> anyhow::Result<(
-    EndpointAddr,
-    Endpoint,
-    tokio::task::JoinHandle<()>,
-    Arc<Metrics>,
-)> {
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let owner = operator_addr();
-    let handler = build_handler_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store,
-        RATE_PER_MB,
-        |deps| {
-            deps.pool_view = Some(Arc::new(FixedRemainingPoolView { owner, remaining }));
-            deps.credit_max = decdn_common::config::DEFAULT_CREDIT_MAX;
-            deps.credit_ramp_divisor = decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR;
-            deps.pool_floor_signer_live_windows = k;
-        },
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_ep, server_task, metrics))
-}
-
-/// Record a lane on the test pool for a fresh signer, and return the signer.
-fn record_fresh_lane(store: &MemoryPoolStateStore) -> anyhow::Result<Arc<PrivateKeySigner>> {
-    let signer = Arc::new(PrivateKeySigner::random());
-    store.record(&LaneState::hydrate(
-        pool_id(),
-        signer.address(),
-        operator_addr(),
-        U256::from(10_000_000u64),
-        u64::MAX,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        decdn_incentive::LaneChain::NONE,
-    ))?;
-    Ok(signer)
-}
-
-/// Take an unpaid whole-blob stream's opening, walk away, and wait until the
-/// node has ended the stream, so its floor reservation is released. Returns the
-/// unpaid wire bytes the stream received.
-async fn take_floor_and_leave(
-    conn: &Connection,
-    hash: [u8; 32],
-    ext: &StreamRequestExt,
-    metrics: &Metrics,
-) -> anyhow::Result<u64> {
-    let ended = || -> anyhow::Result<u64> {
-        Ok(
-            counter(metrics, "decdn_serve_stream_client_declined_total")?
-                + counter(metrics, "decdn_serve_stream_client_abandoned_total")?,
-        )
-    };
-    let before = ended()?;
-    let (unpaid, mut send, mut recv) = read_unpaid_opening(conn, hash, ext).await?;
-    let _ = send.reset(0u32.into());
-    let _ = recv.stop(0u32.into());
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while ended()? == before {
-        anyhow::ensure!(Instant::now() < deadline, "the node never ended the stream");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    Ok(unpaid)
-}
-
-/// #2767: a client that never pays gets a bounded free total from one node.
-/// Each abandoned stream leaves its floor as floor debt, so once the debt fills
-/// the signer's `k`-window cap the node refuses the signer `NotFound`, although
-/// no stream is live and the pool can still pay.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_never_paying_client_gets_a_bounded_free_total() -> anyhow::Result<()> {
-    const K: u64 = 2;
-    let payload = vec![0x2Au8; 4 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let store = Arc::new(MemoryPoolStateStore::new());
-    let signer = record_fresh_lane(&store)?;
-    let (target, server_ep, server_task, metrics) =
-        spawn_floor_debt_server(cache, store, U256::from(1_000_000_000u64), K).await?;
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let ext = binding_ext(&signer, B256::from(*client_ep.id().as_bytes()))?;
-
-    let mut free: u64 = 0;
-    for _ in 0..K {
-        free += take_floor_and_leave(&conn, *hash.as_bytes(), &ext, &metrics).await?;
-    }
-    anyhow::ensure!(
-        free > K * HARNESS_INTERVAL_BYTES && free <= K * HARNESS_FLOOR_BYTES,
-        "the client took {free} free wire bytes; each of {K} streams takes one floor"
-    );
-    let (refusal, refusal_ext) =
-        open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    anyhow::ensure!(
-        !refusal.body.ok && matches!(refusal_ext.error(), Some(StreamError::NotFound)),
-        "a signer whose floor debt fills its cap is refused NotFound, got {:?}",
-        refusal_ext.error()
-    );
-    anyhow::ensure!(
-        counter(
-            &metrics,
-            "decdn_serve_stream_rejected_signer_floor_at_cap_total"
-        )? == 1,
-        "the refusal is the per-signer floor cap"
-    );
-
-    conn.close(0u32.into(), b"done");
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// #2767: rotating signer keys does not escape the pool ceiling. Every signer's
-/// floor debt sums under the pool, so a fresh signer is refused `Unfunded` once
-/// the debt fills `remaining − M`, although no stream is live.
-#[tokio::test(flavor = "multi_thread")]
-async fn rotating_signers_on_one_pool_meet_the_pool_bound() -> anyhow::Result<()> {
-    let payload = vec![0x2Bu8; 4 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let store = Arc::new(MemoryPoolStateStore::new());
-    let signers = [
-        record_fresh_lane(&store)?,
-        record_fresh_lane(&store)?,
-        record_fresh_lane(&store)?,
-    ];
-    // Two floors of headroom with M = 0.
-    let remaining = U256::from(2 * HARNESS_FLOOR_COST);
-    let (target, server_ep, server_task, metrics) =
-        spawn_floor_debt_server(cache, store, remaining, 8).await?;
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let client_node_id = B256::from(*client_ep.id().as_bytes());
-
-    let [first, second, third] = &signers;
-    for signer in [first, second] {
-        let ext = binding_ext(signer, client_node_id)?;
-        take_floor_and_leave(&conn, *hash.as_bytes(), &ext, &metrics).await?;
-    }
-    let ext = binding_ext(third, client_node_id)?;
-    let (refusal, refusal_ext) =
-        open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    anyhow::ensure!(
-        !refusal.body.ok && matches!(refusal_ext.error(), Some(StreamError::Unfunded)),
-        "a fresh signer on a pool full of floor debt is refused Unfunded, got {:?}",
-        refusal_ext.error()
-    );
-    anyhow::ensure!(
-        counter(
-            &metrics,
-            "decdn_serve_stream_rejected_insufficient_deposit_total"
-        )? == 1,
-        "the refusal is the pool floor ceiling"
-    );
-
-    conn.close(0u32.into(), b"done");
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// #2767: payment past a stream's own floor clears the signer's floor debt. A
-/// signer abandons one floor, then pays for a 4 MiB range; with `k = 2` it can
-/// then hold two unpaid streams at once again, which the owed floor would
-/// otherwise refuse.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_paying_stream_clears_the_signers_floor_debt() -> anyhow::Result<()> {
-    const K: u64 = 2;
-    let payload = vec![0x2Cu8; 16 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let store = Arc::new(MemoryPoolStateStore::new());
-    let signer = record_fresh_lane(&store)?;
-    let (target, server_ep, server_task, metrics) =
-        spawn_floor_debt_server(cache, store, U256::from(1_000_000_000u64), K).await?;
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let ext = binding_ext(&signer, B256::from(*client_ep.id().as_bytes()))?;
-
-    take_floor_and_leave(&conn, *hash.as_bytes(), &ext, &metrics).await?;
-    let paid = pay_range_to_end(
-        &conn,
-        *hash.as_bytes(),
-        &ext,
-        &signer,
-        4 * HARNESS_INTERVAL_BYTES,
-        0,
-    )
-    .await?;
-    anyhow::ensure!(
-        paid >= 2 * HARNESS_FLOOR_BYTES,
-        "the paying stream paid {paid} wire bytes, too few to clear a floor past its own"
-    );
-
-    let (_, _send_a, _recv_a) = read_unpaid_opening(&conn, *hash.as_bytes(), &ext).await?;
-    let (_, _send_b, _recv_b) = read_unpaid_opening(&conn, *hash.as_bytes(), &ext).await?;
-    anyhow::ensure!(
-        counter(
-            &metrics,
-            "decdn_serve_stream_rejected_signer_floor_at_cap_total"
-        )? == 0,
-        "the cleared signer holds its full cap again"
-    );
-
-    conn.close(0u32.into(), b"done");
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 /// #1669: `credit_ramp_divisor = 0` opens the full `credit_max` ceiling
 /// immediately, regardless of `paid` — the flat-window behavior, now opt-in. A
 /// client that pays nothing still reads a full `credit_max` ahead of any
@@ -14608,17 +14375,14 @@ async fn a_rate_limited_stream_is_reset_before_its_request_is_read() -> anyhow::
     let server_id = server_sk.public();
     let server_eth = operator_signer();
     let metrics = Arc::new(Metrics::new());
-    // One request per peer, refilled far slower than the test runs; the per-IP
-    // and global layers are off.
+    // One request per peer, refilled far slower than the test runs; the global
+    // layer is off.
     let request_limiter = Arc::new(ServeRateLimiter::from_resolved(
         &decdn_common::config::ResolvedServe {
             per_peer_rate_per_sec: 0.001,
             per_peer_burst: 1,
-            per_ip_rate_per_sec: 0.0,
-            per_ip_burst: 0,
             global_rate_per_sec: 0.0,
             global_burst: 0,
-            max_tracked_per_ip: 16,
             max_tracked_per_peer: 16,
         },
         Arc::clone(&metrics),
@@ -14642,10 +14406,9 @@ async fn a_rate_limited_stream_is_reset_before_its_request_is_read() -> anyhow::
     // Spend the client's one token out of band.
     anyhow::ensure!(
         request_limiter
-            .check(
-                &decdn_node::dht::routing::NodeId::from_bytes(*client_ep.id().as_bytes()),
-                None,
-            )
+            .check(&decdn_node::dht::routing::NodeId::from_bytes(
+                *client_ep.id().as_bytes()
+            ))
             .is_ok()
     );
     let conn = client_ep
@@ -14675,91 +14438,6 @@ async fn a_rate_limited_stream_is_reset_before_its_request_is_read() -> anyhow::
 
     conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// #2694: the serve limiter's per-IP layer keys on the connection's direct-path
-/// source IP. Two peers with distinct node ids on the same loopback IP share
-/// one per-IP bucket: once the other peer spent it, this client's stream is
-/// reset `RATE_LIMITED` and counts on the per-IP counter, not the per-peer one.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_per_ip_request_layer_binds_two_peers_on_one_ip() -> anyhow::Result<()> {
-    use decdn_node::handlers::serve_rate_limit::ServeRateLimiter;
-
-    let (cache, _hash, _cache_tmp) = cache_with_blob(&[0x4Fu8; 1024]).await?;
-    let store_dyn: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let request_limiter = Arc::new(ServeRateLimiter::from_resolved(
-        &decdn_common::config::ResolvedServe {
-            per_peer_rate_per_sec: 0.0,
-            per_peer_burst: 0,
-            per_ip_rate_per_sec: 0.001,
-            per_ip_burst: 1,
-            global_rate_per_sec: 0.0,
-            global_burst: 0,
-            max_tracked_per_ip: 16,
-            max_tracked_per_peer: 16,
-        },
-        Arc::clone(&metrics),
-    ));
-    let handler = build_handler_limited_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        permissive_limiter(&metrics),
-        cache,
-        store_dyn,
-        RATE_PER_MB,
-        16,
-        |deps| deps.request_limiter = Some(Arc::clone(&request_limiter)),
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    // Another peer on the same IP spends the IP's one token out of band.
-    let (second_ep, second_addr) = local_endpoint(fresh_key(), vec![]).await?;
-    let client_ip = second_addr.ip();
-    anyhow::ensure!(
-        request_limiter
-            .check(
-                &decdn_node::dht::routing::NodeId::from_bytes([0x77; 32]),
-                Some(client_ip),
-            )
-            .is_ok()
-    );
-
-    // The client finds the per-IP bucket empty.
-    let second = second_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let (mut send, mut recv) = second
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    send.write_all(&support::frame_len_prefix(
-        decdn_protocol::MAX_CLIENT_CONTROL_FRAME,
-    ))
-    .await
-    .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        assert_stream_reset(&mut recv, decdn_protocol::APP_ERR_RATE_LIMITED),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("the second client's stream was not refused"))??;
-    anyhow::ensure!(
-        counter(&metrics, "decdn_serve_rate_limit_rejected_per_ip_total")? == 1
-            && counter(&metrics, "decdn_serve_rate_limit_rejected_per_peer_total")? == 0,
-        "the refusal counts on the per-IP layer"
-    );
-
-    second.close(0u32.into(), b"done");
-    shutdown([server_task], [&second_ep, &server_ep]).await?;
     Ok(())
 }
 

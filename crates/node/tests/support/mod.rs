@@ -234,9 +234,6 @@ pub(crate) fn spawn_server_counting(
 pub(crate) fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
-        per_source_rate_per_sec: 1_000_000.0,
-        per_source_burst: u32::MAX,
-        max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
 }

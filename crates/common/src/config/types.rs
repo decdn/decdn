@@ -272,7 +272,7 @@ pub struct BlockchainConfig {
     /// submitted chunk settles, so a small (dust) lane rides alongside the
     /// larger lanes that cleared the floor. Larger values amortize gas
     /// across more delivery; smaller values bound unsettled exposure.
-    /// Absent => default (1 USDC = `1_000_000` `µUSDC`).
+    /// Absent => default (0.05 USDC = `50_000` `µUSDC`).
     pub redeem_threshold_micro_usdc: Option<u64>,
     /// Maximum vouchers packed into one `redeemMany` transaction. The redeemer
     /// splits a sweep across this many vouchers per transaction so a high-fan-out
@@ -322,17 +322,18 @@ pub struct BlockchainConfig {
     /// scale; sizing this precisely per ADR 003 is governance/ops policy, not a
     /// build-time constant.
     pub pool_min_remaining_deposit_micro_usdc: Option<u64>,
-    /// Per-signer floor cap `k`, counted in ramp-start credit windows (ADR 003
-    /// § Pool solvency, per-signer floor isolation): the most live un-vouchered floor
-    /// reservation plus floor debt any ONE capability signer may hold against a pool,
-    /// `k · one credit window`, underneath the pool-wide `remaining − M` ceiling.
-    /// The credit window is its floor (one chunk plus one chunk group) normally,
-    /// and at `credit_ramp_divisor == 0` it is `credit_max` raised to that floor.
+    /// Per-signer LIVE concurrency cap `k`, counted in ramp-start credit windows
+    /// (ADR 003 § Pool solvency, per-signer floor isolation): the most live
+    /// un-vouchered floor reservation any ONE capability signer may hold against a
+    /// pool, `k · one credit window`, underneath the pool-wide `remaining − M`
+    /// ceiling. The credit window is its floor (one chunk plus one chunk group)
+    /// normally, and at `credit_ramp_divisor == 0` it is `credit_max` raised to
+    /// that floor.
     ///
-    /// This bounds unpaid credit, not paid throughput: a signer that pays its vouchers
+    /// This bounds concurrency, not paid throughput: a signer that pays its vouchers
     /// releases that stream's reservation, so its cap recycles and a stream already
-    /// under way is never slowed. A stream that ends unpaid leaves its floor as floor
-    /// debt, which only the signer's later payment clears.
+    /// under way is never slowed. It carries no permanent memory and never penalizes a
+    /// signer for quitting.
     ///
     /// The window is the unit actually being rationed: honest need is `concurrent
     /// un-vouchered streams × one window` regardless of the pool's size, so an absolute
@@ -971,44 +972,19 @@ pub struct PaymentConfig {
     pub voucher_commit_interval_ms: Option<u64>,
 }
 
-/// Security / rate-limiting section of the config file.
+/// Connection-concurrency section of the config file.
 ///
 /// All fields are optional; defaults produce a safe configuration out of
 /// the box.
 ///
 /// **All fields are hot-reloadable** on SIGHUP and via `admin_v1_reload`.
-/// The live `ConnectionLimiter` rebuilds its keyed `governor` rate
-/// limiter from the new quota and swaps it under an `RwLock`. The
-/// `Arc<Semaphore>` identity is preserved across cap resizes via
-/// `add_permits` / `acquire_many_owned(...).forget()` so every
-/// in-flight `OwnedSemaphorePermit` keeps draining into the same
-/// semaphore on `Drop`.
+/// The live `ConnectionLimiter` swaps in a fresh `Arc<Semaphore>` of the new
+/// capacity; every in-flight `OwnedSemaphorePermit` keeps draining into the
+/// semaphore it was acquired from.
 ///
-/// **Caveats:** during a shrink the live concurrency cap is `>= new`
-/// until enough handlers drain; under racing reloads (N→N+1→N) the
-/// post-task permit count may briefly land anywhere in `[N, N+1]`
-/// until the next reload reconciles. Accepted as a known trade-off:
-/// strict resize semantics would require a full handler-drain barrier.
-///
-/// Token-bucket state is *not* preserved across a reload — the keyed
-/// limiter is rebuilt from scratch. Operators tuning the per-source
-/// quota live should expect the next acquire after a reload to start
-/// with a fresh burst budget.
-///
-/// **`0` means "disable this layer":**
-///   - `max_concurrent_handlers = 0`: no global concurrency cap.
-///   - `per_source_rate_per_sec = 0`: per-source rate-limit disabled. The
-///     paired `per_source_burst` field is ignored — the limiter
-///     short-circuits before the keyed map is consulted.
-///   - `max_tracked_sources = 0`: rate-limit bookkeeping map is unbounded.
-///     **Warning:** an attacker churning source addresses can grow the
-///     map without bound in this mode — operator opt-in only.
-///
-/// `burst > 0` is required only when paired with a positive rate. Setting
-/// `rate > 0` together with `burst = 0` would deny every request after
-/// the first burst-many — the resolver rejects that combination as a
-/// likely-typo. Setting `rate = 0` together with any `burst` value is
-/// fine; burst is unused once the layer is disabled.
+/// The node keys no limit on the source address: a relay-routed connection
+/// carries no client address, so such a key binds no attacker, while honest
+/// peers behind one NAT share it (#2505).
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -1017,35 +993,6 @@ pub struct SecurityConfig {
     /// closed immediately with `APP_ERR_RATE_LIMITED`. Default: 256.
     /// `0` disables the global cap (no concurrency limit).
     pub max_concurrent_handlers: Option<u32>,
-    /// Refill rate for per-source rate limiting (cells per second).
-    /// More generous than older per-NodeID-only schemes because a single
-    /// source IP may host a legitimate fleet. Default: 100. `0.0`
-    /// disables the per-source layer (the paired `per_source_burst` is
-    /// then ignored).
-    ///
-    /// The current implementation keys on the remote `IpAddr`. IPv6
-    /// addresses are bucketed by their `/64` prefix, not the full
-    /// 128-bit address. A customer-grade IPv6 allocation is typically
-    /// `/64` or larger, so without this prefix grouping an attacker can
-    /// rotate through `2^64` distinct source addresses inside one
-    /// allocation and trivially defeat the layer. IPv4 addresses are
-    /// used in full.
-    ///
-    /// "Per-source" rather than "per-IP" because the keying axis may
-    /// extend in the future (e.g. `NodeID`) without renaming the field.
-    pub per_source_rate_per_sec: Option<f64>,
-    /// Burst capacity for per-source limiting. Default: 200 (2× the
-    /// rate, providing headroom for jitter so well-behaved peers don't
-    /// trip the limit on naturally-clumped requests). Required `> 0`
-    /// when `per_source_rate_per_sec > 0`; ignored when the layer is
-    /// disabled (`per_source_rate_per_sec = 0`).
-    pub per_source_burst: Option<u32>,
-    /// Hard cap on the number of distinct sources tracked in the
-    /// rate-limit state. When the live keyed map exceeds this size the
-    /// limiter prunes entries whose state has refilled to a fresh
-    /// baseline. Default: 4096. `0` makes the map unbounded — see the
-    /// type-level docs for the operator-opt-in warning.
-    pub max_tracked_sources: Option<usize>,
 }
 
 /// `[load_shed]` section — node-local load-shedding thresholds (overload
@@ -1078,12 +1025,11 @@ pub struct LoadShedConfig {
 #[serde(deny_unknown_fields)]
 pub struct DhtConfig {
     /// Rate-limiter settings (ADR 022 §DHT Rate Limiting). Absent =>
-    /// the defaults from the ADR (20/100/1000 req/s with 40/200/2000
-    /// bursts).
+    /// the defaults from the ADR (20/1000 req/s with 40/2000 bursts).
     pub rate_limit: Option<DhtRateLimitConfig>,
 }
 
-/// `[dht.rate_limit]` — three-layer token-bucket settings (ADR 022 §DHT
+/// `[dht.rate_limit]` — two-layer token-bucket settings (ADR 022 §DHT
 /// Rate Limiting).
 ///
 /// Defaults match the ADR's conservative ceilings on adversarial load;
@@ -1094,8 +1040,7 @@ pub struct DhtConfig {
 ///
 /// Setting any `*_rate_per_sec` to `0.0` disables that layer (operator
 /// opt-out), whatever its `*_burst`. A nonzero rate needs a nonzero burst: the
-/// resolver rejects `rate > 0, burst == 0` as a deny-all, the same way
-/// `security.per_source_rate_per_sec` / `per_source_burst` are paired.
+/// resolver rejects `rate > 0, burst == 0` as a deny-all.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DhtRateLimitConfig {
@@ -1105,18 +1050,10 @@ pub struct DhtRateLimitConfig {
     /// Per-peer burst capacity. Absent => 40. Required `> 0` when
     /// `per_peer_rate_per_sec > 0`.
     pub per_peer_burst: Option<u32>,
-    /// Per-IP sustained rate. Absent => 100 req/s. `0.0` disables.
-    pub per_ip_rate_per_sec: Option<f64>,
-    /// Per-IP burst capacity. Absent => 200.
-    pub per_ip_burst: Option<u32>,
     /// Global inbound DHT sustained rate. Absent => 1000 req/s.
     pub global_rate_per_sec: Option<f64>,
     /// Global inbound DHT burst capacity. Absent => 2000.
     pub global_burst: Option<u32>,
-    /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
-    /// makes the map unbounded — operator opt-in (#645). Mirrors
-    /// `security.max_tracked_sources` for the dispatch layer.
-    pub max_tracked_per_ip: Option<usize>,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map. Absent =>
     /// 4096. `0` makes the map unbounded (#645).
     pub max_tracked_per_peer: Option<usize>,
@@ -1131,11 +1068,11 @@ pub struct DhtRateLimitConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProbeConfig {
     /// Rate-limiter settings (ADR 005 §Probe rate limiting). Absent =>
-    /// the defaults from the ADR (5/50/1000 req/s with 5/200/2000 bursts).
+    /// the defaults from the ADR (5/1000 req/s with 5/2000 bursts).
     pub rate_limit: Option<ProbeRateLimitConfig>,
 }
 
-/// `[probe.rate_limit]` — three-layer token-bucket settings (ADR 005 §Probe
+/// `[probe.rate_limit]` — two-layer token-bucket settings (ADR 005 §Probe
 /// rate limiting).
 ///
 /// Mirrors `[dht.rate_limit]` in shape; only the defaults differ (ADR 005
@@ -1143,8 +1080,7 @@ pub struct ProbeConfig {
 /// is unauthenticated and cheaper to flood). Setting any `*_rate_per_sec` to
 /// `0.0` disables that layer (operator opt-out), whatever its `*_burst`. A
 /// nonzero rate needs a nonzero burst: the resolver rejects `rate > 0,
-/// burst == 0` as a deny-all, the same way `security.per_source_*` and
-/// `dht.rate_limit.*` are paired.
+/// burst == 0` as a deny-all, the same way `dht.rate_limit.*` is paired.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeRateLimitConfig {
@@ -1154,17 +1090,10 @@ pub struct ProbeRateLimitConfig {
     /// Per-peer burst capacity. Absent => 5. Required `> 0` when
     /// `per_peer_rate_per_sec > 0`.
     pub per_peer_burst: Option<u32>,
-    /// Per-IP sustained rate. Absent => 50 req/s. `0.0` disables.
-    pub per_ip_rate_per_sec: Option<f64>,
-    /// Per-IP burst capacity. Absent => 200.
-    pub per_ip_burst: Option<u32>,
     /// Global inbound probe sustained rate. Absent => 1000 req/s.
     pub global_rate_per_sec: Option<f64>,
     /// Global inbound probe burst capacity. Absent => 2000.
     pub global_burst: Option<u32>,
-    /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
-    /// makes the map unbounded — operator opt-in (#645).
-    pub max_tracked_per_ip: Option<usize>,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map. Absent =>
     /// 4096. `0` makes the map unbounded (#645).
     pub max_tracked_per_peer: Option<usize>,
@@ -1179,11 +1108,11 @@ pub struct ProbeRateLimitConfig {
 #[serde(deny_unknown_fields)]
 pub struct ServeConfig {
     /// Rate-limiter settings (ADR 005 §Request rate limiting). Absent =>
-    /// the defaults from the ADR (100/200/2000 req/s with 400/800/5000 bursts).
+    /// the defaults from the ADR (100/2000 req/s with 400/5000 bursts).
     pub rate_limit: Option<ServeRateLimitConfig>,
 }
 
-/// `[serve.rate_limit]` — three-layer token-bucket settings for inbound
+/// `[serve.rate_limit]` — two-layer token-bucket settings for inbound
 /// `cdn/client/v1` requests (ADR 005 §Request rate limiting).
 ///
 /// Mirrors `[probe.rate_limit]` in shape; only the defaults differ. One
@@ -1201,17 +1130,10 @@ pub struct ServeRateLimitConfig {
     /// Per-peer burst capacity. Absent => 400. Required `> 0` when
     /// `per_peer_rate_per_sec > 0`.
     pub per_peer_burst: Option<u32>,
-    /// Per-IP sustained rate. Absent => 200 req/s. `0.0` disables.
-    pub per_ip_rate_per_sec: Option<f64>,
-    /// Per-IP burst capacity. Absent => 800.
-    pub per_ip_burst: Option<u32>,
     /// Global inbound request sustained rate. Absent => 2000 req/s.
     pub global_rate_per_sec: Option<f64>,
     /// Global inbound request burst capacity. Absent => 5000.
     pub global_burst: Option<u32>,
-    /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
-    /// makes the map unbounded — operator opt-in (#645).
-    pub max_tracked_per_ip: Option<usize>,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map. Absent =>
     /// 4096. `0` makes the map unbounded (#645).
     pub max_tracked_per_peer: Option<usize>,

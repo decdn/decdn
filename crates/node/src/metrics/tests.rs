@@ -369,7 +369,7 @@ fn adr_registry_names_are_exported() {
             continue;
         };
         // Documentation forms, not single series: label suffixes and
-        // brace-expanded shorthand (`..._{per_peer,per_ip}_total`), and the
+        // brace-expanded shorthand (`..._{per_peer,global}_total`), and the
         // per-watcher templates (`decdn_<watcher>_task_panicked_total`),
         // which stand in for one row per watcher rather than naming one.
         if name.contains('{') || name.contains('<') {

@@ -150,9 +150,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,
-            per_source_rate_per_sec: 100.0,
-            per_source_burst: 200,
-            max_tracked_sources: 4096,
         },
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         dht: decdn_common::config::ResolvedDht::default(),
@@ -343,18 +340,13 @@ async fn sighup_applies_security_changes() {
         setter,
     ));
 
-    // Build a real limiter at the seed defaults (per_source_burst = 200).
+    // Build a real limiter at the seed defaults (max_concurrent_handlers = 256).
     let metrics = Arc::new(Metrics::new());
     let limiter = Arc::new(ConnectionLimiter::new(&initial.security, metrics));
     state.attach_limiter(Some(Arc::clone(&limiter)));
 
-    // Tighten per-source burst to 1.
-    write_config(
-        &path,
-        "[security]\n\
-         per_source_rate_per_sec = 0.001\n\
-         per_source_burst = 1\n",
-    );
+    // Tighten the global cap to 1.
+    write_config(&path, "[security]\nmax_concurrent_handlers = 1\n");
 
     let loop_state = Arc::clone(&state);
     let loop_path = path.clone();
@@ -370,16 +362,16 @@ async fn sighup_applies_security_changes() {
         .expect("reload loop task panicked")
         .expect("reload loop returned Err");
 
-    // Live limiter now has per-source burst=1: first acquire from an
-    // IP succeeds, second from the same IP rejects on per-source.
+    // Live limiter now has a global cap of 1: the first acquire succeeds and
+    // a second concurrent one rejects.
     let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
     let _p1 = limiter
         .acquire_for_test(Some(ip))
-        .expect("first per-source acquire post-SIGHUP");
+        .expect("first acquire post-SIGHUP");
     let err = limiter
         .acquire_for_test(Some(ip))
-        .expect_err("second per-source acquire must reject after SIGHUP-applied burst=1");
-    assert_eq!(err, RejectReason::PerSource);
+        .expect_err("second concurrent acquire must reject after SIGHUP-applied cap=1");
+    assert_eq!(err, RejectReason::GlobalFull);
 }
 
 /// SIGHUP must apply changes to the mutable `observability.log_level` while
@@ -715,68 +707,50 @@ async fn sighup_routes_a_resolve_notice_into_the_log_stream() {
         signal(SignalKind::hangup()).expect("install SIGHUP stream")
     };
 
-    // Both `0`s are documented escape hatches, so the reload must *succeed* —
-    // the notices are the whole observable effect, which is what made them so
-    // easy to lose. The two levels ride the same reload so the `Info` arm is
-    // exercised alongside the `Warn` one.
-    write_config(
-        &path,
-        "[security]\n\
-         max_tracked_sources = 0\n\
-         per_source_rate_per_sec = 0.0\n\
-         per_source_burst = 0\n",
-    );
+    // `0` is a documented escape hatch, so the reload must *succeed* — the
+    // notice is the whole observable effect, which is what made it so easy to
+    // lose.
+    write_config(&path, "[security]\nmax_concurrent_handlers = 0\n");
     raise_sighup_soon();
     hup.recv().await.expect("first SIGHUP");
     state.reload(&path).await.expect("0 is valid, not an error");
 
     let logs = captured_logs(&log_buf);
-    let (level, message) =
-        notice_event(&logs, "security.max_tracked_sources").unwrap_or_else(|| {
-            panic!("no notice for the zeroed bookkeeping cap, got:\n{logs}");
-        });
-    assert_eq!(
-        level, "WARN",
-        "an unbounded bookkeeping map must be WARN, not INFO"
-    );
-    assert!(
-        message.contains("unbounded"),
-        "the notice must carry the word an operator alerts on: {message}"
-    );
-    assert!(
-        !message.contains("security.max_tracked_sources"),
-        "the label rides as a field, so the message must not repeat it: {message}"
-    );
-
-    let (level, message) = notice_event(&logs, "security.per_source_rate_per_sec")
-        .unwrap_or_else(|| panic!("no notice for the disabled rate limit, got:\n{logs}"));
+    let (level, message) = notice_event(&logs, "security.max_concurrent_handlers")
+        .unwrap_or_else(|| panic!("no notice for the disabled concurrency cap, got:\n{logs}"));
     assert_eq!(
         level, "INFO",
         "a deliberate opt-out must not page anyone alerting on WARN"
     );
     assert!(message.contains("disabled"), "{message}");
+    assert!(
+        !message.contains("security.max_concurrent_handlers"),
+        "the label rides as a field, so the message must not repeat it: {message}"
+    );
 
     // An aborted reload applies nothing, so its notices would describe a
     // config the node is not running. Clear the buffer, then SIGHUP a file
-    // whose `[security]` section carries both the notice trigger and a fatal
-    // problem.
+    // that carries both the notice trigger and a fatal problem in another
+    // reloadable section.
     log_buf.lock().unwrap().clear();
     write_config(
         &path,
         "[security]\n\
-         max_tracked_sources = 0\n\
-         per_source_rate_per_sec = -1.0\n",
+         max_concurrent_handlers = 0\n\
+         [load_shed]\n\
+         max_concurrent_serves_high = 1\n\
+         max_concurrent_serves_low = 2\n",
     );
     raise_sighup_soon();
     hup.recv().await.expect("second SIGHUP");
     state
         .reload(&path)
         .await
-        .expect_err("a negative rate must abort the reload");
+        .expect_err("high below low must abort the reload");
 
     let logs = captured_logs(&log_buf);
     assert!(
-        !logs.contains("unbounded"),
+        notice_event(&logs, "security.max_concurrent_handlers").is_none(),
         "an aborted reload must not report notices about a config it did not \
          apply, got:\n{logs}"
     );
@@ -838,7 +812,7 @@ async fn a_failed_commit_reports_no_notices() {
          log_level = \"debug\"\n\
          metrics_port = 9999\n\
          [security]\n\
-         max_tracked_sources = 0\n",
+         max_concurrent_handlers = 0\n",
     );
     raise_sighup_soon();
     hup.recv().await.expect("SIGHUP");
@@ -850,7 +824,7 @@ async fn a_failed_commit_reports_no_notices() {
 
     let logs = captured_logs(&log_buf);
     assert!(
-        !logs.contains("unbounded"),
+        !logs.contains("concurrency cap disabled"),
         "a reload that aborted in phase 2 applied no security values, so it \
          must not report their notices, got:\n{logs}"
     );

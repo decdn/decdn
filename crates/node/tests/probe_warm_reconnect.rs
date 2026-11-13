@@ -61,9 +61,6 @@ fn test_slash_domain() -> Eip712Domain {
 fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
-        per_source_rate_per_sec: 1_000_000.0,
-        per_source_burst: u32::MAX,
-        max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
 }
@@ -74,11 +71,8 @@ fn permissive_probe_rate_limiter(metrics: &Arc<Metrics>) -> Arc<ProbeRateLimiter
     let cfg = RateLimitConfig {
         per_peer_rate_per_sec: 1e9,
         per_peer_burst: u32::MAX,
-        per_ip_rate_per_sec: 1e9,
-        per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e9,
         global_burst: u32::MAX,
-        max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };
     Arc::new(ProbeRateLimiter::new(&cfg, Arc::clone(metrics)))

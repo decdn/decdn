@@ -636,8 +636,8 @@ impl ClientHandler {
         // here and passed by reference: the serve leg releases it once the stream
         // repays one floor, exactly like the hit path. Holding ownership across the
         // `await` keeps the guard alive for the whole serve; its `Drop` frees the
-        // live reservation, and charges any unpaid floor the serve leg left owed,
-        // AFTER `serve_leg` returns, at this function's scope end.
+        // pool's live floor headroom AFTER `serve_leg` returns, at this function's
+        // scope end.
         let serve_result = self
             .serve_leg(
                 conn,
@@ -977,8 +977,8 @@ impl ClientHandler {
         // here and passed by reference so the serve leg releases it exactly like the
         // hit path once the stream repays its floor. Holding ownership across the
         // `await` keeps the guard alive for the whole serve; its `Drop` frees the
-        // live reservation, and charges any unpaid floor the serve leg left owed,
-        // AFTER `serve_leg` returns, at this function's scope end.
+        // pool's live floor headroom AFTER `serve_leg` returns, at this function's
+        // scope end.
         let serve_result = self
             .serve_leg(
                 conn,

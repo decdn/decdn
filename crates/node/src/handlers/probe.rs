@@ -20,7 +20,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
-use crate::dispatch::{ConnectionLimiter, RejectReason};
+use crate::dispatch::ConnectionLimiter;
 use crate::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer};
 use crate::handlers::timestamp_skew::{MAX_REQUEST_TIMESTAMP_SKEW_US, excessive_skew_us, now_us};
 use crate::metrics::{Metrics, ProbeHoldUnavailableReason};
@@ -130,8 +130,8 @@ pub struct ProbeHandler {
     rate_per_mb: u64,
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
-    /// ADR 005 §Probe rate limiting three-layer token-bucket limiter
-    /// (per-peer → per-IP → global). Runs in addition to `limiter` (the
+    /// ADR 005 §Probe rate limiting two-layer token-bucket limiter
+    /// (per-peer → global). Runs in addition to `limiter` (the
     /// connection-level [`ConnectionLimiter`]) — see
     /// [`crate::handlers::probe_rate_limit`] for why both layers run.
     probe_rate_limiter: Arc<ProbeRateLimiter>,
@@ -291,46 +291,33 @@ impl ProbeHandler {
                     VarInt::from_u32(APP_ERR_RATE_LIMITED),
                     reason.as_str().as_bytes(),
                 );
-                // Wait for the close frame to be acknowledged so the peer
-                // reliably observes the 0x10 RATE_LIMITED code and the
-                // layer-label reason byte — except on `GlobalFull`. Under
-                // a global-cap flood every rejection would otherwise
-                // park a task here for up to `REJECTION_CLOSE_TIMEOUT`,
-                // and at thousands of rejections per second that is the
-                // memory-pressure path the limiter exists to prevent.
-                // Layer label is least useful for `GlobalFull` anyway
-                // (operators pivot on the metric counter, not the close
-                // reason byte). Per-source rejections are rate-limited
-                // by the bucket itself, so the bounded wait is safe.
-                if reason != RejectReason::GlobalFull {
-                    let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
-                }
+                // No wait for the close frame: under a global-cap flood every
+                // rejection would park a task here, and at thousands of
+                // rejections per second that is the memory-pressure path the
+                // limiter exists to prevent.
                 return Ok(());
             }
         };
 
-        // ADR 005 §Probe rate limiting: three-layer token-bucket limiter
-        // (per-peer → per-IP → global) applied *before* any signature is
-        // computed and *before* any eviction-hold slot is allocated. It runs in
-        // addition to the `ConnectionLimiter` permit above (per-source IP +
-        // global concurrency) — see `probe_rate_limit` module docs for why
-        // both run. Both the requester NodeId and the source IP are available
-        // pre-stream, so a rejected probe never opens a bidi stream.
+        // ADR 005 §Probe rate limiting: two-layer token-bucket limiter
+        // (per-peer → global) applied *before* any signature is computed and
+        // *before* any eviction-hold slot is allocated. It runs in addition to
+        // the `ConnectionLimiter` permit above (global concurrency) — see
+        // `probe_rate_limit` module docs for why both run. The requester NodeId
+        // is available pre-stream, so a rejected probe never opens a bidi
+        // stream.
         let requester = NodeId::from_bytes(*conn.remote_id().as_bytes());
-        let peer_ip = crate::rate_limit::peer_ip(&conn);
-        if let Err(layer) = self.probe_rate_limiter.check(&requester, peer_ip) {
+        if let Err(layer) = self.probe_rate_limiter.check(&requester) {
             // Load-shedding, not a protocol fault: don't return `Err` (which
             // iroh would log per rejection, amplifying log volume under flood —
             // exactly what the attacker wants). The limiter already bumped the
             // per-layer rejection counter; emit a debug log too so operators
-            // can correlate the offending peer/IP, matching the per-source
-            // (`ConnectionLimiter::acquire_inner`) and DHT
-            // (`close_stream_with_rate_limit`) reject paths.
+            // can correlate the offending peer, matching the DHT
+            // (`close_stream_with_rate_limit`) reject path.
             tracing::debug!(
                 layer = layer.as_str(),
                 requester = ?requester,
-                peer_ip = ?peer_ip,
-                "probe request rejected by the three-layer rate limiter"
+                "probe request rejected by the rate limiter"
             );
             conn.close(
                 VarInt::from_u32(APP_ERR_RATE_LIMITED),
@@ -340,8 +327,8 @@ impl ProbeHandler {
             // RATE_LIMITED code and the layer label — except on the global
             // layer, where a flood would otherwise park a task per rejection
             // (operators pivot on the metric counter, not the close reason,
-            // for a global flood). Per-peer/per-IP rejections are bounded by
-            // their own buckets, so the capped wait is safe.
+            // for a global flood). Per-peer rejections are bounded by their
+            // own bucket, so the capped wait is safe.
             if layer != ProbeRejectLayer::Global {
                 let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
             }
@@ -417,9 +404,9 @@ impl ProbeHandler {
             );
             // Wait briefly for the close frame, as the per-peer rate-limit
             // path does, so the peer reliably observes the `0x04` code rather
-            // than a bare connection loss. The per-peer and per-IP probe
-            // buckets above already bound how often one peer reaches this
-            // point, so the capped wait is safe.
+            // than a bare connection loss. The per-peer probe bucket above
+            // already bounds how often one peer reaches this point, so the
+            // capped wait is safe.
             let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
             // Handled: counted, logged (throttled) and closed with its code.
             // An `Err` would have iroh's router log it again, unthrottled,
