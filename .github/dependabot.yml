@@ -73,6 +73,12 @@ updates:
     commit-message:
       prefix: chore
       include: scope
+    groups:
+      # `init` and `analyze` must run the same codeql-action version; split
+      # PRs leave each one red against the other's pin.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
     # Every dtolnay/rust-toolchain step is pinned by commit SHA and names the
     # Rust version in its `toolchain:` input, which Dependabot does not read, so
     # this ecosystem never moves the toolchain. A Rust release reaches the repo
