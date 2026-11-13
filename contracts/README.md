@@ -86,7 +86,6 @@ For a local chain with the full suite deployed in one command, run [`./dev-deplo
 | Tool | Gate | Config |
 |------|------|--------|
 | Slither | fail on medium+ | `slither.config.json` |
-| Aderyn | fail on high | `aderyn.toml` |
 | Solhint | lints `src/` + `testnet/` + `script/` (tests excluded) | `.solhint.json` |
 
 `.gas-snapshot` is a committed baseline; regenerate it in the same PR when a change legitimately moves gas. See CONTRIBUTING for how to interpret and suppress findings.
