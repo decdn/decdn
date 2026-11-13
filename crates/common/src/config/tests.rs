@@ -7142,11 +7142,6 @@ fn resolve_security_populates_defaults_when_absent() {
         resolved.max_concurrent_handlers,
         DEFAULT_MAX_CONCURRENT_HANDLERS
     );
-    assert!(
-        (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs() < f64::EPSILON
-    );
-    assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
-    assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
 }
 
 #[test]
@@ -7157,154 +7152,27 @@ fn resolve_security_accepts_zero_max_concurrent_handlers_as_disabled() {
 }
 
 #[test]
-fn resolve_security_rejects_non_finite_or_negative_per_source_rate() {
-    // 0.0 is now valid (disabled); only NaN, ±inf, and strictly-negative are rejected.
-    for bad in [-1.0_f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let s = sec_with(|s| s.per_source_rate_per_sec = Some(bad));
-        assert!(
-            resolve_security(Some(&s)).is_err(),
-            "per_source_rate_per_sec={bad} should be rejected"
-        );
-    }
-}
-
-#[test]
-fn resolve_security_accepts_zero_per_source_pair_as_disabled() {
-    // rate=0 + burst=0 disables the per-source layer.
-    let s = sec_with(|s| {
-        s.per_source_rate_per_sec = Some(0.0);
-        s.per_source_burst = Some(0);
-    });
-    let resolved = resolve_security(Some(&s)).expect("0/0 disables per-source");
-    assert_eq!(resolved.per_source_burst, 0);
-}
-
-#[test]
-fn resolve_security_rejects_zero_per_source_burst_with_positive_rate() {
-    // rate>0 with burst=0 is the deny-all corner; reject it.
-    let s = sec_with(|s| {
-        s.per_source_rate_per_sec = Some(10.0);
-        s.per_source_burst = Some(0);
-    });
-    let err = resolve_security(Some(&s)).expect_err("rate>0+burst=0 must reject");
-    assert!(format!("{err:#}").contains("per_source_burst"));
-}
-
-#[test]
-fn resolve_security_accepts_zero_max_tracked_sources_as_unbounded() {
-    let s = sec_with(|s| s.max_tracked_sources = Some(0));
-    let resolved = resolve_security(Some(&s)).expect("0 makes the map unbounded");
-    assert_eq!(resolved.max_tracked_sources, 0);
-}
-
-#[test]
-fn resolve_security_partial_override_keeps_other_defaults() {
-    let s = sec_with(|s| s.max_concurrent_handlers = Some(512));
-    let resolved = resolve_security(Some(&s)).expect("valid override");
-    assert_eq!(resolved.max_concurrent_handlers, 512);
-    assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
-}
-
-// Per-field merge coverage (#438). The four `[security]` fields all
-// resolve through the same file-vs-default path; one happy-path test
-// per field plus an "absent => default" companion documents the
-// contract for each field individually so a regression that
-// accidentally applies the wrong default doesn't slip past the
-// existing aggregate `_populates_defaults_when_absent` assertion.
-//
-// There is no `[security]` CLI surface — `resolve_security` takes
-// only the file argument. Operators tune these fields by editing
-// the config file (with hot reload via SIGHUP). Per-field CLI
-// overrides could land later without changing the test surface
-// here.
-
-#[test]
 fn resolve_security_max_concurrent_handlers_file_override() {
     let s = sec_with(|s| s.max_concurrent_handlers = Some(1024));
     let resolved = resolve_security(Some(&s)).expect("valid override");
     assert_eq!(resolved.max_concurrent_handlers, 1024);
 }
 
+/// The `[security]` section keys nothing on the source address (#2505):
+/// a `per_source_*` key is an unknown field and the file does not parse.
 #[test]
-fn resolve_security_max_concurrent_handlers_default_when_field_absent() {
-    // Other fields populated, this one absent — companion to the
-    // aggregate-defaults test, isolating this single field.
-    let s = sec_with(|s| {
-        s.per_source_rate_per_sec = Some(50.0);
-        s.per_source_burst = Some(100);
-        s.max_tracked_sources = Some(2048);
-    });
-    let resolved = resolve_security(Some(&s)).expect("valid partial config");
-    assert_eq!(
-        resolved.max_concurrent_handlers,
-        DEFAULT_MAX_CONCURRENT_HANDLERS
-    );
-}
-
-#[test]
-fn resolve_security_per_source_rate_file_override() {
-    let s = sec_with(|s| s.per_source_rate_per_sec = Some(42.5));
-    let resolved = resolve_security(Some(&s)).expect("valid override");
-    assert!((resolved.per_source_rate_per_sec - 42.5).abs() < f64::EPSILON);
-}
-
-#[test]
-fn resolve_security_per_source_rate_default_when_field_absent() {
-    let s = sec_with(|s| s.max_concurrent_handlers = Some(128));
-    let resolved = resolve_security(Some(&s)).expect("valid partial config");
-    assert!(
-        (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs() < f64::EPSILON
-    );
-}
-
-#[test]
-fn resolve_security_per_source_burst_file_override() {
-    let s = sec_with(|s| {
-        s.per_source_rate_per_sec = Some(50.0);
-        s.per_source_burst = Some(500);
-    });
-    let resolved = resolve_security(Some(&s)).expect("valid override");
-    assert_eq!(resolved.per_source_burst, 500);
-}
-
-#[test]
-fn resolve_security_per_source_burst_default_when_field_absent() {
-    let s = sec_with(|s| s.per_source_rate_per_sec = Some(50.0));
-    let resolved = resolve_security(Some(&s)).expect("valid partial config");
-    assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
-}
-
-#[test]
-fn resolve_security_max_tracked_sources_file_override() {
-    let s = sec_with(|s| s.max_tracked_sources = Some(8192));
-    let resolved = resolve_security(Some(&s)).expect("valid override");
-    assert_eq!(resolved.max_tracked_sources, 8192);
-}
-
-#[test]
-fn resolve_security_max_tracked_sources_default_when_field_absent() {
-    let s = sec_with(|s| s.max_concurrent_handlers = Some(128));
-    let resolved = resolve_security(Some(&s)).expect("valid partial config");
-    assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
-}
-
-/// Independent fields don't bleed: setting one to a non-default
-/// value must leave the others at their defaults. Catches a
-/// regression that copy-pasted `s.max_concurrent_handlers` into
-/// the wrong field's `unwrap_or(DEFAULT_*)` arm.
-#[test]
-fn resolve_security_field_overrides_are_independent() {
-    let s = sec_with(|s| s.per_source_burst = Some(777));
-    let resolved = resolve_security(Some(&s)).expect("valid partial config");
-    assert_eq!(resolved.per_source_burst, 777);
-    assert_eq!(
-        resolved.max_concurrent_handlers,
-        DEFAULT_MAX_CONCURRENT_HANDLERS
-    );
-    assert!(
-        (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs() < f64::EPSILON
-    );
-    assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
+fn security_section_rejects_per_source_keys() {
+    for key in [
+        "per_source_rate_per_sec = 1.0",
+        "per_source_burst = 1",
+        "max_tracked_sources = 1",
+    ] {
+        let toml = format!("[security]\n{key}\n");
+        assert!(
+            toml::from_str::<types::FileConfig>(&toml).is_err(),
+            "{key} must be an unknown field"
+        );
+    }
 }
 
 // --- resolve_load_shed ----------------------------------------------------
@@ -7344,10 +7212,9 @@ fn load_shed_parses_always_admit() {
 
 // --- resolve_dht: keyspace caps (#645) -----------------------------------
 //
-// Mirrors the `resolve_security_max_tracked_sources_*` triple: each of
-// the two `[dht.rate_limit]` knobs gets a file-override, a
+// The `[dht.rate_limit]` keyspace knob gets a file-override, a
 // default-when-absent, and a zero-as-unbounded test. A typo of the
-// shape `unwrap_or(0)` instead of `unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_*)`
+// shape `unwrap_or(0)` instead of `unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_PEER)`
 // would silently re-introduce the unbounded-keyspace DoS these caps close —
 // these tests are the resolver-layer regression guard.
 
@@ -7362,21 +7229,18 @@ fn dht_rl_with(mutate: impl FnOnce(&mut types::DhtRateLimitConfig)) -> types::Dh
 #[test]
 fn resolve_dht_absent_yields_adr022_defaults() {
     // No `[dht.rate_limit]` section at all => every ADR 022 default.
-    // Counterpart to `resolve_probe_absent_yields_adr005_defaults`: the six
+    // Counterpart to `resolve_probe_absent_yields_adr005_defaults`: the
     // rate/burst rows of `resolve_dht_into` are otherwise unpinned, so a
     // wrong `DEFAULT_DHT_*` on the right-hand side of any `unwrap_or` ships
     // silently. Rates and bursts are spelled as literals on purpose —
     // asserting against the same constant the resolver reads would pin
-    // nothing. `max_tracked_*` has no ADR literal (it is a #645
-    // implementation cap), so those two go through the constants.
+    // nothing. `max_tracked_per_peer` has no ADR literal (it is a #645
+    // implementation cap), so it goes through the constant.
     let resolved = resolve_dht(None).expect("absent section is valid");
     assert!((resolved.per_peer_rate_per_sec - 20.0).abs() < f64::EPSILON);
     assert_eq!(resolved.per_peer_burst, 40);
-    assert!((resolved.per_ip_rate_per_sec - 100.0).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_ip_burst, 200);
     assert!((resolved.global_rate_per_sec - 1000.0).abs() < f64::EPSILON);
     assert_eq!(resolved.global_burst, 2000);
-    assert_eq!(resolved.max_tracked_per_ip, DEFAULT_DHT_MAX_TRACKED_PER_IP);
     assert_eq!(
         resolved.max_tracked_per_peer,
         DEFAULT_DHT_MAX_TRACKED_PER_PEER
@@ -7386,7 +7250,7 @@ fn resolve_dht_absent_yields_adr022_defaults() {
 /// `ResolvedDht::default()` must agree with what the resolver produces for
 /// an absent section.
 ///
-/// The two are independent copies of the same eight values —
+/// The two are independent copies of the same five values —
 /// `DEFAULT_DHT_*` is what production resolves through, while
 /// `ResolvedDht::default()` is what hand-built `ResolvedConfig` fixtures
 /// across `node`, `cli`, and the e2e suite use. Nothing in the type system
@@ -7398,11 +7262,8 @@ fn resolved_dht_default_matches_resolver() {
     let hand = ResolvedDht::default();
     assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
     assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
-    assert!((resolved.per_ip_rate_per_sec - hand.per_ip_rate_per_sec).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_ip_burst, hand.per_ip_burst);
     assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
     assert_eq!(resolved.global_burst, hand.global_burst);
-    assert_eq!(resolved.max_tracked_per_ip, hand.max_tracked_per_ip);
     assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
 }
 
@@ -7416,33 +7277,9 @@ fn resolved_probe_default_matches_resolver() {
     let hand = ResolvedProbe::default();
     assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
     assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
-    assert!((resolved.per_ip_rate_per_sec - hand.per_ip_rate_per_sec).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_ip_burst, hand.per_ip_burst);
     assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
     assert_eq!(resolved.global_burst, hand.global_burst);
-    assert_eq!(resolved.max_tracked_per_ip, hand.max_tracked_per_ip);
     assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
-}
-
-#[test]
-fn resolve_dht_max_tracked_per_ip_file_override() {
-    let d = dht_rl_with(|r| r.max_tracked_per_ip = Some(8192));
-    let resolved = resolve_dht(Some(&d)).expect("valid override");
-    assert_eq!(resolved.max_tracked_per_ip, 8192);
-}
-
-#[test]
-fn resolve_dht_max_tracked_per_ip_default_when_field_absent() {
-    let d = dht_rl_with(|r| r.per_peer_burst = Some(50));
-    let resolved = resolve_dht(Some(&d)).expect("valid partial config");
-    assert_eq!(resolved.max_tracked_per_ip, DEFAULT_DHT_MAX_TRACKED_PER_IP);
-}
-
-#[test]
-fn resolve_dht_accepts_zero_max_tracked_per_ip_as_unbounded() {
-    let d = dht_rl_with(|r| r.max_tracked_per_ip = Some(0));
-    let resolved = resolve_dht(Some(&d)).expect("0 makes the map unbounded");
-    assert_eq!(resolved.max_tracked_per_ip, 0);
 }
 
 #[test]
@@ -7454,7 +7291,7 @@ fn resolve_dht_max_tracked_per_peer_file_override() {
 
 #[test]
 fn resolve_dht_max_tracked_per_peer_default_when_field_absent() {
-    let d = dht_rl_with(|r| r.per_ip_burst = Some(150));
+    let d = dht_rl_with(|r| r.global_burst = Some(1500));
     let resolved = resolve_dht(Some(&d)).expect("valid partial config");
     assert_eq!(
         resolved.max_tracked_per_peer,
@@ -7488,14 +7325,8 @@ fn resolve_probe_absent_yields_adr005_defaults() {
     let resolved = resolve_probe(None).expect("absent section is valid");
     assert!((resolved.per_peer_rate_per_sec - 5.0).abs() < f64::EPSILON);
     assert_eq!(resolved.per_peer_burst, 5);
-    assert!((resolved.per_ip_rate_per_sec - 50.0).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_ip_burst, 200);
     assert!((resolved.global_rate_per_sec - 1000.0).abs() < f64::EPSILON);
     assert_eq!(resolved.global_burst, 2000);
-    assert_eq!(
-        resolved.max_tracked_per_ip,
-        DEFAULT_PROBE_MAX_TRACKED_PER_IP
-    );
     assert_eq!(
         resolved.max_tracked_per_peer,
         DEFAULT_PROBE_MAX_TRACKED_PER_PEER
@@ -7512,7 +7343,7 @@ fn resolve_probe_file_override_applies() {
     assert!((resolved.per_peer_rate_per_sec - 7.0).abs() < f64::EPSILON);
     assert_eq!(resolved.per_peer_burst, 9);
     // Untouched fields keep their ADR 005 defaults.
-    assert_eq!(resolved.per_ip_burst, 200);
+    assert_eq!(resolved.global_burst, 2000);
 }
 
 #[test]
@@ -7538,12 +7369,8 @@ fn resolve_probe_rate_positive_with_zero_burst_rejects() {
 
 #[test]
 fn resolve_probe_accepts_zero_max_tracked_as_unbounded() {
-    let p = probe_rl_with(|r| {
-        r.max_tracked_per_ip = Some(0);
-        r.max_tracked_per_peer = Some(0);
-    });
-    let resolved = resolve_probe(Some(&p)).expect("0 makes the maps unbounded");
-    assert_eq!(resolved.max_tracked_per_ip, 0);
+    let p = probe_rl_with(|r| r.max_tracked_per_peer = Some(0));
+    let resolved = resolve_probe(Some(&p)).expect("0 makes the map unbounded");
     assert_eq!(resolved.max_tracked_per_peer, 0);
 }
 
@@ -7581,53 +7408,16 @@ fn only_notice(notices: Vec<ConfigNotice>) -> ConfigNotice {
     notices.into_iter().next().expect("one notice")
 }
 
+/// The disabled-cap notice is `Info`, not `Warn`: switching the cap off is
+/// a documented opt-out working exactly as configured, and a consumer that
+/// gates its exit status on severity must not trip on it.
 #[test]
-fn security_zero_max_tracked_sources_warns_about_the_unbounded_map() {
-    let s = sec_with(|s| s.max_tracked_sources = Some(0));
+fn security_disabled_cap_is_informational_not_a_warning() {
+    let s = sec_with(|s| s.max_concurrent_handlers = Some(0));
     let notice = only_notice(notices_from(|bag| resolve_security_into(Some(&s), bag)));
-    assert_eq!(notice.field, "security.max_tracked_sources");
-    assert_eq!(
-        notice.level,
-        ConfigNoticeLevel::Warn,
-        "an unbounded bookkeeping map weakens a safety property"
-    );
-    assert!(
-        notice.message.contains("unbounded"),
-        "the operator greps for this word: {}",
-        notice.message
-    );
-}
-
-/// The two disabled-layer notices are `Info`, not `Warn`: switching a rate
-/// limit off is a documented opt-out working exactly as configured, and a
-/// consumer that gates its exit status on severity must not trip on them.
-#[test]
-fn security_disabled_layers_are_informational_not_warnings() {
-    let s = sec_with(|s| {
-        s.max_concurrent_handlers = Some(0);
-        s.per_source_rate_per_sec = Some(0.0);
-        s.per_source_burst = Some(0);
-    });
-    let notices = notices_from(|bag| resolve_security_into(Some(&s), bag));
-    // The exact slice also pins that `per_source_burst = 0` adds nothing:
-    // `rate == 0` short-circuits the rate/burst pairing check, so the
-    // rate notice already covers the disabled layer.
-    let fields: Vec<&str> = notices.iter().map(|n| n.field.as_str()).collect();
-    assert_eq!(
-        fields,
-        [
-            "security.max_concurrent_handlers",
-            "security.per_source_rate_per_sec"
-        ]
-    );
-    assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Info));
-    // Discriminating substrings, so swapping the two bodies fails here.
-    let messages: Vec<&str> = notices.iter().map(|n| n.message.as_str()).collect();
-    assert!(messages[0].contains("concurrency cap"), "{messages:?}");
-    assert!(
-        messages[1].contains("per-source rate-limit"),
-        "{messages:?}"
-    );
+    assert_eq!(notice.field, "security.max_concurrent_handlers");
+    assert_eq!(notice.level, ConfigNoticeLevel::Info);
+    assert!(notice.message.contains("concurrency cap"), "{notice:?}");
 }
 
 #[test]
@@ -7636,30 +7426,16 @@ fn security_at_defaults_records_no_notice() {
 }
 
 #[test]
-fn dht_zero_max_tracked_warns_per_ip_and_per_peer() {
-    let d = dht_rl_with(|r| {
-        r.max_tracked_per_ip = Some(0);
-        r.max_tracked_per_peer = Some(0);
-    });
-    let notices = notices_from(|bag| resolve_dht_into(Some(&d), bag));
-    let fields: Vec<&str> = notices.iter().map(|n| n.field.as_str()).collect();
-    assert_eq!(
-        fields,
-        [
-            "dht.rate_limit.max_tracked_per_ip",
-            "dht.rate_limit.max_tracked_per_peer"
-        ]
-    );
-    assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Warn));
-    assert!(notices.iter().all(|n| n.message.contains("unbounded")));
-    // Per-IP and per-peer are different attacks; a swapped pair must fail.
-    let messages: Vec<&str> = notices.iter().map(|n| n.message.as_str()).collect();
-    assert!(messages[0].contains("per-IP"), "{messages:?}");
-    assert!(messages[1].contains("per-peer"), "{messages:?}");
+fn dht_zero_max_tracked_warns_about_the_unbounded_map() {
+    let d = dht_rl_with(|r| r.max_tracked_per_peer = Some(0));
+    let notice = only_notice(notices_from(|bag| resolve_dht_into(Some(&d), bag)));
+    assert_eq!(notice.field, "dht.rate_limit.max_tracked_per_peer");
+    assert_eq!(notice.level, ConfigNoticeLevel::Warn);
+    assert!(notice.message.contains("unbounded"), "{notice:?}");
 }
 
 /// The counterpart guard: a default `[dht.rate_limit]` must stay silent.
-/// An inverted condition would fire two `Warn`s on every clean config and
+/// An inverted condition would fire a `Warn` on every clean config and
 /// move `doctor --strict` off zero for every node on the network.
 #[test]
 fn dht_at_defaults_records_no_notice() {
@@ -7673,25 +7449,12 @@ fn probe_at_defaults_records_no_notice() {
 }
 
 #[test]
-fn probe_zero_max_tracked_warns_per_ip_and_per_peer() {
-    let p = probe_rl_with(|r| {
-        r.max_tracked_per_ip = Some(0);
-        r.max_tracked_per_peer = Some(0);
-    });
-    let notices = notices_from(|bag| resolve_probe_into(Some(&p), bag));
-    let fields: Vec<&str> = notices.iter().map(|n| n.field.as_str()).collect();
-    assert_eq!(
-        fields,
-        [
-            "probe.rate_limit.max_tracked_per_ip",
-            "probe.rate_limit.max_tracked_per_peer"
-        ]
-    );
-    assert!(notices.iter().all(|n| n.level == ConfigNoticeLevel::Warn));
-    assert!(notices.iter().all(|n| n.message.contains("unbounded")));
-    let messages: Vec<&str> = notices.iter().map(|n| n.message.as_str()).collect();
-    assert!(messages[0].contains("per-IP"), "{messages:?}");
-    assert!(messages[1].contains("per-peer"), "{messages:?}");
+fn probe_zero_max_tracked_warns_about_the_unbounded_map() {
+    let p = probe_rl_with(|r| r.max_tracked_per_peer = Some(0));
+    let notice = only_notice(notices_from(|bag| resolve_probe_into(Some(&p), bag)));
+    assert_eq!(notice.field, "probe.rate_limit.max_tracked_per_peer");
+    assert_eq!(notice.level, ConfigNoticeLevel::Warn);
+    assert!(notice.message.contains("unbounded"), "{notice:?}");
 }
 
 /// #843: a stale exported `DECDN_RELAY_URL` collapses a multi-entry
@@ -7787,19 +7550,20 @@ fn well_known_port_notice_respects_the_range_edges() {
 fn resolve_config_returns_the_notices_its_resolvers_recorded() -> anyhow::Result<()> {
     let dir = data_dir_with_keystore()?;
     let body = format!(
-        "{}\n[security]\nmax_tracked_sources = 0\n",
+        "{}\n[dht.rate_limit]\nmax_tracked_per_peer = 0\n",
         complete_toml_body()
     );
     let path = write_minimal_toml(&dir, &body)?;
     let args = run_args_with_data_dir(dir.path());
 
     let (resolved, notices) = resolve_config(Some(&path), &args)?;
-    assert_eq!(resolved.security.max_tracked_sources, 0);
+    assert_eq!(resolved.dht.max_tracked_per_peer, 0);
     assert!(
-        notices.iter().any(
-            |n| n.field == "security.max_tracked_sources" && n.level == ConfigNoticeLevel::Warn
-        ),
-        "the security notice must survive the trip out of resolve_config: {notices:?}"
+        notices
+            .iter()
+            .any(|n| n.field == "dht.rate_limit.max_tracked_per_peer"
+                && n.level == ConfigNoticeLevel::Warn),
+        "the dht notice must survive the trip out of resolve_config: {notices:?}"
     );
     Ok(())
 }
@@ -7821,11 +7585,8 @@ fn resolve_serve_absent_yields_adr005_defaults() {
     let resolved = resolve_serve(None).expect("absent section is valid");
     assert!((resolved.per_peer_rate_per_sec - 100.0).abs() < f64::EPSILON);
     assert_eq!(resolved.per_peer_burst, 400);
-    assert!((resolved.per_ip_rate_per_sec - 200.0).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_ip_burst, 800);
     assert!((resolved.global_rate_per_sec - 2000.0).abs() < f64::EPSILON);
     assert_eq!(resolved.global_burst, 5000);
-    assert_eq!(resolved.max_tracked_per_ip, 4096);
     assert_eq!(resolved.max_tracked_per_peer, 4096);
 }
 
@@ -7837,11 +7598,8 @@ fn resolved_serve_default_matches_resolver() {
     let hand = ResolvedServe::default();
     assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
     assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
-    assert!((resolved.per_ip_rate_per_sec - hand.per_ip_rate_per_sec).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_ip_burst, hand.per_ip_burst);
     assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
     assert_eq!(resolved.global_burst, hand.global_burst);
-    assert_eq!(resolved.max_tracked_per_ip, hand.max_tracked_per_ip);
     assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
 }
 
@@ -7854,7 +7612,7 @@ fn resolve_serve_file_override_applies() {
     let resolved = resolve_serve(Some(&p)).expect("valid override");
     assert!((resolved.per_peer_rate_per_sec - 7.0).abs() < f64::EPSILON);
     assert_eq!(resolved.per_peer_burst, 9);
-    assert_eq!(resolved.per_ip_burst, 800);
+    assert_eq!(resolved.global_burst, 5000);
 }
 
 #[test]

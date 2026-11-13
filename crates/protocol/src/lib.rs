@@ -103,13 +103,16 @@ pub const ALPN_CLIENT: &[u8] = b"cdn/client/v1";
 /// ALPN protocol identifier for Kademlia-based content discovery (ADR 022).
 pub const ALPN_DHT: &[u8] = b"cdn/dht/v1";
 
-/// Connection rejected by the per-source or global rate limiter (ADR 013 §0x10).
+/// Connection or stream rejected by a node's concurrency cap or rate limiter
+/// (ADR 013 §0x10).
 ///
-/// Unlike `0x01`–`0x03`, this code is delivered via `CONNECTION_CLOSE` rather
-/// than `RESET_STREAM` because the rejection happens before any application
-/// stream is opened. The close-frame reason bytes carry a short layer label
-/// (e.g. `global-full`, `per-source`) so the peer can pick an appropriate
-/// backoff. Peers that receive this code SHOULD back off before
+/// A node that sheds a whole connection (the connection cap or a per-connection
+/// limiter, before any application stream exists) sends it as
+/// `CONNECTION_CLOSE`, and the close-frame reason bytes carry a short layer
+/// label (e.g. `global-full`, `per_peer`) so the peer can pick an appropriate
+/// backoff. A node that sheds one stream on an open connection (the
+/// `cdn/client/v1` stream cap or request limiter) sends it as `RESET_STREAM`,
+/// which carries no reason bytes. Peers that receive this code SHOULD back off before
 /// reconnecting; they MUST NOT treat it as a protocol error (the server is
 /// functioning normally — the client is overloading it). The requester side
 /// (`decdn-client`) types this code as `UpstreamRateLimited` so the pull

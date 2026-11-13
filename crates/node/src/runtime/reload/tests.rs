@@ -130,9 +130,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,
-            per_source_rate_per_sec: 100.0,
-            per_source_burst: 200,
-            max_tracked_sources: 4096,
         },
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
@@ -910,9 +907,6 @@ fn build_test_limiter() -> Arc<crate::dispatch::ConnectionLimiter> {
     Arc::new(ConnectionLimiter::new(
         &ResolvedSecurity {
             max_concurrent_handlers: 256,
-            per_source_rate_per_sec: 100.0,
-            per_source_burst: 200,
-            max_tracked_sources: 4096,
         },
         metrics,
     ))
@@ -920,16 +914,10 @@ fn build_test_limiter() -> Arc<crate::dispatch::ConnectionLimiter> {
 
 #[tokio::test]
 async fn reload_applies_security_when_limiter_attached() {
-    // Tighten per-source burst from default 200 down to 1; after
-    // reload the live limiter must reject the second acquire from
-    // the same source IP.
+    // Tighten the global cap from the seed 256 down to 1; after reload the
+    // live limiter must reject a second concurrent acquire.
     let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        dir.path(),
-        "[security]\n\
-         per_source_rate_per_sec = 0.001\n\
-         per_source_burst = 1\n",
-    );
+    let path = write_config(dir.path(), "[security]\nmax_concurrent_handlers = 1\n");
 
     let initial = seed_resolved(10, LogLevel::Info);
     let (setter, _captured) = recording_setter();
@@ -950,15 +938,13 @@ async fn reload_applies_security_when_limiter_attached() {
 
     state.reload(&path).await.unwrap();
 
-    // Per-source burst is now 1.
+    // The global cap is now 1.
     let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
-    let _p1 = limiter
-        .acquire_for_test(Some(ip))
-        .expect("first per-source acquire");
+    let _p1 = limiter.acquire_for_test(Some(ip)).expect("first acquire");
     let err = limiter
         .acquire_for_test(Some(ip))
-        .expect_err("second per-source acquire must reject after reload");
-    assert_eq!(err, crate::dispatch::RejectReason::PerSource);
+        .expect_err("second concurrent acquire must reject after reload");
+    assert_eq!(err, crate::dispatch::RejectReason::GlobalFull);
 }
 
 #[tokio::test]
@@ -967,10 +953,7 @@ async fn reload_without_attached_limiter_is_noop_for_security() {
     // but doesn't blow up. Equivalent of the cache "noop for pinning"
     // test that already exists.
     let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        dir.path(),
-        "[security]\nper_source_burst = 5\nper_source_rate_per_sec = 1.0\n",
-    );
+    let path = write_config(dir.path(), "[security]\nmax_concurrent_handlers = 5\n");
     let initial = seed_resolved(10, LogLevel::Info);
     let (setter, _captured) = recording_setter();
     let state = RuntimeReloadState::new(
@@ -990,11 +973,11 @@ async fn reload_without_attached_limiter_is_noop_for_security() {
 }
 
 #[tokio::test]
-async fn reload_rejects_invalid_security_and_keeps_previous() {
-    // Negative rate is invalid; reload must reject *and* the rate
-    // atomic and log-level setter must NOT have moved (all-or-
-    // nothing reload — invalid security blocks every other field
-    // too).
+async fn reload_rejects_an_invalid_section_and_keeps_previous() {
+    // A load-shed high-water mark below its low-water mark is invalid; reload
+    // must reject *and* the rate atomic and log-level setter must NOT have
+    // moved (all-or-nothing reload — one invalid section blocks every other
+    // field too).
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(
         dir.path(),
@@ -1002,8 +985,9 @@ async fn reload_rejects_invalid_security_and_keeps_previous() {
          rate_per_mb = 99\n\
          [observability]\n\
          log_level = \"debug\"\n\
-         [security]\n\
-         per_source_rate_per_sec = -1.0\n",
+         [load_shed]\n\
+         max_concurrent_serves_high = 1\n\
+         max_concurrent_serves_low = 2\n",
     );
     let initial = seed_resolved(42, LogLevel::Info);
     let (setter, captured) = recording_setter();
@@ -1022,12 +1006,12 @@ async fn reload_rejects_invalid_security_and_keeps_previous() {
     state.attach_limiter(Some(build_test_limiter()));
 
     let err = state.reload(&path).await.unwrap_err();
-    assert!(format!("{err:#}").contains("per_source_rate_per_sec"));
+    assert!(format!("{err:#}").contains("load_shed.max_concurrent_serves_high"));
     // "Previous values retained on error" applies to the whole reload:
-    // the log-level setter must not have run when security rejected.
+    // the log-level setter must not have run when a section rejected.
     assert!(
         captured.lock().unwrap().is_none(),
-        "log-level setter must not have run when security rejected"
+        "log-level setter must not have run when a section rejected"
     );
 }
 
@@ -1041,8 +1025,9 @@ async fn reload_aggregates_problems_across_sections() {
         dir.path(),
         "[cache]\n\
          pinned_hashes = [\"notahash\"]\n\
-         [security]\n\
-         per_source_rate_per_sec = -1.0\n",
+         [load_shed]\n\
+         max_concurrent_serves_high = 1\n\
+         max_concurrent_serves_low = 2\n",
     );
 
     let initial = seed_resolved(42, LogLevel::Info);
@@ -1075,8 +1060,8 @@ async fn reload_aggregates_problems_across_sections() {
         "missing pinned-hashes field: {msg}"
     );
     assert!(
-        msg.contains("security.per_source_rate_per_sec"),
-        "missing security field: {msg}"
+        msg.contains("load_shed.max_concurrent_serves_high"),
+        "missing load_shed field: {msg}"
     );
 
     // All-or-nothing: the log-level setter must not have run.
@@ -1095,8 +1080,7 @@ async fn reload_keeps_security_when_log_level_setter_fails() {
         dir.path(),
         "[observability]\nlog_level = \"debug\"\n\
          [security]\n\
-         per_source_rate_per_sec = 0.001\n\
-         per_source_burst = 1\n",
+         max_concurrent_handlers = 1\n",
     );
     let failing_setter: LogLevelSetter =
         Box::new(|_| Err(anyhow::anyhow!("simulated tracing-reload failure")));
@@ -1119,19 +1103,18 @@ async fn reload_keeps_security_when_log_level_setter_fails() {
     let err = state.reload(&path).await.unwrap_err();
     assert!(format!("{err:#}").contains("simulated tracing-reload failure"));
 
-    // Limiter must NOT have been mutated — the per-node burst stays
-    // at the seed_resolved default (200), so two acquires from
-    // different IPs still succeed.
+    // Limiter must NOT have been mutated — the global cap stays at the
+    // seed_resolved value (256), so two concurrent acquires still succeed.
     let _p1 = limiter
         .acquire_for_test(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             10, 0, 0, 1,
         ))))
-        .expect("setter failure must not have shrunk per-source burst");
+        .expect("setter failure must not have shrunk the global cap");
     let _p2 = limiter
         .acquire_for_test(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             10, 0, 0, 2,
         ))))
-        .expect("seed burst (200) still in effect → second succeeds");
+        .expect("seed cap (256) still in effect → second succeeds");
 }
 
 /// Mirror of `attach_cache_recovers_from_poisoned_mutex` for the
