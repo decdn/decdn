@@ -35,9 +35,7 @@
 //!   on-chain (`isActive(operator)`: registered AND active bond ≥ the
 //!   operator's floor AND not ejected) alongside the `_registeredAddrs` page.
 //! - `bindings` applies no filter: an operator below its bond floor has
-//!   `isActive = false` but is paid while its active and unbonding bond
-//!   together cover its floor, and again once it tops up, so its binding must
-//!   survive.
+//!   `isActive = false` but is still payable, so its binding must survive.
 //! - `regions`, the reverse map, and the dial-address directory are likewise
 //!   unfiltered: liveness is applied separately at read time via the shared
 //!   `StakerSet`, and an inactive node stays dialable for lane settlement.
@@ -712,9 +710,7 @@ where
         let page_len = resp.page.len() as u64;
         // `active[i]` is `isActive(page[i])`, computed on-chain and index-aligned
         // with `page` by the contract. `bindings` takes every entry (unfiltered):
-        // an operator below its bond floor is inactive but is paid while its
-        // active and unbonding bond together cover its floor, and again once
-        // it tops up.
+        // an operator below its bond floor is inactive but still payable.
         for (node, &is_active) in resp.page.iter().zip(resp.active.iter()) {
             let node_id = NodeId::from_bytes(node.nodeId.0);
             snap.bindings.insert(node_id, node.ethAddress);

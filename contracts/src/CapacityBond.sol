@@ -1565,23 +1565,6 @@ contract CapacityBond is
         active = isActive(operator);
     }
 
-    /// @notice Whether `operator` may be paid for vouchers, and whether its bytes
-    ///         count toward governance. `payee` is a stake check against the
-    ///         operator's minimum bond: the operator holds a bound NodeId, is
-    ///         not ejected, and its active bond plus its unbonding bond covers
-    ///         its grandfathered `bondFloorAtActivation`. Registration is not
-    ///         part of the rule, so a deregistered node redeems earned vouchers
-    ///         for as long as that stake stays in the contract, queued for
-    ///         unbonding or not. An address that never crossed `minBond` holds
-    ///         no floor and is never paid, whatever dust it bonds or queues. An
-    ///         operator slashed below its floor is paid again once it tops up.
-    function payeeStatus(address operator) external view returns (bool payee, bool active) {
-        active = isActive(operator);
-        uint256 floor = bondFloorAtActivation[operator];
-        payee = addressToNodeId[operator] != bytes32(0) && !ejected[operator] && floor != 0
-            && activeBond[operator] + unbondingOf[operator].amount >= floor;
-    }
-
     function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory) {
         return _nodes[ethAddress];
     }
@@ -1616,10 +1599,8 @@ contract CapacityBond is
     ///         record is registered, regardless of bond/unbonding/ejection) plus
     ///         a parallel `active[]` where `active[i] == isActive(page[i].ethAddress)`.
     ///         The two projections diverge on purpose: an operator whose bond sits
-    ///         below its floor is `active[i] == false` but still present in `page` because it stays
-    ///         registered: it is a `payeeStatus` payee while its active and unbonding bond
-    ///         together cover its floor, and again once it tops up to its floor, so the off-chain node→address
-    ///         bindings must survive. Computing
+    ///         below its floor is `active[i] == false` but still present in `page` because it remains
+    ///         payable, so the off-chain node→address bindings must survive. Computing
     ///         `active` here lets callers derive the true active-membership set from a
     ///         single call, with no per-entry `isActive` round-trip (issue #1565).
     function getRegisteredNodes(uint256 offset, uint256 limit)

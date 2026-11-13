@@ -15,8 +15,7 @@
 //!   bond ≥ the operator's floor AND not ejected" predicate. Callers take
 //!   the membership set from `active[]` and keep the full page for the
 //!   payout bindings (an operator below its floor is `active == false`
-//!   but is paid while its active and unbonding bond together cover its
-//!   floor, and again once it tops up), with no per-entry round-trip.
+//!   but still payable), with no per-entry round-trip.
 //! - `nodeIdOf` returns `(bytes32 nodeId, bool active)` where the bool
 //!   is the full `isActive` predicate, not a separate "registered"
 //!   flag.
@@ -325,10 +324,7 @@ mod sol_types {
             /// `termsHash` must equal `currentTermsHash` (ADR 019 § Terms
             /// Acceptance). Reverts if the operator's bond is below `minBond` /
             /// the declared-capacity curve — Phase 2.1/2.2 (`bond` /
-            /// `declareMbps`) are a precondition. A re-registration into a
-            /// region other than the current one reverts
-            /// `RegionCooldownActive(readyAt)` within `regionStabilityWindow`
-            /// of the last region change, the same cooldown as `updateRegion`.
+            /// `declareMbps`) are a precondition.
             function registerNode(
                 bytes32 nodeId,
                 bytes multiaddrs,

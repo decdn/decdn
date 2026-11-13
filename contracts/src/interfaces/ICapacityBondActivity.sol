@@ -4,8 +4,8 @@ pragma solidity 0.8.28;
 /// @title ICapacityBondActivity
 /// @notice Consumer-side view of `CapacityBond.isActive` (ADR 003
 ///         § NodeId-to-Ethereum Binding, ADR 016 § Off-Chain Read API).
-///         `PaymentPool.redeemMany` reads it through `payeeStatus` to count
-///         governance bytes only for an active node; `OriginAssignment`
+///         `PaymentPool.openPool` reads it to refuse pools against an
+///         operator that is not a currently-bonded, active node; `OriginAssignment`
 ///         reads the same predicate for origin authorization. Kept focused —
 ///         mirroring `ICapacityBondEpoch` / `ICapacityBondEjector` — so
 ///         consumers link only the read they need.
@@ -18,10 +18,9 @@ pragma solidity 0.8.28;
 interface ICapacityBondActivity {
     function isActive(address operator) external view returns (bool);
 
-    /// @notice Whether the operator may be paid (a bound NodeId, not ejected,
-    ///         and active plus unbonding bond at or above its minimum bond) and
-    ///         its `isActive` status, in one read. `PaymentPool.redeemMany` uses it
-    ///         to pay only staked operators and to count bytes only for active
-    ///         ones.
-    function payeeStatus(address operator) external view returns (bool payee, bool active);
+    /// @notice The operator's bound NodeId (`bytes32(0)` when it holds no
+    ///         binding) and its `isActive` status, in one read.
+    ///         `PaymentPool.redeemMany` uses it to pay only bound operators
+    ///         and to count bytes only for active ones.
+    function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 }

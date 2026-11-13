@@ -29,8 +29,8 @@ contract MockBondActivity is ICapacityBondActivity {
         return _active[op];
     }
 
-    function payeeStatus(address op) external view override returns (bool, bool) {
-        return (false, _active[op]);
+    function nodeIdOf(address op) external view override returns (bytes32, bool) {
+        return (bytes32(0), _active[op]);
     }
 }
 
