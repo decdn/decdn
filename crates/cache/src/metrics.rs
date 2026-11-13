@@ -373,6 +373,16 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_recency_seed_failures_total`.
     pub recency_seed_failures: Counter,
+    /// Size lookups that the local store could not prove and that every
+    /// origin answered with no `{H}.sizeproof`
+    /// (`decdn_cache_size_proof_origin_missing_total`). The node states no
+    /// size for such a blob and does not serve it from its origin. Nonzero
+    /// means origin objects lack the proof `decdn origin import` writes; one
+    /// lookup per blob counts at most once per miss window.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_size_proof_origin_missing_total`.
+    pub size_proof_origin_missing: Counter,
     /// Partial blobs whose `observe()` failed during a cache-size walk
     /// (`decdn_cache_partial_size_observe_failures_total`). The walk counts
     /// such a blob at its last known present bytes, else at `status()`'s size,

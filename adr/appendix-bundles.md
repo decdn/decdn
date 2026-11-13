@@ -49,10 +49,15 @@ order — field declaration order is load-bearing, see
   rejected at create time.
 - `hash`: `b3:` followed by the 64-character lowercase hex of the
   file's BLAKE3. See [Hash format](#hash-format).
-- `size`: file size in bytes, unsigned 64-bit integer. Optional and a
-  hint on the read side. A bundle pull uses it for the dry-run plan and as
-  the first size claim of the entry, and fetches without it. The fetch
-  proves the true size ([ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)).
+- `size`: file size in bytes, unsigned 64-bit integer. Optional and
+  declared, not proven, on the read side. A bundle pull uses it for the
+  dry-run plan and progress totals, and fetches without it. It sizes no
+  store and plans no range: chunk-dedup ranges apply only when it equals
+  the proven size, and otherwise the entry fetches its whole blob.
+  The first holder that serves the entry proves the true size with its size
+  proof ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)),
+  and the fetch works to the proven size
+  ([ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)).
   When the proven size differs from `size`, the entry succeeds and the
   pull prints `<path>: manifest says X bytes, the blob is Y bytes`.
 - `chunks`: optional ordered list of range-dedup hints over the file's
@@ -426,8 +431,10 @@ The rules below apply to every pull:
   its ranges to the other holders. When the cooldown ends, the holder comes
   back into the same loop. A holder that faults for one entry also cools for
   every other entry. A failed entry does not retry in rounds. The size in
-  the manifest is the first size claim of the entry. It is a hint. A holder
-  that signs a different size stays a holder of the entry. An entry
+  the manifest is declared and not proven, and the entry's fetch works to
+  the size its holders prove. A holder that proves a size other than the
+  manifest's stays a holder of the entry. A holder that states a size it
+  cannot prove is a fault of that holder. An entry
   whose proven size differs from its manifest size succeeds with a warning
   line. A blob over the client's size cap fails only its entry.
   A node's refusal never stops the pull. It removes, parks, or cools that

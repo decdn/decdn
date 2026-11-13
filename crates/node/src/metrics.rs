@@ -1990,10 +1990,9 @@ pub struct DecdnMetrics {
     /// requester. Visible name: `decdn_serve_stream_rejected_pull_loop_guard_total`.
     pub serve_stream_rejected_pull_loop_guard: Counter,
     /// Delivery refused because the requested bounded range starts at or past
-    /// this node's size claim for the blob (ADR 005 §Bounded byte ranges).
-    /// Signed as `Declined`: the size is this node's claim, and another node
-    /// can disagree. A rising value flags clients issuing ranges past the end,
-    /// or nodes that disagree on a blob's size. Visible name:
+    /// the blob's proven size (ADR 005 §Bounded byte ranges). Signed as
+    /// `Declined`. A rising value flags clients issuing ranges past the end.
+    /// Visible name:
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
     /// Delivery refused because a pull-through request needs a byte this node

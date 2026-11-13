@@ -4,7 +4,7 @@
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover the holders, #936),
 //! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, take the
-//! first size claim (the probe hint, or the header of a whole-blob open
+//! blob's proven size (a probe answer's, or the header of a whole-blob open
 //! when there is none), and fetch it through the acquire loop
 //! ([`decdn_client::acquire`]) across one [`decdn_client::PeerSource`] lane
 //! per holder (signing cumulative vouchers, resuming each lane's persisted
@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
 use anyhow::Context as _;
+use decdn_client::ProvenSize;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
@@ -636,7 +637,7 @@ async fn fetch_target(
         read_ahead: None,
         size_cap: None,
         range: None,
-        prove: false,
+        size_only: false,
         hash,
         namespace: uri.namespace,
         output: output.to_path_buf(),
@@ -678,7 +679,7 @@ async fn fetch_entry_hash(
         read_ahead: None,
         size_cap: None,
         range: None,
-        prove: false,
+        size_only: false,
         hash: uri.hash,
         namespace: uri.namespace,
         output: PathBuf::from("-"),
@@ -786,14 +787,12 @@ pub(crate) struct BlobFetch {
     /// blob. Read only when the fetch streams: a window cannot be downloaded
     /// to a file.
     pub(crate) range: Option<(u64, u64)>,
-    /// Prove the blob's size and write no byte (#2645): the fetch pays for
-    /// the last chunk group under the first size claim, and a size its final
-    /// chunk verifies joins the host's verified sizes
-    /// ([`FetchHost::verified_size`]). A fetch that proves nothing still
-    /// succeeds; a fault before the proof (such as no holder) fails it, and
-    /// so does one the pull after it would reach again ([`proof_ends_fetch`]).
-    /// Never set with `range`.
-    pub(crate) prove: bool,
+    /// Learn the blob's size and write no byte: the first size a holder
+    /// proves (its probe answer, or the header of the first leg's open,
+    /// ADR 005 § Bounded byte ranges) joins the host's verified sizes
+    /// ([`FetchHost::verified_size`]). A fault before it (such as no holder)
+    /// fails the fetch. Never set with `range`.
+    pub(crate) size_only: bool,
     /// Print the fetch's one-line cost estimate on stderr before the first
     /// paid byte (#2600): set for the blob a user asked for, and not for a
     /// manifest or a gateway response.
@@ -854,35 +853,35 @@ pub(crate) struct FetchHost {
     pub(crate) escrows: UnconfirmedEscrows,
     /// The pool's settlement token, `PaymentPool.usdc()`, read once.
     token: tokio::sync::OnceCell<alloy::primitives::Address>,
-    /// The sizes of blobs fetches on this host verified whole or proved, up
-    /// to [`MAX_SIZE_HINTS`].
+    /// The proven sizes of blobs fetches on this host learned, up to
+    /// [`MAX_SIZE_HINTS`].
     sizes: Mutex<SizeHints>,
 }
 
 /// The most blob sizes a [`FetchHost`] remembers.
 const MAX_SIZE_HINTS: usize = 4096;
 
-/// Blob sizes by hash, each one a whole fetch verified or a size proof
-/// proved ([`BlobFetch::prove`]), oldest first out
+/// Blob sizes by hash, each one a size a holder proved or a whole fetch
+/// verified ([`BlobFetch::size_only`]), oldest first out
 /// within [`MAX_SIZE_HINTS`] entries. A hash fixes its blob's size, so a hit
-/// is a later fetch's first size claim, and a pinned node is not probed for
+/// is a later fetch's size, and a pinned node is not probed for
 /// it (ADR 005 § Probe rate limiting bounds those probes per peer).
 #[derive(Default)]
 pub(crate) struct SizeHints {
-    sizes: std::collections::HashMap<[u8; 32], u64>,
+    sizes: std::collections::HashMap<[u8; 32], ProvenSize>,
     /// Insertion order, oldest first.
     order: std::collections::VecDeque<[u8; 32]>,
 }
 
 impl SizeHints {
-    /// The size a fetch verified for `hash`, if one did.
-    pub(crate) fn get(&self, hash: &[u8; 32]) -> Option<u64> {
+    /// The size a holder proved for `hash`, if one did.
+    pub(crate) fn get(&self, hash: &[u8; 32]) -> Option<ProvenSize> {
         self.sizes.get(hash).copied()
     }
 
-    /// Remember that `hash`'s blob verified to `size` bytes. A hash fixes its
-    /// blob's size, so a hash already known keeps its size and its place.
-    pub(crate) fn insert(&mut self, hash: [u8; 32], size: u64) {
+    /// Remember that `hash`'s blob is `size` bytes. A hash fixes its blob's
+    /// size, so a hash already known keeps its size and its place.
+    pub(crate) fn insert(&mut self, hash: [u8; 32], size: ProvenSize) {
         let std::collections::hash_map::Entry::Vacant(entry) = self.sizes.entry(hash) else {
             return;
         };
@@ -896,20 +895,14 @@ impl SizeHints {
     }
 }
 
-/// The size a fetch of `hash` starts from: `size_cap`, the caller's declared
-/// size (a bundle manifest's entry size), else one an earlier fetch on the
-/// host verified. Only the declared size caps the fetch ([`held_cap`]).
-pub(crate) fn known_size(
-    hash: &[u8; 32],
-    size_cap: Option<u64>,
-    sizes: &Mutex<SizeHints>,
-) -> Option<u64> {
-    size_cap.or_else(|| {
-        sizes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(hash)
-    })
+/// The size a fetch of `hash` starts from: one a holder proved on this host.
+/// A declared size (a bundle manifest's entry size) only caps the fetch
+/// ([`held_cap`]).
+pub(crate) fn known_size(hash: &[u8; 32], sizes: &Mutex<SizeHints>) -> Option<ProvenSize> {
+    sizes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(hash)
 }
 
 impl FetchHost {
@@ -994,7 +987,7 @@ impl FetchHost {
     /// The size of `hash` a whole fetch on this host verified, or a size
     /// proof on it proved, if one did.
     pub(crate) fn verified_size(&self, hash: &[u8; 32]) -> Option<u64> {
-        known_size(hash, None, &self.sizes)
+        known_size(hash, &self.sizes).map(ProvenSize::get)
     }
 
     /// Wait for every queued peer-record and watermark write to land, then
@@ -1191,8 +1184,8 @@ impl Payer {
 }
 
 /// Fetch the blob `args` names on `host`, paid by `payer`, with its verified
-/// bytes going to `sink`: resolve the holders, take the first size claim (the
-/// probe hint, or the header of a whole-blob open when there is none), then fetch it
+/// bytes going to `sink`: resolve the holders, take the proven size (a probe
+/// answer's, or the header of a whole-blob open when there is none), then fetch it
 /// through the acquire loop. `--output` names the destination only for
 /// [`Sink::Output`]. The fetch ends on done, a fault only the user can fix,
 /// or the stop policy: a terminal waits for Ctrl-C, a script gives up after
@@ -1232,8 +1225,8 @@ pub(crate) async fn fetch_on(
         "a byte window streams; it cannot be downloaded to a file"
     );
     anyhow::ensure!(
-        !(args.prove && args.range.is_some()),
-        "a size proof takes no byte window"
+        !(args.size_only && args.range.is_some()),
+        "a size lookup takes no byte window"
     );
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
     // Only a configuration fault ends the fetch here; with no holder yet, the
@@ -1244,13 +1237,12 @@ pub(crate) async fn fetch_on(
     // peer store keeps per operator address; the guard writes it back once this
     // fetch ends, whatever ends it.
     let _trust = PayerTrust::open(&chain.site.data_dir);
-    // A known size (a gateway's manifest entry, or a size an earlier fetch
-    // on the host verified) is the first size claim, and a pinned node is not
-    // probed for it.
+    // A size an earlier fetch on the host proved is the first size, and a
+    // pinned node is not probed for it.
     let probe = ProbeOpts {
         marks: Some(timings),
         round: ProbeRound::Stream,
-        known_size: known_size(&hash, args.size_cap, sizes),
+        known_size: known_size(&hash, sizes),
     };
     let resolved = holders_or_none(
         resolve_target_node(
@@ -1395,9 +1387,16 @@ pub(crate) async fn fetch_on(
         // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
-            // The first size claim: the probe's hint, or the header of an open
-            // of the drive's first leg, which that leg then adopts.
-            let first_leg = if streams {
+            // The blob's size, proven: the probe's answer, or the header of an
+            // open of the drive's first leg, which that leg then adopts. A
+            // size lookup's leg is the blob's first byte, so its open pays
+            // for one chunk group at most.
+            let first_leg = if args.size_only {
+                FirstLeg::Streamed {
+                    window: (0, 1),
+                    read_ahead: 0,
+                }
+            } else if streams {
                 FirstLeg::Streamed {
                     window: args.range.unwrap_or((0, 0)),
                     read_ahead: stream_read_ahead(args.read_ahead),
@@ -1413,45 +1412,20 @@ pub(crate) async fn fetch_on(
             {
                 // A whole blob is one range, so its wire bytes follow from
                 // its size; an unencodable size prints no estimate.
-                if let Ok(wire) = decdn_client::quote::wire_bytes(claim.total_bytes) {
-                    super::quote::print_estimate((claim.total_bytes, wire), hints, common);
+                let size = claim.total_bytes.get();
+                if let Ok(wire) = decdn_client::quote::wire_bytes(size) {
+                    super::quote::print_estimate((size, wire), hints, common);
                 }
             }
             let total_bytes = claim.total_bytes;
-            if args.prove {
-                let proof = prove_size(
-                    &deps,
-                    &sources,
-                    claim.holders,
-                    Arc::clone(health),
-                    hash,
-                    total_bytes,
-                    stop.clone(),
-                    common.max_sources,
-                )
-                .await;
-                let blob = blake3::Hash::from_bytes(hash).to_hex();
-                match proof {
-                    Ok(Some(size)) => {
-                        sizes
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(hash, size);
-                    }
-                    Ok(None) => tracing::info!(
-                        %blob,
-                        claim = total_bytes,
-                        "a size proof proved nothing: the claim's last chunk group is not the \
-                         blob's last"
-                    ),
-                    Err(err) if proof_ends_fetch(&err) => return Err(err),
-                    Err(err) => tracing::info!(
-                        %blob,
-                        claim = total_bytes,
-                        error = format!("{err:#}"),
-                        "a size proof failed"
-                    ),
-                }
+            // Every size a holder states arrives with its proof, which the
+            // client verified before `first_claim` returned it, so the size
+            // joins the host's verified sizes now.
+            sizes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(hash, total_bytes);
+            if args.size_only {
                 return Ok(());
             }
             let landed = if streams {
@@ -1486,19 +1460,13 @@ pub(crate) async fn fetch_on(
                 .await
             };
             // A whole blob that landed verified against its hash is a receipt
-            // entry, and the size a later fetch of it starts from, at the
-            // length it verified to (the first claim is only a hint); a byte
-            // window is not the blob.
+            // entry, at the length it verified to; a byte window is not the
+            // blob.
             if let Ok(verified) = landed
                 && args.range.is_none()
+                && let Some(evidence) = &payer.evidence
             {
-                sizes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(hash, verified);
-                if let Some(evidence) = &payer.evidence {
-                    evidence.note_landed(hash, verified);
-                }
+                evidence.note_landed(hash, verified);
             }
             landed.map(drop)
         }
@@ -1725,18 +1693,6 @@ where
     Ok(drained)
 }
 
-/// Whether a size proof that failed with `err` ends its fetch with it: a
-/// fault fatal to the command (a funding stop, a pool replacement, an
-/// escrow no record credits, a local fault) or a give-up, which the pull
-/// after the proof would reach again. Any other fault is the proof failing
-/// on its own, and only leaves the size unproven.
-fn proof_ends_fetch(err: &anyhow::Error) -> bool {
-    matches!(
-        decdn_client::classify(err),
-        decdn_client::Fault::Fatal(decdn_client::FatalScope::Command)
-    ) || err.downcast_ref::<decdn_client::GaveUp>().is_some()
-}
-
 /// The scratch dir a stream's fill store lives in for the stream's lifetime:
 /// a streamed blob is not kept, so a temp dir (removed on drop) under the
 /// data dir is its natural home.
@@ -1766,30 +1722,6 @@ where
     streamer
 }
 
-/// Prove the size of `hash` under the first claim `total_bytes`
-/// ([`Streamer::prove_size`]) on at most `max_sources` lanes, as a stream
-/// of it would run: `None` when no leg proved it.
-#[allow(clippy::too_many_arguments)]
-async fn prove_size<P>(
-    deps: &LaneDeps<'_, P>,
-    sources: &LaneSources<'_, P>,
-    holders: Vec<Holder>,
-    health: Arc<PeerHealth>,
-    hash: [u8; 32],
-    total_bytes: u64,
-    stop: StopPolicy,
-    max_sources: usize,
-) -> anyhow::Result<Option<u64>>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    let config = PullConfig::new().with_streamer_lane_cap(max_sources.max(1));
-    let scratch = stream_scratch(deps)?;
-    streamer_over(deps, sources, holders, health, scratch.path())
-        .prove_size(hash, total_bytes, &config, stop)
-        .await
-}
-
 /// The read-ahead a streamed fetch runs under: the outstanding-spend bound
 /// for an abandoned pipe, the client's default or the caller's own.
 fn stream_read_ahead(read_ahead: Option<u64>) -> u64 {
@@ -1814,7 +1746,7 @@ async fn stream_out<P>(
     holders: Vec<Holder>,
     health: Arc<PeerHealth>,
     hash: [u8; 32],
-    total_bytes: u64,
+    total_bytes: ProvenSize,
     stop: StopPolicy,
     (max_sources, read_ahead, range, timings): (
         usize,
@@ -1854,7 +1786,7 @@ where
                 .await?
         }
     };
-    let expected = range.map_or(total_bytes, |(_, len)| len);
+    let expected = range.map_or(total_bytes.get(), |(_, len)| len);
 
     // The bar draws on stderr, so it shows only when stderr is a terminal and
     // the bytes go to stdout; stdout carries the verified bytes either way.
@@ -1958,10 +1890,10 @@ where
     bar.finish_and_clear();
     result?;
     // The finished file holds exactly the proven size, which can differ from
-    // the first claim the fetch started from.
+    // a declared size the fetch started from.
     let proven = tokio::fs::metadata(target.dest)
         .await
-        .map_or(target.total_bytes, |m| m.len());
+        .map_or(target.total_bytes.get(), |m| m.len());
     print_fetch_summary(proven, &meter, target.dest);
     Ok(proven)
 }

@@ -38,8 +38,8 @@ fn the_predicted_leg_cuts_the_request_like_the_first_drive_leg() {
         align_range(0, draw, total).ok()
     );
     // A nonzero offset paired with `len == u64::MAX` genuinely overflows
-    // `offset + len` (unlike offset 0, which does not). A grown size claim
-    // can widen `len` this far, and `saturating_add` plus the
+    // `offset + len` (unlike offset 0, which does not). A request can ask
+    // for a `len` this wide, and `saturating_add` plus the
     // `.min(total_bytes)` clamp right after it primes a leg (the same one a
     // `byte_len == 0` "to end" request from the same offset would) rather
     // than losing the first leg to `None`.

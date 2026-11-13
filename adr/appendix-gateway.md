@@ -60,7 +60,6 @@ write, so it spends the shared bucket. The gateway counts:
 - every byte a pull lands, a manifest that does not parse included;
 - an entry's declared size or a raw blob's verified size before its pull,
   and refuses one that does not fit;
-- one chunk group for each size proof;
 - the chunk-group-aligned span of a range, not the window alone;
 - a bound of what a pull may have paid past the frames it delivered, when a
   response does not end whole.
@@ -68,36 +67,25 @@ write, so it spends the shared bucket. The gateway counts:
 An entry's pull is capped at the size its manifest declares. A manifest
 cannot make the gateway pay for more than it says.
 
-A raw blob has no manifest. The gateway uses the size that a whole pull of
-the blob on this gateway verified. The gateway caps the pull of the blob at
-that size, as it caps the pull of an entry. The empty root has a size of
-zero and needs no pull.
+A raw blob has no manifest. The gateway uses the verified size of the blob.
+Every node that states a size sends its size proof, and the fetch verifies
+the proof against the hash before it uses the size
+([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)). So
+the server can stop reading a body at its `Content-Length`, and a short pull
+never ends as a whole response. The gateway caps the pull of the blob at that
+size, as it caps the pull of an entry. The empty root has a size of zero and
+needs no pull.
 
-The gateway does not use the size that a node reports. The server stops
-reading a body when the body reaches its `Content-Length`. If a node
-reported a size that is too small, a short pull would end as a whole
-response, and the client would keep a cut file.
-
-Thus, before it answers a raw blob that no pull verified, the gateway proves
-the size of the blob. The size proof pays for the last byte under the first
-size that a node reports: one chunk group and its bao proof
-([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)).
-Only the true size verifies a final chunk
-([ADR 039](039-multi-source-parallel-fetch.md#failure-handling-reassign-only-tail)).
-Thus a reported size that is wrong by less than one chunk group still proves
-the true size. The gateway keeps a proven size as a verified size. A reported
-size past `--max-blob-mb` gets no proof.
-
-A proof costs at least one chunk group for each blob of unknown size. A whole
-pull of the blob pays for that chunk group again. A proof that proves nothing
-keeps nothing, so the next request proves again. Two requests at the same time
-each prove.
-
-A proof can prove nothing. The last chunk group under the reported size can
-be a different group than the last group of the blob. Each holder can also
-fail the proof. A blob that the proof does not prove streams whole, with no
-length. A funding stop ends the request as it ends a pull. A fault before the
-proof, such as no holder, also ends the request as it ends a pull.
+Before it answers a raw blob of unknown size, the gateway learns its size. It
+resolves the holders of the blob and takes the first size that one of them
+proves: a probe answer, or the header of an open of the blob's first byte.
+That open pays for one chunk group at most, and the lookup charges the
+allowance nothing. The gateway keeps the size as a verified size. A
+response whose pull passes `--max-blob-mb` answers 413 before any pull. The
+pull is the whole blob, or the chunk-group span of the one `Range`, so a
+range of a large blob is served. A
+funding stop ends the request as it ends a pull. A fault before any holder
+proves a size, such as no holder, also ends the request as it ends a pull.
 
 A blob that is not a manifest does not become one. Its hash fixes its bytes.
 The manifest cap stops a pull only on verified bytes or a proven size. The
@@ -187,7 +175,7 @@ pointer.
 ## Ranges
 
 A sized answer takes one `Range`: an entry whose manifest declares its size,
-or a raw blob whose size a pull verified or a size proof proved. The forms
+or a raw blob whose size a holder proved. The forms
 are `bytes=a-b`, `bytes=a-` or `bytes=-n`. The answer is 206 over exactly that window, with
 `Content-Range`. The pull pays for the chunk-group-aligned span around the
 window ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)). A range past the end
@@ -199,10 +187,9 @@ BEP 19 webseed is a plain URL with ranges, so it needs nothing more.
 `HEAD` on an entry answers from the bundle manifest: the entry's length and
 hash, at no pull of the entry. `HEAD` on a raw blob, on the bare host or under
 a site's `/_decdn/`, answers from the verified size, at no pull. `HEAD` on a
-raw blob of unknown size pays for its size proof, as its `GET` does. The
-proof counts against the allowance. A spent allowance refuses the `HEAD` with
-402. A proof that proves nothing gives a `HEAD` with no length. A fault that
-ends the proof ends the `HEAD` with the status that it gives a `GET`. `HEAD`
+raw blob of unknown size learns its size first, as its `GET` does. A spent
+allowance refuses the `HEAD` with 402. A fault that ends the size lookup ends the
+`HEAD` with the status that it gives a `GET`. `HEAD`
 of a bundle or an entry under a site's `/_decdn/` redirects to the site of
 that bundle.
 

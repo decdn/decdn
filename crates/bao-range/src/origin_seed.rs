@@ -18,8 +18,10 @@ use std::io::Read;
 
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::sync::CreateOutboard;
+use bytes::Bytes;
 
 use crate::IROH_BLOCK_SIZE;
+use crate::size_proof::{encode_size_proof, size_proof_tail_start};
 
 /// Sibling-key suffix for the published pre-order bao outboard (`{H}.obao4`),
 /// per [ADR 037 §Origin-tier pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md).
@@ -27,6 +29,35 @@ use crate::IROH_BLOCK_SIZE;
 /// writer so an operator `aws s3 sync`-ing between backends keeps the same
 /// object names.
 pub const OBAO4_SUFFIX: &str = ".obao4";
+
+/// Sibling-key suffix for the published size proof (`{H}.sizeproof`): the
+/// blob's size and the bytes of [`crate::encode_size_proof`] for it
+/// ([`size_proof_object`]), which a node serves to prove the blob's size (ADR
+/// 005 § Bounded byte ranges). It is the origin's only statement of the
+/// size. It sits beside the `{H}.obao4` outboard under the same shard prefix.
+pub const SIZE_PROOF_SUFFIX: &str = ".sizeproof";
+
+/// The longest `{H}.sizeproof` object: the 8-byte size and the longest proof
+/// ([`crate::MAX_SIZE_PROOF_BYTES`]). A reader reads no more.
+pub const MAX_SIZE_PROOF_OBJECT_BYTES: usize = 8 + crate::MAX_SIZE_PROOF_BYTES;
+
+/// The bytes of a `{H}.sizeproof` object: `size` as 8 little-endian bytes,
+/// then the proof.
+#[must_use]
+pub fn size_proof_object(size: u64, proof: &[u8]) -> Vec<u8> {
+    let mut object = Vec::with_capacity(8 + proof.len());
+    object.extend_from_slice(&size.to_le_bytes());
+    object.extend_from_slice(proof);
+    object
+}
+
+/// The size and the proof a `{H}.sizeproof` object holds, or `None` for an
+/// object shorter than its size field. Nothing is verified here.
+#[must_use]
+pub fn parse_size_proof_object(object: &[u8]) -> Option<(u64, &[u8])> {
+    let (size, proof) = object.split_first_chunk::<8>()?;
+    Some((u64::from_le_bytes(*size), proof))
+}
 
 /// The two-character shard prefix for a blob's lowercase-hex address:
 /// `{base}/{hex[0..2]}/{hex}`. The first two hex chars shard the directory so a
@@ -50,6 +81,10 @@ pub struct EncodedOutboard {
     /// The pre-order bao outboard bytes, byte-identical to what the cache
     /// reader (`origin::fs::fetch_outboard`) expects at the `{hex}.obao4` key.
     pub outboard: Vec<u8>,
+    /// The blob's size in bytes.
+    pub size: u64,
+    /// The size proof of the blob ([`crate::encode_size_proof`]).
+    pub size_proof: Bytes,
 }
 
 impl EncodedOutboard {
@@ -64,21 +99,77 @@ impl EncodedOutboard {
     pub fn obao4_name(&self) -> String {
         format!("{}{OBAO4_SUFFIX}", self.hash_hex)
     }
+
+    /// The `{hex}.sizeproof` sibling file name for this blob.
+    #[must_use]
+    pub fn size_proof_name(&self) -> String {
+        format!("{}{SIZE_PROOF_SUFFIX}", self.hash_hex)
+    }
+
+    /// The bytes of this blob's `{hex}.sizeproof` sibling
+    /// ([`size_proof_object`]).
+    #[must_use]
+    pub fn size_proof_object(&self) -> Vec<u8> {
+        size_proof_object(self.size, &self.size_proof)
+    }
 }
 
-/// Stream `reader` (exactly `size` bytes) once, computing the BLAKE3 root hash
-/// and the pre-order bao outboard at [`crate::IROH_BLOCK_SIZE`] in a single
-/// pass. `size` must equal the number of bytes `reader` yields — it frames the
-/// bao tree, and a wrong value produces an outboard the reader rejects.
+/// A reader that passes bytes through and keeps the ones at or past `from`:
+/// the last chunk group, which the size proof encoder needs.
+struct TailCapture<R> {
+    inner: R,
+    pos: u64,
+    from: u64,
+    tail: Vec<u8>,
+}
+
+impl<R: Read> Read for TailCapture<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let read = buf.get(..n).unwrap_or_default();
+        let end = self.pos.saturating_add(read.len() as u64);
+        if end > self.from {
+            // `from - pos` is below `n` here, so it fits a `usize`.
+            let skip = usize::try_from(self.from.saturating_sub(self.pos)).unwrap_or(usize::MAX);
+            self.tail
+                .extend_from_slice(read.get(skip..).unwrap_or_default());
+        }
+        self.pos = end;
+        Ok(n)
+    }
+}
+
+/// Stream `reader` (exactly `size` bytes) once, computing the BLAKE3 root hash,
+/// the pre-order bao outboard at [`crate::IROH_BLOCK_SIZE`] and the size proof
+/// in a single pass. `size` must equal the number of bytes `reader` yields — it
+/// frames the bao tree, and a wrong value produces an outboard the reader
+/// rejects.
 ///
 /// The source bytes are **not** buffered in memory; only the outboard (roughly
-/// `1/256` of the blob at 16 KiB groups) is retained, so a multi-gigabyte blob
-/// costs a few megabytes of RAM here rather than its whole length.
+/// `1/256` of the blob at 16 KiB groups) and the last chunk group are retained,
+/// so a multi-gigabyte blob costs a few megabytes of RAM here rather than its
+/// whole length.
+///
+/// # Errors
+///
+/// An I/O error from `reader`, or [`std::io::ErrorKind::InvalidData`] when
+/// `reader` yields a number of bytes other than `size`.
 pub fn encode_outboard(reader: impl Read, size: u64) -> std::io::Result<EncodedOutboard> {
-    let ob = PreOrderOutboard::<Vec<u8>>::create_sized(reader, size, IROH_BLOCK_SIZE)?;
+    let mut capture = TailCapture {
+        inner: reader,
+        pos: 0,
+        from: size_proof_tail_start(size),
+        tail: Vec::new(),
+    };
+    let ob = PreOrderOutboard::<Vec<u8>>::create_sized(&mut capture, size, IROH_BLOCK_SIZE)?;
+    let root: [u8; 32] = ob.root.into();
+    let size_proof = encode_size_proof(root, size, &ob.data, &capture.tail)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(EncodedOutboard {
         hash_hex: ob.root.to_hex().to_string(),
         outboard: ob.data,
+        size,
+        size_proof,
     })
 }
 

@@ -605,6 +605,7 @@ fn cache_metrics_counters_start_at_zero() {
         "decdn_cache_evictions_starved_total",
         "decdn_cache_size_measure_failures_total",
         "decdn_cache_recency_seed_failures_total",
+        "decdn_cache_size_proof_origin_missing_total",
         "decdn_cache_evicted_operator_total",
         // Per-partial `observe()` failures inside the size walk. The struct
         // field is `partial_size_observe_failures`.

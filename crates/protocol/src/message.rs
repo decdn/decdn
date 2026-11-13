@@ -25,10 +25,10 @@
 //! ALPN bump. ADR 013 freezes a signed field set at the protocol version that
 //! introduces it; `cdn/probe/v1` had no prior signed `ProbeResponse`, so the
 //! set `{hash, has_blob, rate_per_mb, timestamp_us}` is the v1 baseline (ADR
-//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` rides in
-//! [`ProbeResponseExt`] as the ADR 013 Tier-1 unsigned-evolution exemplar (ADR
-//! 005 §`cdn/probe/v1`) and is deliberately NOT covered by `slash_sig`. The
-//! `ProbeMessage` variant order is unchanged.
+//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` and its `size_proof` ride
+//! in [`ProbeResponseExt`] as ADR 013 Tier-1 unsigned extension fields (ADR
+//! 005 §`cdn/probe/v1`) and are NOT covered by `slash_sig`: the proof, not a
+//! signature, makes the size a fact.
 //!
 //! This crate deliberately does not depend on any crypto library. The caller
 //! (`decdn_incentive::ProbeSlashData` and the probe handler/CLI) computes and
@@ -56,16 +56,27 @@ use serde::{Deserialize, Serialize};
 /// substitute for safe math.
 pub const MAX_RATE_PER_MB: u64 = 1000;
 
-/// Frame ceiling for `cdn/probe/v1`, in payload bytes (ADR 013 § Wire Framing).
+/// Frame ceiling for the [`ProbeResponse`] a requester reads on
+/// `cdn/probe/v1`, in payload bytes (ADR 013 § Wire Framing). A node reads
+/// requests against [`MAX_PROBE_REQUEST_FRAME`].
 ///
-/// Every probe read passes this to [`crate::read_frame`]. The largest legitimate
+/// The largest legitimate
 /// message is a [`ProbeResponse`] with its [`ProbeResponseExt`] at full width:
-/// 325 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap and
-/// its 2-byte length). A [`ProbeRequest`] is
-/// at most 43 bytes. The ceiling leaves headroom for Tier-1 extension fields
-/// and refuses a larger frame before the reader buffers it. The
-/// `probe_frame_ceiling_holds_the_largest_message` test pins the margin.
-pub const MAX_PROBE_FRAME: u32 = 1024;
+/// 4,807 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap
+/// and its 2-byte length) and the size proof up to 4,493 (its `Some` tag, a
+/// 10-byte varint size, and a [`crate::MAX_SIZE_PROOF_BYTES`] proof with its
+/// 2-byte length). A [`ProbeRequest`] is at most 43 bytes. The ceiling leaves headroom
+/// for Tier-1 extension fields and refuses a larger frame before the reader
+/// buffers it. The `probe_frame_ceiling_holds_the_largest_message` test pins
+/// the margin.
+pub const MAX_PROBE_FRAME: u32 = 8 * 1024;
+
+/// Frame ceiling for the [`ProbeRequest`] a node reads, in payload bytes (ADR
+/// 013 § Wire Framing). A request is at most 43 bytes; the ceiling leaves
+/// headroom for Tier-1 fields and keeps the node's per-probe read buffer
+/// small. The `probe_frame_ceiling_holds_the_largest_message` test pins the
+/// margin.
+pub const MAX_PROBE_REQUEST_FRAME: u32 = 1024;
 
 /// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
 ///
@@ -141,14 +152,14 @@ pub enum MessageValidationError {
         /// The signature length that was offered.
         len: usize,
     },
-    /// A [`crate::client::StreamResponse`] carries `body.ok == true` yet also an
-    /// `error`. A node MUST NOT both promise to serve and report a failure
-    /// (ADR 005 §`cdn/client/v1`). Enforced via
-    /// [`crate::client::StreamResponseExt::validate`].
-    #[error("StreamResponse has ok=true but also carries an error")]
+    /// A [`crate::client::StreamResponse`] carries `body.ok == true` but a
+    /// refused outcome, so it states no size proof. A node MUST NOT promise to
+    /// serve without the size it serves under (ADR 005 §`cdn/client/v1`).
+    /// Enforced via [`crate::client::StreamResponseExt::validate`].
+    #[error("StreamResponse has ok=true but a refused outcome with no size proof")]
     StreamErrorWithOk,
-    /// A [`crate::client::StreamResponse`] carries `body.ok == false` but no
-    /// `error` code. A refusal MUST name its reason (ADR 005
+    /// A [`crate::client::StreamResponse`] carries `body.ok == false` but a
+    /// served outcome. A refusal MUST name its reason (ADR 005
     /// §`cdn/client/v1`). Enforced via [`crate::client::StreamResponseExt::validate`].
     #[error("StreamResponse has ok=false but no error code")]
     MissingStreamError,
@@ -272,25 +283,27 @@ pub struct ProbeResponse {
 /// the `ProbeResponse` message via the two-phase pattern (ADR 013 §Tier 1; see
 /// [`encode_probe_response`] / [`parse_probe_response_ext`]).
 ///
-/// Nothing here is covered by `slash_sig`, and nothing here may become
-/// load-bearing for payment, slashing, or any decision a lying node profits
-/// from: an unsigned field is a hint, and the sender is the party with the
-/// motive to shade it.
+/// Nothing here is covered by `slash_sig`. `coverage` is a hint: nothing may
+/// let it decide a payment, a slash, or anything a lying node profits from.
+/// `total_bytes` is a fact once its `size_proof` verifies against the hash,
+/// and nothing before that.
 ///
 /// New fields are appended to the END of this struct and MUST be `Option<T>` or
 /// have a meaningful `Default`. Insertions and reordering are Tier-3.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProbeResponseExt {
-    /// Blob size in bytes when known. Nodes SHOULD include it when the size is
-    /// known so requesters can estimate cost before opening a payment pool.
-    /// Unsigned: treat it as a sizing hint, never as a commitment.
-    pub total_bytes: Option<u64>,
     /// Which discovery blocks (`decdn_protocol::coverage`) this node will
     /// serve. Unsigned: treat it as a hint, never as a commitment. A
     /// requester MUST check it against the signed body (`hash` and
     /// `has_blob`) with [`ProbeResponseExt::consistent_with`] and drop a
     /// response where they disagree rather than trust either field alone.
     pub coverage: crate::Coverage,
+    /// The blob's size and its proof under the signed `hash` (ADR 005 §
+    /// Bounded byte ranges): the only way a probe answer states a size, so a
+    /// requester can price the blob before it opens a payment pool. A
+    /// requester verifies the proof before it uses the size, and drops a
+    /// response whose proof does not verify.
+    pub size_proof: Option<crate::SizeProof>,
 }
 
 /// The BLAKE3 hash of zero bytes: the root of the empty blob.
@@ -317,7 +330,7 @@ impl ProbeResponseExt {
     /// empty on a holder and a non-holder alike. For that hash the coverage
     /// must be empty and `has_blob` alone says whether the node serves it
     /// (#2471). The rule keys on `body.hash`, which the signature covers,
-    /// never on the unsigned `total_bytes` hint.
+    /// never on `total_bytes`.
     ///
     /// Neither `coverage` nor `total_bytes` is in the signed set, so a mismatch
     /// has no attributable author to slash: a requester finding `false` here
@@ -387,7 +400,7 @@ pub fn encode_probe_response(
 /// Parse the trailing [`ProbeResponseExt`] bytes returned as the remainder by
 /// [`crate::decode_message`] after a `ProbeMessage::Response`.
 ///
-/// An empty remainder ⇒ [`ProbeResponseExt::default`] (no size hint). Trailing
+/// An empty remainder ⇒ [`ProbeResponseExt::default`] (no size). Trailing
 /// bytes beyond the known fields are tolerated for forward compatibility (ADR
 /// 013 §Tier 1): a future optional field appended to [`ProbeResponseExt`] is
 /// read by new receivers and skipped by old ones.

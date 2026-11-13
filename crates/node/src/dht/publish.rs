@@ -1210,11 +1210,11 @@ async fn publish_hash(
     attestations: &Attestations,
     hash: ContentHash,
 ) -> u64 {
-    let (coverage, size) = fetch_coverage(cache, hash).await;
+    let coverage = fetch_coverage(cache, hash).await;
     if coverage.is_empty() {
         return 0;
     }
-    let Some(attestation) = attestation_for(cache, attestations, hash, size) else {
+    let Some(attestation) = attestation_for(attestations, hash) else {
         return 0;
     };
     let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
@@ -1288,41 +1288,34 @@ async fn publish_hash(
     accepted
 }
 
-/// Derive `hash`'s current [`Coverage`] and blob size from the cache, folding
-/// any store fault into [`Coverage::empty`] — a republish that can't answer the
+/// Derive `hash`'s current [`Coverage`] from the cache, folding any store
+/// fault into [`Coverage::empty`] — a republish that can't answer the
 /// coverage question advertises nothing for this cycle rather than
 /// blocking on it; the hash stays scheduled and retries next cycle via the
-/// `cache_still_holds` due-time gate.
-async fn fetch_coverage(
-    cache: &decdn_cache::CacheEngine,
-    hash: ContentHash,
-) -> (Coverage, Option<u64>) {
+/// `cache_still_holds` due-time gate. Coverage the node cannot size under a
+/// size proof is no coverage: the node serves no blob it cannot prove the
+/// size of (ADR 005 § Bounded byte ranges), so it advertises none.
+async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> Coverage {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
     match cache.coverage_sized(h).await {
-        Ok((coverage, size)) => (coverage, size.or_else(|| cache.origin_held_size(h))),
+        Ok((coverage, Some(size))) if cache.size_proof(h, size).await.is_some() => coverage,
+        Ok(_) => Coverage::empty(),
         Err(err) => {
             tracing::debug!(
                 hash = ?hash,
                 error = %err.display_chain(),
                 "dht republish: coverage query faulted; publishing empty coverage this cycle"
             );
-            (Coverage::empty(), None)
+            Coverage::empty()
         }
     }
 }
 
 /// The origin attestation to publish `hash` with (ADR 022 § Origin
 /// Attestation), or `None` when the node holds no valid one and cannot sign
-/// its own. `size` is the blob size a self-signed attestation commits to.
-fn attestation_for(
-    cache: &decdn_cache::CacheEngine,
-    attestations: &Attestations,
-    hash: ContentHash,
-    size: Option<u64>,
-) -> Option<OriginAttestation> {
-    let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
-    let size = size.or_else(|| cache.origin_held_size(h)).unwrap_or(0);
-    let attestation = attestations.for_publish(*hash.as_bytes(), size);
+/// its own.
+fn attestation_for(attestations: &Attestations, hash: ContentHash) -> Option<OriginAttestation> {
+    let attestation = attestations.for_publish(*hash.as_bytes());
     if attestation.is_none() {
         tracing::debug!(
             hash = ?hash,
@@ -1414,8 +1407,8 @@ async fn publish_batch(
     let hashes: HashSet<ContentHash> = groups.values().flatten().copied().collect();
     let mut record_by_hash = HashMap::with_capacity(hashes.len());
     for hash in hashes {
-        let (coverage, size) = fetch_coverage(cache, hash).await;
-        if let Some(attestation) = attestation_for(cache, attestations, hash, size) {
+        let coverage = fetch_coverage(cache, hash).await;
+        if let Some(attestation) = attestation_for(attestations, hash) {
             record_by_hash.insert(hash, (coverage, attestation));
         }
     }

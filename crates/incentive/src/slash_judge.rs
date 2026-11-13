@@ -55,7 +55,6 @@ mod sol_types {
                 bytes32 hash;
                 bool ok;
                 uint64 ratePerMb;
-                uint64 totalBytes;
                 uint64 timestampUs;
             }
 

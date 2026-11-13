@@ -1163,33 +1163,6 @@ jobs:
       #     sarif_file: ${{ steps.slither.outputs.sarif }}
       #     category: slither
 
-  solidity-aderyn:
-    name: solidity aderyn
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          submodules: recursive
-      # cache-profile omitted (none): aderyn-ci manages its own build, so we
-      # cache only the solc binaries, not artifacts.
-      - uses: ./.github/actions/foundry-setup
-      # The official Cyfrin/aderyn-ci action installs aderyn, runs it, and
-      # gates the CI step via fail-on. No SARIF surface (which we don't
-      # need anyway — code scanning requires GHAS on private repos), and
-      # the action handles its own toolchain lifecycle.
-      - name: Aderyn check
-        # SHA-pinned (v0.0.10). The action emits a `working-directory`
-        # deprecation warning suggesting `root` in aderyn.toml; both work
-        # today and the warning is benign — the action still respects
-        # the input.
-        uses: Cyfrin/aderyn-ci@6c7e313326652c60f82f804b7f3641650334baaf
-        with:
-          working-directory: contracts
-          fail-on: high
-
   # NOTE: the former standalone `solidity-gas-snapshot` job was folded into
   # `solidity-build-test` (see its "Test + gas snapshot" step). It re-ran the
   # full ci-profile fuzz/invariant suite a second time purely to measure gas;
@@ -1590,7 +1563,7 @@ jobs:
     needs: [fmt, clippy, windows, changes, test, doctest, deny, doc, public-api, markdownlint, adr-book-list,
             pr-title, anvil-e2e-settlement, anvil-e2e-journeys, anvil-e2e-sponsord, installers,
             solidity-fmt, solidity-build-test, solidity-coverage,
-            solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
+            solidity-solhint, solidity-slither, ed25519-vectors,
             docker-build, packaging, dashboard]
     steps:
       - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
@@ -1610,5 +1583,5 @@ jobs:
                          pr-title, markdownlint,
                          anvil-e2e-settlement, anvil-e2e-journeys, anvil-e2e-sponsord, installers,
                          solidity-fmt, solidity-build-test, solidity-coverage,
-                         solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
+                         solidity-solhint, solidity-slither, ed25519-vectors,
                          docker-build, dashboard

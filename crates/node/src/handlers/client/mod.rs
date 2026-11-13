@@ -422,16 +422,14 @@ enum ServeRejectReason {
     /// A cache-MISS serve shed under node overload — concurrency pressure,
     /// per-client fairness, or egress saturation. See [`Self::LoadShedHit`].
     LoadShedMiss,
-    /// The requested range starts at or past this node's size claim for the
-    /// blob. Ships [`StreamError::Declined`]: the size is this node's claim,
-    /// and another node can disagree (ADR 005 §Open-time refusal classes).
+    /// The requested range starts at or past the blob's proven size. Ships
+    /// [`StreamError::Declined`] (ADR 005 §Open-time refusal classes).
     RangeNotSatisfiable,
     /// A pull-through request this node cannot land under its `max_blob_size`
     /// cap on bytes held for one blob (ADR 005 §`max_blob_size` enforcement):
     /// the node already holds the cap's worth before it commits, or its fill
-    /// ends at the cap mid-stream. The node reads only its own store, never the
-    /// upstream's unverified `total_bytes` claim (#1895), and never the
-    /// request's offset. Ships the wire [`StreamError::Declined`] (see
+    /// ends at the cap mid-stream. The node reads only its own store, never
+    /// the upstream's `total_bytes` (#1895), and never the request's offset. Ships the wire [`StreamError::Declined`] (see
     /// [`Self::wire_error`]), so the requester drops this node for the blob.
     BlobTooLarge,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
@@ -649,12 +647,18 @@ enum MissPath {
     /// binding, or this node holds no lane for its signer. No fill tier ran.
     /// A remote peer reaches this path at will, so its line is throttled.
     NoLane,
+    /// The pull leg opened, but no proof of the blob size is at hand: the
+    /// upstream's proof could not be kept, or the live fill this request
+    /// coalesces onto kept none. The response would state a size it cannot
+    /// prove (ADR 005 § Bounded byte ranges).
+    UnprovenSize,
 }
 
 impl MissPath {
     /// The `path` value the refusal's log line records.
     const fn as_str(self) -> &'static str {
         match self {
+            Self::UnprovenSize => "unproven_size",
             Self::CoverageGate(_) => "coverage_gate",
             Self::PullLegMiss(_) => "pull_leg_miss",
             Self::PullLegTimeout => "pull_leg_timeout",
