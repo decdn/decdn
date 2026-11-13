@@ -16,7 +16,7 @@ deCDN builds with a native toolchain and works with any editor. Install the prer
 | A C compiler (`cc`) + `make` | `ring` and `aws-lc-sys` compile C sources during `cargo build`, and rustc needs `cc` to link; `make` also drives the `adr-book-list` and `adr-ref-hygiene` hooks via `make -C adr` | system package manager (`build-essential` on Debian/Ubuntu); `cmake` is optional but lets `aws-lc-sys` skip its slower cc-only fallback |
 | [`gh`](https://cli.github.com/) | issue and PR workflow | system package manager |
 
-Pre-commit covers Solidity too: `forge fmt` and `solhint` run on every commit that touches `contracts/` (solhint needs no local install — pre-commit builds its own node sandbox), `forge build` and `forge test` run on push. The `slither` and `aderyn` static-analysis hooks are manual-stage and need their own installs — see [Solidity development](#solidity-development).
+Pre-commit covers Solidity too: `forge fmt` and `solhint` run on every commit that touches `contracts/` (solhint needs no local install — pre-commit builds its own node sandbox), `forge build` and `forge test` run on push. The `slither` static-analysis hook is manual-stage and needs its own install — see [Solidity development](#solidity-development).
 
 Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [SDK contract runs](#sdk-contract-runs) need Node.js 20.19+ and pnpm for the TypeScript SDK, and `uv` for the Python SDK. The `decdn dashboard` page (`crates/cli/dashboard/`) needs Node.js 24 and pnpm 10 (`corepack enable` provides it). Without them `cargo build` still succeeds and the `decdn` binary embeds a page that says how to build the dashboard:
 
@@ -60,7 +60,7 @@ pre-commit install --hook-type pre-commit --hook-type pre-push   # one-time setu
 pre-commit run --all-files        # run all hooks manually
 ```
 
-Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`, adr-book-list, adr-ref-hygiene, package-embeds, dashboard-lint, deployment-manifest-mirror, toolchain-pin, workspace-manifests, crate-edges, forge-fmt, solhint, forge-build, forge-test, slither, aderyn.
+Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`, adr-book-list, adr-ref-hygiene, package-embeds, dashboard-lint, deployment-manifest-mirror, toolchain-pin, workspace-manifests, crate-edges, forge-fmt, solhint, forge-build, forge-test, slither.
 
 dashboard-lint runs the dashboard's `eslint` and `prettier` when a file under `crates/cli/dashboard/` changes, with pnpm from `PATH`, else through `corepack`. Without the app's `node_modules` it skips and says so, so `pre-commit run --all-files` needs no Node; CI's `dashboard` job lints every change to the app.
 
@@ -319,17 +319,9 @@ cd contracts && npm ci && npm run lint
 
 # Slither (SAST) — requires `pip install slither-analyzer`
 cd contracts && slither . --config-file slither.config.json
-
-# Aderyn (SAST) — install pinned to the version CI uses (aderyn-v0.6.8).
-# Inspect the installer before piping to bash if you don't trust the
-# Cyfrin signing chain; the install URL is reproducible across runs.
-#   curl --proto '=https' --tlsv1.2 -LsSf \
-#     https://github.com/Cyfrin/aderyn/releases/download/aderyn-v0.6.8/aderyn-installer.sh \
-#     | bash
-cd contracts && aderyn .
 ```
 
-The pre-commit hooks run `forge-fmt` and `solhint` on every commit; `forge-build` and `forge-test` on `git push`; `slither` and `aderyn` are manual-stage (`pre-commit run --hook-stage manual <id>`).
+The pre-commit hooks run `forge-fmt` and `solhint` on every commit; `forge-build` and `forge-test` on `git push`; `slither` is manual-stage (`pre-commit run --hook-stage manual slither`).
 
 **Updating the gas snapshot baseline:**
 
@@ -353,7 +345,6 @@ pass (empty) and fail (the drifted entries).
 **Interpreting CI findings:**
 
 - **Slither** fails CI on medium-and-above findings (`fail_on: medium` in `slither.config.json`, also passed as `fail-on: medium` to `crytic/slither-action`); detailed output lives in the job log. SARIF upload to code-scanning is **commented out** in `ci.yml` because the repo does not have GitHub Advanced Security enabled; re-enable the step (and the matching `security-events: write` + `actions: read` permissions) when GHAS is turned on or the repo flips public. For true positives, fix the contract. For confirmed false positives, suppress *inline* (`// slither-disable-next-line <detector>` with a comment justifying the suppression) — never expand `detectors_to_exclude` in `slither.config.json`. Detectors currently excluded globally: `naming-convention` (overlaps with solhint's name-mixedcase rules), `solc-version` and `pragma` (satisfied by the explicit `solc_version` pin in `foundry.toml`).
-- **Aderyn** runs via `Cyfrin/aderyn-ci@v0.0.10` with `fail-on: high`; output lives in the job log under the action's summary.
 - **Solhint** failures point at code; fix the code rather than disabling the rule. Rule changes require a separate PR with rationale. Solhint lints `contracts/src/`, `contracts/testnet/`, and `contracts/script/` (per the `lint` script in `contracts/package.json`); test files (Foundry's `test_xxx_yyy` convention) are out of scope by design.
 - **Coverage** goes to GitHub Code Quality, which posts the PR coverage comment and per-file deltas against `main`. The `solidity-coverage` job converts forge's LCOV with `.github/scripts/lcov_to_cobertura.py`, because Code Quality reads Cobertura XML only; the `test` job uploads the Rust report that `cargo llvm-cov --cobertura` writes. Both uploads are best-effort and need Code Quality enabled in the repository settings.
 
@@ -364,7 +355,6 @@ CI (`.github/workflows/ci.yml`) runs Solidity jobs that fail on warnings local `
 - **`--deny warnings` is fatal under `FOUNDRY_PROFILE=ci`.** It covers both solc warnings AND forge-lint warnings. The most common solc trap is **W5740 (unreachable code) in OZ `ReentrancyGuard._nonReentrantAfter`** when a `nonReentrant` function body always reverts. Either drop `nonReentrant` on always-reverting stubs, or route the call through a TRULY-abstract function (no body) so solc can't propagate the revert. Virtual hooks with concrete bodies are NOT enough — solc inlines them at compile time.
 - **Forge-lint warnings** (`unsafe-typecast`, `erc20-unchecked-transfer`) are suppressed globally in `contracts/foundry.toml` `[lint] exclude_lints = [...]` because per-line waivers would be ~60 sites. The `bytes32("literal")` event-key casts and test-only ERC20 transfers are safe by construction.
 - **Slither directive placement matters.** `// slither-disable-next-line <detector>` must be the **immediate predecessor** of the target line — comments in between break the targeting. For `unused-return` on tuple destructuring, slither attributes the finding to the **enclosing function**, so the directive goes above the `function` declaration, not the call site.
-- **Aderyn directives** (`// aderyn-ignore-next-line(<detector>)`) likewise need to be the immediate predecessor. Detector names live in `aderyn registry`.
 - **`forge fmt` vs `solhint` 120-char rule** can disagree by ±1 char on named-args revert calls. Positional args (`revert ParamOutOfBounds(value, floor, ceiling)`) are the safe tie-breaker.
 - **`emit` before `revert`** in always-reverting functions lets solc classify them as state-mutating (avoids the "function state mutability can be restricted to view" warning, which is also fatal under `--deny warnings`).
 - **Pre-commit hooks** re-run forge-fmt and solhint. If a hook auto-fixes, the commit aborts and you re-stage; CI's `forge fmt --check` then passes.
