@@ -220,9 +220,7 @@ pub struct Candidate {
     /// The blob size the candidate reported on that probe
     /// (`ProbeResponseExt.total_bytes`), when it knows it, proven against the
     /// hash by the probe's size proof. The pull leg cuts its first upstream open
-    /// from it. When that open runs past the blob's end, the pull leg opens the
-    /// whole blob instead; when the signed size differs from this one, it drops
-    /// the pull.
+    /// from it.
     pub total_bytes_hint: Option<u64>,
 }
 

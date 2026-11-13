@@ -115,8 +115,7 @@ pub(crate) struct PullLegTarget {
     candidates: Vec<Candidate>,
     /// The handshake's pull, opened at the first leg the pull leg is expected to
     /// open, for that leg to adopt (#2063). `None` when the handshake kept no
-    /// first-leg pull: no prime or probed size, no predictable leg, a bounded
-    /// open past the blob's end, or a signed size that differs from the probed one.
+    /// first-leg pull: no prime or probed size, or no predictable leg.
     primed: Option<PrimedHandshake>,
 }
 
@@ -986,10 +985,9 @@ impl NodeOrigin {
         // from. It opens a stream on the node's shared connection to the
         // upstream, whose driver runs on the main runtime and outlives the pull
         // thread that adopts the pull.
+        // The probe's size passed its proof, so it is the size the header
+        // proves too.
         let hint = candidate.total_bytes_hint;
-        // Set when the primed open runs past the blob's end: the probed size is
-        // wrong, so no range cut from it can be trusted.
-        let mut hint_wrong = false;
         let predicted = prime.zip(hint).and_then(|(prime, total)| {
             prime
                 .predicted_leg(total, &candidate.coverage, deps.config.max_blob_size_bytes)
@@ -1022,17 +1020,6 @@ impl NodeOrigin {
                         .keep_offered(hash_bytes, header.origin_attestation.as_ref());
                     let total_bytes = header.total_bytes;
                     let size_proof = header.size_proof.clone();
-                    if hint != Some(total_bytes) {
-                        warn!(
-                            peer = %pk,
-                            hash = %Hash::from(hash_bytes),
-                            signed = total_bytes,
-                            ?hint,
-                            "node-origin: the provider signs another size than it probed; \
-                             closing the first-leg handshake pull"
-                        );
-                        return Ok((total_bytes, size_proof, None));
-                    }
                     let primed = PrimedHandshake {
                         key: PrimeKey {
                             candidate_ix,
@@ -1047,18 +1034,7 @@ impl NodeOrigin {
                     };
                     return Ok((total_bytes, size_proof, Some(primed)));
                 }
-                // A range past the blob's end means the probed size was wrong, not
-                // the provider: ask it for the whole blob instead.
-                Err(err) if decdn_client::is_range_past_end(&err) => {
-                    hint_wrong = true;
-                    debug!(
-                        peer = %pk,
-                        hash = %Hash::from(hash_bytes),
-                        "node-origin: the first-leg handshake runs past the blob's end ({err:#}); \
-                         opening the whole blob, as the probed size is wrong"
-                    );
-                }
-                // Any other failure is the handshake's own outcome, classified as the
+                // A failure is the handshake's own outcome, classified as the
                 // whole-blob open's would be.
                 Err(err) => {
                     drop(stream_guard);
@@ -1079,7 +1055,6 @@ impl NodeOrigin {
         // other form a loop. Only without a size to cut that range from is the
         // whole blob (`byte_offset == 0`, `byte_len == 0`) the range asked for.
         let (byte_offset, byte_len) = hint
-            .filter(|_| !hint_wrong)
             .and_then(|total| covered_handshake_range(&candidate.coverage, total))
             .unwrap_or((0, 0));
         let header_source = PeerSource::new(
