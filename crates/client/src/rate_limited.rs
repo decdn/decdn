@@ -36,7 +36,7 @@ use iroh::endpoint::{ApplicationClose, ConnectionError, ReadError, VarInt, Write
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamRateLimited {
     /// The layer label the node put in its `CONNECTION_CLOSE` reason bytes
-    /// (`global-full`, `per-source`, `per_peer`, …), lossily decoded. `None`
+    /// (`global-full`, `per_peer`, …), lossily decoded. `None`
     /// when the shed was a `RESET_STREAM`, which carries no reason bytes.
     pub label: Option<String>,
 }

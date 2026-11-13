@@ -66,14 +66,9 @@ use decdn_incentive::eth_identity;
 /// safety net.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
-/// Period between dispatch per-source rate-limiter GC sweeps (#440).
-/// The acquire path already prunes opportunistically when the keyspace
-/// exceeds `cap + cap/10`, but a node whose connection rate falls below
-/// the over-cap threshold can carry millions of stale buckets
-/// indefinitely. 60s is comfortably larger than the longest realistic
-/// bucket refill window, so the sweep is essentially free when the
-/// keyspace is empty.
-const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
+/// Period between DHT record-store GC sweeps. 60s is well below the 1-hour
+/// record TTL, so an expired record frees its publisher's quota promptly.
+const RECORD_STORE_GC_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Sampling period for the load-shed controller's egress-bytes EWMA. One
 /// second keeps the `ResourcePressure` policy's egress-budget check
@@ -81,16 +76,14 @@ const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
 /// mostly reflects request-arrival jitter.
 const EGRESS_EWMA_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Interval between periodic GC sweeps of the DHT rate-limiter's per-IP
-/// and per-peer keyed maps (#645). 60s matches `DISPATCH_GC_INTERVAL` —
-/// the two limiters share the same operator mental model for keyspace
-/// cleanup cadence. Separate constant (rather than reusing
-/// `DISPATCH_GC_INTERVAL`) so a future tune to one limiter doesn't drag
-/// the other along.
+/// Interval between periodic GC sweeps of the DHT rate-limiter's per-peer
+/// keyed map (#645). 60s is comfortably larger than the longest realistic
+/// bucket refill window, so the sweep is essentially free when the keyspace
+/// is empty.
 const DHT_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Interval between periodic GC sweeps of the probe and serve rate-limiters'
-/// per-IP and per-peer keyed maps (#645, #982). Matches
+/// per-peer keyed maps (#645, #982). Matches
 /// `DHT_RATE_LIMIT_GC_INTERVAL` — the keyed limiters share the same
 /// keyspace-cleanup mental model.
 /// Separate constant so a future tune to one limiter doesn't drag the other.
@@ -389,13 +382,12 @@ fn warn_if_pins_exceed_cache(cache: &decdn_cache::CacheEngine, cache_size_mb: u6
     }
 }
 
-/// Emit one `debug` line for a keyed rate-limiter GC sweep that pruned buckets.
-/// Shared by the DHT, probe and serve rate-limiter GC ticks, whose per-layer
-/// (`per_ip` / `per_peer`) log arms are otherwise byte-identical.
-fn log_keyspace_gc(kind: &'static str, layer: &'static str, sweep: Option<(usize, usize)>) {
+/// Emit one `debug` line for a per-peer rate-limiter GC sweep that pruned
+/// buckets. Shared by the DHT, probe and serve rate-limiter GC ticks.
+fn log_keyspace_gc(kind: &'static str, sweep: Option<(usize, usize)>) {
     if let Some((before, after)) = sweep {
         tracing::debug!(
-            layer,
+            layer = "per_peer",
             before,
             after,
             dropped = before.saturating_sub(after),
@@ -1135,7 +1127,7 @@ async fn build_chain_and_handlers(
             }
         });
 
-    // ADR 005 §Probe rate limiting three-layer token-bucket limiter for
+    // ADR 005 §Probe rate limiting two-layer token-bucket limiter for
     // `cdn/probe/v1`. Built from `[probe.rate_limit]` and run *in addition* to
     // the shared `ConnectionLimiter` (see `probe_rate_limit` module docs); the
     // per-peer (NodeId) layer it adds is the gap #982 closed.
@@ -1183,8 +1175,8 @@ async fn build_chain_and_handlers(
 
     // `cdn/dht/v1` handler (ADR 022 / #320): serves FindNode, FindValue, and
     // Store. Bootstrap, bucket refresh, and the republish scheduler run as
-    // background tasks below. Three-layer rate limiter operates at the full
-    // ADR 022 spec.
+    // background tasks below. The rate limiter operates at the full ADR 022
+    // spec.
     let dht_rate_limiter = Arc::new(DhtRateLimiter::from_resolved(
         &cfg.dht,
         Arc::clone(&infra.node_metrics),
@@ -1520,9 +1512,9 @@ async fn build_chain_and_handlers(
         frame_target_bytes: cfg.payment.frame_target_bytes,
         idle_timeout: None,
         pool_recheck_interval: None,
-        // Per-signer floor gate (ADR 003 §Pool solvency): the cap `k` underneath the
-        // per-pool `remaining − M` ceiling, which bounds how much un-vouchered floor,
-        // live or owed, one capability signer may hold.
+        // Per-signer floor gate (ADR 003 §Pool solvency): the live concurrency cap
+        // `k` underneath the per-pool `remaining − M` ceiling, which bounds how much
+        // live un-vouchered floor one capability signer may hold at once.
         pool_floor_signer_live_windows: cfg.blockchain.pool_floor_signer_live_windows,
         warming_credit,
         operator_shares: operator_shares.clone(),
@@ -1715,7 +1707,6 @@ async fn build_chain_and_handlers(
 /// and keeps that signal. The server's task is in `tasks`, which [`run`]
 /// creates and this region extends.
 struct Background {
-    dispatch_gc_stop_tx: oneshot::Sender<()>,
     egress_ewma_stop_tx: oneshot::Sender<()>,
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
@@ -1804,28 +1795,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // round-trip. The provider/store/pending handles built just above are moved
     // into that task.
 
-    // Periodic dispatch-limiter GC (#440). The acquire path only prunes
-    // under flood (when the keyspace exceeds `cap + cap/10`); a node
-    // with bursty short-lived clients can otherwise accumulate stale
-    // per-source buckets between bursts and never reclaim them until
-    // restart. The sweep is `O(n)` over the live keyspace; on an idle
-    // limiter `n = 0` so the steady-state cost is one mutex acquire
-    // per minute. Stops on its own oneshot — same pattern as the
-    // metrics and admin servers.
-    let dispatch_gc_stop_tx = {
-        let limiter = Arc::clone(&infra.limiter);
-        spawn_periodic(&mut tasks, "dispatch_gc", DISPATCH_GC_INTERVAL, move || {
-            if let Some((before, after)) = limiter.gc_per_source() {
-                tracing::debug!(
-                    before,
-                    after,
-                    dropped = before.saturating_sub(after),
-                    "dispatch GC sweep complete"
-                );
-            }
-        })
-    };
-
     // Periodic load-shed egress-EWMA sample: folds the last interval's served
     // bytes into the controller's smoothed rate and republishes it as the
     // gauges the `ResourcePressure` policy's egress-budget check reads live
@@ -1860,7 +1829,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         spawn_periodic(
             &mut tasks,
             "record_store_gc",
-            DISPATCH_GC_INTERVAL,
+            RECORD_STORE_GC_INTERVAL,
             move || {
                 let now_us = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1924,12 +1893,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     };
 
     // Periodic DHT rate-limiter GC (#645). The acquire path opportunistically
-    // prunes when the per-IP / per-peer keyed maps exceed `cap + cap/10`, but a
-    // node whose DHT traffic falls below that threshold can carry millions of
-    // stale buckets indefinitely — the same DoS shape the dispatch-limiter GC
-    // prevents at the connection layer. `gc_per_ip` / `gc_per_peer` use
-    // independent single-flight flags, so the two sequential sweeps here never
-    // block a concurrent lazy prune from `check`.
+    // prunes when the per-peer keyed map exceeds `cap + cap/10`, but a node
+    // whose DHT traffic falls below that threshold can carry millions of stale
+    // buckets indefinitely. `gc_per_peer` shares the lazy prune's single-flight
+    // flag, so a sweep here never runs beside a lazy prune from `check`.
     //
     // Panic contract: a panic inside `retain_recent` (governor arithmetic bug,
     // allocator OOM during the walk) unwinds out of the sweep and kills this
@@ -1937,7 +1904,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // lazy-prune path in `check` keeps working — but the periodic sweep is dead
     // until restart, surfacing only via `JoinSet::join_next` at shutdown.
     // Operators wanting earlier notice should alert on the
-    // `decdn_dht_rate_limit_tracked_{per_ip,per_peer}` gauges failing to drop on
+    // `decdn_dht_rate_limit_tracked_per_peer` gauge failing to drop on
     // a quiet node (there the periodic sweep is their only writer). A map already
     // empty when the sweep died sits at `0` legitimately — indistinguishable
     // from a healthy sweep over an empty map.
@@ -1948,15 +1915,13 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             "dht_rate_limit_gc",
             DHT_RATE_LIMIT_GC_INTERVAL,
             move || {
-                log_keyspace_gc("dht", "per_ip", limiter.gc_per_ip());
-                log_keyspace_gc("dht", "per_peer", limiter.gc_per_peer());
+                log_keyspace_gc("dht", limiter.gc_per_peer());
             },
         )
     };
 
     // Probe rate-limiter keyspace GC (#982) — same DoS-shape rationale and panic
-    // contract as the DHT GC above, for the `cdn/probe/v1` per-IP / per-peer
-    // keyed maps.
+    // contract as the DHT GC above, for the `cdn/probe/v1` per-peer keyed map.
     let probe_rate_limit_gc_stop_tx = {
         let limiter = Arc::clone(&ch.probe_rate_limiter);
         spawn_periodic(
@@ -1964,14 +1929,13 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             "probe_rate_limit_gc",
             PROBE_RATE_LIMIT_GC_INTERVAL,
             move || {
-                log_keyspace_gc("probe", "per_ip", limiter.gc_per_ip());
-                log_keyspace_gc("probe", "per_peer", limiter.gc_per_peer());
+                log_keyspace_gc("probe", limiter.gc_per_peer());
             },
         )
     };
 
     // `cdn/client/v1` request-limiter keyspace GC, same shape as the probe GC
-    // above, for the serve per-IP / per-peer keyed maps.
+    // above, for the serve per-peer keyed map.
     let serve_rate_limit_gc_stop_tx = {
         let limiter = Arc::clone(&ch.serve_rate_limiter);
         spawn_periodic(
@@ -1979,8 +1943,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             "serve_rate_limit_gc",
             PROBE_RATE_LIMIT_GC_INTERVAL,
             move || {
-                log_keyspace_gc("serve", "per_ip", limiter.gc_per_ip());
-                log_keyspace_gc("serve", "per_peer", limiter.gc_per_peer());
+                log_keyspace_gc("serve", limiter.gc_per_peer());
             },
         )
     };
@@ -2513,7 +2476,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     );
 
     Ok(Background {
-        dispatch_gc_stop_tx,
         egress_ewma_stop_tx,
         origin_rescan_stop_tx,
         record_store_gc_stop_tx,
@@ -2633,7 +2595,6 @@ pub async fn run(
 
     let handles = ShutdownHandles {
         metrics_stop_tx,
-        dispatch_gc_stop_tx: bg.dispatch_gc_stop_tx,
         egress_ewma_stop_tx: bg.egress_ewma_stop_tx,
         buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,
         origin_rescan_stop_tx: bg.origin_rescan_stop_tx,
@@ -2667,7 +2628,6 @@ pub async fn run(
 /// hook make fatal, proving no stop signal was dropped on the floor.
 struct ShutdownHandles<P: Provider + Clone + 'static> {
     metrics_stop_tx: oneshot::Sender<()>,
-    dispatch_gc_stop_tx: oneshot::Sender<()>,
     egress_ewma_stop_tx: oneshot::Sender<()>,
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
     /// Origin-held-index periodic rescan (#1130). `None` when
@@ -2758,7 +2718,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
 ) -> anyhow::Result<()> {
     let ShutdownHandles {
         metrics_stop_tx,
-        dispatch_gc_stop_tx,
         egress_ewma_stop_tx,
         buyer_bootstrap_stop_tx,
         origin_rescan_stop_tx,
@@ -2796,14 +2755,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
         // been the ones signaling it.
         tracing::warn!("metrics server exited before shutdown signal was sent");
     }
-    // Best-effort: silently ignore the dispatch GC stop send failure.
-    // The task only exits early on a panic, and its panic surfaces
-    // through `JoinSet::join_next` during the drain phase below — no
+    // Best-effort: silently ignore the stop send failure. The egress EWMA
+    // tick only exits early on a panic, and its panic surfaces through
+    // `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
-    let _ = dispatch_gc_stop_tx.send(());
-    // Best-effort, same rationale as the dispatch-GC stop above: the egress
-    // EWMA tick only exits early on a panic, which surfaces through
-    // `JoinSet::join_next` during the drain phase below.
     let _ = egress_ewma_stop_tx.send(());
     // Cancel a still-running buyer bootstrap and release the task's
     // process-lifetime hold on the service (#1109). Best-effort: on the

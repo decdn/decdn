@@ -970,9 +970,6 @@ async fn cli_drain_wait_times_out_on_stuck_stream() -> anyhow::Result<()> {
     let limiter = decdn_node::dispatch::ConnectionLimiter::new(
         &ResolvedSecurity {
             max_concurrent_handlers: u32::MAX,
-            per_source_rate_per_sec: 1e9,
-            per_source_burst: u32::MAX,
-            max_tracked_sources: 16,
         },
         Arc::clone(&metrics),
     );

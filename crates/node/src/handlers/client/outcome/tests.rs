@@ -226,7 +226,6 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
         ResetCause::TimestampSkew,
         ResetCause::RequestUnreadable,
         ResetCause::RateLimited(RejectLayer::PerPeer),
-        ResetCause::RateLimited(RejectLayer::PerIp),
         ResetCause::RateLimited(RejectLayer::Global),
     ];
     let ends = refusals

@@ -422,9 +422,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,
-            per_source_rate_per_sec: 100.0,
-            per_source_burst: 200,
-            max_tracked_sources: 4096,
         },
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         dht: decdn_common::config::ResolvedDht::default(),
@@ -762,13 +759,13 @@ fn summary_renders_resolve_notices_under_the_field_list() -> anyhow::Result<()> 
     let notices = vec![
         ConfigNotice {
             level: ConfigNoticeLevel::Warn,
-            field: "security.max_tracked_sources".to_string(),
-            message: "0: rate-limit bookkeeping map is unbounded".to_string(),
+            field: "dht.rate_limit.max_tracked_per_peer".to_string(),
+            message: "0: per-peer bookkeeping map is unbounded".to_string(),
         },
         ConfigNotice {
             level: ConfigNoticeLevel::Info,
-            field: "security.per_source_rate_per_sec".to_string(),
-            message: "0: per-source rate-limit disabled".to_string(),
+            field: "security.max_concurrent_handlers".to_string(),
+            message: "0: global concurrency cap disabled".to_string(),
         },
     ];
     let out = render_with_notices(None, &cfg, &notices)?;
@@ -776,12 +773,14 @@ fn summary_renders_resolve_notices_under_the_field_list() -> anyhow::Result<()> 
     anyhow::ensure!(out.contains("notices (2):"), "{out}");
     anyhow::ensure!(
         out.contains(
-            "- warning: security.max_tracked_sources: 0: rate-limit bookkeeping map is unbounded"
+            "- warning: dht.rate_limit.max_tracked_per_peer: 0: per-peer bookkeeping map is unbounded"
         ),
         "{out}"
     );
     anyhow::ensure!(
-        out.contains("- info: security.per_source_rate_per_sec: 0: per-source rate-limit disabled"),
+        out.contains(
+            "- info: security.max_concurrent_handlers: 0: global concurrency cap disabled"
+        ),
         "{out}"
     );
     // The config still resolved — a notice never fails validation — so the
@@ -812,7 +811,7 @@ fn config_validate_renders_the_notices_the_resolver_recorded() -> anyhow::Result
     // report `config valid` and exit 0, with the notice underneath it.
     fs::write(
         &cfg,
-        format!("{MINIMAL_VALID_CONFIG}\n[security]\nmax_tracked_sources = 0\n"),
+        format!("{MINIMAL_VALID_CONFIG}\n[dht.rate_limit]\nmax_tracked_per_peer = 0\n"),
     )?;
     fs::write(dir.path().join("keystore.json"), "")?;
 
@@ -832,7 +831,7 @@ fn config_validate_renders_the_notices_the_resolver_recorded() -> anyhow::Result
     anyhow::ensure!(stdout.starts_with("config valid"), "{stdout}");
     anyhow::ensure!(stdout.contains("notices (1):"), "{stdout}");
     anyhow::ensure!(
-        stdout.contains("- warning: security.max_tracked_sources: 0: rate-limit bookkeeping"),
+        stdout.contains("- warning: dht.rate_limit.max_tracked_per_peer: 0: per-peer bookkeeping"),
         "{stdout}"
     );
     Ok(())

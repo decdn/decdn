@@ -6,8 +6,8 @@ use super::*;
 #[test]
 fn notices_alone_do_not_fail_resolution() {
     let mut bag = ConfigDiagnostics::new();
-    bag.warn("security.max_tracked_sources", "0: unbounded");
-    bag.note("security.per_source_rate_per_sec", "0: disabled");
+    bag.warn("dht.rate_limit.max_tracked_per_peer", "0: unbounded");
+    bag.note("security.max_concurrent_handlers", "0: disabled");
     assert_eq!(bag.problem_count(), 0, "a notice is not a problem");
     assert!(bag.into_result().is_ok());
 }
@@ -45,7 +45,7 @@ fn take_notices_drains_in_insertion_order() {
 fn taking_notices_leaves_problems_intact() {
     let mut bag = ConfigDiagnostics::new();
     bag.push("blockchain.rpc_url", "missing");
-    bag.warn("security.max_tracked_sources", "0: unbounded");
+    bag.warn("dht.rate_limit.max_tracked_per_peer", "0: unbounded");
 
     assert_eq!(bag.take_notices().len(), 1);
     assert_eq!(bag.problem_count(), 1);

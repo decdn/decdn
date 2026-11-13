@@ -37,8 +37,8 @@ fn warn_notice_becomes_a_warn_finding() {
         &mut report,
         &[ConfigNotice {
             level: ConfigNoticeLevel::Warn,
-            field: "security.max_tracked_sources".into(),
-            message: "0: rate-limit bookkeeping map is unbounded".into(),
+            field: "dht.rate_limit.max_tracked_per_peer".into(),
+            message: "0: per-peer bookkeeping map is unbounded".into(),
         }],
     );
     let finding = report.findings.last().unwrap();
@@ -50,12 +50,16 @@ fn warn_notice_becomes_a_warn_finding() {
     // already opens with the offending value.
     assert_eq!(
         finding.detail.as_deref(),
-        Some("field=security.max_tracked_sources")
+        Some("field=dht.rate_limit.max_tracked_per_peer")
     );
-    assert!(!finding.title.contains("security.max_tracked_sources"));
+    assert!(
+        !finding
+            .title
+            .contains("dht.rate_limit.max_tracked_per_peer")
+    );
     assert_eq!(
         finding.remediation.as_deref(),
-        Some("review security.max_tracked_sources in the config file")
+        Some("review dht.rate_limit.max_tracked_per_peer in the config file")
     );
     assert!(report.has_warn());
 }
@@ -70,13 +74,13 @@ fn info_notice_is_visible_without_moving_exit_status() {
         &mut report,
         &[ConfigNotice {
             level: ConfigNoticeLevel::Info,
-            field: "security.per_source_rate_per_sec".into(),
-            message: "0: per-source rate-limit disabled".into(),
+            field: "security.max_concurrent_handlers".into(),
+            message: "0: global concurrency cap disabled".into(),
         }],
     );
     let finding = report.findings.last().unwrap();
     assert_eq!(finding.severity, Severity::Pass);
-    assert!(finding.title.contains("per-source rate-limit disabled"));
+    assert!(finding.title.contains("global concurrency cap disabled"));
     // Nothing to remediate — the operator configured this on purpose.
     assert!(finding.remediation.is_none());
     assert!(!report.has_warn());

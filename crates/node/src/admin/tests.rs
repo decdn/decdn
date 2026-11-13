@@ -720,9 +720,6 @@ async fn health_reports_in_flight_streams_from_dispatch_gauge() {
     let limiter = crate::dispatch::ConnectionLimiter::new(
         &ResolvedSecurity {
             max_concurrent_handlers: u32::MAX,
-            per_source_rate_per_sec: 1e9,
-            per_source_burst: u32::MAX,
-            max_tracked_sources: 16,
         },
         Arc::clone(&metrics),
     );
