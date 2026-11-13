@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use decdn_cache::{
     Hash, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest, OutboardFetch,
-    S3Credentials, S3Origin, S3OriginConfig, parse_origin_url,
 };
+#[cfg(feature = "s3")]
+use decdn_cache::{S3Credentials, S3Origin, S3OriginConfig, parse_origin_url};
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -170,6 +171,7 @@ fn http_origin(server: &KeepAliveServer) -> anyhow::Result<Arc<dyn Origin>> {
 
 /// A real `S3Origin` (path-style, dummy static credentials) pointed at the
 /// server. The server ignores the path and the signature.
+#[cfg(feature = "s3")]
 async fn s3_origin(server: &KeepAliveServer) -> anyhow::Result<Arc<dyn Origin>> {
     let cfg = S3OriginConfig {
         bucket: "decdn-blobs".to_string(),
@@ -371,13 +373,19 @@ async fn in_flight_request_survives_its_connection_openers_runtime_drop(
 #[derive(Debug, Clone, Copy)]
 enum OriginFor {
     Http,
+    #[cfg(feature = "s3")]
     S3,
 }
 
 impl OriginFor {
+    #[cfg_attr(
+        not(feature = "s3"),
+        expect(clippy::unused_async, reason = "only the S3 origin awaits its build")
+    )]
     async fn build(self, server: &KeepAliveServer) -> anyhow::Result<Arc<dyn Origin>> {
         match self {
             Self::Http => http_origin(server),
+            #[cfg(feature = "s3")]
             Self::S3 => s3_origin(server).await,
         }
     }
@@ -410,15 +418,29 @@ keep_alive_tests! {
     http_keep_alive_survives_a_dropped_range_runtime: Http, Range;
     http_keep_alive_survives_a_dropped_outboard_runtime: Http, Outboard;
     http_keep_alive_survives_a_dropped_size_runtime: Http, Size;
-    s3_keep_alive_survives_a_dropped_fetch_runtime: S3, Fetch;
-    s3_keep_alive_survives_a_dropped_range_runtime: S3, Range;
-    s3_keep_alive_survives_a_dropped_outboard_runtime: S3, Outboard;
-    s3_keep_alive_survives_a_dropped_size_runtime: S3, Size;
 }
 
 in_flight_tests! {
     http_in_flight_fetch_survives_its_connection_openers_runtime_drop: Http, Fetch;
     http_in_flight_range_survives_its_connection_openers_runtime_drop: Http, Range;
-    s3_in_flight_fetch_survives_its_connection_openers_runtime_drop: S3, Fetch;
-    s3_in_flight_range_survives_its_connection_openers_runtime_drop: S3, Range;
+}
+
+#[cfg(feature = "s3")]
+mod s3 {
+    use super::{
+        Op, OriginFor, in_flight_request_survives_its_connection_openers_runtime_drop,
+        keep_alive_survives_a_dropped_pull_runtime,
+    };
+
+    keep_alive_tests! {
+        s3_keep_alive_survives_a_dropped_fetch_runtime: S3, Fetch;
+        s3_keep_alive_survives_a_dropped_range_runtime: S3, Range;
+        s3_keep_alive_survives_a_dropped_outboard_runtime: S3, Outboard;
+        s3_keep_alive_survives_a_dropped_size_runtime: S3, Size;
+    }
+
+    in_flight_tests! {
+        s3_in_flight_fetch_survives_its_connection_openers_runtime_drop: S3, Fetch;
+        s3_in_flight_range_survives_its_connection_openers_runtime_drop: S3, Range;
+    }
 }

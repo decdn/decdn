@@ -9,15 +9,14 @@ use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use tokio::io::AsyncReadExt;
 
-use super::{StreamCandidate, Streamer, VerifiedReader};
+use super::{ScratchStores, StreamCandidate, StreamStore, StreamStores, Streamer, VerifiedReader};
 use crate::pacer::PULL_WINDOW_FLOOR;
 use crate::sink::MemoryBlobCache;
-use crate::source::{BlobSource, FakeFunder, Recovery, ScriptedSource, SourceFuture};
+use crate::source::{BlobSource, FakeFunder, IngestStore, Recovery, ScriptedSource, SourceFuture};
 use crate::{
-    BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, ProgressClock, PullConfig,
-    StaticSources, StopPolicy, UpstreamPullHeader, UpstreamRefused, VoucherProgress,
+    BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, ProgressClock, ProvenSize, PullConfig,
+    StaticSources, StopPolicy, UpstreamPullHeader, VoucherProgress,
 };
-use decdn_protocol::client::StreamError;
 
 fn healthy_ctx() -> PoolContext {
     PoolContext {
@@ -140,7 +139,14 @@ async fn drain_range(
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
-        .open_range(root, claim, window, config, cache, stop())
+        .open_range(
+            root,
+            ProvenSize::assume_for_tests(claim),
+            window,
+            config,
+            cache,
+            stop(),
+        )
         .await?;
     let mut out = Vec::new();
     drive.alongside(reader.read_to_end(&mut out)).await?;
@@ -177,7 +183,7 @@ async fn the_stream_ends_at_the_proven_size_when_the_claim_was_small() -> anyhow
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            64 * 1024,
+            ProvenSize::assume_for_tests(64 * 1024),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -259,7 +265,13 @@ async fn prepopulated_cache_serves_without_fetching() -> anyhow::Result<()> {
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
-        .open(root, total, &PullConfig::default(), cache, stop())
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &PullConfig::default(),
+            cache,
+            stop(),
+        )
         .await?;
     anyhow::ensure!(
         matches!(reader, VerifiedReader::Cached { .. }),
@@ -293,7 +305,7 @@ async fn tampered_tail_fails_and_never_yields_unverified() -> anyhow::Result<()>
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -367,7 +379,7 @@ async fn a_faulting_candidate_fails_over_and_the_stream_completes() -> anyhow::R
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -410,7 +422,13 @@ async fn bounded_read_ahead_holds_the_spend_bound() -> anyhow::Result<()> {
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
-        .open(root, total, &config, Arc::new(NoCache), stop())
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &config,
+            Arc::new(NoCache),
+            stop(),
+        )
         .await?;
 
     // Drain a few bytes at a time while the drive runs beside the reads;
@@ -465,7 +483,13 @@ async fn the_drive_fills_one_window_while_the_consumer_is_paused() -> anyhow::Re
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
-        .open(root, total, &config, Arc::new(NoCache), stop())
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &config,
+            Arc::new(NoCache),
+            stop(),
+        )
         .await?;
 
     // A paused consumer: nothing is read while the drive runs.
@@ -510,7 +534,13 @@ async fn a_paused_consumer_does_not_give_up() -> anyhow::Result<()> {
     let limit = Duration::from_secs(30);
     let stop = StopPolicy::new(false, Some(limit), Arc::new(ProgressClock::new()));
     let (mut reader, mut drive) = streamer
-        .open(root, total, &config, Arc::new(NoCache), stop)
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &config,
+            Arc::new(NoCache),
+            stop,
+        )
         .await?;
 
     // The consumer reads nothing for ten times the limit.
@@ -553,7 +583,7 @@ async fn a_parked_lane_holds_the_clock_only_while_bytes_wait_unread() -> anyhow:
             cursor: AtomicU64::new(cursor),
             start: 0,
             end: None,
-            hint: total,
+            size: ProvenSize::assume_for_tests(total),
             consumed: Notify::new(),
             progressed: Notify::new(),
             outcome: Mutex::new(None),
@@ -634,7 +664,13 @@ async fn a_front_fault_moves_a_parked_lane_to_the_front() -> anyhow::Result<()> 
         ..PullConfig::default()
     };
     let (mut reader, mut drive) = streamer
-        .open(root, total, &config, Arc::new(NoCache), stop())
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &config,
+            Arc::new(NoCache),
+            stop(),
+        )
         .await?;
     let mut out = Vec::new();
     tokio::time::timeout(
@@ -696,6 +732,7 @@ impl BlobSource for TamperTailSource {
             }
             let header = UpstreamPullHeader {
                 total_bytes: self.total,
+                size_proof: None,
                 rate_per_mb: 0,
                 interval_bytes: decdn_protocol::client::CHUNK_BYTES,
                 origin_attestation: None,
@@ -771,7 +808,7 @@ async fn finish_reports_a_late_lane_build_escrow_after_the_last_byte() -> anyhow
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -801,7 +838,7 @@ async fn finish_after_a_clean_stream_is_ok() -> anyhow::Result<()> {
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -952,7 +989,7 @@ async fn a_window_past_the_claim_is_refused_at_open() -> anyhow::Result<()> {
     let opened = streamer
         .open_range(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             (total, 1),
             &PullConfig::default(),
             Arc::new(NoCache),
@@ -992,7 +1029,7 @@ async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
     let (mut reader, mut drive) = streamer
         .open_range(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             (offset, len),
             &PullConfig::default(),
             cache,
@@ -1013,12 +1050,12 @@ async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A bounded window past a size claim too small for the blob is clipped to
-/// the claim: the fetch takes nothing past the end of the blob as the caller
-/// knows it, and the stream ends with an error naming the shortfall, never
-/// following the blob past a reader that stopped.
+/// A bounded window past a first size too small for the blob streams in
+/// full: the first leg's size proof proves the true size, and the window
+/// regains its requested end (#2865), so the stream carries exactly the
+/// window's bytes and no leg runs past the window.
 #[tokio::test]
-async fn a_window_past_a_short_claim_is_clipped_to_it() -> anyhow::Result<()> {
+async fn a_window_past_a_short_first_size_streams_once_the_size_is_proven() -> anyhow::Result<()> {
     let blob = payload(3 * 1024 * 1024 + 777);
     let (source, ledger) = paying_source(blob.clone())?;
     let claim = 2 * 1024 * 1024 + 100;
@@ -1042,16 +1079,17 @@ async fn a_window_past_a_short_claim_is_clipped_to_it() -> anyhow::Result<()> {
         ),
     )
     .await
-    .context("the stream and its drive end")?;
-    let err = match got {
-        Ok(bytes) => anyhow::bail!("{} bytes past the claim were streamed", bytes.len()),
-        Err(err) => format!("{err:#}"),
-    };
-    anyhow::ensure!(err.contains("bytes readable"), "{err}");
+    .context("the stream and its drive end")??;
+    let want = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + 1_000)?)
+        .context("window inside the blob")?;
+    anyhow::ensure!(got == want, "{} of 1000 window bytes", got.len());
+    let window_end = (offset + 1_000).div_ceil(decdn_bao_range::CHUNK_GROUP_BYTES)
+        * decdn_bao_range::CHUNK_GROUP_BYTES;
     for &(start, fetch_len) in &probe.opened_ranges() {
         anyhow::ensure!(
-            start + fetch_len <= claim,
-            "leg ({start}, {fetch_len}) runs past the claim"
+            start + fetch_len <= window_end,
+            "leg ({start}, {fetch_len}) runs past the window"
         );
     }
     Ok(())
@@ -1070,7 +1108,7 @@ async fn a_window_past_zero_needs_a_size_claim() -> anyhow::Result<()> {
     let opened = streamer
         .open_range(
             root,
-            0,
+            ProvenSize::assume_for_tests(0),
             (4_096, 1_000),
             &PullConfig::default(),
             Arc::new(NoCache),
@@ -1147,7 +1185,7 @@ async fn a_window_ending_at_the_cap_stays_bounded() -> anyhow::Result<()> {
     let (mut reader, mut drive) = streamer
         .open_range(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             (offset, len),
             &PullConfig::default(),
             Arc::new(NoCache),
@@ -1170,151 +1208,166 @@ async fn a_window_ending_at_the_cap_stays_bounded() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prove the size of `root` under `claim`, one lane per source.
-async fn prove(
-    sources: Vec<ScriptedSource>,
-    root: [u8; 32],
-    claim: u64,
-) -> anyhow::Result<Option<u64>> {
-    let scratch = tempfile::tempdir()?;
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let candidates = sources
-        .into_iter()
-        .zip(0xA1u8..)
-        .map(|(source, provider)| {
-            candidate(
-                source.paying(Arc::clone(&ledger)),
-                Arc::clone(&ledger),
-                provider,
-            )
-        })
-        .collect();
-    streamer(candidates, scratch.path())?
-        .prove_size(root, claim, &PullConfig::default(), stop())
-        .await
-}
-
-/// A true claim is proven by its last chunk group alone: the proof opens
-/// nothing before the group that holds the final byte.
-#[tokio::test]
-async fn a_true_claim_is_proven_by_its_last_group() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(3 * 1024 * 1024 + 777))?;
-    let (root, total, probe) = (source.root(), source.total_bytes(), source.clone());
-    let proven = prove(vec![source], root, total).await?;
-    anyhow::ensure!(proven == Some(total), "proved {proven:?} of {total}");
-    let group = decdn_bao_range::CHUNK_GROUP_BYTES;
-    let last_group = (total - 1) / group * group;
-    let opened = probe.opened_ranges();
-    anyhow::ensure!(!opened.is_empty(), "the proof opens a leg");
-    for &(start, len) in &opened {
-        anyhow::ensure!(
-            start >= last_group && start + len <= total,
-            "leg ({start}, {len}) is not the last group of {total}"
-        );
-    }
-    Ok(())
-}
-
-/// A claim below the true size proves nothing: the last byte under it is not
-/// the blob's final chunk, so no size is given.
-#[tokio::test]
-async fn a_low_claim_proves_nothing() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(3 * 1024 * 1024 + 777))?;
-    let root = source.root();
-    let proven = prove(vec![source], root, 1024 * 1024).await?;
-    anyhow::ensure!(proven.is_none(), "a low claim proved {proven:?}");
-    Ok(())
-}
-
-/// A claim past the true size gives no size: every holder declines its last
-/// byte, as a node declines a range past the end, and the proof ends at once
-/// with the decline.
-#[tokio::test]
-async fn a_high_claim_gives_no_size() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(100_000))?.refusing_opens_from(0, || {
-        anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined))
-    });
-    let root = source.root();
-    let proven = tokio::time::timeout(
-        Duration::from_secs(20),
-        prove(vec![source], root, 4 * 1024 * 1024),
-    )
-    .await
-    .context("the proof ends")?;
-    let err = match proven {
-        Ok(proven) => anyhow::bail!("a high claim proved {proven:?}"),
-        Err(err) => err,
-    };
-    anyhow::ensure!(
-        err.downcast_ref::<crate::NoNodeWillServe>().is_some(),
-        "{err:#}"
-    );
-    Ok(())
-}
-
-/// A node that signs a wrong size fails to verify the final chunk, and the
-/// proof takes the true size from an honest node. The liar is asked, and
-/// its claim never becomes the size.
+/// A node that signs a size it cannot prove opens no leg: its open fails
+/// with [`crate::UnprovenSize`], its ranges move to the honest node, and the
+/// stream carries every byte of the blob from it.
 #[tokio::test]
 async fn a_lying_source_is_passed_over_for_an_honest_one() -> anyhow::Result<()> {
     let blob = payload(600_000);
-    let honest = ScriptedSource::new(blob.clone())?;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let honest = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
     let (root, total) = (honest.root(), honest.total_bytes());
-    let liar = ScriptedSource::new(blob)?.signing_size(total - 1);
-    let (asked_honest, asked_liar) = (honest.clone(), liar.clone());
-    let proven = prove(vec![liar, honest], root, total).await?;
-    anyhow::ensure!(proven == Some(total), "proved {proven:?} of {total}");
+    let liar = ScriptedSource::new(blob.clone())?
+        .signing_size(total - 1)
+        .paying(Arc::clone(&ledger));
+    let asked_liar = liar.clone();
+    let scratch = tempfile::tempdir()?;
+    let streamer = streamer(
+        vec![
+            candidate(liar, Arc::clone(&ledger), 0xA1),
+            candidate(honest, ledger, 0xA2),
+        ],
+        scratch.path(),
+    )?;
+    let (mut reader, mut drive) = streamer
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    drive.finish().await?;
+    anyhow::ensure!(out == blob, "the stream must carry the honest bytes");
     anyhow::ensure!(
-        !asked_liar.opened_ranges().is_empty() && !asked_honest.opened_ranges().is_empty(),
-        "liar {:?}, honest {:?}",
-        asked_liar.opened_ranges(),
-        asked_honest.opened_ranges()
+        !asked_liar.opened_ranges().is_empty(),
+        "the liar was asked and refused"
     );
     Ok(())
 }
 
-/// A claim off by less than one chunk group, either way, proves the blob's
-/// own size, never the claim: the last group under it is the blob's last.
-#[tokio::test]
-async fn a_claim_within_the_last_group_proves_the_true_size() -> anyhow::Result<()> {
-    for offset in [-100i64, 100] {
-        let source = ScriptedSource::new(payload(600_000))?;
-        let (root, total) = (source.root(), source.total_bytes());
-        let claim = total.checked_add_signed(offset).context("a claim")?;
-        let proven = prove(vec![source], root, claim).await?;
-        anyhow::ensure!(
-            proven == Some(total),
-            "claim {claim} proved {proven:?} of {total}"
-        );
+/// A store type other than the default, delegating to a [`ClientRangedStore`].
+struct WrappedStore(crate::ClientRangedStore);
+
+impl decdn_bao_range::RangedStore for WrappedStore {
+    fn total_bytes(&self) -> u64 {
+        self.0.total_bytes()
     }
-    Ok(())
+    fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+        self.0.present_ranges()
+    }
+    fn missing_ranges(
+        &self,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+        self.0.missing_ranges(byte_offset, byte_len)
+    }
+    fn admit(
+        &self,
+        range: AlignedRange,
+        bao_bytes: Bytes,
+    ) -> decdn_bao_range::RangedFuture<'_, ()> {
+        self.0.admit(range, bao_bytes)
+    }
+    fn read(&self, byte_offset: u64, byte_len: u64) -> decdn_bao_range::RangedFuture<'_, Bytes> {
+        self.0.read(byte_offset, byte_len)
+    }
+    fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
+        self.0.is_complete()
+    }
+    fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
+        self.0.finalize()
+    }
 }
 
-/// A claim past the cap on held bytes proves nothing and opens nothing: a
-/// blob that large is not held whole, and its claim never sizes the work.
+impl IngestStore for WrappedStore {
+    fn ingest_stream<'a, R>(
+        &'a self,
+        range: &'a AlignedRange,
+        reader: R,
+        on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+        claimed_total: u64,
+        stop_at: Option<&'a std::sync::atomic::AtomicU64>,
+    ) -> crate::source::IngestFuture<'a, R>
+    where
+        R: crate::source::BaoRangeReader + 'a,
+    {
+        IngestStore::ingest_stream(&self.0, range, reader, on_progress, claimed_total, stop_at)
+    }
+    fn flush_present_record(&self) -> SourceFuture<'_, ()> {
+        IngestStore::flush_present_record(&self.0)
+    }
+    fn proven(&self) -> Option<u64> {
+        IngestStore::proven(&self.0)
+    }
+    fn set_bound(&self, bound: u64) {
+        IngestStore::set_bound(&self.0, bound);
+    }
+    fn prove_size(&self, size: ProvenSize) {
+        IngestStore::prove_size(&self.0, size);
+    }
+}
+
+impl StreamStore for WrappedStore {
+    fn present_grew(&self) -> &tokio::sync::Notify {
+        StreamStore::present_grew(&self.0)
+    }
+}
+
+/// Opens a [`WrappedStore`] in `dir` and counts the opens.
+struct WrappedStores {
+    dir: std::path::PathBuf,
+    opened: std::sync::atomic::AtomicUsize,
+}
+
+impl StreamStores for WrappedStores {
+    type Store = WrappedStore;
+
+    async fn open(&self, hash: [u8; 32], total_bytes: u64) -> anyhow::Result<WrappedStore> {
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let store = ScratchStores::new(&self.dir)
+            .open(hash, total_bytes)
+            .await?;
+        Ok(WrappedStore(store))
+    }
+}
+
+/// A streamer built with caller-supplied stores fills the store they open,
+/// and the stream it reads back is the blob.
 #[tokio::test]
-async fn a_claim_past_the_cap_opens_nothing() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(600_000))?;
-    let (root, total, probe) = (source.root(), source.total_bytes(), source.clone());
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+async fn a_stream_fills_the_store_its_stores_open() -> anyhow::Result<()> {
+    let blob = payload(1_500_000);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let root = source.root();
     let scratch = tempfile::tempdir()?;
-    let proven = streamer(
-        vec![candidate(source.paying(Arc::clone(&ledger)), ledger, 0xA1)],
-        scratch.path(),
-    )?
-    .max_blob_bytes(total - 1)
-    .prove_size(root, total, &PullConfig::default(), stop())
-    .await?;
-    anyhow::ensure!(proven.is_none() && probe.opened_ranges().is_empty());
-    Ok(())
-}
-
-/// A zero claim proves nothing and opens nothing.
-#[tokio::test]
-async fn a_zero_claim_opens_nothing() -> anyhow::Result<()> {
-    let source = ScriptedSource::new(payload(100_000))?;
-    let (root, probe) = (source.root(), source.clone());
-    let proven = prove(vec![source], root, 0).await?;
-    anyhow::ensure!(proven.is_none() && probe.opened_ranges().is_empty());
+    let stores = WrappedStores {
+        dir: scratch.path().to_path_buf(),
+        opened: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let sources = StaticSources::new(vec![candidate(source, ledger, 0xA1)])?;
+    let holders = sources.holders();
+    let streamer = Streamer::with_stores(sources, funder(), &stores).holders(holders);
+    let (mut reader, mut drive) = streamer
+        .open(
+            root,
+            ProvenSize::assume_for_tests(u64::try_from(blob.len())?),
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    drive.finish().await?;
+    anyhow::ensure!(out == blob, "the stream must be byte-identical");
+    anyhow::ensure!(
+        stores.opened.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "the stream opens exactly one store through its stores"
+    );
     Ok(())
 }

@@ -11,11 +11,11 @@ fn app_close(code: u32, reason: &'static [u8]) -> ConnectionError {
 
 #[test]
 fn a_rate_limit_connection_close_carries_its_layer_label() {
-    let shed = rate_limit_shed(&app_close(APP_ERR_RATE_LIMITED, b"per-source"));
+    let shed = rate_limit_shed(&app_close(APP_ERR_RATE_LIMITED, b"global-full"));
     assert_eq!(
         shed,
         Some(UpstreamRateLimited {
-            label: Some("per-source".to_owned())
+            label: Some("global-full".to_owned())
         })
     );
 }
@@ -99,13 +99,13 @@ fn a_shed_is_found_through_frame_error_and_io_error_nesting() {
 fn transport_error_types_a_shed_and_keeps_plain_text_otherwise() -> anyhow::Result<()> {
     let shed = transport_error(
         "open_bi failed",
-        app_close(APP_ERR_RATE_LIMITED, b"per-source"),
+        app_close(APP_ERR_RATE_LIMITED, b"global-full"),
     )
     .context("probe candidate");
     let sentinel = shed
         .downcast_ref::<UpstreamRateLimited>()
         .ok_or_else(|| anyhow::anyhow!("sentinel lost: {shed:#}"))?;
-    assert_eq!(sentinel.label.as_deref(), Some("per-source"));
+    assert_eq!(sentinel.label.as_deref(), Some("global-full"));
 
     let plain = transport_error("open_bi failed", ConnectionError::TimedOut);
     assert!(plain.downcast_ref::<UpstreamRateLimited>().is_none());

@@ -20,7 +20,6 @@ fn closer(nodes: Vec<NodeId>) -> CloserNodes {
 fn att() -> OriginAttestation {
     OriginAttestation {
         rate_per_mb: 10,
-        total_bytes: 4096,
         timestamp_us: 1_700_000_000_000_000,
         slash_sig: vec![0x5A; SLASH_SIG_LEN],
     }
@@ -30,7 +29,6 @@ fn att() -> OriginAttestation {
 fn widest_att() -> OriginAttestation {
     OriginAttestation {
         rate_per_mb: u64::MAX,
-        total_bytes: u64::MAX,
         timestamp_us: u64::MAX,
         slash_sig: vec![0x5A; SLASH_SIG_LEN],
     }
@@ -353,13 +351,13 @@ fn dht_frame_ceiling_holds_the_largest_message() -> Result<(), postcard::Error> 
 
     let batch_len = postcard::to_allocvec(&batch)?.len();
     // 1 discriminant + 2 (entry count 192) + 192 × (32 hash + 2 + 200 bitmap
-    // + 96 attestation) + 32 holder. The attestation is 3 × 10 varint bytes
+    // + 86 attestation) + 32 holder. The attestation is 2 × 10 varint bytes
     // plus 1 + 65 for the signature.
-    assert_eq!(batch_len, 63_395, "BatchStoreRequest at full width");
+    assert_eq!(batch_len, 61_475, "BatchStoreRequest at full width");
     let response_len = postcard::to_allocvec(&find_value_response)?.len();
-    // 1 + 32 hash + 1 + 50 × (32 node + 2 + 200 bitmap + 96 attestation) + 1
+    // 1 + 32 hash + 1 + 50 × (32 node + 2 + 200 bitmap + 86 attestation) + 1
     // + 20 × 32.
-    assert_eq!(response_len, 17_175, "FindValueResponse at full width");
+    assert_eq!(response_len, 16_675, "FindValueResponse at full width");
 
     let others = [
         DhtMessage::FindValue(sample_find_value_request()),

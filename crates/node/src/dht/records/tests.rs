@@ -21,7 +21,6 @@ fn provider(node: NodeId) -> Provider {
 fn att() -> OriginAttestation {
     OriginAttestation {
         rate_per_mb: 1,
-        total_bytes: 1,
         timestamp_us: 1,
         slash_sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
     }

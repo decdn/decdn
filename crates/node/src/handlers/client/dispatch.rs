@@ -5,9 +5,9 @@ use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
     FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, MissPath,
-    MissRefusal, OwnedSemaphorePermit, PublicKey, REJECTION_CLOSE_TIMEOUT, RecvStream,
-    RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest,
-    StreamResponseBody, U256, VarInt, read_first_message, reset_stream, verify_binding,
+    MissRefusal, OwnedSemaphorePermit, PublicKey, RecvStream, Semaphore, SendStream,
+    ServeRejectReason, StreamReadError, StreamRequest, U256, VarInt, read_first_message,
+    reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
@@ -118,9 +118,6 @@ impl ClientHandler {
                     VarInt::from_u32(APP_ERR_RATE_LIMITED),
                     reason.as_str().as_bytes(),
                 );
-                if reason != RejectReason::GlobalFull {
-                    let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
-                }
                 return Ok(());
             }
         };
@@ -337,19 +334,11 @@ impl ClientHandler {
         // signed response. Most refusals after the request is read sign a
         // response, and an origin-only node probes its backend for an unseen
         // hash before any payment check, so an unpaid flood must stop here.
-        let peer_ip = crate::rate_limit::peer_ip(&conn);
         if let Some(limiter) = &self.request_limiter
-            && let Err(layer) = limiter.check(
-                &crate::dht::routing::NodeId::from_bytes(*peer.as_bytes()),
-                peer_ip,
-            )
+            && let Err(layer) =
+                limiter.check(&crate::dht::routing::NodeId::from_bytes(*peer.as_bytes()))
         {
-            tracing::debug!(
-                layer = layer.as_str(),
-                %peer,
-                ?peer_ip,
-                "client request rate-limited"
-            );
+            tracing::debug!(layer = layer.as_str(), %peer, "client request rate-limited");
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(ServeEnd::Reset(ResetCause::RateLimited(layer)));
         }
@@ -773,14 +762,12 @@ impl ClientHandler {
         // solvency, stateful-B). It sums floor credit across ALL distinct lanes on
         // the pool and bounds it to `remaining − M`, closing the fan-out hole where
         // many distinct signers each draw one un-vouchered floor on the same pool; a
-        // per-signer cap `k · one window` bounds any one signer's share underneath
-        // it. Both levels count floor debt beside the live reservation. The
-        // reservation is span-capped to what THIS request can draw — at most one
-        // voucher-interval floor, less for a bounded range or tail resume — and held
-        // for the stream's lifetime; the `FloorReservation` guard releases it once the
-        // stream repays that floor. On any other exit `Drop` frees the live
-        // reservation and keeps the unpaid part as floor debt, unless the serve loop
-        // judged the end not the client's doing.
+        // per-signer live cap `k · one window` bounds any one signer's share
+        // underneath it. The reservation is span-capped
+        // to what THIS request can draw — at most one voucher-interval floor, less for
+        // a bounded range or tail resume — and held for the stream's lifetime; the
+        // `FloorReservation` guard releases it once the stream repays that floor, and
+        // frees the pool's floor headroom on any exit via `Drop`.
         //
         // The guard is opened at the point the billed span is knowable, NOT here: an
         // open-ended tail (`byte_len == 0`, `byte_offset > 0`) only knows its span
@@ -802,10 +789,10 @@ impl ClientHandler {
         // `serve_via_backend_origin` / `serve_via_window_pull_through` miss legs take it
         // by value and pass it by reference into their shared `serve_leg`. All three
         // release the reservation once the stream repays one floor; any other exit
-        // (disconnect, `?`, panic) drops the guard, whose `Drop` frees the live
-        // reservation so no stream holds it past its own lifetime. The unpaid floor a
-        // client left behind stays as floor debt, which admission counts against the
-        // pool ceiling and the per-signer cap.
+        // (disconnect, `?`, panic) drops the guard, whose `Drop` frees the pool's live
+        // floor headroom so an abandoned stream never holds it past its own lifetime.
+        // The pool ceiling and the per-signer live cap bound un-vouchered floor at
+        // admission; the per-stream credit window bounds what one stream can take.
         let mut floor_reservation: Option<FloorReservation> = None;
 
         // Blob availability gate. A store fault is NOT an absence: an
@@ -934,7 +921,7 @@ impl ClientHandler {
                 // The shed gate runs before the lane-authority refusal below,
                 // so an unbound / unknown-lane request can transiently hold a
                 // `ShedSlot` until that refusal returns it. This is bounded by
-                // the `ConnectionLimiter` global + per-source caps and is
+                // the `ConnectionLimiter` global cap and is
                 // self-limiting: once the node is pressured, further such
                 // requests shed right here without acquiring a slot at all.
                 // Keeping the gate here — ahead of lane authority and any
@@ -1156,15 +1143,24 @@ impl ClientHandler {
                 // streams the same filling cache to its own client (no double origin
                 // egress). The registry is range-aware, so this coalescing is not
                 // limited to the whole-blob case.
+                // The node serves an origin blob only under a size its origin's
+                // `{H}.sizeproof` proves (ADR 005 § Bounded byte ranges).
+                // The proof comes first; only a proven size sizes the outboard
+                // read of the range probe. An origin blob with no size, or with
+                // no proof of it, is not served from the origin, by the range
+                // encoder or by the buffered populate below.
+                let mut origin_proven = false;
                 if let Some((lk, ln)) = authority {
                     match self.cache.origin_size(hash).await {
+                        Ok(Some(total)) if self.cache.size_proof(hash, total).await.is_none() => {}
                         Ok(Some(total)) => {
+                            origin_proven = true;
                             match self.cache.origin_range_serviceable(hash, total).await {
-                                // Serviceable: size known and an origin publishes the
-                                // outboard and serves ranges. Enter the orchestration
-                                // directly — it claims the fill (owner-or-attach)
-                                // internally after signing the response, so no
-                                // coalescing decision happens here.
+                                // Serviceable: the size is proven and an origin
+                                // publishes the outboard and serves ranges. Enter the
+                                // orchestration directly — it claims the fill
+                                // (owner-or-attach) internally after signing the
+                                // response, so no coalescing decision happens here.
                                 Ok(true) => {
                                     // Boxed: the serve future is large
                                     // (clippy::large_futures).
@@ -1189,7 +1185,7 @@ impl ClientHandler {
                                     ))
                                     .await;
                                 }
-                                // Size known but no origin publishes the outboard
+                                // Size proven but no origin publishes the outboard
                                 // and serves ranges — not serviceable via the range
                                 // encoder. Degrade to the buffered local populate
                                 // below.
@@ -1205,8 +1201,8 @@ impl ClientHandler {
                                 }
                             }
                         }
-                        // No origin knows the size, or no origin is configured at
-                        // all — both a clean fall-through (degrade). `origin_size`
+                        // No origin states a size, or no origin is configured at
+                        // all: nothing is served from the origin. `origin_size`
                         // returns Ok(None) only for clean declines; a probe that
                         // ends on a transport fault reaches the Err arm below.
                         Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
@@ -1245,6 +1241,7 @@ impl ClientHandler {
                 // client-attributable and would refuse regardless of origin
                 // health.)
                 if !locally_filled
+                    && origin_proven
                     && let Some(timeout) = self.local_populate
                     && authority.is_some()
                 {
@@ -1392,6 +1389,20 @@ impl ClientHandler {
                 )
                 .await;
         }
+        // The response states `total_bytes`, so its proof must be at hand
+        // before any reservation: a complete blob or a covering partial built
+        // or kept it above. With none, refuse now with a signed answer rather
+        // than fail the signing later (ADR 005 § Bounded byte ranges).
+        if self.cache.size_proof(hash, total_bytes).await.is_none() {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::InternalError,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // Resolve the lane (must be pre-persisted — see module docs / #327).
         // The lane is keyed by `(pool_id, bound_signer, this operator)`; a
@@ -1443,8 +1454,8 @@ impl ClientHandler {
         // legs, which spend, open theirs pre-fill above). Open it HERE, span-capped
         // to `guard_bytes`, via [`ClientHandler::try_reserve_floor`] — its
         // two-level check — `remaining − M ≥ committed + reserved` pool-wide, and
-        // this signer's own floor cap — both admits the stream and bounds the pool's
-        // cumulative cross-lane floor credit, live and owed. A miss-fill stream
+        // this signer's own live cap — both admits the stream and bounds the pool's
+        // cumulative cross-lane LIVE floor credit. A miss-fill stream
         // already holds its reservation, so re-validate solvency against the pool's
         // already-committed LIVE floor reservation via
         // [`ClientHandler::pool_budget_covers_reserve`] with `new_reserve = 0` — the
@@ -1522,14 +1533,7 @@ impl ClientHandler {
         }
 
         // Build and sign the success response.
-        let body = StreamResponseBody {
-            hash: req.hash,
-            ok: true,
-            rate_per_mb,
-            total_bytes,
-            timestamp_us: req.timestamp_us,
-        };
-        let (resp, resp_ext) = self.sign_response(body, None)?;
+        let (resp, resp_ext) = self.sign_served(&req, rate_per_mb, total_bytes).await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);
@@ -1590,9 +1594,8 @@ pub(super) fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) ->
 /// (the direct-serve gate and the own-origin twin) refuses the same starts with
 /// `RangeNotSatisfiable` BEFORE it signs a response. A whole-blob request
 /// (`0, 0`) is always in bounds, including for the empty blob. An end past the
-/// blob is NOT out of bounds here: it is served clamped to the blob's end (a
-/// claimed size is a hint), so only a start at or past a non-empty blob's end
-/// refuses.
+/// blob is NOT out of bounds here: it is served clamped to the blob's end, so
+/// only a start at or past a non-empty blob's end refuses.
 pub(super) fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: u64) -> bool {
     decdn_bao_range::align_range_clamped(byte_offset, byte_len, total_bytes).is_err()
 }

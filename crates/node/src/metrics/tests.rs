@@ -369,7 +369,7 @@ fn adr_registry_names_are_exported() {
             continue;
         };
         // Documentation forms, not single series: label suffixes and
-        // brace-expanded shorthand (`..._{per_peer,per_ip}_total`), and the
+        // brace-expanded shorthand (`..._{per_peer,global}_total`), and the
         // per-watcher templates (`decdn_<watcher>_task_panicked_total`),
         // which stand in for one row per watcher rather than naming one.
         if name.contains('{') || name.contains('<') {
@@ -605,6 +605,7 @@ fn cache_metrics_counters_start_at_zero() {
         "decdn_cache_evictions_starved_total",
         "decdn_cache_size_measure_failures_total",
         "decdn_cache_recency_seed_failures_total",
+        "decdn_cache_size_proof_origin_missing_total",
         "decdn_cache_evicted_operator_total",
         // Per-partial `observe()` failures inside the size walk. The struct
         // field is `partial_size_observe_failures`.

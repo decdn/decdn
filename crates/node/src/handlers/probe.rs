@@ -20,7 +20,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
-use crate::dispatch::{ConnectionLimiter, RejectReason};
+use crate::dispatch::ConnectionLimiter;
 use crate::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer};
 use crate::handlers::timestamp_skew::{MAX_REQUEST_TIMESTAMP_SKEW_US, excessive_skew_us, now_us};
 use crate::metrics::{Metrics, ProbeHoldUnavailableReason};
@@ -130,8 +130,8 @@ pub struct ProbeHandler {
     rate_per_mb: u64,
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
-    /// ADR 005 §Probe rate limiting three-layer token-bucket limiter
-    /// (per-peer → per-IP → global). Runs in addition to `limiter` (the
+    /// ADR 005 §Probe rate limiting two-layer token-bucket limiter
+    /// (per-peer → global). Runs in addition to `limiter` (the
     /// connection-level [`ConnectionLimiter`]) — see
     /// [`crate::handlers::probe_rate_limit`] for why both layers run.
     probe_rate_limiter: Arc<ProbeRateLimiter>,
@@ -225,10 +225,10 @@ impl ProbeHandler {
 
     /// The advertised `total_bytes` for a blob already established as present.
     ///
-    /// `total_bytes` is an unsigned, optional hint outside the `slash_sig`
-    /// typehash, so `None` degrades cleanly to "unknown but fetchable" — no
-    /// consumer treats it as a presence signal. An `Err` here is still worth a
-    /// log: every caller has *just* proven the blob present, so a failing
+    /// `total_bytes` sits outside the `slash_sig` typehash and goes out only
+    /// with its size proof. A `None` leaves the answer with no size, so the
+    /// probe advertises no coverage and `has_blob = false`. An `Err` here is
+    /// still worth a log: every caller has *just* proven the blob present, so a failing
     /// `inspect` means the store started degrading in between, which is a
     /// strictly stronger signal than the plain miss the `Err` arms warn about.
     async fn inspect_size(&self, hash: Hash) -> Option<u64> {
@@ -243,6 +243,32 @@ impl ProbeHandler {
                 None
             }
         }
+    }
+
+    /// `size` with the proof the cache keeps or builds for it, or no size at
+    /// all when the cache cannot prove it (ADR 005 § Bounded byte ranges).
+    async fn proven_size(
+        &self,
+        hash: Hash,
+        size: Option<u64>,
+    ) -> (Option<u64>, Option<decdn_protocol::SizeProof>) {
+        let Some(size) = size else {
+            return (None, None);
+        };
+        // A refused hash states no size and reads no proof.
+        if self.cache.refuses(hash) {
+            return (None, None);
+        }
+        let proof = self
+            .cache
+            .size_proof(hash, size)
+            .await
+            .and_then(|proof| decdn_protocol::SizeProof::new(size, proof.to_vec()).ok());
+        if proof.is_none() {
+            tracing::debug!(%hash, size, "no size proof; the probe states no size");
+            return (None, None);
+        }
+        (Some(size), proof)
     }
 
     // Linear, ordered protocol sequence (limit → accept → read → hold →
@@ -265,46 +291,33 @@ impl ProbeHandler {
                     VarInt::from_u32(APP_ERR_RATE_LIMITED),
                     reason.as_str().as_bytes(),
                 );
-                // Wait for the close frame to be acknowledged so the peer
-                // reliably observes the 0x10 RATE_LIMITED code and the
-                // layer-label reason byte — except on `GlobalFull`. Under
-                // a global-cap flood every rejection would otherwise
-                // park a task here for up to `REJECTION_CLOSE_TIMEOUT`,
-                // and at thousands of rejections per second that is the
-                // memory-pressure path the limiter exists to prevent.
-                // Layer label is least useful for `GlobalFull` anyway
-                // (operators pivot on the metric counter, not the close
-                // reason byte). Per-source rejections are rate-limited
-                // by the bucket itself, so the bounded wait is safe.
-                if reason != RejectReason::GlobalFull {
-                    let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
-                }
+                // No wait for the close frame: under a global-cap flood every
+                // rejection would park a task here, and at thousands of
+                // rejections per second that is the memory-pressure path the
+                // limiter exists to prevent.
                 return Ok(());
             }
         };
 
-        // ADR 005 §Probe rate limiting: three-layer token-bucket limiter
-        // (per-peer → per-IP → global) applied *before* any signature is
-        // computed and *before* any eviction-hold slot is allocated. It runs in
-        // addition to the `ConnectionLimiter` permit above (per-source IP +
-        // global concurrency) — see `probe_rate_limit` module docs for why
-        // both run. Both the requester NodeId and the source IP are available
-        // pre-stream, so a rejected probe never opens a bidi stream.
+        // ADR 005 §Probe rate limiting: two-layer token-bucket limiter
+        // (per-peer → global) applied *before* any signature is computed and
+        // *before* any eviction-hold slot is allocated. It runs in addition to
+        // the `ConnectionLimiter` permit above (global concurrency) — see
+        // `probe_rate_limit` module docs for why both run. The requester NodeId
+        // is available pre-stream, so a rejected probe never opens a bidi
+        // stream.
         let requester = NodeId::from_bytes(*conn.remote_id().as_bytes());
-        let peer_ip = crate::rate_limit::peer_ip(&conn);
-        if let Err(layer) = self.probe_rate_limiter.check(&requester, peer_ip) {
+        if let Err(layer) = self.probe_rate_limiter.check(&requester) {
             // Load-shedding, not a protocol fault: don't return `Err` (which
             // iroh would log per rejection, amplifying log volume under flood —
             // exactly what the attacker wants). The limiter already bumped the
             // per-layer rejection counter; emit a debug log too so operators
-            // can correlate the offending peer/IP, matching the per-source
-            // (`ConnectionLimiter::acquire_inner`) and DHT
-            // (`close_stream_with_rate_limit`) reject paths.
+            // can correlate the offending peer, matching the DHT
+            // (`close_stream_with_rate_limit`) reject path.
             tracing::debug!(
                 layer = layer.as_str(),
                 requester = ?requester,
-                peer_ip = ?peer_ip,
-                "probe request rejected by the three-layer rate limiter"
+                "probe request rejected by the rate limiter"
             );
             conn.close(
                 VarInt::from_u32(APP_ERR_RATE_LIMITED),
@@ -314,8 +327,8 @@ impl ProbeHandler {
             // RATE_LIMITED code and the layer label — except on the global
             // layer, where a flood would otherwise park a task per rejection
             // (operators pivot on the metric counter, not the close reason,
-            // for a global flood). Per-peer/per-IP rejections are bounded by
-            // their own buckets, so the capped wait is safe.
+            // for a global flood). Per-peer rejections are bounded by their
+            // own bucket, so the capped wait is safe.
             if layer != ProbeRejectLayer::Global {
                 let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
             }
@@ -391,9 +404,9 @@ impl ProbeHandler {
             );
             // Wait briefly for the close frame, as the per-peer rate-limit
             // path does, so the peer reliably observes the `0x04` code rather
-            // than a bare connection loss. The per-peer and per-IP probe
-            // buckets above already bound how often one peer reaches this
-            // point, so the capped wait is safe.
+            // than a bare connection loss. The per-peer probe bucket above
+            // already bounds how often one peer reaches this point, so the
+            // capped wait is safe.
             let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
             // Handled: counted, logged (throttled) and closed with its code.
             // An `Err` would have iroh's router log it again, unthrottled,
@@ -637,20 +650,29 @@ impl ProbeHandler {
         //   unaffected — it never reaches this arm because it is already
         //   `is_origin_sourced`).
         let is_origin_sourced = has_blob && !store_present;
+        // A node states no size it cannot prove (ADR 005 § Bounded byte
+        // ranges). Prove the size before an origin-sourced coverage is
+        // sized from it: an origin size with no proof advertises nothing.
+        let (total_bytes, size_proof) = if chain_stale {
+            (None, None)
+        } else {
+            self.proven_size(hash, total_bytes).await
+        };
         // The coverage and the size the response advertises, bound together: a
         // partial holder reads its size from the same bitfield as its blocks
-        // (#2195), because the store branch above sizes only a `Complete` blob and
-        // ADR 005 asks a node to include the size whenever it knows it.
-        let (coverage, total_bytes) = if chain_stale {
+        // (#2195), because the store branch above sizes only a `Complete` blob.
+        // That size, too, is stated only with its proof.
+        let (coverage, total_bytes, size_proof) = if chain_stale {
             // Chain-stale (above): advertise no coverage, so the re-derived
             // `has_blob` below stays false. This arm binds the stale answer for
             // every blob with a block; the presence gate above binds it for the
             // empty root (#2471).
-            (Coverage::empty(), total_bytes)
+            (Coverage::empty(), total_bytes, size_proof)
         } else if is_origin_sourced {
             (
                 total_bytes.map_or_else(Coverage::empty, |size| Coverage::full(num_blocks(size))),
                 total_bytes,
+                size_proof,
             )
         } else if holds_disabled || !self.relay_foreign_namespaces {
             // `holds_disabled`: the operator's explicit store opt-out (above).
@@ -661,17 +683,21 @@ impl ProbeHandler {
             // would read as "advertised but didn't serve", the reputation
             // hazard that policy closes). Consulting the cache's coverage
             // here would leak exactly that hit back in.
-            (Coverage::empty(), total_bytes)
+            (Coverage::empty(), total_bytes, size_proof)
         } else {
             match self.cache.coverage_sized(hash).await {
-                Ok((c, size)) => (c, total_bytes.or(size)),
+                Ok((c, size)) if total_bytes.is_none() => {
+                    let (total_bytes, size_proof) = self.proven_size(hash, size).await;
+                    (c, total_bytes, size_proof)
+                }
+                Ok((c, _)) => (c, total_bytes, size_proof),
                 Err(e) => {
                     tracing::warn!(
                         error = %e.display_chain(),
                         %hash,
                         "cache error deriving probe coverage; advertising none"
                     );
-                    (Coverage::empty(), total_bytes)
+                    (Coverage::empty(), total_bytes, size_proof)
                 }
             }
         };
@@ -687,12 +713,23 @@ impl ProbeHandler {
         // `coverage_sized`'s own refusal gate, and the empty root must not
         // bypass that, because signing `has_blob: true` for a blacklisted
         // hash is a blacklist-violation offense (ADR 014).
+        // A holder serves under a size it proves, so coverage it cannot size
+        // with a proof is no coverage (ADR 005 § Bounded byte ranges).
+        let coverage = if total_bytes.is_none() && *hash.as_bytes() != EMPTY_ROOT {
+            Coverage::empty()
+        } else {
+            coverage
+        };
         let has_blob = !coverage.is_empty()
             || (has_blob && *hash.as_bytes() == EMPTY_ROOT && !self.cache.refuses(hash));
+        // A size, and the proof that carries up to 1 KiB of the blob's tail,
+        // goes only with an advertised blob: never for a refused hash, a
+        // chain-stale answer or an opted-out store.
+        let size_proof = if has_blob { size_proof } else { None };
         debug_assert!(
             ProbeResponseExt {
-                total_bytes,
                 coverage: coverage.clone(),
+                size_proof: None,
             }
             .consistent_with(&ProbeResponseBody {
                 hash: *hash.as_bytes(),
@@ -743,13 +780,13 @@ impl ProbeHandler {
         };
 
         let resp = ProbeResponse { body, slash_sig };
-        // `total_bytes` and `coverage` are unsigned, so they ride in the trailing
-        // extension rather than the signed base (ADR 013 §Tier 1). Two-phase
-        // encode: a receiver that predates a future extension field stops at the
-        // end of the base.
+        // `coverage` and `size_proof` (the size and its proof) are unsigned,
+        // so they ride in the trailing extension rather than the signed base
+        // (ADR 013 §Tier 1). Two-phase encode: a receiver that predates a
+        // future extension field stops at the end of the base.
         let ext = ProbeResponseExt {
-            total_bytes,
             coverage,
+            size_proof,
         };
 
         let payload = encode_probe_response(&resp, Some(&ext))
@@ -859,11 +896,11 @@ async fn read_probe_request(
         let _ = recv.stop(v);
     };
 
-    // A probe request is at most 43 bytes; the ceiling refuses a larger frame before it
-    // is buffered (ADR 013 § Wire Framing).
+    // A probe request is at most 43 bytes; the request ceiling refuses a larger
+    // frame before it is buffered (ADR 013 § Wire Framing).
     let frame = match tokio::time::timeout(
         PROBE_READ_TIMEOUT,
-        read_frame(recv, decdn_protocol::MAX_PROBE_FRAME),
+        read_frame(recv, decdn_protocol::MAX_PROBE_REQUEST_FRAME),
     )
     .await
     {

@@ -128,6 +128,9 @@ impl BlobSource for BackendSource {
             };
             let header = UpstreamPullHeader {
                 total_bytes: self.total_bytes,
+                // The engine proved this size from the node's own origin
+                // before the response was signed.
+                size_proof: None,
                 rate_per_mb: 0,
                 interval_bytes: 0,
                 origin_attestation: None,

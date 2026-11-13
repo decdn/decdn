@@ -18,6 +18,7 @@
 //! | [`client`] | `cdn/client/v1`: [`StreamRequest`], [`StreamResponse`], [`ChunkData`], the wire [`Voucher`], [`StreamError`] |
 //! | [`dht`] | `cdn/dht/v1`: store and find requests, provider records, closer-node lists |
 //! | [`coverage`] | The block coverage bitmap a partial holder advertises |
+//! | [`size_proof`] | The [`SizeProof`] that proves a stated blob size |
 //! | [`identity`] | The 32-byte [`NodeId`] and [`ContentHash`] newtypes |
 //! | [`region`] | ISO 3166-1 alpha-2 [`Region`] codes |
 //!
@@ -25,7 +26,8 @@
 //!
 //! Every message is a postcard encoding behind a varint length prefix. Each read
 //! caps the prefix at its frame ceiling — [`MAX_PROBE_FRAME`],
-//! [`MAX_CLIENT_CONTROL_FRAME`], [`MAX_CHUNK_FRAME`] or [`MAX_DHT_FRAME`]
+//! [`MAX_CLIENT_CONTROL_FRAME`], [`MAX_STREAM_RESPONSE_FRAME`],
+//! [`MAX_CHUNK_FRAME`] or [`MAX_DHT_FRAME`]
 //! ([ADR 013 § Wire Framing]). A signed message has a frozen
 //! base: the fields its signature covers. Unsigned fields travel as trailing
 //! bytes after the base. [`decode_message`] returns them as a remainder, and the
@@ -63,13 +65,15 @@ pub mod framing;
 pub mod identity;
 pub mod message;
 pub mod region;
+pub mod size_proof;
 
 pub use client::{
     BINDING_SIG_LEN, CHUNK_BYTES, ChunkData, ChunkPreimage, ClientBinding, ClientMessage,
-    MAX_CHAIN_LENGTH, MAX_CHUNK_FRAME, MAX_CLIENT_CONTROL_FRAME, MB_BYTES, StreamError,
-    StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody, StreamResponseExt,
-    VOUCHER_SIG_LEN, Voucher, VoucherRejectReason, encode_chunk_frame, encode_stream_request,
-    encode_stream_response, parse_stream_request_ext, parse_stream_response_ext,
+    MAX_CHAIN_LENGTH, MAX_CHUNK_FRAME, MAX_CLIENT_CONTROL_FRAME, MAX_STREAM_RESPONSE_FRAME,
+    MB_BYTES, StreamError, StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody,
+    StreamResponseExt, VOUCHER_SIG_LEN, Voucher, VoucherRejectReason, encode_chunk_frame,
+    encode_stream_request, encode_stream_response, parse_stream_request_ext,
+    parse_stream_response_ext,
 };
 pub use coverage::{Coverage, DISCOVERY_BLOCK_BYTES, discovery_block_bytes, num_blocks};
 #[cfg(feature = "test-support")]
@@ -88,11 +92,12 @@ pub use framing::{
 };
 pub use identity::{ContentHash, ID_LEN, NodeId};
 pub use message::{
-    EMPTY_ROOT, MAX_PROBE_FRAME, MAX_RATE_PER_MB, MessageValidationError, ProbeMessage,
-    ProbeRequest, ProbeResponse, ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN,
+    EMPTY_ROOT, MAX_PROBE_FRAME, MAX_PROBE_REQUEST_FRAME, MAX_RATE_PER_MB, MessageValidationError,
+    ProbeMessage, ProbeRequest, ProbeResponse, ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN,
     encode_probe_response, parse_probe_response_ext,
 };
 pub use region::{InvalidRegion, Region, is_valid_region};
+pub use size_proof::{MAX_SIZE_PROOF_BYTES, SizeProof, SizeProofTooLong};
 
 /// ALPN protocol identifier for latency and availability probing.
 pub const ALPN_PROBE: &[u8] = b"cdn/probe/v1";
@@ -103,13 +108,16 @@ pub const ALPN_CLIENT: &[u8] = b"cdn/client/v1";
 /// ALPN protocol identifier for Kademlia-based content discovery (ADR 022).
 pub const ALPN_DHT: &[u8] = b"cdn/dht/v1";
 
-/// Connection rejected by the per-source or global rate limiter (ADR 013 §0x10).
+/// Connection or stream rejected by a node's concurrency cap or rate limiter
+/// (ADR 013 §0x10).
 ///
-/// Unlike `0x01`–`0x03`, this code is delivered via `CONNECTION_CLOSE` rather
-/// than `RESET_STREAM` because the rejection happens before any application
-/// stream is opened. The close-frame reason bytes carry a short layer label
-/// (e.g. `global-full`, `per-source`) so the peer can pick an appropriate
-/// backoff. Peers that receive this code SHOULD back off before
+/// A node that sheds a whole connection (the connection cap or a per-connection
+/// limiter, before any application stream exists) sends it as
+/// `CONNECTION_CLOSE`, and the close-frame reason bytes carry a short layer
+/// label (e.g. `global-full`, `per_peer`) so the peer can pick an appropriate
+/// backoff. A node that sheds one stream on an open connection (the
+/// `cdn/client/v1` stream cap or request limiter) sends it as `RESET_STREAM`,
+/// which carries no reason bytes. Peers that receive this code SHOULD back off before
 /// reconnecting; they MUST NOT treat it as a protocol error (the server is
 /// functioning normally — the client is overloading it). The requester side
 /// (`decdn-client`) types this code as `UpstreamRateLimited` so the pull

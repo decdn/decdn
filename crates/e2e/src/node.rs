@@ -250,9 +250,9 @@ impl NodeFixture {
     /// (`pool_floor_signer_live_windows`) in the daemon's config and restart the
     /// daemon so the new value takes effect.
     ///
-    /// This sizes the per-signer floor cap `k` in ramp-start credit windows (ADR 003
-    /// § Pool solvency, per-signer floor isolation): the most live un-vouchered floor
-    /// reservation plus floor debt one capability signer may hold underneath the
+    /// This sizes the per-signer LIVE concurrency cap `k` in ramp-start credit
+    /// windows (ADR 003 § Pool solvency, per-signer floor isolation): the most live
+    /// un-vouchered floor reservation one capability signer may hold underneath the
     /// per-pool `remaining − M` ceiling. A journey shrinks it so one signer
     /// deterministically fills its own share while the pool stays solvent, without
     /// touching a co-tenant's.
@@ -1429,13 +1429,22 @@ fn line_with_all<'a>(log: &'a str, needles: &[&str]) -> Option<&'a str> {
         .find(|line| needles.iter().all(|needle| line.contains(needle)))
 }
 
-/// Write `blob` into a filesystem-origin shard layout (`{root}/{hex[..2]}/{hex}`).
+/// Write `blob` into a filesystem-origin shard layout (`{root}/{hex[..2]}/{hex}`)
+/// with its `{hex}.sizeproof` sibling, as `decdn origin import` writes it.
 fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> anyhow::Result<()> {
     let hex = hash.to_hex();
     let shard = hex.as_str().get(..2).context("blob hex too short")?;
     let dir = root.join(shard);
     std::fs::create_dir_all(&dir).context("create origin shard dir")?;
     std::fs::write(dir.join(hex.as_str()), blob).context("write origin blob")?;
+    let size = u64::try_from(blob.len()).context("blob length")?;
+    let encoded =
+        decdn_bao_range::encode_outboard(blob, size).context("encode origin size proof")?;
+    std::fs::write(
+        dir.join(encoded.size_proof_name()),
+        encoded.size_proof_object(),
+    )
+    .context("write origin size proof")?;
     Ok(())
 }
 

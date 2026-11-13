@@ -98,7 +98,6 @@ fn seeded_dht_handles() -> DhtStatusHandles {
         decdn_node::dht::AttestedBy {
             attestation: decdn_protocol::OriginAttestation {
                 rate_per_mb: 1,
-                total_bytes: 1,
                 timestamp_us: 1,
                 slash_sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
             },
@@ -970,9 +969,6 @@ async fn cli_drain_wait_times_out_on_stuck_stream() -> anyhow::Result<()> {
     let limiter = decdn_node::dispatch::ConnectionLimiter::new(
         &ResolvedSecurity {
             max_concurrent_handlers: u32::MAX,
-            per_source_rate_per_sec: 1e9,
-            per_source_burst: u32::MAX,
-            max_tracked_sources: 16,
         },
         Arc::clone(&metrics),
     );

@@ -31,7 +31,7 @@ fn an_attestation_does_not_carry_to_another_hash() {
 fn an_unseated_signer_attests_nothing() {
     let other = PrivateKeySigner::random();
     let hash = [7; 32];
-    let att = sign_attestation(&other, &domain(), hash, 1, 1, 1).unwrap();
+    let att = sign_attestation(&other, &domain(), hash, 1, 1).unwrap();
     assert_eq!(verifier().recover(hash, &att), Some(other.address()));
     assert_eq!(verifier().verify(hash, &att), None);
 }
@@ -54,6 +54,6 @@ fn unseating_the_signer_cancels_its_attestation() {
 fn a_tampered_field_breaks_the_signature() {
     let hash = [7; 32];
     let mut att = attest(hash);
-    att.total_bytes += 1;
+    att.rate_per_mb += 1;
     assert_eq!(verifier().verify(hash, &att), None);
 }

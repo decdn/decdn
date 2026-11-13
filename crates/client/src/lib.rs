@@ -48,10 +48,10 @@
 //!    ([`discovery::select_candidates`]), and probe each one
 //!    ([`probe::probe_once`]). Verify every answer
 //!    ([`probe::verify_probe_response`]) before it counts, and drop an answer
-//!    whose `has_blob` and coverage disagree. A probe answer's size
-//!    ([`discovery::Probed::total_bytes`]) is an unsigned hint: pass it as the
-//!    fetch's first size claim, which the fetch grows or shrinks as verified
-//!    bytes land.
+//!    whose `has_blob` and coverage disagree, or that states a size with no
+//!    valid size proof ([`check_size_proof`]). A probe answer's size
+//!    ([`discovery::Probed::total_bytes`]) is proven: pass it as the fetch's
+//!    size, which plans the whole blob from the start.
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
 //!    what the `(pool, lane key, provider)` lane has already paid, and bind it
@@ -305,7 +305,10 @@ pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{Funder, PeerSource, PoolReplaced, Recovery, SourceFuture};
 pub use source_set::{Holder, NoAffordableSource, NoNodeWillServe, NoSourceHasBlob, StaticSources};
 pub use stop::{ClockHold, GaveUp, ProgressClock, StopPolicy};
-pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
+pub use streamer::{
+    LiveReader, ScratchStores, StreamCandidate, StreamDrive, StreamStore, StreamStores, Streamer,
+    VerifiedReader,
+};
 
 // The engine seams the node and the `decdn` CLI drive directly. They are
 // public so those crates can reach them, hidden from the docs and the
@@ -800,10 +803,8 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
 /// Typed sentinel for a pull ended by the buyer's `max_blob_size_bytes` cap
 /// (#1895). The cap bounds how many bytes of one blob the buyer holds, not which
 /// offsets it reads: a range anywhere in a blob larger than the cap lands while
-/// the bytes held stay within it. The peer's signed `total_bytes` claim never
-/// drives a refusal — it is peer-controlled and unverified
-/// (`StreamResponse::validate()` does not bound it) — so the cap binds on
-/// RECEIVED, BLAKE3-verified bytes instead. Returned (not a bare string) so the
+/// the bytes held stay within it, so the cap binds on RECEIVED, BLAKE3-verified
+/// bytes, and on a proven size that needs more than the cap. Returned (not a bare string) so the
 /// pull orchestrator can `downcast_ref` and classify it as a buyer-side policy
 /// rejection — distinct from a hash mismatch or an unreachable peer — rather than
 /// mis-attributing it to the provider's reputation. `Display` carries
@@ -867,6 +868,81 @@ impl std::fmt::Display for ResumeOffsetPastEnd {
 }
 
 impl std::error::Error for ResumeOffsetPastEnd {}
+
+/// A node stated a blob size it did not prove (ADR 005 § Bounded byte
+/// ranges): the size proof of a `StreamResponse` with `ok = true`, or of a
+/// probe answer, does not verify against the content hash and the size it
+/// states.
+///
+/// The size is a fault of that node. The client uses no part of the answer:
+/// it plans nothing, allocates nothing and pays nothing against the size. The
+/// acquire loop classifies it as a [`Fault::Source`], so the source cools and
+/// its ranges move to other sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnprovenSize {
+    /// The size the proof states.
+    pub total_bytes: u64,
+}
+
+impl std::fmt::Display for UnprovenSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the node's size proof does not prove a {}-byte blob",
+            self.total_bytes
+        )
+    }
+}
+
+impl std::error::Error for UnprovenSize {}
+
+/// A blob size whose size proof verified against the blob's hash (ADR 005 §
+/// Bounded byte ranges). [`check_size_proof`] is the only way to make one, so
+/// a raw `u64` from a node never reaches planning, allocation, a cap or
+/// payment. Read the size with [`Self::get`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProvenSize(u64);
+
+impl ProvenSize {
+    /// The size in bytes.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Take `size` as proven with no proof. Only tests build one this way:
+    /// their fixtures know the true size of the blobs they make.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub const fn assume_for_tests(size: u64) -> Self {
+        Self(size)
+    }
+}
+
+impl std::fmt::Display for ProvenSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Check that `proof` proves that the blob with hash `hash` is the size the
+/// proof states. Every size a node states is a proof, and passes through here
+/// before the client uses it.
+///
+/// # Errors
+///
+/// [`UnprovenSize`] when `proof` does not verify.
+pub fn check_size_proof(
+    hash: [u8; 32],
+    proof: &decdn_protocol::SizeProof,
+) -> Result<ProvenSize, UnprovenSize> {
+    let total_bytes = proof.size();
+    if decdn_bao_range::verify_size_proof(hash, total_bytes, proof.as_bytes()) {
+        Ok(ProvenSize(total_bytes))
+    } else {
+        Err(UnprovenSize { total_bytes })
+    }
+}
 
 impl std::fmt::Display for BlobTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1196,7 +1272,7 @@ impl UpstreamRefused {
                  (StreamResponse::validate invariant bypassed)"
             );
         }
-        match ext.error.clone() {
+        match ext.error().cloned() {
             Some(error) => anyhow::Error::new(Self {
                 kind: Kind::Open {
                     error,
@@ -1991,6 +2067,7 @@ async fn open_stream(
     RecvStream,
     StreamResponse,
     StreamResponseExt,
+    Option<ProvenSize>,
 )> {
     tokio::time::timeout(open, async move {
         let conn = match source {
@@ -2044,7 +2121,7 @@ async fn open_stream(
             .map_err(|e| rate_limited::transport_error("write stream request", e))?;
 
         let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-        verify_response(
+        let proven = verify_response(
             &resp,
             &resp_ext,
             slash_domain,
@@ -2052,7 +2129,7 @@ async fn open_stream(
             hash,
             timestamp_us,
         )?;
-        Ok((conn, send, recv, resp, resp_ext))
+        Ok((conn, send, recv, resp, resp_ext, proven))
     })
     .await
     .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
@@ -2186,10 +2263,9 @@ async fn fetch_inner(
 /// ([`UpstreamPull::next_chunk`] under a [`PullReader`]) with an in-memory `Vec`
 /// standing in for the ranged store / cache admit; there is no second receive
 /// implementation. A corrupt chunk group therefore aborts the pull at that group
-/// (ADR 038 §Receive side), before the rest of the stream is pulled or paid for —
-/// so a peer that signs an inflated `total_bytes` and streams framed garbage can
-/// bill at most the bytes that arrived before the first unverifiable group, never
-/// its claim.
+/// (ADR 038 §Receive side), before the rest of the stream is pulled or paid for,
+/// so a peer that streams framed garbage can bill at most the bytes that arrived
+/// before the first unverifiable group, never the whole blob.
 ///
 /// # Errors
 ///
@@ -2335,9 +2411,8 @@ async fn fetch_in_memory_once_on(
 /// The decoded buffer spans the chunk-group-aligned **superset**
 /// `[aligned.fetch_start(), aligned.fetch_end())` the server serves (a bao proof
 /// anchors whole 16 KiB groups); the caller trims the lead. The buffer is grown
-/// leaf by leaf rather than pre-sized: `aligned` derives from the peer's
-/// unverified `total_bytes`, so a capacity hint would let an inflated claim drive
-/// an over-allocation before a single byte verifies.
+/// leaf by leaf rather than pre-sized, so a caller-supplied `aligned` can drive
+/// no allocation before a single byte verifies.
 ///
 /// `on_progress`, when set, is called with `(content_position, total_bytes)` after
 /// each verified leaf lands — the same content-byte unit [`driver::drive`] reports.
@@ -2769,7 +2844,7 @@ fn frontier_is_proved(bundle: &WatermarkBundle) -> bool {
 }
 
 /// Whether a failed open of a bounded range could mean only that the range's
-/// START is past the blob's end: the size it was cut from was wrong. An end
+/// START is past the blob's end: it was cut before the size was known. An end
 /// past the blob clamps and serves rather than failing, so this fires only on
 /// a start with no bytes to serve.
 ///
@@ -2778,7 +2853,7 @@ fn frontier_is_proved(bundle: &WatermarkBundle) -> bool {
 /// class, so it removes the holder for this fetch and does not qualify here. A
 /// relay signs its own size instead, and the range then fails to align against
 /// it here ([`decdn_bao_range::RangeVerifyError::RangeOutOfBounds`] or
-/// [`ResumeOffsetPastEnd`]). A caller that cut the range from an unsigned size
+/// [`ResumeOffsetPastEnd`]). A caller that cut the range with no proven size
 /// asks for the whole blob on these, and treats every other failure as the
 /// open's own outcome (#2063).
 #[must_use]
@@ -2798,8 +2873,8 @@ pub fn is_range_past_end(err: &anyhow::Error) -> bool {
 /// size of the chunk-group-aligned range (content plus interleaved proof, ADR
 /// 038 §Payment metering), exactly the byte count the server emits. The server
 /// widens the request to enclosing 16 KiB groups and clamps an end past the
-/// blob to the blob's end (a claimed size is a hint); `total_bytes` here is the response
-/// header's signed size, so [`align_range_clamped`] /
+/// blob to the blob's end; `total_bytes` here is the response header's proven
+/// size, so [`align_range_clamped`] /
 /// [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
 /// reproduce the same clamp the server applied, keeping the two sides in
 /// lock-step. The one site every pull derives its wire bound (and its
@@ -2893,9 +2968,14 @@ fn log_proof_stall(
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct UpstreamPullHeader {
-    /// Whole-blob size the upstream promised (echoed into our downstream
-    /// `StreamResponse`).
+    /// Whole-blob size: the size [`Self::size_proof`] proves on a paid
+    /// upstream, and the size of the bytes an unpaid source serves.
     pub total_bytes: u64,
+    /// The size proof the upstream sent, verified against the hash and
+    /// `total_bytes` before this header exists. A relay keeps it and serves
+    /// it on its own responses. `None` on an unpaid source, which states the
+    /// size of bytes the caller already holds or reads from its own origin.
+    pub size_proof: Option<decdn_protocol::SizeProof>,
     /// Upstream rate; informational for the caller (the buyer pays it inside
     /// [`UpstreamPull::next_chunk`]).
     pub rate_per_mb: u64,
@@ -2911,6 +2991,18 @@ pub struct UpstreamPullHeader {
     /// here; a relay checks it against its seated-origin set before keeping
     /// it. `None` on an unpaid source.
     pub origin_attestation: Option<decdn_protocol::OriginAttestation>,
+}
+
+impl UpstreamPullHeader {
+    /// The header's size, proven by its size proof against `hash`; `None` for
+    /// a header with no proof (an unpaid source) or a proof of another size.
+    #[must_use]
+    pub fn proven_size(&self, hash: [u8; 32]) -> Option<ProvenSize> {
+        let proof = self.size_proof.as_ref()?;
+        check_size_proof(hash, proof)
+            .ok()
+            .filter(|proven| proven.get() == self.total_bytes)
+    }
 }
 
 /// A live, progressive `cdn/client/v1` pull (#856) — the ONE receive loop for
@@ -3031,9 +3123,9 @@ impl std::fmt::Debug for UpstreamPull {
 /// `total_bytes` is known up front), and return its header plus a live
 /// [`UpstreamPull`] to drive. Zero-rate rejection, `slash_sig` recovery, echoed
 /// field checks, the buyer's rate ceiling, and the `total_bytes >= byte_offset`
-/// floor are all enforced BEFORE the first chunk. The `max_blob_size_bytes`
-/// cap is NOT one of them (#1895): the peer's `total_bytes` claim is
-/// unverified, so the cap binds on the bytes that ACTUALLY arrive. One stream
+/// floor are all enforced BEFORE the first chunk, and so is the size proof of
+/// `total_bytes` ([`UnprovenSize`]). The `max_blob_size_bytes` cap binds on the
+/// bytes held for the blob, not on its size (#1895). One stream
 /// carries at most the cap's worth of content from its own offset, enforced
 /// inside [`UpstreamPull::next_chunk`] as [`BlobTooLarge`]; the offset itself is
 /// never refused. `0` = unlimited.
@@ -3218,7 +3310,7 @@ async fn open_progressive_pull_impl(
     let result: anyhow::Result<(UpstreamPullHeader, UpstreamPull)> = async {
         let window = deadlines.window;
         let floor_bps = deadlines.floor_bps;
-        let (conn, send, recv, resp, resp_ext) = open_stream(
+        let (conn, send, recv, resp, resp_ext, proven) = open_stream(
             source,
             ctx,
             slash_domain,
@@ -3238,17 +3330,13 @@ async fn open_progressive_pull_impl(
             deadlines.open,
         )
         .await?;
-        if !resp.body.ok {
+        let Some(proven) = proven.filter(|_| resp.body.ok) else {
             return Err(UpstreamRefused::open(resp, &resp_ext));
-        }
-        // The peer's signed `total_bytes` never drives a refusal (#1895): it is
-        // peer-controlled and unverified (`StreamResponse::validate()` does not bound
-        // it), so the `max_blob_size_bytes` cap is enforced on the bytes that
-        // ACTUALLY arrive, inside `UpstreamPull::next_chunk`, not on the claim. Refusing
-        // on an inflated claim would let a holder centralise a small blob's traffic
-        // across every finite-cap relay; a lie cannot produce bytes that verify
-        // against the true root, and one stream of an honest giant is streamed and
-        // paid for only up to the cap's worth.
+        };
+        // `verify_response` proved the size against the hash. The
+        // `max_blob_size_bytes` cap still binds on the bytes that arrive, inside
+        // `UpstreamPull::next_chunk`: one stream of a large blob is streamed and paid
+        // for only up to the cap's worth, wherever it starts.
         // Buyer-side rate ceiling (#1375): refuse an over-ceiling quote before the
         // first paid interval, carrying the signed quote out as rate-manipulation
         // evidence. `0` = unbounded.
@@ -3264,14 +3352,14 @@ async fn open_progressive_pull_impl(
         // Wire-byte bound (bao-encoded size of the aligned range), not content bytes:
         // the window path forwards this stream verbatim and pays the upstream in wire
         // bytes (ADR 038 §Payment metering).
-        let total_bytes = resp.body.total_bytes;
+        let total_bytes = proven.get();
         let expected_wire_bytes = served_wire_len(byte_offset, byte_len, total_bytes)?;
         // Per-stream bound on received bytes (#1895), as WIRE so `next_chunk` can
         // enforce it without decoding: the wire size of the cap's worth of content
         // from this offset. The cap bounds the bytes held for one blob, so one
         // stream never carries more content than the cap, wherever in the blob it
-        // starts. Enforced on the bytes that ACTUALLY arrive, never on the peer's
-        // unverified `total_bytes` claim. The caller's driver meters the bytes the
+        // starts. Enforced on the bytes that ACTUALLY arrive. The caller's driver
+        // meters the bytes the
         // store holds across streams (`driver::fill_gap`). `0` = unlimited. The
         // empty blob carries no content, so a cap has nothing to bound and no
         // range to size against a signed size of zero.
@@ -3282,6 +3370,7 @@ async fn open_progressive_pull_impl(
         };
         let header = UpstreamPullHeader {
             total_bytes,
+            size_proof: resp_ext.size_proof().cloned(),
             rate_per_mb,
             interval_bytes: CHUNK_BYTES,
             origin_attestation: resp_ext
@@ -3595,8 +3684,7 @@ impl UpstreamPull {
                         );
                     }
                     // Per-stream received-byte bound (#1895): enforce the cap on the
-                    // bytes that ACTUALLY arrive, never on the peer's unverified
-                    // `total_bytes` claim. `max_received_wire` is the wire size of the
+                    // bytes that ACTUALLY arrive. `max_received_wire` is the wire size of the
                     // cap's worth of content from this stream's offset, so this is the
                     // wire form of "this stream carried more content than the cap" —
                     // distinct from the claim-derived `expected_wire_bytes` overrun
@@ -4345,6 +4433,7 @@ fn voucher_rejection(
 }
 
 /// Validate + verify a `StreamResponse` on receive (ADR 005, ADR 014 §1, #252).
+/// Returns the proven blob size of a served response, `None` for a refusal.
 fn verify_response(
     resp: &StreamResponse,
     ext: &StreamResponseExt,
@@ -4352,7 +4441,7 @@ fn verify_response(
     expected_signer: Address,
     hash: [u8; 32],
     timestamp_us: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ProvenSize>> {
     // #252 + slash_sig length/upper-bound checks on the frozen base...
     resp.validate()
         .map_err(|e| anyhow::anyhow!("invalid stream response: {e}"))?;
@@ -4373,7 +4462,12 @@ fn verify_response(
     StreamSlashData::from_response_body(&resp.body)
         .verify_signer(&sig, expected_signer, slash_domain)
         .map_err(|e| anyhow::anyhow!("slash_sig verification failed: {e}"))?;
-    Ok(())
+    // A served response states its size only in its proof (ADR 005 § Bounded
+    // byte ranges), and `validate` above ties a served outcome to `ok`.
+    Ok(ext
+        .size_proof()
+        .map(|proof| check_size_proof(hash, proof))
+        .transpose()?)
 }
 
 async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Result<()> {
@@ -4397,13 +4491,13 @@ async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Re
 /// extension: every mid-stream variant is a single postcard value, and widening
 /// the shared reader would push an always-`default()` ext onto all of them.
 ///
-/// The read is capped at [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`]: a
-/// `StreamResponse` is a few hundred bytes, so a node cannot make the payer
-/// buffer a chunk-sized frame before the stream has opened.
+/// The read is capped at [`decdn_protocol::MAX_STREAM_RESPONSE_FRAME`]: a
+/// `StreamResponse` with its size proof is under 5 KiB, so a node cannot make
+/// the payer buffer a chunk-sized frame before the stream has opened.
 async fn read_stream_response(
     recv: &mut RecvStream,
 ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
-    let frame = read_frame(recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME)
+    let frame = read_frame(recv, decdn_protocol::MAX_STREAM_RESPONSE_FRAME)
         .await
         .map_err(|e| rate_limited::transport_error("frame read failed", e))?;
     let (msg, tail) = decode_message::<ClientMessage>(&frame)

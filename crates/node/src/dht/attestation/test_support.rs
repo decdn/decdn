@@ -53,9 +53,8 @@ pub fn self_signing() -> Arc<crate::attestations::Attestations> {
 /// A valid attestation for `hash`, signed by [`ORIGIN`].
 #[must_use]
 pub fn attest(hash: [u8; 32]) -> OriginAttestation {
-    sign_attestation(&*ORIGIN, &domain(), hash, 1, 1, 1).unwrap_or_else(|_| OriginAttestation {
+    sign_attestation(&*ORIGIN, &domain(), hash, 1, 1).unwrap_or_else(|_| OriginAttestation {
         rate_per_mb: 1,
-        total_bytes: 1,
         timestamp_us: 1,
         slash_sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
     })

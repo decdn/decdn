@@ -1616,7 +1616,6 @@ impl ChainFixture {
         // higher `stream_rate` for the same hash inside the 30s window.
         let probe_rate: u64 = 10;
         let stream_rate: u64 = 25;
-        let total_bytes: u64 = 1_048_576;
 
         let probe = ProbeSlashData {
             hash: blob_hash,
@@ -1628,7 +1627,6 @@ impl ChainFixture {
             hash: blob_hash,
             ok: true,
             rate_per_mb: stream_rate,
-            total_bytes,
             timestamp_us: stream_ts_us,
         };
         let domain = slash_judge_domain(self.chain_id, self.addrs.slash_judge);
@@ -1677,7 +1675,6 @@ impl ChainFixture {
             hash: blob_hash,
             ok: true,
             ratePerMb: stream_rate,
-            totalBytes: total_bytes,
             timestampUs: stream_ts_us,
         };
         let receipt = crate::bindings::SlashJudgeRate::new(self.addrs.slash_judge, &ch_provider)
@@ -1879,7 +1876,6 @@ impl ChainFixture {
             hash: stream_data.hash,
             ok: stream_data.ok,
             ratePerMb: stream_data.rate_per_mb,
-            totalBytes: stream_data.total_bytes,
             timestampUs: stream_data.timestamp_us,
         };
         // The daemon's own signatures, forwarded byte-for-byte.

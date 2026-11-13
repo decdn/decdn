@@ -29,12 +29,14 @@ The Ethereum key is the same secp256k1 key the node already holds for staking an
 `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Requesters MUST reject responses with missing or zero-length `slash_sig`. There is no opt-out: every interaction in the paid delivery path is on-chain slashable. The fields covered by `slash_sig` are the same fields that drive the slashing mechanisms in [ADR 005](005-protocol.md#adr-005-wire-protocol):
 
 ```
-ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {total_bytes?}
-StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {error?}
+ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {coverage, size_proof?}
+StreamResponse {ok, rate_per_mb, timestamp_us, slash_sig} ++ Ext {outcome, origin_attestation?}
 ```
 
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
-- **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, timestamp_us}`
+- **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, timestamp_us}`
+
+No signed field holds the blob size. A response states the size only in its size proof, which the receiver verifies against `hash` ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)). No slashing condition reads the size.
 
 `hash` is a request-context field (from `ProbeRequest` and `StreamRequest`), not transmitted in the response body — implementers must include it when building and verifying the EIP-712 typed data. The signed `StreamResponse` names no pool or payer. It is a statement by the node about its own serve of a hash, so a third party can verify it without the request. A seated origin's `StreamResponse` with `ok: true` is therefore also the origin attestation that a DHT record carries ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
 
@@ -46,7 +48,7 @@ bytes32 constant PROBE_RESPONSE_TYPEHASH = keccak256(
 );
 
 bytes32 constant STREAM_RESPONSE_TYPEHASH = keccak256(
-    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,uint64 timestampUs)"
+    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)"
 );
 ```
 

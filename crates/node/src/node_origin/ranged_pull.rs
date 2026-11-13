@@ -28,9 +28,9 @@
 //!
 //! A source that refuses a run for backpressure ([`RunOutcome::Backpressure`])
 //! has not shown that it cannot serve. The common cause is the source's
-//! per-signer floor cap: this node pays every upstream leg from one buyer signer,
+//! per-signer live cap: this node pays every upstream leg from one buyer signer,
 //! so its OTHER pulls on the same source (other serve-misses, each with its own
-//! assembly) can fill that cap, and its live part clears as those pulls pay. When
+//! assembly) can fill that cap, and the refusal clears as those pulls pay. When
 //! another survivor covers the still-missing gap, the loop reassigns as for any
 //! other fault. When no survivor does, dropping the source would end the assembly
 //! and fail every serve stream attached to it, so the loop keeps the source, waits
@@ -91,7 +91,7 @@ pub(crate) enum RunOutcome {
     /// funding recovery step raises the deposit ([`RunSink::recover`]).
     Unfunded,
     /// The source refused to open this run for a reason that usually clears with
-    /// time — most often a per-signer floor cap, or a load shed (#2178). It says
+    /// time — most often a per-signer live cap, or a load shed (#2178). It says
     /// nothing about whether the source can serve the range. The loop reassigns
     /// when another survivor covers the gap, and otherwise keeps the source and
     /// drives it again after a [`RunSink::backoff`].
@@ -418,6 +418,21 @@ pub(crate) async fn assemble<S: RunSink>(
         }
         surviving.retain(|&s| s != ix);
     }
+}
+
+/// The length of a pull of `len` bytes (`0`: to the end) the pull plans, cut
+/// to the bytes a node holds for one blob, `max_blob_size_bytes` (`0`: no
+/// cap). A whole-blob request of a blob larger than the cap plans no block
+/// past the cap's reach from the pull's offset. The reach runs one chunk
+/// group past the cap, so a pull that would hold more than the cap still
+/// meets the held-bytes meter and ends with `BlobTooLarge`. The result is
+/// never `0` for a nonzero cap, so it never reads as "to the end".
+pub(crate) const fn planned_len(len: u64, max_blob_size_bytes: u64) -> u64 {
+    if max_blob_size_bytes == 0 {
+        return len;
+    }
+    let reach = max_blob_size_bytes.saturating_add(decdn_bao_range::CHUNK_GROUP_BYTES);
+    if len == 0 || len > reach { reach } else { len }
 }
 
 /// The part of `gap` that no candidate in `coverage` covers — the test

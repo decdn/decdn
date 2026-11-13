@@ -1,8 +1,9 @@
 //! Origin backends — the source of truth a node falls back to on a cache miss.
 //!
-//! [`Origin`] is the seam. Three concrete implementations ship today:
-//! [`HttpOrigin`] (generic HTTP/S), [`FilesystemOrigin`] (local disk), and
-//! [`S3Origin`] (S3-compatible object stores: AWS S3, R2, B2, `MinIO`).
+//! [`Origin`] is the seam. Three concrete implementations ship:
+//! `HttpOrigin` (generic HTTP/S), `FilesystemOrigin` (local disk), and
+//! `S3Origin` (S3-compatible object stores: AWS S3, R2, B2, `MinIO`). The
+//! `s3` feature, on by default, builds `S3Origin` and links the AWS SDK.
 
 pub(crate) mod decompress;
 pub mod fs;
@@ -10,6 +11,7 @@ pub mod http;
 pub(crate) mod io_runtime;
 #[cfg(test)]
 mod log_capture;
+#[cfg(feature = "s3")]
 pub mod s3;
 
 use std::future::Future;
@@ -21,6 +23,7 @@ use iroh_blobs::Hash;
 
 pub use fs::FilesystemOrigin;
 pub use http::HttpOrigin;
+#[cfg(feature = "s3")]
 pub use s3::{S3Credentials, S3Origin, S3OriginConfig};
 // `OriginKind`, `OriginUrl`, `DecompressMode`, `parse_origin_url`, and
 // `DEFAULT_USER_AGENT` moved to the `decdn-config-types` leaf crate
@@ -427,6 +430,24 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         _outboard_max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async { Ok(OutboardFetch::Unsupported) })
+    }
+
+    /// Fetch the sibling `{H}.sizeproof` object of the blob `hash`: the size
+    /// and its proof that `decdn origin import` writes beside the outboard
+    /// (ADR 005 § Bounded byte ranges; [`decdn_bao_range::size_proof_object`]).
+    /// The read is capped at [`decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES`].
+    ///
+    /// `Ok(None)` means the origin serves no proof for the hash: the object is
+    /// missing, larger than the cap, or the backend does not serve siblings.
+    /// The engine then has no provable size for an origin-only blob, and the
+    /// node states none. Like every origin byte, a returned proof is **untrusted** until
+    /// it verifies against `H`. A transport fault surfaces as
+    /// [`OriginPullError`]. The default returns `Ok(None)`.
+    fn fetch_size_proof(
+        &self,
+        _hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Best-effort total byte size of the blob `hash`, used to scope a

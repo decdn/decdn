@@ -32,8 +32,10 @@ Each read has a frame ceiling. The ceiling is at least the largest legitimate me
 
 | Ceiling | Value | Reads | Largest legitimate message |
 | --- | --- | --- | --- |
-| `MAX_PROBE_FRAME` | 1 KiB | Every `cdn/probe/v1` read | `ProbeResponse` with its extension: 325 B |
-| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher`, `ChunkPreimage` and `StreamResponse` | `StreamRequest` with a binding and a capability: 301 B |
+| `MAX_PROBE_REQUEST_FRAME` | 1 KiB | `ProbeRequest`, which the node reads | `ProbeRequest`: 43 B |
+| `MAX_PROBE_FRAME` | 8 KiB | `ProbeResponse`, which the requester reads | `ProbeResponse` with its extension and a full size proof: 4,807 B |
+| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding and a capability: 301 B |
+| `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a refusal code, an origin attestation and a full size proof: under 5 KiB |
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |
 | `MAX_DHT_FRAME` | 64 KiB | Every `cdn/dht/v1` read, request and response | `BatchStoreRequest` with 256 entries: 59,939 B |
 
@@ -288,8 +290,10 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
-| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `timestamp_us` | `error`, `origin_attestation` |
+| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `coverage`, `size_proof` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `timestamp_us` | `outcome` (`Served(size_proof)` or `Refused(error)`), `origin_attestation` |
+
+An unsigned field is a fact when a proof that the receiver checks makes it one. `size_proof` is such a field: it holds the blob size and proves it against the signed `hash` ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)), so it needs no signature, and no signed field repeats the size. Its decode bounds the proof bytes at 4,480. A `StreamResponse` with `ok = true` must have a served outcome, so it always carries its size proof; a receiver refuses one that does not.
 
 #### Implementation note — separating signed and unsigned fields
 
@@ -315,7 +319,8 @@ struct ProbeResponse {
 /// Unsigned fields — a separate postcard value appended after the base.
 #[derive(Serialize, Deserialize, Default)]
 struct ProbeResponseExt {
-    total_bytes: Option<u64>,
+    coverage: Coverage,
+    size_proof: Option<SizeProof>,
 }
 ```
 
@@ -338,7 +343,7 @@ QUIC application error codes used by this ADR:
 | `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix above the frame ceiling of the read ([Wire Framing](#wire-framing)). The node sends it when it refuses a request read. A reader that refuses a later frame on an open stream ends the stream without this code. |
 | `0x03` | `MALFORMED_MESSAGE` | Frame failed application-layer decoding: postcard deserialization failure or varint parse error. Transport-level read failures (truncation, peer reset) are reported as `0x00` instead — the framing layer surfaces them as a distinct error variant (`FrameError::Io` vs `FrameError::Varint`/`Decode`), so a receiver does not have to collapse the two. The node also sends it for a client binding that fails to verify ([ADR 005 § Client identity binding](005-protocol.md#client-identity-binding)): the request decodes, but its proof of identity does not hold. |
 | `0x04` | `TIMESTAMP_SKEW` | Request refused because its `timestamp_us` differs from the node's clock by more than the 30-second bound ([ADR 005](005-protocol.md#adr-005-wire-protocol)). The signed response bodies echo the requester timestamp into the slash-evidence set, so the node refuses before it signs anything. The node sends it as `RESET_STREAM` on `cdn/client/v1` and as `CONNECTION_CLOSE` on `cdn/probe/v1`. The usual cause is the requester's clock. If only one node refuses, that node's clock is wrong. `decdn-client` types this code as `UpstreamTimestampRejected` so the failure names the clock. A peer that does not know the code treats it as a generic transport error, which is safe. Peers MUST NOT apply the `0x03` protocol-fault penalty to it. The node-to-node pull path records no reputation outcome for it and suppresses the `(peer, hash)` pair for a short window, as for `0x10`. |
-| `0x10` | `RATE_LIMITED` | Connection rejected by the per-source or global rate limiter. Delivered via `CONNECTION_CLOSE` (not `RESET_STREAM`) because rejection happens before any application stream exists; the close-frame reason bytes carry a short layer label (e.g. `global-full`, `per-source`) so peers can pick an appropriate backoff. Peers that receive this code SHOULD back off before reconnecting; they MUST NOT treat it as a protocol error. The requester reads this code: `decdn-client` types a `0x10` close or stream reset as `UpstreamRateLimited`, and the node-to-node pull path suppresses the `(peer, hash)` pair for a short window and records no reputation outcome (the same treatment as a handler-level `NotFound` refusal). |
+| `0x10` | `RATE_LIMITED` | Connection or stream rejected by a concurrency cap or a rate limiter. A node that sheds a whole connection, before any application stream exists, sends `CONNECTION_CLOSE`. The close-frame reason bytes carry a short layer label (e.g. `global-full`, `per_peer`) so peers can pick an appropriate backoff. A node that sheds one stream on an open connection (the `cdn/client/v1` stream cap or request limiter) sends `RESET_STREAM`, which carries no reason bytes. Peers that receive this code SHOULD back off before reconnecting; they MUST NOT treat it as a protocol error. The requester reads this code: `decdn-client` types a `0x10` close or stream reset as `UpstreamRateLimited`, and the node-to-node pull path suppresses the `(peer, hash)` pair for a short window and records no reputation outcome (the same treatment as a handler-level `NotFound` refusal). |
 
 #### Scope
 

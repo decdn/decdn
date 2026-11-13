@@ -50,9 +50,6 @@ fn dht_conns(ep: &Endpoint) -> decdn_client::Connections {
 fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
-        per_source_rate_per_sec: 1_000_000.0,
-        per_source_burst: u32::MAX,
-        max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
 }
@@ -61,11 +58,8 @@ fn permissive_dht_rate_limiter(metrics: &Arc<Metrics>) -> Arc<DhtRateLimiter> {
     let cfg = DhtRateLimitConfig {
         per_peer_rate_per_sec: 1e6,
         per_peer_burst: u32::MAX,
-        per_ip_rate_per_sec: 1e6,
-        per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e6,
         global_burst: u32::MAX,
-        max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };
     Arc::new(DhtRateLimiter::new(&cfg, Arc::clone(metrics)))
@@ -926,8 +920,14 @@ impl TwoBlockBlob {
         iroh_blobs::Hash::from_bytes(self.root)
     }
 
-    /// Admit `[off, off + len)` of the blob into `cache`.
+    /// Admit `[off, off + len)` of the blob into `cache`, keeping the blob's
+    /// size proof first as a pull-through keeps its upstream's: a node
+    /// advertises no coverage it cannot size under a proof.
     async fn admit(&self, cache: &decdn_cache::CacheEngine, off: u64, len: u64) {
+        let proof = decdn_bao_range::encode_outboard(self.plaintext.as_slice(), self.total)
+            .unwrap()
+            .size_proof;
+        assert!(cache.keep_size_proof(self.hash(), self.total, &proof).await);
         let (hash, ranges, bao) = bao_for(
             self.root,
             &self.plaintext,

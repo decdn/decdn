@@ -589,7 +589,7 @@ impl ClientFixture {
 
         let frame = tokio::time::timeout(
             WIRE_TAP_FIRST_FRAME,
-            decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME),
+            decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_STREAM_RESPONSE_FRAME),
         )
         .await
         .context("delivery capture: node sent no open frame")?

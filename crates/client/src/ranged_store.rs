@@ -4,15 +4,15 @@
 //! `iroh-blobs` dependency: `decdn-client` must stay iroh-blobs-free so the
 //! CLI's pull path links no blob store / AWS SDK (#578).
 //!
-//! The store is keyed by offset, not by size. A blob's size is a hint: the
-//! store holds the current size `bound` the planner works to, and a `proven`
-//! size once some leg proves one. Each leg verifies under the size its own
-//! sender claims, because a range can verify only under its sender's tree:
-//! `ingest_stream` realigns the leg under that claim and decodes with
-//! `BaoTree::new(claim, IROH_BLOCK_SIZE)`. A verified leaf is a genuine byte
-//! at its genuine offset under any claim, so the data file and the verified
-//! chunk ranges do not depend on the size. A leg that verifies the final chunk
-//! of its claim proves that size: only the true size verifies a final chunk.
+//! The store is keyed by offset. It holds the size `bound` the planner works
+//! to and the `proven` size: a size proof sets both
+//! ([`ClientRangedStore::prove_size`]), and no work is planned before one.
+//! Each leg verifies under the size its sender proves in the leg's header:
+//! `ingest_stream` aligns the leg under that size and decodes with
+//! `BaoTree::new(size, IROH_BLOCK_SIZE)`. A verified leaf is a genuine byte at
+//! its genuine offset, so the data file and the verified chunk ranges do not
+//! depend on the size. A leg that verifies the final chunk proves the size as
+//! well: only the true size verifies a final chunk.
 //!
 //! Construction plus the query methods (`total_bytes`, `present_ranges`,
 //! `missing_ranges`, `read`, `is_complete`) query the record. `admit` and
@@ -533,6 +533,27 @@ impl ClientRangedStore {
         if state.proven.is_none() {
             state.bound = bound;
         }
+    }
+
+    /// Record `size` as proven: a node's size proof verified it against the
+    /// root (ADR 005 § Bounded byte ranges), so the bound becomes it
+    /// before any leg holds the final chunk. Only the true size proves, so a
+    /// resumed record that names another proven size is wrong: the fresh
+    /// proof replaces it, with a warning.
+    pub fn prove_size(&self, size: crate::ProvenSize) {
+        let size = size.get();
+        let mut state = self.lock_state();
+        if state.proven == Some(size) {
+            return;
+        }
+        if let Some(recorded) = state.proven {
+            tracing::warn!(
+                recorded,
+                proven = size,
+                "the store's record names another proven size; the fresh proof replaces it"
+            );
+        }
+        state.prove(size);
     }
 
     /// The state under its lock. A poisoned lock still holds a consistent
@@ -1618,6 +1639,10 @@ impl crate::source::IngestStore for ClientRangedStore {
 
     fn set_bound(&self, bound: u64) {
         Self::set_bound(self, bound);
+    }
+
+    fn prove_size(&self, size: crate::ProvenSize) {
+        Self::prove_size(self, size);
     }
 }
 

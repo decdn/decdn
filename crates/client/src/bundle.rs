@@ -436,8 +436,9 @@ pub struct ManifestEntry {
     pub path: String,
     /// The file's whole-file BLAKE3 hash, which the fetch verifies.
     pub hash: [u8; 32],
-    /// The file's size. Optional on the wire: the pull uses it as the first
-    /// size claim and for progress totals, and verifies the true size.
+    /// The file's declared size. Optional on the wire: the pull uses it for
+    /// progress totals, and its chunk hints hold only when it equals the size
+    /// a holder proves. It sizes no store and plans no range.
     pub size: Option<u64>,
     /// The file's ordered chunk decomposition, a range-dedup hint. Chunks it
     /// shares with a sibling entry are spliced from disk instead of paid for

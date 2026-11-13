@@ -34,8 +34,7 @@ pnpm -C crates/cli/dashboard install --frozen-lockfile && pnpm -C crates/cli/das
 pre-commit run --all-files           # run all hooks
 # Contracts — mirror what CI runs.
 (cd contracts && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings && forge test)
-(cd contracts && aderyn -o /tmp/aderyn.md --no-snippets --skip-update-check)  # fail-on: high
-(cd contracts && slither . --config-file slither.config.json)                 # fail-on: medium
+(cd contracts && slither . --config-file slither.config.json)  # fail-on: medium
 ```
 
 Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots live in [CONTRIBUTING.md § Solidity development](CONTRIBUTING.md#solidity-development). CI fails on warnings that local `forge test` ignores, so reproduce with the `FOUNDRY_PROFILE=ci` commands before pushing.
@@ -67,8 +66,8 @@ crates/
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   config-types/ — config-vocabulary value types (RetryPolicy, DecompressMode, OriginUrl, OriginKind, Hash, PinnedHashes) shared by cache + common (leaf crate: serde + url + anyhow, no iroh-blobs / no AWS — #578)
-  bao-range/    — iroh-blobs-free bao verified-range helpers (ADR 038): chunk-group alignment, range encode/verify against an untrusted `{H}.obao4` pre-order outboard, plus the origin-store layout contract (`OBAO4_SUFFIX`, shard prefix) and the writer-side outboard encoder (`encode_outboard`) shared by the cache reader and `decdn origin import` (#1904). Builds on `bao-tree` rather than `iroh-blobs`, which is what keeps the CLI pull path iroh-blobs-free (#823, #915, #578, #1904)
-  cache/        — cache engine wrapping iroh-blobs + origin pull-through
+  bao-range/    — iroh-blobs-free bao verified-range helpers (ADR 038): chunk-group alignment, range encode/verify against an untrusted `{H}.obao4` pre-order outboard, size proofs (`verify_size_proof`, `encode_size_proof`, `size_proof_from_tail_wire`: the last 1 KiB chunk and its path to the root), plus the origin-store layout contract (`OBAO4_SUFFIX`, `SIZE_PROOF_SUFFIX`, shard prefix) and the writer-side encoder (`encode_outboard`, which yields the outboard and the size proof in one pass) shared by the cache reader and `decdn origin import` (#1904). Builds on `bao-tree` rather than `iroh-blobs`, which is what keeps the CLI pull path iroh-blobs-free (#823, #915, #578, #1904)
+  cache/        — cache engine wrapping iroh-blobs + origin pull-through, plus the eviction driver loop that holds the store under its disk-aware ceiling (`eviction_driver::run`; the caller injects the free-disk probe and a per-release callback); keeps one size proof per blob (`CacheEngine::size_proof`), built from the local store or read from the origin's `{H}.sizeproof`, stored under a named tag while the store holds the blob (so it survives a restart) and dropped on eviction; the default `s3` feature builds `S3Origin` and links the AWS SDK, and `default-features = false` is the store-only build with neither
   client/       — reusable `cdn/client/v1` paid-pull requester (`open_progressive_pull` → `UpstreamPull`, driven by the gap-filling `drive`) + buyer-side channel open: signs the request, verifies the signed `StreamResponse`, pays cumulative vouchers at each interval, verifies every bao chunk group as it lands. Shared by `node` (node-to-node miss pulls, #317) and `cli` (`decdn get` of a blob or a bundle); the `test-util` `stream_fetch*` wrappers drive the same loop into memory for tests
   incentive/    — shared payment pools, staking, vouchers (alloy for Ethereum)
   reputation/   — reputation scoring (ADR 008): local per-peer EWMA only; no cross-node aggregation
@@ -100,6 +99,7 @@ The two node binaries share `common` for config schema, identity, and admin wire
 ### Key Design Decisions
 
 - Content is BLAKE3-addressed; clients verify hashes on received bytes
+- A blob size is a fact: every size a node states carries a size proof, and nothing plans, allocates or pays from a size before its proof verifies (ADR 005 § Bounded byte ranges)
 - No external origin URLs are ever exposed — origin backends (S3/R2/B2) are opaque per-node config
 - All byte transfers are paid, including node-to-node cache-miss pulls
 - TOKEN for staking/governance, USDC for payments (dual-currency model)

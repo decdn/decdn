@@ -105,7 +105,7 @@ use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
     ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
-    pinned_targets, probe_and_order, probe_pinned,
+    probe_and_order, probe_pinned,
 };
 use crate::{
     ClientRangedStore, Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded,
@@ -340,7 +340,7 @@ async fn resolve_disk_state(
         }
         // Fast-skip: the saved record agrees with the file on hash, size, and
         // mtime. The file is accepted by its hash: the manifest's `size` is only
-        // a first claim, and a blob whose true size differs from it is still
+        // declared, and a blob whose true size differs from it is still
         // the entry's blob, so it is not fetched again on every run.
         let fast = saved
             .get(&en.path)
@@ -1837,7 +1837,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         max_blob_bytes: u64,
     ) -> anyhow::Result<bool> {
         slot.ensure().await?;
-        let targets = self.entry_targets(hash, total).await?;
+        let targets = self.entry_targets(hash).await?;
         self.acquire_entry(
             &targets,
             hash,
@@ -1851,32 +1851,21 @@ impl<P: Provider + Clone> PullCtx<P> {
         .await
     }
 
-    /// One entry's holders: the pinned node, probed for the blob's size when
-    /// `total` (the manifest's size) gives none, or a fresh probe of the
+    /// One entry's holders: the pinned node, probed for the blob's proven
+    /// size, or a fresh probe of the
     /// entry's own registry sample (proxy-warming non-holders first when they
     /// help, then holders nearest RTT first). An entry resolves them once and
     /// every fetch of the entry reuses them. A resolution that fails for any
     /// reason but the configuration ([`holders_or_none`]) starts the
     /// entry with no holder, and its acquire loop discovers them.
-    async fn entry_targets(
-        &self,
-        hash: [u8; 32],
-        total: Option<u64>,
-    ) -> anyhow::Result<ResolvedTargets> {
-        holders_or_none(self.resolve_entry_targets(hash, total).await)
+    async fn entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
+        holders_or_none(self.resolve_entry_targets(hash).await)
     }
 
     /// [`Self::entry_targets`] before a failure is sorted into a configuration
     /// fault or an empty start.
-    async fn resolve_entry_targets(
-        &self,
-        hash: [u8; 32],
-        total: Option<u64>,
-    ) -> anyhow::Result<ResolvedTargets> {
+    async fn resolve_entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
         match &self.nodes.selection {
-            Selection::Pinned(pinned) if total.is_some() => {
-                Ok(pinned_targets(pinned.node_id, pinned.provider))
-            }
             Selection::Pinned(pinned) => Ok(probe_pinned(
                 &self.endpoint,
                 &self.chain,
@@ -1940,11 +1929,11 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// store beside `staging` through the acquire loop, across `targets`' holders.
     /// The store is promoted to `staging` once every byte is present.
     ///
-    /// `total` is the entry's first size claim: the manifest's `size` when it
-    /// gives one. The fetch grows or shrinks it as bytes land, so a manifest
-    /// size that differs from the blob never fails the entry. With no manifest
-    /// size (the manifest blob itself, or an unsized entry), the first claim
-    /// comes from the probe's size hint, or else from a whole-blob first open.
+    /// The entry's size is a proven one: a probe answer's, or else a
+    /// whole-blob first open's header. `total` is the manifest's declared
+    /// `size`: `ranges` hold only when it equals the proven size
+    /// ([`ranges_at_proven_size`]), and otherwise the entry fetches its whole
+    /// blob. A manifest size that differs from the blob never fails the entry.
     ///
     /// A holder that faults cools in the command-wide [`PeerHealth`] and
     /// returns inside the same loop, so a holder that fails one entry is
@@ -2000,16 +1989,15 @@ impl<P: Provider + Clone> PullCtx<P> {
         // vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
-            // The manifest's size is the entry's first claim; without one, the
-            // probe's hint or a whole-blob open's header gives it.
-            let (total_bytes, holders) = if let Some(total) = total {
-                (total, holders)
-            } else {
-                let claim = sources
-                    .first_claim(hash, holders, FirstLeg::Whole, &self.health, stop)
-                    .await?;
-                (claim.total_bytes, claim.holders)
-            };
+            // The entry's size is a proven one: a probe answer's, or a
+            // whole-blob open's header. A manifest's size is declared, and it
+            // plans nothing. Ranges planned from it hold only when it is the
+            // proven size; otherwise the whole blob is fetched.
+            let claim = sources
+                .first_claim(hash, holders, FirstLeg::Whole, &self.health, stop)
+                .await?;
+            let (total_bytes, holders) = (claim.total_bytes, claim.holders);
+            let ranges = ranges_at_proven_size(ranges, total, total_bytes);
             // The max sources cap the lanes the entry stripes across at
             // once; every other holder waits as a reserve.
             let mut downloader = Downloader::new(&sources, sources.funder())
@@ -2197,9 +2185,9 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// their destination and never buffer the whole blob), so streaming into a
     /// staging file under `out_root` and reading it back is cheap; it also
     /// means a manifest fetch runs the same acquire loop, under the same
-    /// health table and progress clock, as every entry. A manifest has no
-    /// manifest size, so the fetch takes the first size claim (the probe hint,
-    /// a pinned node's included, or a whole-blob open when there is none).
+    /// health table and progress clock, as every entry. The fetch takes a
+    /// proven size (a probe answer's, a pinned node's included, or a
+    /// whole-blob open's when there is none).
     /// The fetch runs under [`manifest_cap_bytes`], so a blob past the
     /// largest manifest fails once the fetch holds the cap, and pays for at
     /// most the cap.
@@ -2621,8 +2609,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let Some((plan, total)) = plan else {
             // No donor overlap and nothing deferred — pay for the whole file, then
             // register its chunks so a *later* entry can dedup against it. The
-            // manifest's `size`, when it gives one, is the entry's first size claim,
-            // a hint; the paid count is the verified blob's length.
+            // paid count is the verified blob's length.
             let refetched = self
                 .fetch_to_staging(
                     hash,
@@ -2648,7 +2635,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // Resolve the entry's holders ONCE and reuse them across every drive
         // below (complement, donor re-fetch, whole-blob re-drive), so the entry
         // probes exactly once.
-        let targets = self.entry_targets(hash, Some(total)).await?;
+        let targets = self.entry_targets(hash).await?;
         let driver = AcquireRangeDriver {
             ctx: self,
             targets: &targets,
@@ -3047,6 +3034,17 @@ impl EntryBytes {
     }
 }
 
+/// The ranges an entry fetch drives: `ranges`, planned from the manifest's
+/// `declared` size, only when that size is the `proven` one. A declared size
+/// that differs plans nothing, so the entry fetches its whole blob.
+fn ranges_at_proven_size(
+    ranges: Option<&[(u64, u64)]>,
+    declared: Option<u64>,
+    proven: crate::ProvenSize,
+) -> Option<&[(u64, u64)]> {
+    ranges.filter(|_| declared == Some(proven.get()))
+}
+
 /// The byte spans of `staging`'s ranged store that earlier runs already
 /// fetched: the present set of its `.partial.ranges` record, as sorted,
 /// disjoint `(offset, len)` pairs. The store marks only fetched bytes present,
@@ -3138,9 +3136,9 @@ trait RangeDriver {
 /// whole-file entry: it stripes the ranges across the holders, a holder that
 /// faults cools in the command-wide [`PeerHealth`] and returns, and the drive
 /// ends on done, a fault only the user can fix, a unanimous verdict of the
-/// holders, or the command's [`StopPolicy`]. The manifest's size is the
-/// drive's first claim, a hint: a leg that verifies the final chunk proves
-/// the true size. The spliced donor bytes are never marked present in the
+/// holders, or the command's [`StopPolicy`]. Each drive works to the size
+/// its holders prove, and its ranges hold only when the manifest's size is
+/// that size ([`ranges_at_proven_size`]). The spliced donor bytes are never marked present in the
 /// store, so a drive promotes the entry only once fetched bytes fill the
 /// whole store: a resumed store that already held the rest, or the self-heal
 /// re-drive of the whole blob.
@@ -3149,7 +3147,7 @@ struct AcquireRangeDriver<'a, 'g, P: Provider + Clone> {
     targets: &'a ResolvedTargets,
     hash: [u8; 32],
     staging: &'a Path,
-    /// The manifest's size: the entry's first size claim.
+    /// The manifest's declared size, which the ranges were planned from.
     total: u64,
     progress: Option<&'a ProgressCallback>,
     /// Set once a drive's finalize failed its hash and the drive fetched the
@@ -4446,7 +4444,8 @@ fn record_one(
 
 /// One line for each entry whose landed file differs in size from its
 /// manifest's `size`: `<path>: manifest says X bytes, the blob is Y bytes`. A
-/// manifest size is only the fetch's first claim, so such an entry succeeds;
+/// manifest size is only declared, and the holders prove the true one, so
+/// such an entry succeeds;
 /// the line tells the user the manifest is stale. `updates` holds the landed
 /// files' records ([`build_completed_updates`]).
 fn size_warnings(

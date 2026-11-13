@@ -1,4 +1,5 @@
 use super::*;
+use crate::ProvenSize;
 use anyhow::Context as _;
 use std::sync::Arc;
 use std::time::Instant;
@@ -476,7 +477,7 @@ async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
     let probe = ProbeOpts {
         marks: None,
         round: ProbeRound::Stream,
-        known_size: Some(4096),
+        known_size: Some(ProvenSize::assume_for_tests(4096)),
     };
 
     let targets = resolve_target_node(
@@ -491,7 +492,7 @@ async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
     .unwrap();
 
     assert!(targets.pinned);
-    assert_eq!(targets.size_hint, Some(4096));
+    assert_eq!(targets.size_hint, Some(ProvenSize::assume_for_tests(4096)));
     assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
     client.close().await;
     server.close().await;
@@ -1021,8 +1022,8 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
         Ok((
             ProbeResponse { body, slash_sig },
             ProbeResponseExt {
-                total_bytes: Some(0),
                 coverage: Coverage::empty(),
+                size_proof: Some(decdn_protocol::SizeProof::default()),
             },
             crate::probe::ProbeRtt {
                 ms: 5.0,
@@ -1033,7 +1034,7 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
 
     match classify_probe(&cand, answer(EMPTY_ROOT, true), EMPTY_ROOT, TS, &domain) {
         ProbeOutcome::Holder(probed, _) => {
-            assert_eq!(probed.total_bytes, Some(0));
+            assert_eq!(probed.total_bytes, Some(ProvenSize::assume_for_tests(0)));
             assert!(probed.coverage.is_empty());
         }
         _ => anyhow::bail!("the empty root's holder must classify as a holder"),
@@ -1054,6 +1055,93 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
         ),
         "an empty coverage with has_blob:true is malformed for a non-empty root"
     );
+    Ok(())
+}
+
+/// A probe answer states a size only in its proof, and keeps it only when the
+/// proof verifies under the hash. A wrong size with real but mismatched proof
+/// bytes and a 2^60 size with garbage proof bytes both drop the answer, so the
+/// size never reaches a plan.
+#[test]
+fn a_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::{ProbeSlashData, slash_judge_domain};
+    use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
+    use decdn_protocol::{Coverage, ProbeResponseExt, SizeProof};
+
+    const TS: u64 = 1_700_000_000_000_000;
+    let blob: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let size = u64::try_from(blob.len())?;
+    let hash = *blake3::hash(&blob).as_bytes();
+    let proof_bytes = decdn_bao_range::encode_outboard(blob.as_slice(), size)?
+        .size_proof
+        .to_vec();
+    let proof = SizeProof::new(size, proof_bytes.clone())?;
+    let signer = PrivateKeySigner::random();
+    let domain = slash_judge_domain(421_614, alloy::primitives::Address::repeat_byte(0x0D));
+    let cand = NodeCandidate {
+        node_id: node_key(1),
+        eth_address: signer.address(),
+        region_hint: None,
+        multiaddrs: alloy::primitives::Bytes::new(),
+    };
+    let answer = |size_proof: Option<SizeProof>| -> anyhow::Result<(
+        ProbeResponse,
+        ProbeResponseExt,
+        crate::probe::ProbeRtt,
+    )> {
+        let body = ProbeResponseBody {
+            hash,
+            has_blob: true,
+            rate_per_mb: 10,
+            timestamp_us: TS,
+        };
+        let slash_sig = ProbeSlashData {
+            hash: hash.into(),
+            has_blob: true,
+            rate_per_mb: 10,
+            timestamp_us: TS,
+        }
+        .sign(&signer, &domain)
+        .map_err(|e| anyhow::anyhow!("sign: {e}"))?
+        .as_bytes()
+        .to_vec();
+        Ok((
+            ProbeResponse { body, slash_sig },
+            ProbeResponseExt {
+                coverage: Coverage::full(1),
+                size_proof,
+            },
+            crate::probe::ProbeRtt {
+                ms: 5.0,
+                direct: true,
+            },
+        ))
+    };
+    let classify = |size_proof| classify_probe(&cand, answer(size_proof), hash, TS, &domain);
+
+    match classify(Some(proof)) {
+        ProbeOutcome::Holder(probed, _) => {
+            assert_eq!(probed.total_bytes.map(ProvenSize::get), Some(size));
+        }
+        _ => anyhow::bail!("a proven size keeps the holder"),
+    }
+    match classify(None) {
+        ProbeOutcome::Holder(probed, _) => assert_eq!(probed.total_bytes, None),
+        _ => anyhow::bail!("a holder that states no size is still a holder"),
+    }
+    for (what, size_proof) in [
+        (
+            "a wrong size",
+            SizeProof::new(size + 1, proof_bytes.clone())?,
+        ),
+        ("a huge size", SizeProof::new(1u64 << 60, vec![0xAB; 4000])?),
+    ] {
+        assert!(
+            matches!(classify(Some(size_proof)), ProbeOutcome::Unusable),
+            "{what} drops the answer"
+        );
+    }
     Ok(())
 }
 

@@ -231,6 +231,10 @@ async fn direct_path_rtt(conn: &Connection) -> Option<Duration> {
 /// anything to that peer — an unverified message is precisely a message with no
 /// established author.
 ///
+/// It checks the signed body only. A size the answer states rides in the
+/// unsigned [`decdn_protocol::ProbeResponseExt`], and the caller checks its
+/// proof with [`crate::check_size_proof`] before it reads the size.
+///
 /// # Errors
 ///
 /// A failed invariant, a mismatched echoed `hash`/`timestamp_us`, an unparseable

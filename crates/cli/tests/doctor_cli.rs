@@ -76,7 +76,7 @@ fn a_resolve_notice_becomes_a_doctor_finding() {
     // surface: invisible in the resolved values themselves.
     std::fs::write(
         &cfg,
-        format!("{MINIMAL_CONFIG}\n[security]\nmax_tracked_sources = 0\n"),
+        format!("{MINIMAL_CONFIG}\n[dht.rate_limit]\nmax_tracked_per_peer = 0\n"),
     )
     .unwrap();
     std::fs::write(dir.path().join("keystore.json"), "").unwrap();
@@ -112,7 +112,10 @@ fn a_resolve_notice_becomes_a_doctor_finding() {
         notice["title"].as_str().unwrap().contains("unbounded"),
         "{notice}"
     );
-    assert_eq!(notice["detail"], "field=security.max_tracked_sources");
+    assert_eq!(
+        notice["detail"],
+        "field=dht.rate_limit.max_tracked_per_peer"
+    );
     assert!(notice["remediation"].as_str().is_some(), "{notice}");
 
     // A warning alone is not a failure.

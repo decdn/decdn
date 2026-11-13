@@ -332,16 +332,6 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  security.per_source_rate_per_sec: {}",
-        resolved.security.per_source_rate_per_sec
-    )?;
-    writeln!(
-        w,
-        "  security.per_source_burst: {}",
-        resolved.security.per_source_burst
-    )?;
-    writeln!(
-        w,
         "  dht.per_peer_rate_per_sec: {}",
         resolved.dht.per_peer_rate_per_sec
     )?;
@@ -999,13 +989,13 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
 # get_logs_max_block_span = 10000    # max blocks per chain-watcher eth_getLogs request; set to your RPC provider's range limit (the poller also shrinks the window when the provider rejects a range; set it to the lowest span the poller reaches while rejections keep coming); default 10000, must be > 0
 # fee_shares_poll_interval_sec = 3600  # authoritative getShares() re-read cadence, safety net beside the SharesUpdated subscription (ADR 041); default 3600s, must be > 0
-# redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
+# redeem_threshold_micro_usdc = 50000            # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 0.05 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
 # buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
-# pool_floor_signer_live_windows = 8              # per-signer floor cap k, in ramp-start credit windows: the most live un-vouchered floor reservation plus floor debt one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as the signer pays; lower-clamped to one window; default 8
+# pool_floor_signer_live_windows = 8              # per-signer LIVE concurrency cap k, in ramp-start credit windows: the most live un-vouchered floor reservation one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as streams pay; lower-clamped to one window; default 8
 # CLI-only [blockchain] keys — consumed by `decdn appeal` / the client, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
@@ -1110,9 +1100,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [security]
 # max_concurrent_handlers = 256             # global cap on in-flight QUIC handler tasks; 0 disables the cap
-# per_source_rate_per_sec = 100.0           # per-source rate-limit refill (cells/sec); 0.0 disables the layer
-# per_source_burst = 200                    # per-source burst capacity; required > 0 when the rate is > 0
-# max_tracked_sources = 4096                # cap on tracked sources in the keyed limiter; 0 = unbounded
 
 [load_shed]
 # policy = "resource-pressure"              # "resource-pressure" (default) or "always-admit"
@@ -1124,31 +1111,22 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [dht.rate_limit]
 # per_peer_rate_per_sec = 20.0              # per-peer (NodeId) sustained rate (ADR 022); 0.0 disables the layer
 # per_peer_burst = 40                       # per-peer burst capacity; required > 0 when the rate is > 0
-# per_ip_rate_per_sec = 100.0               # per-IP sustained rate; 0.0 disables
-# per_ip_burst = 200                        # per-IP burst capacity
 # global_rate_per_sec = 1000.0              # global inbound DHT sustained rate; 0.0 disables
 # global_burst = 2000                       # global inbound DHT burst capacity
-# max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
 
 [probe.rate_limit]
 # per_peer_rate_per_sec = 5.0               # per-peer (NodeId) sustained rate (ADR 005); 0.0 disables the layer
 # per_peer_burst = 5                        # per-peer burst capacity; required > 0 when the rate is > 0
-# per_ip_rate_per_sec = 50.0                # per-IP sustained rate; 0.0 disables
-# per_ip_burst = 200                        # per-IP burst capacity
 # global_rate_per_sec = 1000.0              # global inbound probe sustained rate; 0.0 disables
 # global_burst = 2000                       # global inbound probe burst capacity
-# max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
 
 [serve.rate_limit]
 # per_peer_rate_per_sec = 100.0             # inbound cdn/client/v1 requests per peer (NodeId), sustained (ADR 005); 0.0 disables
 # per_peer_burst = 400                      # per-peer burst capacity; required > 0 when the rate is > 0
-# per_ip_rate_per_sec = 200.0               # per-IP sustained rate; 0.0 disables
-# per_ip_burst = 800                        # per-IP burst capacity
 # global_rate_per_sec = 2000.0              # global inbound request sustained rate; 0.0 disables
 # global_burst = 5000                       # global inbound request burst capacity
-# max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map; 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map; 0 = unbounded
 
 [receipts]

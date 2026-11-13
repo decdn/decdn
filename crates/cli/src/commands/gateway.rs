@@ -72,14 +72,12 @@
 //! An entry's pull is capped at the size its manifest declares, so a manifest
 //! cannot make the gateway pay for more than it says, and a declared size is
 //! what `Content-Length` and the allowance count on. A raw blob's size is
-//! one a whole pull here verified, or else one a size proof proves before
-//! the response: a pull of the last chunk group under the first node's size
-//! claim, whose final chunk verifies only under the true size (ADR 039). A
-//! loopback gateway proves sizes too, on the capability that pays. A blob
-//! whose proof proves nothing streams with no length. No node's size
-//! claim gives a response its length, since the server stops reading a body
-//! at its length and a short pull would then end as a whole file. A
-//! sized response takes one
+//! one a holder proves: every node that states a size sends a size proof,
+//! which the fetch verifies against the hash before it uses the size (ADR
+//! 005 § Bounded byte ranges). Before the response, the gateway
+//! resolves the holders of a raw blob of unknown size and takes the first
+//! size one proves, paying for one chunk group at most. A loopback gateway
+//! does the same, on the capability that pays. A sized response takes one
 //! `Range`: the response is `206` over exactly that window, the pull pays
 //! only for the chunk-group-aligned span around it (ADR 038), the allowance
 //! admits and charges the request by that span, and a window past the end is
@@ -88,8 +86,7 @@
 //! allows, so a `curl -r`, a resumed download and a BEP 19 webseed all work.
 //! `HEAD` on an entry is answered from the bundle manifest, at no pull of the
 //! entry, and on a raw blob from its verified size, at no pull at all; a
-//! raw blob of unknown size pays for its size proof (`PROOF_BYTES` of the
-//! allowance), as its `GET` would. The
+//! raw blob of unknown size first learns its size, as its `GET` would. The
 //! API paths answer `404`,
 //! and a site's `Sec-Fetch-*` headers decide nothing: the operator pays,
 //! within the allowance. Every answer is readable by every origin
@@ -144,8 +141,8 @@ use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
@@ -170,7 +167,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit, oneshot};
 
 use super::fetch::{
     BlobFetch, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb, resolve_chain,
@@ -252,6 +249,21 @@ const MANIFEST_CACHE_BYTES: usize = 64 << 20;
 /// The most hashes the gateway remembers as no bundle manifest.
 const MAX_NOT_MANIFESTS: usize = 1024;
 
+/// The manifest bytes the gateway buffers at once over every fill in flight:
+/// four buffers at the manifest cap ([`MAX_MANIFEST_BYTES`]). A fill takes
+/// budget for its buffer as the buffer grows, so a pull still looking for a
+/// holder, or one whose bytes trickle in, holds only what it has buffered. A
+/// fill that would pass the budget fails at once instead of waiting: a fill
+/// that waited would keep its pull's worker slot idle, and two fills that
+/// each hold part of the budget would wait on each other. The budget counts
+/// manifest buffers only: a fill's worker slot and its first-chunk read
+/// buffer fall outside it.
+const MANIFEST_BUFFER_BYTES: usize = 4 * MAX_MANIFEST_BYTES;
+
+/// The size at which the manifest fill map first prunes the locks of
+/// finished fills ([`ManifestFills::prune_at`]).
+const FLIGHT_PRUNE_FLOOR: usize = 16;
+
 /// The most bytes of text a not-manifest verdict keeps. A parse error quotes
 /// the publisher's paths and hash strings, which a manifest under the cap can
 /// make megabytes long.
@@ -281,14 +293,6 @@ const DROP_PENALTY_BYTES: u64 = {
     };
     window + PIPE_BYTES as u64 + CHUNK_BYTES as u64
 };
-
-/// What a size proof counts against the allowance: the one chunk group it
-/// pays for, its proof aside.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "a chunk group is 16 KiB, within any usize"
-)]
-const PROOF_BYTES: usize = decdn_bao_range::CHUNK_GROUP_BYTES as usize;
 
 /// Run the gateway until Ctrl-C.
 ///
@@ -364,7 +368,8 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         pulls,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
-        manifest_fill: Mutex::new(()),
+        manifest_fills: std::sync::Mutex::default(),
+        manifest_buffer: Semaphore::new(MANIFEST_BUFFER_BYTES),
         hosts: allowed_hosts(args.listen),
         sites,
         metrics: Metrics::default(),
@@ -923,9 +928,12 @@ struct Gateway {
     /// Hashes a pull found to be no manifest, so a repeat request pays for
     /// no second pull.
     not_manifests: std::sync::Mutex<NotManifests>,
-    /// Held while a missing manifest is pulled, so concurrent requests for it
-    /// pull and pay once. Cache hits never wait on it.
-    manifest_fill: Mutex<()>,
+    /// The fill locks of the manifests being pulled, one per hash and routing
+    /// namespace.
+    manifest_fills: std::sync::Mutex<ManifestFills>,
+    /// The manifest bytes left to buffer, out of [`MANIFEST_BUFFER_BYTES`]:
+    /// one permit per byte of a fill buffer's capacity.
+    manifest_buffer: Semaphore,
     hosts: Vec<String>,
     /// Where site origins live, and what a `Host` names.
     sites: SiteDomain,
@@ -1071,8 +1079,8 @@ impl ManifestCache {
 }
 
 /// Why a blob is no bundle manifest. The hash fixes the bytes, and a cap
-/// stop comes from verified bytes or a proven size (a node's lying size claim
-/// fails verification first), so the verdict holds for the hash while the
+/// stop comes from verified bytes or a proven size (a size with no valid
+/// proof never reaches the cap), so the verdict holds for the hash while the
 /// manifest cap stays the same: the whole run. It holds no request's raw-blob
 /// hint: [`Self::error`] adds the asker's.
 #[derive(Clone, Debug)]
@@ -1130,6 +1138,39 @@ fn clip(mut text: String) -> String {
         text.push_str(MARK);
     }
     text
+}
+
+/// A manifest's hash and the namespace its pull routes through.
+type FlightKey = ([u8; 32], Option<u64>);
+
+/// The fill lock of a manifest, by [`FlightKey`]. On a public gateway,
+/// requests that waited on a fill which failed upstream share its failure:
+/// one pool pays them all, so their pulls would end the same. A request that
+/// comes after the failure pulls again.
+#[derive(Default)]
+struct Flight {
+    /// How many fills under this lock have ended, bumped under the lock as
+    /// each ends. A request reads it before it waits, so it tells a fill
+    /// that ended while it waited from one that ended before it came.
+    ended: AtomicU64,
+    /// The lock a fill holds while it pulls, with the upstream failure of the
+    /// fill that ended last, when that failure is shared.
+    failed: Mutex<Option<String>>,
+}
+
+/// One fill lock per manifest hash and routing namespace with a fill in
+/// flight: held while that missing manifest is pulled, so concurrent
+/// requests for it pull and pay once, and a stalled pull delays no other
+/// hash or namespace. Cache hits never wait on a fill.
+#[derive(Default)]
+struct ManifestFills {
+    /// Each lock by its key, held as `Weak`. Requests hold `Arc` clones, so
+    /// an entry lives while a request holds or waits on its lock.
+    flights: HashMap<FlightKey, Weak<Flight>>,
+    /// The map size at which the next new entry first prunes the dead ones,
+    /// then moves to twice what is left (at least [`FLIGHT_PRUNE_FLOOR`]), so
+    /// pruning costs amortized O(1) per new entry.
+    prune_at: usize,
 }
 
 /// Hashes found to be no bundle manifest, with their verdicts, least recently
@@ -1252,6 +1293,23 @@ impl Gateway {
                 .allowance
                 .charge(bucket, DROP_PENALTY_BYTES, now_secs());
         }
+    }
+
+    /// A 413 when `span`, the bytes a response pulls (the whole blob, or the
+    /// span of its one `Range`), passes `--max-blob-mb` (`0` for no cap): the
+    /// pull would end at the cap, so the gateway pays for no byte of it.
+    fn over_blob_cap(&self, span: Option<u64>) -> Option<Response<Body>> {
+        let cap = self.common.max_blob_mb.saturating_mul(1024 * 1024);
+        let span = span?;
+        (cap != 0 && span > cap).then(|| {
+            text(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!(
+                    "the response pulls {span} bytes, past this gateway's {} MiB cap\n",
+                    self.common.max_blob_mb
+                ),
+            )
+        })
     }
 
     /// The 402 for `uri` when `size` (its length, when known) does not fit
@@ -2039,13 +2097,14 @@ impl Gateway {
         }
     }
 
-    /// A blob by its hash. Its size, as a pull here verified it
-    /// ([`Self::blob_size`]) or else as a size proof proves it
-    /// ([`Self::prove`]), gives the response its length, admits the request
-    /// against the allowance, caps the pull and lets one `Range` through, as
-    /// an entry's declared size does. A blob whose proof proved nothing
-    /// streams whole, with no length. A `HEAD` answers with the headers once
-    /// the size is known or the proof ends.
+    /// A blob by its hash. Its verified size ([`Self::blob_size`], else
+    /// [`Self::learn_size`]) gives the response its length, admits the
+    /// request against the allowance, caps the pull and lets one `Range`
+    /// through, as an entry's declared size does. A response whose pull
+    /// (the whole blob, or the span of its `Range`) passes `--max-blob-mb`
+    /// answers 413 before any pull. A blob the gateway
+    /// rewrites streams whole, with no length. A `HEAD` answers with the
+    /// headers once the size is known.
     async fn blob(
         self: &Arc<Self>,
         uri: &DecdnUri,
@@ -2057,7 +2116,7 @@ impl Gateway {
         let rewritten = rewrites(present, &name);
         let mut size = self.blob_size(uri.hash).await;
         if size.is_none() && !rewritten {
-            size = self.prove(uri, paying).await?;
+            size = self.learn_size(uri, paying).await?;
         }
         let range = match ask {
             Ask::Get(range) => range,
@@ -2074,6 +2133,9 @@ impl Gateway {
             Ok(extent) => extent,
             Err(size) => return Ok(not_satisfiable(size)),
         };
+        if let Some(refused) = self.over_blob_cap(extent.billable()) {
+            return Ok(refused);
+        }
         if let Some(refused) = self.too_large(paying.bucket(), uri, extent.billable(), false) {
             return Ok(refused);
         }
@@ -2084,10 +2146,11 @@ impl Gateway {
             .await
     }
 
-    /// The size of the blob `hash` as a whole pull or a size proof here
-    /// verified it ([`PullWorker::size`]); the empty root's is zero. A node's size claim
-    /// never counts: the server stops reading a body at its length, so a
-    /// claim below the real size would end a short pull as a whole file.
+    /// The verified size of the blob `hash` that a fetch here learned
+    /// ([`PullWorker::size`]); the empty root's is zero. Every size a node
+    /// states arrives with its size proof, which the fetch verified (ADR 005 §
+    /// Bounded byte ranges), so the server can stop reading a body at
+    /// its length.
     async fn blob_size(&self, hash: [u8; 32]) -> Option<u64> {
         if hash == decdn_protocol::EMPTY_ROOT {
             return Some(0);
@@ -2095,28 +2158,25 @@ impl Gateway {
         self.pulls.size(hash).await
     }
 
-    /// Prove the size of the blob `uri` names before its response, paid by
-    /// `paying`: the worker pays for the last chunk group under the first
-    /// node's size claim, and a size its final chunk verifies joins the
-    /// verified sizes ([`PullWorker::size`]). `None` when the proof proved
-    /// nothing. The allowance it waited behind refuses it at its slot, as a
-    /// pull's does. A proof that ends without an error counts [`PROOF_BYTES`]
-    /// against the allowance, and so does a request dropped while its proof
-    /// runs ([`ProofCharge`]), since the worker still pays for the proof.
+    /// Learn the verified size of the blob `uri` names before its response,
+    /// on `paying`'s lanes: the worker runs a fetch that resolves the holders
+    /// and takes the first size one proves, and writes no byte. The size
+    /// joins the verified sizes ([`PullWorker::size`]). The allowance it
+    /// waited behind refuses it at its slot, as a pull's does. When no probe
+    /// answer proves the size, it opens the blob's first byte, which pays for
+    /// one chunk group at most; the lookup charges the allowance nothing.
     ///
     /// # Errors
     ///
     /// What ends the request as it ends a pull: a funding stop, an allowance
-    /// stop, a fault before the proof (such as no holder), or a fault the
-    /// pull after the proof would reach again. A proof that fails on its own
-    /// is no error.
-    async fn prove(
+    /// stop, or a fault before any holder states a size (such as no holder).
+    async fn learn_size(
         self: &Arc<Self>,
         uri: &DecdnUri,
         paying: &Payment,
     ) -> Result<Option<u64>, PullError> {
         let bucket = paying.bucket();
-        // The proof writes nothing; the reader is held to its end, so the
+        // The lookup writes nothing; the reader is held to its end, so the
         // pipe never reads as closed.
         let (writer, _reader) = tokio::io::duplex(1);
         let (done, ended) = oneshot::channel();
@@ -2133,7 +2193,7 @@ impl Gateway {
                     read_ahead: None,
                     size_cap: None,
                     range: None,
-                    prove: true,
+                    size_only: true,
                 },
                 paying: paying.clone(),
                 writer,
@@ -2141,18 +2201,13 @@ impl Gateway {
                 admit,
             })
             .map_err(PullError::Other)?;
-        let mut charge = ProofCharge {
-            gateway: Arc::clone(self),
-            bucket,
-            armed: true,
-        };
-        let failed = match ended.await {
-            Ok(Ok(())) => return Ok(self.pulls.size(uri.hash).await),
-            Ok(Err(e)) => classify(e),
-            Err(_) => PullError::Other(anyhow::anyhow!("the size proof ended without a result")),
-        };
-        charge.armed = false;
-        Err(failed)
+        match ended.await {
+            Ok(Ok(())) => Ok(self.pulls.size(uri.hash).await),
+            Ok(Err(e)) => Err(classify(e)),
+            Err(_) => Err(PullError::Other(anyhow::anyhow!(
+                "the size lookup ended without a result"
+            ))),
+        }
     }
 
     /// One bundle entry, by its literal manifest path. A path the manifest
@@ -2313,7 +2368,9 @@ impl Gateway {
     /// and so pays for, at most the manifest cap. A blob that is no manifest
     /// is remembered as such (up to [`MAX_NOT_MANIFESTS`] hashes), so a repeat
     /// request answers without a pull. A pull that ends for any other reason
-    /// is not, and a later request pulls again.
+    /// is not, and a later request pulls again. On a public gateway, the
+    /// requests that waited on a fill which failed upstream share its failure
+    /// ([`Flight`]).
     async fn manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2331,13 +2388,28 @@ impl Gateway {
         if let Some(known) = self.cached_manifest(&hash) {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
-        let _fill = self.manifest_fill.lock().await;
+        let flight = self.manifest_flight((hash, namespace));
+        let seen = flight.ended.load(Ordering::Relaxed);
+        let mut failed = flight.failed.lock().await;
         // A request that waited on the fill lock finds what the one before it
         // pulled.
         if let Some(known) = self.cached_manifest(&hash) {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
-        match self.pull_manifest(hash, namespace, paying, cap_mb).await {
+        if flight.ended.load(Ordering::Relaxed) > seen
+            && let Some(cause) = failed.as_deref()
+        {
+            return Err(PullError::Other(anyhow::anyhow!("{cause}")));
+        }
+        let pulled = self.pull_manifest(hash, namespace, paying, cap_mb).await;
+        *failed = match &pulled {
+            Err(ManifestStop::Pull(PullError::Other(cause))) if self.public() => {
+                Some(format!("{cause:#}"))
+            }
+            _ => None,
+        };
+        flight.ended.fetch_add(1, Ordering::Relaxed);
+        match pulled {
             Ok((manifest, size)) => {
                 self.manifests
                     .lock()
@@ -2355,6 +2427,43 @@ impl Gateway {
             }
             Err(ManifestStop::Pull(e)) => Err(e),
         }
+    }
+
+    /// The fill lock that serializes fills of the manifest `key`
+    /// ([`Gateway::manifest_fills`]). The caller locks it, re-checks the
+    /// cache, and only then pulls.
+    fn manifest_flight(&self, key: FlightKey) -> Arc<Flight> {
+        let mut fills = self
+            .manifest_fills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(live) = fills.flights.get(&key).and_then(Weak::upgrade) {
+            return live;
+        }
+        if fills.flights.len() >= fills.prune_at {
+            fills.flights.retain(|_, w| w.strong_count() > 0);
+            fills.prune_at = fills
+                .flights
+                .len()
+                .saturating_mul(2)
+                .max(FLIGHT_PRUNE_FLOOR);
+        }
+        let flight = Arc::new(Flight::default());
+        fills.flights.insert(key, Arc::downgrade(&flight));
+        flight
+    }
+
+    /// `n` bytes of the manifest buffer budget ([`MANIFEST_BUFFER_BYTES`]),
+    /// or an error at once when the budget is spent.
+    fn manifest_buffer_bytes(&self, n: usize) -> Result<SemaphorePermit<'_>, PullError> {
+        u32::try_from(n)
+            .ok()
+            .and_then(|n| self.manifest_buffer.try_acquire_many(n).ok())
+            .ok_or_else(|| {
+                PullError::Other(anyhow::anyhow!(
+                    "the gateway's manifest buffer is full; retry the request"
+                ))
+            })
     }
 
     /// Pull `hash` under the manifest cap of `cap_mb` and parse it. Returns
@@ -2377,6 +2486,8 @@ impl Gateway {
         if !self.charge(bucket, first.len()) {
             return Err(PullError::Allowance.into());
         }
+        // The buffer's capacity, held against the budget until the fill ends.
+        let mut held = self.manifest_buffer_bytes(first.len())?;
         let mut bytes = first.to_vec();
         let read = async {
             let mut buf = vec![0u8; CHUNK_BYTES];
@@ -2391,14 +2502,25 @@ impl Gateway {
                 if !self.charge(bucket, n) {
                     return Err(PullError::Allowance.into());
                 }
-                bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
                 // A backstop: the manifest cap ends the pull before this.
-                if bytes.len() > MAX_MANIFEST_BYTES {
+                let len = bytes.len().saturating_add(n);
+                if len > MAX_MANIFEST_BYTES {
                     return Err(ManifestStop::Not(NotManifest::Plain(format!(
                         "the blob is larger than {MAX_MANIFEST_BYTES} bytes, the most this \
                          gateway reads as a bundle manifest"
                     ))));
                 }
+                // Grown by hand so the buffer's capacity stays within the cap.
+                if len > bytes.capacity() {
+                    let grown = bytes
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(len)
+                        .min(MAX_MANIFEST_BYTES);
+                    held.merge(self.manifest_buffer_bytes(grown.saturating_sub(bytes.capacity()))?);
+                    bytes.reserve_exact(grown.saturating_sub(bytes.len()));
+                }
+                bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
             }
             finished(done).await.map_err(ManifestStop::from)
         }
@@ -2516,8 +2638,8 @@ impl Gateway {
 
     /// `HEAD` on the public bare host, or under a site's `/_decdn/`: a blob's
     /// headers, with its length when a pull here verified it
-    /// ([`Self::blob_size`]), at no pull; a blob of unknown size pays for its
-    /// size proof as its `GET` would ([`Self::prove`]): from the pool, as
+    /// ([`Self::blob_size`]), at no pull; a blob of unknown size learns its
+    /// size as its `GET` would ([`Self::learn_size`]): on the pool, as
     /// [`Self::paid`] pays for `page_host`, against the allowance `bucket`
     /// names for the blob's hash. A bundle or an entry redirects to its site, at no pull,
     /// where `GET` under `/_decdn/` would serve a page's request for it
@@ -2662,7 +2784,7 @@ impl Gateway {
                     read_ahead: self.public().then_some(PUBLIC_READ_AHEAD_BYTES),
                     size_cap,
                     range,
-                    prove: false,
+                    size_only: false,
                 },
                 paying: paying.clone(),
                 writer,
@@ -2908,23 +3030,6 @@ struct PullGuard {
     delivered: Arc<AtomicU64>,
 }
 
-/// Counts a size proof's [`PROOF_BYTES`] against its allowance `bucket` when
-/// it drops armed: once its proof ends without an error, or when the request
-/// drops while the worker still runs (and pays for) its proof.
-struct ProofCharge {
-    gateway: Arc<Gateway>,
-    bucket: Option<u64>,
-    armed: bool,
-}
-
-impl Drop for ProofCharge {
-    fn drop(&mut self) {
-        if self.armed {
-            self.gateway.charge(self.bucket, PROOF_BYTES);
-        }
-    }
-}
-
 impl PullGuard {
     /// A guard for a pull `gateway` is about to start, paid by `paying`
     /// against its allowance bucket: armed on a public gateway, counted
@@ -3107,10 +3212,12 @@ fn preflight(origin: Option<&str>) -> Response<Body> {
 /// The response headers a page on another origin may read from a public
 /// gateway: the body's length and type, the hash (`ETag`), the window
 /// (`Content-Range`, `Accept-Ranges`) and, on a 402 or 503, when to retry and
-/// where to fetch instead (`Retry-After`, `Link`).
+/// where to fetch instead (`Retry-After`, `Link`). `Content-Encoding` tells the
+/// page that a proxy in front encoded the body, so `Content-Length` counts the
+/// encoded bytes rather than the decoded body.
 const PUBLIC_EXPOSED: header::HeaderValue = header::HeaderValue::from_static(
-    "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, ETag, \
-     Retry-After, Link",
+    "Content-Length, Content-Encoding, Content-Range, Accept-Ranges, Content-Type, \
+     Content-Disposition, ETag, Retry-After, Link",
 );
 
 /// The origins that may read a public gateway's answers: all of them.

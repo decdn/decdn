@@ -204,23 +204,26 @@ async fn ranged_paid_pull(
     write_frame_to(&mut send, &payload).await?;
 
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
+    let total_bytes = resp_ext
+        .size_proof()
+        .map(decdn_protocol::SizeProof::size)
+        .ok_or_else(|| anyhow::anyhow!("an ok response carries a size proof"))?;
     // The advertised size is the *whole* blob; the range delivers `byte_len`, or
     // the whole tail when `byte_len == 0`. `byte_offset` must be inside the
-    // advertised total: a signed `total_bytes` at or before the offset is
-    // surfaced here as a server bug. An end past the advertised total is not a
-    // bug: it clamps and serves up to the blob's end (a claimed size is a
-    // hint), so it is NOT checked here. `align_range_clamped` below is the
-    // single source of truth for the served (and billed) span.
+    // advertised total: a proven size at or before the offset is surfaced here
+    // as a server bug. An end past the advertised total is not a bug: it clamps
+    // and serves up to the blob's end, so it is NOT checked here.
+    // `align_range_clamped` below is the single source of truth for the served
+    // (and billed) span.
     if byte_len == 0 {
-        resp.body
-            .total_bytes
+        total_bytes
             .checked_sub(byte_offset)
-            .ok_or_else(|| anyhow::anyhow!("response total_bytes is before byte_offset"))?;
+            .ok_or_else(|| anyhow::anyhow!("response size is before byte_offset"))?;
     } else {
         anyhow::ensure!(
-            byte_offset < resp.body.total_bytes,
-            "response total_bytes is at or before the requested offset"
+            byte_offset < total_bytes,
+            "response size is at or before the requested offset"
         );
     }
     // ADR 038: the wire carries the bao verified-stream (content + interleaved
@@ -229,11 +232,10 @@ async fn ranged_paid_pull(
     // `align_range_clamped`, because `byte_len` may run past `total_bytes`: the
     // server serves and bills that clamped to the blob's end rather than
     // refusing it.
-    let aligned =
-        decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, resp.body.total_bytes)
-            .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
+    let aligned = decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, total_bytes)
+        .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let expected_wire =
-        decdn_cache::range_pull::bao_encoded_size(resp.body.total_bytes, aligned.chunk_ranges());
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, aligned.chunk_ranges());
     let interval_bytes = CHUNK_BYTES;
 
     let mut buf = BytesMut::new();
@@ -286,7 +288,7 @@ async fn ranged_paid_pull(
     // The wire is the header-less bao verified-stream for the aligned superset;
     // decode + verify it against the root and trim to the requested span (ADR
     // 038), so callers compare against the exact range content as before.
-    decode_bao_range(hash, resp.body.total_bytes, byte_offset, byte_len, &buf)
+    decode_bao_range(hash, total_bytes, byte_offset, byte_len, &buf)
 }
 
 /// Decode the header-less bao verified-stream `wire` for `[byte_offset,
@@ -399,12 +401,16 @@ async fn idle_open(
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
     write_frame_to(&mut send, &payload).await?;
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "idle open refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "idle open refused: {:?}", resp_ext.error());
+    let total_bytes = resp_ext
+        .size_proof()
+        .map(decdn_protocol::SizeProof::size)
+        .ok_or_else(|| anyhow::anyhow!("an ok response carries a size proof"))?;
     // Keep the streams alive with the connection so the node's serve leg stays
     // parked on a client that never pays.
     std::mem::forget(send);
     std::mem::forget(recv);
-    Ok((conn, resp.body.total_bytes))
+    Ok((conn, total_bytes))
 }
 
 async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result<()> {
@@ -418,6 +424,7 @@ async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result
 /// before a test's own data mocks, so the probe wins over a mock that fails
 /// every ranged GET.
 async fn mount_range_probe(server: &MockServer, hex: &str, blob: &[u8]) {
+    mount_size_proof(server, hex, blob).await;
     let end = blob.len().min(16 * 1024);
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
@@ -425,6 +432,24 @@ async fn mount_range_probe(server: &MockServer, hex: &str, blob: &[u8]) {
         .respond_with(
             ResponseTemplate::new(206).set_body_bytes(blob.get(..end).unwrap_or_default().to_vec()),
         )
+        .mount(server)
+        .await;
+}
+
+/// Serve the `{hex}.sizeproof` sibling `decdn origin import` writes, which
+/// proves the blob's size before the node states it (ADR 005 § Bounded
+/// byte ranges).
+async fn mount_size_proof(server: &MockServer, hex: &str, blob: &[u8]) {
+    let size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let Ok(eo) = decdn_bao_range::encode_outboard(blob, size) else {
+        return;
+    };
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/{hex}{}",
+            decdn_bao_range::SIZE_PROOF_SUFFIX
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(eo.size_proof_object()))
         .mount(server)
         .await;
 }
@@ -791,6 +816,7 @@ async fn range_request_with_outboard_outage_falls_back_to_whole_blob() -> anyhow
     let (req_off, req_len) = (16 * 1024u64, 32 * 1024u64);
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // HEAD answers and a plain whole-blob GET is served, but `{H}.obao4`
     // answers 503: the outboard half of the probe faults.
     Mock::given(method("HEAD"))
@@ -893,6 +919,7 @@ async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> a
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // The size answers but the outboard answers 503. Nothing else is mounted:
     // no fill tier can serve.
     Mock::given(method("HEAD"))
@@ -991,6 +1018,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // Mount the full range-pull surface; the assertion is that NONE of it is hit.
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
@@ -1298,6 +1326,7 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
@@ -1392,6 +1421,7 @@ async fn end_past_the_blob_is_served_clamped_not_refused() -> anyhow::Result<()>
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
@@ -1499,6 +1529,7 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
@@ -1839,6 +1870,7 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -2003,6 +2035,7 @@ async fn tail_open_ahead_of_a_stalled_owner_does_not_starve() -> anyhow::Result<
     let tail_off = 2 * 1024 * 1024u64;
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -2130,6 +2163,7 @@ async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Res
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -2270,6 +2304,7 @@ async fn no_range_origin_degrades_to_buffered_before_signing() -> anyhow::Result
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -2463,6 +2498,7 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // The size and the outboard answer, but the probe's ranged read of the first
     // chunk group hangs past the origin read budget set below: a transport-class
     // timeout fault, unlike a decline. Nothing else is mounted: no fill tier can
@@ -2935,6 +2971,7 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
         .to_vec();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
@@ -3127,6 +3164,7 @@ async fn a_bounded_miss_seeds_only_the_held_ranges_inside_it() -> anyhow::Result
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
@@ -3286,6 +3324,7 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     // (1) HEAD → size probe SUCCEEDS (serviceability).
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
@@ -3494,6 +3533,7 @@ async fn mid_blob_open_behind_a_paying_owners_frontier_attaches() -> anyhow::Res
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("HEAD"))
         .and(path(format!("/{hex}")))
         .respond_with(
