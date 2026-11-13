@@ -104,7 +104,7 @@ sequenceDiagram
     participant D as Delivering Node
 
     P->>D: StreamRequest {hash, namespace_id, chain_id, pool_id, byte_offset, timestamp_us}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {error?, origin_attestation?}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {error?, origin_attestation?, payment_chains?}
 
     alt ok = true
         P->>D: Voucher {sig, amt, chain_root, chunk_price} (opens the chain)
@@ -160,7 +160,7 @@ Like `byte_len`, `namespace_id` is part of the base `StreamRequest` (every node 
 A pool id is unique only inside one `PaymentPool` deployment, and many payment chains run at once. `StreamRequest` therefore carries `chain_id`, the EIP-155 id of the payment chain that holds `pool_id`. The node routes on it:
 
 - **A chain the node accepts.** The node reads the pool, checks the voucher domain and redeems on that chain. The voucher domain binds that chain id and that chain's `PaymentPool` address ([ADR 003 § PaymentPool](003-payments.md#paymentpool)).
-- **A chain the node does not accept.** The node answers `Declined` before it reads any pool state.
+- **A chain the node does not accept.** The node answers `Declined` before it reads any pool state. The refusal carries the node's accepted chains in the unsigned extension field `payment_chains` of the `StreamResponse`, with the same bound of 16 entries as the probe hint. The node sets the field only on this refusal, and the extension validator rejects the field on any other response. A requester that holds a funded pool on a listed chain retries this node once on that chain. Otherwise it removes the node as for any `Declined`.
 
 `chain_id` is part of the base `StreamRequest`. Every node routes on it, and the voucher it selects has no meaning without it. Because `cdn/client/v1` is pre-finalisation, it is a straight in-place addition with no version bump and no compatibility shim. A request is not signed, so `chain_id` adds no signed field. The signed `StreamResponse` fields do not change.
 

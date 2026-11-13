@@ -234,7 +234,9 @@ in current schema terms:
   A client with pools on several payment chains lists one payment-chain set for each. For each
   candidate node it picks a chain that is in its own list and in the node's `payment_chains` probe
   hint, and it sets that chain as `chain_id` in the `StreamRequest`
-  ([ADR 005 § Payment chain routing](005-protocol.md#payment-chain-routing)).
+  ([ADR 005 § Payment chain routing](005-protocol.md#payment-chain-routing)). A node that refuses
+  the chain lists its accepted chains in the refusal, and the client retries that node once on a
+  listed chain where it holds a funded pool.
   The RPC URLs and keystore live here, **not** under `[network]`/`[keys]`.
 - `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
   probing to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull
