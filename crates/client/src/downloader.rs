@@ -83,13 +83,16 @@ pub struct DownloadTarget<'a> {
 /// use std::path::Path;
 ///
 /// use decdn_client::source::BlobSource;
-/// use decdn_client::{DownloadTarget, Downloader, Funder, StaticSources, StreamCandidate};
+/// use decdn_client::{
+///     DownloadTarget, Downloader, Funder, ProvenSize, StaticSources, StreamCandidate,
+/// };
 ///
+/// // `total_bytes` comes from `check_size_proof` on a node's size proof.
 /// async fn download<S: BlobSource, F: Funder>(
 ///     candidates: Vec<StreamCandidate<S>>,
 ///     funder: F,
 ///     hash: [u8; 32],
-///     total_bytes: u64,
+///     total_bytes: ProvenSize,
 ///     dest: &Path,
 /// ) -> anyhow::Result<()> {
 ///     let downloader = Downloader::new(StaticSources::new(candidates)?, funder);

@@ -482,15 +482,16 @@ where
 ///
 /// use decdn_client::source::BlobSource;
 /// use decdn_client::{
-///     Funder, NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, StreamCandidate,
-///     Streamer,
+///     Funder, NoCache, ProgressClock, ProvenSize, PullConfig, StaticSources, StopPolicy,
+///     StreamCandidate, Streamer,
 /// };
 ///
+/// // `total_bytes` comes from `check_size_proof` on a node's size proof.
 /// async fn stream<S: BlobSource, F: Funder>(
 ///     candidates: Vec<StreamCandidate<S>>,
 ///     funder: F,
 ///     hash: [u8; 32],
-///     total_bytes: u64,
+///     total_bytes: ProvenSize,
 ///     scratch: &Path,
 /// ) -> anyhow::Result<()> {
 ///     let streamer = Streamer::new(StaticSources::new(candidates)?, funder, scratch);
