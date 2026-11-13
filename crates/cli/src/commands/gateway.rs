@@ -144,8 +144,8 @@ use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
@@ -170,7 +170,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit, oneshot};
 
 use super::fetch::{
     BlobFetch, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb, resolve_chain,
@@ -251,6 +251,21 @@ const MANIFEST_CACHE_BYTES: usize = 64 << 20;
 
 /// The most hashes the gateway remembers as no bundle manifest.
 const MAX_NOT_MANIFESTS: usize = 1024;
+
+/// The manifest bytes the gateway buffers at once over every fill in flight:
+/// four buffers at the manifest cap ([`MAX_MANIFEST_BYTES`]). A fill takes
+/// budget for its buffer as the buffer grows, so a pull still looking for a
+/// holder, or one whose bytes trickle in, holds only what it has buffered. A
+/// fill that would pass the budget fails at once instead of waiting: a fill
+/// that waited would keep its pull's worker slot idle, and two fills that
+/// each hold part of the budget would wait on each other. The budget counts
+/// manifest buffers only: a fill's worker slot and its first-chunk read
+/// buffer fall outside it.
+const MANIFEST_BUFFER_BYTES: usize = 4 * MAX_MANIFEST_BYTES;
+
+/// The size at which the manifest fill map first prunes the locks of
+/// finished fills ([`ManifestFills::prune_at`]).
+const FLIGHT_PRUNE_FLOOR: usize = 16;
 
 /// The most bytes of text a not-manifest verdict keeps. A parse error quotes
 /// the publisher's paths and hash strings, which a manifest under the cap can
@@ -364,7 +379,8 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         pulls,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
-        manifest_fill: Mutex::new(()),
+        manifest_fills: std::sync::Mutex::default(),
+        manifest_buffer: Semaphore::new(MANIFEST_BUFFER_BYTES),
         hosts: allowed_hosts(args.listen),
         sites,
         metrics: Metrics::default(),
@@ -923,9 +939,12 @@ struct Gateway {
     /// Hashes a pull found to be no manifest, so a repeat request pays for
     /// no second pull.
     not_manifests: std::sync::Mutex<NotManifests>,
-    /// Held while a missing manifest is pulled, so concurrent requests for it
-    /// pull and pay once. Cache hits never wait on it.
-    manifest_fill: Mutex<()>,
+    /// The fill locks of the manifests being pulled, one per hash and routing
+    /// namespace.
+    manifest_fills: std::sync::Mutex<ManifestFills>,
+    /// The manifest bytes left to buffer, out of [`MANIFEST_BUFFER_BYTES`]:
+    /// one permit per byte of a fill buffer's capacity.
+    manifest_buffer: Semaphore,
     hosts: Vec<String>,
     /// Where site origins live, and what a `Host` names.
     sites: SiteDomain,
@@ -1130,6 +1149,39 @@ fn clip(mut text: String) -> String {
         text.push_str(MARK);
     }
     text
+}
+
+/// A manifest's hash and the namespace its pull routes through.
+type FlightKey = ([u8; 32], Option<u64>);
+
+/// The fill lock of a manifest, by [`FlightKey`]. On a public gateway,
+/// requests that waited on a fill which failed upstream share its failure:
+/// one pool pays them all, so their pulls would end the same. A request that
+/// comes after the failure pulls again.
+#[derive(Default)]
+struct Flight {
+    /// How many fills under this lock have ended, bumped under the lock as
+    /// each ends. A request reads it before it waits, so it tells a fill
+    /// that ended while it waited from one that ended before it came.
+    ended: AtomicU64,
+    /// The lock a fill holds while it pulls, with the upstream failure of the
+    /// fill that ended last, when that failure is shared.
+    failed: Mutex<Option<String>>,
+}
+
+/// One fill lock per manifest hash and routing namespace with a fill in
+/// flight: held while that missing manifest is pulled, so concurrent
+/// requests for it pull and pay once, and a stalled pull delays no other
+/// hash or namespace. Cache hits never wait on a fill.
+#[derive(Default)]
+struct ManifestFills {
+    /// Each lock by its key, held as `Weak`. Requests hold `Arc` clones, so
+    /// an entry lives while a request holds or waits on its lock.
+    flights: HashMap<FlightKey, Weak<Flight>>,
+    /// The map size at which the next new entry first prunes the dead ones,
+    /// then moves to twice what is left (at least [`FLIGHT_PRUNE_FLOOR`]), so
+    /// pruning costs amortized O(1) per new entry.
+    prune_at: usize,
 }
 
 /// Hashes found to be no bundle manifest, with their verdicts, least recently
@@ -2313,7 +2365,9 @@ impl Gateway {
     /// and so pays for, at most the manifest cap. A blob that is no manifest
     /// is remembered as such (up to [`MAX_NOT_MANIFESTS`] hashes), so a repeat
     /// request answers without a pull. A pull that ends for any other reason
-    /// is not, and a later request pulls again.
+    /// is not, and a later request pulls again. On a public gateway, the
+    /// requests that waited on a fill which failed upstream share its failure
+    /// ([`Flight`]).
     async fn manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2331,13 +2385,28 @@ impl Gateway {
         if let Some(known) = self.cached_manifest(&hash) {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
-        let _fill = self.manifest_fill.lock().await;
+        let flight = self.manifest_flight((hash, namespace));
+        let seen = flight.ended.load(Ordering::Relaxed);
+        let mut failed = flight.failed.lock().await;
         // A request that waited on the fill lock finds what the one before it
         // pulled.
         if let Some(known) = self.cached_manifest(&hash) {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
-        match self.pull_manifest(hash, namespace, paying, cap_mb).await {
+        if flight.ended.load(Ordering::Relaxed) > seen
+            && let Some(cause) = failed.as_deref()
+        {
+            return Err(PullError::Other(anyhow::anyhow!("{cause}")));
+        }
+        let pulled = self.pull_manifest(hash, namespace, paying, cap_mb).await;
+        *failed = match &pulled {
+            Err(ManifestStop::Pull(PullError::Other(cause))) if self.public() => {
+                Some(format!("{cause:#}"))
+            }
+            _ => None,
+        };
+        flight.ended.fetch_add(1, Ordering::Relaxed);
+        match pulled {
             Ok((manifest, size)) => {
                 self.manifests
                     .lock()
@@ -2355,6 +2424,43 @@ impl Gateway {
             }
             Err(ManifestStop::Pull(e)) => Err(e),
         }
+    }
+
+    /// The fill lock that serializes fills of the manifest `key`
+    /// ([`Gateway::manifest_fills`]). The caller locks it, re-checks the
+    /// cache, and only then pulls.
+    fn manifest_flight(&self, key: FlightKey) -> Arc<Flight> {
+        let mut fills = self
+            .manifest_fills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(live) = fills.flights.get(&key).and_then(Weak::upgrade) {
+            return live;
+        }
+        if fills.flights.len() >= fills.prune_at {
+            fills.flights.retain(|_, w| w.strong_count() > 0);
+            fills.prune_at = fills
+                .flights
+                .len()
+                .saturating_mul(2)
+                .max(FLIGHT_PRUNE_FLOOR);
+        }
+        let flight = Arc::new(Flight::default());
+        fills.flights.insert(key, Arc::downgrade(&flight));
+        flight
+    }
+
+    /// `n` bytes of the manifest buffer budget ([`MANIFEST_BUFFER_BYTES`]),
+    /// or an error at once when the budget is spent.
+    fn manifest_buffer_bytes(&self, n: usize) -> Result<SemaphorePermit<'_>, PullError> {
+        u32::try_from(n)
+            .ok()
+            .and_then(|n| self.manifest_buffer.try_acquire_many(n).ok())
+            .ok_or_else(|| {
+                PullError::Other(anyhow::anyhow!(
+                    "the gateway's manifest buffer is full; retry the request"
+                ))
+            })
     }
 
     /// Pull `hash` under the manifest cap of `cap_mb` and parse it. Returns
@@ -2377,6 +2483,8 @@ impl Gateway {
         if !self.charge(bucket, first.len()) {
             return Err(PullError::Allowance.into());
         }
+        // The buffer's capacity, held against the budget until the fill ends.
+        let mut held = self.manifest_buffer_bytes(first.len())?;
         let mut bytes = first.to_vec();
         let read = async {
             let mut buf = vec![0u8; CHUNK_BYTES];
@@ -2391,14 +2499,25 @@ impl Gateway {
                 if !self.charge(bucket, n) {
                     return Err(PullError::Allowance.into());
                 }
-                bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
                 // A backstop: the manifest cap ends the pull before this.
-                if bytes.len() > MAX_MANIFEST_BYTES {
+                let len = bytes.len().saturating_add(n);
+                if len > MAX_MANIFEST_BYTES {
                     return Err(ManifestStop::Not(NotManifest::Plain(format!(
                         "the blob is larger than {MAX_MANIFEST_BYTES} bytes, the most this \
                          gateway reads as a bundle manifest"
                     ))));
                 }
+                // Grown by hand so the buffer's capacity stays within the cap.
+                if len > bytes.capacity() {
+                    let grown = bytes
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(len)
+                        .min(MAX_MANIFEST_BYTES);
+                    held.merge(self.manifest_buffer_bytes(grown.saturating_sub(bytes.capacity()))?);
+                    bytes.reserve_exact(grown.saturating_sub(bytes.len()));
+                }
+                bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
             }
             finished(done).await.map_err(ManifestStop::from)
         }
