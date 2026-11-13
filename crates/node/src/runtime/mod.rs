@@ -1,7 +1,6 @@
 //! Node runtime: owns the iroh endpoint, metrics server, and protocol router.
 
 mod addr_publish;
-pub mod eviction;
 mod reachability;
 pub mod reload;
 
@@ -1868,7 +1867,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             );
         }
         let (eviction_stop_tx, eviction_stop_rx) = oneshot::channel::<()>();
-        let params = eviction::EvictionParams {
+        let params = decdn_cache::EvictionParams {
             cache_size_mb: cfg.cache.cache_size_mb,
             disk_headroom_mb: cfg.cache.disk_headroom_mb,
             high_water_pct: cfg.cache.eviction_high_water_pct,
@@ -1876,15 +1875,18 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             per_sweep_budget: cfg.cache.eviction_per_sweep_budget,
             tick: Duration::from_secs(cfg.cache.eviction_tick_secs),
         };
-        tasks.spawn(eviction::run(
+        let cache_dir = cfg.cache.cache_dir.clone();
+        // ADR 041: the SAME warming allowance the buy loop debits and the serve
+        // path credits. The driver forgets an evicted hash's tag, so a later
+        // reuse of the slot never credits a stale source's allowance.
+        let warming = Arc::clone(&ch.warming);
+        tasks.spawn(decdn_cache::eviction_driver::run(
             infra.cache.clone(),
             infra.node_metrics.cache_metrics(),
             params,
-            cfg.cache.cache_dir.clone(),
             infra.eviction_policy.clone(),
-            // ADR 041: the SAME warming allowance the buy loop debits and the serve
-            // path credits — the driver forgets an evicted hash's tag.
-            Arc::clone(&ch.warming),
+            move || decdn_common::disk::statvfs_target(&cache_dir).map(|space| space.avail),
+            move |hash| warming.forget(hash),
             eviction_stop_rx,
         ));
         eviction_stop_tx
