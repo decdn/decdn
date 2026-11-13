@@ -2,7 +2,126 @@
 //! and the refusal of a size that the blob does not have.
 
 use super::*;
-use crate::origin::FilesystemOrigin;
+use crate::origin::{FilesystemOrigin, OriginFetch};
+
+/// An origin that holds no object and answers every `{H}.sizeproof` read
+/// with no proof, or with a transport fault when `down`. It counts the reads.
+#[derive(Debug)]
+struct ProofReads {
+    reads: AtomicUsize,
+    down: bool,
+}
+
+impl ProofReads {
+    fn new(down: bool) -> Arc<Self> {
+        Arc::new(Self {
+            reads: AtomicUsize::new(0),
+            down,
+        })
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl Origin for ProofReads {
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(OriginFetch::NotFound) })
+    }
+
+    fn fetch_size_proof(
+        &self,
+        _hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let down = self.down;
+        Box::pin(async move {
+            if down {
+                Err(OriginPullError::Transient(anyhow::anyhow!("origin down")))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn kind(&self) -> OriginKind {
+        OriginKind::Filesystem
+    }
+}
+
+/// A lookup every origin answers with no proof is remembered: a repeat
+/// within the miss window reads no origin, and one after it reads again.
+#[tokio::test]
+async fn a_proof_miss_is_remembered_for_its_window() -> anyhow::Result<()> {
+    let origin = ProofReads::new(false);
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin.clone()], 64).await?;
+    let (hash, size) = (Hash::new(b"unproven"), 9000);
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
+    anyhow::ensure!(origin.reads() == 1, "the miss memo answers the repeat");
+    // Age the miss past its window.
+    let aged = Instant::now()
+        .checked_sub(SIZE_PROOF_MISS_TTL + Duration::from_secs(1))
+        .ok_or_else(|| anyhow::anyhow!("clock too young"))?;
+    engine
+        .inner
+        .size_proof_misses
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert((hash, size), aged);
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
+    anyhow::ensure!(
+        origin.reads() == 2,
+        "an expired miss reads the origin again"
+    );
+    Ok(())
+}
+
+/// An origin outage is no answer: the next lookup reads the origin again.
+#[tokio::test]
+async fn an_origin_outage_is_not_remembered_as_a_miss() -> anyhow::Result<()> {
+    let origin = ProofReads::new(true);
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin.clone()], 64).await?;
+    let (hash, size) = (Hash::new(b"outage"), 9000);
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
+    anyhow::ensure!(!engine.size_proof_missed(hash, size));
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
+    anyhow::ensure!(origin.reads() == 2);
+    Ok(())
+}
+
+/// The sweep deletes the proof tag of a blob the store no longer tracks,
+/// and deletes nothing when the open-time recency seed failed.
+#[tokio::test]
+async fn the_sweep_deletes_the_proof_of_an_untracked_blob() -> anyhow::Result<()> {
+    let data = blob();
+    let size = u64::try_from(data.len())?;
+    let (hash, _dir, origin) = seeded_fs_origin(&data, true).await?;
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin], 64).await?;
+    let _ = engine.get(hash).await?;
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_some());
+    anyhow::ensure!(proof_tags(&engine, hash).await? == [Hash::EMPTY]);
+    // The store stops tracking the blob, as after a GC reclaim.
+    engine.inner.access_times.remove(&hash);
+    engine.inner.recency_seeded.store(false, Ordering::Release);
+    anyhow::ensure!(
+        engine.sweep_orphan_size_proofs().await? == 0,
+        "no seed, no sweep"
+    );
+    anyhow::ensure!(proof_tags(&engine, hash).await? == [Hash::EMPTY]);
+    engine.inner.recency_seeded.store(true, Ordering::Release);
+    anyhow::ensure!(engine.sweep_orphan_size_proofs().await? == 1);
+    anyhow::ensure!(proof_tags(&engine, hash).await?.is_empty());
+    Ok(())
+}
 
 /// A blob over several chunk groups with a short last group.
 fn blob() -> Vec<u8> {
@@ -191,8 +310,10 @@ async fn a_kept_proof_survives_a_restart() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     {
         let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
-        hold_first_group(&engine, &data, hash).await?;
+        // A pull-through keeps the upstream's proof before its first bytes land.
         anyhow::ensure!(engine.keep_size_proof(hash, size, &proof).await);
+        anyhow::ensure!(proof_tags(&engine, hash).await?.is_empty());
+        hold_first_group(&engine, &data, hash).await?;
         anyhow::ensure!(
             proof_tags(&engine, hash).await? == [Hash::EMPTY],
             "one tag, which roots no content"
@@ -265,5 +386,25 @@ async fn evicting_a_blob_drops_its_proof() -> anyhow::Result<()> {
     );
     engine.evict(hash).await?;
     anyhow::ensure!(engine.kept_size_proof(hash).is_none(), "evict drops it");
+    Ok(())
+}
+
+/// Every proof tag points at the empty blob, so evicting the empty blob must
+/// leave the proofs of other blobs in the store.
+#[tokio::test]
+async fn evicting_the_empty_blob_keeps_other_proofs() -> anyhow::Result<()> {
+    let data = blob();
+    let size = u64::try_from(data.len())?;
+    let (hash, _dir, origin) = seeded_fs_origin(&data, true).await?;
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin], 64).await?;
+    let _ = engine.get(hash).await?;
+    anyhow::ensure!(engine.size_proof(hash, size).await.is_some());
+    anyhow::ensure!(proof_tags(&engine, hash).await? == [Hash::EMPTY]);
+    engine.evict(Hash::EMPTY).await?;
+    anyhow::ensure!(
+        proof_tags(&engine, hash).await? == [Hash::EMPTY],
+        "the proof of another blob survives"
+    );
     Ok(())
 }

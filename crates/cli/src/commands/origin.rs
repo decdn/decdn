@@ -4,7 +4,7 @@
 //! For every blob it writes the sharded data object `{base}/{hex[0..2]}/{hex}`,
 //! its sibling pre-order bao outboard `{hex}.obao4` and its sibling size proof
 //! `{hex}.sizeproof` — the exact layout the daemon reads back (ADR 037
-//! §Origin-tier pull-through, ADR 005 § A node proves the blob size).
+//! §Origin-tier pull-through, ADR 005 § Bounded byte ranges).
 //!
 //! `--to` is a local filesystem directory: the store is written to disk and
 //! nowhere else. Populating an S3 origin needs no separate writer, because the

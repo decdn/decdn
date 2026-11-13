@@ -32,7 +32,7 @@ pub const OBAO4_SUFFIX: &str = ".obao4";
 
 /// Sibling-key suffix for the published size proof (`{H}.sizeproof`): the
 /// bytes of [`crate::encode_size_proof`] for the blob, which a node serves to
-/// prove the blob's size (ADR 005 § A node proves the blob size). It sits
+/// prove the blob's size (ADR 005 § Bounded byte ranges). It sits
 /// beside the `{H}.obao4` outboard under the same shard prefix.
 pub const SIZE_PROOF_SUFFIX: &str = ".sizeproof";
 

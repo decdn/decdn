@@ -911,12 +911,17 @@ struct Work {
     front_first: bool,
     /// The blob the work fetches. Steal logs name it.
     hash: [u8; 32],
+    /// The furthest byte the requested ranges reach ([`Want::reach`]). A lane
+    /// without a probed bitmap covers the blocks up to it, not the whole
+    /// proven size, so a small window of a huge blob sizes no huge bitmap.
+    coverage_reach: u64,
 }
 
 impl Work {
     /// A work-state for blob `hash` with no lanes and `pending` queued.
     const fn new(pending: VecDeque<AlignedRange>, hash: [u8; 32], front_first: bool) -> Self {
         Self {
+            coverage_reach: u64::MAX,
             pending,
             in_flight: Vec::new(),
             cancel: Vec::new(),
@@ -933,6 +938,18 @@ impl Work {
             front_first,
             hash,
         }
+    }
+
+    /// Set the furthest byte the requested ranges reach (see
+    /// [`Self::coverage_reach`]).
+    const fn set_coverage_reach(&mut self, reach: u64) {
+        self.coverage_reach = reach;
+    }
+
+    /// The coverage of a lane that holds the whole blob of `total_bytes`:
+    /// every block up to the requested reach.
+    fn whole_coverage(&self, total_bytes: u64) -> Coverage {
+        Coverage::full(num_blocks(total_bytes.min(self.coverage_reach)))
     }
 
     /// Record `provider` as the payee worker slot `slot` fetches from.
@@ -985,8 +1002,8 @@ impl Work {
         self.units.push(0);
         self.alive.push(true);
         self.measured.push(coverage.is_some());
-        self.coverage
-            .push(coverage.unwrap_or_else(|| Coverage::full(num_blocks(total_bytes))));
+        let coverage = coverage.unwrap_or_else(|| self.whole_coverage(total_bytes));
+        self.coverage.push(coverage);
         self.lane_of.push(slot);
         self.extra.push(false);
         self.providers.push(None);
@@ -1134,11 +1151,12 @@ impl Work {
     }
 
     /// Size every lane without a probed bitmap to the whole blob of
-    /// `total_bytes`.
+    /// `total_bytes`, up to the requested reach.
     fn grow_coverage(&mut self, total_bytes: u64) {
+        let whole = self.whole_coverage(total_bytes);
         for (coverage, &measured) in self.coverage.iter_mut().zip(&self.measured) {
             if !measured {
-                *coverage = Coverage::full(num_blocks(total_bytes));
+                *coverage = whole.clone();
             }
         }
     }
@@ -2978,6 +2996,15 @@ impl Want {
         self.bound = bound;
         true
     }
+
+    /// The furthest byte the fitted ranges reach: the end of the last range.
+    fn reach(&self) -> u64 {
+        self.ranges
+            .iter()
+            .map(|&(start, len)| start.saturating_add(len))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// Releases every started lane's [`LaneLease`] when [`acquire`] returns or is
@@ -3036,7 +3063,7 @@ fn lanes_to_start<P: SourceProvider>(
         busy.insert(holder.provider);
         let take_uncovered = !sources.no_pull_through(holder.provider);
         if work.has_work_for(
-            &holder_coverage(&holder, total_bytes),
+            &holder_coverage(&holder, work, total_bytes),
             total_bytes,
             take_uncovered,
         ) {
@@ -3046,13 +3073,13 @@ fn lanes_to_start<P: SourceProvider>(
     out
 }
 
-/// `holder`'s coverage, or every block of a blob of `total_bytes` for a holder
-/// of the whole blob.
-fn holder_coverage(holder: &Holder, total_bytes: u64) -> Coverage {
+/// `holder`'s coverage, or, for a holder of the whole blob of `total_bytes`,
+/// every block up to the requested reach ([`Work::whole_coverage`]).
+fn holder_coverage(holder: &Holder, work: &Work, total_bytes: u64) -> Coverage {
     holder
         .coverage
         .clone()
-        .unwrap_or_else(|| Coverage::full(num_blocks(total_bytes)))
+        .unwrap_or_else(|| work.whole_coverage(total_bytes))
 }
 
 /// Whether no work left lies inside the coverage of a holder barred from
@@ -3068,7 +3095,7 @@ fn only_uncovered_left<P: SourceProvider>(
         .holders()
         .iter()
         .filter(|h| sources.no_pull_through(h.provider))
-        .all(|h| !work.has_work_for(&holder_coverage(h, total_bytes), total_bytes, false))
+        .all(|h| !work.has_work_for(&holder_coverage(h, work, total_bytes), total_bytes, false))
 }
 
 /// Whether every byte of `ranges` is present. With no lane running nothing is
@@ -3555,10 +3582,10 @@ where
     // Each leg's room is what the store's held bytes leave under the cap, and
     // a leg in flight on another stream is not yet held. Work that could pass
     // the cap therefore runs one stream at a time: one lane, no extra streams.
-    // The planned work rests on a claim that may be inflated, so it narrows
-    // the fetch and never refuses it.
     let one_stream = cap > 0 && needs > cap;
-    let work = AsyncMutex::new(Work::new(pending, hash, env.pacing.is_some()));
+    let mut first_work = Work::new(pending, hash, env.pacing.is_some());
+    first_work.set_coverage_reach(want.reach());
+    let work = AsyncMutex::new(first_work);
     let progress_wake = Notify::new();
 
     // The pool deposit every lane draws on, as the loop last saw it. Each built
@@ -3747,6 +3774,7 @@ where
                 }
                 bound_seen.store(bound, Ordering::Release);
                 let mut w = work.lock().await;
+                w.set_coverage_reach(want.reach());
                 w.grow_coverage(bound);
                 w.clip(bound)?;
             }
@@ -4092,12 +4120,14 @@ where
             // building asks for no probe round (ADR 039 § Source set and
             // selection).
             if discovering.is_none() && arrivals.is_none() {
+                let w = work.lock().await;
                 let building: Vec<Coverage> = connecting_set
                     .iter()
                     .filter_map(|&provider| sources.holder(provider))
-                    .map(|holder| holder_coverage(holder, total_bytes))
+                    .map(|holder| holder_coverage(holder, &w, total_bytes))
                     .collect();
-                let uncovered = work.lock().await.uncovered_beside(total_bytes, &building);
+                let uncovered = w.uncovered_beside(total_bytes, &building);
+                drop(w);
                 if sources.wants_discovery(now, deposit, running.len(), uncovered) {
                     discovering = Some(sources.provider().discover(sources.hash()));
                 }

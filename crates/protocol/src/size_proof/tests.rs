@@ -15,8 +15,9 @@ fn new_refuses_a_proof_past_the_bound() {
     assert_eq!(err.len, MAX_SIZE_PROOF_BYTES + 1);
 }
 
-/// A length prefix far past the bound, with no bytes behind it, is refused on
-/// the prefix alone.
+/// A length prefix far past the bound, with no bytes behind it, is refused
+/// with no allocation: postcard checks the prefix against the input it holds
+/// before the visitor runs.
 #[test]
 #[allow(clippy::cast_possible_truncation)] // varint bytes are masked to 7 bits
 fn decode_refuses_a_huge_declared_length() {
@@ -28,14 +29,18 @@ fn decode_refuses_a_huge_declared_length() {
         n >>= 7;
     }
     bytes.push(n as u8);
-    assert!(postcard::from_bytes::<SizeProof>(&bytes).is_err());
+    let err = postcard::from_bytes::<SizeProof>(&bytes).unwrap_err();
+    assert_eq!(err, postcard::Error::DeserializeUnexpectedEnd, "{err}");
 }
 
+/// A proof one byte past the bound, with every byte present, is refused by
+/// the bound itself.
 #[test]
 fn decode_refuses_a_proof_past_the_bound() {
     // Encode the raw vector with the same layout as a `SizeProof`: one
     // length-prefixed byte vector.
     let long = vec![0u8; MAX_SIZE_PROOF_BYTES + 1];
     let bytes = postcard::to_allocvec(&long).unwrap();
-    assert!(postcard::from_bytes::<SizeProof>(&bytes).is_err());
+    let err = postcard::from_bytes::<SizeProof>(&bytes).unwrap_err();
+    assert_eq!(err, postcard::Error::SerdeDeCustom, "{err}");
 }

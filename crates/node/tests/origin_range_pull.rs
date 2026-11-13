@@ -431,8 +431,8 @@ async fn mount_range_probe(server: &MockServer, hex: &str, blob: &[u8]) {
 }
 
 /// Serve the `{hex}.sizeproof` sibling `decdn origin import` writes, which
-/// proves the blob's size before the node states it (ADR 005 § A node
-/// proves the blob size).
+/// proves the blob's size before the node states it (ADR 005 § Bounded
+/// byte ranges).
 async fn mount_size_proof(server: &MockServer, hex: &str, blob: &[u8]) {
     let size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let Ok(eo) = decdn_bao_range::encode_outboard(blob, size) else {

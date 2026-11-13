@@ -536,7 +536,7 @@ impl ClientRangedStore {
     }
 
     /// Record `size` as proven: a node's size proof verified it against the
-    /// root (ADR 005 § A node proves the blob size), so the bound becomes it
+    /// root (ADR 005 § Bounded byte ranges), so the bound becomes it
     /// before any leg holds the final chunk. Only the true size proves, so a
     /// resumed record that names another proven size is wrong: the fresh
     /// proof replaces it, with a warning.

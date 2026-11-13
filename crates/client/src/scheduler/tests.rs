@@ -988,6 +988,7 @@ fn one_victim_work(total: u64, coverage: &Coverage) -> super::Work {
         no_uncovered: vec![false; 3],
         front_first: false,
         hash: [0; 32],
+        coverage_reach: u64::MAX,
     }
 }
 
@@ -5656,7 +5657,7 @@ async fn blocks_no_lane_covers_are_taken_by_a_partial_holder() -> anyhow::Result
 
 /// Acquire `data`'s blob from one honest lane into a store sized by the
 /// proven size `claim`, under `cap`. Returns the result, every progress
-/// total, and the store.
+/// total, the store, and the bytes the source opened.
 async fn acquire_capped(
     data: &[u8],
     claim: u64,
@@ -5666,6 +5667,7 @@ async fn acquire_capped(
     Vec<u64>,
     ClientRangedStore,
     tempfile::TempDir,
+    u64,
 )> {
     let (sources, provider) = honest_lanes(data, &[0xA1])?;
     let root = sources
@@ -5694,7 +5696,8 @@ async fn acquire_capped(
     )
     .await;
     let totals = totals.lock().map(|t| t.clone()).unwrap_or_default();
-    Ok((result, totals, store, dir))
+    let opened = sources.first().map_or(0, ScriptedSource::opened_bytes);
+    Ok((result, totals, store, dir, opened))
 }
 
 /// A blob within the cap completes, and no progress total passes the cap.
@@ -5702,7 +5705,7 @@ async fn acquire_capped(
 async fn a_blob_within_the_cap_completes() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
     let cap = 5 * MIB;
-    let (result, totals, store, dir) = acquire_capped(&data, 3 * MIB, cap).await?;
+    let (result, totals, store, dir, _) = acquire_capped(&data, 3 * MIB, cap).await?;
     result?;
     assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
     assert_eq!(store.proven(), Some(3 * MIB));
@@ -5717,7 +5720,7 @@ async fn a_blob_within_the_cap_completes() -> anyhow::Result<()> {
 async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
     let data = blob(3 * MIB as usize);
     let cap = 2 * MIB;
-    let (result, totals, _store, _dir) = acquire_capped(&data, 3 * MIB, cap).await?;
+    let (result, totals, _store, _dir, opened) = acquire_capped(&data, 3 * MIB, cap).await?;
     let err = result
         .err()
         .ok_or_else(|| anyhow::anyhow!("a blob past the cap must fail"))?;
@@ -5727,6 +5730,7 @@ async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
     );
     assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
     assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
+    assert_eq!(opened, 0, "no leg opens");
     Ok(())
 }
 
@@ -5735,7 +5739,7 @@ async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
 #[tokio::test(start_paused = true)]
 async fn a_blob_exactly_at_the_cap_completes() -> anyhow::Result<()> {
     let data = blob(2 * MIB as usize);
-    let (result, _, store, _dir) = acquire_capped(&data, 2 * MIB, 2 * MIB).await?;
+    let (result, _, store, _dir, _) = acquire_capped(&data, 2 * MIB, 2 * MIB).await?;
     result?;
     assert_eq!(store.proven(), Some(2 * MIB));
     Ok(())
@@ -5747,7 +5751,7 @@ async fn a_blob_exactly_at_the_cap_completes() -> anyhow::Result<()> {
 async fn a_proven_size_past_an_unaligned_cap_ends_the_item() -> anyhow::Result<()> {
     let data = blob(2 * MIB as usize + 100);
     let cap = 2 * MIB + 50;
-    let (result, _, store, _dir) = acquire_capped(&data, 2 * MIB + 100, cap).await?;
+    let (result, _, store, _dir, _) = acquire_capped(&data, 2 * MIB + 100, cap).await?;
     let err = result
         .err()
         .ok_or_else(|| anyhow::anyhow!("a proven size past the cap must fail"))?;
@@ -8195,4 +8199,22 @@ async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_o
         b_probe.opened_ranges()
     );
     Ok(())
+}
+
+/// A lane without a probed bitmap covers the blocks up to the requested
+/// reach, not the whole proven size: a 1 MiB window of a 2^60-byte blob
+/// sizes a one-block bitmap.
+#[test]
+fn whole_blob_coverage_stops_at_the_requested_reach() {
+    let want = super::Want::new(&[(0, MIB)], 1 << 60);
+    let mut work = super::Work::new(std::collections::VecDeque::new(), [0; 32], false);
+    work.set_coverage_reach(want.reach());
+    assert_eq!(want.reach(), MIB);
+    let coverage = work.whole_coverage(1 << 60);
+    assert_eq!(coverage.covered_blocks().count(), 1);
+    let slot = work.add_lane(None, 1 << 60);
+    assert_eq!(work.coverage[slot].covered_blocks().count(), 1);
+    // A tail runs to the end of the blob, so it covers every block.
+    let tail = super::Want::new(&[(0, 0)], 3 * MIB);
+    assert_eq!(tail.reach(), 3 * MIB);
 }

@@ -844,7 +844,7 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
 ///
 /// The streamed counterpart of [`first_leg`], for a size open that runs before
 /// the store exists ([`crate::lane_sources::LaneSources::first_claim`]): the
-/// open reads the signed size from the header of a pull of this range, and the
+/// open reads the proven size from the header of a pull of this range, and the
 /// pull stays primed for the drive's first leg to adopt. The draw is what
 /// `pacer` decides on a fresh state, so a size open and the drive it primes
 /// cannot disagree on the window. The gap is the window widened to whole

@@ -1702,8 +1702,8 @@ async fn probe_candidate(
         );
         return Err(ProbeDrop::Inconsistent);
     }
-    // A stated size is a fact only with its proof (ADR 005 § A node proves
-    // the blob size). A size with no valid proof is the holder's fault: drop
+    // A stated size is a fact only with its proof (ADR 005 § Bounded byte
+    // ranges). A size with no valid proof is the holder's fault: drop
     // the answer before the size can size a coverage union or a pull leg.
     if let Err(e) = probe_size_proven(hash_bytes, &resp_ext) {
         debug!(error = %e, "node-origin: dropping a probe response with an unproven size");
@@ -1755,7 +1755,7 @@ async fn probe_candidate(
 }
 
 /// Whether a probe answer's size, when it states one, is proven for `hash`
-/// (ADR 005 § A node proves the blob size). An answer that states no size
+/// (ADR 005 § Bounded byte ranges). An answer that states no size
 /// passes.
 ///
 /// # Errors

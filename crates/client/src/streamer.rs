@@ -78,7 +78,7 @@ pub trait StreamStores {
     /// The store each stream fills.
     type Store: StreamStore;
 
-    /// Open the store for `hash`, sized to the stream's size claim
+    /// Open the store for `hash`, sized to the stream's proven size
     /// `total_bytes`. A store that already holds verified bytes of `hash`
     /// keeps them, and the stream fetches only what is missing. Two streams
     /// must not fill one store at the same time: an implementation either
@@ -595,10 +595,8 @@ impl<P, F, O> Streamer<'_, P, F, O> {
         self
     }
 
-    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A first size past
-    /// what the window can reach under the cap (the cap itself for the whole
-    /// blob, the window's offset plus the cap otherwise) is clamped before the
-    /// fill store is sized, and a blob that holds bytes past the cap ends the
+    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A window whose
+    /// bytes under the proven size would hold more than the cap ends the
     /// stream with [`crate::BlobTooLarge`]
     /// ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
@@ -640,9 +638,10 @@ where
     /// of the consumer's cursor, and the verified blob is teed to `cache` for the
     /// next revisit.
     ///
-    /// `total_bytes` is the first size. A resumed store's bound wins, and the
-    /// first paid leg's size proof sets the size. `hash` is
-    /// the bao root every byte is verified against; a wrong hash surfaces as a
+    /// `total_bytes` is the first size, a size a node proved. The fetch
+    /// records it as proven before any leg opens, so a resumed store that
+    /// records another size takes it. `hash` is the bao root every byte is
+    /// verified against; a wrong hash surfaces as a
     /// read error, never as silent corruption.
     ///
     /// # Errors
@@ -679,11 +678,9 @@ where
     /// revisit is served the whole blob; a cache that holds exactly the window
     /// serves it with no fetch.
     ///
-    /// `total_bytes` is the end of the blob as the caller knows it. A window
+    /// `total_bytes` is the end of the blob, a size a node proved. A window
     /// past it is clipped to it, and the stream then ends with an error naming
-    /// the shortfall; a window whose offset lies past the blob's real size,
-    /// under a claim that overstated it, ends with the fetch's error, as no
-    /// leg can verify it.
+    /// the shortfall.
     ///
     /// # Errors
     ///

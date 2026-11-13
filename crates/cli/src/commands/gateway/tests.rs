@@ -3000,6 +3000,10 @@ async fn a_raw_blob_past_the_blob_cap_answers_413_with_no_pull() {
     let answer = request(&gateway, "decdn.test", &path, &[]).await;
     assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(logs.caps.lock().unwrap().is_empty(), "no pull runs");
+    // A `Range` inside the cap pulls only its span, so it is served.
+    let window = request(&gateway, "decdn.test", &path, &[("range", "bytes=0-3")]).await;
+    assert_ne!(window.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(*logs.ranges.lock().unwrap(), [Some((0, 4))]);
 }
 
 /// A raw blob of verified size takes one `Range`, as a sized entry does: 206

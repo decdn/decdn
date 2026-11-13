@@ -1,5 +1,5 @@
-//! The size proof a node attaches to every size it states (ADR 005 § A node
-//! proves the blob size).
+//! The size proof a node attaches to every size it states (ADR 005 § Bounded
+//! byte ranges).
 //!
 //! A [`SizeProof`] is the bao encoding of the final BLAKE3 chunk of a blob at
 //! chunk granularity: one 64-byte pair of parent hashes for each level on the

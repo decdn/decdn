@@ -74,7 +74,7 @@
 //! what `Content-Length` and the allowance count on. A raw blob's size is
 //! one a holder proves: every node that states a size sends a size proof,
 //! which the fetch verifies against the hash before it uses the size (ADR
-//! 005 § A node proves the blob size). Before the response, the gateway
+//! 005 § Bounded byte ranges). Before the response, the gateway
 //! resolves the holders of a raw blob of unknown size and takes the first
 //! size one proves, paying for one chunk group at most. A loopback gateway
 //! does the same, on the capability that pays. A sized response takes one
@@ -1295,29 +1295,29 @@ impl Gateway {
         }
     }
 
-    /// The 402 for `uri` when `size` (its length, when known) does not fit
-    /// what is left of the public allowance `bucket` today, else `None`.
-    /// `size_is_floor` marks `size` as a lower bound on the length, not the
-    /// length itself; the refusal log then says so.
-    /// Refusing before the pull costs nothing; cutting it after would waste
-    /// what it paid for.
-    /// A 413 for a blob whose proven `size` passes `--max-blob-mb` (`0` for
-    /// no cap): the pull would end at the cap, so the gateway pays for no
-    /// byte of it.
-    fn over_blob_cap(&self, size: Option<u64>) -> Option<Response<Body>> {
+    /// A 413 when `span`, the bytes a response pulls (the whole blob, or the
+    /// span of its one `Range`), passes `--max-blob-mb` (`0` for no cap): the
+    /// pull would end at the cap, so the gateway pays for no byte of it.
+    fn over_blob_cap(&self, span: Option<u64>) -> Option<Response<Body>> {
         let cap = self.common.max_blob_mb.saturating_mul(1024 * 1024);
-        let size = size?;
-        (cap != 0 && size > cap).then(|| {
+        let span = span?;
+        (cap != 0 && span > cap).then(|| {
             text(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 &format!(
-                    "the blob is {size} bytes, past this gateway's {} MiB cap\n",
+                    "the response pulls {span} bytes, past this gateway's {} MiB cap\n",
                     self.common.max_blob_mb
                 ),
             )
         })
     }
 
+    /// The 402 for `uri` when `size` (its length, when known) does not fit
+    /// what is left of the public allowance `bucket` today, else `None`.
+    /// `size_is_floor` marks `size` as a lower bound on the length, not the
+    /// length itself; the refusal log then says so.
+    /// Refusing before the pull costs nothing; cutting it after would waste
+    /// what it paid for.
     fn too_large(
         &self,
         bucket: Option<u64>,
@@ -2100,8 +2100,9 @@ impl Gateway {
     /// A blob by its hash. Its verified size ([`Self::blob_size`], else
     /// [`Self::learn_size`]) gives the response its length, admits the
     /// request against the allowance, caps the pull and lets one `Range`
-    /// through, as an entry's declared size does. A proven size past
-    /// `--max-blob-mb` answers 413 before any pull. A blob the gateway
+    /// through, as an entry's declared size does. A response whose pull
+    /// (the whole blob, or the span of its `Range`) passes `--max-blob-mb`
+    /// answers 413 before any pull. A blob the gateway
     /// rewrites streams whole, with no length. A `HEAD` answers with the
     /// headers once the size is known.
     async fn blob(
@@ -2116,9 +2117,6 @@ impl Gateway {
         let mut size = self.blob_size(uri.hash).await;
         if size.is_none() && !rewritten {
             size = self.learn_size(uri, paying).await?;
-        }
-        if let Some(refused) = self.over_blob_cap(size) {
-            return Ok(refused);
         }
         let range = match ask {
             Ask::Get(range) => range,
@@ -2135,6 +2133,9 @@ impl Gateway {
             Ok(extent) => extent,
             Err(size) => return Ok(not_satisfiable(size)),
         };
+        if let Some(refused) = self.over_blob_cap(extent.billable()) {
+            return Ok(refused);
+        }
         if let Some(refused) = self.too_large(paying.bucket(), uri, extent.billable(), false) {
             return Ok(refused);
         }
@@ -2148,7 +2149,7 @@ impl Gateway {
     /// The verified size of the blob `hash` that a fetch here learned
     /// ([`PullWorker::size`]); the empty root's is zero. Every size a node
     /// states arrives with its size proof, which the fetch verified (ADR 005 §
-    /// A node proves the blob size), so the server can stop reading a body at
+    /// Bounded byte ranges), so the server can stop reading a body at
     /// its length.
     async fn blob_size(&self, hash: [u8; 32]) -> Option<u64> {
         if hash == decdn_protocol::EMPTY_ROOT {

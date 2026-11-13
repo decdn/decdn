@@ -226,9 +226,9 @@ impl ProbeHandler {
     /// The advertised `total_bytes` for a blob already established as present.
     ///
     /// `total_bytes` sits outside the `slash_sig` typehash and goes out only
-    /// with its size proof, so `None` degrades cleanly to "unknown but
-    /// fetchable": no consumer treats it as a presence signal. An `Err` here is still worth a
-    /// log: every caller has *just* proven the blob present, so a failing
+    /// with its size proof. A `None` leaves the answer with no size, so the
+    /// probe advertises no coverage and `has_blob = false`. An `Err` here is
+    /// still worth a log: every caller has *just* proven the blob present, so a failing
     /// `inspect` means the store started degrading in between, which is a
     /// strictly stronger signal than the plain miss the `Err` arms warn about.
     async fn inspect_size(&self, hash: Hash) -> Option<u64> {
@@ -246,8 +246,7 @@ impl ProbeHandler {
     }
 
     /// `size` with the proof the cache keeps or builds for it, or no size at
-    /// all when the cache cannot prove it (ADR 005 § A node proves the blob
-    /// size).
+    /// all when the cache cannot prove it (ADR 005 § Bounded byte ranges).
     async fn proven_size(
         &self,
         hash: Hash,
@@ -664,8 +663,8 @@ impl ProbeHandler {
         //   unaffected — it never reaches this arm because it is already
         //   `is_origin_sourced`).
         let is_origin_sourced = has_blob && !store_present;
-        // A node states no size it cannot prove (ADR 005 § A node proves the
-        // blob size). Prove the size before an origin-sourced coverage is
+        // A node states no size it cannot prove (ADR 005 § Bounded byte
+        // ranges). Prove the size before an origin-sourced coverage is
         // sized from it: an origin size with no proof advertises nothing.
         let (total_bytes, size_proof) = if chain_stale {
             (None, None)
@@ -728,7 +727,7 @@ impl ProbeHandler {
         // bypass that, because signing `has_blob: true` for a blacklisted
         // hash is a blacklist-violation offense (ADR 014).
         // A holder serves under a size it proves, so coverage it cannot size
-        // with a proof is no coverage (ADR 005 § A node proves the blob size).
+        // with a proof is no coverage (ADR 005 § Bounded byte ranges).
         let coverage = if total_bytes.is_none() && *hash.as_bytes() != EMPTY_ROOT {
             Coverage::empty()
         } else {

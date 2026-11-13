@@ -1,5 +1,5 @@
-//! The in-memory cache of the size proofs the engine keeps (ADR 005 § A node
-//! proves the blob size).
+//! The in-memory cache of the size proofs the engine keeps (ADR 005 § Bounded
+//! byte ranges).
 //!
 //! The store keeps the proof of each blob it tracks under a named tag, so
 //! this memo is a cache in front of it, and the first home of a proof a pull

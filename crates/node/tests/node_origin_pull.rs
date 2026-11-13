@@ -8898,6 +8898,70 @@ async fn window_pull_through_bounded_unaligned_range_pulls_only_the_span() -> Re
     Ok(())
 }
 
+/// A peer serve-miss (leaf→B→A) whose offset is the blob's proven size is
+/// refused `Declined` (`RangeNotSatisfiable`) before B signs a success, and B
+/// keeps no byte of the blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_refuses_an_offset_at_the_proven_size() -> Result<()> {
+    let payload: Vec<u8> = (0..PAYLOAD_LEN)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let hash = support::register_payload(&payload);
+    let total = u64::try_from(PAYLOAD_LEN)?;
+
+    let ab_pool_id = B256::repeat_byte(0xAB);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_pool_id = B256::repeat_byte(0x8E);
+    let (handler_b, b_target, ep_b, _recorded, cache_b, _b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_pool_id,
+            &b_buyer,
+            leaf_pool_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+
+    let refused = leaf_ranged_paid_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        b_operator,
+        leaf_pool_id,
+        hash,
+        total,
+        0,
+        RATE,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("an offset at the size must be refused"))?;
+    anyhow::ensure!(
+        format!("{refused:#}").contains("Declined"),
+        "the refusal is Declined: {refused:#}"
+    );
+    anyhow::ensure!(
+        cache_b.present_ranges(hash).await?.is_empty(),
+        "B keeps no byte of the blob"
+    );
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
 /// A BOUNDED peer serve-miss (leaf→B→A) over a B that already holds ranges both
 /// inside and outside the request (#2205). B seeds the shared outboard only from
 /// the held part of its own aligned range. The held groups 4-7 form one whole

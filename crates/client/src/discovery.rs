@@ -694,8 +694,8 @@ pub struct Probed {
     /// Round-trip time measured by the probe, in milliseconds.
     pub rtt_ms: f64,
     /// The blob size the node stated, proven against the hash by the size
-    /// proof in its answer before this value exists (ADR 005 § A node proves
-    /// the blob size). `None` when the node stated no size.
+    /// proof in its answer before this value exists (ADR 005 § Bounded byte
+    /// ranges). `None` when the node stated no size.
     pub total_bytes: Option<u64>,
     /// Which discovery blocks this holder answered `has_blob:true` for
     /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`.

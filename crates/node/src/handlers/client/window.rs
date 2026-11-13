@@ -325,22 +325,34 @@ impl ClientHandler {
                         let total = opened.total_bytes;
                         // Keep the upstream's proof, which its open verified, so
                         // this node serves it before it holds the tail (ADR 005 §
-                        // A node proves the blob size).
+                        // Bounded byte ranges).
                         let kept = match opened.size_proof.as_ref() {
                             Some(proof) => {
-                                self.cache
+                                let kept = self
+                                    .cache
                                     .keep_size_proof(hash, total, proof.as_bytes())
-                                    .await
+                                    .await;
+                                if !kept && !self.cache.refuses(hash) {
+                                    // The open verified this proof, so the cache
+                                    // refusing it is a bug, not a peer fault.
+                                    tracing::error!(
+                                        %hash,
+                                        total,
+                                        "the cache refused a size proof the upstream open verified"
+                                    );
+                                    debug_assert!(kept, "a verified proof is kept");
+                                }
+                                kept
                             }
                             None => false,
                         };
                         if !kept {
                             release_reservation_unspent(floor_reservation.as_ref());
                             return self
-                                .respond_error(
+                                .respond_miss(
                                     &mut send,
                                     req,
-                                    ServeRejectReason::CacheMiss,
+                                    MissRefusal::new(fault_seen, MissPath::UnprovenSize),
                                     rate_per_mb,
                                 )
                                 .await;
@@ -361,11 +373,16 @@ impl ClientHandler {
         // The response states `total_bytes`, so its proof must be at hand before
         // the fill is claimed: a coalescing request reads the proof the live
         // fill kept. With none, refuse now with a signed miss rather than let the
-        // signing fail after the claim (ADR 005 § A node proves the blob size).
+        // signing fail after the claim (ADR 005 § Bounded byte ranges).
         if self.cache.size_proof(hash, total_bytes).await.is_none() {
             release_reservation_unspent(floor_reservation.as_ref());
             return self
-                .respond_error(&mut send, req, ServeRejectReason::CacheMiss, rate_per_mb)
+                .respond_miss(
+                    &mut send,
+                    req,
+                    MissRefusal::new(fault_seen, MissPath::UnprovenSize),
+                    rate_per_mb,
+                )
                 .await;
         }
         // (4) `total_bytes` is proven (the upstream's size proof, or the live fill's

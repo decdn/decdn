@@ -111,7 +111,7 @@ pub async fn probe(
 }
 
 /// Refuse a probe answer that states a size its proof does not prove against
-/// `hash` (ADR 005 § A node proves the blob size): such an answer is faulty,
+/// `hash` (ADR 005 § Bounded byte ranges): such an answer is faulty,
 /// and the probe shows none of it. An answer that states no size passes.
 pub(crate) fn check_stated_size(
     hash: [u8; 32],

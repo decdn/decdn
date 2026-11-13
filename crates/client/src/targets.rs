@@ -498,8 +498,8 @@ impl ProbeTally {
 }
 
 /// Whether `ext` states a size for `hash` with no valid size proof. A stated
-/// size is a fact only with its proof (ADR 005 § A node proves the blob
-/// size), and a size with no valid proof is a fault of the node: the caller
+/// size is a fact only with its proof (ADR 005 § Bounded byte
+/// ranges), and a size with no valid proof is a fault of the node: the caller
 /// drops the answer before the size can reach a plan or a price.
 fn states_an_unproven_size(
     cand: &NodeCandidate,

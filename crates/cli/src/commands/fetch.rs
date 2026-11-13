@@ -748,7 +748,7 @@ pub(crate) struct BlobFetch {
     pub(crate) range: Option<(u64, u64)>,
     /// Learn the blob's size and write no byte: the first size a holder
     /// proves (its probe answer, or the header of the first leg's open,
-    /// ADR 005 § A node proves the blob size) joins the host's verified sizes
+    /// ADR 005 § Bounded byte ranges) joins the host's verified sizes
     /// ([`FetchHost::verified_size`]). A fault before it (such as no holder)
     /// fails the fetch. Never set with `range`.
     pub(crate) size_only: bool,

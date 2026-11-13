@@ -1157,7 +1157,7 @@ impl ClientHandler {
                 // egress). The registry is range-aware, so this coalescing is not
                 // limited to the whole-blob case.
                 // The node serves an origin blob only under a size its origin's
-                // `{H}.sizeproof` proves (ADR 005 § A node proves the blob size).
+                // `{H}.sizeproof` proves (ADR 005 § Bounded byte ranges).
                 // The proof comes first; only a proven size sizes the outboard
                 // read of the range probe. An origin blob with no proof is not
                 // served from the origin, by the range encoder or by the
@@ -1406,7 +1406,7 @@ impl ClientHandler {
         // The response states `total_bytes`, so its proof must be at hand
         // before any reservation: a complete blob or a covering partial built
         // or kept it above. With none, refuse now with a signed answer rather
-        // than fail the signing later (ADR 005 § A node proves the blob size).
+        // than fail the signing later (ADR 005 § Bounded byte ranges).
         if self.cache.size_proof(hash, total_bytes).await.is_none() {
             return self
                 .respond_error(

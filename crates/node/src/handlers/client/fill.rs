@@ -235,8 +235,8 @@ impl ClientHandler {
         if size == 0 {
             return None;
         }
-        // The node serves under a size only with its proof (ADR 005 § A node
-        // proves the blob size). A partial with no kept proof and no tail falls
+        // The node serves under a size only with its proof (ADR 005 § Bounded
+        // byte ranges). A partial with no kept proof and no tail falls
         // through to the miss path, whose upstream pull brings the proof.
         self.cache.size_proof(hash, size).await?;
         let missing = self

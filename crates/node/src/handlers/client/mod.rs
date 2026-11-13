@@ -1149,12 +1149,18 @@ enum MissPath {
     /// binding, or this node holds no lane for its signer. No fill tier ran.
     /// A remote peer reaches this path at will, so its line is throttled.
     NoLane,
+    /// The pull leg opened, but no proof of the blob size is at hand: the
+    /// upstream's proof could not be kept, or the live fill this request
+    /// coalesces onto kept none. The response would state a size it cannot
+    /// prove (ADR 005 § Bounded byte ranges).
+    UnprovenSize,
 }
 
 impl MissPath {
     /// The `path` value the refusal's log line records.
     const fn as_str(self) -> &'static str {
         match self {
+            Self::UnprovenSize => "unproven_size",
             Self::CoverageGate(_) => "coverage_gate",
             Self::PullLegMiss(_) => "pull_leg_miss",
             Self::PullLegTimeout => "pull_leg_timeout",

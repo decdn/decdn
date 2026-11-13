@@ -481,7 +481,7 @@ pub struct StreamResponseExt {
     /// it; a relay verifies it before keeping it.
     pub origin_attestation: Option<crate::dht::OriginAttestation>,
     /// The proof of the signed `total_bytes` under the signed `hash` (ADR 005
-    /// § A node proves the blob size). A node sends it on every response with
+    /// § Bounded byte ranges). A node sends it on every response with
     /// `ok = true`. The receiver verifies it before it uses the size, and
     /// treats a response with `ok = true` and no valid proof as a fault of the
     /// node.

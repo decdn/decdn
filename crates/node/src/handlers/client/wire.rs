@@ -55,7 +55,7 @@ impl ClientHandler {
     /// the pair must be written together — see [`Self::write_stream_response`].
     ///
     /// An `ok: true` response carries the size proof of `body.total_bytes`
-    /// (ADR 005 § A node proves the blob size), which the cache engine keeps
+    /// (ADR 005 § Bounded byte ranges), which the cache engine keeps
     /// or builds. Every success path checks the proof before it reaches here,
     /// so a missing proof is this node's fault and fails the signing: the node
     /// states no size it cannot prove.

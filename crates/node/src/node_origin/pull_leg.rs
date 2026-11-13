@@ -906,10 +906,9 @@ impl NodeOrigin {
     /// pull's first lane to this provider reuses it.
     ///
     /// With a `prime` and the candidate's probe-reported size, the handshake opens
-    /// [`PrimeLeg::predicted_leg`]. A bounded open that fails anyway (a range past
-    /// the blob's end) is asked again for the whole blob before the candidate
-    /// counts as failed, and a pull whose signed size differs from the probed one
-    /// is dropped: its range was cut from another size.
+    /// [`PrimeLeg::predicted_leg`]. The probe's size passed its proof, so the
+    /// header proves the same size. A failure of that open is the candidate's
+    /// handshake outcome, classified as the whole-blob open's would be.
     // Straight-line resolve → gate → open → bind → handshake; the bounded first
     // attempt adds one branch to a flow that reads best in one piece.
     #[allow(clippy::too_many_lines)]

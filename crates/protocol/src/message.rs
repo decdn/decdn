@@ -303,8 +303,8 @@ pub struct ProbeResponseExt {
     /// `has_blob`) with [`ProbeResponseExt::consistent_with`] and drop a
     /// response where they disagree rather than trust either field alone.
     pub coverage: crate::Coverage,
-    /// The proof of [`Self::total_bytes`] under the signed `hash` (ADR 005 § A
-    /// node proves the blob size). Present exactly when `total_bytes` is.
+    /// The proof of [`Self::total_bytes`] under the signed `hash` (ADR 005 §
+    /// Bounded byte ranges). Present exactly when `total_bytes` is.
     pub size_proof: Option<crate::SizeProof>,
 }
 

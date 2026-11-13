@@ -323,6 +323,23 @@ fn a_move_import_lands_the_object_with_both_siblings() {
     );
 }
 
+/// A `--move` whose sibling write fails moves nothing: the source stays, and
+/// no data object lands without its proof.
+#[test]
+fn a_move_whose_sibling_write_fails_keeps_its_source() {
+    let bytes = vec![0x3c; 40_000];
+    let (dir, source, eo, shard) = move_fixture(&bytes);
+    // A directory where the outboard goes makes its write fail.
+    std::fs::create_dir_all(shard.join(eo.obao4_name())).unwrap();
+    assert!(import_one_file(&dir.path().join("store"), &source, true, false).is_err());
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        bytes,
+        "the source survives"
+    );
+    assert!(!shard.join(&eo.hash_hex).exists(), "no data object lands");
+}
+
 /// A `--move` cut short after the siblings landed still has its source, and
 /// the next import of it moves the object into place.
 #[test]

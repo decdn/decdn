@@ -80,8 +80,10 @@ Before it answers a raw blob of unknown size, the gateway learns its size. It
 resolves the holders of the blob and takes the first size that one of them
 proves: a probe answer, or the header of an open of the blob's first byte.
 That open pays for one chunk group at most, and the lookup charges the
-allowance nothing. The gateway keeps the size as a verified size. A blob
-whose proven size passes `--max-blob-mb` answers 413 before any pull. A
+allowance nothing. The gateway keeps the size as a verified size. A
+response whose pull passes `--max-blob-mb` answers 413 before any pull. The
+pull is the whole blob, or the chunk-group span of the one `Range`, so a
+range of a large blob is served. A
 funding stop ends the request as it ends a pull. A fault before any holder
 proves a size, such as no holder, also ends the request as it ends a pull.
 

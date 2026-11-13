@@ -869,8 +869,8 @@ impl std::fmt::Display for ResumeOffsetPastEnd {
 
 impl std::error::Error for ResumeOffsetPastEnd {}
 
-/// A node stated a blob size it did not prove (ADR 005 § A node proves the
-/// blob size): a `StreamResponse` with `ok = true`, or a probe answer that
+/// A node stated a blob size it did not prove (ADR 005 § Bounded byte
+/// ranges): a `StreamResponse` with `ok = true`, or a probe answer that
 /// states a size, whose size proof is missing or does not verify against the
 /// content hash and that size.
 ///
@@ -2829,7 +2829,7 @@ fn frontier_is_proved(bundle: &WatermarkBundle) -> bool {
 }
 
 /// Whether a failed open of a bounded range could mean only that the range's
-/// START is past the blob's end: the size it was cut from was wrong. An end
+/// START is past the blob's end: it was cut before the size was known. An end
 /// past the blob clamps and serves rather than failing, so this fires only on
 /// a start with no bytes to serve.
 ///
@@ -2838,7 +2838,7 @@ fn frontier_is_proved(bundle: &WatermarkBundle) -> bool {
 /// class, so it removes the holder for this fetch and does not qualify here. A
 /// relay signs its own size instead, and the range then fails to align against
 /// it here ([`decdn_bao_range::RangeVerifyError::RangeOutOfBounds`] or
-/// [`ResumeOffsetPastEnd`]). A caller that cut the range from an unsigned size
+/// [`ResumeOffsetPastEnd`]). A caller that cut the range with no proven size
 /// asks for the whole blob on these, and treats every other failure as the
 /// open's own outcome (#2063).
 #[must_use]
@@ -4434,8 +4434,8 @@ fn verify_response(
     StreamSlashData::from_response_body(&resp.body)
         .verify_signer(&sig, expected_signer, slash_domain)
         .map_err(|e| anyhow::anyhow!("slash_sig verification failed: {e}"))?;
-    // A node proves every size it serves under (ADR 005 § A node proves the
-    // blob size). Nothing downstream reads `total_bytes` before this passes.
+    // A node proves every size it serves under (ADR 005 § Bounded byte
+    // ranges). Nothing downstream reads `total_bytes` before this passes.
     if resp.body.ok {
         check_size_proof(hash, resp.body.total_bytes, ext.size_proof.as_ref())?;
     }
