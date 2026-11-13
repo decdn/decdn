@@ -146,7 +146,7 @@ Four boot reads must succeed before the node serves: the registry snapshot (Step
 - The registry, slash, and blacklist enumerations read at one snapshot block. The snapshot block is 256 blocks below the head that the RPC reports. A load-balanced RPC reports the head of its newest upstream. An upstream that is behind that head cannot serve it, but all upstreams can serve an older block. If the contract has no code at the snapshot block, the contract is newer than the margin, and the node reads at the head.
 - Each event tail starts at its snapshot block. The first poll applies the events between the snapshot block and the head again. Each watcher ignores an event that it already has.
 
-The operator-share read (the payment chain pool's immutable `operatorBps`) uses the same retry. It retries for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after it. When it fails, the node uses the floor fee share and does not stop.
+The operator-share read (the payment chain pool's immutable `operatorBps`) uses the same retry. It retries for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after it. When it fails, the node does not stop. It holds no operator share and makes no upstream purchase until a later read of `operatorBps` succeeds ([ADR 041](041-refuse-to-serve.md#adr-041-refuse-to-serve-economics)).
 
 #### Step 3.3 — Configure local rate
 

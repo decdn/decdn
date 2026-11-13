@@ -18,7 +18,7 @@ Declared capacity (`CapacityBond.declaredMbps`) is operator-asserted at registra
 
 Served bytes arrive at the governance-chain `FeeRouter` as the bytes feed in the hook data of each sweep ([ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter)). The router writes `bytesPerEpoch[operator][epoch]` from it. This counter is the canonical voting-weight source.
 
-The weight rules touch only governance: they leave payment-pool mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), the fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), the the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), on `CapacityBond`'s registration / slashing semantics, or on `SlashAppeal` / `BuybackBurner`. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
+The weight rules touch only governance: they leave payment-pool mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), the fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), `CapacityBond`'s registration / slashing semantics, and `SlashAppeal` / `BuybackBurner` unchanged. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
 
 ## Decision
 
