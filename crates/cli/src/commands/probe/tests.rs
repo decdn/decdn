@@ -19,12 +19,12 @@ fn fixture(
             slash_sig: vec![0xCD; SLASH_SIG_LEN],
         },
         decdn_protocol::ProbeResponseExt {
-            total_bytes,
             coverage: if has_blob {
                 decdn_protocol::Coverage::full(1)
             } else {
                 decdn_protocol::Coverage::empty()
             },
+            size_proof: total_bytes.map(|size| decdn_protocol::SizeProof::new(size, []).unwrap()),
         },
     )
 }
@@ -156,4 +156,29 @@ fn parse_hash_accepts_hex_with_and_without_prefix() {
 fn parse_hash_rejects_wrong_length() {
     assert!(parse_hash("abc").is_err());
     assert!(parse_hash(&"ab".repeat(33)).is_err());
+}
+
+/// `decdn probe` fails on an answer whose size proof does not verify (no
+/// proof bytes, or a proof of another size), and passes a proven size or no
+/// size at all.
+#[test]
+fn a_stated_size_must_carry_its_proof() {
+    let data = vec![0x11u8; 5000];
+    let size = data.len() as u64;
+    let eo = decdn_bao_range::encode_outboard(data.as_slice(), size).unwrap();
+    let hash = *blake3::hash(&data).as_bytes();
+    let proof = |size| decdn_protocol::SizeProof::new(size, eo.size_proof.to_vec()).unwrap();
+    let ext = |size_proof| decdn_protocol::ProbeResponseExt {
+        coverage: decdn_protocol::Coverage::empty(),
+        size_proof,
+    };
+    assert!(check_stated_size(hash, &ext(Some(proof(size)))).is_ok());
+    assert!(check_stated_size(hash, &ext(None)).is_ok());
+    let empty = decdn_protocol::SizeProof::new(size, []).unwrap();
+    let unproven = check_stated_size(hash, &ext(Some(empty))).unwrap_err();
+    assert!(
+        format!("{unproven:#}").contains("rejecting probe response"),
+        "{unproven:#}"
+    );
+    assert!(check_stated_size(hash, &ext(Some(proof(size + 1)))).is_err());
 }

@@ -6,8 +6,8 @@ use super::{
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
     FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, MissPath,
     MissRefusal, OwnedSemaphorePermit, PublicKey, RecvStream, Semaphore, SendStream,
-    ServeRejectReason, StreamReadError, StreamRequest, StreamResponseBody, U256, VarInt,
-    read_first_message, reset_stream, verify_binding,
+    ServeRejectReason, StreamReadError, StreamRequest, U256, VarInt, read_first_message,
+    reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
@@ -1143,15 +1143,24 @@ impl ClientHandler {
                 // streams the same filling cache to its own client (no double origin
                 // egress). The registry is range-aware, so this coalescing is not
                 // limited to the whole-blob case.
+                // The node serves an origin blob only under a size its origin's
+                // `{H}.sizeproof` proves (ADR 005 § Bounded byte ranges).
+                // The proof comes first; only a proven size sizes the outboard
+                // read of the range probe. An origin blob with no size, or with
+                // no proof of it, is not served from the origin, by the range
+                // encoder or by the buffered populate below.
+                let mut origin_proven = false;
                 if let Some((lk, ln)) = authority {
                     match self.cache.origin_size(hash).await {
+                        Ok(Some(total)) if self.cache.size_proof(hash, total).await.is_none() => {}
                         Ok(Some(total)) => {
+                            origin_proven = true;
                             match self.cache.origin_range_serviceable(hash, total).await {
-                                // Serviceable: size known and an origin publishes the
-                                // outboard and serves ranges. Enter the orchestration
-                                // directly — it claims the fill (owner-or-attach)
-                                // internally after signing the response, so no
-                                // coalescing decision happens here.
+                                // Serviceable: the size is proven and an origin
+                                // publishes the outboard and serves ranges. Enter the
+                                // orchestration directly — it claims the fill
+                                // (owner-or-attach) internally after signing the
+                                // response, so no coalescing decision happens here.
                                 Ok(true) => {
                                     // Boxed: the serve future is large
                                     // (clippy::large_futures).
@@ -1176,7 +1185,7 @@ impl ClientHandler {
                                     ))
                                     .await;
                                 }
-                                // Size known but no origin publishes the outboard
+                                // Size proven but no origin publishes the outboard
                                 // and serves ranges — not serviceable via the range
                                 // encoder. Degrade to the buffered local populate
                                 // below.
@@ -1192,8 +1201,8 @@ impl ClientHandler {
                                 }
                             }
                         }
-                        // No origin knows the size, or no origin is configured at
-                        // all — both a clean fall-through (degrade). `origin_size`
+                        // No origin states a size, or no origin is configured at
+                        // all: nothing is served from the origin. `origin_size`
                         // returns Ok(None) only for clean declines; a probe that
                         // ends on a transport fault reaches the Err arm below.
                         Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
@@ -1232,6 +1241,7 @@ impl ClientHandler {
                 // client-attributable and would refuse regardless of origin
                 // health.)
                 if !locally_filled
+                    && origin_proven
                     && let Some(timeout) = self.local_populate
                     && authority.is_some()
                 {
@@ -1379,6 +1389,20 @@ impl ClientHandler {
                 )
                 .await;
         }
+        // The response states `total_bytes`, so its proof must be at hand
+        // before any reservation: a complete blob or a covering partial built
+        // or kept it above. With none, refuse now with a signed answer rather
+        // than fail the signing later (ADR 005 § Bounded byte ranges).
+        if self.cache.size_proof(hash, total_bytes).await.is_none() {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::InternalError,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // Resolve the lane (must be pre-persisted — see module docs / #327).
         // The lane is keyed by `(pool_id, bound_signer, this operator)`; a
@@ -1509,14 +1533,7 @@ impl ClientHandler {
         }
 
         // Build and sign the success response.
-        let body = StreamResponseBody {
-            hash: req.hash,
-            ok: true,
-            rate_per_mb,
-            total_bytes,
-            timestamp_us: req.timestamp_us,
-        };
-        let (resp, resp_ext) = self.sign_response(body, None)?;
+        let (resp, resp_ext) = self.sign_served(&req, rate_per_mb, total_bytes).await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);
@@ -1577,9 +1594,8 @@ pub(super) fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) ->
 /// (the direct-serve gate and the own-origin twin) refuses the same starts with
 /// `RangeNotSatisfiable` BEFORE it signs a response. A whole-blob request
 /// (`0, 0`) is always in bounds, including for the empty blob. An end past the
-/// blob is NOT out of bounds here: it is served clamped to the blob's end (a
-/// claimed size is a hint), so only a start at or past a non-empty blob's end
-/// refuses.
+/// blob is NOT out of bounds here: it is served clamped to the blob's end, so
+/// only a start at or past a non-empty blob's end refuses.
 pub(super) fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: u64) -> bool {
     decdn_bao_range::align_range_clamped(byte_offset, byte_len, total_bytes).is_err()
 }

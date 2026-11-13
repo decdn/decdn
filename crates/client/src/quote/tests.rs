@@ -1,4 +1,5 @@
 use super::*;
+use crate::ProvenSize;
 use crate::targets::tests_support::node_key;
 
 const MIB: u64 = 1024 * 1024;
@@ -18,7 +19,7 @@ fn answer(seed: u8, operator: u8, rtt_ms: f64, rate_per_mb: u64, has_blob: bool)
         rtt_ms,
         rate_per_mb,
         has_blob,
-        total_bytes: has_blob.then_some(10 * MIB),
+        total_bytes: has_blob.then_some(ProvenSize::assume_for_tests(10 * MIB)),
         coverage: decdn_protocol::Coverage::empty(),
     }
 }
@@ -221,10 +222,13 @@ fn serve_order_leads_with_a_warming_proxy() {
 #[test]
 fn size_hint_is_the_nearest_holders() {
     let mut far = answer(1, 1, 50.0, 10, true);
-    far.total_bytes = Some(5);
+    far.total_bytes = Some(ProvenSize::assume_for_tests(5));
     let mut near = answer(2, 2, 5.0, 10, true);
-    near.total_bytes = Some(7);
-    assert_eq!(census_of(vec![far, near]).size_hint(), Some(7));
+    near.total_bytes = Some(ProvenSize::assume_for_tests(7));
+    assert_eq!(
+        census_of(vec![far, near]).size_hint(),
+        Some(ProvenSize::assume_for_tests(7))
+    );
 }
 
 /// The tally sorts each outcome under its hash and counts each failure.
@@ -235,7 +239,7 @@ fn tally_sorts_outcomes_by_hash() {
         discovery::Probed {
             candidate: cand(1, 1),
             rtt_ms: 12.0,
-            total_bytes: Some(99),
+            total_bytes: Some(ProvenSize::assume_for_tests(99)),
             coverage: decdn_protocol::Coverage::empty(),
         },
         (node_key(1), 12.0, 17),
@@ -268,7 +272,10 @@ fn tally_sorts_outcomes_by_hash() {
     assert_eq!(first.hash, [1; 32]);
     assert_eq!(first.answers.len(), 1);
     assert_eq!(first.answers[0].rate_per_mb, 17);
-    assert_eq!(first.answers[0].total_bytes, Some(99));
+    assert_eq!(
+        first.answers[0].total_bytes,
+        Some(ProvenSize::assume_for_tests(99))
+    );
     assert!(first.answers[0].has_blob);
     assert_eq!((first.rate_limited, first.unverifiable), (1, 1));
     assert_eq!(second.answers.len(), 1);

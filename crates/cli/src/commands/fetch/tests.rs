@@ -1,6 +1,7 @@
 use super::*;
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
+use decdn_client::ProvenSize;
 use decdn_client::bundle::parse_hash;
 use decdn_client::sign_client_binding;
 use decdn_incentive::bind_node_id_domain;
@@ -729,18 +730,19 @@ fn size_hints_forget_the_oldest_past_the_bound() {
         h[..8].copy_from_slice(&n.to_le_bytes());
         h
     };
+    let size = ProvenSize::assume_for_tests;
     let mut sizes = SizeHints::default();
     for n in 0..MAX_SIZE_HINTS {
-        sizes.insert(key(n), 7);
+        sizes.insert(key(n), size(7));
     }
     // A repeat insert keeps the first size and the entry's place.
-    sizes.insert(key(0), 8);
-    assert_eq!(sizes.get(&key(0)), Some(7));
+    sizes.insert(key(0), size(8));
+    assert_eq!(sizes.get(&key(0)), Some(size(7)));
     assert_eq!(sizes.order.len(), MAX_SIZE_HINTS);
-    sizes.insert(key(MAX_SIZE_HINTS), 9);
+    sizes.insert(key(MAX_SIZE_HINTS), size(9));
     assert_eq!(sizes.get(&key(0)), None, "the oldest is forgotten");
-    assert_eq!(sizes.get(&key(1)), Some(7));
-    assert_eq!(sizes.get(&key(MAX_SIZE_HINTS)), Some(9));
+    assert_eq!(sizes.get(&key(1)), Some(size(7)));
+    assert_eq!(sizes.get(&key(MAX_SIZE_HINTS)), Some(size(9)));
     assert_eq!(
         (sizes.sizes.len(), sizes.order.len()),
         (MAX_SIZE_HINTS, MAX_SIZE_HINTS)
@@ -748,47 +750,18 @@ fn size_hints_forget_the_oldest_past_the_bound() {
 }
 
 /// A blob an earlier fetch verified starts the next fetch at its size, so a
-/// pinned node is not probed for it; a declared size still comes first.
+/// pinned node is not probed for it.
 #[test]
 fn a_verified_size_is_the_next_fetchs_known_size() {
     let sizes = Mutex::new(SizeHints::default());
-    assert_eq!(known_size(&[5; 32], None, &sizes), None);
-    sizes.lock().unwrap().insert([5; 32], 4096);
-    assert_eq!(known_size(&[5; 32], None, &sizes), Some(4096));
-    assert_eq!(known_size(&[6; 32], None, &sizes), None);
-    assert_eq!(known_size(&[5; 32], Some(10), &sizes), Some(10));
-}
-
-/// A size proof's fault ends its fetch only when the pull after the proof
-/// would reach it again: a funding stop, a pool replacement, a local fault
-/// (seen through the lane-build wrapper the scheduler adds), or a give-up.
-/// A source that declines or lacks the blob only leaves the size unproven,
-/// context or not.
-#[test]
-fn a_proof_ends_its_fetch_only_on_a_fault_its_pull_would_reach() {
-    let ends = [
-        anyhow::Error::new(decdn_client::FundingNeeded::PublisherPool { pool: B256::ZERO }),
-        anyhow::Error::new(PoolReplaced {
-            closed: B256::ZERO,
-            opened: B256::repeat_byte(1),
-        })
-        .context("the pass"),
-        anyhow::Error::new(decdn_client::LaneBuildFault(anyhow::Error::new(
-            decdn_client::LocalPullFault,
-        ))),
-        anyhow::Error::new(decdn_client::GaveUp {
-            idle: Duration::from_secs(1),
-        }),
-    ];
-    for err in &ends {
-        assert!(proof_ends_fetch(err), "{err:#}");
-    }
-    let unproven = [
-        anyhow::Error::new(decdn_client::NoNodeWillServe { reasons: vec![] }),
-        anyhow::Error::new(decdn_client::NoNodeWillServe { reasons: vec![] }).context("a leg"),
-        anyhow::anyhow!("a source failed"),
-    ];
-    for err in &unproven {
-        assert!(!proof_ends_fetch(err), "{err:#}");
-    }
+    assert_eq!(known_size(&[5; 32], &sizes), None);
+    sizes
+        .lock()
+        .unwrap()
+        .insert([5; 32], ProvenSize::assume_for_tests(4096));
+    assert_eq!(
+        known_size(&[5; 32], &sizes),
+        Some(ProvenSize::assume_for_tests(4096))
+    );
+    assert_eq!(known_size(&[6; 32], &sizes), None);
 }

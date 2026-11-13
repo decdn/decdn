@@ -507,8 +507,6 @@ pub struct ReceiptResponse {
     pub ok: bool,
     /// The quoted rate, in token base units per MB.
     pub rate_per_mb: u64,
-    /// The blob size the node signed.
-    pub total_bytes: u64,
     /// The requester's timestamp, echoed and signed by the node.
     pub timestamp_us: u64,
     /// The node's 65-byte EIP-712 signature.
@@ -521,7 +519,6 @@ impl From<&StreamResponse> for ReceiptResponse {
             hash: B256::from(r.body.hash),
             ok: r.body.ok,
             rate_per_mb: r.body.rate_per_mb,
-            total_bytes: r.body.total_bytes,
             timestamp_us: r.body.timestamp_us,
             slash_sig: Bytes::copy_from_slice(&r.slash_sig),
         }
@@ -535,7 +532,6 @@ impl ReceiptResponse {
                 hash: self.hash.into(),
                 ok: self.ok,
                 rate_per_mb: self.rate_per_mb,
-                total_bytes: self.total_bytes,
                 timestamp_us: self.timestamp_us,
             },
             slash_sig: self.slash_sig.to_vec(),
@@ -679,15 +675,6 @@ pub enum ReceiptFault {
         /// The hash.
         hash: B256,
     },
-    /// An entry's size differs from the size a node signed for it.
-    EntrySize {
-        /// The entry.
-        hash: B256,
-        /// The size the receipt states.
-        stated: u64,
-        /// The size the node signed.
-        signed: u64,
-    },
     /// A complete receipt lists a hash that did not land.
     Unlanded {
         /// The hash.
@@ -755,14 +742,6 @@ impl std::fmt::Display for ReceiptFault {
             Self::ResponseSignature { provider, hash } => write!(
                 f,
                 "node {provider}: response for {hash} is not signed by the node"
-            ),
-            Self::EntrySize {
-                hash,
-                stated,
-                signed,
-            } => write!(
-                f,
-                "entry {hash}: size {stated} differs from the {signed} a node signed"
             ),
             Self::Unlanded { hash } => write!(
                 f,
@@ -894,7 +873,7 @@ impl PullReceipt {
         }
         for lane in &self.lanes {
             for r in &lane.responses {
-                faults.extend(verify_response(lane, r, content, &listed, &slash_dom));
+                faults.extend(verify_response(lane, r, &listed, &slash_dom));
             }
             faults.extend(verify_payment(lane, &voucher_dom));
         }
@@ -906,7 +885,6 @@ impl PullReceipt {
 fn verify_response(
     lane: &ReceiptLane,
     r: &ReceiptResponse,
-    content: &ReceiptContent,
     listed: &impl Fn(&B256) -> bool,
     slash_dom: &Eip712Domain,
 ) -> Vec<ReceiptFault> {
@@ -938,15 +916,6 @@ fn verify_response(
         .is_err()
     {
         faults.push(ReceiptFault::ResponseSignature { provider, hash });
-    }
-    for e in &content.entries {
-        if e.hash == hash && e.size != r.total_bytes {
-            faults.push(ReceiptFault::EntrySize {
-                hash,
-                stated: e.size,
-                signed: r.total_bytes,
-            });
-        }
     }
     faults
 }

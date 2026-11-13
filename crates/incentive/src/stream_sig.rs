@@ -29,9 +29,11 @@
 //! # `StreamResponse` type
 //!
 //! ```text
-//! StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,
-//!                uint64 timestampUs)
+//! StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)
 //! ```
+//!
+//! The blob size is not signed: a response states it only in its size proof,
+//! which the receiver verifies against `hash` (ADR 005 § Bounded byte ranges).
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature};
@@ -58,7 +60,6 @@ mod sol_types {
             bytes32 hash;
             bool ok;
             uint64 ratePerMb;
-            uint64 totalBytes;
             uint64 timestampUs;
         }
     }
@@ -70,22 +71,22 @@ use sol_types::StreamResponse as StreamResponseSol;
 /// string (ADR 014 §EIP-712 Type Definitions):
 ///
 /// ```text
-/// StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,uint64 timestampUs)
+/// StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)
 /// ```
 ///
 /// The Solidity suite pins `SlashJudge.STREAM_RESPONSE_TYPEHASH` to the same
 /// digest (`contracts/test/SlashJudge.t.sol`), so a one-sided edit of either
 /// side's type string fails default CI on both sides (#1843).
 pub const STREAM_RESPONSE_TYPEHASH: B256 =
-    alloy::primitives::b256!("0x6d6dc23d742a8f37702eadc9d0b75cf937e8ec82c6c6ff0d5d2a83527ffbaa2d");
+    alloy::primitives::b256!("0x8cdc58326f067436e492abcb22129dd2bcee462a10809d3ed3a0377858ebd535");
 
 /// The signed field set of a `StreamResponse` (ADR 014 §1).
 ///
 /// `hash` is a request-context field echoed back in the response body;
 /// `timestamp_us` is the requester-generated timestamp echoed
-/// from the `StreamRequest`. Together with `ok`, `rate_per_mb`, and
-/// `total_bytes`, these are exactly the fields the on-chain `SlashJudge`
-/// reconstructs to verify rate-manipulation and blacklist-violation evidence.
+/// from the `StreamRequest`. Together with `ok` and `rate_per_mb`, these are
+/// exactly the fields the on-chain `SlashJudge` reconstructs to verify
+/// rate-manipulation and blacklist-violation evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamSlashData {
     /// BLAKE3 hash of the delivered blob (iroh `Hash` bytes).
@@ -94,8 +95,6 @@ pub struct StreamSlashData {
     pub ok: bool,
     /// The node's quoted rate in token base units per MB.
     pub rate_per_mb: u64,
-    /// Total blob size in bytes.
-    pub total_bytes: u64,
     /// Requester-generated microsecond timestamp echoed from the request.
     pub timestamp_us: u64,
 }
@@ -108,7 +107,6 @@ impl StreamSlashData {
             hash: B256::from(body.hash),
             ok: body.ok,
             rate_per_mb: body.rate_per_mb,
-            total_bytes: body.total_bytes,
             timestamp_us: body.timestamp_us,
         }
     }
@@ -118,7 +116,6 @@ impl StreamSlashData {
             hash: self.hash,
             ok: self.ok,
             ratePerMb: self.rate_per_mb,
-            totalBytes: self.total_bytes,
             timestampUs: self.timestamp_us,
         }
     }

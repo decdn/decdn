@@ -191,7 +191,7 @@ contract SlashJudgeTest is Test {
     bytes32 internal constant PROBE_TYPEHASH =
         keccak256("ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)");
     bytes32 internal constant STREAM_TYPEHASH =
-        keccak256("StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,uint64 timestampUs)");
+        keccak256("StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)");
 
     uint64 internal probeTs;
     uint64 internal streamTs;
@@ -231,8 +231,7 @@ contract SlashJudgeTest is Test {
     }
 
     function _stream(bool ok, uint64 ratePerMb, uint64 ts) internal pure returns (SlashJudge.StreamMsg memory) {
-        return
-            SlashJudge.StreamMsg({ hash: BLOB, ok: ok, ratePerMb: ratePerMb, totalBytes: 1_048_576, timestampUs: ts });
+        return SlashJudge.StreamMsg({ hash: BLOB, ok: ok, ratePerMb: ratePerMb, timestampUs: ts });
     }
 
     function _probeStructHash(SlashJudge.ProbeMsg memory p) internal pure returns (bytes32) {
@@ -240,7 +239,7 @@ contract SlashJudgeTest is Test {
     }
 
     function _streamStructHash(SlashJudge.StreamMsg memory s) internal pure returns (bytes32) {
-        return keccak256(abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.timestampUs));
+        return keccak256(abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.timestampUs));
     }
 
     function _digest(bytes32 structHash) internal view returns (bytes32) {
@@ -306,7 +305,7 @@ contract SlashJudgeTest is Test {
     /// The strings themselves follow ADR 014 § EIP-712 Type Definitions.
     function test_eip712Typehashes_pinnedAcrossLanguages() public view {
         assertEq(judge.PROBE_RESPONSE_TYPEHASH(), 0x4638cb019b77f8677ac7015556f19e56f0be5a6a0d9392006a7fb5b8acd587e5);
-        assertEq(judge.STREAM_RESPONSE_TYPEHASH(), 0x6d6dc23d742a8f37702eadc9d0b75cf937e8ec82c6c6ff0d5d2a83527ffbaa2d);
+        assertEq(judge.STREAM_RESPONSE_TYPEHASH(), 0x8cdc58326f067436e492abcb22129dd2bcee462a10809d3ed3a0377858ebd535);
     }
 
     // -----------------------------------------------------------------

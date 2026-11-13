@@ -227,9 +227,10 @@ async fn a_lane_gates_on_the_pools_shared_spend() {
     assert_eq!(source.opened_ranges().len(), 1);
 }
 
-/// A leg whose signed size differs from the store's bound verifies under its
-/// own claim: the planner's bound is too small, the leg's range lies inside
-/// both sizes, and its bytes land at their offsets.
+/// A leg whose proven size differs from the store's bound verifies under its
+/// own size: the planner's bound is too small, the leg's range lies inside
+/// both sizes, and its bytes land at their offsets. The leg's size proof makes
+/// the store's size the true one, though the leg holds no final chunk.
 #[tokio::test]
 async fn a_leg_whose_claim_differs_from_the_bound_is_ingested_under_its_claim() {
     let truth = 8 * GROUP;
@@ -271,8 +272,12 @@ async fn a_leg_whose_claim_differs_from_the_bound_is_ingested_under_its_claim() 
             .as_ref(),
         &plaintext[(4 * GROUP) as usize..(6 * GROUP) as usize]
     );
-    assert_eq!(store.proven(), None, "a non-final leg proves no size");
-    assert_eq!(store.bound(), bound);
+    assert_eq!(
+        store.proven(),
+        Some(truth),
+        "the leg's size proof proves the size"
+    );
+    assert_eq!(store.bound(), truth);
 }
 
 /// `first_leg` is exactly the range the drive opens first, both on a fresh
@@ -944,6 +949,7 @@ impl BlobSource for FailFirstOpen {
                 // fault instead of yielding any wire bytes.
                 let header = UpstreamPullHeader {
                     total_bytes: self.inner.total_bytes(),
+                    size_proof: None,
                     rate_per_mb: 1,
                     interval_bytes: 1024 * 1024,
                     origin_attestation: None,
@@ -1014,6 +1020,7 @@ impl BlobSource for FaultingOpens {
             if let Some(fault) = fault {
                 let header = UpstreamPullHeader {
                     total_bytes: self.inner.total_bytes(),
+                    size_proof: None,
                     rate_per_mb: 1,
                     interval_bytes: 1024 * 1024,
                     origin_attestation: None,
@@ -1511,7 +1518,6 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     hash,
                     ok: false,
                     rate_per_mb: 1,
-                    total_bytes: self.inner.total_bytes(),
                     timestamp_us: 0,
                 };
                 // `open` retains the response as-is without re-validating the
@@ -1522,10 +1528,7 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     body,
                     slash_sig: vec![0u8; 65],
                 };
-                let ext = StreamResponseExt {
-                    error: Some(StreamError::Unfunded),
-                    origin_attestation: None,
-                };
+                let ext = StreamResponseExt::refused(StreamError::Unfunded);
                 return Err(UpstreamRefused::open(resp, &ext));
             }
             self.inner.open(hash, range).await
@@ -3492,63 +3495,4 @@ async fn a_streamed_drive_adopts_a_pull_primed_at_its_first_leg() {
             plaintext.as_slice()
         );
     }
-}
-
-/// Under a cap on held bytes, a streamed drive over a store the cap's reach
-/// sizes adopts a pull primed at [`crate::lane_sources::primed_first_leg`]
-/// (#2644): the primed range carries the store's size, not the signed one.
-#[tokio::test]
-async fn a_capped_streamed_drive_adopts_its_primed_first_leg() {
-    use crate::lane_sources::{FirstLeg, primed_first_leg, size_open_span};
-    let pacer = crate::streamer::stream_pacer(0);
-    let window = crate::pacer::PULL_WINDOW_FLOOR;
-    let total = 3 * window + 1234;
-    let cap = 2 * window;
-    let streamed = FirstLeg::Streamed {
-        window: (0, 0),
-        read_ahead: 0,
-    };
-    let (root, plaintext, _) = synth_blob(total as usize);
-    let span = size_open_span(root, streamed, cap).expect("a span");
-    let primed_at = primed_first_leg(streamed, cap, &span, total).expect("the pull is the leg");
-    let store = fresh_store(root, cap);
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let primed = PrimedSource::new(
-        ScriptedSource::new(plaintext.clone())
-            .expect("source")
-            .capped(cap)
-            .paying(Arc::clone(&ledger)),
-    );
-    let (header, reader) = primed
-        .inner()
-        .open(root, primed_at.clone())
-        .await
-        .expect("priming open");
-    primed.prime_next(root, primed_at, header, reader, tokio::time::Instant::now());
-    let downstream = || super::DownstreamFrontier {
-        served_paid: u64::MAX,
-        serve_demand: 0,
-    };
-    // The drive stops at the cap; only its first leg matters here.
-    let _ = drive(
-        &store,
-        &primed,
-        &pacer,
-        &Arc::new(Mutex::new(healthy_ctx())),
-        &ledger,
-        root,
-        0,
-        0,
-        None,
-        None,
-        Some(&downstream),
-        None,
-    )
-    .await;
-    let opened = primed.inner().opened_ranges();
-    assert_eq!(
-        opened.iter().filter(|&&(start, _)| start == 0).count(),
-        1,
-        "the first leg adopted the primed pull: {opened:?}"
-    );
 }

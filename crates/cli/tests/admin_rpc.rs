@@ -98,7 +98,6 @@ fn seeded_dht_handles() -> DhtStatusHandles {
         decdn_node::dht::AttestedBy {
             attestation: decdn_protocol::OriginAttestation {
                 rate_per_mb: 1,
-                total_bytes: 1,
                 timestamp_us: 1,
                 slash_sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
             },

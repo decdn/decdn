@@ -480,6 +480,29 @@ impl Origin for HttpOrigin {
         })
     }
 
+    fn fetch_size_proof(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let hex = hash.to_hex();
+            let url = self
+                .base_url
+                .as_url()
+                .join(&format!("{hex}{}", decdn_bao_range::SIZE_PROOF_SUFFIX))
+                .with_context(|| format!("failed to build size proof URL for {hash}"))
+                .map_err(OriginPullError::Permanent)?;
+            // The sibling is read like the outboard sibling, with the proof
+            // cap. A missing or declined proof is `None`: the origin proves no
+            // size for the hash.
+            let max = decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES as u64;
+            Ok(match self.get_outboard_bounded(&url, max).await? {
+                OutboardFetch::Found(bytes) => Some(bytes),
+                OutboardFetch::NotFound | OutboardFetch::Unsupported => None,
+            })
+        })
+    }
+
     fn size(
         &self,
         hash: Hash,

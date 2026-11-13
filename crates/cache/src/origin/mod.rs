@@ -432,6 +432,24 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         Box::pin(async { Ok(OutboardFetch::Unsupported) })
     }
 
+    /// Fetch the sibling `{H}.sizeproof` object of the blob `hash`: the size
+    /// and its proof that `decdn origin import` writes beside the outboard
+    /// (ADR 005 § Bounded byte ranges; [`decdn_bao_range::size_proof_object`]).
+    /// The read is capped at [`decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES`].
+    ///
+    /// `Ok(None)` means the origin serves no proof for the hash: the object is
+    /// missing, larger than the cap, or the backend does not serve siblings.
+    /// The engine then has no provable size for an origin-only blob, and the
+    /// node states none. Like every origin byte, a returned proof is **untrusted** until
+    /// it verifies against `H`. A transport fault surfaces as
+    /// [`OriginPullError`]. The default returns `Ok(None)`.
+    fn fetch_size_proof(
+        &self,
+        _hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Best-effort total byte size of the blob `hash`, used to scope a
     /// range-pull ([`Self::fetch_range_data`], #823): the bao tree needs the blob's
     /// **exact** total length to verify a sub-range against the root `H`, and

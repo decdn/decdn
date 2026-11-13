@@ -57,13 +57,16 @@ impl Keys {
         }
     }
 
-    fn response(&self, hash: B256, total_bytes: u64) -> StreamResponse {
+    fn response(&self, hash: B256) -> StreamResponse {
+        self.response_at(hash, 1_700_000_000_000_000)
+    }
+
+    fn response_at(&self, hash: B256, timestamp_us: u64) -> StreamResponse {
         let body = StreamResponseBody {
             hash: hash.into(),
             ok: true,
             rate_per_mb: RATE,
-            total_bytes,
-            timestamp_us: 1_700_000_000_000_000,
+            timestamp_us,
         };
         let c = chain();
         let sig = StreamSlashData::from_response_body(&body)
@@ -175,9 +178,7 @@ fn receipt_of(lanes: Vec<ReceiptLane>, hash: B256, size: u64) -> PullReceipt {
 async fn chained_receipt(keys: &Keys, seed: Cumulative) -> PullReceipt {
     let hash = B256::repeat_byte(0x44);
     let (collector, ledger) = collected(keys, seed);
-    ledger
-        .attach_evidence()
-        .note_response(&keys.response(hash, 3 * CHUNK_BYTES));
+    ledger.attach_evidence().note_response(&keys.response(hash));
     issue(&ledger, keys, 0, EpochAction::Open).await;
     for _ in 0..3 {
         reveal(&ledger).await;
@@ -204,13 +205,13 @@ fn evidence_keeps_the_last_signed_vouchers() {
 fn evidence_keeps_the_first_acceptance_per_hash() {
     let keys = Keys::new();
     let evidence = LaneEvidence::default();
-    let mut refused = keys.response(B256::repeat_byte(1), 10);
+    let mut refused = keys.response(B256::repeat_byte(1));
     refused.body.ok = false;
     evidence.note_response(&refused);
-    let first = keys.response(B256::repeat_byte(1), 10);
+    let first = keys.response(B256::repeat_byte(1));
     evidence.note_response(&first);
-    evidence.note_response(&keys.response(B256::repeat_byte(1), 99));
-    evidence.note_response(&keys.response(B256::repeat_byte(2), 20));
+    evidence.note_response(&keys.response_at(B256::repeat_byte(1), 99));
+    evidence.note_response(&keys.response(B256::repeat_byte(2)));
     let kept = evidence.responses();
     assert_eq!(kept.len(), 2);
     assert_eq!(kept.first(), Some(&first));
@@ -515,13 +516,13 @@ async fn two_ledgers_on_one_lane_merge() {
     collector.attach(&chain_config(), keys.key(), &first);
     first
         .attach_evidence()
-        .note_response(&keys.response(B256::repeat_byte(1), 1));
+        .note_response(&keys.response(B256::repeat_byte(1)));
     let mid = issue(&first, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     let second = Arc::new(PoolLedger::new(mid));
     collector.attach(&chain_config(), keys.key(), &second);
     second
         .attach_evidence()
-        .note_response(&keys.response(B256::repeat_byte(2), 2));
+        .note_response(&keys.response(B256::repeat_byte(2)));
     let top = issue(&second, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     let lane = only_lane(&collector).await;
     assert_eq!(proof(&lane).claim, ReceiptAmount::try_from(top).unwrap());
@@ -623,25 +624,17 @@ async fn tampering_with_each_signed_field_is_named() {
     );
 
     let mut r = good.clone();
-    response0(&mut r).total_bytes += 1;
+    response0(&mut r).timestamp_us += 1;
     assert_eq!(
         r.verify(),
-        vec![
-            ReceiptFault::ResponseSignature { provider, hash },
-            ReceiptFault::EntrySize {
-                hash,
-                stated: 3 * CHUNK_BYTES,
-                signed: 3 * CHUNK_BYTES + 1,
-            },
-        ]
+        vec![ReceiptFault::ResponseSignature { provider, hash }]
     );
 
+    // No node signs a size, so an entry's size is the receipt's own statement
+    // and no response contradicts it.
     let mut r = good.clone();
     r.content.entries.first_mut().unwrap().size += 1;
-    assert!(matches!(
-        r.verify().as_slice(),
-        [ReceiptFault::EntrySize { .. }]
-    ));
+    assert_eq!(r.verify(), Vec::new());
 
     let mut r = good.clone();
     lane0(&mut r).provider = Address::repeat_byte(0x55);
@@ -793,12 +786,8 @@ async fn an_incomplete_receipt_lists_what_did_not_land_and_verifies() {
         B256::repeat_byte(0x03),
     );
     let evidence = ledger.attach_evidence();
-    for (hash, size) in [
-        (manifest, 10),
-        (landed, CHUNK_BYTES),
-        (started, CHUNK_BYTES),
-    ] {
-        evidence.note_response(&keys.response(hash, size));
+    for hash in [manifest, landed, started] {
+        evidence.note_response(&keys.response(hash));
     }
     issue(&ledger, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     collector.note_landed(manifest.into(), 10);
@@ -824,9 +813,7 @@ async fn an_interrupted_blob_pull_lists_its_blob_as_unlanded() {
     let keys = Keys::new();
     let (collector, ledger) = collected(&keys, Cumulative::default());
     let hash = B256::repeat_byte(0x44);
-    ledger
-        .attach_evidence()
-        .note_response(&keys.response(hash, 4 * CHUNK_BYTES));
+    ledger.attach_evidence().note_response(&keys.response(hash));
     issue(&ledger, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     let receipt = collector
         .receipt(hash.into(), ContentKind::Blob, None, false, window())
@@ -851,9 +838,7 @@ async fn the_collector_builds_the_whole_receipt() {
     let hash = B256::repeat_byte(0x44);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     collector.attach(&chain_config(), keys.key(), &ledger);
-    ledger
-        .attach_evidence()
-        .note_response(&keys.response(hash, CHUNK_BYTES));
+    ledger.attach_evidence().note_response(&keys.response(hash));
     issue(&ledger, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     collector.note_landed(hash.into(), CHUNK_BYTES);
     collector.note_landed(hash.into(), CHUNK_BYTES);
@@ -954,7 +939,6 @@ fn the_json_schema_is_pinned() {
             hash: B256::repeat_byte(0x04),
             ok: true,
             rate_per_mb: 10,
-            total_bytes: 20,
             timestamp_us: 30,
             slash_sig: Bytes::from_static(&[0xaa]),
         }],
@@ -1026,7 +1010,6 @@ fn the_json_schema_is_pinned() {
                 "hash": b("04"),
                 "ok": true,
                 "rate_per_mb": 10,
-                "total_bytes": 20,
                 "timestamp_us": 30,
                 "slash_sig": "0xaa",
             }],
