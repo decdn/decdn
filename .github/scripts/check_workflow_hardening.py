@@ -42,8 +42,7 @@ the IMAGE_INPUTS actions' inputs and the job keys named above, and rule 6
 only install-action. A SHA-pinned action that installs code of its own can
 still float it. For example, crytic/slither-action builds `FROM python:3.10`
 and installs the newest slither, astral-sh/setup-uv with no `version`
-installs the newest uv, Cyfrin/aderyn-ci installs the newest
-`@cyfrin/aderyn` 0.6.x, cargo-semver-checks-action installs the `stable`
+installs the newest uv, cargo-semver-checks-action installs the `stable`
 toolchain and the newest cargo-semver-checks, and a setup-node or
 setup-python version such as `'24'` takes the newest patch. Each runs under
 a read-only token.

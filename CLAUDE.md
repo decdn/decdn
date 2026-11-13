@@ -34,8 +34,7 @@ pnpm -C crates/cli/dashboard install --frozen-lockfile && pnpm -C crates/cli/das
 pre-commit run --all-files           # run all hooks
 # Contracts — mirror what CI runs.
 (cd contracts && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings && forge test)
-(cd contracts && aderyn -o /tmp/aderyn.md --no-snippets --skip-update-check)  # fail-on: high
-(cd contracts && slither . --config-file slither.config.json)                 # fail-on: medium
+(cd contracts && slither . --config-file slither.config.json)  # fail-on: medium
 ```
 
 Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots live in [CONTRIBUTING.md § Solidity development](CONTRIBUTING.md#solidity-development). CI fails on warnings that local `forge test` ignores, so reproduce with the `FOUNDRY_PROFILE=ci` commands before pushing.

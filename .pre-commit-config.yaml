@@ -244,12 +244,3 @@ repos:
         entry: bash -c 'cd contracts && slither . --config-file slither.config.json'
         files: '^contracts/.*\.sol$'
         pass_filenames: false
-
-      - id: aderyn
-        name: aderyn
-        language: system
-        # Needs `aderyn` on PATH (cyfrinup or curl installer). CI is authoritative.
-        stages: [manual]
-        entry: bash -c 'cd contracts && aderyn .'
-        files: '^contracts/.*\.sol$'
-        pass_filenames: false
