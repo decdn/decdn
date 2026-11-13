@@ -120,6 +120,15 @@ pub struct LaneState {
     /// redemption planning, not voucher acceptance), so it is `pub` rather than a
     /// private `last_*` field.
     pub paid_cumulative: U256,
+    /// The wire bytes the node has sent on this lane, across every stream and
+    /// every restart. The node debits it once, atomically, before each frame it
+    /// sends, and credits a backfill back to it ([`Self::credit_bytes`]). The
+    /// lane's credit is [`Self::owed_bytes`] minus this count. A crash can lose
+    /// a debit the background flush has not written, which makes the node send
+    /// bytes again that the lane already paid for. That costs the node egress
+    /// and the payer nothing, so the count is not replay-critical and stays
+    /// `pub` like `paid_cumulative`.
+    pub delivered_bytes: u64,
     /// Cumulative amount of the most-recently-accepted voucher (token base
     /// units). `U256::ZERO` until the first voucher is applied. Private
     /// (#527/#751) — read via [`Self::last_amount`].
@@ -296,6 +305,7 @@ impl LaneState {
             registered_until: 0,
             owner_sig: None,
             paid_cumulative: U256::ZERO,
+            delivered_bytes: 0,
             last_amount,
             last_bytes_delivered,
             last_signature,
@@ -394,6 +404,40 @@ impl LaneState {
     #[must_use]
     pub fn owed_bytes(&self) -> U256 {
         self.live_claim().map_or(U256::ZERO, |c| c.bytes_value())
+    }
+
+    /// The bytes this lane can still be sent: [`Self::owed_bytes`] minus
+    /// [`Self::delivered_bytes`], saturating at zero. The node sends a frame only
+    /// while this covers it.
+    #[must_use]
+    pub fn credit_bytes(&self) -> u64 {
+        let credit = self
+            .owed_bytes()
+            .saturating_sub(U256::from(self.delivered_bytes));
+        u64::try_from(credit).unwrap_or(u64::MAX)
+    }
+
+    /// Debit `len` bytes from the lane's credit, or return the credit that is
+    /// there when it cannot cover them. The caller holds the lane's lock, so the
+    /// check and the debit are one atomic step: two streams on one lane never
+    /// spend the same payment.
+    ///
+    /// # Errors
+    ///
+    /// The lane's current credit, when it is below `len`.
+    pub fn debit(&mut self, len: u64) -> Result<(), u64> {
+        let credit = self.credit_bytes();
+        if credit < len {
+            return Err(credit);
+        }
+        self.delivered_bytes = self.delivered_bytes.saturating_add(len);
+        Ok(())
+    }
+
+    /// Give `len` bytes back to the lane's credit, saturating at the bytes the
+    /// lane has been sent. Used by a backfill.
+    pub const fn refund(&mut self, len: u64) {
+        self.delivered_bytes = self.delivered_bytes.saturating_sub(len);
     }
 
     /// What this lane is **owed**: the value of its strongest claim, or zero if

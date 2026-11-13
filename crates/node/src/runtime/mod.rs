@@ -1506,16 +1506,12 @@ async fn build_chain_and_handlers(
         pull_through,
         local_populate,
         pull_through_origin,
-        // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
-        credit_max: cfg.payment.credit_max,
-        credit_ramp_divisor: cfg.payment.credit_ramp_divisor,
+        // Backfill after a dropped stream (ADR 003 § Credit Window).
+        backfill_window: cfg.payment.backfill_window,
+        backfill_divisor: cfg.payment.backfill_divisor,
         frame_target_bytes: cfg.payment.frame_target_bytes,
         idle_timeout: None,
         pool_recheck_interval: None,
-        // Per-signer floor gate (ADR 003 §Pool solvency): the live concurrency cap
-        // `k` underneath the per-pool `remaining − M` ceiling, which bounds how much
-        // live un-vouchered floor one capability signer may hold at once.
-        pool_floor_signer_live_windows: cfg.blockchain.pool_floor_signer_live_windows,
         warming_credit,
         operator_shares: operator_shares.clone(),
         // Origin-only policy (#1759): backend-authoritative own/foreign decision.

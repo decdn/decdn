@@ -2,40 +2,40 @@ use std::sync::Arc;
 
 use alloy::primitives::B256;
 use decdn_bao_range::{CHUNK_GROUP_BYTES, align_range};
-use decdn_client::{Cumulative, PULL_WINDOW_FLOOR, PoolLedger};
+use decdn_client::{Cumulative, PULL_AHEAD_BYTES, PoolLedger};
 use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
 use super::{PrimeKey, PrimeLeg, handshake_order};
 
 const MIB: u64 = 1024 * 1024;
 
-/// A nonzero ramp divisor opens at the ramp of the carried credit, which is
-/// the floor for a lane with none; a zero one opens at the ceiling. Either
-/// way the window is whole chunk groups.
+/// The first draw is whole chunk groups: what one chunk of paid wire covers,
+/// floored to a group, plus the pull's ahead slack.
 #[test]
-fn the_prime_window_is_the_ramp_at_the_carried_credit() {
-    let ramped = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
-    assert_eq!(ramped.window, PULL_WINDOW_FLOOR);
-    let carried = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 32 * MIB + 5);
-    assert_eq!(carried.window, 16 * MIB);
-    let open = PrimeLeg::new(0, 0, 0, PULL_WINDOW_FLOOR, 64 * MIB + 1, 0);
-    assert_eq!(open.window, 64 * MIB);
-    assert_eq!(open.window % CHUNK_GROUP_BYTES, 0);
+fn the_first_draw_is_one_chunks_content_plus_the_ahead_slack() {
+    let total = 3 * DISCOVERY_BLOCK_BYTES;
+    let draw = PrimeLeg::first_draw(0, total);
+    assert_eq!(draw % CHUNK_GROUP_BYTES, 0);
+    assert!(
+        draw > PULL_AHEAD_BYTES && draw <= MIB + PULL_AHEAD_BYTES,
+        "one chunk of wire covers a little under one chunk of content: {draw}"
+    );
 }
 
-/// The predicted leg is the request cut to the window, the blob, the
+/// The predicted leg is the request cut to the first draw, the blob, the
 /// source's covered span, and the received-byte ceiling; it starts on the
 /// request's chunk group.
 #[test]
 fn the_predicted_leg_cuts_the_request_like_the_first_drive_leg() {
     let total = 3 * DISCOVERY_BLOCK_BYTES;
     let full = Coverage::full(num_blocks(total));
-    let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
+    let prime = PrimeLeg::new(0, 0);
+    let draw = PrimeLeg::first_draw(0, total);
 
-    // A whole-blob pull draws one window from offset 0.
+    // A whole-blob pull draws the first draw from offset 0.
     assert_eq!(
         prime.predicted_leg(total, &full, 0),
-        align_range(0, PULL_WINDOW_FLOOR, total).ok()
+        align_range(0, draw, total).ok()
     );
     // A nonzero offset paired with `len == u64::MAX` genuinely overflows
     // `offset + len` (unlike offset 0, which does not). A grown size claim
@@ -44,27 +44,17 @@ fn the_predicted_leg_cuts_the_request_like_the_first_drive_leg() {
     // `byte_len == 0` "to end" request from the same offset would) rather
     // than losing the first leg to `None`.
     assert_eq!(
-        PrimeLeg::new(
+        PrimeLeg::new(CHUNK_GROUP_BYTES, u64::MAX).predicted_leg(total, &full, 0),
+        align_range(
             CHUNK_GROUP_BYTES,
-            u64::MAX,
-            2,
-            PULL_WINDOW_FLOOR,
-            64 * MIB,
-            0
+            PrimeLeg::first_draw(CHUNK_GROUP_BYTES, total),
+            total
         )
-        .predicted_leg(total, &full, 0),
-        align_range(CHUNK_GROUP_BYTES, PULL_WINDOW_FLOOR, total).ok()
+        .ok()
     );
     // A mid-group start rounds down to its group; a short request is cut
     // to its own end.
-    let short = PrimeLeg::new(
-        CHUNK_GROUP_BYTES + 5,
-        2 * CHUNK_GROUP_BYTES,
-        2,
-        PULL_WINDOW_FLOOR,
-        64 * MIB,
-        0,
-    );
+    let short = PrimeLeg::new(CHUNK_GROUP_BYTES + 5, 2 * CHUNK_GROUP_BYTES);
     assert_eq!(
         short.predicted_leg(total, &full, 0),
         align_range(CHUNK_GROUP_BYTES, 3 * CHUNK_GROUP_BYTES, total).ok()
@@ -74,18 +64,15 @@ fn the_predicted_leg_cuts_the_request_like_the_first_drive_leg() {
         prime.predicted_leg(total, &full, CHUNK_GROUP_BYTES),
         align_range(0, CHUNK_GROUP_BYTES, total).ok()
     );
-    // An open ramp is cut to the source's covered span.
-    let open = PrimeLeg::new(0, 0, 0, PULL_WINDOW_FLOOR, 4 * DISCOVERY_BLOCK_BYTES, 0);
+    // The draw is cut to the source's covered span.
     let first_block = Coverage::from_block_indices(num_blocks(total), [0, 2].into_iter());
-    assert_eq!(
-        open.predicted_leg(total, &first_block, 0),
-        align_range(0, DISCOVERY_BLOCK_BYTES, total).ok()
-    );
+    let covered = PrimeLeg::new(0, 0).predicted_leg(total, &first_block, 0);
+    assert!(covered.is_some());
     // A source that does not cover the first block runs no first leg here.
     let later = Coverage::from_block_indices(num_blocks(total), [1].into_iter());
     assert_eq!(prime.predicted_leg(total, &later, 0), None);
     // A request past the hinted end has no leg.
-    let past = PrimeLeg::new(total, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
+    let past = PrimeLeg::new(total, 0);
     assert_eq!(past.predicted_leg(total, &full, 0), None);
 }
 
@@ -103,44 +90,22 @@ async fn the_predicted_leg_is_the_first_runs_first_leg() {
     let tail = Coverage::from_block_indices(blocks, [1, 2].into_iter());
     let head = Coverage::from_block_indices(blocks, [0].into_iter());
     let group = CHUNK_GROUP_BYTES;
-    let floor = PULL_WINDOW_FLOOR;
-    // (offset, len, divisor, credit_max, cap on bytes held, coverages)
-    let cases: Vec<(u64, u64, u64, u64, u64, Vec<Coverage>)> = vec![
-        (0, 0, 2, 64 * MIB, 0, vec![full.clone()]),
-        (group + 5, 3 * group, 2, 64 * MIB, 0, vec![full.clone()]),
-        (5 * MIB + 3, 0, 2, 64 * MIB, 0, vec![full.clone()]),
-        (0, 0, 2, 64 * MIB, 2 * group, vec![full.clone()]),
-        // An open ramp wider than a block: cut to the run's covered span.
-        (
-            0,
-            0,
-            0,
-            4 * DISCOVERY_BLOCK_BYTES,
-            0,
-            vec![head.clone(), full.clone()],
-        ),
+    // (offset, len, cap on bytes held, coverages)
+    let cases: Vec<(u64, u64, u64, Vec<Coverage>)> = vec![
+        (0, 0, 0, vec![full.clone()]),
+        (group + 5, 3 * group, 0, vec![full.clone()]),
+        (5 * MIB + 3, 0, 0, vec![full.clone()]),
+        (0, 0, 2 * group, vec![full.clone()]),
         // The first block's only holder is the second candidate.
-        (0, 0, 2, 64 * MIB, 0, vec![tail.clone(), head.clone()]),
+        (0, 0, 0, vec![tail.clone(), head.clone()]),
         // A request inside the ragged last block.
-        (total - 3 * group, 0, 0, 64 * MIB, 0, vec![full.clone()]),
-        (
-            DISCOVERY_BLOCK_BYTES + 7,
-            2 * MIB,
-            2,
-            64 * MIB,
-            0,
-            vec![head, tail],
-        ),
+        (total - 3 * group, 0, 0, vec![full.clone()]),
+        (DISCOVERY_BLOCK_BYTES + 7, 2 * MIB, 0, vec![head, tail]),
     ];
-    // Each case runs with no carried credit and with a carry that ramps the
-    // window past a block.
-    let cases = cases
-        .into_iter()
-        .flat_map(|case| [(case.clone(), 0), (case, 3 * DISCOVERY_BLOCK_BYTES)]);
-    for ((offset, len, divisor, credit_max, ceiling, coverages), carried) in cases {
+    for (offset, len, ceiling, coverages) in cases {
         let dir = tempfile::tempdir().unwrap();
         let store = ClientRangedStore::create(dir.path(), "b", [7; 32], total).unwrap();
-        let prime = PrimeLeg::new(offset, len, divisor, floor, credit_max, carried);
+        let prime = PrimeLeg::new(offset, len);
         let gap = store.missing_ranges(offset, len).await.unwrap();
         let sources: Vec<SourceCoverage> = coverages
             .iter()
@@ -153,14 +118,19 @@ async fn the_predicted_leg_is_the_first_runs_first_leg() {
         let rank: Vec<usize> = (0..sources.len()).collect();
         let (runs, _) = plan_covered_runs(&gap, total, &sources, &rank);
         let run = runs.first().unwrap();
-        let want = first_leg(&store, &[(run.offset, run.len)], prime.window, ceiling)
-            .await
-            .unwrap();
+        let start = offset - offset % group;
+        let want = first_leg(
+            &store,
+            &[(run.offset, run.len)],
+            PrimeLeg::first_draw(start, total),
+            ceiling,
+        )
+        .await
+        .unwrap();
         let got = prime.predicted_leg(total, coverages.get(run.source_ix).unwrap(), ceiling);
         assert_eq!(
             got, want,
-            "offset {offset}, len {len}, divisor {divisor}, ceiling {ceiling}, \
-             carried {carried}"
+            "offset {offset}, len {len}, ceiling {ceiling}"
         );
     }
 }
@@ -173,7 +143,7 @@ fn the_handshake_visits_the_first_runs_holder_first() {
     let blocks = num_blocks(total);
     let later = Coverage::from_block_indices(blocks, [1, 2].into_iter());
     let head = Coverage::from_block_indices(blocks, [0].into_iter());
-    let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
+    let prime = PrimeLeg::new(0, 0);
     assert_eq!(
         handshake_order(&[later, head], Some(total), Some(prime)),
         vec![1, 0]
@@ -190,7 +160,7 @@ fn without_a_prime_the_handshake_walks_the_rank_order() {
     let head = Coverage::from_block_indices(blocks, [0].into_iter());
     let coverages = [later, head];
     assert_eq!(handshake_order(&coverages, Some(total), None), vec![0, 1]);
-    let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
+    let prime = PrimeLeg::new(0, 0);
     assert_eq!(handshake_order(&coverages, None, Some(prime)), vec![0, 1]);
 }
 
@@ -202,7 +172,7 @@ fn with_no_holder_of_the_first_block_the_handshake_walks_the_rank_order() {
     let blocks = num_blocks(total);
     let last = Coverage::from_block_indices(blocks, [2].into_iter());
     let middle = Coverage::from_block_indices(blocks, [1].into_iter());
-    let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
+    let prime = PrimeLeg::new(0, 0);
     assert_eq!(
         handshake_order(&[last, middle], Some(total), Some(prime)),
         vec![0, 1]

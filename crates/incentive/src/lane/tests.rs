@@ -1367,3 +1367,55 @@ fn a_lane_with_no_voucher_holds_no_claim() {
     assert!(state.live_claim().is_none());
     assert_eq!(state.owed(), U256::ZERO);
 }
+
+/// A lane that holds `paid` bytes of signed claim.
+fn lane_paid(paid: u64) -> LaneState {
+    LaneState::hydrate(
+        B256::ZERO,
+        Address::ZERO,
+        Address::ZERO,
+        U256::MAX,
+        u64::MAX,
+        U256::from(paid),
+        U256::from(paid),
+        Some([1u8; 65]),
+        LaneChain::NONE,
+    )
+}
+
+/// A lane with no claim has no credit and refuses every debit.
+#[test]
+fn a_lane_with_no_claim_has_no_credit() {
+    let mut lane = lane_with_terms(1, u64::MAX);
+    assert_eq!(lane.credit_bytes(), 0);
+    assert_eq!(lane.debit(1), Err(0));
+    assert_eq!(lane.delivered_bytes, 0);
+}
+
+/// A debit takes from the credit once. Two debits that together exceed the
+/// payment cannot both succeed, which is what stops two streams on one lane
+/// from spending one payment twice.
+#[test]
+fn a_debit_spends_the_credit_once() {
+    let mut lane = lane_paid(1_000);
+    assert_eq!(lane.credit_bytes(), 1_000);
+    assert_eq!(lane.debit(600), Ok(()));
+    assert_eq!(lane.credit_bytes(), 400);
+    assert_eq!(lane.debit(600), Err(400));
+    assert_eq!(lane.delivered_bytes, 600);
+    assert_eq!(lane.debit(400), Ok(()));
+    assert_eq!(lane.credit_bytes(), 0);
+}
+
+/// A refund gives bytes back to the credit and never takes the delivered
+/// count below zero.
+#[test]
+fn a_refund_returns_credit_and_saturates() {
+    let mut lane = lane_paid(1_000);
+    assert_eq!(lane.debit(1_000), Ok(()));
+    lane.refund(300);
+    assert_eq!(lane.credit_bytes(), 300);
+    lane.refund(u64::MAX);
+    assert_eq!(lane.delivered_bytes, 0);
+    assert_eq!(lane.credit_bytes(), 1_000);
+}

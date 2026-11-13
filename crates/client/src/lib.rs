@@ -335,8 +335,8 @@ pub use ledger::{ChainCommit, EpochAction, Metered, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
 #[doc(hidden)]
 pub use pacer::{
-    BudgetPacer, DownstreamFrontier, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer,
-    VERIFY_LAG_BYTES, WindowPacer,
+    BudgetPacer, CreditPacer, DownstreamFrontier, PULL_AHEAD_BYTES, PULL_WINDOW_FLOOR,
+    PaceDecision, PaceState, Pacer, VERIFY_LAG_BYTES, WindowPacer,
 };
 #[doc(hidden)]
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};

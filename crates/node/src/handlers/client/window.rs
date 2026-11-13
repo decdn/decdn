@@ -10,23 +10,10 @@ use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
-    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, CoverageShortfall, FloorReservation, Hash,
-    LaneDeliveryState, LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream, SendStream,
-    ServeRejectReason, StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, CoverageShortfall, Hash, LaneDeliveryState,
+    LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
+    StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
-
-/// Release a miss leg's floor reservation on a refusal taken BEFORE the serve
-/// loop runs — the pre-flight floor-`M` gate, the size gate, or an upstream that
-/// refused the header handshake. Nothing was fronted upstream and no byte
-/// was delivered, so [`FloorReservation::release_unspent`] frees the live
-/// reservation promptly and marks the guard so its `Drop` is a clean no-op
-/// (ADR 003 §Pool solvency). A no-op when no lane was known (no reservation was
-/// taken).
-fn release_reservation_unspent(reservation: Option<&FloorReservation>) {
-    if let Some(reservation) = reservation {
-        reservation.release_unspent();
-    }
-}
 
 /// The held chunk ranges whose proof a serve-miss for `[offset, +len)` seeds:
 /// `present` clipped to the chunk-group-aligned ranges the serve leg encodes.
@@ -56,14 +43,13 @@ fn held_seed_ranges(present: &ChunkRanges, offset: u64, len: u64, total_bytes: u
 /// dispatch and this point. Either way the serve leg can never deliver the hash
 /// (`covers_locally` refuses it). Spawning the pull would pay upstream or origin
 /// egress for bytes that never go on the wire, so the owner skips it. It fails
-/// the session so attached observers stop, releases every lease, and frees the
-/// floor reservation, because no byte was delivered. The response is already
-/// sent, so the serve fails mid-stream.
+/// the session so attached observers stop and releases every lease, because no
+/// byte was delivered. The response is already sent, so the serve fails
+/// mid-stream.
 fn abort_withdrawn_fill(
     hash: Hash,
     serve_session: &decdn_cache::FillSession,
     leases: Vec<decdn_cache::ObserverLease>,
-    floor_reservation: Option<&FloorReservation>,
 ) -> anyhow::Error {
     serve_session.mark_ended(Err(decdn_cache::FillError::new(
         "the hash is refused: withdrawn or denied during the serve-miss",
@@ -71,7 +57,6 @@ fn abort_withdrawn_fill(
     for lease in leases {
         let _ = lease.release();
     }
-    release_reservation_unspent(floor_reservation);
     anyhow::anyhow!("serve-miss for {hash}: the hash is refused after seeding; skipped the pull")
 }
 
@@ -79,9 +64,9 @@ impl ClientHandler {
     /// Serve a cache miss by running the two decoupled serve-miss legs (#856, ADR
     /// 037): the pull leg fills the cache from upstream for only the missing ranges
     /// while the serve leg streams the filling cache to the paying client, pacing the
-    /// upstream spend by the downstream's vouchers so per-request speculative
-    /// exposure is bounded to the ramped credit window (#1669) rather than the
-    /// whole blob. The caller has already proven lane authority. The request may
+    /// upstream spend by the credit the downstream lane holds, so the node pays its
+    /// upstream only for bytes the lane has paid for. The caller has already proven
+    /// lane authority. The request may
     /// be whole-blob, bounded, or resumed: the serve leg clamps delivery to
     /// `[byte_offset, end)` and the pull leg fills only that span's missing chunk
     /// groups.
@@ -138,7 +123,6 @@ impl ClientHandler {
         pool_remaining: Option<U256>,
         fault_seen: bool,
         rate_per_mb: u64,
-        floor_reservation: Option<FloorReservation>,
         mut first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
@@ -149,44 +133,29 @@ impl ClientHandler {
         // owes both checks, because this is a spend-and-serve path.
         //
         // They cover the request, not the stream: a takedown landing after this
-        // point is caught per MB boundary inside the serve leg (`serve_leg`, ADR 011
-        // §On Blacklist Event, in-flight termination), which matters most here
+        // point is caught before each frame inside the serve leg (`serve_leg`, ADR
+        // 011 §On Blacklist Event, in-flight termination), which matters most here
         // because this path is simultaneously *acquiring* the blob upstream.
         //
         // The owning lane is resolved and its ownership proven by the caller
         // (`pull_authorized` + the serve gate), and threaded in as `lane` /
-        // `lane_key` for the downstream voucher collection.
-        //
-        // The floor-M guard, the response signature, and the serve/pull window
-        // all price against the fixed voucher accounting interval.
+        // `lane_key` for the downstream proof collection.
         let chunk_bytes = CHUNK_BYTES;
-        // The pre-flight reservation is the ramp floor — one chunk. In-
-        // stream exposure is bounded by the ramped credit window, which the serve
-        // loop and the pull-leg `RampPacer` both enforce (#1669).
-        let credit_floor = self.credit_window(chunk_bytes, 0);
 
-        // The pull leg paces in CONTENT bytes while the client pays in WIRE bytes,
-        // and two chunk-group roundings sit between the two (see
-        // `PULL_WINDOW_FLOOR`). Its window therefore floors one chunk HIGHER than
-        // the reservation and the serve loop, which both meter in wire and need no
-        // such allowance.
-        let pacing_floor = credit_floor.max(decdn_client::PULL_WINDOW_FLOOR);
-
-        // Pre-flight floor-M guard (shared-payment-pool model) — the pull-through
-        // twin of the `dispatch.rs` direct-serve gate. Refuse the speculative pull
-        // when the pool's on-chain remaining (`getPool.deposit − totalRedeemed`)
-        // minus the refundable floor `M` can no longer cover the reserved floor,
-        // so the node never fronts upstream USDC for a pool that cannot cover it.
-        // The floor is one credit window, CAPPED BY THE REQUEST'S ALIGNED SPAN
-        // when the request bounds itself — the same pricing `dispatch.rs` reserved,
-        // so a request accepted there is never refused here for a sub-window span.
+        // Pre-flight pool admission guard — the pull-through twin of the
+        // `dispatch.rs` direct-serve gate. Refuse the pull when the pool's
+        // on-chain remaining (`getPool.deposit − totalRedeemed`) minus the
+        // refundable floor `M` cannot cover one chunk (ADR 003 § Pool solvency).
+        // The price is CAPPED BY THE REQUEST'S ALIGNED SPAN when the request
+        // bounds itself — the same pricing `dispatch.rs` uses, so a request
+        // accepted there is never refused here for a sub-chunk span.
         // `pool_remaining` is the cached `getPool.remaining` threaded from the
         // serve gate; `None` (no pool-view, unknown pool, or a read fault) fails
         // open — the on-chain `redeem` is the backstop.
         let guard_bytes = if req.byte_len > 0 {
-            aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(credit_floor)
+            aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(chunk_bytes)
         } else {
-            credit_floor
+            chunk_bytes
         };
         if let Some(remaining) = pool_remaining
             && !self.pool_remaining_covers_window(remaining, guard_bytes, rate_per_mb)
@@ -198,7 +167,6 @@ impl ClientHandler {
                 headroom,
                 decdn_incentive::min_payment(guard_bytes, rate_per_mb),
             );
-            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(
                     &mut send,
@@ -232,7 +200,6 @@ impl ClientHandler {
                 })
                 .is_ok_and(|present| present.held_bytes() >= cap)
         {
-            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
                 .await;
@@ -254,23 +221,9 @@ impl ClientHandler {
         // big-endian to the on-chain `uint256` shape.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
         let namespace_id = U256::from_be_bytes(req.namespace_id);
-        // The lane's banked ramp credit, taken once for this stream (ADR 003
-        // §Credit window). An owned pull leg paces on it too. The serve leg
-        // returns it only when the stream ends fully paid.
-        let carry = self.take_ramp_carry(Some(lane)).await;
-        let paid_carried = carry.carried();
         // The first leg a pull of `[offset, +len)` opens, so the handshake can
         // open that leg instead of a whole-blob open it drops (#2063).
-        let prime_for = |offset: u64, len: u64| {
-            PrimeLeg::new(
-                offset,
-                len,
-                self.credit_ramp_divisor,
-                pacing_floor,
-                self.credit_max,
-                paid_carried,
-            )
-        };
+        let prime_for = PrimeLeg::new;
         let mut target: Option<PullLegTarget> = None;
         let in_flight = self.cache.in_flight_total(hash);
         // A whole-blob request from an active staker, with no live fill to
@@ -290,7 +243,6 @@ impl ClientHandler {
                 "refusing a whole-blob request from a node while this node's own \
                  upstream open for the blob is in progress"
             );
-            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(
                     &mut send,
@@ -327,7 +279,6 @@ impl ClientHandler {
                         total
                     }
                     Err(refusal) => {
-                        release_reservation_unspent(floor_reservation.as_ref());
                         return self
                             .respond_miss(&mut send, req, refusal, rate_per_mb)
                             .await;
@@ -438,7 +389,6 @@ impl ClientHandler {
             {
                 Ok(opened) => target = Some(opened),
                 Err(refusal) => {
-                    release_reservation_unspent(floor_reservation.as_ref());
                     return self
                         .respond_miss(&mut send, req, refusal, rate_per_mb)
                         .await;
@@ -453,7 +403,6 @@ impl ClientHandler {
             .pull_range_uncovered(hash, total_bytes, pull_range, target.as_ref())
             .await
         {
-            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_miss(
                     &mut send,
@@ -487,12 +436,7 @@ impl ClientHandler {
         self.seed_held_outboard(hash, &serve_session, req, total_bytes)
             .await;
         if pull_range.is_some() && self.cache.refuses(hash) {
-            return Err(abort_withdrawn_fill(
-                hash,
-                &serve_session,
-                leases,
-                floor_reservation.as_ref(),
-            ));
+            return Err(abort_withdrawn_fill(hash, &serve_session, leases));
         }
         // The serve leg reads the cache the pull leg fills — same engine, same hash.
         let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
@@ -523,12 +467,6 @@ impl ClientHandler {
             let engine = self.cache.clone();
             let session = Arc::clone(&serve_session);
             let cancel = serve_session.cancel_token().clone();
-            // The pull leg's `RampPacer` (#1669): the same ramp the serve loop
-            // computes from its own paid frontier and its carried lane credit, so
-            // the pull never runs further ahead of the downstream served-paid
-            // frontier than the ramped credit window allows.
-            let credit_ramp_divisor = self.credit_ramp_divisor;
-            let credit_max = self.credit_max;
             // The pull runs on its own thread and runtime, which starts with no
             // span: open its span here, under the serve stream's, and enter it
             // there so the pull's spans and events stay in this trace.
@@ -548,10 +486,6 @@ impl ClientHandler {
                             hash,
                             pull_offset,
                             pull_len,
-                            credit_ramp_divisor,
-                            pacing_floor,
-                            credit_max,
-                            paid_carried,
                             Arc::clone(&session),
                             cancel,
                         )),
@@ -587,13 +521,6 @@ impl ClientHandler {
         // It mints its outboard reader from the shared per-hash outboard and reads the
         // registry-wide fill liveness for the no-hang guarantee, pacing every pull it
         // draws from (its own plus any attached sibling).
-        //
-        // The pool floor reservation (opened at the dispatch pre-spend gate) is OWNED
-        // here and passed by reference: the serve leg releases it once the stream
-        // repays one floor, exactly like the hit path. Holding ownership across the
-        // `await` keeps the guard alive for the whole serve; its `Drop` frees the
-        // pool's live floor headroom AFTER `serve_leg` returns, at this function's
-        // scope end.
         let serve_result = self
             .serve_leg(
                 conn,
@@ -603,7 +530,6 @@ impl ClientHandler {
                 Arc::clone(&serve_session),
                 &also_pace,
                 lane,
-                carry,
                 hash,
                 lane_key,
                 client_node_id,
@@ -611,7 +537,6 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                floor_reservation.as_ref(),
                 first_byte,
             )
             .await;
@@ -669,7 +594,7 @@ impl ClientHandler {
     /// The ADR 011 open-time deny gates are already discharged (a denylisted hash
     /// is refused before the availability check; a blacklisted funder is refused
     /// at `serve_stream`'s open-time funder gate, which precedes every fill tier). A
-    /// takedown that lands mid-stream is caught per interval inside
+    /// takedown that lands mid-stream is caught before each frame inside
     /// [`Self::serve_leg`].
     ///
     /// Faults are scored LOCAL (never against a provider — there is none): the serve
@@ -689,7 +614,6 @@ impl ClientHandler {
         total_bytes: u64,
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
-        floor_reservation: Option<FloorReservation>,
         mut first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // Mark that the own-origin serve-miss tier fired for this request, before
@@ -699,33 +623,18 @@ impl ClientHandler {
         self.metrics.local_outboard_serve();
 
         // The owning lane is resolved and its ownership proven by the caller;
-        // `lane` / `lane_key` are threaded in for the downstream voucher
+        // `lane` / `lane_key` are threaded in for the downstream proof
         // collection.
-        //
-        // The floor-M guard, the response signature, and the serve/pull window
-        // price against the fixed voucher accounting interval.
         let chunk_bytes = CHUNK_BYTES;
-        // The pre-flight reservation is the ramp floor — one chunk, the
-        // same bound the peer twin computes. In-stream exposure is bounded by the
-        // ramped credit window, which the serve loop and the pull-leg `RampPacer`
-        // both enforce (#1669).
-        let credit_floor = self.credit_window(chunk_bytes, 0);
 
-        // The pull leg paces in CONTENT bytes while the client pays in WIRE bytes,
-        // and two chunk-group roundings sit between the two (see
-        // `PULL_WINDOW_FLOOR`). Its window therefore floors one chunk HIGHER than
-        // the reservation and the serve loop, which both meter in wire and need no
-        // such allowance.
-        let pacing_floor = credit_floor.max(decdn_client::PULL_WINDOW_FLOOR);
-
-        // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
-        // twin of the peer path and of `dispatch.rs`. Refuse the serve when the
-        // pool's on-chain remaining minus the refundable floor `M` cannot cover
-        // the reserved floor. `pool_remaining` is the cached `getPool.remaining`
-        // threaded from the serve gate; `None` fails open (on-chain `redeem` is
-        // the backstop). The own-origin leg fronts no upstream USDC, but delivery
-        // is billed per voucher, so a pool that cannot cover the floor is refused
-        // here for wire-parity with the peer path rather than served for free.
+        // Pre-flight pool admission guard — the own-origin twin of the peer path
+        // and of `dispatch.rs`. Refuse the serve when the pool's on-chain
+        // remaining minus the refundable floor `M` cannot cover one chunk.
+        // `pool_remaining` is the cached `getPool.remaining` threaded from the
+        // serve gate; `None` fails open (on-chain `redeem` is the backstop). The
+        // own-origin leg fronts no upstream USDC, but delivery is billed per
+        // chunk, so a pool that cannot cover one is refused here for wire-parity
+        // with the peer path rather than served for free.
         //
         // (2) Bounds gate first, on the probed geometry, BEFORE the guard and the
         // signature: an offset at or past the end is `RangeNotSatisfiable` here
@@ -736,7 +645,6 @@ impl ClientHandler {
         // size is a hint). This total is the node's OWN origin probe, so unlike the peer
         // twin the gate cannot be steered by a lying counterparty (#1895).
         if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
-            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(
                     &mut send,
@@ -747,13 +655,12 @@ impl ClientHandler {
                 .await;
         }
 
-        // The floor is capped by the request's aligned span — priced against the
-        // PROBED total (in hand here, unlike dispatch's pre-fill reservation), so
-        // a resumed tail near the blob end span-caps too, and a request accepted
-        // at dispatch is never refused here for a sub-window span. In bounds per
-        // the gate above, so `aligned_span` never saturates.
+        // The price is capped by the request's aligned span — priced against the
+        // PROBED total, so a resumed tail near the blob end span-caps too, and a
+        // request accepted at dispatch is never refused here for a sub-chunk span.
+        // In bounds per the gate above, so `aligned_span` never saturates.
         let guard_bytes =
-            aligned_span(req.byte_offset, req.byte_len, total_bytes).min(credit_floor);
+            aligned_span(req.byte_offset, req.byte_len, total_bytes).min(chunk_bytes);
         if let Some(remaining) = pool_remaining
             && !self.pool_remaining_covers_window(remaining, guard_bytes, rate_per_mb)
         {
@@ -764,7 +671,6 @@ impl ClientHandler {
                 headroom,
                 decdn_incentive::min_payment(guard_bytes, rate_per_mb),
             );
-            release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(
                     &mut send,
@@ -804,8 +710,6 @@ impl ClientHandler {
         // current-thread runtime, coordinating only through the `Send + Sync`
         // `FillSession` (the shared PAID frontier, the captured outboard, the pull's
         // terminal signal). #1610 — ingest only behind a waiting, paying client.
-        // `interval_bytes` and the pacing `credit_floor` were resolved with the floor-M
-        // guard above.
 
         // (5a) Atomically claim the fill (ADR 038): under one registry lock,
         // OWN a fresh local pull for `hash` or ATTACH as an observer to a live same-hash
@@ -838,12 +742,7 @@ impl ClientHandler {
         self.seed_held_outboard(hash, &serve_session, req, total_bytes)
             .await;
         if pull_range.is_some() && self.cache.refuses(hash) {
-            return Err(abort_withdrawn_fill(
-                hash,
-                &serve_session,
-                leases,
-                floor_reservation.as_ref(),
-            ));
+            return Err(abort_withdrawn_fill(hash, &serve_session, leases));
         }
         // The serve leg reads the cache the pull leg fills — same engine, same hash.
         let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
@@ -855,18 +754,11 @@ impl ClientHandler {
         // that `run_local_pull_leg` reads back via `source.ledger()` and hands to
         // `drive` as the completion frontier (THE CRUX — a completion counter, never
         // payment).
-        // The lane's banked ramp credit, taken once for this stream (ADR 003
-        // §Credit window). An owned pull leg paces on it too. The serve leg
-        // returns it only when the stream ends fully paid.
-        let carry = self.take_ramp_carry(Some(lane)).await;
         if let Some((pull_offset, pull_len)) = pull_range {
             let engine = self.cache.clone();
             let metrics = Arc::clone(&self.metrics);
             let session = Arc::clone(&serve_session);
             let cancel = serve_session.cancel_token().clone();
-            let credit_ramp_divisor = self.credit_ramp_divisor;
-            let credit_max = self.credit_max;
-            let paid_carried = carry.carried();
             // The unpaid local-origin leg: a throwaway ledger that never signs
             // and never meters, because `BackendSource` quotes rate 0.
             let ledger = Arc::new(decdn_client::PoolLedger::new(
@@ -897,10 +789,6 @@ impl ClientHandler {
                             hash,
                             pull_offset,
                             pull_len,
-                            credit_ramp_divisor,
-                            pacing_floor,
-                            credit_max,
-                            paid_carried,
                             total_bytes,
                             Arc::clone(&session),
                             cancel,
@@ -937,13 +825,6 @@ impl ClientHandler {
         // Run the serve leg on THIS (accept) task and await it. It owns termination —
         // mid-stream takedown and client-disconnect are both handled inside it — and
         // paces every pull it draws from (its own plus any attached sibling).
-        //
-        // The pool floor reservation (opened at the dispatch pre-spend gate) is OWNED
-        // here and passed by reference so the serve leg releases it exactly like the
-        // hit path once the stream repays its floor. Holding ownership across the
-        // `await` keeps the guard alive for the whole serve; its `Drop` frees the
-        // pool's live floor headroom AFTER `serve_leg` returns, at this function's
-        // scope end.
         let serve_result = self
             .serve_leg(
                 conn,
@@ -953,7 +834,6 @@ impl ClientHandler {
                 Arc::clone(&serve_session),
                 &also_pace,
                 lane,
-                carry,
                 hash,
                 lane_key,
                 client_node_id,
@@ -961,7 +841,6 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                floor_reservation.as_ref(),
                 first_byte,
             )
             .await;

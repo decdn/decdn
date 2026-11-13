@@ -1871,7 +1871,7 @@ impl super::PacingWait for CatchingUpWait<'_> {
 /// collapse draws back to about one chunk.
 #[tokio::test(start_paused = true)]
 async fn a_large_window_draws_at_least_half_per_open_and_completes() {
-    use crate::pacer::{PULL_WINDOW_FLOOR, RampPacer};
+    use crate::pacer::{PULL_WINDOW_FLOOR, WindowPacer};
 
     for demand in [false, true] {
         let window = 8 * PULL_WINDOW_FLOOR;
@@ -1886,13 +1886,7 @@ async fn a_large_window_draws_at_least_half_per_open_and_completes() {
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
-        let pacer = RampPacer {
-            divisor: 0,
-            floor: PULL_WINDOW_FLOOR,
-            credit_max: window,
-            paid_base: 0,
-            paid_carried: 0,
-        };
+        let pacer = WindowPacer::new(window);
         let served_paid = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let serve_demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let wait_hook = CatchingUpWait {
@@ -2032,7 +2026,7 @@ impl super::PacingWait for ParkingWait {
 /// then parks. The downstream client pays nothing throughout.
 #[tokio::test(start_paused = true)]
 async fn in_band_demand_converges_when_upstream_payment_lags_delivery() {
-    use crate::pacer::{PULL_WINDOW_FLOOR, RampPacer};
+    use crate::pacer::{PULL_WINDOW_FLOOR, WindowPacer};
 
     const FLOOR: u64 = PULL_WINDOW_FLOOR;
     // Room past `window + 2 * FLOOR`, so an over-sized demand draw is not
@@ -2052,18 +2046,11 @@ async fn in_band_demand_converges_when_upstream_payment_lags_delivery() {
         max_opens: 8,
     };
 
-    // A window of two floors: `divisor: 0` fixes the window at `credit_max`,
-    // and `served_paid` stays 0, so the window never slides. The first leg
-    // fills it, and half payment leaves the paid frontier about one floor
-    // behind delivery.
+    // A window of two floors, and `served_paid` stays 0, so the window never
+    // slides. The first leg fills it, and half payment leaves the paid frontier
+    // about one floor behind delivery.
     let window = 2 * FLOOR;
-    let pacer = RampPacer {
-        divisor: 0,
-        floor: FLOOR,
-        credit_max: window,
-        paid_base: 0,
-        paid_carried: 0,
-    };
+    let pacer = WindowPacer::new(window);
     // The serve leg is parked on the first byte past the closed window: one
     // byte ahead of the pull once the window fills, and so in band.
     let demand = window + 1;

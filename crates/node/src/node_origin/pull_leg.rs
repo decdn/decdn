@@ -22,7 +22,7 @@
 //!   ranged-drive loop (#1506): it plans the missing range into runs by coverage
 //!   ([`decdn_client::plan_covered_runs`]) and drives them in offset order,
 //!   opening ONE payment lane ([`NodeAdmitStore`] sink, [`PeerSource`],
-//!   [`RampPacer`], [`super::funder::NodeFunder`]) per run and re-planning a non-terminal run
+//!   [`CreditPacer`], [`super::funder::NodeFunder`]) per run and re-planning a non-terminal run
 //!   fault onto the survivors. It scores each provider as its run ends and records
 //!   the assembly's terminal outcome via the shared
 //!   [`decdn_cache::FillSession::mark_ended`]. A per-lane [`SettleOnDrop`] guard
@@ -50,8 +50,8 @@ use decdn_cache::{CacheEngine, CacheError, DownstreamWatch, FillError, FillSessi
 use decdn_client::sink::PullReader;
 use decdn_client::source::BlobSource as _;
 use decdn_client::{
-    CoveredRun, DownstreamFrontier, Fault, HashMismatch as ClientPullHashMismatch, LegNoProgress,
-    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, RecoveryGate, SharedPool,
+    CoveredRun, CreditPacer, DownstreamFrontier, Fault, HashMismatch as ClientPullHashMismatch,
+    LegNoProgress, PacingWait, PeerSource, PoolLedger, PrimedSource, RecoveryGate, SharedPool,
     UpstreamPullHeader, WaitReason, classify, drive, first_leg,
 };
 
@@ -149,30 +149,28 @@ pub(crate) struct PrimeLeg {
     pub(crate) offset: u64,
     /// The pull's content length; `0` is to the blob's end.
     pub(crate) len: u64,
-    /// The first draw [`RampPacer`] allows: the ramped credit window at the
-    /// ramp credit the owning stream carries and no payment of its own yet,
-    /// floored to whole chunk groups as the window pacer floors it.
-    pub(crate) window: u64,
 }
 
 impl PrimeLeg {
-    /// The prime for a pull of `[offset, +len)` paced by a [`RampPacer`] built
-    /// from `divisor`, `floor`, `credit_max`, and `paid_carried`.
-    pub(crate) fn new(
-        offset: u64,
-        len: u64,
-        divisor: u64,
-        floor: u64,
-        credit_max: u64,
-        paid_carried: u64,
-    ) -> Self {
-        let window =
-            decdn_incentive::ramped_credit_window(divisor, floor, credit_max, paid_carried);
-        Self {
-            offset,
-            len,
-            window: window - window % CHUNK_GROUP_BYTES,
-        }
+    /// The prime for a pull of `[offset, +len)` paced by a [`CreditPacer`].
+    pub(crate) const fn new(offset: u64, len: u64) -> Self {
+        Self { offset, len }
+    }
+
+    /// The first draw [`CreditPacer`] allows once the downstream lane holds the
+    /// credit of a payer's first payment, one chunk: the content that one chunk of
+    /// wire covers from `start`, floored to a chunk group, plus
+    /// [`decdn_client::PULL_AHEAD_BYTES`]. A payer that pays more than one chunk at
+    /// first draws a larger leg, and the drive then opens its own leg instead of
+    /// adopting the primed pull.
+    fn first_draw(start: u64, total_bytes: u64) -> u64 {
+        let paid = decdn_client::sink::content_paid_frontier(
+            start,
+            total_bytes,
+            decdn_protocol::client::CHUNK_BYTES,
+        );
+        paid.saturating_sub(start)
+            .saturating_add(decdn_client::PULL_AHEAD_BYTES)
     }
 
     /// The first leg the pull leg's first run opens on a node holding none of
@@ -218,7 +216,7 @@ impl PrimeLeg {
         let span_end = (u64::from(last_block) + 1)
             .saturating_mul(block_bytes)
             .min(request_end);
-        let mut draw = (span_end - start).min(self.window);
+        let mut draw = (span_end - start).min(Self::first_draw(start, total_bytes));
         if max_blob_size_bytes > 0 {
             // Predicted for a store holding none of the blob, so the cap's whole
             // worth is room.
@@ -338,7 +336,7 @@ pub(crate) struct PrimedHandshake {
     reader: TimedReader<PullReader>,
 }
 
-/// The injected wait for [`RampPacer`]'s `Wait` and `WaitForMinDraw`: resolve once the serve leg's paid
+/// The injected wait for [`CreditPacer`]'s `Wait` and `WaitForMinDraw`: resolve once the serve leg's paid
 /// frontier moves past, or the nearest serve demand differs from, what the decision read
 /// ([`DownstreamWatch::past`], which owns the #1673 arm-then-recheck). Also the
 /// reader `drive` paces against, so the decision and the wait always read the same
@@ -1148,13 +1146,11 @@ fn handshake_verdict(
 
 /// Assemble `[offset, offset + len)` of `hash` into `engine`'s cache across the
 /// ranked partial holders in `target` via the ranged-drive loop (#1506, ADR 039),
-/// paying only for the missing ranges and pacing each lane with a [`RampPacer`]
-/// built from `credit_ramp_divisor`, `credit_floor`, `credit_max`, and the ramp
-/// credit `paid_carried` the owning stream carries from its lane — the same
-/// ramped credit window the serve leg computes from its own paid frontier (ADR 003
-/// §Credit window / ADR 037), so the pull never runs further ahead of the
-/// downstream serve leg's paid frontier than that window allows, plus the one
-/// window floor a serve leg parked at the pull's frontier demands.
+/// paying only for the missing ranges and pacing each lane with a
+/// [`CreditPacer`]: the pull draws only what the downstream lane has paid for (ADR
+/// 003 § Credit Window, ADR 037), so it never runs further ahead of the serve
+/// leg's credit frontier than [`decdn_client::PULL_AHEAD_BYTES`], and it draws
+/// nothing while the lane holds no credit.
 ///
 /// # Ranged assembly across partial holders
 ///
@@ -1164,7 +1160,7 @@ fn handshake_verdict(
 /// probe-fresh coverage ([`decdn_client::plan_covered_runs`], concentrate +
 /// sticky), and drives the runs in offset order. Each run opens ONE buyer lane to
 /// its source — one `(signer, provider)` payment lane — and runs are SEQUENTIAL,
-/// so two lanes never pay at once. The [`NodeAdmitStore`], [`RampPacer`], the
+/// so two lanes never pay at once. The [`NodeAdmitStore`], [`CreditPacer`], the
 /// downstream frontier reader and wait ([`DownstreamWait`]) are SHARED across
 /// every run, so the demand window is continuous: it is keyed on the downstream
 /// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
@@ -1220,10 +1216,6 @@ pub(crate) async fn run_pull_leg(
     hash: Hash,
     offset: u64,
     len: u64,
-    credit_ramp_divisor: u64,
-    credit_floor: u64,
-    credit_max: u64,
-    paid_carried: u64,
     session: Arc<FillSession>,
     cancel: CancellationToken,
 ) {
@@ -1257,15 +1249,11 @@ pub(crate) async fn run_pull_leg(
 
     let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)))
         .counting_received(Arc::clone(&deps.metrics));
-    // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037), SHARED
-    // across every run so the pull never runs further ahead of the downstream
-    // served-paid frontier than the window allows, in lockstep with the serve leg.
-    let pacer = RampPacer {
-        divisor: credit_ramp_divisor,
-        floor: credit_floor,
-        credit_max,
+    // The credit pacer (ADR 003 § Credit Window / ADR 037), SHARED across every
+    // run so the pull never runs further ahead of the downstream credit frontier
+    // than its slack allows, in lockstep with the serve leg.
+    let pacer = CreditPacer {
         paid_base: session.served_start(),
-        paid_carried,
     };
     // The downstream pacing wait and frontier reader, SHARED across every run's lane
     // so the window is continuous — keyed on the session's downstream frontiers, not
@@ -1391,7 +1379,7 @@ struct PeerRunSink<'a> {
     total_bytes: u64,
     deadlines: PullDeadlines,
     admit_store: &'a NodeAdmitStore,
-    pacer: &'a RampPacer,
+    pacer: &'a CreditPacer,
     /// The shared downstream wait, which is also the frontier reader every run's
     /// `drive` paces against, so the demand window is continuous across runs.
     pacing_wait: &'a DownstreamWait,
@@ -1433,7 +1421,10 @@ impl PeerRunSink<'_> {
         let leg = match first_leg(
             self.admit_store,
             &[(run.offset, run.len)],
-            primed.prime.window,
+            PrimeLeg::first_draw(
+                primed.prime.offset - primed.prime.offset % CHUNK_GROUP_BYTES,
+                self.total_bytes,
+            ),
             self.deps.config.max_blob_size_bytes,
         )
         .await
@@ -1921,9 +1912,8 @@ fn local_bookkeeping_ctx() -> PoolContext {
 
 /// Run the range-minimized OWN-ORIGIN pull for `[offset, offset + len)` of `hash`
 /// into `engine`'s cache via [`drive`] over an UNPAID [`BackendSource`], pacing the
-/// pull with the same [`RampPacer`] the paid leg uses, built from
-/// `credit_ramp_divisor`, `credit_floor`, `credit_max`, and `paid_carried` (ADR
-/// 003 §Credit window / ADR 037). Records the terminal outcome via the shared [`FillSession::mark_ended`]. The
+/// pull with the same [`CreditPacer`] the paid leg uses (ADR 003 § Credit Window /
+/// ADR 037). Records the terminal outcome via the shared [`FillSession::mark_ended`]. The
 /// local twin of [`run_pull_leg`].
 ///
 /// # What drops out relative to the paid [`run_pull_leg`]
@@ -1956,10 +1946,10 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// lane, no voucher, no chain, no counterparty; see the [`BackendSource`] module
 /// docs.
 ///
-/// The downstream [`RampPacer`] is KEPT (bound on `served_paid`): the pull still
-/// never runs further ahead of the real downstream client's paid frontier than the
-/// ramped credit window allows, plus one serve-demand floor (#1610 — ingest only behind a waiting, paying client
-/// — and the storage/egress exposure bound).
+/// The downstream [`CreditPacer`] is KEPT (bound on `served_paid`): the pull still
+/// never runs further ahead of the credit the real downstream client's lane holds
+/// than [`decdn_client::PULL_AHEAD_BYTES`] (#1610 — ingest only behind a waiting,
+/// paying client — and the storage/egress exposure bound).
 ///
 /// # Off the accept task, on its own runtime
 ///
@@ -1978,10 +1968,6 @@ pub(crate) async fn run_local_pull_leg(
     hash: Hash,
     offset: u64,
     len: u64,
-    credit_ramp_divisor: u64,
-    credit_floor: u64,
-    credit_max: u64,
-    paid_carried: u64,
     total_bytes: u64,
     session: Arc<FillSession>,
     cancel: CancellationToken,
@@ -1997,15 +1983,11 @@ pub(crate) async fn run_local_pull_leg(
     let ledger = source.ledger();
     let ctx = Arc::new(std::sync::Mutex::new(local_bookkeeping_ctx()));
 
-    // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037), IDENTICAL
-    // to the paid leg's: bound on `served_paid` (#1610 + storage/egress exposure),
-    // so the unpaid pull is still throttled to the real client's paid frontier.
-    let pacer = RampPacer {
-        divisor: credit_ramp_divisor,
-        floor: credit_floor,
-        credit_max,
+    // The credit pacer (ADR 003 § Credit Window / ADR 037), IDENTICAL to the paid
+    // leg's: bound on `served_paid` (#1610 + storage/egress exposure), so the
+    // unpaid pull is still throttled to the real client's credit frontier.
+    let pacer = CreditPacer {
         paid_base: session.served_start(),
-        paid_carried,
     };
     let pacing_wait = DownstreamWait::for_session(&session, hash, Arc::clone(&metrics));
     let downstream_reader = || pacing_wait.frontier();

@@ -14,7 +14,7 @@
 //!
 //! | Area | Modules |
 //! |---|---|
-//! | Vouchers and metering | [`voucher`] (sign and verify), [`chain`] (hash chains), [`rate`] (rate checks), [`credit`] (credit window), [`client_bridge`] (to and from the wire [`decdn_protocol::Voucher`]) |
+//! | Vouchers and metering | [`voucher`] (sign and verify), [`chain`] (hash chains), [`rate`] (rate checks),[`client_bridge`] (to and from the wire [`decdn_protocol::Voucher`]) |
 //! | Spend delegation | [`capability`] (the signed capability), [`capability_grant`] (its transferable `dcap1:` form) |
 //! | Lane state | [`lane`] (the seller's per-lane watermark), [`store`] (persistence traits and in-memory stores, the settlement ledger among them), [`earnings`] (sums over the ledger for `decdn node earnings`), [`deployment`] (which `PaymentPool` a state belongs to) |
 //! | Buyer bookkeeping | [`buyer_pool`] (the buyer's pools and lanes), `buyer_pool_table` and `buyer_pool_redb` (an on-disk `redb` store, behind the `buyer-store-core` and `redb` features) |
@@ -62,7 +62,6 @@
 
 pub mod bind_sig;
 pub mod buyer_pool;
-pub mod credit;
 pub mod deployment;
 pub mod earnings;
 pub mod log_scan;
@@ -119,7 +118,6 @@ pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
 };
-pub use credit::ramped_credit_window;
 pub use deployment::Deployment;
 pub use erc20::Erc20;
 pub use lane::{
@@ -134,7 +132,7 @@ pub use probe_sig::{
     SLASH_JUDGE_DOMAIN_VERSION, slash_judge_domain,
 };
 pub use rate::{
-    BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, pool_budget_covers, verify_rate,
+    BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate,
 };
 pub use store::{
     CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, MemorySettlementLedger,
