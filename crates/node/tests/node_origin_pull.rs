@@ -9336,8 +9336,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_spend() -> Result<()>
-{
+async fn window_pull_through_connected_nonpaying_leaf_bounds_upstream_spend() -> Result<()> {
     let spans = support::capture_spans();
     // A leaf pays three vouchers, so both of B's windows ramp past their floors,
     // then stays connected and keeps reading without paying. B's unrecouped
@@ -9409,21 +9408,13 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
         "leaf should have paid exactly three vouchers, got {}",
         outcome.acks
     );
-    // The hold reached saturation: B served its whole ramped serve window past
-    // the last voucher, and its pull leg paused on a closed window. Without
-    // these, a B that stalled early would pass every upper bound below.
+    // B sends only against the lane's credit, so the leaf receives no more than
+    // it paid for, and its pull leg paused on a closed window.
     let paid = outcome.paid_wire;
     let group = decdn_cache::CHUNK_GROUP_BYTES;
-    let serve_window = decdn_incentive::ramped_credit_window(
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-        CHUNK_BYTES,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        paid,
-    );
     anyhow::ensure!(
-        outcome.received + group >= paid + serve_window,
-        "B must fill its serve credit window ({serve_window}) past the last voucher \
-         during the hold ({} received, {paid} paid)",
+        outcome.received <= paid + group,
+        "B must send no more than the leaf paid for ({} received, {paid} paid)",
         outcome.received
     );
     anyhow::ensure!(
@@ -9448,20 +9439,7 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
 
-    // Content never exceeds its wire, and the ramp only widens with payment, so
-    // taking the paid wire as the paid content over-states the window.
     let pull_floor = decdn_client::PULL_WINDOW_FLOOR;
-    let ramped = decdn_incentive::ramped_credit_window(
-        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-        pull_floor,
-        decdn_common::config::DEFAULT_CREDIT_MAX,
-        paid,
-    );
-    anyhow::ensure!(
-        ramped > pull_floor,
-        "the pull window must have ramped past its floor ({ramped} <= {pull_floor}), \
-         or this test does not cover the ramp"
-    );
     // ADR 037 bounds the unrecouped frontier as bytes pulled minus bytes paid.
     // Measuring against the paid wire, not the larger wire the leaf received
     // inside B's serve credit window, keeps the bound tight.
@@ -9475,14 +9453,12 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     // allowance stays far below the one floor a breach would add.
     let proof_path = support::bao_wire_len(payload_len, 0, group).saturating_sub(group);
     let max_opens = 32;
-    let bound_wire =
-        support::bao_wire_len(payload_len, 0, ramped + pull_floor) + max_opens * proof_path;
+    let bound_wire = support::bao_wire_len(payload_len, 0, pull_floor) + max_opens * proof_path;
     let lead = upstream_wire.saturating_sub(paid);
     anyhow::ensure!(
         lead <= bound_wire,
         "B's unrecouped upstream lead ({upstream_wire} upstream - {paid} paid = {lead}) must \
-         stay within the ramped window ({ramped}) plus one pull-window floor ({pull_floor}) \
-         plus {max_opens} proof paths of {proof_path} = {bound_wire} wire bytes; leaf \
+         stay within one pull-window floor ({pull_floor}) plus {max_opens} proof paths of {proof_path} = {bound_wire} wire bytes; leaf \
          received {}",
         outcome.received
     );

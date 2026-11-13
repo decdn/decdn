@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;

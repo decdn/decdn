@@ -1,7 +1,6 @@
 use super::{
     BudgetPacer, CHUNK_BYTES, CHUNK_GROUP_BYTES, CreditPacer, DownstreamFrontier, MIN_DRAW_WINDOW,
-    PULL_AHEAD_BYTES, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, VERIFY_LAG_BYTES,
-    WindowPacer,
+    PULL_AHEAD_BYTES, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, WindowPacer,
 };
 use alloy::primitives::U256;
 use std::assert_matches;

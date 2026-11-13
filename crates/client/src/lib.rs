@@ -230,9 +230,6 @@ pub mod ordered_writes;
 /// draw / wait / done / refuse for the gap-driven driver, with no I/O.
 #[doc(hidden)]
 pub mod pacer;
-/// The payer's credit window: how far payment runs ahead of delivery toward a
-/// node, and the per-operator track record that sizes it (ADR 003 § Credit
-/// Window).
 pub mod payer_window;
 /// Persisted per-peer knowledge base: registry-fed identity plus interaction-fed
 /// latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.

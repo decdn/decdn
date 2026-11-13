@@ -406,8 +406,7 @@ pub(crate) struct DriveCounters {
     pub(crate) gap_paid_frontier: Option<u64>,
     /// The paid-frontier anchor of the leg [`fill_gap`] runs or ran last: the
     /// content offset the leg opened at, and the wire bytes the lane's
-    /// [`PoolLedger::settlement`] held then. A caller that drops [`fill_gap`] mid-leg prices the leg's paid
-    /// frontier from it ([`ended_frontiers`]). `None` before the first pass.
+    /// [`PoolLedger::settlement`] held then. `None` before the first pass.
     pub(crate) leg_anchor: Option<(u64, U256)>,
 }
 
@@ -971,8 +970,6 @@ where
     // so a resumed leg prices the paid frontier against the previous leg's own
     // spend. Both the completion signal (`paid_cleared`) and the Draw resume
     // start are derived from it; see the per-pass computation at the loop top.
-    // It lives in `counters`, so a caller that drops this future mid-leg prices
-    // the leg's paid frontier from it ([`ended_frontiers`]).
     //
     // The baseline is the settlement, not the committed watermark: a leg that
     // opens after a fault left a voucher armed must not count that voucher as
