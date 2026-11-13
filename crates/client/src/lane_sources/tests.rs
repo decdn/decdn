@@ -1,4 +1,5 @@
 use super::{PeerEvent, holders_from, lane_lease};
+use crate::ProvenSize;
 use crate::stream_cap::LaneStreamCap;
 use alloy::primitives::Address;
 
@@ -359,14 +360,14 @@ async fn claim_of(targets: &crate::targets::ResolvedTargets) -> anyhow::Result<(
         opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         async move {
             Ok(super::FirstClaim {
-                total_bytes: 7,
+                total_bytes: ProvenSize::assume_for_tests(7),
                 holders,
             })
         }
     })
     .await?;
     Ok((
-        claim.total_bytes,
+        claim.total_bytes.get(),
         opens.load(std::sync::atomic::Ordering::SeqCst),
     ))
 }
@@ -380,7 +381,7 @@ async fn the_first_claim_comes_from_the_probe_hint_without_a_whole_blob_open() -
     let hint = targets
         .size_hint
         .ok_or_else(|| anyhow::anyhow!("the fixture's probe gives a hint"))?;
-    assert_eq!(claim_of(&targets).await?, (hint, 0));
+    assert_eq!(claim_of(&targets).await?, (hint.get(), 0));
     Ok(())
 }
 

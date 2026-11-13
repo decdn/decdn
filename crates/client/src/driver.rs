@@ -1377,8 +1377,8 @@ where
                     Ok((header, reader)) => {
                         // A paid open verified the header's size proof: the
                         // size is the blob's, and the planner works to it.
-                        if header.size_proof.is_some() {
-                            store.prove_size(header.total_bytes);
+                        if let Some(size) = header.proven_size(hash) {
+                            store.prove_size(size);
                         }
                         counters.next_voucher_cost = voucher_cost(&header);
                         if let Some(quotes) = pool.and_then(|p| p.quotes) {

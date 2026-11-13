@@ -14,7 +14,7 @@ use crate::pacer::PULL_WINDOW_FLOOR;
 use crate::sink::MemoryBlobCache;
 use crate::source::{BlobSource, FakeFunder, IngestStore, Recovery, ScriptedSource, SourceFuture};
 use crate::{
-    BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, ProgressClock, PullConfig,
+    BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, ProgressClock, ProvenSize, PullConfig,
     StaticSources, StopPolicy, UpstreamPullHeader, VoucherProgress,
 };
 
@@ -139,7 +139,14 @@ async fn drain_range(
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
-        .open_range(root, claim, window, config, cache, stop())
+        .open_range(
+            root,
+            ProvenSize::assume_for_tests(claim),
+            window,
+            config,
+            cache,
+            stop(),
+        )
         .await?;
     let mut out = Vec::new();
     drive.alongside(reader.read_to_end(&mut out)).await?;
@@ -176,7 +183,7 @@ async fn the_stream_ends_at_the_proven_size_when_the_claim_was_small() -> anyhow
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            64 * 1024,
+            ProvenSize::assume_for_tests(64 * 1024),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -258,7 +265,13 @@ async fn prepopulated_cache_serves_without_fetching() -> anyhow::Result<()> {
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
-        .open(root, total, &PullConfig::default(), cache, stop())
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &PullConfig::default(),
+            cache,
+            stop(),
+        )
         .await?;
     anyhow::ensure!(
         matches!(reader, VerifiedReader::Cached { .. }),
@@ -292,7 +305,7 @@ async fn tampered_tail_fails_and_never_yields_unverified() -> anyhow::Result<()>
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -366,7 +379,7 @@ async fn a_faulting_candidate_fails_over_and_the_stream_completes() -> anyhow::R
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -409,7 +422,13 @@ async fn bounded_read_ahead_holds_the_spend_bound() -> anyhow::Result<()> {
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
-        .open(root, total, &config, Arc::new(NoCache), stop())
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &config,
+            Arc::new(NoCache),
+            stop(),
+        )
         .await?;
 
     // Drain a few bytes at a time while the drive runs beside the reads;
@@ -464,7 +483,13 @@ async fn the_drive_fills_one_window_while_the_consumer_is_paused() -> anyhow::Re
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
-        .open(root, total, &config, Arc::new(NoCache), stop())
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &config,
+            Arc::new(NoCache),
+            stop(),
+        )
         .await?;
 
     // A paused consumer: nothing is read while the drive runs.
@@ -509,7 +534,13 @@ async fn a_paused_consumer_does_not_give_up() -> anyhow::Result<()> {
     let limit = Duration::from_secs(30);
     let stop = StopPolicy::new(false, Some(limit), Arc::new(ProgressClock::new()));
     let (mut reader, mut drive) = streamer
-        .open(root, total, &config, Arc::new(NoCache), stop)
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &config,
+            Arc::new(NoCache),
+            stop,
+        )
         .await?;
 
     // The consumer reads nothing for ten times the limit.
@@ -552,7 +583,7 @@ async fn a_parked_lane_holds_the_clock_only_while_bytes_wait_unread() -> anyhow:
             cursor: AtomicU64::new(cursor),
             start: 0,
             end: None,
-            hint: total,
+            size: ProvenSize::assume_for_tests(total),
             consumed: Notify::new(),
             progressed: Notify::new(),
             outcome: Mutex::new(None),
@@ -633,7 +664,13 @@ async fn a_front_fault_moves_a_parked_lane_to_the_front() -> anyhow::Result<()> 
         ..PullConfig::default()
     };
     let (mut reader, mut drive) = streamer
-        .open(root, total, &config, Arc::new(NoCache), stop())
+        .open(
+            root,
+            ProvenSize::assume_for_tests(total),
+            &config,
+            Arc::new(NoCache),
+            stop(),
+        )
         .await?;
     let mut out = Vec::new();
     tokio::time::timeout(
@@ -771,7 +808,7 @@ async fn finish_reports_a_late_lane_build_escrow_after_the_last_byte() -> anyhow
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -801,7 +838,7 @@ async fn finish_after_a_clean_stream_is_ok() -> anyhow::Result<()> {
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -952,7 +989,7 @@ async fn a_window_past_the_claim_is_refused_at_open() -> anyhow::Result<()> {
     let opened = streamer
         .open_range(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             (total, 1),
             &PullConfig::default(),
             Arc::new(NoCache),
@@ -992,7 +1029,7 @@ async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
     let (mut reader, mut drive) = streamer
         .open_range(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             (offset, len),
             &PullConfig::default(),
             cache,
@@ -1071,7 +1108,7 @@ async fn a_window_past_zero_needs_a_size_claim() -> anyhow::Result<()> {
     let opened = streamer
         .open_range(
             root,
-            0,
+            ProvenSize::assume_for_tests(0),
             (4_096, 1_000),
             &PullConfig::default(),
             Arc::new(NoCache),
@@ -1148,7 +1185,7 @@ async fn a_window_ending_at_the_cap_stays_bounded() -> anyhow::Result<()> {
     let (mut reader, mut drive) = streamer
         .open_range(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             (offset, len),
             &PullConfig::default(),
             Arc::new(NoCache),
@@ -1195,7 +1232,7 @@ async fn a_lying_source_is_passed_over_for_an_honest_one() -> anyhow::Result<()>
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            total,
+            ProvenSize::assume_for_tests(total),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),
@@ -1270,7 +1307,7 @@ impl IngestStore for WrappedStore {
     fn set_bound(&self, bound: u64) {
         IngestStore::set_bound(&self.0, bound);
     }
-    fn prove_size(&self, size: u64) {
+    fn prove_size(&self, size: ProvenSize) {
         IngestStore::prove_size(&self.0, size);
     }
 }
@@ -1318,7 +1355,7 @@ async fn a_stream_fills_the_store_its_stores_open() -> anyhow::Result<()> {
     let (mut reader, mut drive) = streamer
         .open(
             root,
-            u64::try_from(blob.len())?,
+            ProvenSize::assume_for_tests(u64::try_from(blob.len())?),
             &PullConfig::default(),
             Arc::new(NoCache),
             stop(),

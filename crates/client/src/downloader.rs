@@ -45,8 +45,8 @@ pub struct DownloadTarget<'a> {
     /// The blob's BLAKE3 content address (its bao root); every ingested byte is
     /// verified against it.
     pub hash: [u8; 32],
-    /// The blob's content length in bytes.
-    pub total_bytes: u64,
+    /// The blob's proven content length in bytes.
+    pub total_bytes: crate::ProvenSize,
     /// Where to write the finished blob. The `.partial` store and the promoted
     /// final file are keyed by this path, so the finished file IS `dest`.
     pub dest: &'a Path,
@@ -257,7 +257,7 @@ where
     /// Any error [`Self::fetch_to_paths`] returns.
     pub async fn fetch_to_dir(
         &self,
-        entries: &[([u8; 32], u64)],
+        entries: &[([u8; 32], crate::ProvenSize)],
         dir: &Path,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ) -> anyhow::Result<Vec<PathBuf>> {
@@ -382,7 +382,7 @@ where
             // Off the runtime: opening a finalized blob hashes its final file.
             let store = {
                 let (dir, stem) = (dir.clone(), stem.clone());
-                let (hash, total) = (target.hash, target.total_bytes);
+                let (hash, total) = (target.hash, target.total_bytes.get());
                 tokio::task::spawn_blocking(move || {
                     ClientRangedStore::open_or_create(&dir, &stem, hash, total)
                 })

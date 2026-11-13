@@ -2984,9 +2984,9 @@ impl EntryBytes {
 fn ranges_at_proven_size(
     ranges: Option<&[(u64, u64)]>,
     declared: Option<u64>,
-    proven: u64,
+    proven: crate::ProvenSize,
 ) -> Option<&[(u64, u64)]> {
-    ranges.filter(|_| declared == Some(proven))
+    ranges.filter(|_| declared == Some(proven.get()))
 }
 
 /// The byte spans of `staging`'s ranged store that earlier runs already

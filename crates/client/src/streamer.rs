@@ -157,9 +157,9 @@ struct StreamState<S> {
     /// The byte the window ends before, or `None` for a tail that ends at the
     /// size a leg proves. The stream ends at the smaller of the two.
     end: Option<u64>,
-    /// The caller's proven size. The stream ends at the size a leg proves
-    /// ([`IngestStore::proven`]).
-    hint: u64,
+    /// The caller's proven size, which the acquire loop records in the store
+    /// ([`IngestStore::prove_size`]).
+    size: crate::ProvenSize,
     /// Woken by the reader when `cursor` advances, so a pull parked on a full
     /// read-ahead window ([`PaceDecision::Wait`](crate::pacer::PaceDecision::Wait))
     /// re-decides.
@@ -433,7 +433,7 @@ where
         AcquireTarget {
             store: &state.store,
             hash,
-            total_bytes: state.hint,
+            total_bytes: state.size,
             ranges: &ranges,
         },
         &mut sources,
@@ -652,7 +652,7 @@ where
     pub async fn open<'a>(
         self,
         hash: [u8; 32],
-        total_bytes: u64,
+        total_bytes: crate::ProvenSize,
         config: &PullConfig,
         cache: Arc<dyn BlobCache>,
         stop: StopPolicy,
@@ -690,7 +690,7 @@ where
     pub async fn open_range<'a>(
         self,
         hash: [u8; 32],
-        total_bytes: u64,
+        size: crate::ProvenSize,
         window: (u64, u64),
         config: &PullConfig,
         cache: Arc<dyn BlobCache>,
@@ -700,6 +700,7 @@ where
         P: 'a,
         F: 'a,
     {
+        let total_bytes = size.get();
         let (offset, len) = window;
         anyhow::ensure!(
             offset == 0 || offset < total_bytes,
@@ -729,7 +730,7 @@ where
             cursor: AtomicU64::new(offset),
             start: offset,
             end,
-            hint: total_bytes,
+            size,
             consumed: Notify::new(),
             progressed: Notify::new(),
             outcome: Mutex::new(None),

@@ -1,4 +1,5 @@
 use super::*;
+use crate::ProvenSize;
 use anyhow::Context as _;
 use std::sync::Arc;
 use std::time::Instant;
@@ -476,7 +477,7 @@ async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
     let probe = ProbeOpts {
         marks: None,
         round: ProbeRound::Stream,
-        known_size: Some(4096),
+        known_size: Some(ProvenSize::assume_for_tests(4096)),
     };
 
     let targets = resolve_target_node(
@@ -491,7 +492,7 @@ async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
     .unwrap();
 
     assert!(targets.pinned);
-    assert_eq!(targets.size_hint, Some(4096));
+    assert_eq!(targets.size_hint, Some(ProvenSize::assume_for_tests(4096)));
     assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
     client.close().await;
     server.close().await;
@@ -1034,7 +1035,7 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
 
     match classify_probe(&cand, answer(EMPTY_ROOT, true), EMPTY_ROOT, TS, &domain) {
         ProbeOutcome::Holder(probed, _) => {
-            assert_eq!(probed.total_bytes, Some(0));
+            assert_eq!(probed.total_bytes, Some(ProvenSize::assume_for_tests(0)));
             assert!(probed.coverage.is_empty());
         }
         _ => anyhow::bail!("the empty root's holder must classify as a holder"),
@@ -1123,7 +1124,9 @@ fn a_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
     };
 
     match classify(Some(size), Some(proof.clone())) {
-        ProbeOutcome::Holder(probed, _) => assert_eq!(probed.total_bytes, Some(size)),
+        ProbeOutcome::Holder(probed, _) => {
+            assert_eq!(probed.total_bytes.map(ProvenSize::get), Some(size));
+        }
         _ => anyhow::bail!("a proven size keeps the holder"),
     }
     match classify(None, None) {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::ProvenSize;
 use std::assert_matches;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -1262,12 +1263,12 @@ async fn a_fresh_proof_replaces_a_wrong_recorded_size() -> anyhow::Result<()> {
         let dir = tmp_dir();
         {
             let store = ClientRangedStore::open_or_create(dir.path(), "blob", root, recorded)?;
-            store.prove_size(recorded);
+            store.prove_size(ProvenSize::assume_for_tests(recorded));
             crate::source::IngestStore::flush_present_record(&store).await?;
         }
         let store = ClientRangedStore::open_or_create(dir.path(), "blob", root, truth)?;
         assert_eq!(store.proven(), Some(recorded), "the record holds its size");
-        store.prove_size(truth);
+        store.prove_size(ProvenSize::assume_for_tests(truth));
         assert_eq!(store.proven(), Some(truth));
         assert_eq!(store.bound(), truth);
     }

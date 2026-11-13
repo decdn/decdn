@@ -1,6 +1,7 @@
 use super::*;
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
+use decdn_client::ProvenSize;
 use decdn_client::bundle::parse_hash;
 use decdn_client::sign_client_binding;
 use decdn_incentive::bind_node_id_domain;
@@ -729,18 +730,19 @@ fn size_hints_forget_the_oldest_past_the_bound() {
         h[..8].copy_from_slice(&n.to_le_bytes());
         h
     };
+    let size = ProvenSize::assume_for_tests;
     let mut sizes = SizeHints::default();
     for n in 0..MAX_SIZE_HINTS {
-        sizes.insert(key(n), 7);
+        sizes.insert(key(n), size(7));
     }
     // A repeat insert keeps the first size and the entry's place.
-    sizes.insert(key(0), 8);
-    assert_eq!(sizes.get(&key(0)), Some(7));
+    sizes.insert(key(0), size(8));
+    assert_eq!(sizes.get(&key(0)), Some(size(7)));
     assert_eq!(sizes.order.len(), MAX_SIZE_HINTS);
-    sizes.insert(key(MAX_SIZE_HINTS), 9);
+    sizes.insert(key(MAX_SIZE_HINTS), size(9));
     assert_eq!(sizes.get(&key(0)), None, "the oldest is forgotten");
-    assert_eq!(sizes.get(&key(1)), Some(7));
-    assert_eq!(sizes.get(&key(MAX_SIZE_HINTS)), Some(9));
+    assert_eq!(sizes.get(&key(1)), Some(size(7)));
+    assert_eq!(sizes.get(&key(MAX_SIZE_HINTS)), Some(size(9)));
     assert_eq!(
         (sizes.sizes.len(), sizes.order.len()),
         (MAX_SIZE_HINTS, MAX_SIZE_HINTS)
@@ -753,7 +755,13 @@ fn size_hints_forget_the_oldest_past_the_bound() {
 fn a_verified_size_is_the_next_fetchs_known_size() {
     let sizes = Mutex::new(SizeHints::default());
     assert_eq!(known_size(&[5; 32], &sizes), None);
-    sizes.lock().unwrap().insert([5; 32], 4096);
-    assert_eq!(known_size(&[5; 32], &sizes), Some(4096));
+    sizes
+        .lock()
+        .unwrap()
+        .insert([5; 32], ProvenSize::assume_for_tests(4096));
+    assert_eq!(
+        known_size(&[5; 32], &sizes),
+        Some(ProvenSize::assume_for_tests(4096))
+    );
     assert_eq!(known_size(&[6; 32], &sizes), None);
 }

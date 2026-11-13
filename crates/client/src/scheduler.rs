@@ -278,7 +278,7 @@ pub struct AcquireTarget<'a, St> {
     pub hash: [u8; 32],
     /// The blob's proven size: a probe answer's or a header's. The store
     /// records it as proven before the first leg opens.
-    pub total_bytes: u64,
+    pub total_bytes: crate::ProvenSize,
     /// The `(offset, len)` byte ranges to fill. A range with a zero length is
     /// a tail: it runs to the end of the blob and follows the bound. Every
     /// other range is exact, and is clipped to the bound. Bytes outside the

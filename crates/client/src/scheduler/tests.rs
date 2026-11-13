@@ -18,7 +18,7 @@ use crate::source_set::{NoAffordableSource, NoSourceHasBlob, SourceSet, StaticSo
 use crate::stop::{GaveUp, StopPolicy};
 use crate::streamer::StreamCandidate;
 use crate::{
-    ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamRefused,
+    ClientRangedStore, Cumulative, PoolContext, PoolLedger, ProvenSize, UpstreamRefused,
     UpstreamVoucherRejected,
 };
 use decdn_bao_range::RangedStore;
@@ -161,7 +161,7 @@ async fn run_acquire_with<S: BlobSource>(
         AcquireTarget {
             store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             // The whole blob: one tail that runs to the end the bound names.
             ranges: &[(0, 0)],
         },
@@ -3016,7 +3016,7 @@ async fn acquire_bounded<St: crate::source::IngestStore>(
     let target = AcquireTarget {
         store,
         hash: root,
-        total_bytes: total,
+        total_bytes: ProvenSize::assume_for_tests(total),
         ranges: &ranges,
     };
     tokio::time::timeout(Duration::from_mins(2), acquire(target, &mut set, &env))
@@ -3618,7 +3618,7 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -3663,7 +3663,7 @@ async fn acquire_under<S: BlobSource>(
         AcquireTarget {
             store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -4322,7 +4322,7 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -4402,7 +4402,7 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -4827,7 +4827,7 @@ async fn acquire_with_late_builds_halted(
     let target = AcquireTarget {
         store: &store,
         hash: root,
-        total_bytes: total,
+        total_bytes: ProvenSize::assume_for_tests(total),
         ranges: &ranges,
     };
     let (result, ()) = tokio::join!(acquire(target, &mut set, &env), halt);
@@ -5181,7 +5181,7 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -5243,7 +5243,7 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -5305,7 +5305,7 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -5351,7 +5351,7 @@ async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,
@@ -5391,7 +5391,7 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, mib), (4 * mib, mib)],
         },
         &mut set,
@@ -5813,7 +5813,7 @@ async fn acquire_capped_into(
         AcquireTarget {
             store,
             hash: root,
-            total_bytes: u64::try_from(data.len())?,
+            total_bytes: ProvenSize::assume_for_tests(u64::try_from(data.len())?),
             ranges,
         },
         &mut set,
@@ -6400,7 +6400,7 @@ async fn acquire_over<P: crate::SourceProvider>(
         AcquireTarget {
             store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &whole,
         },
         &mut set,
@@ -6940,7 +6940,7 @@ async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &runs,
         },
         &mut set,
@@ -7483,7 +7483,7 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
         AcquireTarget {
             store: &store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &whole,
         },
         &mut set,
@@ -7689,7 +7689,7 @@ async fn acquire_delegated_in_run(
         AcquireTarget {
             store,
             hash: root,
-            total_bytes: total,
+            total_bytes: ProvenSize::assume_for_tests(total),
             ranges: &[(0, total)],
         },
         &mut set,

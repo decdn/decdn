@@ -67,7 +67,7 @@ const UNBOUNDED_SIZE: u64 = 1 << 62;
 #[derive(Debug)]
 pub struct FirstClaim {
     /// The proven size.
-    pub total_bytes: u64,
+    pub total_bytes: crate::ProvenSize,
     /// Every holder known when the size was proven.
     pub holders: Vec<Holder>,
 }
@@ -80,7 +80,7 @@ pub struct FirstClaim {
 ///
 /// The error `open` ends with.
 async fn first_claim_or_open<F, Fut>(
-    hint: Option<u64>,
+    hint: Option<crate::ProvenSize>,
     holders: Vec<Holder>,
     open: F,
 ) -> anyhow::Result<FirstClaim>
@@ -224,7 +224,7 @@ pub struct LaneSources<'a, P> {
     parked: Mutex<HashMap<Address, StreamCandidate<PrimedSource<PeerSource<'a>>>>>,
     /// The proven size of the last probe that gave one
     /// ([`ResolvedTargets::size_hint`]): the fetch's first size.
-    size_hint: Mutex<Option<u64>>,
+    size_hint: Mutex<Option<crate::ProvenSize>>,
     /// The pending probes of the streamed round the holders came from
     /// ([`ResolvedTargets::late`]), until [`SourceProvider::arrivals`] takes
     /// them.
@@ -475,7 +475,12 @@ where
                     .unwrap_or_else(PoisonError::into_inner)
                     .provider;
                 self.record_open(provider, header.rate_per_mb);
-                let total_bytes = header.total_bytes;
+                // The open checked the header's proof; a header without one
+                // is that source's fault.
+                let total_bytes = header.proven_size(hash).ok_or(crate::UnprovenSize {
+                    total_bytes: header.total_bytes,
+                    had_proof: header.size_proof.is_some(),
+                })?;
                 // The node has already written into the pull, so it is parked
                 // for the drive's first leg to adopt instead of dropped unread;
                 // another first leg closes it first. A pull with no range to
@@ -484,7 +489,7 @@ where
                     lane.source.prime_next(hash, range, header, pull, opened_at);
                 } else {
                     tracing::debug!(
-                        total_bytes,
+                        total_bytes = total_bytes.get(),
                         "the size open's pull is not the drive's first leg; not primed"
                     );
                     drop((header, pull));

@@ -163,7 +163,10 @@ impl Buyer {
     /// Every probe answer is verified before it counts (ADR 014 §1). An answer
     /// whose signature does not verify, or whose `has_blob` and coverage
     /// disagree, is dropped.
-    pub(crate) async fn holders(&self, hash: [u8; 32]) -> Result<(Vec<Holder>, u64)> {
+    pub(crate) async fn holders(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<(Vec<Holder>, decdn_client::ProvenSize)> {
         let bootstrap = discovery::bootstrap_nodes(
             &self.env.rpc_url,
             self.env.capacity_bond,
@@ -202,12 +205,16 @@ impl Buyer {
                 continue;
             }
             // A stated size counts only once its proof verifies.
-            if let Some(size) = ext.total_bytes
-                && decdn_client::check_size_proof(hash, size, ext.size_proof.as_ref()).is_err()
-            {
-                continue;
-            }
-            total_bytes = total_bytes.or(ext.total_bytes);
+            let proven = match ext.total_bytes {
+                Some(size) => {
+                    match decdn_client::check_size_proof(hash, size, ext.size_proof.as_ref()) {
+                        Ok(proven) => Some(proven),
+                        Err(_) => continue,
+                    }
+                }
+                None => None,
+            };
+            total_bytes = total_bytes.or(proven);
             holders.push(Holder {
                 candidate,
                 coverage: ext.coverage,

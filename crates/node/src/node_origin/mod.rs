@@ -1767,7 +1767,7 @@ pub(super) fn probe_size_proven(
     ext: &decdn_protocol::ProbeResponseExt,
 ) -> Result<(), decdn_client::UnprovenSize> {
     ext.total_bytes.map_or(Ok(()), |total_bytes| {
-        decdn_client::check_size_proof(hash, total_bytes, ext.size_proof.as_ref())
+        decdn_client::check_size_proof(hash, total_bytes, ext.size_proof.as_ref()).map(drop)
     })
 }
 

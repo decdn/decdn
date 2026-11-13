@@ -121,6 +121,7 @@ pub(crate) fn check_stated_size(
         return Ok(());
     };
     decdn_client::check_size_proof(hash, total_bytes, resp_ext.size_proof.as_ref())
+        .map(drop)
         .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))
 }
 

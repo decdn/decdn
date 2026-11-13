@@ -540,7 +540,8 @@ impl ClientRangedStore {
     /// before any leg holds the final chunk. Only the true size proves, so a
     /// resumed record that names another proven size is wrong: the fresh
     /// proof replaces it, with a warning.
-    pub fn prove_size(&self, size: u64) {
+    pub fn prove_size(&self, size: crate::ProvenSize) {
+        let size = size.get();
         let mut state = self.lock_state();
         if state.proven == Some(size) {
             return;
@@ -1640,7 +1641,7 @@ impl crate::source::IngestStore for ClientRangedStore {
         Self::set_bound(self, bound);
     }
 
-    fn prove_size(&self, size: u64) {
+    fn prove_size(&self, size: crate::ProvenSize) {
         Self::prove_size(self, size);
     }
 }

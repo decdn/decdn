@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
 use anyhow::Context as _;
+use decdn_client::ProvenSize;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
@@ -827,20 +828,20 @@ const MAX_SIZE_HINTS: usize = 4096;
 /// it (ADR 005 § Probe rate limiting bounds those probes per peer).
 #[derive(Default)]
 pub(crate) struct SizeHints {
-    sizes: std::collections::HashMap<[u8; 32], u64>,
+    sizes: std::collections::HashMap<[u8; 32], ProvenSize>,
     /// Insertion order, oldest first.
     order: std::collections::VecDeque<[u8; 32]>,
 }
 
 impl SizeHints {
-    /// The size a fetch verified for `hash`, if one did.
-    pub(crate) fn get(&self, hash: &[u8; 32]) -> Option<u64> {
+    /// The size a holder proved for `hash`, if one did.
+    pub(crate) fn get(&self, hash: &[u8; 32]) -> Option<ProvenSize> {
         self.sizes.get(hash).copied()
     }
 
-    /// Remember that `hash`'s blob verified to `size` bytes. A hash fixes its
-    /// blob's size, so a hash already known keeps its size and its place.
-    pub(crate) fn insert(&mut self, hash: [u8; 32], size: u64) {
+    /// Remember that `hash`'s blob is `size` bytes. A hash fixes its blob's
+    /// size, so a hash already known keeps its size and its place.
+    pub(crate) fn insert(&mut self, hash: [u8; 32], size: ProvenSize) {
         let std::collections::hash_map::Entry::Vacant(entry) = self.sizes.entry(hash) else {
             return;
         };
@@ -854,10 +855,10 @@ impl SizeHints {
     }
 }
 
-/// The size a fetch of `hash` starts from: one a holder proved, or a whole
-/// fetch verified, on this host. A declared size (a bundle manifest's entry
-/// size) only caps the fetch ([`held_cap`]).
-pub(crate) fn known_size(hash: &[u8; 32], sizes: &Mutex<SizeHints>) -> Option<u64> {
+/// The size a fetch of `hash` starts from: one a holder proved on this host.
+/// A declared size (a bundle manifest's entry size) only caps the fetch
+/// ([`held_cap`]).
+pub(crate) fn known_size(hash: &[u8; 32], sizes: &Mutex<SizeHints>) -> Option<ProvenSize> {
     sizes
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -946,7 +947,7 @@ impl FetchHost {
     /// The size of `hash` a whole fetch on this host verified, or a size
     /// proof on it proved, if one did.
     pub(crate) fn verified_size(&self, hash: &[u8; 32]) -> Option<u64> {
-        known_size(hash, &self.sizes)
+        known_size(hash, &self.sizes).map(ProvenSize::get)
     }
 
     /// Wait for every queued peer-record and watermark write to land, then
@@ -1367,8 +1368,9 @@ pub(crate) async fn fetch_on(
             {
                 // A whole blob is one range, so its wire bytes follow from
                 // its size; an unencodable size prints no estimate.
-                if let Ok(wire) = decdn_client::quote::wire_bytes(claim.total_bytes) {
-                    super::quote::print_estimate((claim.total_bytes, wire), hints, common);
+                let size = claim.total_bytes.get();
+                if let Ok(wire) = decdn_client::quote::wire_bytes(size) {
+                    super::quote::print_estimate((size, wire), hints, common);
                 }
             }
             let total_bytes = claim.total_bytes;
@@ -1414,19 +1416,13 @@ pub(crate) async fn fetch_on(
                 .await
             };
             // A whole blob that landed verified against its hash is a receipt
-            // entry, and the size a later fetch of it starts from, at the
-            // length it verified to; a byte
-            // window is not the blob.
+            // entry, at the length it verified to; a byte window is not the
+            // blob.
             if let Ok(verified) = landed
                 && args.range.is_none()
+                && let Some(evidence) = &payer.evidence
             {
-                sizes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(hash, verified);
-                if let Some(evidence) = &payer.evidence {
-                    evidence.note_landed(hash, verified);
-                }
+                evidence.note_landed(hash, verified);
             }
             landed.map(drop)
         }
@@ -1706,7 +1702,7 @@ async fn stream_out<P>(
     holders: Vec<Holder>,
     health: Arc<PeerHealth>,
     hash: [u8; 32],
-    total_bytes: u64,
+    total_bytes: ProvenSize,
     stop: StopPolicy,
     (max_sources, read_ahead, range, timings): (
         usize,
@@ -1747,7 +1743,7 @@ where
                 .await?
         }
     };
-    let expected = range.map_or(total_bytes, |(_, len)| len);
+    let expected = range.map_or(total_bytes.get(), |(_, len)| len);
 
     // The bar draws on stderr, so it shows only when stderr is a terminal and
     // the bytes go to stdout; stdout carries the verified bytes either way.
@@ -1854,7 +1850,7 @@ where
     // a declared size the fetch started from.
     let proven = tokio::fs::metadata(target.dest)
         .await
-        .map_or(target.total_bytes, |m| m.len());
+        .map_or(target.total_bytes.get(), |m| m.len());
     print_fetch_summary(proven, &meter, target.dest);
     Ok(proven)
 }

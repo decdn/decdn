@@ -696,7 +696,7 @@ pub struct Probed {
     /// The blob size the node stated, proven against the hash by the size
     /// proof in its answer before this value exists (ADR 005 § Bounded byte
     /// ranges). `None` when the node stated no size.
-    pub total_bytes: Option<u64>,
+    pub total_bytes: Option<crate::ProvenSize>,
     /// Which discovery blocks this holder answered `has_blob:true` for
     /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`.
     /// Unsigned and outside `slash_sig`: a hint for the scheduler's segment

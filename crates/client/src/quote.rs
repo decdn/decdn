@@ -53,7 +53,7 @@ pub struct NodeAnswer {
     /// The blob size the node stated, proven against the hash by the size
     /// proof in its answer; `None` from a non-holder, or from a holder that
     /// stated no size.
-    pub total_bytes: Option<u64>,
+    pub total_bytes: Option<crate::ProvenSize>,
     /// The byte ranges the node holds. Unsigned; empty exactly when
     /// `has_blob` is false, which the census checks before it keeps an
     /// answer.
@@ -92,7 +92,7 @@ impl HashCensus {
     /// The proven blob size from the nearest holder that stated one. Only the
     /// true size proves, so every holder that states a size states this one.
     #[must_use]
-    pub fn size_hint(&self) -> Option<u64> {
+    pub fn size_hint(&self) -> Option<crate::ProvenSize> {
         self.answers
             .iter()
             .filter(|a| a.has_blob && a.total_bytes.is_some())

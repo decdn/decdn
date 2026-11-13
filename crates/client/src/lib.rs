@@ -906,6 +906,35 @@ impl std::fmt::Display for UnprovenSize {
 
 impl std::error::Error for UnprovenSize {}
 
+/// A blob size whose size proof verified against the blob's hash (ADR 005 §
+/// Bounded byte ranges). [`check_size_proof`] is the only way to make one, so
+/// a raw `u64` from a node never reaches planning, allocation, a cap or
+/// payment. Read the size with [`Self::get`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProvenSize(u64);
+
+impl ProvenSize {
+    /// The size in bytes.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Take `size` as proven with no proof. Only tests build one this way:
+    /// their fixtures know the true size of the blobs they make.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub const fn assume_for_tests(size: u64) -> Self {
+        Self(size)
+    }
+}
+
+impl std::fmt::Display for ProvenSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Check that `proof` proves that the blob with hash `hash` is `total_bytes`
 /// long. Every size a node states passes through here before the client uses
 /// it.
@@ -917,14 +946,14 @@ pub fn check_size_proof(
     hash: [u8; 32],
     total_bytes: u64,
     proof: Option<&decdn_protocol::SizeProof>,
-) -> Result<(), UnprovenSize> {
+) -> Result<ProvenSize, UnprovenSize> {
     let unproven = UnprovenSize {
         total_bytes,
         had_proof: proof.is_some(),
     };
     let proof = proof.ok_or(unproven)?;
     if decdn_bao_range::verify_size_proof(hash, total_bytes, proof.as_bytes()) {
-        Ok(())
+        Ok(ProvenSize(total_bytes))
     } else {
         Err(unproven)
     }
@@ -2976,6 +3005,15 @@ pub struct UpstreamPullHeader {
     /// here; a relay checks it against its seated-origin set before keeping
     /// it. `None` on an unpaid source.
     pub origin_attestation: Option<decdn_protocol::OriginAttestation>,
+}
+
+impl UpstreamPullHeader {
+    /// The header's size, proven by its size proof against `hash`; `None` for
+    /// a header with no proof (an unpaid source) or a proof of another size.
+    #[must_use]
+    pub fn proven_size(&self, hash: [u8; 32]) -> Option<ProvenSize> {
+        check_size_proof(hash, self.total_bytes, self.size_proof.as_ref()).ok()
+    }
 }
 
 /// A live, progressive `cdn/client/v1` pull (#856) — the ONE receive loop for

@@ -5,8 +5,8 @@ use super::DownloadTarget;
 use super::Downloader;
 use crate::source::{BlobSource, FakeFunder, PrimedSource, Recovery, ScriptedSource};
 use crate::{
-    ClientRangedStore, Cumulative, GaveUp, PoolContext, PoolLedger, ProgressClock, StaticSources,
-    StopPolicy, StreamCandidate,
+    ClientRangedStore, Cumulative, GaveUp, PoolContext, PoolLedger, ProgressClock, ProvenSize,
+    StaticSources, StopPolicy, StreamCandidate,
 };
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
@@ -74,7 +74,11 @@ async fn a_downloader_streams_at_most_max_lanes() -> anyhow::Result<()> {
         .max_lanes(1);
     let dir = tempfile::tempdir()?;
     downloader
-        .fetch_to_dir(&[(root, total)], dir.path(), None)
+        .fetch_to_dir(
+            &[(root, ProvenSize::assume_for_tests(total))],
+            dir.path(),
+            None,
+        )
         .await?;
     anyhow::ensure!(
         (probe_a.delivered_bytes() > 0) != (probe_b.delivered_bytes() > 0),
@@ -113,7 +117,11 @@ async fn fetch_to_dir_writes_a_blake3_identical_file() -> anyhow::Result<()> {
     let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
     let dir = tempfile::tempdir()?;
     let paths = downloader
-        .fetch_to_dir(&[(root, total)], dir.path(), None)
+        .fetch_to_dir(
+            &[(root, ProvenSize::assume_for_tests(total))],
+            dir.path(),
+            None,
+        )
         .await?;
 
     anyhow::ensure!(
@@ -161,7 +169,11 @@ async fn a_primed_whole_blob_pull_is_the_downloads_first_leg() -> anyhow::Result
         let downloader = downloader(vec![candidate(primed, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), None)
+            .fetch_to_dir(
+                &[(root, ProvenSize::assume_for_tests(total))],
+                dir.path(),
+                None,
+            )
             .await?;
         let path = paths
             .first()
@@ -202,7 +214,11 @@ async fn fetch_to_dir_reports_progress_up_to_the_blobs_total() -> anyhow::Result
     };
 
     downloader
-        .fetch_to_dir(&[(root, total)], dir.path(), Some(&on_progress))
+        .fetch_to_dir(
+            &[(root, ProvenSize::assume_for_tests(total))],
+            dir.path(),
+            Some(&on_progress),
+        )
         .await?;
 
     anyhow::ensure!(
@@ -235,7 +251,7 @@ async fn fetch_to_paths_writes_each_blob_to_its_named_dest() -> anyhow::Result<(
         .fetch_to_paths(
             &[DownloadTarget {
                 hash: root,
-                total_bytes: total,
+                total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &dest,
                 ranges: None,
             }],
@@ -274,7 +290,7 @@ async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::
         .fetch_to_paths(
             &[DownloadTarget {
                 hash: root,
-                total_bytes: total,
+                total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &part,
                 ranges: Some(&half),
             }],
@@ -292,7 +308,7 @@ async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::
         .fetch_to_paths(
             &[DownloadTarget {
                 hash: root,
-                total_bytes: total,
+                total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &whole,
                 ranges: Some(&all),
             }],
@@ -331,7 +347,7 @@ async fn fetch_to_paths_threads_a_shared_ledger_registry() -> anyhow::Result<()>
         .fetch_to_paths_shared(
             &[DownloadTarget {
                 hash: root,
-                total_bytes: total,
+                total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &dest,
                 ranges: None,
             }],
@@ -366,7 +382,11 @@ async fn two_holders_stripe_a_blake3_identical_file() -> anyhow::Result<()> {
     ])?;
     let dir = tempfile::tempdir()?;
     let paths = downloader
-        .fetch_to_dir(&[(root, total)], dir.path(), None)
+        .fetch_to_dir(
+            &[(root, ProvenSize::assume_for_tests(total))],
+            dir.path(),
+            None,
+        )
         .await?;
 
     let path = paths
@@ -405,7 +425,11 @@ async fn a_pre_seeded_prefix_is_not_refetched() -> anyhow::Result<()> {
 
     let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
     let paths = downloader
-        .fetch_to_dir(&[(root, total)], dir.path(), None)
+        .fetch_to_dir(
+            &[(root, ProvenSize::assume_for_tests(total))],
+            dir.path(),
+            None,
+        )
         .await?;
 
     let path = paths
@@ -444,7 +468,7 @@ async fn fetch_ranges(
         .fetch_to_paths(
             &[DownloadTarget {
                 hash: probe.root(),
-                total_bytes: claim,
+                total_bytes: ProvenSize::assume_for_tests(claim),
                 dest,
                 ranges,
             }],
@@ -528,7 +552,7 @@ async fn a_finalize_hash_mismatch_fetches_again_and_completes() -> anyhow::Resul
     let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
     let target = DownloadTarget {
         hash: probe.root(),
-        total_bytes: total,
+        total_bytes: ProvenSize::assume_for_tests(total),
         dest: &dest,
         ranges: None,
     };
@@ -567,7 +591,7 @@ async fn a_lone_stalled_source_recovers_after_it_cools() -> anyhow::Result<()> {
         .fetch_to_paths_until(
             &[DownloadTarget {
                 hash: root,
-                total_bytes: total,
+                total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &dest,
                 ranges: None,
             }],
@@ -601,7 +625,7 @@ async fn a_download_with_no_progress_gives_up() -> anyhow::Result<()> {
         .fetch_to_paths_until(
             &[DownloadTarget {
                 hash: root,
-                total_bytes: total,
+                total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &dest,
                 ranges: None,
             }],
@@ -639,7 +663,7 @@ async fn a_dropped_download_records_the_landed_prefix() -> anyhow::Result<()> {
     let dest = dir.path().join("model.bin");
     let targets = [DownloadTarget {
         hash: root,
-        total_bytes: total,
+        total_bytes: ProvenSize::assume_for_tests(total),
         dest: &dest,
         ranges: None,
     }];
@@ -694,7 +718,11 @@ async fn a_downloader_with_no_holder_discovers_them() -> anyhow::Result<()> {
     let downloader = Downloader::new(sources, funder());
     let dir = tempfile::tempdir()?;
     let paths = downloader
-        .fetch_to_dir(&[(root, total)], dir.path(), None)
+        .fetch_to_dir(
+            &[(root, ProvenSize::assume_for_tests(total))],
+            dir.path(),
+            None,
+        )
         .await?;
     let path = paths
         .first()

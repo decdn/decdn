@@ -246,7 +246,7 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     /// it against the root before the leg that carried it opened. The
     /// planner's bound becomes it at once. A store keyed by a fixed size knows
     /// its size already, so the default does nothing.
-    fn prove_size(&self, size: u64) {
+    fn prove_size(&self, size: crate::ProvenSize) {
         let _ = size;
     }
 }

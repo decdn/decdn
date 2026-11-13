@@ -401,7 +401,7 @@ pub struct ProbeOpts<'a> {
     /// A size of the blob an earlier fetch proved or verified: the fetch's
     /// first size when no probe answer proves one. A pinned node is not
     /// probed for it. A declared size (a bundle manifest's) is never one.
-    pub known_size: Option<u64>,
+    pub known_size: Option<crate::ProvenSize>,
 }
 
 impl std::fmt::Debug for ProbeOpts<'_> {
@@ -497,25 +497,22 @@ impl ProbeTally {
     }
 }
 
-/// Whether `ext` states a size for `hash` with no valid size proof. A stated
-/// size is a fact only with its proof (ADR 005 § Bounded byte
-/// ranges), and a size with no valid proof is a fault of the node: the caller
-/// drops the answer before the size can reach a plan or a price.
-fn states_an_unproven_size(
+/// The size `ext` states for `hash`, proven: `Ok(None)` when it states none,
+/// `Err(())` when it states one with no valid size proof. A stated size is a
+/// fact only with its proof (ADR 005 § Bounded byte ranges), and a size with
+/// no valid proof is a fault of the node: the caller drops the answer before
+/// the size can reach a plan or a price.
+fn stated_size(
     cand: &NodeCandidate,
     hash: [u8; 32],
     ext: &decdn_protocol::ProbeResponseExt,
-) -> bool {
+) -> Result<Option<crate::ProvenSize>, ()> {
     let Some(total_bytes) = ext.total_bytes else {
-        return false;
+        return Ok(None);
     };
-    match crate::check_size_proof(hash, total_bytes, ext.size_proof.as_ref()) {
-        Ok(()) => false,
-        Err(e) => {
-            tracing::warn!("dropping a probe response from {}: {e}", cand.node_id);
-            true
-        }
-    }
+    crate::check_size_proof(hash, total_bytes, ext.size_proof.as_ref())
+        .map(Some)
+        .map_err(|e| tracing::warn!("dropping a probe response from {}: {e}", cand.node_id))
 }
 
 /// Verify `cand`'s probe result and classify it. Every response is verified
@@ -567,9 +564,9 @@ pub(crate) fn classify_probe(
         );
         return ProbeOutcome::Unusable;
     }
-    if states_an_unproven_size(cand, hash, &resp_ext) {
+    let Ok(total_bytes) = stated_size(cand, hash, &resp_ext) else {
         return ProbeOutcome::Unusable;
-    }
+    };
     let rtt_ms = rtt.ms;
     // Every verified responder contributes a probe sample, holder or not.
     let sample = (cand.node_id, rtt_ms, resp.body.rate_per_mb);
@@ -578,7 +575,7 @@ pub(crate) fn classify_probe(
             discovery::Probed {
                 candidate: cand.clone(),
                 rtt_ms,
-                total_bytes: resp_ext.total_bytes,
+                total_bytes,
                 coverage: resp_ext.coverage,
             },
             sample,
@@ -773,7 +770,7 @@ where
 
 /// The proven size of the nearest holder that gave one: the fetch's first
 /// size ([`ResolvedTargets::size_hint`]).
-fn nearest_size_hint(holders: &[discovery::Probed]) -> Option<u64> {
+fn nearest_size_hint(holders: &[discovery::Probed]) -> Option<crate::ProvenSize> {
     holders
         .iter()
         .filter(|h| h.total_bytes.is_some())
@@ -1304,7 +1301,7 @@ pub struct ResolvedTargets {
     /// probed and no size is known (the peer-store fast path, a pinned
     /// rediscovery), when no holder stated it, or when a pinned `--node-id`'s
     /// probe failed or named no size.
-    pub(crate) size_hint: Option<u64>,
+    pub(crate) size_hint: Option<crate::ProvenSize>,
     /// The probes a streamed round left pending ([`ProbeRound::Stream`]).
     /// Empty on every other path.
     pub(crate) late: LateSlot,
@@ -1566,7 +1563,7 @@ pub(crate) async fn probe_pinned(
 
 /// The size a probe outcome offers as the fetch's size: the size a holder
 /// proves in an answer whose signature and size proof verify, else none.
-const fn probed_size_hint(outcome: &ProbeOutcome) -> Option<u64> {
+const fn probed_size_hint(outcome: &ProbeOutcome) -> Option<crate::ProvenSize> {
     match outcome {
         ProbeOutcome::Holder(probed, _) => probed.total_bytes,
         _ => None,
