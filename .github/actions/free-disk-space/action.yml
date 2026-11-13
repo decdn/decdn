@@ -1,0 +1,37 @@
+name: Free disk space
+description: >-
+  Reclaim about 20 GB of preinstalled toolchains the workspace build never
+  uses, only when the root file system has less free space than `min-free-gb`.
+  Hosted runners come with either a 145 GB root (about 86 GB free) or a 72 GB
+  one, and `runs-on: ubuntu-latest` cannot pick between them. The coverage
+  build fills about 78 GB of the root, so a small runner fails with ENOSPC
+  without this step, and a runner with the free space skips its 1:44 to 3:20
+  cost.
+
+inputs:
+  min-free-gb:
+    description: >-
+      Free space on `/`, in GB, at or above which the step reclaims nothing.
+    required: false
+    default: '80'
+
+runs:
+  using: composite
+  steps:
+    - name: Free disk space when the root is short of it
+      env:
+        MIN_FREE_GB: ${{ inputs.min-free-gb }}
+      shell: bash
+      run: |
+        free_gb=$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')
+        echo "free on /: ${free_gb} GB (threshold ${MIN_FREE_GB} GB)"
+        if [ "$free_gb" -ge "$MIN_FREE_GB" ]; then
+          exit 0
+        fi
+        sudo rm -rf /opt/hostedtoolcache/CodeQL \
+                    /usr/local/lib/android \
+                    /usr/share/dotnet \
+                    /opt/ghc \
+                    /usr/local/.ghcup
+        sudo docker image prune --all --force || true
+        df -h /

@@ -565,3 +565,24 @@ fn resolve_role_maps_flags() {
     // ftp:// fails the scheme classification in `parse_origin_spec`.
     assert!(resolve_role(&args(Some("ftp://origin.example/"), false)).is_err());
 }
+
+/// The config file is owner-only, an overwritten one too, and the directory
+/// created for it is owner-only.
+#[cfg(unix)]
+#[test]
+fn config_file_is_written_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("fresh");
+    let output = dir.join("node.toml");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    write_private_config(&output, b"a = 1\n").unwrap();
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&output), 0o600);
+
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private_config(&output, b"b = 2\n").unwrap();
+    assert_eq!(mode(&output), 0o600, "an overwrite restricts the file too");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "b = 2\n");
+}
