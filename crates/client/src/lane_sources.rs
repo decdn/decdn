@@ -479,7 +479,6 @@ where
                 // is that source's fault.
                 let total_bytes = header.proven_size(hash).ok_or(crate::UnprovenSize {
                     total_bytes: header.total_bytes,
-                    had_proof: header.size_proof.is_some(),
                 })?;
                 // The node has already written into the pull, so it is parked
                 // for the drive's first leg to adopt instead of dropped unread;

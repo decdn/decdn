@@ -1,11 +1,11 @@
-//! The size proof a node attaches to every size it states (ADR 005 § Bounded
-//! byte ranges).
+//! The size proof that is the only way a node states a blob size (ADR 005 §
+//! Bounded byte ranges).
 //!
-//! A [`SizeProof`] is the bao encoding of the final BLAKE3 chunk of a blob at
-//! chunk granularity: one 64-byte pair of parent hashes for each level on the
-//! path from the root to the last chunk, then that chunk (at most 1 KiB).
-//! BLAKE3 binds the length of its input into the tree, so a proof verifies
-//! under the content hash for the true size alone.
+//! A [`SizeProof`] is a size and the bao encoding of the final BLAKE3 chunk
+//! of a blob of that size at chunk granularity: one 64-byte pair of parent
+//! hashes for each level on the path from the root to the last chunk, then
+//! that chunk (at most 1 KiB). BLAKE3 binds the length of its input into the
+//! tree, so a proof verifies under the content hash for the true size alone.
 //!
 //! This crate holds no hashing, so it carries the proof as opaque bytes and
 //! bounds its length at decode. `decdn_bao_range::verify_size_proof` checks
@@ -19,11 +19,12 @@ use serde::{Deserialize, Serialize};
 /// chunks). A wire proof longer than this fails decode.
 pub const MAX_SIZE_PROOF_BYTES: usize = 1024 + 64 * 54;
 
-/// A blob size proof as it travels on the wire: at most
-/// [`MAX_SIZE_PROOF_BYTES`] bytes, checked by nothing until the receiver
-/// verifies it against the content hash and the stated size.
+/// A blob size and its proof as they travel on the wire: the proof is at most
+/// [`MAX_SIZE_PROOF_BYTES`] bytes, and nothing checks either until the
+/// receiver verifies the proof against the content hash and the size.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SizeProof {
+    size: u64,
     #[serde(deserialize_with = "deserialize_bounded_proof")]
     bytes: Vec<u8>,
 }
@@ -37,18 +38,25 @@ pub struct SizeProofTooLong {
 }
 
 impl SizeProof {
-    /// Wrap proof bytes for the wire.
+    /// Wrap a size and its proof bytes for the wire.
     ///
     /// # Errors
     ///
     /// [`SizeProofTooLong`] when `bytes` is longer than
     /// [`MAX_SIZE_PROOF_BYTES`]. No valid proof is.
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, SizeProofTooLong> {
+    pub fn new(size: u64, bytes: impl Into<Vec<u8>>) -> Result<Self, SizeProofTooLong> {
         let bytes = bytes.into();
         if bytes.len() > MAX_SIZE_PROOF_BYTES {
             return Err(SizeProofTooLong { len: bytes.len() });
         }
-        Ok(Self { bytes })
+        Ok(Self { size, bytes })
+    }
+
+    /// The size this proof states, in bytes. A fact only once the proof
+    /// verifies against the content hash.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
     }
 
     /// The proof bytes, for `decdn_bao_range::verify_size_proof`.

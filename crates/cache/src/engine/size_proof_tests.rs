@@ -144,7 +144,7 @@ async fn seeded_fs_origin(
     std::fs::write(shard.join(&eo.hash_hex), data)?;
     std::fs::write(shard.join(eo.obao4_name()), &eo.outboard)?;
     if with_proof {
-        std::fs::write(shard.join(eo.size_proof_name()), &eo.size_proof)?;
+        std::fs::write(shard.join(eo.size_proof_name()), eo.size_proof_object())?;
     }
     let hash = Hash::new(data);
     let origin = Arc::new(FilesystemOrigin::new(dir.path()).await?) as Arc<dyn Origin>;

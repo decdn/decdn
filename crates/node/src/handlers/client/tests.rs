@@ -3075,18 +3075,19 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
     let proof = decdn_bao_range::encode_outboard(data.as_slice(), 1024)?.size_proof;
     let hash = Hash::new(&data);
     assert!(handler.cache.keep_size_proof(hash, 1024, &proof).await);
-    let body = StreamResponseBody {
+    let req = decdn_protocol::client::StreamRequest {
         hash: *hash.as_bytes(),
-        ok: true,
-        rate_per_mb: 1,
-        total_bytes: 1024,
+        namespace_id: [0; 32],
+        pool_id: [0; 32],
+        byte_offset: 0,
+        byte_len: 0,
         timestamp_us: an_hour_ago,
     };
-    let (resp, _ext) = handler.sign_response(body.clone(), None).await?;
+    let (resp, _ext) = handler.sign_served(&req, 1, 1024).await?;
     assert_eq!(resp.body.timestamp_us, an_hour_ago);
     let sig = alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?;
-    let recovered =
-        StreamSlashData::from_response_body(&body).recover_signer(&sig, &handler.slash_domain)?;
+    let recovered = StreamSlashData::from_response_body(&resp.body)
+        .recover_signer(&sig, &handler.slash_domain)?;
     assert_eq!(recovered, handler.eth_signer.address());
     Ok(())
 }
@@ -3103,20 +3104,22 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
     let proof = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof;
     let hash = Hash::new(&data);
     assert!(handler.cache.keep_size_proof(hash, size, &proof).await);
-    let body = |hash: [u8; 32], total_bytes| StreamResponseBody {
+    let req = |hash: [u8; 32]| decdn_protocol::client::StreamRequest {
         hash,
-        ok: true,
-        rate_per_mb: 1,
-        total_bytes,
+        namespace_id: [0; 32],
+        pool_id: [0; 32],
+        byte_offset: 0,
+        byte_len: 0,
         timestamp_us: crate::handlers::timestamp_skew::now_us(),
     };
 
-    let (_, ext) = handler
-        .sign_response(body(*hash.as_bytes(), size), None)
-        .await?;
+    let (resp, ext) = handler.sign_served(&req(*hash.as_bytes()), 1, size).await?;
+    assert!(resp.body.ok);
+    assert_eq!(ext.validate(resp.body.ok), Ok(()));
     let sent = ext
-        .size_proof
+        .size_proof()
         .ok_or_else(|| anyhow::anyhow!("no proof sent"))?;
+    assert_eq!(sent.size(), size);
     assert!(decdn_bao_range::verify_size_proof(
         *hash.as_bytes(),
         size,
@@ -3125,13 +3128,13 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
 
     assert!(
         handler
-            .sign_response(body(*hash.as_bytes(), size + 1), None)
+            .sign_served(&req(*hash.as_bytes()), 1, size + 1)
             .await
             .is_err()
     );
     assert!(
         handler
-            .sign_response(body([9; 32], 1 << 60), None)
+            .sign_served(&req([9; 32]), 1, 1 << 60)
             .await
             .is_err()
     );

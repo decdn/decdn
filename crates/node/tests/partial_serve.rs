@@ -152,12 +152,16 @@ async fn ranged_paid_pull(
     write_frame_to(&mut send, &payload).await?;
 
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
+    let total_bytes = resp_ext
+        .size_proof()
+        .map(decdn_protocol::SizeProof::size)
+        .ok_or_else(|| anyhow::anyhow!("an ok response carries a size proof"))?;
 
-    let aligned = align_range(byte_offset, byte_len, resp.body.total_bytes)
+    let aligned = align_range(byte_offset, byte_len, total_bytes)
         .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let expected_wire =
-        decdn_cache::range_pull::bao_encoded_size(resp.body.total_bytes, aligned.chunk_ranges());
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, aligned.chunk_ranges());
     let interval_bytes = CHUNK_BYTES;
 
     let mut buf = BytesMut::new();
@@ -201,7 +205,7 @@ async fn ranged_paid_pull(
         }
     }
     conn.close(0u32.into(), b"done");
-    decode_bao_range(hash, resp.body.total_bytes, byte_offset, byte_len, &buf)
+    decode_bao_range(hash, total_bytes, byte_offset, byte_len, &buf)
 }
 
 /// Decode the header-less bao verified-stream `wire` for `[byte_offset,
@@ -434,13 +438,14 @@ async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Res
         .mount(&server)
         .await;
     // sibling size proof GET: the node proves the size before it states it.
-    let proof = decdn_bao_range::encode_outboard(plaintext.as_slice(), total)?.size_proof;
+    let proof_object =
+        decdn_bao_range::encode_outboard(plaintext.as_slice(), total)?.size_proof_object();
     Mock::given(method("GET"))
         .and(path(format!(
             "/{hex}{}",
             decdn_bao_range::SIZE_PROOF_SUFFIX
         )))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(proof.to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(proof_object))
         .mount(&server)
         .await;
     // The requested span is group 0 + group 1. Group 0 is already cached, group 1

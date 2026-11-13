@@ -553,7 +553,7 @@ async fn open_and_hold(
     if !resp.body.ok {
         conn.close(0u32.into(), b"refused");
         return Ok(OpenOutcome::Refused(
-            resp_ext.error.unwrap_or(StreamError::Declined),
+            resp_ext.error().cloned().unwrap_or(StreamError::Declined),
         ));
     }
 

@@ -92,21 +92,24 @@ fn single_file_import_is_readable_and_range_serves() {
         let reader = FilesystemOrigin::new(origin.path()).await.unwrap();
 
         // The size proof sibling proves the true size and no other.
-        let proof = reader
+        let object = reader
             .fetch_size_proof(hash)
             .await
             .unwrap()
             .expect("import writes the size proof");
+        let (stated, proof) = decdn_bao_range::parse_size_proof_object(&object)
+            .expect("the size proof object holds its size");
         let size = u64::try_from(payload.len()).unwrap();
+        assert_eq!(stated, size, "the object states the true size");
         assert!(decdn_bao_range::verify_size_proof(
             *hash.as_bytes(),
             size,
-            &proof
+            proof
         ));
         assert!(!decdn_bao_range::verify_size_proof(
             *hash.as_bytes(),
             size + 1,
-            &proof
+            proof
         ));
 
         // Whole-blob fetch round-trips the exact bytes.

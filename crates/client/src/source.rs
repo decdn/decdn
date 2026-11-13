@@ -1403,10 +1403,10 @@ mod doubles {
                     &self.outboard,
                     self.blob.get(tail_start..).unwrap_or_default(),
                 )?;
-                let size_proof = decdn_protocol::SizeProof::new(proof.to_vec())?;
-                if let Some(signed) = self.signed_size {
-                    crate::check_size_proof(self.root, signed, Some(&size_proof))?;
-                }
+                // A source that states another size sends this proof under it.
+                let stated = self.signed_size.unwrap_or(total);
+                let size_proof = decdn_protocol::SizeProof::new(stated, proof.to_vec())?;
+                crate::check_size_proof(self.root, &size_proof)?;
                 // Serve the request clamped to this blob's end, as a node
                 // does: the requester's range may be aligned under another
                 // size than this blob's.

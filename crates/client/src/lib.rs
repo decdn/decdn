@@ -870,9 +870,9 @@ impl std::fmt::Display for ResumeOffsetPastEnd {
 impl std::error::Error for ResumeOffsetPastEnd {}
 
 /// A node stated a blob size it did not prove (ADR 005 § Bounded byte
-/// ranges): a `StreamResponse` with `ok = true`, or a probe answer that
-/// states a size, whose size proof is missing or does not verify against the
-/// content hash and that size.
+/// ranges): the size proof of a `StreamResponse` with `ok = true`, or of a
+/// probe answer, does not verify against the content hash and the size it
+/// states.
 ///
 /// The size is a fault of that node. The client uses no part of the answer:
 /// it plans nothing, allocates nothing and pays nothing against the size. The
@@ -880,27 +880,17 @@ impl std::error::Error for ResumeOffsetPastEnd {}
 /// its ranges move to other sources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnprovenSize {
-    /// The size the node stated.
+    /// The size the proof states.
     pub total_bytes: u64,
-    /// Whether the node sent a proof at all.
-    pub had_proof: bool,
 }
 
 impl std::fmt::Display for UnprovenSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.had_proof {
-            write!(
-                f,
-                "the node's size proof does not prove a {}-byte blob",
-                self.total_bytes
-            )
-        } else {
-            write!(
-                f,
-                "the node stated a {}-byte blob with no size proof",
-                self.total_bytes
-            )
-        }
+        write!(
+            f,
+            "the node's size proof does not prove a {}-byte blob",
+            self.total_bytes
+        )
     }
 }
 
@@ -935,27 +925,22 @@ impl std::fmt::Display for ProvenSize {
     }
 }
 
-/// Check that `proof` proves that the blob with hash `hash` is `total_bytes`
-/// long. Every size a node states passes through here before the client uses
-/// it.
+/// Check that `proof` proves that the blob with hash `hash` is the size the
+/// proof states. Every size a node states is a proof, and passes through here
+/// before the client uses it.
 ///
 /// # Errors
 ///
-/// [`UnprovenSize`] when `proof` is missing or does not verify.
+/// [`UnprovenSize`] when `proof` does not verify.
 pub fn check_size_proof(
     hash: [u8; 32],
-    total_bytes: u64,
-    proof: Option<&decdn_protocol::SizeProof>,
+    proof: &decdn_protocol::SizeProof,
 ) -> Result<ProvenSize, UnprovenSize> {
-    let unproven = UnprovenSize {
-        total_bytes,
-        had_proof: proof.is_some(),
-    };
-    let proof = proof.ok_or(unproven)?;
+    let total_bytes = proof.size();
     if decdn_bao_range::verify_size_proof(hash, total_bytes, proof.as_bytes()) {
         Ok(ProvenSize(total_bytes))
     } else {
-        Err(unproven)
+        Err(UnprovenSize { total_bytes })
     }
 }
 
@@ -1287,7 +1272,7 @@ impl UpstreamRefused {
                  (StreamResponse::validate invariant bypassed)"
             );
         }
-        match ext.error.clone() {
+        match ext.error().cloned() {
             Some(error) => anyhow::Error::new(Self {
                 kind: Kind::Open {
                     error,
@@ -2082,6 +2067,7 @@ async fn open_stream(
     RecvStream,
     StreamResponse,
     StreamResponseExt,
+    Option<ProvenSize>,
 )> {
     tokio::time::timeout(open, async move {
         let conn = match source {
@@ -2135,7 +2121,7 @@ async fn open_stream(
             .map_err(|e| rate_limited::transport_error("write stream request", e))?;
 
         let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-        verify_response(
+        let proven = verify_response(
             &resp,
             &resp_ext,
             slash_domain,
@@ -2143,7 +2129,7 @@ async fn open_stream(
             hash,
             timestamp_us,
         )?;
-        Ok((conn, send, recv, resp, resp_ext))
+        Ok((conn, send, recv, resp, resp_ext, proven))
     })
     .await
     .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
@@ -2982,8 +2968,8 @@ fn log_proof_stall(
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct UpstreamPullHeader {
-    /// Whole-blob size, proven by [`Self::size_proof`] on a paid upstream
-    /// (echoed into our downstream `StreamResponse`).
+    /// Whole-blob size: the size [`Self::size_proof`] proves on a paid
+    /// upstream, and the size of the bytes an unpaid source serves.
     pub total_bytes: u64,
     /// The size proof the upstream sent, verified against the hash and
     /// `total_bytes` before this header exists. A relay keeps it and serves
@@ -3012,7 +2998,10 @@ impl UpstreamPullHeader {
     /// a header with no proof (an unpaid source) or a proof of another size.
     #[must_use]
     pub fn proven_size(&self, hash: [u8; 32]) -> Option<ProvenSize> {
-        check_size_proof(hash, self.total_bytes, self.size_proof.as_ref()).ok()
+        let proof = self.size_proof.as_ref()?;
+        check_size_proof(hash, proof)
+            .ok()
+            .filter(|proven| proven.get() == self.total_bytes)
     }
 }
 
@@ -3321,7 +3310,7 @@ async fn open_progressive_pull_impl(
     let result: anyhow::Result<(UpstreamPullHeader, UpstreamPull)> = async {
         let window = deadlines.window;
         let floor_bps = deadlines.floor_bps;
-        let (conn, send, recv, resp, resp_ext) = open_stream(
+        let (conn, send, recv, resp, resp_ext, proven) = open_stream(
             source,
             ctx,
             slash_domain,
@@ -3341,10 +3330,10 @@ async fn open_progressive_pull_impl(
             deadlines.open,
         )
         .await?;
-        if !resp.body.ok {
+        let Some(proven) = proven.filter(|_| resp.body.ok) else {
             return Err(UpstreamRefused::open(resp, &resp_ext));
-        }
-        // `verify_response` proved `total_bytes` against the hash. The
+        };
+        // `verify_response` proved the size against the hash. The
         // `max_blob_size_bytes` cap still binds on the bytes that arrive, inside
         // `UpstreamPull::next_chunk`: one stream of a large blob is streamed and paid
         // for only up to the cap's worth, wherever it starts.
@@ -3363,7 +3352,7 @@ async fn open_progressive_pull_impl(
         // Wire-byte bound (bao-encoded size of the aligned range), not content bytes:
         // the window path forwards this stream verbatim and pays the upstream in wire
         // bytes (ADR 038 §Payment metering).
-        let total_bytes = resp.body.total_bytes;
+        let total_bytes = proven.get();
         let expected_wire_bytes = served_wire_len(byte_offset, byte_len, total_bytes)?;
         // Per-stream bound on received bytes (#1895), as WIRE so `next_chunk` can
         // enforce it without decoding: the wire size of the cap's worth of content
@@ -3381,7 +3370,7 @@ async fn open_progressive_pull_impl(
         };
         let header = UpstreamPullHeader {
             total_bytes,
-            size_proof: resp_ext.size_proof.clone(),
+            size_proof: resp_ext.size_proof().cloned(),
             rate_per_mb,
             interval_bytes: CHUNK_BYTES,
             origin_attestation: resp_ext
@@ -4444,6 +4433,7 @@ fn voucher_rejection(
 }
 
 /// Validate + verify a `StreamResponse` on receive (ADR 005, ADR 014 §1, #252).
+/// Returns the proven blob size of a served response, `None` for a refusal.
 fn verify_response(
     resp: &StreamResponse,
     ext: &StreamResponseExt,
@@ -4451,7 +4441,7 @@ fn verify_response(
     expected_signer: Address,
     hash: [u8; 32],
     timestamp_us: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ProvenSize>> {
     // #252 + slash_sig length/upper-bound checks on the frozen base...
     resp.validate()
         .map_err(|e| anyhow::anyhow!("invalid stream response: {e}"))?;
@@ -4472,12 +4462,12 @@ fn verify_response(
     StreamSlashData::from_response_body(&resp.body)
         .verify_signer(&sig, expected_signer, slash_domain)
         .map_err(|e| anyhow::anyhow!("slash_sig verification failed: {e}"))?;
-    // A node proves every size it serves under (ADR 005 § Bounded byte
-    // ranges). Nothing downstream reads `total_bytes` before this passes.
-    if resp.body.ok {
-        check_size_proof(hash, resp.body.total_bytes, ext.size_proof.as_ref())?;
-    }
-    Ok(())
+    // A served response states its size only in its proof (ADR 005 § Bounded
+    // byte ranges), and `validate` above ties a served outcome to `ok`.
+    Ok(ext
+        .size_proof()
+        .map(|proof| check_size_proof(hash, proof))
+        .transpose()?)
 }
 
 async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Result<()> {

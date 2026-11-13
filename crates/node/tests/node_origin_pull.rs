@@ -385,9 +385,8 @@ async fn answer_probe_with_coverage(
     let payload = encode_probe_response(
         &resp,
         Some(&ProbeResponseExt {
-            total_bytes: Some(total_bytes),
             coverage,
-            size_proof: support::size_proof_for(req.hash, total_bytes),
+            size_proof: Some(support::size_proof_for(req.hash, total_bytes)),
         }),
     )
     .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
@@ -1767,9 +1766,9 @@ async fn serve_wrong_bytes(
         hash: req.hash,
         ok: true,
         rate_per_mb: rate,
-        total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
         timestamp_us: req.timestamp_us,
     };
+    let total_bytes = u64::try_from(served.len()).unwrap_or(u64::MAX);
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
@@ -1778,7 +1777,7 @@ async fn serve_wrong_bytes(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -1900,7 +1899,6 @@ async fn serve_gated_correct_bytes(
             hash: req.hash,
             ok: true,
             rate_per_mb: rate,
-            total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
             timestamp_us: req.timestamp_us,
         };
         let slash_sig = StreamSlashData::from_response_body(&body)
@@ -1909,7 +1907,7 @@ async fn serve_gated_correct_bytes(
             .as_bytes()
             .to_vec();
         let resp = StreamResponse { body, slash_sig };
-        let resp_ext = support::proven_ext(&resp);
+        let resp_ext = support::proven_ext(&resp, u64::try_from(served.len()).unwrap_or(u64::MAX));
         write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
             .await
             .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -2090,9 +2088,9 @@ async fn serve_then_reject_voucher(
         hash: req.hash,
         ok: true,
         rate_per_mb: rate,
-        total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
         timestamp_us: req.timestamp_us,
     };
+    let total_bytes = u64::try_from(served.len()).unwrap_or(u64::MAX);
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
@@ -2101,7 +2099,7 @@ async fn serve_then_reject_voucher(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -2173,9 +2171,9 @@ async fn serve_then_error_on_voucher(
         hash: req.hash,
         ok: true,
         rate_per_mb: rate,
-        total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
         timestamp_us: req.timestamp_us,
     };
+    let total_bytes = u64::try_from(served.len()).unwrap_or(u64::MAX);
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
@@ -2184,7 +2182,7 @@ async fn serve_then_error_on_voucher(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -3861,7 +3859,6 @@ fn signed_response(
         hash: req.hash,
         ok: error.is_none(),
         rate_per_mb: rate,
-        total_bytes,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -3869,18 +3866,11 @@ fn signed_response(
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
         .as_bytes()
         .to_vec();
-    Ok((
-        StreamResponse { body, slash_sig },
-        StreamResponseExt {
-            size_proof: if error.is_none() {
-                support::size_proof_for(req.hash, total_bytes)
-            } else {
-                None
-            },
-            error,
-            origin_attestation: None,
-        },
-    ))
+    let ext = match error {
+        None => StreamResponseExt::served(support::size_proof_for(req.hash, total_bytes), None),
+        Some(error) => StreamResponseExt::refused(error),
+    };
+    Ok((StreamResponse { body, slash_sig }, ext))
 }
 
 /// The honest whole-blob bao verified-stream wire for `payload` (ADR 038), with
@@ -6994,8 +6984,11 @@ async fn leaf_ranged_paid_pull(
         .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
 
     let (resp, resp_ext) = read_client_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
-    let total = resp.body.total_bytes;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
+    let total = resp_ext
+        .size_proof()
+        .map(decdn_protocol::SizeProof::size)
+        .ok_or_else(|| anyhow::anyhow!("an ok response carries a size proof"))?;
     // The paid/closing boundary is the bao-encoded WIRE size of the aligned
     // superset (ADR 038), not the requested content length. `align_range_clamped`,
     // because `byte_len` may run past `total`: the server serves and bills that
@@ -7258,8 +7251,11 @@ async fn leaf_paced_pull_mode(
         .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
 
     let (resp, resp_ext) = read_client_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
-    let total = resp.body.total_bytes;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
+    let total = resp_ext
+        .size_proof()
+        .map(decdn_protocol::SizeProof::size)
+        .ok_or_else(|| anyhow::anyhow!("an ok response carries a size proof"))?;
     // B forwards + meters WIRE bytes (bao: content + interleaved proof), so the
     // closing-voucher / completeness boundary is the bao-encoded size, not the
     // content `total_bytes`. The per-interval boundary is unchanged — both sides
@@ -8771,10 +8767,10 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
         "concurrent same-lane MISS must be refused while budget covers only one floor"
     );
     anyhow::ensure!(
-        matches!(resp2_ext.error, Some(StreamError::Unfunded)),
+        matches!(resp2_ext.error(), Some(StreamError::Unfunded)),
         "expected the Unfunded wire code for the pool-ceiling refusal, \
          got {:?}",
-        resp2_ext.error
+        resp2_ext.error()
     );
     conn2.close(0u32.into(), b"refused");
 
@@ -9806,7 +9802,6 @@ async fn serve_wire_paced(
         hash: req.hash,
         ok: true,
         rate_per_mb: rate,
-        total_bytes,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -9817,7 +9812,7 @@ async fn serve_wire_paced(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -10210,7 +10205,7 @@ async fn leaf_opens_paid_stream(
     .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
 
     let (resp, resp_ext) = read_client_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
     Ok(LeafStream {
         conn,
         send,

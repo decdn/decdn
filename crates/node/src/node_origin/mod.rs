@@ -1750,7 +1750,10 @@ async fn probe_candidate(
         // The holder's blob size, proven above. The coverage-union gather
         // (#1506) reads it to know how many discovery blocks the union must
         // span, and the pull leg cuts its first upstream open from it.
-        total_bytes_hint: resp_ext.total_bytes,
+        total_bytes_hint: resp_ext
+            .size_proof
+            .as_ref()
+            .map(decdn_protocol::SizeProof::size),
     })
 }
 
@@ -1766,8 +1769,8 @@ pub(super) fn probe_size_proven(
     hash: [u8; 32],
     ext: &decdn_protocol::ProbeResponseExt,
 ) -> Result<(), decdn_client::UnprovenSize> {
-    ext.total_bytes.map_or(Ok(()), |total_bytes| {
-        decdn_client::check_size_proof(hash, total_bytes, ext.size_proof.as_ref()).map(drop)
+    ext.size_proof.as_ref().map_or(Ok(()), |proof| {
+        decdn_client::check_size_proof(hash, proof).map(drop)
     })
 }
 

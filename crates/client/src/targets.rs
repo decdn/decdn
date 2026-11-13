@@ -507,10 +507,10 @@ fn stated_size(
     hash: [u8; 32],
     ext: &decdn_protocol::ProbeResponseExt,
 ) -> Result<Option<crate::ProvenSize>, ()> {
-    let Some(total_bytes) = ext.total_bytes else {
+    let Some(proof) = ext.size_proof.as_ref() else {
         return Ok(None);
     };
-    crate::check_size_proof(hash, total_bytes, ext.size_proof.as_ref())
+    crate::check_size_proof(hash, proof)
         .map(Some)
         .map_err(|e| tracing::warn!("dropping a probe response from {}: {e}", cand.node_id))
 }

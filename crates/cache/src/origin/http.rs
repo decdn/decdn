@@ -495,7 +495,7 @@ impl Origin for HttpOrigin {
             // The sibling is read like the outboard sibling, with the proof
             // cap. A missing or declined proof is `None`: the origin proves no
             // size for the hash.
-            let max = decdn_bao_range::MAX_SIZE_PROOF_BYTES as u64;
+            let max = decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES as u64;
             Ok(match self.get_outboard_bounded(&url, max).await? {
                 OutboardFetch::Found(bytes) => Some(bytes),
                 OutboardFetch::NotFound | OutboardFetch::Unsupported => None,

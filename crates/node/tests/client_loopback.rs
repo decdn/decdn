@@ -1038,7 +1038,7 @@ async fn open_paid_range_stream(
         .await
         .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
     Ok((send, recv))
 }
 
@@ -2250,9 +2250,9 @@ async fn a_never_paying_client_gets_a_bounded_free_total() -> anyhow::Result<()>
     let (refusal, refusal_ext) =
         open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
     anyhow::ensure!(
-        !refusal.body.ok && matches!(refusal_ext.error, Some(StreamError::NotFound)),
+        !refusal.body.ok && matches!(refusal_ext.error(), Some(StreamError::NotFound)),
         "a signer whose floor debt fills its cap is refused NotFound, got {:?}",
-        refusal_ext.error
+        refusal_ext.error()
     );
     anyhow::ensure!(
         counter(
@@ -2300,9 +2300,9 @@ async fn rotating_signers_on_one_pool_meet_the_pool_bound() -> anyhow::Result<()
     let (refusal, refusal_ext) =
         open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
     anyhow::ensure!(
-        !refusal.body.ok && matches!(refusal_ext.error, Some(StreamError::Unfunded)),
+        !refusal.body.ok && matches!(refusal_ext.error(), Some(StreamError::Unfunded)),
         "a fresh signer on a pool full of floor debt is refused Unfunded, got {:?}",
-        refusal_ext.error
+        refusal_ext.error()
     );
     anyhow::ensure!(
         counter(
@@ -2743,7 +2743,7 @@ async fn stall_delivery_at_closing_voucher(
         .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
 
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
 
     let mut wire_bytes: u64 = 0;
     while wire_bytes < expected_wire {
@@ -3472,11 +3472,11 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
     );
     anyhow::ensure!(
         matches!(
-            refusal_ext.error,
+            refusal_ext.error(),
             Some(decdn_protocol::client::StreamError::Unfunded)
         ),
         "expected the Unfunded wire code, got {:?}",
-        refusal_ext.error
+        refusal_ext.error()
     );
 
     // The admitted stream still settles cleanly once its slot is the only one
@@ -5641,11 +5641,11 @@ async fn client_unknown_lane_is_rejected() -> anyhow::Result<()> {
             );
             anyhow::ensure!(
                 matches!(
-                    resp_ext.error,
+                    resp_ext.error(),
                     Some(decdn_protocol::client::StreamError::NotFound)
                 ),
                 "expected NotFound, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
         }
         other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
@@ -5735,11 +5735,11 @@ async fn client_underfunded_pool_is_refused_pre_serve() -> anyhow::Result<()> {
             // funding recovery can run.
             anyhow::ensure!(
                 matches!(
-                    resp_ext.error,
+                    resp_ext.error(),
                     Some(decdn_protocol::client::StreamError::Unfunded)
                 ),
                 "expected the Unfunded wire code, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
         }
         other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
@@ -6087,7 +6087,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
         (ClientMessage::StreamResponse(resp), resp_ext) => anyhow::ensure!(
             resp.body.ok,
             "a resume funded for its tail must be served, not refused: {:?}",
-            resp_ext.error
+            resp_ext.error()
         ),
         other => anyhow::bail!("expected a signed StreamResponse, got {other:?}"),
     }
@@ -6161,7 +6161,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         (ClientMessage::StreamResponse(resp), resp_ext) => anyhow::ensure!(
             resp.body.ok,
             "headroom exactly equal to the ceiling must be served: {:?}",
-            resp_ext.error
+            resp_ext.error()
         ),
         other => anyhow::bail!("expected a signed StreamResponse, got {other:?}"),
     }
@@ -6715,9 +6715,9 @@ async fn an_unbound_request_reads_no_pool() -> anyhow::Result<()> {
         let (resp, ext) = open_expecting_refusal(&conn, *hash.as_bytes(), None).await?;
         anyhow::ensure!(!resp.body.ok);
         anyhow::ensure!(
-            matches!(ext.error, Some(StreamError::NotFound)),
+            matches!(ext.error(), Some(StreamError::NotFound)),
             "an unbound request hears NotFound, got {:?}",
-            ext.error
+            ext.error()
         );
     }
     anyhow::ensure!(
@@ -6799,9 +6799,9 @@ async fn a_closing_pool_is_unfunded_to_its_lane_and_not_found_to_anyone_else() -
     let (proven, proven_ext) = open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
     anyhow::ensure!(!proven.body.ok, "a closing pool must not be served");
     anyhow::ensure!(
-        matches!(proven_ext.error, Some(StreamError::Unfunded)),
+        matches!(proven_ext.error(), Some(StreamError::Unfunded)),
         "the lane's requester must hear Unfunded, got {:?}",
-        proven_ext.error
+        proven_ext.error()
     );
 
     // A binding verifies once per connection, so the unbound request goes on a
@@ -6814,9 +6814,9 @@ async fn a_closing_pool_is_unfunded_to_its_lane_and_not_found_to_anyone_else() -
     let (unbound, unbound_ext) = open_expecting_refusal(&stranger, *hash.as_bytes(), None).await?;
     anyhow::ensure!(!unbound.body.ok, "a closing pool must not be served");
     anyhow::ensure!(
-        matches!(unbound_ext.error, Some(StreamError::NotFound)),
+        matches!(unbound_ext.error(), Some(StreamError::NotFound)),
         "an unbound requester must hear NotFound, got {:?}",
-        unbound_ext.error
+        unbound_ext.error()
     );
     // The unbound request names no lane, so it is refused before the pool
     // read: it counts as an owner mismatch, not as a closing pool.
@@ -8329,11 +8329,11 @@ async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
     // prober-facing `NotFound`.
     anyhow::ensure!(
         matches!(
-            refusal_ext.error,
+            refusal_ext.error(),
             Some(decdn_protocol::client::StreamError::Unfunded)
         ),
         "expected the Unfunded wire code, got {:?}",
-        refusal_ext.error
+        refusal_ext.error()
     );
 
     drop(held);
@@ -9761,9 +9761,9 @@ async fn expect_signed_refusal(
                 "the signed refusal echoes the request timestamp"
             );
             anyhow::ensure!(
-                resp_ext.error.as_ref() == Some(&expected),
+                resp_ext.error() == Some(&expected),
                 "expected {expected:?}, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
             Ok(())
         }
@@ -9888,11 +9888,11 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
             );
             anyhow::ensure!(
                 matches!(
-                    resp_ext.error,
+                    resp_ext.error(),
                     Some(decdn_protocol::client::StreamError::NotFound)
                 ),
                 "expected NotFound, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
         }
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
@@ -9988,9 +9988,9 @@ async fn client_capability_signed_by_a_non_owner_registers_no_lane() -> anyhow::
         (ClientMessage::StreamResponse(resp), resp_ext) => {
             anyhow::ensure!(!resp.body.ok, "a dropped capability must not be served");
             anyhow::ensure!(
-                matches!(resp_ext.error, Some(StreamError::NotFound)),
+                matches!(resp_ext.error(), Some(StreamError::NotFound)),
                 "expected the unknown-lane NotFound, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
         }
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
@@ -10095,7 +10095,7 @@ async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<
             anyhow::ensure!(
                 resp.body.ok,
                 "the pinned voucher signer must be authorized, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
         }
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
@@ -10135,11 +10135,11 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
             anyhow::ensure!(!resp.body.ok, "expected ok:false for the funder binding");
             anyhow::ensure!(
                 matches!(
-                    resp_ext.error,
+                    resp_ext.error(),
                     Some(decdn_protocol::client::StreamError::NotFound)
                 ),
                 "expected NotFound, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
         }
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
@@ -10201,11 +10201,11 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
             );
             anyhow::ensure!(
                 matches!(
-                    resp_ext.error,
+                    resp_ext.error(),
                     Some(decdn_protocol::client::StreamError::Declined)
                 ),
                 "expected Declined, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
         }
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
@@ -11152,11 +11152,11 @@ async fn underfunded_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
             // so the wire code is `Unfunded`, not the prober-facing `NotFound`.
             anyhow::ensure!(
                 matches!(
-                    resp_ext.error,
+                    resp_ext.error(),
                     Some(decdn_protocol::client::StreamError::Unfunded)
                 ),
                 "expected the Unfunded wire code, got {:?}",
-                resp_ext.error
+                resp_ext.error()
             );
         }
         other => anyhow::bail!("expected a signed refusal, got {other:?}"),
@@ -12696,12 +12696,13 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
             "expected a signed NotFound for a genuine absence, got: {e}"
         ),
     }
-    // The local origin WAS consulted on the miss (proving the local-first path
-    // ran, not that it was skipped), then the request fell through to a clean
-    // refusal because node→node is off — the only further tier.
+    // The local origin states no size for the blob, so the node fetches nothing
+    // from it (it serves no origin blob it cannot size under a proof), and the
+    // request falls through to a clean refusal because node→node is off — the
+    // only further tier.
     anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 1,
-        "local origin should be consulted once on the miss, got {}",
+        cache_metrics.origin_fetches.get() == 0,
+        "an origin with no size for the blob is not fetched from, got {} fetches",
         cache_metrics.origin_fetches.get()
     );
     // The inverse of the hard-fault tests, and the guard that makes the pair
@@ -12710,14 +12711,14 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     // healthy-but-empty node as broken and steer clients away from it.
     support::assert_inbound_failures_attributed(&metrics, 1).await?;
     assert_reject_reason(&metrics, 0, 1)?;
-    // Authorized, but node-to-node is off: the local tier ran and missed.
+    // Authorized, but node-to-node is off and the origin states no size.
     assert_one_miss_line(&spans, hash, "no_pull_through", "cache_miss")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
 
-    // The refusal and the miss chain under it land on the spans: the local
-    // tier finds nothing, its origin walk is a clean `not_found` (no error
-    // status), and the stream records a signed `cache_miss` refusal.
+    // The refusal lands on the spans: the origin states no size, so no fill
+    // tier runs and no origin walk starts, and the stream records a signed
+    // `cache_miss` refusal.
     let key = hash.to_string();
     let field = |span: &support::CapturedSpan, name: &str| span.fields.get(name).cloned();
     let served = spans.matching("serve_stream", "hash", &key);
@@ -12730,23 +12731,9 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
         "serve_stream: {serve:?}"
     );
     let fills = spans.matching("pull_through", "hash", &key);
-    anyhow::ensure!(
-        fills
-            .iter()
-            .any(|s| field(s, "tier").as_deref() == Some("local")
-                && field(s, "outcome").as_deref() == Some("clean_miss")
-                && s.parent == Some("serve_stream")),
-        "pull_through: {fills:?}"
-    );
+    anyhow::ensure!(fills.is_empty(), "pull_through: {fills:?}");
     let walks = spans.matching("origin_pull", "hash", &key);
-    anyhow::ensure!(
-        walks
-            .iter()
-            .any(|s| field(s, "outcome").as_deref() == Some("not_found")
-                && field(s, "otel.status_code").is_none()
-                && s.parent == Some("pull_through")),
-        "origin_pull: {walks:?}"
-    );
+    anyhow::ensure!(walks.is_empty(), "origin_pull: {walks:?}");
     Ok(())
 }
 
@@ -12857,7 +12844,10 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
         let shard = origin_dir.path().join(encoded.shard());
         std::fs::create_dir_all(&shard)?;
         std::fs::write(shard.join(&encoded.hash_hex), &payload)?;
-        std::fs::write(shard.join(encoded.size_proof_name()), &encoded.size_proof)?;
+        std::fs::write(
+            shard.join(encoded.size_proof_name()),
+            encoded.size_proof_object(),
+        )?;
         if holds == OriginHolds::BlobAndOutboard {
             std::fs::write(shard.join(encoded.obao4_name()), &encoded.outboard)?;
         }
@@ -13121,13 +13111,46 @@ fn assert_one_miss_line(
 /// Distinct from [`CountingOrigin`] in the way that matters: that one is
 /// `OriginKind::Peer`, which `populate_local` deliberately SKIPS, so it can never
 /// exercise the local tier. This one is `OriginKind::Http` — a local-tier origin
-/// the reactive populate does consult.
+/// the reactive populate does consult. It states the blob's size and serves its
+/// `{H}.sizeproof`, because the node populates only a blob whose size its
+/// origin proves; only the blob fetch fails.
 #[derive(Debug)]
 struct FailingOrigin {
     hits: Arc<std::sync::atomic::AtomicUsize>,
+    size: u64,
+    size_proof_object: bytes::Bytes,
 }
 
 impl decdn_cache::Origin for FailingOrigin {
+    fn size(
+        &self,
+        _hash: decdn_cache::Hash,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>>
+                + Send
+                + '_,
+        >,
+    > {
+        let size = self.size;
+        Box::pin(async move { Ok(Some(size)) })
+    }
+
+    fn fetch_size_proof(
+        &self,
+        _hash: decdn_cache::Hash,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<bytes::Bytes>, decdn_cache::OriginPullError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let object = self.size_proof_object.clone();
+        Box::pin(async move { Ok(Some(object)) })
+    }
+
     fn fetch(
         &self,
         _hash: decdn_cache::Hash,
@@ -13167,8 +13190,13 @@ async fn empty_cache_with_failing_origin(
     let hash = support::register_payload(payload);
     let cache_dir = tempfile::tempdir()?;
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let size = u64::try_from(payload.len())?;
     let origin = Arc::new(FailingOrigin {
         hits: Arc::clone(&hits),
+        size,
+        size_proof_object: decdn_bao_range::encode_outboard(payload, size)?
+            .size_proof_object()
+            .into(),
     });
     let cache = CacheEngine::open_full(
         cache_dir.path(),
@@ -13468,11 +13496,11 @@ async fn cache_miss_refused_under_concurrency_pressure() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         matches!(
-            refusal_ext.error,
+            refusal_ext.error(),
             Some(decdn_protocol::client::StreamError::NotFound)
         ),
         "expected the collapsed NotFound wire code, got {:?}",
-        refusal_ext.error
+        refusal_ext.error()
     );
 
     // Release the held slot only after the refusal is observed, so the shed
@@ -13554,11 +13582,11 @@ async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         matches!(
-            refusal_ext.error,
+            refusal_ext.error(),
             Some(decdn_protocol::client::StreamError::NotFound)
         ),
         "expected the collapsed NotFound wire code, got {:?}",
-        refusal_ext.error
+        refusal_ext.error()
     );
 
     // The availability gate counts ahead of the shed gate, so a serve the shed
@@ -14880,7 +14908,6 @@ async fn serve_lying_stream(
         hash: req.hash,
         ok: true,
         rate_per_mb: RATE_PER_MB,
-        total_bytes: advertised_total_bytes,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -14891,7 +14918,10 @@ async fn serve_lying_stream(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
+        &encode_stream_response(
+            &resp,
+            Some(&support::proven_ext(&resp, advertised_total_bytes)),
+        )?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -15755,7 +15785,7 @@ async fn a_payer_that_stops_reading_faults_at_the_no_progress_timeout() -> anyho
         .await
         .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
 
     // Read nothing more and pay nothing. The node ends the stream by dropping
     // its receive half, which stops this send half.
@@ -15861,7 +15891,6 @@ async fn serve_stop_send_then_signal(
         hash: req.hash,
         ok: true,
         rate_per_mb: RATE_PER_MB,
-        total_bytes,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
@@ -15872,7 +15901,7 @@ async fn serve_stop_send_then_signal(
     let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_stream_response(&resp, Some(&support::proven_ext(&resp)))?,
+        &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;

@@ -31,10 +31,33 @@ use crate::size_proof::{encode_size_proof, size_proof_tail_start};
 pub const OBAO4_SUFFIX: &str = ".obao4";
 
 /// Sibling-key suffix for the published size proof (`{H}.sizeproof`): the
-/// bytes of [`crate::encode_size_proof`] for the blob, which a node serves to
-/// prove the blob's size (ADR 005 § Bounded byte ranges). It sits
-/// beside the `{H}.obao4` outboard under the same shard prefix.
+/// blob's size and the bytes of [`crate::encode_size_proof`] for it
+/// ([`size_proof_object`]), which a node serves to prove the blob's size (ADR
+/// 005 § Bounded byte ranges). It is the origin's only statement of the
+/// size. It sits beside the `{H}.obao4` outboard under the same shard prefix.
 pub const SIZE_PROOF_SUFFIX: &str = ".sizeproof";
+
+/// The longest `{H}.sizeproof` object: the 8-byte size and the longest proof
+/// ([`crate::MAX_SIZE_PROOF_BYTES`]). A reader reads no more.
+pub const MAX_SIZE_PROOF_OBJECT_BYTES: usize = 8 + crate::MAX_SIZE_PROOF_BYTES;
+
+/// The bytes of a `{H}.sizeproof` object: `size` as 8 little-endian bytes,
+/// then the proof.
+#[must_use]
+pub fn size_proof_object(size: u64, proof: &[u8]) -> Vec<u8> {
+    let mut object = Vec::with_capacity(8 + proof.len());
+    object.extend_from_slice(&size.to_le_bytes());
+    object.extend_from_slice(proof);
+    object
+}
+
+/// The size and the proof a `{H}.sizeproof` object holds, or `None` for an
+/// object shorter than its size field. Nothing is verified here.
+#[must_use]
+pub fn parse_size_proof_object(object: &[u8]) -> Option<(u64, &[u8])> {
+    let (size, proof) = object.split_first_chunk::<8>()?;
+    Some((u64::from_le_bytes(*size), proof))
+}
 
 /// The two-character shard prefix for a blob's lowercase-hex address:
 /// `{base}/{hex[0..2]}/{hex}`. The first two hex chars shard the directory so a
@@ -58,8 +81,9 @@ pub struct EncodedOutboard {
     /// The pre-order bao outboard bytes, byte-identical to what the cache
     /// reader (`origin::fs::fetch_outboard`) expects at the `{hex}.obao4` key.
     pub outboard: Vec<u8>,
-    /// The size proof of the blob, the bytes of its `{hex}.sizeproof`
-    /// sibling ([`SIZE_PROOF_SUFFIX`]).
+    /// The blob's size in bytes.
+    pub size: u64,
+    /// The size proof of the blob ([`crate::encode_size_proof`]).
     pub size_proof: Bytes,
 }
 
@@ -80,6 +104,13 @@ impl EncodedOutboard {
     #[must_use]
     pub fn size_proof_name(&self) -> String {
         format!("{}{SIZE_PROOF_SUFFIX}", self.hash_hex)
+    }
+
+    /// The bytes of this blob's `{hex}.sizeproof` sibling
+    /// ([`size_proof_object`]).
+    #[must_use]
+    pub fn size_proof_object(&self) -> Vec<u8> {
+        size_proof_object(self.size, &self.size_proof)
     }
 }
 
@@ -137,6 +168,7 @@ pub fn encode_outboard(reader: impl Read, size: u64) -> std::io::Result<EncodedO
     Ok(EncodedOutboard {
         hash_hex: ob.root.to_hex().to_string(),
         outboard: ob.data,
+        size,
         size_proof,
     })
 }

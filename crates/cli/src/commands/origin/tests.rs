@@ -319,7 +319,7 @@ fn a_move_import_lands_the_object_with_both_siblings() {
     );
     assert_eq!(
         std::fs::read(shard.join(eo.size_proof_name())).unwrap(),
-        eo.size_proof.as_ref()
+        eo.size_proof_object()
     );
 }
 

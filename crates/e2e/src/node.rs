@@ -1440,8 +1440,11 @@ fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> any
     let size = u64::try_from(blob.len()).context("blob length")?;
     let encoded =
         decdn_bao_range::encode_outboard(blob, size).context("encode origin size proof")?;
-    std::fs::write(dir.join(encoded.size_proof_name()), &encoded.size_proof)
-        .context("write origin size proof")?;
+    std::fs::write(
+        dir.join(encoded.size_proof_name()),
+        encoded.size_proof_object(),
+    )
+    .context("write origin size proof")?;
     Ok(())
 }
 

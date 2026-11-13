@@ -433,9 +433,9 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     }
 
     /// Fetch the sibling `{H}.sizeproof` object of the blob `hash`: the size
-    /// proof that `decdn origin import` writes beside the outboard (ADR 005 §
-    /// Bounded byte ranges). The read is capped at
-    /// [`decdn_bao_range::MAX_SIZE_PROOF_BYTES`].
+    /// and its proof that `decdn origin import` writes beside the outboard
+    /// (ADR 005 § Bounded byte ranges; [`decdn_bao_range::size_proof_object`]).
+    /// The read is capped at [`decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES`].
     ///
     /// `Ok(None)` means the origin serves no proof for the hash: the object is
     /// missing, larger than the cap, or the backend does not serve siblings.

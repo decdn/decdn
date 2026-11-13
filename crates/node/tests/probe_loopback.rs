@@ -48,6 +48,11 @@ fn test_slash_domain() -> Eip712Domain {
     decdn_incentive::slash_judge_domain(421_614, Address::repeat_byte(0x11))
 }
 
+/// The size a probe answer states: the size its proof carries, if any.
+fn stated_size(ext: &ProbeResponseExt) -> Option<u64> {
+    ext.size_proof.as_ref().map(decdn_protocol::SizeProof::size)
+}
+
 /// Open an empty cache (no origin) in a fresh temp dir. The returned
 /// `TempDir` must be kept alive for the cache's lifetime.
 async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
@@ -541,7 +546,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         !resp.body.has_blob,
         "empty cache must report has_blob=false"
     );
-    assert_eq!(resp_ext.total_bytes, None, "no size when blob absent");
+    assert_eq!(stated_size(&resp_ext), None, "no size when blob absent");
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
     conn.close(0u32.into(), b"bye");
@@ -1562,9 +1567,9 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
 
     anyhow::ensure!(resp.body.has_blob, "cached blob must report has_blob=true");
     anyhow::ensure!(
-        resp_ext.total_bytes == Some(payload.len() as u64),
+        stated_size(&resp_ext) == Some(payload.len() as u64),
         "total_bytes should report the blob size, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     anyhow::ensure!(resp.body.hash == *hash.as_bytes(), "hash echoed");
     assert_slash_sig_valid(&resp, &signer, &domain)?;
@@ -1597,9 +1602,9 @@ async fn probe_has_blob_true_for_the_empty_blob() -> anyhow::Result<()> {
         "a node serves the empty blob, so it must advertise it"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes == Some(0),
+        stated_size(&resp_ext) == Some(0),
         "the empty blob reports a size of 0, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     anyhow::ensure!(
         resp_ext.coverage.is_empty(),
@@ -1653,9 +1658,9 @@ async fn probe_has_blob_false_for_the_empty_blob_when_chain_stale() -> anyhow::R
         "a chain-stale node must not advertise the empty blob"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes.is_none(),
+        stated_size(&resp_ext).is_none(),
         "a suppressed advertisement carries no size, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     anyhow::ensure!(
         resp_ext.consistent_with(&resp.body),
@@ -1692,9 +1697,9 @@ async fn probe_has_blob_false_for_a_chain_denied_empty_blob() -> anyhow::Result<
         "a chain-denied empty root must not be advertised"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes.is_none(),
+        resp_ext.size_proof.is_none(),
         "a refused hash carries no size, got {:?}",
-        resp_ext.total_bytes
+        resp_ext.size_proof
     );
     anyhow::ensure!(resp_ext.coverage.is_empty(), "no block to advertise");
     anyhow::ensure!(
@@ -1730,7 +1735,7 @@ async fn probe_states_no_size_or_proof_for_a_denied_held_blob() -> anyhow::Resul
 
     anyhow::ensure!(!resp.body.has_blob, "a denied blob is not advertised");
     anyhow::ensure!(
-        resp_ext.total_bytes.is_none() && resp_ext.size_proof.is_none(),
+        resp_ext.size_proof.is_none(),
         "a denied blob states no size and no proof: {resp_ext:?}"
     );
     anyhow::ensure!(resp_ext.coverage.is_empty(), "no block to advertise");
@@ -1766,9 +1771,9 @@ async fn probe_holds_disabled_signs_has_blob_false_for_the_empty_blob() -> anyho
         "holds-disabled must hide the empty root like any store-backed blob"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes.is_none(),
+        stated_size(&resp_ext).is_none(),
         "no size advertised when has_blob=false, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     anyhow::ensure!(
         resp_ext.consistent_with(&resp.body),
@@ -1811,9 +1816,9 @@ async fn origin_only_probe_does_not_advertise_the_empty_blob_off_its_store() -> 
         "origin-only node must not advertise the empty root off its store"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes.is_none(),
+        stated_size(&resp_ext).is_none(),
         "a non-advertised hash carries no size, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     anyhow::ensure!(
         resp_ext.consistent_with(&resp.body),
@@ -1852,9 +1857,9 @@ async fn origin_only_probe_advertises_an_empty_origin_object() -> anyhow::Result
         "origin-only node must advertise its own 0-byte origin object"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes == Some(0),
+        stated_size(&resp_ext) == Some(0),
         "the empty object reports a size of 0, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     anyhow::ensure!(
         resp_ext.coverage.is_empty(),
@@ -1912,9 +1917,9 @@ async fn probe_has_blob_false_when_chain_stale() -> anyhow::Result<()> {
         "a chain-stale node must not advertise a held blob"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes.is_none(),
+        stated_size(&resp_ext).is_none(),
         "a suppressed advertisement carries no size, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     anyhow::ensure!(
         resp_ext.consistent_with(&resp.body),
@@ -1975,9 +1980,9 @@ async fn probe_has_blob_true_and_partial_coverage_for_cached_partial_holder() ->
     // A partial holder advertises its blob size with its blocks (#2195), so a
     // requester can tell whether a set of partials spans the blob.
     anyhow::ensure!(
-        resp_ext.total_bytes == direct_size,
+        stated_size(&resp_ext) == direct_size,
         "a partial holder must advertise its size {direct_size:?}, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     anyhow::ensure!(
         resp_ext.consistent_with(&resp.body),
@@ -2008,7 +2013,7 @@ async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow:
     // proof, which lets the node state the size it advertises.
     let eo = decdn_bao_range::encode_outboard(&payload[..], u64::try_from(payload.len())?)?;
     std::fs::write(dir.join(eo.obao4_name()), &eo.outboard)?;
-    std::fs::write(dir.join(eo.size_proof_name()), &eo.size_proof)?;
+    std::fs::write(dir.join(eo.size_proof_name()), eo.size_proof_object())?;
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
@@ -2041,15 +2046,15 @@ async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow:
         resp.body.has_blob,
         "an origin-held blob must be advertised even though nothing is cached"
     );
-    anyhow::ensure!(
-        resp_ext.total_bytes == Some(payload.len() as u64),
-        "origin content's total_bytes should report the backend size, got {:?}",
-        resp_ext.total_bytes
-    );
     let proof = resp_ext
         .size_proof
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("a stated size carries its proof"))?;
+        .ok_or_else(|| anyhow::anyhow!("an origin-held blob states its size with a proof"))?;
+    anyhow::ensure!(
+        proof.size() == payload.len() as u64,
+        "origin content's size should report the backend size, got {}",
+        proof.size()
+    );
     anyhow::ensure!(decdn_bao_range::verify_size_proof(
         *hash.as_bytes(),
         payload.len() as u64,
@@ -2101,7 +2106,7 @@ async fn probe_of_an_origin_object_without_a_size_proof_states_nothing() -> anyh
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
-        resp_ext.total_bytes.is_none() && resp_ext.size_proof.is_none(),
+        resp_ext.size_proof.is_none(),
         "no proof, no size: {resp_ext:?}"
     );
     anyhow::ensure!(resp_ext.coverage.is_empty(), "no block without a size");
@@ -2144,9 +2149,9 @@ async fn origin_only_probe_advertises_backend_only() -> anyhow::Result<()> {
         "origin-only node must not advertise a store hit outside its own origin"
     );
     anyhow::ensure!(
-        foreign_resp_ext.total_bytes.is_none(),
+        stated_size(&foreign_resp_ext).is_none(),
         "a non-advertised hash must carry no total_bytes hint, got {:?}",
-        foreign_resp_ext.total_bytes
+        stated_size(&foreign_resp_ext)
     );
 
     let own_req = ProbeRequest {
@@ -2159,9 +2164,9 @@ async fn origin_only_probe_advertises_backend_only() -> anyhow::Result<()> {
         "origin-only node must still advertise its own backend-held content"
     );
     anyhow::ensure!(
-        own_resp_ext.total_bytes == Some(own_payload.len() as u64),
+        stated_size(&own_resp_ext) == Some(own_payload.len() as u64),
         "own content's total_bytes should report the backend size, got {:?}",
-        own_resp_ext.total_bytes
+        stated_size(&own_resp_ext)
     );
 
     Ok(())
@@ -2198,9 +2203,9 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
         "holds-disabled must yield has_blob=false even though the blob is cached"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes.is_none(),
+        stated_size(&resp_ext).is_none(),
         "no size advertised when has_blob=false, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     // The signature must cover has_blob=false (not a stale true).
     assert_slash_sig_valid(&resp, &signer, &domain)?;
@@ -2266,9 +2271,9 @@ async fn probe_budget_exhausted_still_advertises_and_counts_exhausted() -> anyho
         "budget-exhausted must still advertise has_blob=true — the hold is forgone, not the answer"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes == Some(b.len() as u64),
+        stated_size(&resp_ext) == Some(b.len() as u64),
         "the advertised blob must carry its size, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
@@ -2349,9 +2354,9 @@ async fn probe_end_client_reserved_out_still_advertises() -> anyhow::Result<()> 
         "an end-client under a stake-lane reservation must still get has_blob=true (hold shed, not the answer)"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes == Some(payload.len() as u64),
+        stated_size(&resp_ext) == Some(payload.len() as u64),
         "the advertised blob must carry its size, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
@@ -2435,9 +2440,9 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
         "a stake-lane requester must keep its reserved headroom -> has_blob=true"
     );
     anyhow::ensure!(
-        resp_ext.total_bytes == Some(payload.len() as u64),
+        stated_size(&resp_ext) == Some(payload.len() as u64),
         "stake-lane requester should be served the blob size, got {:?}",
-        resp_ext.total_bytes
+        stated_size(&resp_ext)
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 

@@ -204,23 +204,26 @@ async fn ranged_paid_pull(
     write_frame_to(&mut send, &payload).await?;
 
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
+    let total_bytes = resp_ext
+        .size_proof()
+        .map(decdn_protocol::SizeProof::size)
+        .ok_or_else(|| anyhow::anyhow!("an ok response carries a size proof"))?;
     // The advertised size is the *whole* blob; the range delivers `byte_len`, or
     // the whole tail when `byte_len == 0`. `byte_offset` must be inside the
-    // advertised total: a signed `total_bytes` at or before the offset is
-    // surfaced here as a server bug. An end past the advertised total is not a
-    // bug: it clamps and serves up to the blob's end (a claimed size is a
-    // hint), so it is NOT checked here. `align_range_clamped` below is the
-    // single source of truth for the served (and billed) span.
+    // advertised total: a proven size at or before the offset is surfaced here
+    // as a server bug. An end past the advertised total is not a bug: it clamps
+    // and serves up to the blob's end, so it is NOT checked here.
+    // `align_range_clamped` below is the single source of truth for the served
+    // (and billed) span.
     if byte_len == 0 {
-        resp.body
-            .total_bytes
+        total_bytes
             .checked_sub(byte_offset)
-            .ok_or_else(|| anyhow::anyhow!("response total_bytes is before byte_offset"))?;
+            .ok_or_else(|| anyhow::anyhow!("response size is before byte_offset"))?;
     } else {
         anyhow::ensure!(
-            byte_offset < resp.body.total_bytes,
-            "response total_bytes is at or before the requested offset"
+            byte_offset < total_bytes,
+            "response size is at or before the requested offset"
         );
     }
     // ADR 038: the wire carries the bao verified-stream (content + interleaved
@@ -229,11 +232,10 @@ async fn ranged_paid_pull(
     // `align_range_clamped`, because `byte_len` may run past `total_bytes`: the
     // server serves and bills that clamped to the blob's end rather than
     // refusing it.
-    let aligned =
-        decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, resp.body.total_bytes)
-            .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
+    let aligned = decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, total_bytes)
+        .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let expected_wire =
-        decdn_cache::range_pull::bao_encoded_size(resp.body.total_bytes, aligned.chunk_ranges());
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, aligned.chunk_ranges());
     let interval_bytes = CHUNK_BYTES;
 
     let mut buf = BytesMut::new();
@@ -286,7 +288,7 @@ async fn ranged_paid_pull(
     // The wire is the header-less bao verified-stream for the aligned superset;
     // decode + verify it against the root and trim to the requested span (ADR
     // 038), so callers compare against the exact range content as before.
-    decode_bao_range(hash, resp.body.total_bytes, byte_offset, byte_len, &buf)
+    decode_bao_range(hash, total_bytes, byte_offset, byte_len, &buf)
 }
 
 /// Decode the header-less bao verified-stream `wire` for `[byte_offset,
@@ -399,12 +401,16 @@ async fn idle_open(
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
     write_frame_to(&mut send, &payload).await?;
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "idle open refused: {:?}", resp_ext.error);
+    anyhow::ensure!(resp.body.ok, "idle open refused: {:?}", resp_ext.error());
+    let total_bytes = resp_ext
+        .size_proof()
+        .map(decdn_protocol::SizeProof::size)
+        .ok_or_else(|| anyhow::anyhow!("an ok response carries a size proof"))?;
     // Keep the streams alive with the connection so the node's serve leg stays
     // parked on a client that never pays.
     std::mem::forget(send);
     std::mem::forget(recv);
-    Ok((conn, resp.body.total_bytes))
+    Ok((conn, total_bytes))
 }
 
 async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result<()> {
@@ -443,7 +449,7 @@ async fn mount_size_proof(server: &MockServer, hex: &str, blob: &[u8]) {
             "/{hex}{}",
             decdn_bao_range::SIZE_PROOF_SUFFIX
         )))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(eo.size_proof.to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(eo.size_proof_object()))
         .mount(server)
         .await;
 }

@@ -746,7 +746,7 @@ fn ensure_siblings(shard_dir: &Path, eo: &EncodedOutboard) -> anyhow::Result<()>
     ensure_sibling(
         shard_dir,
         &shard_dir.join(eo.size_proof_name()),
-        &eo.size_proof,
+        &eo.size_proof_object(),
         "size proof",
     )
 }

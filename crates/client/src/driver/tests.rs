@@ -1518,7 +1518,6 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     hash,
                     ok: false,
                     rate_per_mb: 1,
-                    total_bytes: self.inner.total_bytes(),
                     timestamp_us: 0,
                 };
                 // `open` retains the response as-is without re-validating the
@@ -1529,11 +1528,7 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     body,
                     slash_sig: vec![0u8; 65],
                 };
-                let ext = StreamResponseExt {
-                    error: Some(StreamError::Unfunded),
-                    origin_attestation: None,
-                    size_proof: None,
-                };
+                let ext = StreamResponseExt::refused(StreamError::Unfunded);
                 return Err(UpstreamRefused::open(resp, &ext));
             }
             self.inner.open(hash, range).await

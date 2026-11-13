@@ -263,7 +263,7 @@ impl ProbeHandler {
             .cache
             .size_proof(hash, size)
             .await
-            .and_then(|proof| decdn_protocol::SizeProof::new(proof.to_vec()).ok());
+            .and_then(|proof| decdn_protocol::SizeProof::new(size, proof.to_vec()).ok());
         if proof.is_none() {
             tracing::debug!(%hash, size, "no size proof; the probe states no size");
             return (None, None);
@@ -738,14 +738,9 @@ impl ProbeHandler {
         // A size, and the proof that carries up to 1 KiB of the blob's tail,
         // goes only with an advertised blob: never for a refused hash, a
         // chain-stale answer or an opted-out store.
-        let (total_bytes, size_proof) = if has_blob {
-            (total_bytes, size_proof)
-        } else {
-            (None, None)
-        };
+        let size_proof = if has_blob { size_proof } else { None };
         debug_assert!(
             ProbeResponseExt {
-                total_bytes,
                 coverage: coverage.clone(),
                 size_proof: None,
             }
@@ -798,12 +793,11 @@ impl ProbeHandler {
         };
 
         let resp = ProbeResponse { body, slash_sig };
-        // `total_bytes`, `coverage` and `size_proof` are unsigned, so they ride
-        // in the trailing extension rather than the signed base (ADR 013 §Tier
-        // 1). Two-phase encode: a receiver that predates a future extension
-        // field stops at the end of the base.
+        // `coverage` and `size_proof` (the size and its proof) are unsigned,
+        // so they ride in the trailing extension rather than the signed base
+        // (ADR 013 §Tier 1). Two-phase encode: a receiver that predates a
+        // future extension field stops at the end of the base.
         let ext = ProbeResponseExt {
-            total_bytes,
             coverage,
             size_proof,
         };

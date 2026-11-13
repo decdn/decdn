@@ -18,9 +18,8 @@ fn sample_response() -> ProbeResponse {
 
 fn sample_ext() -> ProbeResponseExt {
     ProbeResponseExt {
-        total_bytes: Some(4096),
         coverage: crate::Coverage::from_block_indices(2, [0].into_iter()),
-        size_proof: crate::SizeProof::new(vec![0x42; 3 * 64 + 1024]).ok(),
+        size_proof: crate::SizeProof::new(4096, vec![0x42; 3 * 64 + 1024]).ok(),
     }
 }
 
@@ -125,7 +124,6 @@ fn body_for(hash: [u8; 32], has_blob: bool) -> ProbeResponseBody {
 
 fn one_block_ext() -> ProbeResponseExt {
     ProbeResponseExt {
-        total_bytes: Some(4096),
         coverage: crate::Coverage::full(1),
         size_proof: None,
     }
@@ -160,7 +158,6 @@ fn consistent_with_rejects_mismatched_pairs() {
 #[test]
 fn consistent_with_reads_has_blob_alone_for_the_empty_root() {
     let holder = ProbeResponseExt {
-        total_bytes: Some(0),
         coverage: crate::Coverage::empty(),
         size_proof: None,
     };
@@ -408,17 +405,15 @@ fn probe_response_wire_format_is_stable() -> Result<(), postcard::Error> {
     let framed = encode_probe_response(
         &resp,
         Some(&ProbeResponseExt {
-            total_bytes: Some(7),
             coverage: crate::Coverage::empty(),
-            size_proof: crate::SizeProof::new(vec![0x33]).ok(),
+            size_proof: crate::SizeProof::new(7, vec![0x33]).ok(),
         }),
     )?;
     let mut expected_framed = vec![1u8]; // ProbeMessage::Response discriminant
     expected_framed.extend_from_slice(&expected);
-    expected_framed.push(1u8); // total_bytes = Some
-    expected_framed.push(7u8); // total_bytes varint
     expected_framed.push(0u8); // coverage: empty Vec<u8> length-prefix (0)
     expected_framed.push(1u8); // size_proof = Some
+    expected_framed.push(7u8); // size_proof.size varint
     expected_framed.push(1u8); // size_proof length prefix
     expected_framed.push(0x33); // size_proof bytes
     assert_eq!(framed, expected_framed);
@@ -447,15 +442,14 @@ fn probe_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::er
         slash_sig: vec![0x03; SLASH_SIG_LEN],
     };
     let ext = ProbeResponseExt {
-        total_bytes: Some(u64::MAX),
         coverage: crate::Coverage::full(u32::try_from(crate::coverage::MAX_COVERAGE_BYTES * 8)?),
-        size_proof: Some(crate::SizeProof::new(vec![
-            0x04;
-            crate::MAX_SIZE_PROOF_BYTES
-        ])?),
+        size_proof: Some(crate::SizeProof::new(
+            u64::MAX,
+            vec![0x04; crate::MAX_SIZE_PROOF_BYTES],
+        )?),
     };
     let response = encode_probe_response(&response, Some(&ext))?;
-    assert_eq!(response.len(), 4808, "ProbeResponse + ext at full width");
+    assert_eq!(response.len(), 4807, "ProbeResponse + ext at full width");
 
     assert!(request.len() <= MAX_PROBE_REQUEST_FRAME as usize);
     assert!(response.len() <= MAX_PROBE_FRAME as usize);

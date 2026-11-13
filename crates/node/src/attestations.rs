@@ -156,7 +156,7 @@ impl Attestations {
     /// node's operator holds a seat. `None` means the node publishes no
     /// record for `hash`.
     #[must_use]
-    pub fn for_publish(&self, hash: [u8; 32], total_bytes: u64) -> Option<OriginAttestation> {
+    pub fn for_publish(&self, hash: [u8; 32]) -> Option<OriginAttestation> {
         if let Some(held) = self
             .held
             .read()
@@ -175,7 +175,6 @@ impl Attestations {
             self.verifier.domain(),
             hash,
             origin.rate_per_mb,
-            total_bytes,
             crate::handlers::timestamp_skew::now_us(),
         );
         match signed {

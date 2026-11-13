@@ -4330,10 +4330,14 @@ impl CacheEngine {
         let mut answered = true;
         for origin in &*self.inner.origins {
             match origin.fetch_size_proof(hash).await {
-                Ok(Some(proof)) if decdn_bao_range::verify_size_proof(root, size, &proof) => {
-                    return Ok(Some(proof));
-                }
-                Ok(Some(_)) => {
+                Ok(Some(object)) => {
+                    // The object states its own size beside the proof.
+                    if let Some((stated, proof)) = decdn_bao_range::parse_size_proof_object(&object)
+                        && stated == size
+                        && decdn_bao_range::verify_size_proof(root, size, proof)
+                    {
+                        return Ok(Some(object.slice(8..)));
+                    }
                     tracing::warn!(
                         %hash,
                         size,

@@ -12,7 +12,7 @@ use crate::node_origin::{PrimeLeg, PullLegTarget};
 use super::{
     Arc, B256, CHUNK_BYTES, ClientHandler, Connection, CoverageShortfall, FloorReservation, Hash,
     LaneDeliveryState, LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream, SendStream,
-    ServeRejectReason, StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    ServeRejectReason, StreamRequest, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 /// Release a miss leg's floor reservation on a refusal taken BEFORE the serve
@@ -516,15 +516,9 @@ impl ClientHandler {
 
         // (7) Sign + send the response now that the fill mechanism is secured for every
         // branch (attach: the owner fills; own/mixed: `target` is set by step 3 or 6b).
-        // It commits to `total_bytes`, known from the peek or the header handshake.
-        let body = StreamResponseBody {
-            hash: req.hash,
-            ok: true,
-            rate_per_mb,
-            total_bytes,
-            timestamp_us: req.timestamp_us,
-        };
-        let (resp, resp_ext) = self.sign_response(body, None).await?;
+        // It states `total_bytes` by its proof, known from the peek or the
+        // header handshake.
+        let (resp, resp_ext) = self.sign_served(req, rate_per_mb, total_bytes).await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         first_byte.mark_responded();
@@ -831,17 +825,9 @@ impl ClientHandler {
         // blob fails the fill there rather than being refused up front on the probe
         // size.
 
-        // (4) Sign + send the response up front — it commits to `total_bytes`,
-        // which the caller already read from the origin size probe, and to the
-        // interval negotiated above.
-        let body = StreamResponseBody {
-            hash: req.hash,
-            ok: true,
-            rate_per_mb,
-            total_bytes,
-            timestamp_us: req.timestamp_us,
-        };
-        let (resp, resp_ext) = self.sign_response(body, None).await?;
+        // (4) Sign + send the response up front: it states `total_bytes` by
+        // its proof, a size the caller already proved for the origin object.
+        let (resp, resp_ext) = self.sign_served(req, rate_per_mb, total_bytes).await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         first_byte.mark_responded();

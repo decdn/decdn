@@ -52,6 +52,7 @@ fn obao4_name_appends_suffix() {
     let ob = EncodedOutboard {
         hash_hex: "ab".repeat(32),
         outboard: Vec::new(),
+        size: 0,
         size_proof: Bytes::new(),
     };
     assert_eq!(ob.shard(), "ab");
@@ -87,7 +88,24 @@ fn encode_outboard_proves_the_size() {
             !crate::verify_size_proof(root, size + 1, &got.size_proof),
             "size {size} + 1"
         );
+        // The `{H}.sizeproof` object carries the size beside the proof.
+        let object = got.size_proof_object();
+        assert_eq!(
+            crate::parse_size_proof_object(&object),
+            Some((size, got.size_proof.as_ref())),
+            "size {size}"
+        );
     }
+}
+
+/// An object shorter than its size field is no size proof object.
+#[test]
+fn a_short_size_proof_object_parses_to_nothing() {
+    assert_eq!(crate::parse_size_proof_object(&[1, 2, 3]), None);
+    assert_eq!(
+        crate::parse_size_proof_object(&7u64.to_le_bytes()),
+        Some((7, &[][..]))
+    );
 }
 
 /// A reader shorter than the stated size fails rather than proving a size.

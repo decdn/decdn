@@ -30,7 +30,7 @@ use crate::error::OriginPullError;
 /// the sibling key from, so an operator `aws s3 sync`-ing between backends keeps
 /// the same object names.
 pub(super) use decdn_bao_range::OBAO4_SUFFIX;
-use decdn_bao_range::{MAX_SIZE_PROOF_BYTES, SIZE_PROOF_SUFFIX};
+use decdn_bao_range::{MAX_SIZE_PROOF_OBJECT_BYTES, SIZE_PROOF_SUFFIX};
 
 /// Origin backed by a local filesystem directory. Blobs live at
 /// `{base}/{hex[0..2]}/{hex}`; the engine is responsible for BLAKE3
@@ -531,7 +531,7 @@ impl Origin for FilesystemOrigin {
             else {
                 return Ok(None);
             };
-            let max = MAX_SIZE_PROOF_BYTES as u64;
+            let max = MAX_SIZE_PROOF_OBJECT_BYTES as u64;
             if meta.len() > max {
                 return Ok(None);
             }

@@ -1137,40 +1137,41 @@ fn trail_counts_saturate() {
     assert_eq!(tally.dropped, u16::MAX);
 }
 
-/// The node takes an upstream's probe size only with its proof: a wrong size
-/// under a real proof of another size, a size with no proof, and a 2^60 size
-/// with garbage proof bytes are all refused before the size sizes a coverage
-/// union or a pull leg. An answer with no size passes.
+/// The node takes an upstream's probe size only from a proof that verifies:
+/// a wrong size with real proof bytes of another size, a size with no proof
+/// bytes, and a 2^60 size with garbage proof bytes are all refused before the
+/// size sizes a coverage union or a pull leg. An answer with no size passes.
 #[test]
 fn an_upstream_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
     use decdn_protocol::{ProbeResponseExt, SizeProof};
     let blob: Vec<u8> = (0..90_000u32).map(|i| (i % 251) as u8).collect();
     let size = u64::try_from(blob.len())?;
     let hash = *Hash::new(&blob).as_bytes();
-    let proof = SizeProof::new(
-        decdn_bao_range::encode_outboard(blob.as_slice(), size)?
-            .size_proof
-            .to_vec(),
-    )?;
-    let ext = |total_bytes, size_proof| ProbeResponseExt {
-        total_bytes,
+    let proof_bytes = decdn_bao_range::encode_outboard(blob.as_slice(), size)?
+        .size_proof
+        .to_vec();
+    let ext = |size_proof| ProbeResponseExt {
         coverage: Coverage::full(1),
         size_proof,
     };
-    assert!(probe_size_proven(hash, &ext(Some(size), Some(proof.clone()))).is_ok());
-    assert!(probe_size_proven(hash, &ext(None, None)).is_ok());
-    for (what, total_bytes, size_proof) in [
-        ("a wrong size", Some(size + 1), Some(proof.clone())),
-        ("no proof", Some(size), None),
+    assert!(
+        probe_size_proven(hash, &ext(Some(SizeProof::new(size, proof_bytes.clone())?))).is_ok()
+    );
+    assert!(probe_size_proven(hash, &ext(None)).is_ok());
+    for (what, size_proof) in [
         (
-            "a huge size",
-            Some(1u64 << 60),
-            Some(SizeProof::new(vec![0xEE; 4000])?),
+            "a wrong size",
+            SizeProof::new(size + 1, proof_bytes.clone())?,
         ),
-        ("a huge size with no proof", Some(1u64 << 60), None),
+        ("no proof bytes", SizeProof::new(size, Vec::new())?),
+        ("a huge size", SizeProof::new(1u64 << 60, vec![0xEE; 4000])?),
+        (
+            "a huge size with no proof bytes",
+            SizeProof::new(1u64 << 60, Vec::new())?,
+        ),
     ] {
         assert!(
-            probe_size_proven(hash, &ext(total_bytes, size_proof)).is_err(),
+            probe_size_proven(hash, &ext(Some(size_proof))).is_err(),
             "{what} is refused"
         );
     }

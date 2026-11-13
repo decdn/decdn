@@ -205,13 +205,11 @@ impl Buyer {
                 continue;
             }
             // A stated size counts only once its proof verifies.
-            let proven = match ext.total_bytes {
-                Some(size) => {
-                    match decdn_client::check_size_proof(hash, size, ext.size_proof.as_ref()) {
-                        Ok(proven) => Some(proven),
-                        Err(_) => continue,
-                    }
-                }
+            let proven = match &ext.size_proof {
+                Some(proof) => match decdn_client::check_size_proof(hash, proof) {
+                    Ok(proven) => Some(proven),
+                    Err(_) => continue,
+                },
                 None => None,
             };
             total_bytes = total_bytes.or(proven);

@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use anyhow::Context as _;
 use bytes::Bytes;
 
+use decdn_protocol::client::StreamOutcome;
 use iroh::endpoint::WriteError;
 
 use super::{
@@ -50,35 +51,63 @@ impl ClientHandler {
         self.receipt_sink.record(receipt);
     }
 
+    /// Sign an `ok: true` response for `req` at `rate_per_mb`, whose outcome is
+    /// the size proof of the `total_bytes`-byte blob (ADR 005 § Bounded byte
+    /// ranges), which the cache engine keeps or builds. Every success path
+    /// checks the proof before it reaches here, so a missing proof is this
+    /// node's fault and fails the signing: the node states no size it cannot
+    /// prove, and a served response always carries one.
+    pub(super) async fn sign_served(
+        &self,
+        req: &StreamRequest,
+        rate_per_mb: u64,
+        total_bytes: u64,
+    ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
+        let proof = self
+            .cache
+            .size_proof(Hash::from_bytes(req.hash), total_bytes)
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no size proof for a {total_bytes}-byte blob; the node states no size it \
+                     cannot prove"
+                )
+            })?;
+        let size_proof = decdn_protocol::SizeProof::new(total_bytes, proof.to_vec())?;
+        let body = StreamResponseBody {
+            hash: req.hash,
+            ok: true,
+            rate_per_mb,
+            timestamp_us: req.timestamp_us,
+        };
+        self.sign_response(body, StreamOutcome::Served(size_proof))
+    }
+
+    /// Sign an `ok: false` refusal of `req` with `error` at `rate_per_mb`.
+    pub(super) fn sign_refusal(
+        &self,
+        req: &StreamRequest,
+        rate_per_mb: u64,
+        error: StreamError,
+    ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
+        let body = StreamResponseBody {
+            hash: req.hash,
+            ok: false,
+            rate_per_mb,
+            timestamp_us: req.timestamp_us,
+        };
+        self.sign_response(body, StreamOutcome::Refused(error))
+    }
+
     /// Sign a `StreamResponse` body and assemble the frozen base plus its
-    /// unsigned extension (ADR 013 §Tier 1). `error` rides in the extension, so
-    /// the pair must be written together — see [`Self::write_stream_response`].
-    ///
-    /// An `ok: true` response carries the size proof of `body.total_bytes`
-    /// (ADR 005 § Bounded byte ranges), which the cache engine keeps
-    /// or builds. Every success path checks the proof before it reaches here,
-    /// so a missing proof is this node's fault and fails the signing: the node
-    /// states no size it cannot prove.
-    pub(super) async fn sign_response(
+    /// unsigned extension (ADR 013 §Tier 1). The outcome rides in the
+    /// extension, so the pair must be written together — see
+    /// [`Self::write_stream_response`].
+    fn sign_response(
         &self,
         body: StreamResponseBody,
-        error: Option<StreamError>,
+        outcome: StreamOutcome,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
-        let size_proof = if body.ok {
-            let proof = self
-                .cache
-                .size_proof(Hash::from_bytes(body.hash), body.total_bytes)
-                .await
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no size proof for a {}-byte blob; the node states no size it cannot prove",
-                        body.total_bytes
-                    )
-                })?;
-            Some(decdn_protocol::SizeProof::new(proof.to_vec())?)
-        } else {
-            None
-        };
         // Every stream signature passes through here, and every caller echoes
         // the dispatch-gated first request's `timestamp_us`
         // (`crate::handlers::timestamp_skew`). This check catches only a
@@ -108,9 +137,8 @@ impl ClientHandler {
         Ok((
             StreamResponse { body, slash_sig },
             StreamResponseExt {
-                error,
+                outcome,
                 origin_attestation,
-                size_proof,
             },
         ))
     }
@@ -155,17 +183,8 @@ impl ClientHandler {
         reason: ServeRejectReason,
         rate_per_mb: u64,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
-        let error = reason.wire_error();
-        let body = StreamResponseBody {
-            hash: req.hash,
-            ok: false,
-            rate_per_mb,
-            total_bytes: 0,
-            timestamp_us: req.timestamp_us,
-        };
         let (resp, resp_ext) = self
-            .sign_response(body, Some(error))
-            .await
+            .sign_refusal(req, rate_per_mb, reason.wire_error())
             .with_context(|| format!("sign the {reason:?} refusal"))?;
         tolerate_departed_peer(
             self.write_stream_response(send, &resp, &resp_ext).await,

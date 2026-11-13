@@ -62,10 +62,10 @@ pub const MAX_RATE_PER_MB: u64 = 1000;
 ///
 /// The largest legitimate
 /// message is a [`ProbeResponse`] with its [`ProbeResponseExt`] at full width:
-/// 4,808 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap
-/// and its 2-byte length) and the size proof up to 4,483 (a
-/// [`crate::MAX_SIZE_PROOF_BYTES`] proof, its 2-byte length and its `Some`
-/// tag). A [`ProbeRequest`] is at most 43 bytes. The ceiling leaves headroom
+/// 4,807 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap
+/// and its 2-byte length) and the size proof up to 4,493 (its `Some` tag, a
+/// 10-byte varint size, and a [`crate::MAX_SIZE_PROOF_BYTES`] proof with its
+/// 2-byte length). A [`ProbeRequest`] is at most 43 bytes. The ceiling leaves headroom
 /// for Tier-1 extension fields and refuses a larger frame before the reader
 /// buffers it. The `probe_frame_ceiling_holds_the_largest_message` test pins
 /// the margin.
@@ -152,14 +152,14 @@ pub enum MessageValidationError {
         /// The signature length that was offered.
         len: usize,
     },
-    /// A [`crate::client::StreamResponse`] carries `body.ok == true` yet also an
-    /// `error`. A node MUST NOT both promise to serve and report a failure
-    /// (ADR 005 §`cdn/client/v1`). Enforced via
-    /// [`crate::client::StreamResponseExt::validate`].
-    #[error("StreamResponse has ok=true but also carries an error")]
+    /// A [`crate::client::StreamResponse`] carries `body.ok == true` but a
+    /// refused outcome, so it states no size proof. A node MUST NOT promise to
+    /// serve without the size it serves under (ADR 005 §`cdn/client/v1`).
+    /// Enforced via [`crate::client::StreamResponseExt::validate`].
+    #[error("StreamResponse has ok=true but a refused outcome with no size proof")]
     StreamErrorWithOk,
-    /// A [`crate::client::StreamResponse`] carries `body.ok == false` but no
-    /// `error` code. A refusal MUST name its reason (ADR 005
+    /// A [`crate::client::StreamResponse`] carries `body.ok == false` but a
+    /// served outcome. A refusal MUST name its reason (ADR 005
     /// §`cdn/client/v1`). Enforced via [`crate::client::StreamResponseExt::validate`].
     #[error("StreamResponse has ok=false but no error code")]
     MissingStreamError,
@@ -292,19 +292,17 @@ pub struct ProbeResponse {
 /// have a meaningful `Default`. Insertions and reordering are Tier-3.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProbeResponseExt {
-    /// Blob size in bytes. A node states it only together with a
-    /// [`Self::size_proof`] for it, so a requester can price the blob before it
-    /// opens a payment pool. A requester verifies the proof before it uses the
-    /// size, and drops a response that states a size with no valid proof.
-    pub total_bytes: Option<u64>,
     /// Which discovery blocks (`decdn_protocol::coverage`) this node will
     /// serve. Unsigned: treat it as a hint, never as a commitment. A
     /// requester MUST check it against the signed body (`hash` and
     /// `has_blob`) with [`ProbeResponseExt::consistent_with`] and drop a
     /// response where they disagree rather than trust either field alone.
     pub coverage: crate::Coverage,
-    /// The proof of [`Self::total_bytes`] under the signed `hash` (ADR 005 §
-    /// Bounded byte ranges). Present exactly when `total_bytes` is.
+    /// The blob's size and its proof under the signed `hash` (ADR 005 §
+    /// Bounded byte ranges): the only way a probe answer states a size, so a
+    /// requester can price the blob before it opens a payment pool. A
+    /// requester verifies the proof before it uses the size, and drops a
+    /// response whose proof does not verify.
     pub size_proof: Option<crate::SizeProof>,
 }
 

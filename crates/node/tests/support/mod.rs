@@ -91,7 +91,7 @@ pub(crate) fn register_payload(payload: impl AsRef<[u8]>) -> Hash {
     let hash = Hash::new(payload);
     let size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     if let Ok(eo) = decdn_bao_range::encode_outboard(payload, size)
-        && let Ok(proof) = decdn_protocol::SizeProof::new(eo.size_proof.to_vec())
+        && let Ok(proof) = decdn_protocol::SizeProof::new(size, eo.size_proof.to_vec())
         && let Ok(mut proofs) = SIZE_PROOFS.lock()
     {
         proofs.insert(*hash.as_bytes(), (size, proof));
@@ -99,30 +99,35 @@ pub(crate) fn register_payload(payload: impl AsRef<[u8]>) -> Hash {
     hash
 }
 
-/// The size proof a scripted upstream sends when it signs `total_bytes` for
-/// `hash`: the registered payload's proof when that is its size, else `None`,
-/// as a node that cannot prove the size it states.
-pub(crate) fn size_proof_for(
-    hash: [u8; 32],
-    total_bytes: u64,
-) -> Option<decdn_protocol::SizeProof> {
+/// The size proof a scripted upstream sends when it states `total_bytes` for
+/// `hash`: the registered payload's proof when that is its size, else a proof
+/// with no bytes, as a node that cannot prove the size it states.
+pub(crate) fn size_proof_for(hash: [u8; 32], total_bytes: u64) -> decdn_protocol::SizeProof {
     SIZE_PROOFS
         .lock()
-        .ok()?
-        .get(&hash)
-        .filter(|(size, _)| *size == total_bytes)
-        .map(|(_, proof)| proof.clone())
+        .ok()
+        .and_then(|proofs| {
+            proofs
+                .get(&hash)
+                .filter(|(size, _)| *size == total_bytes)
+                .map(|(_, proof)| proof.clone())
+        })
+        .unwrap_or_else(|| {
+            decdn_protocol::SizeProof::new(total_bytes, Vec::new()).unwrap_or_default()
+        })
 }
 
-/// The extension a scripted upstream sends on its `ok: true` response: the
-/// size proof of `resp`'s signed size, when a registered payload proves it.
+/// The extension a scripted upstream sends on its `ok: true` response for
+/// `resp`'s hash at `total_bytes`: a served outcome with
+/// [`size_proof_for`]'s proof.
 pub(crate) fn proven_ext(
     resp: &decdn_protocol::client::StreamResponse,
+    total_bytes: u64,
 ) -> decdn_protocol::client::StreamResponseExt {
-    decdn_protocol::client::StreamResponseExt {
-        size_proof: size_proof_for(resp.body.hash, resp.body.total_bytes),
-        ..Default::default()
-    }
+    decdn_protocol::client::StreamResponseExt::served(
+        size_proof_for(resp.body.hash, total_bytes),
+        None,
+    )
 }
 
 pub(crate) fn honest_bao_wire_range(
@@ -164,7 +169,10 @@ pub(crate) fn seed_origin_object(root: &std::path::Path, payload: &[u8]) -> anyh
     let shard = root.join(encoded.shard());
     std::fs::create_dir_all(&shard)?;
     std::fs::write(shard.join(&encoded.hash_hex), payload)?;
-    std::fs::write(shard.join(encoded.size_proof_name()), &encoded.size_proof)?;
+    std::fs::write(
+        shard.join(encoded.size_proof_name()),
+        encoded.size_proof_object(),
+    )?;
     Ok(hash)
 }
 

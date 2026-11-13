@@ -13,10 +13,10 @@
 //! The two signed artifacts on this protocol are produced/verified by
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
-//!     signed body fields `{hash, ok, rate_per_mb, total_bytes, pool_id,
-//!     timestamp_us}` (ADR 014 §1), produced by the stream-response slash
-//!     signer in `decdn_incentive` (analogous to its `ProbeSlashData`).
-//!     `error` is unsigned.
+//!     signed body fields `{hash, ok, rate_per_mb, timestamp_us}` (ADR 014
+//!     §1), produced by the stream-response slash signer in `decdn_incentive`
+//!     (analogous to its `ProbeSlashData`). The outcome (the size proof or
+//!     the refusal class) is unsigned.
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
 //!     carries `{signature, amount}` and the receiver reconstructs the full typed
 //!     data `{poolId, signer, provider, amount, bytesDelivered}` from stream
@@ -26,8 +26,7 @@
 //!
 //! The signed set on [`StreamResponseBody`] is the `cdn/client/v1` v1 baseline.
 //! Any change to it is a Tier-3 ALPN bump. New unsigned fields go on
-//! [`StreamResponse`] as optional fields, following the `total_bytes` exemplar
-//! on [`crate::message::ProbeResponse`].
+//! [`StreamResponseExt`].
 //!
 //! # Variant order
 //!
@@ -465,34 +464,86 @@ pub struct StreamResponse {
 /// reordering are Tier-3.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StreamResponseExt {
-    /// Open-time refusal class when `body.ok == false` (`NotFound`,
-    /// `Declined`, `Unfunded`).
-    /// Unsigned and informational. `VoucherRejected` never rides here — it is
-    /// delivered mid-stream via [`ClientMessage::StreamError`].
-    ///
-    /// Its agreement with the signed `body.ok` is a cross-half invariant, so it
-    /// is checked by [`StreamResponseExt::validate`], which takes `ok` — the
-    /// base-only [`StreamResponse::validate`] cannot see this field.
-    pub error: Option<StreamError>,
+    /// What the node answered: the blob's size with its proof, or a refusal.
+    /// It agrees with the signed `body.ok`, a cross-half invariant checked by
+    /// [`StreamResponseExt::validate`].
+    pub outcome: StreamOutcome,
     /// The origin attestation the serving node holds for the hash (ADR 022
     /// § Origin Attestation), forwarded so a pulling relay can publish its own
     /// DHT records. A seated origin serving from its backend leaves it empty,
     /// because its own `StreamResponse` is the attestation. A client ignores
     /// it; a relay verifies it before keeping it.
     pub origin_attestation: Option<crate::dht::OriginAttestation>,
-    /// The proof of the signed `total_bytes` under the signed `hash` (ADR 005
-    /// § Bounded byte ranges). A node sends it on every response with
-    /// `ok = true`. The receiver verifies it before it uses the size, and
-    /// treats a response with `ok = true` and no valid proof as a fault of the
-    /// node.
-    pub size_proof: Option<crate::SizeProof>,
+}
+
+/// The unsigned answer of a [`StreamResponse`]: a served blob's size, or the
+/// open-time refusal class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamOutcome {
+    /// The node serves the blob (`body.ok == true`). The proof states the
+    /// blob's size, and is the only place the response states one (ADR 005 §
+    /// Bounded byte ranges). The receiver verifies it against the signed
+    /// `hash` before it uses the size, and treats a proof that does not
+    /// verify as a fault of the node.
+    Served(crate::SizeProof),
+    /// The node refuses (`body.ok == false`): `NotFound`, `Declined` or
+    /// `Unfunded`. `VoucherRejected` never rides here; it is delivered
+    /// mid-stream via [`ClientMessage::StreamError`].
+    Refused(StreamError),
+}
+
+/// An empty extension is a `NotFound` refusal, which no `ok == true`
+/// response passes [`StreamResponseExt::validate`] with.
+impl Default for StreamOutcome {
+    fn default() -> Self {
+        Self::Refused(StreamError::NotFound)
+    }
 }
 
 impl StreamResponseExt {
+    /// A served answer: the blob's size and its proof.
+    #[must_use]
+    pub const fn served(
+        size_proof: crate::SizeProof,
+        origin_attestation: Option<crate::dht::OriginAttestation>,
+    ) -> Self {
+        Self {
+            outcome: StreamOutcome::Served(size_proof),
+            origin_attestation,
+        }
+    }
+
+    /// A refusal with `error`.
+    #[must_use]
+    pub const fn refused(error: StreamError) -> Self {
+        Self {
+            outcome: StreamOutcome::Refused(error),
+            origin_attestation: None,
+        }
+    }
+
+    /// The refusal class, when the node refused.
+    #[must_use]
+    pub const fn error(&self) -> Option<&StreamError> {
+        match &self.outcome {
+            StreamOutcome::Refused(error) => Some(error),
+            StreamOutcome::Served(_) => None,
+        }
+    }
+
+    /// The size proof, when the node serves.
+    #[must_use]
+    pub const fn size_proof(&self) -> Option<&crate::SizeProof> {
+        match &self.outcome {
+            StreamOutcome::Served(proof) => Some(proof),
+            StreamOutcome::Refused(_) => None,
+        }
+    }
+
     /// Check the unsigned half against the signed `ok` flag (ADR 005
-    /// §`cdn/client/v1`): `ok == true` ⇒ no `error`; `ok == false` ⇒ exactly one
-    /// delivery-side `error`, never the mid-stream-only
-    /// [`StreamError::VoucherRejected`].
+    /// §`cdn/client/v1`): `ok == true` ⇒ a served outcome with its size
+    /// proof; `ok == false` ⇒ a delivery-side refusal, never the
+    /// mid-stream-only [`StreamError::VoucherRejected`].
     ///
     /// Separate from parsing so forward-compatible trailing bytes do not couple
     /// to value checks, and separate from [`StreamResponse::validate`] because
@@ -505,10 +556,10 @@ impl StreamResponseExt {
     /// [`MessageValidationError::MissingStreamError`], or
     /// [`MessageValidationError::VoucherRejectedInResponse`].
     pub const fn validate(&self, ok: bool) -> Result<(), MessageValidationError> {
-        match (ok, &self.error) {
-            (true, Some(_)) => Err(MessageValidationError::StreamErrorWithOk),
-            (false, None) => Err(MessageValidationError::MissingStreamError),
-            (false, Some(code)) if !code.is_delivery_side() => {
+        match (ok, &self.outcome) {
+            (true, StreamOutcome::Refused(_)) => Err(MessageValidationError::StreamErrorWithOk),
+            (false, StreamOutcome::Served(_)) => Err(MessageValidationError::MissingStreamError),
+            (false, StreamOutcome::Refused(code)) if !code.is_delivery_side() => {
                 Err(MessageValidationError::VoucherRejectedInResponse)
             }
             _ => Ok(()),
@@ -570,10 +621,6 @@ pub struct StreamResponseBody {
     /// Quoted rate in token base units per MB. Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "crate::message::deserialize_rate_per_mb")]
     pub rate_per_mb: u64,
-    /// Total blob size in bytes. On a response with `ok = true` the
-    /// [`StreamResponseExt::size_proof`] proves it, and a receiver uses it only
-    /// after that proof verifies.
-    pub total_bytes: u64,
     /// Requester-generated microsecond timestamp from the [`StreamRequest`],
     /// echoed back unchanged.
     pub timestamp_us: u64,

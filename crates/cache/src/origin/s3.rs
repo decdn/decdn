@@ -946,7 +946,7 @@ impl Origin for S3Origin {
                     }
                 },
             };
-            collect_bounded(resp.body, decdn_bao_range::MAX_SIZE_PROOF_BYTES).await
+            collect_bounded(resp.body, decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES).await
         })
     }
 

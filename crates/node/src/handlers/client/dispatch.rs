@@ -6,8 +6,8 @@ use super::{
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
     FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, MissPath,
     MissRefusal, OwnedSemaphorePermit, PublicKey, REJECTION_CLOSE_TIMEOUT, RecvStream,
-    RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest,
-    StreamResponseBody, U256, VarInt, read_first_message, reset_stream, verify_binding,
+    RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest, U256,
+    VarInt, read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
@@ -1159,16 +1159,15 @@ impl ClientHandler {
                 // The node serves an origin blob only under a size its origin's
                 // `{H}.sizeproof` proves (ADR 005 § Bounded byte ranges).
                 // The proof comes first; only a proven size sizes the outboard
-                // read of the range probe. An origin blob with no proof is not
-                // served from the origin, by the range encoder or by the
-                // buffered populate below.
-                let mut origin_unprovable = false;
+                // read of the range probe. An origin blob with no size, or with
+                // no proof of it, is not served from the origin, by the range
+                // encoder or by the buffered populate below.
+                let mut origin_proven = false;
                 if let Some((lk, ln)) = authority {
                     match self.cache.origin_size(hash).await {
-                        Ok(Some(total)) if self.cache.size_proof(hash, total).await.is_none() => {
-                            origin_unprovable = true;
-                        }
+                        Ok(Some(total)) if self.cache.size_proof(hash, total).await.is_none() => {}
                         Ok(Some(total)) => {
+                            origin_proven = true;
                             match self.cache.origin_range_serviceable(hash, total).await {
                                 // Serviceable: the size is proven and an origin
                                 // publishes the outboard and serves ranges. Enter the
@@ -1215,8 +1214,8 @@ impl ClientHandler {
                                 }
                             }
                         }
-                        // No origin knows the size, or no origin is configured at
-                        // all — both a clean fall-through (degrade). `origin_size`
+                        // No origin states a size, or no origin is configured at
+                        // all: nothing is served from the origin. `origin_size`
                         // returns Ok(None) only for clean declines; a probe that
                         // ends on a transport fault reaches the Err arm below.
                         Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
@@ -1255,7 +1254,7 @@ impl ClientHandler {
                 // client-attributable and would refuse regardless of origin
                 // health.)
                 if !locally_filled
-                    && !origin_unprovable
+                    && origin_proven
                     && let Some(timeout) = self.local_populate
                     && authority.is_some()
                 {
@@ -1547,14 +1546,7 @@ impl ClientHandler {
         }
 
         // Build and sign the success response.
-        let body = StreamResponseBody {
-            hash: req.hash,
-            ok: true,
-            rate_per_mb,
-            total_bytes,
-            timestamp_us: req.timestamp_us,
-        };
-        let (resp, resp_ext) = self.sign_response(body, None).await?;
+        let (resp, resp_ext) = self.sign_served(&req, rate_per_mb, total_bytes).await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);
