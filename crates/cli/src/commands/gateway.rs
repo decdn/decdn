@@ -258,7 +258,9 @@ const MAX_NOT_MANIFESTS: usize = 1024;
 /// holder, or one whose bytes trickle in, holds only what it has buffered. A
 /// fill that would pass the budget fails at once instead of waiting: a fill
 /// that waited would keep its pull's worker slot idle, and two fills that
-/// each hold part of the budget would wait on each other.
+/// each hold part of the budget would wait on each other. The budget counts
+/// manifest buffers only: a fill's worker slot and its first-chunk read
+/// buffer fall outside it.
 const MANIFEST_BUFFER_BYTES: usize = 4 * MAX_MANIFEST_BYTES;
 
 /// The size at which the manifest fill map first prunes the locks of
