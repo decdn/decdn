@@ -51,10 +51,10 @@ use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
 use decdn_client::{
-    BlobTooLarge, Cumulative, HashMismatch, PoolContext, PoolLedger, PullDeadlines,
-    RateAboveCeiling, UpstreamVoucherRejected, VoucherProgress, WarmConnection,
-    sign_client_binding, stream_fetch, stream_fetch_on, stream_fetch_shared, stream_fetch_tracked,
-    stream_fetch_tracked_with_progress,
+    BlobTooLarge, Cumulative, HashMismatch, PoolContext, PoolLedger, PullDeadlines, PullStalled,
+    PullTimeout, RateAboveCeiling, UpstreamVoucherRejected, VoucherProgress, WarmConnection,
+    open_progressive_pull, sign_client_binding, stream_fetch, stream_fetch_on, stream_fetch_shared,
+    stream_fetch_tracked, stream_fetch_tracked_with_progress,
 };
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
@@ -1690,6 +1690,78 @@ async fn a_below_frontier_reveal_adds_no_credit() -> anyhow::Result<()> {
         lane.owed() == U256::from(5 * RATE_PER_MB),
         "the below-frontier reveals must take no new money: {}",
         lane.owed()
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Proofs delivered on a funded stream are committed near arrival, so they do
+/// not sit buffered until a shortfall reads them against the per-chunk proof
+/// budget (#2877). The payer funds ten intervals, then — while the stream is
+/// funded and frames are still flowing — re-sends sixteen reveals the frontier
+/// already folded. Each folds nothing, so before the fix they buffered unread
+/// and the shortfall after the funded span read eight zero-credit proofs and
+/// ended the stream `ProofBudgetExhausted`. With the pre-frame drain the stale
+/// reveals are consumed as delivery runs, the park after the funded span is
+/// clean, and one more reveal resumes delivery with the budget untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn buffered_stale_reveals_do_not_spend_a_later_frames_proof_budget() -> anyhow::Result<()> {
+    const FUNDED_INTERVALS: u8 = 10;
+    let payload = vec![0x5Au8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_pipelined_server_with_metrics(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+
+    // Anchor the chain and fund ten intervals with one deep reveal.
+    open_chain(&mut send, &signer, chain_root(), RATE_PER_MB, U256::ZERO, 0).await?;
+    release(&mut send, FUNDED_INTERVALS).await?;
+
+    // While the stream is funded and the node still owes frames, re-send
+    // reveals the frontier already folded — the shape of a sibling's late
+    // reveal, sixteen times over. Interleave the batches with reads, so the
+    // flow-control window keeps the node mid-delivery (draining before each
+    // frame) rather than parked with the whole backlog unread.
+    for _batch in 0..4u8 {
+        read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+        for index in 1..=4u8 {
+            release(&mut send, index).await?;
+        }
+    }
+
+    // The rest of the funded span still arrives, and the node then parks for
+    // the next proof instead of ending the stream on the stale backlog.
+    read_exact_chunks(
+        &mut recv,
+        u64::from(FUNDED_INTERVALS - 4) * HARNESS_INTERVAL_BYTES,
+    )
+    .await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    // One fresh reveal resumes delivery: the stale reveals were committed near
+    // arrival, not read here against this frame's proof budget.
+    release(&mut send, FUNDED_INTERVALS + 1).await?;
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_proof_budget_exhausted_total")? == 0,
+        "stale reveals on a funded stream must not spend a later frame's proof budget"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == 0,
+        "a stale reveal on a funded stream is benign, never a rejection"
     );
 
     conn.close(0u32.into(), b"done");
@@ -6801,6 +6873,223 @@ async fn a_pool_exhausted_between_root_voucher_and_reveal_resumes_without_heal()
     anyhow::ensure!(
         counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == rejected_before,
         "the resumed fetch draws no voucher rejection, so no reseed either"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// ADR 003's first write-off case, observed end to end (#2877). An unclean end
+/// loses frames the node already debited, so the payer's books count credit the
+/// node no longer holds. A resumed pull on that lane then reads nothing for a
+/// full floor window while its books say the credit covers the next bytes — the
+/// node is parked for a proof the payer, trusting its books, never sends. The
+/// payer writes the counted credit off (the operator's lost count grows and the
+/// books drop to zero) instead of wedging the lane, and the next fetch pays
+/// afresh and completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_stall_against_counted_credit_writes_the_lane_credit_off() -> anyhow::Result<()> {
+    let payload = vec![0x6Du8; 4 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_pipelined_server_with_metrics(cache, store).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let sd = slash_domain();
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+
+    // Leg 1: pay one window ahead, read ONE frame, and let the node debit the
+    // rest of the window into the transport. Dropping the pull then loses the
+    // debited frames in flight, so the books keep counting credit the node has
+    // already spent.
+    let generous = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)
+        .map_err(|e| anyhow::anyhow!("deadlines: {e}"))?;
+    let (_header, mut pull) = open_progressive_pull(
+        &client_ep,
+        target.clone(),
+        &ctx,
+        Arc::clone(&ledger),
+        &sd,
+        operator_addr(),
+        *hash.as_bytes(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        now_us(),
+        0,
+        0,
+        generous,
+        0,
+    )
+    .await?;
+    let first = pull
+        .next_chunk()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("stream ended before its first frame"))?;
+    // Wait until the node has debited well past the one frame read, so the
+    // drop below loses paid-for frames rather than ending books-balanced.
+    let read = first.len() as u64;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while counter(&metrics, "decdn_bytes_served_total")? < read + 256 * 1024 {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the node never debited ahead of the one frame read"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::ensure!(
+        ledger.prepaid() > 0,
+        "leg 1 must leave counted credit on the books"
+    );
+    drop(pull); // the unclean end: the debited, unread frames are lost
+
+    // Leg 2: resume on the same lane with a short floor window. The books say
+    // the node holds more credit than it does, so once the real credit runs out
+    // the node parks for a proof the payer never sends. The floor trips on the
+    // silent window and the payer writes the counted credit off.
+    let short = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(1), 0)
+        .map_err(|e| anyhow::anyhow!("deadlines: {e}"))?;
+    let err = stream_fetch_shared(
+        &client_ep,
+        target.clone(),
+        &ctx,
+        &ledger,
+        &sd,
+        operator_addr(),
+        *hash.as_bytes(),
+        0,
+        now_us(),
+        short,
+        0,
+        0,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("the resumed pull must stall on the phantom credit"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<PullStalled>().is_some() || err.downcast_ref::<PullTimeout>().is_some(),
+        "the silent stall surfaces as the floor verdict, got: {err:?}"
+    );
+    anyhow::ensure!(
+        ledger.trust().lost() > 0,
+        "a silent stall against counted credit must book the credit as lost"
+    );
+    anyhow::ensure!(
+        ledger.prepaid() == 0,
+        "the write-off must drop the books to zero, got {}",
+        ledger.prepaid()
+    );
+
+    // The write-off unsticks the lane: with the books at or below the node's
+    // count, the next fetch pays afresh and completes.
+    let got = stream_fetch_shared(
+        &client_ep,
+        target,
+        &ctx,
+        &ledger,
+        &sd,
+        operator_addr(),
+        *hash.as_bytes(),
+        0,
+        now_us(),
+        PullDeadlines::whole_transfer(Duration::from_secs(30)),
+        0,
+        0,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("follow-up fetch after the write-off: {e:#}"))?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "the follow-up fetch must deliver the whole blob"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A mere disconnect is not a write-off (ADR 003 §Write-offs, #2877): when the
+/// payer drops a stream having read every frame the node debited, the books and
+/// the node agree, so nothing is booked lost — the write-off is reserved for a
+/// node observed not delivering against counted credit. The resumed fetch on
+/// the same lane completes, and the operator's lost count stays at zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mere_disconnect_is_not_a_write_off() -> anyhow::Result<()> {
+    let payload = vec![0x7Au8; 4 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, store).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let sd = slash_domain();
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+
+    // Leg 1: read the whole promised wire, then vanish — no `StreamEnd` read,
+    // no clean finish. Every byte paid for was received, so the books balance
+    // at the drop and the disconnect alone gives the payer nothing to write
+    // off. (A drop that loses debited frames is the write-off case, covered by
+    // `a_silent_stall_against_counted_credit_writes_the_lane_credit_off`.)
+    let deadlines = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)
+        .map_err(|e| anyhow::anyhow!("deadlines: {e}"))?;
+    let (_header, mut pull) = open_progressive_pull(
+        &client_ep,
+        target.clone(),
+        &ctx,
+        Arc::clone(&ledger),
+        &sd,
+        operator_addr(),
+        *hash.as_bytes(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        now_us(),
+        0,
+        0,
+        deadlines,
+        0,
+    )
+    .await?;
+    let expected_wire = pull.expected_wire_bytes();
+    let mut got_wire: u64 = 0;
+    while got_wire < expected_wire {
+        let chunk = pull.next_chunk().await?.ok_or_else(|| {
+            anyhow::anyhow!("StreamEnd before the promised wire: {got_wire} of {expected_wire}")
+        })?;
+        got_wire = got_wire.saturating_add(chunk.len() as u64);
+    }
+    drop(pull); // the disconnect: the stream is never finished client-side
+    anyhow::ensure!(
+        ledger.trust().lost() == 0,
+        "a mere disconnect must book no loss, got {}",
+        ledger.trust().lost()
+    );
+
+    // The resumed fetch on the same lane pays and completes.
+    let got = stream_fetch_shared(
+        &client_ep,
+        target,
+        &ctx,
+        &ledger,
+        &sd,
+        operator_addr(),
+        *hash.as_bytes(),
+        0,
+        now_us(),
+        PullDeadlines::whole_transfer(Duration::from_secs(30)),
+        0,
+        0,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("resumed fetch after the disconnect: {e:#}"))?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "the resumed fetch must deliver the whole blob"
+    );
+    anyhow::ensure!(
+        ledger.trust().lost() == 0,
+        "nothing on this lane was lost end to end, got {}",
+        ledger.trust().lost()
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -13014,15 +13303,30 @@ async fn sliver_vouchers_exhaust_the_per_chunk_proof_budget() -> anyhow::Result<
         send_signed_voucher(&mut fx.send, &fx.signer, bytes, amount).await?;
     }
 
-    // The stream ends with a payment fault: no further byte and no `StreamEnd`.
+    // The stream ends with a payment fault: no further byte and no `StreamEnd`,
+    // but an in-band `AmountRegression` carrying the lane's watermark (#2877) —
+    // so a restarted payer whose ledger trails the node's reseeds from it
+    // instead of retrying its stale chain against the budget forever.
     match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut fx.recv)).await {
         Err(_elapsed) => anyhow::bail!("the node kept the stream open past the proof budget"),
         Ok(Ok(ClientMessage::ChunkData(chunk))) => anyhow::bail!(
             "the node delivered {} more wire bytes on a chunk that is still owed",
             chunk.bytes().len()
         ),
-        Ok(Ok(other)) => anyhow::bail!("expected the stream to fail, got {other:?}"),
-        Ok(Err(_)) => {}
+        Ok(Ok(ClientMessage::StreamError(StreamError::VoucherRejected { reason, bundle }))) => {
+            anyhow::ensure!(
+                reason == VoucherRejectReason::AmountRegression,
+                "a spent proof budget rejects AmountRegression, got {reason:?}"
+            );
+            anyhow::ensure!(
+                bundle.is_some(),
+                "the budget reject must carry the lane's watermark bundle"
+            );
+        }
+        Ok(Ok(other)) => anyhow::bail!("expected the budget reject, got {other:?}"),
+        Ok(Err(e)) => {
+            anyhow::bail!("the stream must end on an in-band reject, not drop bare: {e}")
+        }
     }
     // The fault is the payer's, not the node's.
     anyhow::ensure!(
@@ -13037,6 +13341,67 @@ async fn sliver_vouchers_exhaust_the_per_chunk_proof_budget() -> anyhow::Result<
         "a spent proof budget must be counted"
     );
     support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// A spent proof budget rejects `AmountRegression` carrying the lane's accepted
+/// watermark (#2877). Before the reject frame, the stream ended bare on a spent
+/// budget, so a restarted payer on a lane whose credit fell short of one frame
+/// retried its stale chain forever. The bundle's amount and bytes are the last
+/// voucher the node accepted — here the eighth sliver — so the payer reseeds
+/// from the node's true state and resumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_proof_budget_rejects_amount_regression_with_the_bundle() -> anyhow::Result<()> {
+    // The node's private `MAX_PROOFS_PER_CHUNK`; keep the two in step.
+    const PROOF_BUDGET: u64 = 8;
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    // Eight accepted slivers, none covering the node's next frame: the budget
+    // is spent with the watermark at the eighth sliver.
+    let mut amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    for n in 1..=PROOF_BUDGET {
+        amount += min_payment(SUB_FRAME_SLIVER_BYTES, RATE_PER_MB);
+        let bytes = HARNESS_INTERVAL_BYTES + n * SUB_FRAME_SLIVER_BYTES;
+        send_signed_voucher(&mut fx.send, &fx.signer, bytes, amount).await?;
+    }
+
+    let bundle = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut fx.recv))
+            .await
+            .map_err(|_| anyhow::anyhow!("node never answered with the budget reject"))??;
+        match msg {
+            // Chunks already in flight when the budget was spent.
+            ClientMessage::ChunkData(_) => {}
+            ClientMessage::StreamError(StreamError::VoucherRejected {
+                reason: VoucherRejectReason::AmountRegression,
+                bundle: Some(bundle),
+            }) => break bundle,
+            other => anyhow::bail!("expected AmountRegression with the watermark, got {other:?}"),
+        }
+    };
+    // The bundle reports the accepted watermark: every sliver was accepted, so
+    // it is the eighth sliver's cumulative, not the pre-sliver interval.
+    let watermark_bytes = HARNESS_INTERVAL_BYTES + PROOF_BUDGET * SUB_FRAME_SLIVER_BYTES;
+    anyhow::ensure!(
+        U256::from(bundle.amount) == amount && bundle.bytes_delivered == watermark_bytes,
+        "the bundle must report the accepted watermark ({amount}, {watermark_bytes}), got ({}, {})",
+        bundle.amount,
+        bundle.bytes_delivered
+    );
+    // The reject is in band and the stream then finishes cleanly.
+    assert_stream_finished(&mut fx.recv).await?;
+
+    support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
+    anyhow::ensure!(
+        counter(
+            &fx.metrics,
+            "decdn_serve_stream_proof_budget_exhausted_total"
+        )? == 1,
+        "the spent budget is still counted on its own reason counter"
+    );
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;

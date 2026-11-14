@@ -1533,3 +1533,14 @@ fn forgetting_credit_is_not_a_write_off() {
     assert_eq!(trust.outstanding(), 0);
     assert_eq!(trust.lost(), 0);
 }
+
+#[test]
+fn dropping_a_ledger_releases_its_outstanding_credit() {
+    let trust = node();
+    let ledger = lane_at(&trust);
+    ledger.note_prepaid(8 * MIB);
+    assert_eq!(trust.outstanding(), 8 * MIB);
+    drop(ledger);
+    assert_eq!(trust.outstanding(), 0);
+    assert_eq!(trust.lost(), 0);
+}

@@ -554,7 +554,9 @@ pub struct PoolLedger {
     /// the node holds for the lane ([`Self::prepaid`]). Payment adds to it and
     /// every received frame spends it, so it is the payer's view of the node's
     /// lane credit, and a later stream on the lane draws on it with no payment
-    /// of its own.
+    /// of its own. The node debits its credit when it sends, so after an
+    /// unclean stream end this count runs above the node's by the bytes lost
+    /// in flight, until a reconciliation writes them off.
     prepaid: AtomicU64,
     /// Ticks each time [`Self::prepaid`] falls: a stream received bytes, or the
     /// lane dropped its credit. A stream blocked on a read pays again when it
@@ -611,6 +613,12 @@ pub(crate) fn merge_spans(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
         .into_iter()
         .map(|(start, end)| (start, end - start))
         .collect()
+}
+
+impl Drop for PoolLedger {
+    fn drop(&mut self) {
+        self.release_outstanding();
+    }
 }
 
 impl PoolLedger {
@@ -745,9 +753,10 @@ impl PoolLedger {
 
     /// Write off what this lane paid and the node did not deliver: the credit
     /// it still holds, and the bytes it sent that never verified. Called at
-    /// reconciliation, when the node was reached again and did not deliver
-    /// against the credit, and never at a disconnect. The node's lost count
-    /// grows, so its next window shrinks. Returns the bytes written off.
+    /// reconciliation — the node was reached again and did not deliver against
+    /// the credit, or a live stream read nothing for a full floor window while
+    /// the books held credit — and never at a mere disconnect. The node's lost
+    /// count grows, so its next window shrinks. Returns the bytes written off.
     pub(crate) fn write_off_prepaid(&self) -> u64 {
         let held = self.prepaid.swap(0, Ordering::Relaxed);
         self.note_prepaid_fell();
@@ -769,6 +778,18 @@ impl PoolLedger {
     /// The lane's receipt evidence, or `None` when no collector attached one.
     pub(crate) fn evidence(&self) -> Option<&LaneEvidence> {
         self.evidence.get().map(AsRef::as_ref)
+    }
+
+    /// Release this lane's counted credit from the operator record when the
+    /// ledger retires. The record outlives the lane for the whole run; without
+    /// the release, credit stranded on retired lanes accumulates in the
+    /// operator's outstanding total until the per-node cap refuses every
+    /// payment. Not a write-off: nothing is booked lost and the run's budget
+    /// is untouched.
+    fn release_outstanding(&mut self) {
+        if let Some(trust) = self.trust.get() {
+            trust.note_spent(*self.prepaid.get_mut());
+        }
     }
 
     /// The lane's receipt evidence, attaching an empty one first if none is

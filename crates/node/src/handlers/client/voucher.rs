@@ -238,13 +238,46 @@ impl ClientHandler {
             None => read.await?,
         };
 
+        self.commit_wire_proof(
+            send,
+            conn.stable_id(),
+            anchor,
+            hash,
+            lane_key,
+            lane,
+            client_node_id,
+            rate_per_mb,
+            proof,
+        )
+        .await
+    }
+
+    /// Verify one proof already read off the stream and commit it to the lane:
+    /// the price check, the signature recovery, the watermark-gated re-checks
+    /// and the advance under the per-lane lock, then the record and the
+    /// receipt. [`Self::commit_one_proof`] calls this for the proof it waits
+    /// for; the serve loop's pre-frame drain calls it for the proofs the payer
+    /// already delivered on the stream.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) async fn commit_wire_proof(
+        &self,
+        send: &mut SendStream,
+        conn_id: usize,
+        anchor: &mut StreamAnchor,
+        hash: Hash,
+        lane_key: LaneKey,
+        lane: &Arc<Mutex<LaneDeliveryState>>,
+        client_node_id: B256,
+        rate_per_mb: u64,
+        proof: Proof,
+    ) -> anyhow::Result<VoucherStop> {
         let wire = match proof {
             Proof::Voucher(wire) => wire,
             Proof::Preimage(preimage) => {
                 return self
                     .commit_one_preimage(
                         send,
-                        conn.stable_id(),
+                        conn_id,
                         anchor,
                         hash,
                         lane_key,
@@ -361,7 +394,7 @@ impl ClientHandler {
         // once: the payer reseeds and resumes rather than wait out the proof
         // timeout.
         if !anchor.credited
-            && guard.last_credit_conn != Some(conn.stable_id())
+            && guard.last_credit_conn != Some(conn_id)
             && wire.chain_root == [0u8; 32]
             && U256::from(wire.amount) <= guard.state.last_amount()
             && guard.state.credit_bytes() == 0
@@ -411,7 +444,7 @@ impl ClientHandler {
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
         if credited_bytes > 0 {
             guard.note_credit_raised();
-            guard.last_credit_conn = Some(conn.stable_id());
+            guard.last_credit_conn = Some(conn_id);
             anchor.credited = true;
         }
         drop(guard);
@@ -849,7 +882,7 @@ impl ClientHandler {
     /// The watermark reported is `state`'s last-accepted amount / bytes, read
     /// while still holding the per-lane guard, before the caller swaps in the
     /// newly verified state.
-    fn watermark_bundle_for_reject(
+    pub(super) fn watermark_bundle_for_reject(
         reason: VoucherRejectReason,
         state: &LaneState,
     ) -> Option<WatermarkBundle> {

@@ -10382,15 +10382,23 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
         .await?;
     }
 
-    // The stream ends with a payment fault: no further byte and no `StreamEnd`.
+    // The spent budget ends the stream in-band: an `AmountRegression` reject
+    // with the lane's watermark bundle, so the payer can reseed.
     match tokio::time::timeout(Duration::from_secs(10), read_client(&mut leaf.recv)).await {
         Err(_elapsed) => anyhow::bail!("B kept the stream open past the proof budget"),
         Ok(Ok(ClientMessage::ChunkData(chunk))) => anyhow::bail!(
             "B delivered {} more wire bytes on a chunk that is still owed",
             chunk.bytes().len()
         ),
-        Ok(Ok(other)) => anyhow::bail!("expected the stream to fail, got {other:?}"),
-        Ok(Err(_)) => {}
+        Ok(Ok(ClientMessage::StreamError(StreamError::VoucherRejected { reason, bundle }))) => {
+            assert_eq!(reason, VoucherRejectReason::AmountRegression);
+            anyhow::ensure!(
+                bundle.is_some(),
+                "a spent proof budget must carry the watermark bundle"
+            );
+        }
+        Ok(Ok(other)) => anyhow::bail!("expected the budget rejection, got {other:?}"),
+        Ok(Err(e)) => anyhow::bail!("expected the budget rejection, got a read error: {e}"),
     }
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
     assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 1)?;

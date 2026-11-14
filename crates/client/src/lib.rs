@@ -2968,6 +2968,38 @@ fn log_proof_stall(
     );
 }
 
+/// Write off the lane's counted credit at a silent floor trip — ADR 003's
+/// first write-off case, observed: the stream is live, the books say the
+/// lane's credit covers the next bytes (the floor pauses during the payer's
+/// own payment waits), and no byte arrived for a full window
+/// (`window_bytes == 0`; a slow-but-delivering node is never written off).
+/// The credit the node holds is lower — frames lost in flight at an earlier
+/// unclean end — so the books drop to zero, at or below the node's count, and
+/// the next payment restores delivery. A lane whose credit fell during the
+/// read (`lane_credit_fell`) is excluded: a sibling is drawing delivery
+/// against it, so the credit is live.
+fn write_off_silent_stall(
+    ledger: &PoolLedger,
+    peer: &dyn std::fmt::Display,
+    hash: [u8; 32],
+    window: Duration,
+    window_bytes: u64,
+    lane_credit_fell: bool,
+) {
+    if window_bytes != 0 || lane_credit_fell || ledger.prepaid() == 0 {
+        return;
+    }
+    let written = ledger.write_off_prepaid();
+    tracing::warn!(
+        peer = %peer,
+        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+        written_off_bytes = written,
+        window_ms = window.as_millis(),
+        "node sent nothing for a full window against counted credit; wrote the \
+         lane's counted credit off"
+    );
+}
+
 /// Header fields from the upstream `StreamResponse`, surfaced by
 /// [`open_progressive_pull`] before the first chunk so the fused serve path
 /// (#856) knows `total_bytes` up front — it must sign its OWN downstream
@@ -3639,12 +3671,17 @@ impl UpstreamPull {
         // when the lane's credit falls, without dropping the pinned read.
         let mut prepaid_falls = self.ledger.prepaid_falls();
         prepaid_falls.borrow_and_update();
+        // Whether the lane's credit fell during this read: a sibling stream is
+        // drawing delivery against it, so the lane's credit is live and a stall
+        // here is not the node withholding against counted credit.
+        let mut lane_credit_fell = false;
         let need = self.expected_wire_bytes.saturating_sub(cumulative);
         loop {
             tokio::select! {
                 biased;
                 r = &mut read => return r,
                 Ok(()) = prepaid_falls.changed() => {
+                    lane_credit_fell = true;
                     let (chunks, residual) = pay_ahead_due(
                         &self.ctx,
                         &self.ledger,
@@ -3690,6 +3727,14 @@ impl UpstreamPull {
                                 .map(|t| now.saturating_duration_since(t).as_millis()),
                             window_ms = window.as_millis(),
                             "upstream pull fell under its throughput floor"
+                        );
+                        write_off_silent_stall(
+                            &self.ledger,
+                            &peer,
+                            hash,
+                            window,
+                            floor.window_bytes(),
+                            lane_credit_fell,
                         );
                         return Err(if cumulative == 0 {
                             anyhow::Error::new(PullTimeout { after: window })
