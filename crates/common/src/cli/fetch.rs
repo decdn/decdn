@@ -230,6 +230,32 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "UNITS", default_value_t = 0)]
     pub max_rate_per_mb: u64,
 
+    /// The most USDC (base units) this payer holds as credit at one node, across
+    /// every signer (ADR 003 § Credit Window). A node sends only what a lane has
+    /// paid for, so this is the most a node that keeps the credit can take. It is
+    /// converted to bytes at the rate the node quotes. Default 640: 64 MiB at
+    /// the default node rate. Payer policy: nodes never see it.
+    #[arg(long, value_name = "UNITS", default_value_t = 640)]
+    pub pay_ahead_cap: u64,
+
+    /// The payer's window toward a node is its verified bytes divided by this,
+    /// once that exceeds one chunk plus one chunk group, up to
+    /// `--pay-ahead-cap`. A node the payer has not used starts at the floor.
+    #[arg(long, value_name = "N", default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
+    pub pay_ahead_divisor: u64,
+
+    /// How many verified bytes one written-off byte cancels when the payer sizes
+    /// a node's window. A node that takes credit and does not deliver loses its
+    /// window for good, so a higher value forgives less.
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub loss_weight: u64,
+
+    /// The most USDC (base units) one run writes off in total. Past it every
+    /// node's window stays at its floor for the rest of the run. Default 2560,
+    /// four times the default `--pay-ahead-cap`.
+    #[arg(long, value_name = "UNITS", default_value_t = 2560)]
+    pub write_off_budget: u64,
+
     /// Hard cap on the total wall-clock time of the `CapacityBond` registry read
     /// (discovery), in milliseconds. Defaults to 1 hour.
     ///

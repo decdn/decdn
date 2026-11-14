@@ -410,6 +410,11 @@ struct StoredLaneState {
     /// a breaking on-disk change (a record written before it fails to decode), not
     /// silently defaulted — deliberate and unversioned; see [`StoredLaneState`].
     paid_cumulative: [u8; 32],
+    /// The wire bytes the node has sent on the lane ([`LaneState::delivered_bytes`]).
+    /// The lane's credit is its claim minus this count, so persisting it in the
+    /// same row as the frontier is what lets credit survive a restart. A required
+    /// field like `paid_cumulative`: a record written without it fails to decode.
+    delivered_bytes: u64,
 }
 
 impl From<&LaneState> for StoredLaneState {
@@ -424,6 +429,7 @@ impl From<&LaneState> for StoredLaneState {
             registered_until: state.registered_until,
             owner_sig: state.owner_sig.map_or_else(Vec::new, |s| s.to_vec()),
             paid_cumulative: state.paid_cumulative.to_be_bytes(),
+            delivered_bytes: state.delivered_bytes,
             chain_root: state.chain().chain_root.into(),
             chunk_price: state.chain().chunk_price.to_be_bytes(),
             verified_index: state.chain().verified_index,
@@ -494,6 +500,7 @@ impl StoredLaneState {
         state.registered_until = self.registered_until;
         state.owner_sig = owner_sig;
         state.paid_cumulative = U256::from_be_bytes(self.paid_cumulative);
+        state.delivered_bytes = self.delivered_bytes;
         Ok(state)
     }
 }

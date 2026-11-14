@@ -455,8 +455,8 @@ async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
 /// Sad path: the client disconnects mid-stream (#746).
 ///
 /// A downstream node B (the real [`ClientHandler`]) is paid-serving a 1.5 MiB
-/// blob. Its client reads the signed response and one chunk, then aborts the
-/// connection before paying any voucher. Two properties must hold:
+/// blob. Its client reads the signed response, then aborts the connection
+/// before paying any voucher. Two properties must hold:
 ///
 /// 1. The aborted pull advances **nothing** — B accepts no voucher, so the
 ///    lane stays at nonce 0. No payment is fabricated for un-acked bytes and
@@ -492,7 +492,7 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
     let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_b = spawn_server(ep_b.clone(), handler);
 
-    // --- Abort: request, read the response + one chunk, then hang up ---------
+    // --- Abort: request, read the response, then hang up --------------------
     {
         let client_sk = fresh_key();
         let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -545,14 +545,11 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
             }
             _ => anyhow::bail!("expected a StreamResponse first"),
         }
-        // Read at least one chunk so the abort is genuinely *mid*-stream, then
-        // drop without paying. The explicit close hands B a CONNECTION_CLOSE so
-        // its voucher read unblocks at once (vs. waiting on an idle timeout),
-        // freeing the serial accept loop to serve the honest pull below.
-        match read_client_msg(&mut recv).await? {
-            ClientMessage::ChunkData(_) => {}
-            _ => anyhow::bail!("expected a ChunkData mid-stream"),
-        }
+        // B sends nothing before it is paid, so the client hangs up mid-stream
+        // without paying. The explicit close hands B a CONNECTION_CLOSE so its
+        // proof read unblocks at once (vs. waiting on an idle timeout), freeing
+        // the serial accept loop to serve the honest pull below.
+        drop(recv);
         conn.close(0u32.into(), b"client-abort");
         shutdown([], [&client_ep]).await?;
     }

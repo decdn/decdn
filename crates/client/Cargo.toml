@@ -91,6 +91,8 @@ tracing-subscriber = { workspace = true }
 public-api = { workspace = true }
 rustdoc-json = { workspace = true }
 insta = { workspace = true }
+# The pay-ahead property test: no byte range of one lane is paid for twice.
+proptest = { workspace = true }
 
 # The public-API snapshot test shells out to rustdoc and is slow, so it is
 # compiled and run only when `public-api-test` is enabled (see CONTRIBUTING.md

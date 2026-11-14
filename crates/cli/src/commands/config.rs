@@ -229,11 +229,6 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  pool_floor_signer_live_windows: {}",
-        resolved.blockchain.pool_floor_signer_live_windows
-    )?;
-    writeln!(
-        w,
         "  cache_dir:                {}",
         resolved.cache.cache_dir.display()
     )?;
@@ -965,7 +960,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
-# pool_floor_signer_live_windows = 8              # per-signer LIVE concurrency cap k, in ramp-start credit windows: the most live un-vouchered floor reservation one capability signer may hold against a pool, k × one window (ADR 003 § Pool solvency); recycles as streams pay; lower-clamped to one window; default 8
 # CLI-only [blockchain] keys — consumed by `decdn appeal` / the client, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
@@ -1055,9 +1049,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [payment]
 # rate_per_mb = 10
-# credit_max = 67108864                    # downstream credit-window ceiling in bytes (ADR 003 §Credit window); the window ramps toward this cap as the stream pays; default 64 MiB; floored at one chunk plus one chunk group (1 MiB + 16 KiB)
-# credit_ramp_divisor = 2                  # ramp divisor (ADR 003 §Credit window); window is paid/credit_ramp_divisor, capped at credit_max; 0 opens the full ceiling immediately
-# frame_target_bytes = 1048576              # serve-path wire-frame target in bytes (ADR 005 §cdn/client/v1); node-local, never negotiated; clamped down to the credit window's remaining room; must be in 1..=1048576 (one payment chunk); default 1 MiB
+# backfill_window = 4194304                # most bytes one backfill returns to a lane's credit after a dropped stream (ADR 003 § Credit Window); node-local, no wire field; default 4 MiB
+# backfill_divisor = 64                    # a lane's backfills total at most paid/backfill_divisor bytes (ADR 003 § Credit Window); 0 turns backfill off; default 64
+# frame_target_bytes = 1048576              # serve-path wire-frame target in bytes (ADR 005 §cdn/client/v1); node-local, never negotiated; clamped down to the lane's credit; must be in 1..=1048576 (one payment chunk); default 1 MiB
 # voucher_commit_interval_ms = 5000        # background flush period (ms) for durable voucher persistence (ADR 003); must be > 0; default 5000 (5s)
 
 [observability]

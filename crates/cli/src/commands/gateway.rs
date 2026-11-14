@@ -281,17 +281,29 @@ const CHUNK_BYTES: usize = 256 * 1024;
 /// pull-window floor when this is below it.
 const PUBLIC_READ_AHEAD_BYTES: u64 = 2 << 20;
 
+/// The credit a pull holds ahead of delivery at one node: the payer window at
+/// its cap, at the default node rate. The pull pays this far ahead of the bytes
+/// it has received, so a response that ends early leaves it paid and
+/// undelivered.
+const PUBLIC_PAY_AHEAD_BYTES: u64 =
+    decdn_client::payer_window::DEFAULT_PAY_AHEAD_CAP_MICRO_USDC * (1 << 20) / DEFAULT_RATE_PER_MB;
+
+/// The node rate the default payer window cap is priced at, in base units per
+/// MiB.
+const DEFAULT_RATE_PER_MB: u64 = 10;
+
 /// The most a pull may have paid for beyond the frames its response
-/// delivered: the read-ahead window, the pipe, and one frame in flight. A
-/// response that does not end cleanly is charged this against the allowance,
-/// since nothing reports what the pull paid.
+/// delivered: the read-ahead window, the credit it holds ahead of delivery,
+/// the pipe, and one frame in flight. A response that does not end cleanly is
+/// charged this against the allowance, since nothing reports what the pull
+/// paid.
 const DROP_PENALTY_BYTES: u64 = {
     let window = if PUBLIC_READ_AHEAD_BYTES > decdn_client::PULL_WINDOW_FLOOR {
         PUBLIC_READ_AHEAD_BYTES
     } else {
         decdn_client::PULL_WINDOW_FLOOR
     };
-    window + PIPE_BYTES as u64 + CHUNK_BYTES as u64
+    window + PUBLIC_PAY_AHEAD_BYTES + PIPE_BYTES as u64 + CHUNK_BYTES as u64
 };
 
 /// Run the gateway until Ctrl-C.

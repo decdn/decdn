@@ -719,43 +719,23 @@ revenue flat while requests arrive; `decdn get` against this node returns
   (`ceiling`), and how many refusals it suppressed since the last line
   (`suppressed`). Raise the log level to `debug` for one line per
   refusal — that one also carries the hash.
-- `decdn_serve_stream_rejected_signer_floor_at_cap_total`, the sibling counter for
-  a refusal where the pool is solvent but ONE capability signer has filled its share
-  of the un-vouchered floor. It rises while `…insufficient_deposit_total` stays flat.
-  This counter has **no alert rule**: it is dashboard- and log-only, so cause 3
-  below is found by looking, not by being paged. The node's own `warn!` for it runs
-  on a separate 5-minute window from the deposit line above, so neither arm can
-  starve the other or mix its `suppressed` count.
 - Grafana panel **Payment-class serve refusals (all collapse to NotFound)**. Its
   series are a subset of the ten reject reasons that share that one wire code, so
   a client cannot distinguish them and the server-side counters are the only place
   the cause exists at all.
 
-**Causes:** three, with different remedies, and the `insufficient_deposit` counter
-alone cannot tell the first two apart — this is why the log line exists:
+**Causes:** two, with different remedies, and the `insufficient_deposit` counter
+alone cannot tell them apart — this is why the log line exists:
 
-1. **Clients genuinely running dry.** Their remaining deposit cannot cover one
-   credit window. Nothing is wrong with this node. Expect a low background rate.
+1. **Clients genuinely running dry.** Their remaining deposit, less the
+   refundable floor `M`, cannot cover one chunk. Nothing is wrong with this
+   node. Expect a low background rate.
 2. **This node's chain watcher is lagging an on-chain top-up.** The seller's view
    of a pool's deposit is only raised by observing `PoolToppedUp`, so a
    client that just topped up is refused until the watcher catches up. Funded
    clients are being turned away and will route elsewhere.
 
-3. **One signer is at its live floor cap.** The pool is solvent, but one capability
-   signer is running more concurrent un-vouchered streams than its share of the
-   floor covers
-   ([ADR 003 § Pool solvency](../adr/003-payments.md#pool-solvency-and-the-refundable-floor-m)).
-   `decdn_serve_stream_rejected_signer_floor_at_cap_total` rises while
-   `…insufficient_deposit_total` stays flat, and the `warn!` names the signer. The
-   cap holds no permanent charge — it is pure concurrency, released as each of the
-   signer's streams pays, so it clears on its own and needs no top-up or reclaim.
-   If a signer is honest and legitimately highly concurrent, the operator raises
-   `blockchain.pool_floor_signer_live_windows`. That knob is **restart-required** —
-   `blockchain.*` is not a reload section, so `decdn node reload` neither applies
-   nor validates a new value. Rotating the session key is the remedy that takes
-   effect immediately.
-
-A fourth, rarer cause: the operator's own
+A third, rarer cause: the operator's own
 `blockchain.buyer_working_deposit_micro_usdc` is too small for the *upstream*
 rate, in which case this node is the one being refused. (The node opens its
 buyer pool at the working deposit and the low-water refill tops it back up on

@@ -90,6 +90,25 @@ fn owner_sig_rides_the_lane_record_through_flush_and_reopen() -> anyhow::Result<
     Ok(())
 }
 
+/// The count of bytes the node has sent on a lane rides the lane record, so the
+/// lane's credit survives a restart.
+#[test]
+fn delivered_bytes_survive_a_flush_and_reopen() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+    let mut lane = sample(0x5b);
+    lane.delivered_bytes = 3_145_728;
+    PoolStateStore::record(store.as_ref(), &lane)?;
+    store.flush()?;
+    drop(store);
+
+    let reopened = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+    let got = PoolStateStore::get(&reopened, lane.key())?
+        .ok_or_else(|| anyhow::anyhow!("lane gone after reopen"))?;
+    anyhow::ensure!(got.delivered_bytes == 3_145_728);
+    Ok(())
+}
+
 #[test]
 fn open_empty_store_returns_no_entries() -> anyhow::Result<()> {
     let dir = data_dir()?;

@@ -23,7 +23,6 @@ use super::{
     WatermarkBundle, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
-use std::collections::VecDeque;
 
 /// One stream's hash-chain anchor: the `chain_root` it has been told about
 /// (ADR 003 §Concurrent Streams, Rule 1).
@@ -45,14 +44,22 @@ pub(super) struct StreamAnchor {
     /// The root this stream has carried a voucher for, or `None` if it has
     /// carried none — or if the last one it carried was sealed.
     root: Option<B256>,
+    /// The anchoring voucher signed an amount below the lane's signed
+    /// watermark: the payer's ledger trails the node's, as a restarted payer's
+    /// does. An honest stream anchors at the watermark, never below it.
+    trailing: bool,
+    /// A proof on this stream has credited the lane. A stale proof on such a
+    /// stream is an honest sibling race, never a payer that lost its watermark.
+    credited: bool,
 }
 
 impl StreamAnchor {
     /// Re-anchor to whatever an accepted voucher committed. A sealed voucher
     /// (`chain_root == 0`) clears the anchor: it meters nothing, so a reveal
     /// arriving afterwards on this stream would have no chain to belong to.
-    fn adopt(&mut self, chain_root: B256) {
+    fn adopt(&mut self, chain_root: B256, trailing: bool) {
         self.root = (!chain_root.is_zero()).then_some(chain_root);
+        self.trailing = trailing && self.root.is_some();
     }
 }
 
@@ -114,182 +121,11 @@ fn chunk_price_matches_quote(wire: &decdn_protocol::client::Voucher, rate_per_mb
     wire.chunk_price == expected
 }
 
-/// Rule #1 credit cap: advance a lane's `paid_credited` by at most the amount the
-/// watermark advanced, and return the wire bytes to credit the serve loop's `paid`.
-/// A benign already-satisfied voucher (watermark unchanged, `paid_credited` already at
-/// it) credits zero, so it cannot reopen the credit window for unsettled bytes.
-fn credit_advance(
-    paid_credited: U256,
-    delta_bytes: u64,
-    watermark: U256,
-) -> anyhow::Result<(U256, u64)> {
-    let new_credited = (paid_credited + U256::from(delta_bytes)).min(watermark);
-    let credited = new_credited.saturating_sub(paid_credited);
-    let credited_bytes = u64::try_from(credited).map_err(|_| {
-        anyhow::anyhow!("credited bytes exceeded u64 — paid-frontier invariant broke")
-    })?;
-    Ok((new_credited, credited_bytes))
-}
-
-/// Credit a stale proof from lane headroom, or `None` when the headroom cannot
-/// pay all `due` bytes of the chunk the proof answers.
-///
-/// A proof is stale when the lane already holds its payment: a voucher at or
-/// below the signed anchor, or a reveal that folds nothing. An honest
-/// payer pays each chunk with one proof, so an honest stale proof always finds
-/// its whole chunk in headroom. The later proof that moved the lane past it
-/// folded its payment, and no metering voucher takes a whole chunk from
-/// headroom (`voucher_credit_delta`). A stale proof that comes up short is a
-/// payer whose watermark trails the node's watermark, for example a restart
-/// that lost accepted vouchers. No later proof pays that chunk: the payer
-/// believes it is paid. Crediting it the part that exists would leave the stream waiting on a
-/// proof the payer never sends, so the caller rejects it with the watermark
-/// bundle instead, and commits no credit.
-fn credit_stale(
-    paid_credited: U256,
-    due: u64,
-    watermark: U256,
-) -> anyhow::Result<Option<(U256, u64)>> {
-    let (new_credited, credited_bytes) = credit_advance(paid_credited, due, watermark)?;
-    Ok((credited_bytes == due).then_some((new_credited, credited_bytes)))
-}
-
-/// One delivered chunk of a stream that the payer has not fully paid yet.
-///
-/// A proof that is not stale credits at most the headroom the lane holds
-/// (`credit_advance`), so it can pay part of a chunk. A stale proof pays the whole
-/// remainder or is rejected (`credit_stale`). The unpaid remainder stays owed: the recoup loop takes
-/// the chunk off its queue and reads proofs for it until [`Self::settle`] reports
-/// it paid. The serve loop's credit window rests on this. The remainders of the
-/// queued chunks and of the chunk in hand, plus the bytes not yet cut into a
-/// chunk, are exactly `delivered − paid`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct OwedChunk {
-    /// The chunk's delivered wire bytes. Never zero.
-    len: u64,
-    /// The part of `len` that no proof has credited yet.
-    remaining: u64,
-}
-
-impl OwedChunk {
-    /// A delivered chunk of `len` wire bytes, with nothing paid yet. Both serve
-    /// loops cut a chunk only from bytes they delivered, so `len` is never zero.
-    pub(super) const fn new(len: u64) -> Self {
-        debug_assert!(len > 0, "an owed chunk holds at least one delivered byte");
-        Self {
-            len,
-            remaining: len,
-        }
-    }
-
-    /// The chunk's delivered wire bytes. This, not [`Self::remaining`], decides
-    /// whether it is a whole chunk (`voucher_credit_delta`).
-    pub(super) const fn len(self) -> u64 {
-        self.len
-    }
-
-    /// The bytes of the chunk that are still unpaid.
-    pub(super) const fn remaining(self) -> u64 {
-        self.remaining
-    }
-
-    /// Apply a credit of `credited` bytes and report whether the chunk is now
-    /// fully paid.
-    ///
-    /// # Errors
-    ///
-    /// A credit larger than [`Self::remaining`]. Every proof path caps its credit
-    /// at `remaining`, so this is a node accounting fault. The caller has already
-    /// added the credit to `paid`, so it must end the stream rather than let the
-    /// excess reopen the credit window.
-    pub(super) fn settle(&mut self, credited: u64) -> anyhow::Result<bool> {
-        self.remaining = self.remaining.checked_sub(credited).ok_or_else(|| {
-            anyhow::anyhow!(
-                "a proof credited {credited} bytes against a {}-byte chunk that owes {}",
-                self.len,
-                self.remaining
-            )
-        })?;
-        Ok(self.remaining == 0)
-    }
-}
-
-/// Take the next owed chunk the payer can pay for now, or `None` when there is
-/// none.
-///
-/// The payer pays only for bytes it has verified, and it verifies a chunk's last
-/// byte only with the whole bao leaf that holds it. That leaf can run up to
-/// [`decdn_client::VERIFY_LAG_BYTES`] past the chunk's end. So the newest owed
-/// chunk is payable only once that many bytes have gone out after it, or once
-/// the whole range is on the wire. Every older chunk has a whole chunk after it.
-/// A recoup phase that waited on the newest chunk before then would wait for a
-/// proof the payer cannot send. The credit window's floor of one chunk plus
-/// that lag keeps a payable chunk at the front whenever the window is shut.
-pub(super) fn pop_payable(
-    pending: &mut VecDeque<OwedChunk>,
-    unvouchered: u64,
-    done_delivering: bool,
-) -> Option<OwedChunk> {
-    let payable =
-        pending.len() > 1 || unvouchered >= decdn_client::VERIFY_LAG_BYTES || done_delivering;
-    if payable { pending.pop_front() } else { None }
-}
-
-/// Check the serve loop's byte accounting after a recoup phase.
-///
-/// The recoup phase pays every payable owed chunk before it returns
-/// ([`pop_payable`]), so the only unpaid bytes left are the chunks it holds back
-/// and the bytes not yet cut into a chunk: `delivered − paid` must equal their
-/// sum. A mismatch is a node accounting fault. A shortfall would let the stream
-/// end with bytes nobody paid for, or fill the credit window with nothing left to
-/// collect. An excess would let `paid` run ahead of `delivered`.
-///
-/// # Errors
-///
-/// The accounting does not balance.
-pub(super) fn ensure_unpaid_bytes_tracked(
-    delivered: u64,
-    paid: u64,
-    unvouchered: u64,
-    pending: &VecDeque<OwedChunk>,
-) -> anyhow::Result<()> {
-    let held: u64 = pending.iter().map(|owed| owed.remaining()).sum();
-    if delivered.checked_sub(paid) == Some(unvouchered.saturating_add(held)) {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "serve accounting broke: {delivered} bytes delivered, {paid} paid, \
-             {held} held in owed chunks, {unvouchered} not yet cut into a chunk"
-        ))
-    }
-}
-
-/// The share of an outstanding chunk a voucher may take from lane headroom
-/// (ADR 003 §Concurrent Streams).
-///
-/// A **metering** voucher — one that carries a live `chain_root` — never pays a
-/// whole chunk. The payer pays every whole chunk with a reveal and sends a
-/// metering voucher only to open, re-anchor, or roll a chain. Those vouchers can
-/// fold a reveal that a sibling stream carries and this node has not read yet.
-/// If such a voucher took the chunk from headroom, the sibling's reveal would
-/// then find no headroom left, and the sibling would wait for a proof the payer
-/// never sends. So a metering voucher credits nothing against a whole chunk: it
-/// advances the watermark and anchors its stream, and the stream waits for its
-/// reveal.
-///
-/// A sealed voucher (`chain_root == 0`) and a voucher that settles a partial
-/// closing chunk (`len < CHUNK_BYTES`) take what the chunk still owes: each is
-/// the payment for the bytes it answers.
-///
-/// The chunk's delivered length decides which case applies, not the part still
-/// owed. A whole chunk that a proof paid in part is still a whole chunk, so its
-/// remainder waits for a reveal exactly as the whole chunk did.
-fn voucher_credit_delta(wire: &decdn_protocol::client::Voucher, owed: OwedChunk) -> u64 {
-    if wire.chain_root != [0u8; 32] && owed.len() >= super::CHUNK_BYTES {
-        0
-    } else {
-        owed.remaining()
-    }
+/// The bytes a proof added to a lane's paid frontier: the lane's paid bytes after
+/// the proof minus the paid bytes before it. A proof that folds nothing adds zero.
+fn paid_gain(before: U256, after: U256) -> anyhow::Result<u64> {
+    u64::try_from(after.saturating_sub(before))
+        .map_err(|_| anyhow::anyhow!("a proof added more than u64 bytes to a lane"))
 }
 
 /// Log one rejected payment proof at `info!`: the proof kind (`voucher` or
@@ -347,9 +183,9 @@ impl ClientHandler {
     /// store (buffered; the background flush makes it durable, ADR 003
     /// §Off-chain voucher state persistence). Acceptance is implicit: no positive
     /// message is written; the caller keeps delivering.
-    // One coherent hot-path unit under the per-lane guard: read, verify, credit
-    // (or reject a stale payer with the watermark bundle), advance, then record. Splitting it would scatter
-    // state that must stay atomic under the lock.
+    // One coherent hot-path unit under the per-lane guard: read, verify, advance,
+    // then record. Splitting it would scatter state that must stay atomic under
+    // the lock.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn commit_one_proof(
         &self,
@@ -363,8 +199,8 @@ impl ClientHandler {
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
-        owed: OwedChunk,
         proofs: &ChunkProofs,
+        credit_rx: Option<&mut tokio::sync::watch::Receiver<u64>>,
     ) -> anyhow::Result<VoucherStop> {
         // Unknown lane: `serve_stream` refuses one pre-serve, so this is a
         // defensive backstop matching the sole callers (which forward `Some`).
@@ -381,10 +217,26 @@ impl ClientHandler {
         };
 
         // (1) READ one proof (bounded by the proof wait, which counts `conn`'s
-        // transport progress and the owed chunk's ceiling in `proofs`) WITHOUT
+        // transport progress and the wait's ceiling in `proofs`) WITHOUT
         // holding the per-lane lock — a network read must not block same-lane
         // streams. The reader is cancellation-safe.
-        let proof = super::proof_wait::await_proof(reader.read(recv), conn, proofs).await?;
+        // A stream waiting for credit also wakes when a sibling's proof raises
+        // the lane's credit (`credit_rx`); the read is cancel-safe, so a wake
+        // leaves any partial proof buffered for the next read.
+        // Boxed: the select below would otherwise inline this future into every
+        // serve loop's future and trip `large_futures`.
+        let read = Box::pin(super::proof_wait::await_proof(
+            reader.read(recv),
+            conn,
+            proofs,
+        ));
+        let proof = match credit_rx {
+            Some(rx) => tokio::select! {
+                proof = read => proof?,
+                Ok(()) = rx.changed() => return Ok(VoucherStop::Woken),
+            },
+            None => read.await?,
+        };
 
         let wire = match proof {
             Proof::Voucher(wire) => wire,
@@ -392,13 +244,13 @@ impl ClientHandler {
                 return self
                     .commit_one_preimage(
                         send,
+                        conn.stable_id(),
                         anchor,
                         hash,
                         lane_key,
                         lane,
                         client_node_id,
                         preimage,
-                        owed,
                     )
                     .await;
             }
@@ -459,10 +311,6 @@ impl ClientHandler {
         // streams reading the same watermark and both advancing would lose one.
         let mut guard = lane.lock().await;
 
-        // The lane's authoritative cumulative BEFORE this voucher. A voucher at
-        // or under it is stale: the lane already holds its payment.
-        let prior_last_amount = guard.state.last_amount();
-
         // Capability-expiry gate (ADR 003 §Revocation). The node stops accepting
         // vouchers a margin BEFORE the expiry: one redeem interval plus the
         // redeemer's landing slack. The preimage path applies the same gate, so
@@ -484,74 +332,54 @@ impl ClientHandler {
                 .await;
         }
 
-        let verified = match Self::verify_voucher(
-            &guard.state,
-            guard.bytes_delivered_cumulative,
-            &signed,
-            &wire,
-            rate_per_mb,
-        ) {
-            Ok(v) => v,
-            Err(VerifyStop::Reject(reason, bundle)) => {
-                drop(guard);
-                return self
-                    .reject_proof(send, "voucher", &lane_key, reason, bundle)
-                    .await;
-            }
-            Err(VerifyStop::Bail(e)) => {
-                drop(guard);
-                if e.is::<super::wire::ClientPaymentFault>() {
-                    log_rate_check_reject(&lane_key, &e);
+        let verified =
+            match Self::verify_voucher(&guard.state, guard.paid_bytes, &signed, &wire, rate_per_mb)
+            {
+                Ok(v) => v,
+                Err(VerifyStop::Reject(reason, bundle)) => {
+                    drop(guard);
+                    return self
+                        .reject_proof(send, "voucher", &lane_key, reason, bundle)
+                        .await;
                 }
-                return Err(e);
-            }
-        };
+                Err(VerifyStop::Bail(e)) => {
+                    drop(guard);
+                    if e.is::<super::wire::ClientPaymentFault>() {
+                        log_rate_check_reject(&lane_key, &e);
+                    }
+                    return Err(e);
+                }
+            };
 
-        // Rule #1 cap: credit this stream from lane headroom — proved bytes no
-        // stream has claimed yet. `paid_credited` is monotone and bounded by the
-        // settled watermark, so a voucher can never reopen the credit window for
-        // bytes no proof settled. A metering voucher takes no whole chunk from
-        // that headroom (`voucher_credit_delta`): the reveal it precedes, or a
-        // sibling's reveal it folded, pays the chunk. Computed under the guard so
-        // the read of `paid_credited` and its store cannot interleave with
-        // another proof.
-        //
-        // A stale voucher that pays its chunk — a sealed voucher, or one closing
-        // a partial chunk — must find all of it in headroom (`credit_stale`), or
-        // it is a payer whose watermark fell behind ours (#1946). It gets the
-        // watermark bundle, so the payer reseeds and resumes. A stale metering
-        // voucher pays no whole chunk, so it stays benign: it anchors the stream,
-        // and the reveal after it is the proof that settles the chunk.
-        let due = voucher_credit_delta(&wire, owed);
-        let stale = U256::from(wire.amount) <= prior_last_amount;
-        let credit = if stale && due > 0 {
-            credit_stale(guard.paid_credited, due, verified.new_bytes)?
-        } else {
-            Some(credit_advance(
-                guard.paid_credited,
-                due,
-                verified.new_bytes,
-            )?)
-        };
-        let Some((new_credited, credited_bytes)) = credit else {
-            // A stale voucher changes no lane state, so `guard.state` still holds
-            // the watermark the bundle reports.
+        // A stale SEALED voucher — at or below the signed watermark, opening no
+        // chain — on a stream no proof has credited yet, and on a connection
+        // other than the one that last credited the lane, is a payer whose
+        // ledger trails the node's: a restarted payer re-signing a watermark it
+        // lost. A concurrent sibling's late voucher comes on its payer's
+        // connection, or on a stream its payer already paid on. On a lane with no credit the stale voucher can pay nothing
+        // and nothing else is coming, so reject it with the watermark bundle at
+        // once: the payer reseeds and resumes rather than wait out the proof
+        // timeout.
+        if !anchor.credited
+            && guard.last_credit_conn != Some(conn.stable_id())
+            && wire.chain_root == [0u8; 32]
+            && U256::from(wire.amount) <= guard.state.last_amount()
+            && guard.state.credit_bytes() == 0
+        {
             let reason = VoucherRejectReason::AmountRegression;
             let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
-            let paid_credited = guard.paid_credited;
             drop(guard);
-            Self::log_stale_reject(
-                "voucher",
-                &lane_key,
-                bundle.is_some(),
-                due,
-                paid_credited,
-                verified.new_bytes,
-            );
             return self
                 .reject_proof(send, "voucher", &lane_key, reason, bundle)
                 .await;
-        };
+        }
+
+        // The voucher's full value is lane credit: the lane's credit is its paid
+        // bytes minus its delivered bytes (`LaneState::credit_bytes`), so raising
+        // the watermark raises the credit of every stream on the lane. A voucher at
+        // or below the signed watermark raises nothing, and the serve loop keeps
+        // waiting, bounded by the proof budget.
+        let credited_bytes = paid_gain(guard.paid_bytes, verified.new_bytes)?;
 
         // Advance in-memory, then record to the buffered store (a cheap map write;
         // durability is the background flush's job). A poisoned store mutex is the
@@ -561,13 +389,13 @@ impl ClientHandler {
         // remaining clone is the store's own and is the buffer resharding's to
         // remove (issue #1792 item 3; `verified.{new_bytes,amount}` are `Copy`, so
         // the partial move leaves them readable below).
+        let trailing = U256::from(wire.amount) < guard.state.last_amount();
         guard.state = verified.next_state;
-        guard.bytes_delivered_cumulative = verified.new_bytes;
+        guard.paid_bytes = verified.new_bytes;
         // This stream now knows which chain the payer is metering against, so a
         // bare reveal arriving on it afterwards is placeable. A sealed voucher
         // clears the anchor instead — it opens no chain to reveal against.
-        anchor.adopt(B256::from(wire.chain_root));
-        guard.paid_credited = new_credited;
+        anchor.adopt(B256::from(wire.chain_root), trailing);
         if let Err(e) = self.pool_state_store.record(&guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
@@ -581,6 +409,11 @@ impl ClientHandler {
         guard
             .last_voucher_at
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
+        if credited_bytes > 0 {
+            guard.note_credit_raised();
+            guard.last_credit_conn = Some(conn.stable_id());
+            anchor.credited = true;
+        }
         drop(guard);
         self.metrics.voucher_received();
 
@@ -588,9 +421,9 @@ impl ClientHandler {
         //
         // Only a proof that actually CREDITED bytes gets a receipt. Under
         // `PayWord` a stream sends an anchor voucher before its first reveal of
-        // an epoch. That voucher is a metering voucher against a whole chunk, so
-        // it credits nothing, and logging it would put a payment in the audit
-        // log that this stream never took.
+        // an epoch. That voucher adds nothing to the lane's paid frontier, and
+        // logging it would put a payment in the audit log that this stream never
+        // took.
         if credited_bytes > 0 {
             self.record_receipt(hash, credited_bytes, client_node_id, verified.amount);
         }
@@ -646,13 +479,13 @@ impl ClientHandler {
     async fn commit_one_preimage(
         &self,
         send: &mut SendStream,
+        conn_id: usize,
         anchor: &mut StreamAnchor,
         hash: Hash,
         lane_key: LaneKey,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         client_node_id: B256,
         preimage: decdn_protocol::client::ChunkPreimage,
-        owed: OwedChunk,
     ) -> anyhow::Result<VoucherStop> {
         // Index 0 names the root and resolves to the voucher's own `amount`, so
         // it proves nothing the voucher does not already say and never travels
@@ -761,72 +594,28 @@ impl ClientHandler {
 
         // A reveal that advanced nothing — at or below the frontier, or naming a
         // superseded epoch — advances the lane's claim by nothing, so nothing is
-        // recorded and no redeem hint fires. But this stream still DELIVERED the
-        // bytes `owed` still names, and for an honest payer the lane already
-        // holds the money for them: a concurrent same-lane sibling raced the shared chain index
-        // ahead, or a sibling's rollover voucher folded this very reveal into the
-        // watermark.
-        // So credit this stream from that lane headroom rather than throttling it
-        // to a `MAX_PROOFS_PER_CHUNK` stall. Without it, cross-stream reveal
-        // reordering starves the slower stream: its reveals keep landing below the
-        // frontier, credit nothing, and its unpaid frontier is stopped as
-        // `ProofBudgetExhausted` (the concurrent same-lane voucher-starvation bug).
-        //
-        // The headroom is this reveal's to take because no metering voucher takes
-        // a whole chunk from it (`voucher_credit_delta`). A sibling's rollover
-        // that folds this reveal advances the watermark and credits its own
-        // stream nothing, so the headroom it opens waits here for the reveal the
-        // payer did send.
-        //
-        // The credit is bounded by the lane's proven `owed_bytes`, and
-        // `paid_credited` is monotone, so total credit across every same-lane
-        // stream can never exceed money the node can redeem — no double-pay, no
-        // under-pay.
-        //
-        // The reveal is the last proof the payer sends for its chunk, so the
-        // headroom must pay all of it (`credit_stale`). A reveal that folds
-        // nothing and finds the headroom short comes from a payer whose
-        // watermark trails the node's: a restart that lost accepted vouchers,
-        // then anchored this stream to a fresh root below the signed anchor. No
-        // later proof pays the chunk, so the node rejects the reveal with the
-        // watermark bundle rather than wait on a proof that never comes (#2173).
+        // recorded and no redeem hint fires. It credits nothing: for an honest
+        // payer the lane already holds the money it names, because a concurrent
+        // same-lane sibling raced the shared chain index ahead, or a sibling's
+        // rollover voucher folded this very reveal into the watermark. That money
+        // is already lane credit, which the serve loop reads before it sends. The
+        // proof budget bounds a payer that keeps sending proofs that credit
+        // nothing. A stream anchored below the lane's watermark is a payer whose
+        // ledger trails the node's (a restarted payer): on a lane with no credit
+        // its reveal pays nothing and no sibling's money waits behind it, so
+        // reject it with the watermark bundle at once and let the payer reseed
+        // rather than wait out the proof timeout.
         if !applied.advanced() {
-            // Frontier unchanged, so `guard.state`'s owed claim is what a sibling
-            // has already paid the lane for. Read the receipt amount before the
-            // drop, mirroring the advanced path below.
-            let owed_bytes = guard.state.owed_bytes();
-            let amount = u64::try_from(guard.state.owed()).unwrap_or(u64::MAX);
-            let Some((new_credited, credited_bytes)) =
-                credit_stale(guard.paid_credited, owed.remaining(), owed_bytes)?
-            else {
+            if anchor.trailing && guard.state.credit_bytes() == 0 {
                 let reason = VoucherRejectReason::AmountRegression;
                 let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
-                let paid_credited = guard.paid_credited;
                 drop(guard);
-                Self::log_stale_reject(
-                    "reveal",
-                    &lane_key,
-                    bundle.is_some(),
-                    owed.remaining(),
-                    paid_credited,
-                    owed_bytes,
-                );
                 return self
                     .reject_proof(send, "reveal", &lane_key, reason, bundle)
                     .await;
-            };
-            guard.paid_credited = new_credited;
-            guard
-                .last_voucher_at
-                .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
-            drop(guard);
-            // Only bytes actually credited get a receipt, exactly as the advanced
-            // reveal and benign voucher paths gate it; receipts sum to
-            // `paid_credited`, so this cannot double-count.
-            if credited_bytes > 0 {
-                self.record_receipt(hash, credited_bytes, client_node_id, amount);
             }
-            return Ok(VoucherStop::Continue { credited_bytes });
+            drop(guard);
+            return Ok(VoucherStop::Continue { credited_bytes: 0 });
         }
 
         let owed_bytes = next_state.owed_bytes();
@@ -835,14 +624,10 @@ impl ClientHandler {
         // this reveal (issue #1792 item 3). The store's own clone inside `record`
         // remains, to be removed with the buffer resharding.
         let amount = u64::try_from(next_state.owed()).unwrap_or(u64::MAX);
+        // The reveal's full value is lane credit, as a voucher's is.
+        let credited_bytes = paid_gain(guard.paid_bytes, owed_bytes)?;
         guard.state = next_state;
-        guard.bytes_delivered_cumulative = owed_bytes;
-        // The same rule #1 cap the voucher path uses, against the CHAIN-EXTENDED
-        // frontier: a reveal is what pays for these bytes, so they are as settled
-        // as a signature's.
-        let (new_credited, credited_bytes) =
-            credit_advance(guard.paid_credited, owed.remaining(), owed_bytes)?;
-        guard.paid_credited = new_credited;
+        guard.paid_bytes = owed_bytes;
         if let Err(e) = self.pool_state_store.record(&guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
@@ -850,6 +635,11 @@ impl ClientHandler {
         guard
             .last_voucher_at
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
+        if credited_bytes > 0 {
+            guard.note_credit_raised();
+            guard.last_credit_conn = Some(conn_id);
+            anchor.credited = true;
+        }
         drop(guard);
         self.metrics.preimage_reveal_received();
 
@@ -858,15 +648,11 @@ impl ClientHandler {
         // receipt carries, so the audit log reads uniformly across both proof
         // kinds.
         //
-        // The byte figure is `credited_bytes`, not what this stream still owes,
-        // for the same reason the voucher path logs it: the two diverge. A reveal
-        // walks from the LANE's frontier, so one arriving ahead of a sibling's
-        // covers every index between and pays for more than one stream's chunk,
-        // while `credit_advance` caps it below what the chunk still owes whenever
-        // the watermark does not reach that far. `credited_bytes` is what the lane actually
-        // charged for, which is what an audit log must say (#248/#803). Gated the
-        // same way, so a reveal that advanced the frontier but credited nothing
-        // against the cap logs no payment. `amount` is the lane's new total claim,
+        // The byte figure is `credited_bytes`: what the reveal added to the lane's
+        // paid frontier. A reveal walks from the LANE's frontier, so one arriving
+        // ahead of a sibling's covers every index between and pays for more than
+        // one chunk. That is what an audit log must say (#248/#803). A reveal that
+        // advanced nothing logs no payment. `amount` is the lane's new total claim,
         // computed above before the candidate moved into the lane.
         if credited_bytes > 0 {
             self.record_receipt(hash, credited_bytes, client_node_id, amount);
@@ -983,9 +769,8 @@ impl ClientHandler {
             Err(PoolError::AmountRegression { last, .. }) => {
                 // A voucher at-or-below the lane's SIGNED watermark: a concurrent
                 // same-lane sibling already settled this cumulative. Treat it as
-                // ALREADY-SATISFIED: do not advance the watermark. The caller still
-                // requires lane headroom to pay the chunk such a voucher answers
-                // (`credit_stale`). The one exception here is a DIVERGENT voucher at the SAME amount
+                // ALREADY-SATISFIED: do not advance the watermark. It credits
+                // nothing. The one exception here is a DIVERGENT voucher at the SAME amount
                 // claiming DIFFERENT bytes — the same money for more bytes or for
                 // fewer — which is a single-signer fault (#1699 rule 4). Every
                 // honest voucher at the signed amount re-signs the signed bytes.
@@ -995,8 +780,7 @@ impl ClientHandler {
                 // A rollover that falls short of the live chain's claim is not this
                 // arm, even at exactly the signed watermark: the lane returns
                 // `UnderFold`, and the catch-all below rejects it with the bundle
-                // stating the fold owed. Crediting it zero here would leave the
-                // node waiting on a proof the payer never sends.
+                // stating the fold owed.
                 let amount = U256::from(wire.amount);
                 if amount == last && new_bytes != state.last_bytes_delivered() {
                     return Err(VerifyStop::Reject(
@@ -1042,46 +826,6 @@ impl ClientHandler {
                 let bundle = Self::watermark_bundle_for_reject(reason, state);
                 Err(VerifyStop::Reject(reason, bundle))
             }
-        }
-    }
-
-    /// Log a stale proof that lane headroom could not pay, before the caller
-    /// rejects it `AmountRegression`. Its line (`debug!`, or `warn!` when there
-    /// is no bundle) adds the headroom numbers to the `info!` line that
-    /// [`log_proof_reject`] writes for the reject.
-    ///
-    /// The reject exists to hand the payer the watermark bundle it reseeds from.
-    /// A lane that holds no signature, or a watermark past `u64`, yields no
-    /// bundle: the payer then cannot heal, which only a corrupt lane record
-    /// explains, so that case logs at `warn!`.
-    fn log_stale_reject(
-        proof: &'static str,
-        lane_key: &LaneKey,
-        with_watermark: bool,
-        due: u64,
-        paid_credited: U256,
-        watermark: U256,
-    ) {
-        if with_watermark {
-            tracing::debug!(
-                proof,
-                pool_id = %lane_key.pool_id,
-                signer = %lane_key.signer,
-                due,
-                %paid_credited,
-                %watermark,
-                "rejecting a stale proof that lane headroom cannot pay"
-            );
-        } else {
-            tracing::warn!(
-                proof,
-                pool_id = %lane_key.pool_id,
-                signer = %lane_key.signer,
-                due,
-                %paid_credited,
-                %watermark,
-                "rejecting a stale proof with no watermark bundle; the payer cannot reseed"
-            );
         }
     }
 

@@ -102,7 +102,6 @@ fn default_config_template_covers_every_wired_field() {
         buyer_working_deposit_micro_usdc,
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
-        pool_floor_signer_live_windows,
         usdc_address,
     } = &config::types::BlockchainConfig::default();
     let blockchain = [
@@ -175,10 +174,6 @@ fn default_config_template_covers_every_wired_field() {
         (
             "pool_min_remaining_deposit_micro_usdc =",
             pool_min_remaining_deposit_micro_usdc.is_none(),
-        ),
-        (
-            "pool_floor_signer_live_windows =",
-            pool_floor_signer_live_windows.is_none(),
         ),
         ("usdc_address =", usdc_address.is_none()),
     ];
@@ -291,16 +286,16 @@ fn default_config_template_covers_every_wired_field() {
 
     let config::types::PaymentConfig {
         rate_per_mb,
-        credit_max,
-        credit_ramp_divisor,
+        backfill_window,
+        backfill_divisor,
         frame_target_bytes,
         voucher_commit_interval_ms,
     } = &config::types::PaymentConfig::default();
     let payment = [
         ("rate_per_mb =", rate_per_mb.is_none()),
-        ("credit_max =", credit_max.is_none()),
+        ("backfill_window =", backfill_window.is_none()),
         ("frame_target_bytes =", frame_target_bytes.is_none()),
-        ("credit_ramp_divisor =", credit_ramp_divisor.is_none()),
+        ("backfill_divisor =", backfill_divisor.is_none()),
         (
             "voucher_commit_interval_ms =",
             voucher_commit_interval_ms.is_none(),

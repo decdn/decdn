@@ -66,7 +66,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -307,57 +307,6 @@ const CHUNK_BYTES: u64 = 1024;
 /// mirrors the voucher-flush cadence.
 pub(crate) const PRESENT_RECORD_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The spans [`drive`] took from its lane's unpaid record
-/// ([`PoolLedger::take_unpaid`]). The lane owes them until a gap bills them,
-/// so whatever ends the drive first, an error or the caller dropping the
-/// drive, notes back every span that ends past the offset billing reached.
-/// A span the gap's own funding refusal also noted bills once:
-/// `take_unpaid` merges.
-struct OwedSpans<'l> {
-    ledger: &'l PoolLedger,
-    hash: [u8; 32],
-    /// The owed spans, as `(start, len)` in ascending order.
-    spans: Vec<(u64, u64)>,
-    /// The content offset billing reached: the start of the gap in flight,
-    /// its paid frontier once the gap failed, or `u64::MAX` once every gap
-    /// is filled.
-    unbilled_from: AtomicU64,
-}
-
-impl<'l> OwedSpans<'l> {
-    /// Take `hash`'s owed spans from `ledger`.
-    fn take(ledger: &'l PoolLedger, hash: [u8; 32]) -> Self {
-        Self {
-            ledger,
-            hash,
-            spans: ledger.take_unpaid(hash),
-            unbilled_from: AtomicU64::new(0),
-        }
-    }
-
-    /// Billing has reached `offset`.
-    fn unbilled_from(&self, offset: u64) {
-        self.unbilled_from.store(offset, Ordering::Relaxed);
-    }
-
-    /// Every gap is filled, so every owed span is billed.
-    fn billed(&self) {
-        self.unbilled_from(u64::MAX);
-    }
-}
-
-impl Drop for OwedSpans<'_> {
-    fn drop(&mut self) {
-        let from = self.unbilled_from.load(Ordering::Relaxed);
-        for &(start, len) in &self.spans {
-            let end = start.saturating_add(len);
-            if end > from {
-                self.ledger.note_unpaid(self.hash, start.max(from), end);
-            }
-        }
-    }
-}
-
 /// Drive `fut` (a fetch's whole gap/worker set) to completion while a single
 /// periodic tick flushes the store's `.ranges` present record every `interval`,
 /// so a crash mid-fetch costs at most one `interval` of resume progress (spec
@@ -457,8 +406,7 @@ pub(crate) struct DriveCounters {
     pub(crate) gap_paid_frontier: Option<u64>,
     /// The paid-frontier anchor of the leg [`fill_gap`] runs or ran last: the
     /// content offset the leg opened at, and the wire bytes the lane's
-    /// [`PoolLedger::settlement`] held then. A caller that drops [`fill_gap`] mid-leg prices the leg's paid
-    /// frontier from it ([`ended_frontiers`]). `None` before the first pass.
+    /// [`PoolLedger::settlement`] held then. `None` before the first pass.
     pub(crate) leg_anchor: Option<(u64, U256)>,
 }
 
@@ -686,15 +634,9 @@ where
         .missing_ranges(offset, len)
         .await
         .map_err(store_query_fault)?;
-    // The spans this lane delivered and did not pay for when a funding refusal
-    // ended its last drive join the gaps, even outside the request: the lane
-    // owes them, so the drive opens at their paid frontier and bills them again
-    // although the store holds the bytes.
-    let owed = OwedSpans::take(ledger, hash);
     let gaps = crate::ledger::merge_spans(
         contiguous_byte_ranges(&missing, total_bytes)
             .into_iter()
-            .chain(owed.spans.iter().copied())
             .map(|(start, len)| (start, start.saturating_add(len)))
             .collect(),
     );
@@ -706,11 +648,9 @@ where
     // (and re-pay for) the whole in-flight range on resume; the interval bounds
     // that loss to one `PRESENT_RECORD_FLUSH_INTERVAL`. This loop is the
     // single-source path's sole periodic flush owner — `fill_gap` never flushes.
-    let owed = &owed;
     let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
         let mut counters = DriveCounters::new();
         for (gap_start, gap_len) in gaps {
-            owed.unbilled_from(gap_start);
             fill_gap(
                 store,
                 source,
@@ -740,14 +680,8 @@ where
                 // No steal on the single-source path.
                 None,
             )
-            .await
-            .inspect_err(|_| {
-                // The failed gap's owed part stays owed from its paid
-                // frontier on.
-                owed.unbilled_from(counters.gap_paid_frontier.unwrap_or(gap_start));
-            })?;
+            .await?;
         }
-        owed.billed();
         Ok(())
     })
     .await;
@@ -967,38 +901,6 @@ fn warn_on_new_hole(
     );
 }
 
-/// The paid and delivered frontiers of the gap `[gap_start, asked_end)`, read
-/// after its last leg ended: the leg's paid frontier, clamped to the store's
-/// contiguous delivered frontier, and that delivered frontier. `None` when the
-/// store cannot answer.
-///
-/// The paid wire is the lane's [`PoolLedger::settlement`] past the leg's
-/// baseline, not only its committed watermark. A leg that ends on a fault can
-/// leave a voucher armed whose send did not confirm. The lane's next voucher
-/// builds on that voucher, so the bytes it signs are paid, and the span the
-/// lane owes starts past them.
-pub(crate) async fn ended_frontiers<St: RangedStore + ?Sized>(
-    store: &St,
-    ledger: &PoolLedger,
-    gap_start: u64,
-    asked_end: u64,
-    leg_anchor: Option<(u64, U256)>,
-) -> Option<(u64, u64)> {
-    let (still_missing, total_bytes) =
-        missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start))
-            .await
-            .ok()?;
-    let gap_end = asked_end.min(total_bytes);
-    let delivered = contiguous_frontier(&still_missing, total_bytes, gap_start, gap_end);
-    let settled = ledger.settlement().bytes;
-    let (leg_start, baseline) = leg_anchor.unwrap_or((gap_start, settled));
-    let paid_wire = u64::try_from(settled.saturating_sub(baseline)).unwrap_or(u64::MAX);
-    let paid = crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire)
-        .min(gap_end)
-        .min(delivered);
-    Some((paid, delivered))
-}
-
 /// The per-gap resume/pay loop. Fills the contiguous content span
 /// `[gap_start, gap_start + gap_len)` — a single gap of `missing_ranges` — driving
 /// the [`Pacer`] until it is fully present. `counters` persist across gaps.
@@ -1068,8 +970,6 @@ where
     // so a resumed leg prices the paid frontier against the previous leg's own
     // spend. Both the completion signal (`paid_cleared`) and the Draw resume
     // start are derived from it; see the per-pass computation at the loop top.
-    // It lives in `counters`, so a caller that drops this future mid-leg prices
-    // the leg's paid frontier from it ([`ended_frontiers`]).
     //
     // The baseline is the settlement, not the committed watermark: a leg that
     // opens after a fault left a voucher armed must not count that voucher as
@@ -1161,7 +1061,7 @@ where
         // the previous paid frontier, keeping the frontier monotonic and never summing
         // two legs' (proof-duplicating) wire encodings, which would map PAST the true
         // paid frontier and under-pay.
-        let (leg_start, leg_baseline) = *counters
+        let (_, leg_baseline) = *counters
             .leg_anchor
             .get_or_insert((gap_start, ledger.settlement().bytes));
         let paid_wire_this_leg =
@@ -1186,10 +1086,13 @@ where
         // store leaves a hole before present bytes: the contiguous delivered
         // frontier stops at the hole, so the paid frontier stops there too and
         // the next leg opens at the hole.
-        let paid_frontier =
-            crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire_this_leg)
-                .min(gap_end)
-                .min(delivered_frontier);
+        //
+        // The payer pays ahead of delivery, so the lane's payment runs at or
+        // past what it received. Completion and resume therefore follow the
+        // verified frontier, which is the store's contiguous delivered
+        // frontier: a byte the payer prepaid and has not received is not
+        // verified, and a byte the store holds is never fetched or paid again.
+        let paid_frontier = delivered_frontier.min(gap_end);
         let paid_cleared = paid_frontier.saturating_sub(gap_start);
         counters.gap_paid_frontier = Some(paid_frontier);
 
@@ -1276,9 +1179,6 @@ where
                 );
             }
             PaceDecision::Refuse => {
-                // The lane keeps what it delivered and did not pay for, so
-                // its next drive, if it runs again, bills it.
-                ledger.note_unpaid(hash, paid_frontier, delivered_frontier);
                 counters.gap_paid_frontier = Some(paid_frontier);
                 return Err(anyhow::Error::new(PoolExhausted { gap_start, gap_len }));
             }
@@ -1518,12 +1418,12 @@ where
                     //    pays, so a leg cut short leaves verified bytes unpaid.
                     //    The lane's next drive, if it runs again, opens at the
                     //    paid frontier and bills them.
-                    if let Some((paid, delivered)) =
-                        ended_frontiers(store, ledger, gap_start, asked_end, counters.leg_anchor)
-                            .await
-                    {
-                        counters.gap_paid_frontier = Some(paid);
-                        ledger.note_unpaid(hash, paid, delivered);
+                    // A decode that proves the node's bytes corrupt is the node
+                    // not delivering against the credit it took: write the held
+                    // credit and the corrupt bytes off at this reconciliation.
+                    // A disconnect or a cancel is not one.
+                    if err.downcast_ref::<crate::HashMismatch>().is_some() {
+                        ledger.write_off_prepaid();
                     }
                     return Err(err);
                 }

@@ -182,15 +182,6 @@ pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Precise sizing per ADR 003 is governance/ops policy, not a build-time
 /// constant.
 pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
-/// Default per-signer LIVE concurrency cap `k`, in ramp-start credit windows: `8`.
-/// The most live un-vouchered floor reservation any one capability signer may hold
-/// against a pool is `k · one credit window`, underneath the pool-wide `remaining − M`
-/// ceiling (ADR 003 § Pool solvency, per-signer floor isolation). The window is the
-/// unit rationed — honest need is `concurrent un-vouchered streams × one window`
-/// regardless of pool size — so an absolute count fits it directly. It carries no
-/// permanent memory: it recycles as each stream pays, and never penalizes a signer for
-/// quitting.
-pub const DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS: u64 = 8;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Egress ceiling off unless the operator sets one.
@@ -455,17 +446,15 @@ pub const DEFAULT_NODE_PULL_STALL_WINDOW_SEC: u64 = 20;
 /// `0` disables the throughput test and leaves pure idle detection (one byte per window).
 pub const DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS: u64 = 4096;
 
-/// Default downstream credit-window ceiling (ADR 003 §Credit window): 64 MiB. A
-/// stream's window ramps from one chunk toward this cap in proportion to what
-/// the stream has already paid; a fully-ramped high-bandwidth lane runs
-/// link-bound within this bound, while a non-paying lane stays pinned at the
-/// chunk floor. Node-local policy, floored to one chunk by the serve loop.
-pub const DEFAULT_CREDIT_MAX: u64 = 64 * 1024 * 1024;
-/// Default ramp divisor (ADR 003 §Credit window): 2. The credit window is at most
-/// `paid / credit_ramp_divisor`, so the node's unbilled egress on a stream never
-/// exceeds half the revenue the stream has already confirmed. Lower ramps faster;
-/// `0` opens the full [`DEFAULT_CREDIT_MAX`] from the first byte.
-pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
+/// Default backfill window (ADR 003 § Credit Window): 4 MiB. The most bytes one
+/// backfill returns to a lane's credit when a payer resumes a stream that ended
+/// without a clean close. Node-local policy: no wire field carries it.
+pub const DEFAULT_BACKFILL_WINDOW: u64 = 4 * 1024 * 1024;
+/// Default backfill divisor (ADR 003 § Credit Window): 64. A lane's backfills
+/// total at most `paid / backfill_divisor` bytes, so a payer that claims a drop at
+/// every resume takes at most 1.6% of its paid bytes again. `0` turns backfill
+/// off.
+pub const DEFAULT_BACKFILL_DIVISOR: u64 = 64;
 /// Default serve-path wire-frame target (ADR 005 §`cdn/client/v1`): 1 MiB, matching
 /// the payment quantum so a fully-ramped stream sends about one frame per priced
 /// chunk. Node-local policy that travels on no message: the payer accepts any
@@ -1614,14 +1603,6 @@ fn resolve_blockchain_into(
         .and_then(|b| b.pool_min_remaining_deposit_micro_usdc)
         .unwrap_or(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
 
-    // Per-signer LIVE concurrency cap `k`, in credit windows (ADR 003 § Pool
-    // solvency, per-signer floor isolation). Any value is legal: the node
-    // lower-clamps the cap to one window at use, so `0` behaves as "admit a lone
-    // signer's first stream" rather than wedging it — no bound to enforce.
-    let pool_floor_signer_live_windows = file
-        .and_then(|b| b.pool_floor_signer_live_windows)
-        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS);
-
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
     // the runtime loader: a stale path falls through there, so a headless run
@@ -1656,7 +1637,6 @@ fn resolve_blockchain_into(
         buyer_working_deposit_micro_usdc,
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
-        pool_floor_signer_live_windows,
     }
 }
 
@@ -2798,20 +2778,17 @@ pub fn resolve_payment_into(
             )
         },
     );
-    // Downstream credit-window ceiling (ADR 003 §Credit window). Default 64 MiB;
-    // no upper bound beyond the runtime deposit guard — a larger ceiling is more
-    // unbilled egress the node fronts once a stream has ramped up, which the
-    // operator owns. Floored to one chunk by the serve loop, so no lower
-    // bound is enforced here.
-    let credit_max = file
-        .and_then(|p| p.credit_max.as_ref())
-        .map_or(DEFAULT_CREDIT_MAX, |b| b.get());
-    // Ramp divisor (ADR 003 §Credit window). Default 2; `0` (open the full
-    // ceiling immediately) is a valid setting, so it merges as a first-class
-    // value rather than falling back to the default.
-    let credit_ramp_divisor = file
-        .and_then(|p| p.credit_ramp_divisor)
-        .unwrap_or(DEFAULT_CREDIT_RAMP_DIVISOR);
+    // Backfill window and divisor (ADR 003 § Credit Window). They bound what a
+    // node returns to a lane after a dropped stream, so a payer that claims a drop
+    // at every resume takes at most `1 / backfill_divisor` of its paid bytes again.
+    // A divisor of `0` turns backfill off, so it merges as a first-class value
+    // rather than falling back to the default.
+    let backfill_window = file
+        .and_then(|p| p.backfill_window.as_ref())
+        .map_or(DEFAULT_BACKFILL_WINDOW, |b| b.get());
+    let backfill_divisor = file
+        .and_then(|p| p.backfill_divisor)
+        .unwrap_or(DEFAULT_BACKFILL_DIVISOR);
     // Serve-path wire-frame target (ADR 005 §`cdn/client/v1`). Default and ceiling
     // are both one `CHUNK_BYTES` payment interval: a frame never crosses a payment
     // boundary, so the serve loop clamps every request to the interval remainder and
@@ -2853,8 +2830,8 @@ pub fn resolve_payment_into(
     );
     ResolvedPayment {
         rate_per_mb,
-        credit_max,
-        credit_ramp_divisor,
+        backfill_window,
+        backfill_divisor,
         frame_target_bytes,
         voucher_commit_interval_ms,
     }

@@ -238,11 +238,20 @@ pub async fn decdn_client::buyer_pool::top_up<P: alloy_provider::provider::trait
 pub fn decdn_client::buyer_pool::topped_up_effect(alloy_primitives::aliases::B256, alloy_primitives::aliases::U256) -> alloc::string::String
 pub fn decdn_client::buyer_pool::topped_up_from_receipt(&alloy_rpc_types_eth::transaction::receipt::TransactionReceipt, alloy_primitives::bits::address::Address, alloy_primitives::aliases::B256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::ToppedUpPool>
 pub mod decdn_client::config
-pub struct decdn_client::config::PullConfig
+#[non_exhaustive] pub struct decdn_client::config::PullConfig
+pub decdn_client::config::PullConfig::loss_weight: u64
+pub decdn_client::config::PullConfig::pay_ahead_cap: u64
+pub decdn_client::config::PullConfig::pay_ahead_divisor: u64
 pub decdn_client::config::PullConfig::read_ahead_bytes: u64
 pub decdn_client::config::PullConfig::streamer_lane_cap: usize
+pub decdn_client::config::PullConfig::write_off_budget: u64
 impl decdn_client::config::PullConfig
+pub fn decdn_client::config::PullConfig::apply_pay_ahead(&self)
 pub const fn decdn_client::config::PullConfig::new() -> Self
+pub const fn decdn_client::config::PullConfig::pay_ahead_policy(&self) -> decdn_client::payer_window::PayAheadPolicy
+pub const fn decdn_client::config::PullConfig::with_pay_ahead(self, decdn_client::payer_window::PayAheadPolicy) -> Self
+pub const fn decdn_client::config::PullConfig::with_read_ahead_bytes(self, u64) -> Self
+pub const fn decdn_client::config::PullConfig::with_streamer_lane_cap(self, usize) -> Self
 impl core::default::Default for decdn_client::config::PullConfig
 pub fn decdn_client::config::PullConfig::default() -> Self
 pub mod decdn_client::connection
@@ -352,6 +361,44 @@ pub mod decdn_client::endpoint
 pub fn decdn_client::endpoint::client_discovery(core::option::Option<&std::path::Path>) -> anyhow::Result<decdn_common::config::resolved::ResolvedDiscovery>
 pub async fn decdn_client::endpoint::client_endpoint(&[iroh_base::relay_url::RelayUrl], &decdn_common::config::resolved::ResolvedDiscovery) -> anyhow::Result<iroh::endpoint::Endpoint>
 pub fn decdn_client::endpoint::resolve_relays(core::option::Option<&str>, core::option::Option<&std::path::Path>) -> anyhow::Result<alloc::vec::Vec<iroh_base::relay_url::RelayUrl>>
+pub mod decdn_client::payer_window
+pub struct decdn_client::payer_window::NodeTrust
+impl decdn_client::payer_window::NodeTrust
+pub fn decdn_client::payer_window::NodeTrust::budget_spent(&self) -> bool
+pub fn decdn_client::payer_window::NodeTrust::cap_room_bytes(&self, u64) -> u64
+pub fn decdn_client::payer_window::NodeTrust::detached() -> alloc::sync::Arc<Self>
+pub fn decdn_client::payer_window::NodeTrust::lost(&self) -> u64
+pub fn decdn_client::payer_window::NodeTrust::note_verified(&self, u64)
+pub fn decdn_client::payer_window::NodeTrust::outstanding(&self) -> u64
+pub fn decdn_client::payer_window::NodeTrust::verified(&self) -> u64
+pub fn decdn_client::payer_window::NodeTrust::window_bytes(&self, u64) -> u64
+pub fn decdn_client::payer_window::NodeTrust::write_off(&self, u64, u64, u64)
+pub struct decdn_client::payer_window::PayAheadPolicy
+pub decdn_client::payer_window::PayAheadPolicy::cap_micro_usdc: u64
+pub decdn_client::payer_window::PayAheadPolicy::divisor: u64
+pub decdn_client::payer_window::PayAheadPolicy::loss_weight: u64
+pub decdn_client::payer_window::PayAheadPolicy::write_off_budget_micro_usdc: u64
+impl decdn_client::payer_window::PayAheadPolicy
+pub fn decdn_client::payer_window::PayAheadPolicy::cap_bytes(&self, u64) -> u64
+pub const fn decdn_client::payer_window::PayAheadPolicy::new() -> Self
+pub fn decdn_client::payer_window::PayAheadPolicy::window_bytes(&self, u64, u64, u64) -> u64
+impl core::default::Default for decdn_client::payer_window::PayAheadPolicy
+pub fn decdn_client::payer_window::PayAheadPolicy::default() -> Self
+pub struct decdn_client::payer_window::PayerWindows
+impl decdn_client::payer_window::PayerWindows
+pub fn decdn_client::payer_window::PayerWindows::configure(&self, decdn_client::payer_window::PayAheadPolicy)
+pub fn decdn_client::payer_window::PayerWindows::new(decdn_client::payer_window::PayAheadPolicy) -> Self
+pub fn decdn_client::payer_window::PayerWindows::node(&self, alloy_primitives::bits::address::Address) -> alloc::sync::Arc<decdn_client::payer_window::NodeTrust>
+pub fn decdn_client::payer_window::PayerWindows::policy(&self) -> decdn_client::payer_window::PayAheadPolicy
+pub fn decdn_client::payer_window::PayerWindows::process() -> &'static Self
+pub fn decdn_client::payer_window::PayerWindows::seed(&self, alloy_primitives::bits::address::Address, u64, u64)
+pub fn decdn_client::payer_window::PayerWindows::snapshot(&self) -> alloc::vec::Vec<(alloy_primitives::bits::address::Address, u64, u64)>
+pub fn decdn_client::payer_window::PayerWindows::written_off_micro_usdc(&self) -> u64
+pub const decdn_client::payer_window::DEFAULT_LOSS_WEIGHT: u64
+pub const decdn_client::payer_window::DEFAULT_PAY_AHEAD_CAP_MICRO_USDC: u64
+pub const decdn_client::payer_window::DEFAULT_PAY_AHEAD_DIVISOR: u64
+pub const decdn_client::payer_window::DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC: u64
+pub const decdn_client::payer_window::WINDOW_FLOOR_BYTES: u64
 pub mod decdn_client::probe
 pub struct decdn_client::probe::ProbeRtt
 pub decdn_client::probe::ProbeRtt::direct: bool
@@ -913,11 +960,14 @@ impl core::fmt::Display for decdn_client::driver::PoolExhausted
 pub fn decdn_client::driver::PoolExhausted::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::PoolLedger
 impl decdn_client::PoolLedger
+pub fn decdn_client::PoolLedger::attach_trust(&self, alloc::sync::Arc<decdn_client::payer_window::NodeTrust>)
 pub fn decdn_client::PoolLedger::committed(&self) -> decdn_client::Cumulative
 pub fn decdn_client::PoolLedger::new(decdn_client::Cumulative) -> Self
 pub fn decdn_client::PoolLedger::paid_bytes(&self) -> alloy_primitives::aliases::U256
+pub fn decdn_client::PoolLedger::prepaid(&self) -> u64
 pub fn decdn_client::PoolLedger::settlement(&self) -> decdn_client::Cumulative
 pub fn decdn_client::PoolLedger::take_unsaved_rebase(&self) -> core::option::Option<decdn_client::Cumulative>
+pub fn decdn_client::PoolLedger::trust(&self) -> &alloc::sync::Arc<decdn_client::payer_window::NodeTrust>
 pub fn decdn_client::PoolLedger::wire_bytes(&self) -> u64
 pub struct decdn_client::PoolReplaced
 pub decdn_client::PoolReplaced::closed: decdn_incentive::lane::PoolId
@@ -938,11 +988,20 @@ impl decdn_client::ProvenSize
 pub const fn decdn_client::ProvenSize::get(self) -> u64
 impl core::fmt::Display for decdn_client::ProvenSize
 pub fn decdn_client::ProvenSize::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_client::PullConfig
+#[non_exhaustive] pub struct decdn_client::PullConfig
+pub decdn_client::PullConfig::loss_weight: u64
+pub decdn_client::PullConfig::pay_ahead_cap: u64
+pub decdn_client::PullConfig::pay_ahead_divisor: u64
 pub decdn_client::PullConfig::read_ahead_bytes: u64
 pub decdn_client::PullConfig::streamer_lane_cap: usize
+pub decdn_client::PullConfig::write_off_budget: u64
 impl decdn_client::config::PullConfig
+pub fn decdn_client::config::PullConfig::apply_pay_ahead(&self)
 pub const fn decdn_client::config::PullConfig::new() -> Self
+pub const fn decdn_client::config::PullConfig::pay_ahead_policy(&self) -> decdn_client::payer_window::PayAheadPolicy
+pub const fn decdn_client::config::PullConfig::with_pay_ahead(self, decdn_client::payer_window::PayAheadPolicy) -> Self
+pub const fn decdn_client::config::PullConfig::with_read_ahead_bytes(self, u64) -> Self
+pub const fn decdn_client::config::PullConfig::with_streamer_lane_cap(self, usize) -> Self
 impl core::default::Default for decdn_client::config::PullConfig
 pub fn decdn_client::config::PullConfig::default() -> Self
 pub struct decdn_client::PullDeadlines

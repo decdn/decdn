@@ -322,26 +322,6 @@ pub struct BlockchainConfig {
     /// scale; sizing this precisely per ADR 003 is governance/ops policy, not a
     /// build-time constant.
     pub pool_min_remaining_deposit_micro_usdc: Option<u64>,
-    /// Per-signer LIVE concurrency cap `k`, counted in ramp-start credit windows
-    /// (ADR 003 § Pool solvency, per-signer floor isolation): the most live
-    /// un-vouchered floor reservation any ONE capability signer may hold against a
-    /// pool, `k · one credit window`, underneath the pool-wide `remaining − M`
-    /// ceiling. The credit window is its floor (one chunk plus one chunk group)
-    /// normally, and at `credit_ramp_divisor == 0` it is `credit_max` raised to
-    /// that floor.
-    ///
-    /// This bounds concurrency, not paid throughput: a signer that pays its vouchers
-    /// releases that stream's reservation, so its cap recycles and a stream already
-    /// under way is never slowed. It carries no permanent memory and never penalizes a
-    /// signer for quitting.
-    ///
-    /// The window is the unit actually being rationed: honest need is `concurrent
-    /// un-vouchered streams × one window` regardless of the pool's size, so an absolute
-    /// window count fits it directly. Node-local risk policy — it needs no pool-owner
-    /// cooperation. Lower-clamped to one window (so a lone signer's first stream is
-    /// always admissible). Absent => default (`8`). See
-    /// `DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS`.
-    pub pool_floor_signer_live_windows: Option<u64>,
     /// USDC settlement-token contract address — the ERC-20 clients spend on
     /// deposits into a payment pool. Declared here so a client config that names
     /// it passes `decdn config validate` under this section's
@@ -937,23 +917,19 @@ pub enum S3Credentials {
 pub struct PaymentConfig {
     /// Rate per MB in USDC base units.
     pub rate_per_mb: Option<u64>,
-    /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window). The
-    /// per-stream window ramps toward this cap as the stream pays, bounding the
-    /// node's credit exposure (unbilled egress already on the wire) to
-    /// `paid / credit_ramp_divisor`; the client's exposure stays zero (vouchers
-    /// are cumulative over delivered bytes). Absent =>
-    /// [`crate::config::DEFAULT_CREDIT_MAX`] (64 MiB). Floored at one chunk
-    /// ([`decdn_protocol::client::CHUNK_BYTES`], 1 MiB); a value at or below one
-    /// chunk reproduces the strict stop-and-wait cadence — deliver a chunk, then
-    /// recoup it. It is node-local config, not a governance-owned parameter — no
-    /// contract holds a delivery-cadence value.
-    pub credit_max: Option<decdn_config_types::Bytes>,
-    /// Ramp divisor for the credit window (ADR 003 §Credit window): the window is
-    /// `paid / credit_ramp_divisor`, floored at one chunk plus one chunk group and capped at
-    /// [`Self::credit_max`]. Absent => [`crate::config::DEFAULT_CREDIT_RAMP_DIVISOR`]
-    /// (2). `0` opens the full ceiling immediately, reproducing the flat-window
-    /// behavior. It is node-local config, not a governance-owned parameter.
-    pub credit_ramp_divisor: Option<u64>,
+    /// The most bytes one backfill returns to a lane's credit (ADR 003 § Credit
+    /// Window). A payer that resumes a stream that ended without a clean close gets
+    /// the gap between its resume offset and the node's remembered end offset back
+    /// as credit, up to this many bytes. Absent =>
+    /// [`crate::config::DEFAULT_BACKFILL_WINDOW`] (4 MiB). It is node-local config,
+    /// not a wire field and not a governance-owned parameter.
+    pub backfill_window: Option<decdn_config_types::Bytes>,
+    /// A lane's total backfill allowance is `paid / backfill_divisor` bytes, less
+    /// earlier backfills (ADR 003 § Credit Window). Absent =>
+    /// [`crate::config::DEFAULT_BACKFILL_DIVISOR`] (64), so a payer that claims a
+    /// drop at every resume takes at most 1.6% of its paid bytes again. `0` turns
+    /// backfill off. It is node-local config.
+    pub backfill_divisor: Option<u64>,
     /// Target wire-frame size for the serve path, in bytes (ADR 005
     /// §`cdn/client/v1`). Absent => [`crate::config::DEFAULT_FRAME_TARGET_BYTES`]
     /// (1 MiB). Must be > 0.

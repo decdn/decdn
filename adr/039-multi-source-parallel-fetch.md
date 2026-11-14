@@ -160,7 +160,7 @@ The same scheduler drives two consumers over one shared code path: the client fe
 - No new wire surface: each source is an ordinary bounded `cdn/client/v1` paid stream. The mechanism is a pure client-side policy.
 - A corrupt or vanished source costs only a range reassignment, never a restart — the verified-range property ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)) localizes every failure.
 - Verification failures cost the source its payment for that range, and a node lowers the source's local reputation score, so multi-source fetch hardens the network against bad sources rather than merely tolerating them.
-- No new node-side abuse surface: a source sees a bounded paid stream identical to today's, so the existing ramped credit window and deposit guard apply unchanged.
+- No new node-side abuse surface: a source sees a bounded paid stream identical to today's, so the existing lane credit and deposit gate apply unchanged.
 - Tail-stealing needs no separate "keep the fastest source hot" controller: the fastest source finishes its segment soonest and so steals the most remaining work, as an emergent property of the assignment rule.
 
 ### Negative

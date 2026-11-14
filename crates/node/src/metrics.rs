@@ -85,7 +85,6 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_pull_loop_guard_total",
     "decdn_serve_stream_rejected_range_not_satisfiable_total",
     "decdn_serve_stream_rejected_signer_cap_exhausted_total",
-    "decdn_serve_stream_rejected_signer_floor_at_cap_total",
     "decdn_serve_stream_rejected_stream_cap_full_total",
     "decdn_serve_stream_rejected_timestamp_skew_total",
     "decdn_serve_stream_rejected_unknown_lane_total",
@@ -1899,23 +1898,13 @@ pub struct DecdnMetrics {
     /// `serve_stream` requests refused before any bytes are served because the
     /// requesting pool's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
-    /// response; what is never signed is an `ok: true`.) **Three** guards bump
-    /// this. Not a sequence any one request walks: a cache HIT reaches only (3),
-    /// and the window tier returns out of `serve_stream`, so (2) and (3) are
-    /// mutually exclusive. A miss passes (1) and then at most one of (2)/(3):
-    /// 1. the cache-miss **floor** (#1519) — one credit window, applied above
-    ///    every fill tier so none of them fronts origin egress or upstream USDC
-    ///    for a pool that cannot pay for a single interval;
-    /// 2. the **window** tier's speculative ceiling (#856) — the whole-blob cost
-    ///    when `max_blob_size_bytes` is finite, else the window cost;
-    /// 3. the **direct-serve** ceiling (#1516) —
-    ///    `min(credit window, chunk-group-aligned request span)`.
-    ///
-    /// It does not distinguish them, so a spike cannot be attributed to a layer
-    /// from this series alone — the log line at the refusal site is what says
-    /// which. Guards (1) and (3) also split by CAP: both run the two-level floor
-    /// check, and its per-signer arm bumps `serve_stream_rejected_signer_floor_at_cap`
-    /// instead, so this counter is the pool-ceiling half of them.
+    /// response; what is never signed is an `ok: true`.) **Two** guards bump
+    /// this, and both ask whether the pool's `remaining − M` covers one chunk
+    /// (capped by the request's aligned span): the pull-through tiers' guard
+    /// (#856, #1519), which runs before any tier fronts origin egress or upstream
+    /// USDC, and the **direct-serve** guard (#1516). It does not distinguish them,
+    /// so a spike cannot be attributed to a guard from this series alone — the log
+    /// line at the refusal site is what says which.
     /// Signed as `Unfunded`: every guard runs past the lane-ownership proof, so
     /// its audience is the proven requester (ADR 005 §Open-time refusal classes).
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
@@ -1992,17 +1981,6 @@ pub struct DecdnMetrics {
     /// rising value means clients ask this node for more of a blob than its cap
     /// lets it hold. Visible name: `decdn_serve_stream_midstream_blob_too_large_total`.
     pub serve_stream_midstream_blob_too_large: Counter,
-    /// Delivery refused because ONE capability signer hit its per-signer live
-    /// concurrency cap of un-vouchered reservation, while the pool itself can still
-    /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
-    /// Signed as `NotFound`, because it clears by waiting rather than by funding
-    /// (ADR 005 §Open-time refusal classes), so this counter is the only place
-    /// the reason survives — a rising value means one signer runs
-    /// more concurrent un-vouchered streams than its share covers while the pool as a
-    /// whole is solvent. The two remedies differ: a pool shortfall clears with a
-    /// top-up, a signer at its share does not. Visible name:
-    /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
-    pub serve_stream_rejected_signer_floor_at_cap: Counter,
     /// Whole-blob requests from an active staker refused while this node's own
     /// upstream open for the blob was in progress (#2224): the guard that stops
     /// partial holders pulling a blob from each other in a loop. Signed as
@@ -3558,7 +3536,6 @@ recorders! {
     /// Record a `serve_stream` delivery refused because this capability signer hit its
     /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
     /// whole can still pay.
-    serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
 
     /// Record a whole-blob request from an active staker refused while this
     /// node's own upstream open for the blob was in progress (#2224).

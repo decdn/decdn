@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
@@ -48,13 +47,7 @@ async fn verify_voucher_advances_candidate() {
         None,
         decdn_incentive::LaneChain::NONE,
     );
-    let lane = Arc::new(Mutex::new(LaneDeliveryState {
-        state: seed,
-        bytes_delivered_cumulative: U256::ZERO,
-        paid_credited: U256::ZERO,
-        last_voucher_at: AtomicU64::new(0),
-        ramp_pool: Arc::default(),
-    }));
+    let lane = Arc::new(Mutex::new(LaneDeliveryState::hydrated(seed)));
     handler.lanes.insert(lane_key, Arc::clone(&lane));
 
     // A cumulative voucher paying exactly one MB from zero, signed by the
@@ -107,234 +100,26 @@ async fn verify_voucher_advances_candidate() {
     );
 }
 
-/// Rule #1 credit cap: a benign already-satisfied voucher (watermark
-/// unchanged) on a lane with no slack credits ZERO — this is what blocks the
-/// free-download leech (a client that delivers a window then pays only (0,0)
-/// vouchers must not have its window reopened).
+/// A proof's gain is the bytes it added to the lane's paid frontier: a proof
+/// that folds nothing gains zero, and a lane never gains a negative amount.
 #[test]
-fn credit_advance_benign_credits_zero() {
-    let (new_credited, credited) = super::credit_advance(U256::ZERO, 500, U256::ZERO)
-        .expect("credit_advance is infallible for in-range values");
-    assert_eq!(new_credited, U256::ZERO);
+fn a_proofs_gain_is_what_it_added_to_the_paid_frontier() -> anyhow::Result<()> {
+    assert_eq!(super::paid_gain(U256::ZERO, U256::from(500u64))?, 500);
     assert_eq!(
-        credited, 0,
-        "a benign voucher with no watermark slack must credit ZERO (leech block)"
-    );
-}
-
-/// Rule #1 credit cap: an advance whose watermark grew to cover the delta
-/// credits the full delta — no behavior change for honest flows.
-#[test]
-fn credit_advance_full_delta() {
-    let (new_credited, credited) = super::credit_advance(U256::ZERO, 500, U256::from(500u64))
-        .expect("credit_advance is infallible for in-range values");
-    assert_eq!(new_credited, U256::from(500u64));
-    assert_eq!(credited, 500, "an advance credits the full delivered delta");
-}
-
-/// Rule #1 credit cap: a voucher whose watermark is already fully credited
-/// credits nothing further, and `paid_credited` does not advance past it.
-#[test]
-fn credit_advance_already_credited() {
-    let (new_credited, credited) =
-        super::credit_advance(U256::from(500u64), 500, U256::from(500u64))
-            .expect("credit_advance is infallible for in-range values");
-    assert_eq!(new_credited, U256::from(500u64));
-    assert_eq!(
-        credited, 0,
-        "an already fully credited watermark credits nothing further"
-    );
-}
-
-/// A wire voucher naming `chain_root`, for the credit-share tests. Only the
-/// root matters to [`super::voucher_credit_delta`]; the other fields are
-/// placeholders.
-fn wire_voucher_with_root(chain_root: [u8; 32]) -> decdn_protocol::client::Voucher {
-    decdn_protocol::client::Voucher {
-        signature: vec![0u8; 65],
-        amount: 0,
-        bytes_delivered: 0,
-        chain_root,
-        chunk_price: 0,
-    }
-}
-
-/// A stale proof is credited only when lane headroom pays all of its chunk.
-/// The credit it would take stays uncommitted on a short headroom, so a stream
-/// the caller then rejects consumes nothing (#2173).
-#[test]
-fn a_stale_proof_is_credited_only_in_full() -> anyhow::Result<()> {
-    let chunk = super::super::CHUNK_BYTES;
-    assert_eq!(
-        super::credit_stale(U256::ZERO, chunk, U256::from(2 * chunk))?,
-        Some((U256::from(chunk), chunk)),
-        "headroom covering the chunk pays it"
-    );
-    assert_eq!(
-        super::credit_stale(U256::from(chunk), chunk, U256::from(chunk + 1))?,
-        None,
-        "one byte of headroom does not pay a chunk"
-    );
-    assert_eq!(
-        super::credit_stale(U256::from(chunk), chunk, U256::from(chunk))?,
-        None,
-        "no headroom pays nothing"
-    );
-    Ok(())
-}
-
-/// A metering voucher (live root) takes no whole chunk from lane headroom,
-/// even when the headroom covers it: the reveal it precedes, or a sibling's
-/// reveal it folded, pays that chunk.
-#[test]
-fn a_metering_voucher_credits_no_whole_chunk() {
-    let chunk = super::super::CHUNK_BYTES;
-    let wire = wire_voucher_with_root([0x5E; 32]);
-    let delta = super::voucher_credit_delta(&wire, super::OwedChunk::new(chunk));
-    assert_eq!(delta, 0, "a metering voucher pays no whole chunk");
-    let (new_credited, credited) = super::credit_advance(U256::ZERO, delta, U256::from(4 * chunk))
-        .expect("credit_advance is infallible for in-range values");
-    assert_eq!(new_credited, U256::ZERO, "the headroom stays unclaimed");
-    assert_eq!(credited, 0);
-}
-
-/// A metering voucher that settles a partial closing chunk is the payment
-/// for those bytes, so it credits what the chunk still owes.
-#[test]
-fn a_metering_voucher_settles_a_closing_partial() {
-    let partial = super::super::CHUNK_BYTES - 1;
-    let wire = wire_voucher_with_root([0x5E; 32]);
-    assert_eq!(
-        super::voucher_credit_delta(&wire, super::OwedChunk::new(partial)),
-        partial,
-        "a closing residual under one chunk credits in full"
-    );
-}
-
-/// A sealed voucher (zero root) meters no chain, so nothing else can pay the
-/// chunk it answers: it credits what the chunk still owes.
-#[test]
-fn a_sealed_voucher_credits_a_whole_chunk() {
-    let chunk = super::super::CHUNK_BYTES;
-    let wire = wire_voucher_with_root([0u8; 32]);
-    assert_eq!(
-        super::voucher_credit_delta(&wire, super::OwedChunk::new(chunk)),
-        chunk,
-        "a sealed voucher pays its whole chunk"
-    );
-}
-
-/// A proof that pays part of a chunk leaves the rest owed, and the chunk is
-/// settled only when its remainder reaches zero (#2132).
-#[test]
-fn an_owed_chunk_settles_only_when_fully_paid() -> anyhow::Result<()> {
-    let mut owed = super::OwedChunk::new(1000);
-    assert!(!owed.settle(0)?, "a zero credit settles nothing");
-    assert!(!owed.settle(400)?, "a partial credit leaves the rest owed");
-    assert_eq!(owed.remaining(), 600);
-    assert_eq!(owed.len(), 1000, "the delivered length does not change");
-    assert!(owed.settle(600)?, "paying the remainder settles the chunk");
-    assert_eq!(owed.remaining(), 0);
-    Ok(())
-}
-
-/// A credit larger than what the chunk still owes is a node accounting fault,
-/// never a quiet settle: the serve loop has already added it to `paid`.
-#[test]
-fn an_over_credit_is_refused() {
-    let mut owed = super::OwedChunk::new(10);
-    assert!(owed.settle(11).is_err(), "an over-credit must not settle");
-}
-
-/// The post-recoup accounting check passes only when the unpaid bytes are
-/// exactly the held owed chunks plus the ones not yet cut into a chunk.
-#[test]
-fn unpaid_bytes_must_all_be_tracked() {
-    let none = std::collections::VecDeque::new();
-    assert!(super::ensure_unpaid_bytes_tracked(1000, 900, 100, &none).is_ok());
-    let held = std::collections::VecDeque::from([super::OwedChunk::new(100)]);
-    assert!(
-        super::ensure_unpaid_bytes_tracked(1000, 800, 100, &held).is_ok(),
-        "a held owed chunk counts as tracked"
-    );
-    assert!(
-        super::ensure_unpaid_bytes_tracked(1000, 800, 100, &none).is_err(),
-        "a shortfall nothing tracks is refused"
-    );
-    assert!(
-        super::ensure_unpaid_bytes_tracked(1000, 1001, 0, &none).is_err(),
-        "paid running ahead of delivered is refused"
-    );
-}
-
-/// The newest owed chunk waits until the leaf that verifies its last byte is
-/// on the wire; every older chunk, and any chunk once the range is all sent,
-/// is payable at once.
-#[test]
-fn the_newest_chunk_is_payable_only_past_the_verify_lag() {
-    let lag = decdn_client::VERIFY_LAG_BYTES;
-    let mut pending = std::collections::VecDeque::from([super::OwedChunk::new(1 << 20)]);
-    assert!(
-        super::pop_payable(&mut pending, lag - 1, false).is_none(),
-        "the payer cannot verify the chunk's last byte yet"
-    );
-    assert!(super::pop_payable(&mut pending, lag, false).is_some());
-
-    let mut pending = std::collections::VecDeque::from([super::OwedChunk::new(1 << 20)]);
-    assert!(
-        super::pop_payable(&mut pending, 0, true).is_some(),
-        "a fully sent range is payable to its end"
-    );
-
-    let mut pending = std::collections::VecDeque::from([
-        super::OwedChunk::new(1 << 20),
-        super::OwedChunk::new(1 << 20),
-    ]);
-    assert!(
-        super::pop_payable(&mut pending, 0, false).is_some(),
-        "an older chunk has a whole chunk after it"
-    );
-    assert!(super::pop_payable(&mut pending, 0, false).is_none());
-}
-
-/// A whole chunk that a proof paid in part is still a whole chunk: a metering
-/// voucher takes nothing from its remainder, so the remainder cannot eat the
-/// headroom a sibling's reveal needs. A sealed voucher takes exactly the
-/// remainder, never the chunk's full length.
-#[test]
-fn a_partly_paid_whole_chunk_keeps_its_whole_chunk_rule() {
-    let chunk = super::super::CHUNK_BYTES;
-    let mut owed = super::OwedChunk::new(chunk);
-    assert!(
-        !owed
-            .settle(chunk / 4)
-            .expect("a partial credit fits the chunk")
-    );
-    let remainder = chunk - chunk / 4;
-
-    let metering = wire_voucher_with_root([0x5E; 32]);
-    assert_eq!(
-        super::voucher_credit_delta(&metering, owed),
+        super::paid_gain(U256::from(500u64), U256::from(500u64))?,
         0,
-        "a metering voucher pays no part of a whole chunk"
+        "an already-satisfied proof adds nothing"
     );
-    let sealed = wire_voucher_with_root([0u8; 32]);
     assert_eq!(
-        super::voucher_credit_delta(&sealed, owed),
-        remainder,
-        "a sealed voucher pays what the chunk still owes"
+        super::paid_gain(U256::from(500u64), U256::from(100u64))?,
+        0,
+        "a frontier that did not move gains zero, never a wrapped value"
     );
-}
-
-/// A partly paid closing partial chunk credits only its remainder, from any
-/// voucher.
-#[test]
-fn a_partly_paid_closing_partial_credits_its_remainder() {
-    let partial = super::super::CHUNK_BYTES / 2;
-    let mut owed = super::OwedChunk::new(partial);
-    assert!(!owed.settle(100).expect("a partial credit fits the chunk"));
-    let metering = wire_voucher_with_root([0x5E; 32]);
-    assert_eq!(super::voucher_credit_delta(&metering, owed), partial - 100);
+    assert!(
+        super::paid_gain(U256::ZERO, U256::MAX).is_err(),
+        "a gain past u64 is a node accounting fault"
+    );
+    Ok(())
 }
 
 /// A voucher at-or-below the lane watermark — a concurrent sibling raced ahead

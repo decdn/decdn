@@ -376,7 +376,6 @@ fn build_config(
             // gas-funded-but-otherwise-inert) node's boot path chain-write-free.
             buyer_max_approve: false,
             pool_min_remaining_deposit_micro_usdc: 1_000_000,
-            pool_floor_signer_live_windows: 8,
             slash_judge_address: addrs.slash_judge.to_string(),
             content_blacklist_address: Some(addrs.content_blacklist.to_string()),
             content_blacklist_poll_interval_sec: 600,
@@ -434,8 +433,8 @@ fn build_config(
         payment: ResolvedPayment {
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             rate_per_mb: 10,
-            credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
-            credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+            backfill_window: decdn_common::config::DEFAULT_BACKFILL_WINDOW,
+            backfill_divisor: decdn_common::config::DEFAULT_BACKFILL_DIVISOR,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
         },
         observability: ResolvedObservability {

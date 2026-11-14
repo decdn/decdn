@@ -208,16 +208,14 @@ async fn run_to_termination(
 ) -> anyhow::Result<Option<Result<(), FillError>>> {
     let hash = Hash::from(root);
     let source = BackendSource::new(engine.clone(), root, total, fresh_ledger());
-    // Start the served frontier at `total` so the downstream `RampPacer` never
-    // gates the pull (this test exercises the completion path, not the window).
-    let session = FillSession::starting_at(bao_tree::blake3::Hash::from(root), total, total);
+    // The downstream lane has credit for the whole blob, so the `CreditPacer`
+    // never gates the pull (this test exercises the completion path, not the
+    // credit pacing).
+    let session = FillSession::starting_at(bao_tree::blake3::Hash::from(root), total, 0);
+    session.extend_served_from(0, total);
 
     let cancel = CancellationToken::new();
     let metrics = Arc::new(crate::metrics::Metrics::new());
-    // A floor comfortably larger than the blob: `ramped_credit_window` never
-    // returns below `floor`, so with `served_paid == total` the pull never waits,
-    // regardless of divisor/credit_max — this only has to admit the whole gap.
-    let credit_floor = total.saturating_mul(4).max(decdn_cache::CHUNK_GROUP_BYTES);
 
     tokio::time::timeout(
         Duration::from_secs(45),
@@ -227,10 +225,6 @@ async fn run_to_termination(
             source,
             hash,
             0,
-            0,
-            2,
-            credit_floor,
-            credit_floor,
             0,
             total,
             Arc::clone(&session),

@@ -15,7 +15,52 @@ fn sample_record() -> PeerRecord {
         rate_per_mb: None,
         sample_count: 0,
         last_failure_at_secs: None,
+        verified_bytes: 0,
+        lost_bytes: 0,
     }
+}
+
+#[test]
+fn a_record_without_pay_ahead_counts_still_loads() {
+    let rec = sample_record();
+    let mut json: serde_json::Value = serde_json::to_value(&rec).unwrap();
+    let object = json.as_object_mut().unwrap();
+    object.remove("verified_bytes");
+    object.remove("lost_bytes");
+    let loaded: PeerRecord = serde_json::from_value(json).unwrap();
+    assert_eq!((loaded.verified_bytes, loaded.lost_bytes), (0, 0));
+}
+
+#[test]
+fn a_record_holding_a_track_record_is_never_pruned() {
+    let cfg = StoreConfig::default();
+    let mut rec = sample_record();
+    let ancient = rec.identity_seen_at_secs + cfg.identity_prune_secs + 1;
+    assert!(rec.identity_prunable(ancient, &cfg));
+    rec.verified_bytes = 1;
+    assert!(!rec.identity_prunable(ancient, &cfg));
+    rec.verified_bytes = 0;
+    rec.lost_bytes = 1;
+    assert!(!rec.identity_prunable(ancient, &cfg));
+}
+
+#[test]
+fn the_track_record_round_trips_through_the_store_by_operator_address() {
+    use crate::payer_window::{PayAheadPolicy, PayerWindows};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = PeerStore::open(dir.path());
+    let rec = sample_record();
+    store.write(&rec).unwrap();
+
+    let windows = PayerWindows::new(PayAheadPolicy::new());
+    windows.seed(rec.eth_address, 7 << 20, 3);
+    store.save_windows(&windows).unwrap();
+
+    let fresh = PayerWindows::new(PayAheadPolicy::new());
+    store.seed_windows(&fresh);
+    let node = fresh.node(rec.eth_address);
+    assert_eq!((node.verified(), node.lost()), (7 << 20, 3));
 }
 
 #[test]

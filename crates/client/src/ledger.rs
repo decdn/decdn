@@ -17,6 +17,7 @@ use decdn_protocol::MB_BYTES;
 use decdn_protocol::client::WatermarkBundle;
 use tokio::sync::Mutex;
 
+use crate::payer_window::NodeTrust;
 use crate::receipt::LaneEvidence;
 
 /// A lane's cumulative voucher state: the absolute totals carried by the most
@@ -39,6 +40,15 @@ impl Cumulative {
         Self {
             bytes: self.bytes.saturating_add(other.bytes),
             amount: self.amount.saturating_add(other.amount),
+        }
+    }
+
+    /// Componentwise minimum.
+    #[must_use]
+    fn min_componentwise(self, other: Self) -> Self {
+        Self {
+            bytes: self.bytes.min(other.bytes),
+            amount: self.amount.min(other.amount),
         }
     }
 
@@ -531,18 +541,6 @@ pub struct PoolLedger {
     /// to another provider. A timed-out send is treated exactly like any other
     /// ambiguous send: the voucher stays armed and `settlement` settles high.
     send_deadline: Duration,
-    /// Content spans a lane delivered and did not pay for when a leg ended
-    /// early, on a funding refusal, a fault or a cancel: `(hash, start, end)`.
-    /// ADR 003's credit window lets the node stream ahead of the voucher that
-    /// pays for it, so the store can hold these bytes while the lane owes
-    /// them. When this lane runs again, its next drive takes them and bills
-    /// them again ([`Self::take_unpaid`]).
-    /// They live only on this lane. A fetch that completes without this lane
-    /// running again leaves them unpaid, and so does a replaced pool or a
-    /// rotated key, which builds a new lane. An unpaid span is the node's
-    /// credit-window loss, at most one credit window per lane, as for any
-    /// client that ends mid-stream.
-    unpaid: std::sync::Mutex<Vec<([u8; 32], u64, u64)>>,
     /// The signed messages a pull receipt keeps for this lane, once a
     /// [`crate::receipt::ReceiptEvidence`] collector attaches it. Empty on a
     /// lane nothing collects for, which keeps a long-lived ledger (a node's
@@ -552,6 +550,27 @@ pub struct PoolLedger {
     /// The `ChunkData` payload bytes this lane's streams read, verified or
     /// not ([`Self::wire_bytes`]).
     wire: AtomicU64,
+    /// Bytes this lane has paid for that no stream has received yet: the credit
+    /// the node holds for the lane ([`Self::prepaid`]). Payment adds to it and
+    /// every received frame spends it, so it is the payer's view of the node's
+    /// lane credit, and a later stream on the lane draws on it with no payment
+    /// of its own.
+    prepaid: AtomicU64,
+    /// Ticks each time [`Self::prepaid`] falls: a stream received bytes, or the
+    /// lane dropped its credit. A stream blocked on a read pays again when it
+    /// ticks, because a sibling may have spent the credit it was counting on.
+    prepaid_fell: tokio::sync::watch::Sender<u64>,
+    /// Bytes this lane's streams received that no decoder has verified yet. A
+    /// provable corruption writes them off with the credit still held.
+    unverified: AtomicU64,
+    /// Bytes this lane's streams verified since the ledger was built. A rebase
+    /// never moves the ledger below their price ([`Self::verified_floor`]).
+    lane_verified: AtomicU64,
+    /// The rate a stream of this lane was last quoted, in base units per MiB.
+    quoted_rate: AtomicU64,
+    /// The track record of the node operator this lane pays, shared with every
+    /// other lane at that operator ([`Self::attach_trust`]).
+    trust: OnceLock<Arc<NodeTrust>>,
 }
 
 /// What a lane can prove it was paid: the signed anchor its vouchers last
@@ -624,10 +643,127 @@ impl PoolLedger {
             epoch: std::sync::Mutex::new(None),
             retired: std::sync::Mutex::new(Displaced::Nothing),
             send_deadline: VOUCHER_SEND_DEADLINE,
-            unpaid: std::sync::Mutex::new(Vec::new()),
             evidence: OnceLock::new(),
             wire: AtomicU64::new(0),
+            prepaid: AtomicU64::new(0),
+            prepaid_fell: tokio::sync::watch::Sender::new(0),
+            unverified: AtomicU64::new(0),
+            lane_verified: AtomicU64::new(0),
+            quoted_rate: AtomicU64::new(0),
+            trust: OnceLock::new(),
         }
+    }
+
+    /// Bind this lane to the track record of the node operator it pays, so the
+    /// per-node cap and the window ramp count every lane at that operator. The
+    /// first binding wins. A lane never bound reads a record of its own under
+    /// the default policy.
+    pub fn attach_trust(&self, trust: Arc<NodeTrust>) {
+        // A second binding changes nothing; the first operator record stands.
+        let _ = self.trust.set(trust);
+    }
+
+    /// The track record this lane reads and feeds.
+    #[must_use]
+    pub fn trust(&self) -> &Arc<NodeTrust> {
+        self.trust.get_or_init(NodeTrust::detached)
+    }
+
+    /// Bytes this lane has paid for and no stream has received yet.
+    #[must_use]
+    pub fn prepaid(&self) -> u64 {
+        self.prepaid.load(Ordering::Relaxed)
+    }
+
+    /// Count `n` bytes this lane paid ahead of delivery.
+    pub(crate) fn note_prepaid(&self, n: u64) {
+        self.prepaid
+            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.saturating_add(n)
+            });
+        self.trust().note_prepaid(n);
+    }
+
+    /// Spend up to `n` bytes of held credit against received delivery.
+    fn spend_prepaid(&self, n: u64) {
+        let spent = self
+            .prepaid
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            })
+            .map_or(0, |before| before.min(n));
+        self.trust().note_spent(spent);
+        if spent > 0 {
+            self.note_prepaid_fell();
+        }
+    }
+
+    /// A receiver that ticks each time the lane's prepaid credit falls.
+    pub(crate) fn prepaid_falls(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.prepaid_fell.subscribe()
+    }
+
+    fn note_prepaid_fell(&self) {
+        self.prepaid_fell
+            .send_modify(|tick| *tick = tick.wrapping_add(1));
+    }
+
+    /// Record the rate a stream of this lane was quoted, which prices a later
+    /// write-off against the run's budget.
+    pub(crate) fn note_rate(&self, rate_per_mb: u64) {
+        self.quoted_rate.store(rate_per_mb, Ordering::Relaxed);
+    }
+
+    /// Record `n` bytes a stream of this lane verified: they feed the node's
+    /// verified count and are no longer at risk.
+    pub(crate) fn note_verified(&self, n: u64) {
+        self.unverified
+            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.saturating_sub(n)
+            });
+        self.lane_verified
+            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.saturating_add(n)
+            });
+        self.trust().note_verified(n);
+    }
+
+    /// The least claim a rebase may leave the ledger at: the bytes this lane
+    /// verified and their price at the rate the node quoted. A lane's cumulative
+    /// claim covers every byte it ever verified, so a watermark below this
+    /// would have the payer pay again for delivered bytes.
+    fn verified_floor(&self) -> Cumulative {
+        let verified = u128::from(self.lane_verified.load(Ordering::Relaxed));
+        let rate = u128::from(self.quoted_rate.load(Ordering::Relaxed));
+        let mb = u128::from(MB_BYTES);
+        let price = (verified * rate).div_ceil(mb);
+        Cumulative {
+            bytes: U256::from(verified),
+            amount: U256::from(price),
+        }
+    }
+
+    /// Write off what this lane paid and the node did not deliver: the credit
+    /// it still holds, and the bytes it sent that never verified. Called at
+    /// reconciliation, when the node was reached again and did not deliver
+    /// against the credit, and never at a disconnect. The node's lost count
+    /// grows, so its next window shrinks. Returns the bytes written off.
+    pub(crate) fn write_off_prepaid(&self) -> u64 {
+        let held = self.prepaid.swap(0, Ordering::Relaxed);
+        self.note_prepaid_fell();
+        let bad = self.unverified.swap(0, Ordering::Relaxed);
+        self.trust()
+            .write_off(held, bad, self.quoted_rate.load(Ordering::Relaxed));
+        held.saturating_add(bad)
+    }
+
+    /// Forget the credit this lane believes the node holds, without a
+    /// write-off. A rejected proof leaves the payer's view of the node's credit
+    /// unknown, and the lane resumes from the node's own watermark.
+    pub(crate) fn forget_prepaid(&self) {
+        let held = self.prepaid.swap(0, Ordering::Relaxed);
+        self.note_prepaid_fell();
+        self.trust().note_spent(held);
     }
 
     /// The lane's receipt evidence, or `None` when no collector attached one.
@@ -675,61 +811,6 @@ impl PoolLedger {
             baseline,
             reveal,
         }
-    }
-
-    /// Record that this lane delivered `[start, end)` of `hash` and did not pay
-    /// for it. An empty span records nothing.
-    pub(crate) fn note_unpaid(&self, hash: [u8; 32], start: u64, end: u64) {
-        if start >= end {
-            return;
-        }
-        self.unpaid
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((hash, start, end));
-    }
-
-    /// Take every span of `hash` this lane delivered and did not pay for, as
-    /// `(start, len)` in ascending order. Overlapping or adjacent spans merge.
-    pub(crate) fn take_unpaid(&self, hash: [u8; 32]) -> Vec<(u64, u64)> {
-        let mut spans: Vec<(u64, u64)> = Vec::new();
-        self.unpaid
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|&(h, start, end)| {
-                if h == hash {
-                    spans.push((start, end));
-                    false
-                } else {
-                    true
-                }
-            });
-        merge_spans(spans)
-    }
-
-    /// Take every span of `hash` this lane delivered and did not pay for that
-    /// lies inside `[start, end)`, as `(start, len)` in ascending order.
-    /// Overlapping or adjacent spans merge. A span that reaches outside the
-    /// range stays owed.
-    pub(crate) fn take_unpaid_within(
-        &self,
-        hash: [u8; 32],
-        start: u64,
-        end: u64,
-    ) -> Vec<(u64, u64)> {
-        let mut spans: Vec<(u64, u64)> = Vec::new();
-        self.unpaid
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|&(h, s, e)| {
-                if h == hash && s >= start && e <= end {
-                    spans.push((s, e));
-                    false
-                } else {
-                    true
-                }
-            });
-        merge_spans(spans)
     }
 
     #[cfg(test)]
@@ -818,10 +899,16 @@ impl PoolLedger {
     }
 
     /// Count `n` wire bytes that one of this lane's streams read.
+    /// Every received byte spends the lane's held credit.
     pub(crate) fn note_wire(&self, n: u64) {
         self.wire.update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             v.saturating_add(n)
         });
+        self.spend_prepaid(n);
+        self.unverified
+            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.saturating_add(n)
+            });
     }
 
     /// The cumulative a cancelled pull must PERSIST — the drop-path counterpart of
@@ -1315,6 +1402,15 @@ impl PoolLedger {
             if !admits(from) {
                 return Rebase::Refused;
             }
+            // The node's watermark never moves the ledger below what this lane
+            // has verified: price times the verified bytes. A node that states
+            // an older watermark of ours cannot make the payer pay again for
+            // bytes it already delivered.
+            let floor = self.verified_floor().min_componentwise(from);
+            let cum = Cumulative {
+                bytes: cum.bytes.max(floor.bytes),
+                amount: cum.amount.max(floor.amount),
+            };
             pipeline.heal(cum);
             pipeline.generation = pipeline.generation.saturating_add(1);
             pipeline.unsaved_rebase = Some(cum);

@@ -188,15 +188,9 @@ pub struct ResolvedBlockchain {
     pub buyer_max_approve: bool,
     /// The node's refundable floor `M` (base units, `µUSDC`), sized per ADR
     /// 003 § Sizing (`M = k·ρ·B·Δ`). The node stops serving a pool once its
-    /// remaining on-chain balance minus `M` can no longer cover the next
-    /// credit window. Defaults to 1 USDC (`1_000_000` `µUSDC`).
+    /// remaining on-chain balance minus `M` can no longer cover one chunk.
+    /// Defaults to 1 USDC (`1_000_000` `µUSDC`).
     pub pool_min_remaining_deposit_micro_usdc: u64,
-    /// Per-signer LIVE concurrency cap `k`, in ramp-start credit windows (ADR 003
-    /// § Pool solvency, per-signer floor isolation): the most live un-vouchered floor
-    /// reservation any one capability signer may hold against a pool, `k · one credit
-    /// window`. Lower-clamped to one window at use. Defaults to `8` — see
-    /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS`.
-    pub pool_floor_signer_live_windows: u64,
 }
 
 /// Resolved cache fields.
@@ -541,17 +535,15 @@ pub enum ResolvedS3Credentials {
 pub struct ResolvedPayment {
     /// Rate per MB in USDC base units (6 decimals).
     pub rate_per_mb: u64,
-    /// Credit-window ceiling in bytes (ADR 003 §Credit window). The per-stream
-    /// window ramps toward this cap as the stream pays; floored at one chunk
-    /// ([`decdn_protocol::client::CHUNK_BYTES`], the payment quantum) plus one
-    /// 16 KiB chunk group, the leaf the payer verifies before it pays.
-    /// See [`crate::config::DEFAULT_CREDIT_MAX`].
-    pub credit_max: u64,
-    /// Ramp divisor for the credit window; `0` opens the full ceiling immediately.
-    pub credit_ramp_divisor: u64,
+    /// Most bytes one backfill returns to a lane's credit (ADR 003 § Credit
+    /// Window). See [`crate::config::DEFAULT_BACKFILL_WINDOW`].
+    pub backfill_window: u64,
+    /// A lane's total backfill allowance is `paid / backfill_divisor` bytes; `0`
+    /// turns backfill off. See [`crate::config::DEFAULT_BACKFILL_DIVISOR`].
+    pub backfill_divisor: u64,
     /// Target wire-frame size for the serve path, in bytes (ADR 005
     /// §`cdn/client/v1`). See [`crate::config::DEFAULT_FRAME_TARGET_BYTES`] (1 MiB).
-    /// Clamped down to the credit window's remaining room per frame.
+    /// Clamped down to the lane's credit per frame.
     pub frame_target_bytes: u64,
     /// Background flush period for the lane store, in ms. See
     /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 s). Must be > 0.

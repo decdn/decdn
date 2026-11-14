@@ -80,6 +80,12 @@ impl ChunkProofs {
         self.attempts
     }
 
+    /// Take back the last [`Self::next_attempt`]: the wait it began ended on a
+    /// lane credit wake, not on a proof.
+    pub(super) const fn refund_attempt(&mut self) {
+        self.attempts = self.attempts.saturating_sub(1);
+    }
+
     /// The proofs read for the chunk so far.
     pub(super) const fn attempts(&self) -> u32 {
         self.attempts

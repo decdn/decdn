@@ -1,21 +1,15 @@
 use super::*;
 
-/// The credit-window floor (one chunk plus the verify lag) priced in `µUSDC` at
-/// `rate_per_mb`: the credit a fresh stream reserves before its first proof.
-fn floor_micro(rate_per_mb: u64) -> U256 {
-    decdn_incentive::min_payment(CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES, rate_per_mb)
-}
-
-/// #2171: a lane loaded from the store counts its whole claim — the signed
-/// bytes AND the chunks its chain proved — as already credited. Crediting
-/// only the signed half would reopen the proved frontier as headroom for any
-/// stream whose proofs pay nothing.
+/// A lane loaded from the store keeps its credit: the claim covers the signed
+/// bytes AND the chunks its chain proved, and the persisted delivered count says
+/// how much of it the node has already sent. The difference survives the restart
+/// (ADR 003 § Credit Window), so a payer's prepayment is not lost with the process.
 #[tokio::test]
-async fn a_loaded_lane_counts_its_proved_frontier_as_credited() {
+async fn a_loaded_lane_keeps_its_credit_across_a_restart() {
     use decdn_incentive::chain::{CHUNK_BYTES, preimage_at, root_from_seed};
 
     let seed = B256::repeat_byte(0x5E);
-    let lane = LaneState::hydrate(
+    let mut lane = LaneState::hydrate(
         B256::repeat_byte(0x21),
         Address::repeat_byte(0x33),
         Address::repeat_byte(0x55),
@@ -33,6 +27,7 @@ async fn a_loaded_lane_counts_its_proved_frontier_as_credited() {
     );
     let owed_bytes = lane.owed_bytes();
     assert_eq!(owed_bytes, U256::from(8 * CHUNK_BYTES));
+    lane.delivered_bytes = 2 * CHUNK_BYTES;
 
     let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new());
     store.record(&lane).expect("record the seeded lane");
@@ -46,10 +41,11 @@ async fn a_loaded_lane_counts_its_proved_frontier_as_credited() {
         .expect("the handler loads the stored lane");
     let guard = loaded.lock().await;
     assert_eq!(
-        guard.paid_credited, owed_bytes,
-        "the whole claim is credited"
+        guard.state.credit_bytes(),
+        6 * CHUNK_BYTES,
+        "the paid claim minus the delivered count is the lane's credit"
     );
-    assert_eq!(guard.bytes_delivered_cumulative, owed_bytes);
+    assert_eq!(guard.paid_bytes, owed_bytes);
 }
 
 /// A client that sends garbage on the proof stream is a peer fault, not a node
@@ -148,44 +144,44 @@ async fn an_open_window_spends_one_frame_per_payment_chunk() {
     );
 }
 
-/// The serve side's prefetch floor and the pull side's reservation are one
+/// The serve side's room floor and the pull side's ahead slack are one
 /// invariant split across two crates, so it needs a test that names both.
 ///
 /// `frame_target` floors its room cap at one bao chunk group, which on a cache
-/// miss is a request the upstream pull must be allowed to satisfy past a shut
-/// credit window. `PULL_WINDOW_FLOOR` reserves a third group for exactly that.
-/// Raise one without the other and the cache-miss leg parks — and it parks as a
-/// hang with no diagnostic, which is why the relationship is asserted here
-/// rather than left to an integration test's timeout.
+/// miss is a request the upstream pull must be allowed to satisfy past the lane's
+/// credit. `PULL_AHEAD_BYTES` reserves the groups for exactly that: two roundings
+/// and the leaf of the frame. Raise one without the other and the cache-miss leg
+/// parks — and it parks as a hang with no diagnostic, which is why the
+/// relationship is asserted here rather than left to an integration test's
+/// timeout.
 #[tokio::test]
-async fn frame_target_room_floor_matches_the_pull_reservation() {
+async fn frame_target_room_floor_matches_the_pull_slack() {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await;
     let interval = decdn_protocol::CHUNK_BYTES;
     let group = decdn_bao_range::CHUNK_GROUP_BYTES;
 
-    // What the serve side asks for past a shut window.
+    // What the serve side asks for on a lane with no credit.
     let prefetch = handler.frame_target(0, interval, 0) as u64;
     assert_eq!(prefetch, group, "the room floor is one bao chunk group");
 
-    // What the pull side can still draw once both group roundings are spent.
-    let drawable = decdn_client::PULL_WINDOW_FLOOR - 2 * group;
+    // What the pull side can still draw past the credit frontier once both
+    // group roundings are spent.
+    let drawable = decdn_client::PULL_AHEAD_BYTES - 2 * group;
     assert!(
-        drawable >= interval + prefetch,
-        "the pull floor leaves {drawable} bytes after both roundings, but the \
-         client must complete a {interval}-byte chunk to pay AND the serve leg \
-         prefetches {prefetch} bytes past its shut window — the miss leg would park"
+        drawable >= prefetch,
+        "the pull slack leaves {drawable} bytes after both roundings, but the \
+         serve leg cuts {prefetch} bytes past an empty lane — the miss leg would park"
     );
 }
 
-/// A closed window must not be asked for a full frame. Both loops prefetch one
-/// frame ahead of the window check, and on the cache-miss leg the producer is fed
-/// by an upstream pull paced against this stream's own served-and-paid frontier —
-/// so a large request parks on bytes that only recouping can unblock, and the
-/// loop must exit to recoup. The room cap is what keeps that prefetch
-/// satisfiable; the floor keeps it from degenerating to a single byte.
+/// A lane with no credit must not be asked for a full frame. On the cache-miss
+/// leg the producer is fed by an upstream pull that draws only what the lane has
+/// paid for, so a large request parks on bytes that only a payment can unblock.
+/// The room cap, the lane's credit, keeps the request satisfiable; the floor keeps
+/// it from degenerating to a single byte.
 #[tokio::test]
-async fn a_closed_window_yields_a_short_frame_not_a_full_one() {
+async fn an_empty_lane_yields_a_short_frame_not_a_full_one() {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await;
     let interval = decdn_protocol::CHUNK_BYTES;
@@ -194,10 +190,10 @@ async fn a_closed_window_yields_a_short_frame_not_a_full_one() {
     let closed = handler.frame_target(0, interval, 0) as u64;
     assert_eq!(
         closed, group,
-        "a closed window must fall back to the group floor"
+        "an empty lane must fall back to the group floor"
     );
 
-    // A partly-open window is honoured as-is once it clears the floor.
+    // A lane with some credit is honoured as-is once it clears the floor.
     assert_eq!(
         handler.frame_target(0, interval, 4 * group) as u64,
         4 * group
@@ -242,29 +238,17 @@ async fn handler_for_tests(metrics: &Arc<Metrics>) -> (Arc<ClientHandler>, tempf
 }
 
 /// [`handler_for_tests`] with an explicit floor-`M` so the floor-`M` guard can
-/// be exercised with a non-zero minimum-remaining-deposit. The per-signer gates
-/// are no-ops (unbounded live cap, bottomless bucket), so the pool ceiling is the
-/// only floor bound that bites.
+/// be exercised with a non-zero minimum-remaining-deposit.
 async fn handler_for_tests_with_floor(
     metrics: &Arc<Metrics>,
     pool_min_remaining_deposit: U256,
-) -> (Arc<ClientHandler>, tempfile::TempDir) {
-    handler_for_tests_with_signer_policy(metrics, pool_min_remaining_deposit, u64::MAX).await
-}
-
-/// [`handler_for_tests_with_floor`] plus an explicit per-signer live concurrency
-/// cap `k` (in windows). `u64::MAX` leaves that gate a no-op.
-async fn handler_for_tests_with_signer_policy(
-    metrics: &Arc<Metrics>,
-    pool_min_remaining_deposit: U256,
-    pool_floor_signer_live_windows: u64,
 ) -> (Arc<ClientHandler>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
         .await
         .expect("cache");
     let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-    let mut deps = ClientHandlerDeps::new(
+    let deps = ClientHandlerDeps::new(
         iroh::SecretKey::generate().public(),
         Arc::clone(metrics),
         Arc::new(ConnectionLimiter::new(
@@ -288,7 +272,6 @@ async fn handler_for_tests_with_signer_policy(
         pool_min_remaining_deposit,
         always_admit_shed(),
     );
-    deps.pool_floor_signer_live_windows = pool_floor_signer_live_windows;
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
 }
@@ -728,11 +711,6 @@ fn takedown_reject_reasons_are_declined() {
         ServeRejectReason::OwnerMismatch,
         ServeRejectReason::PoolUnconfirmed,
         ServeRejectReason::PoolClosing { proven: false },
-        // A distinct wire code here would hand a prober an oracle: with
-        // throwaway signer keys it could binary-search per-signer headroom and
-        // reconstruct `remaining − M`, the pool-balance map this collapse exists
-        // to hide.
-        ServeRejectReason::SignerFloorAtCap,
         // "Not now" states of this node: a later request can be served.
         ServeRejectReason::PullLoopGuard,
         ServeRejectReason::LoadShedHit,
@@ -1424,473 +1402,26 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
 
 /// Lock the floor map for a test assertion, surfacing a poisoned lock as an
 /// `anyhow` error rather than panicking (the anti-panic policy holds in tests).
-/// The capability signer every floor-accumulator unit test reserves under.
-/// A second signer (`TEST_SIGNER_B`) exercises per-signer isolation.
-const TEST_SIGNER: Address = Address::new([0xa1u8; 20]);
-/// A distinct co-tenant on the same pool.
-const TEST_SIGNER_B: Address = Address::new([0xb2u8; 20]);
-/// The advertised `µUSDC`/MB rate the floor-cap tests price against. Only the
-/// one-credit-window clamp in [`ClientHandler::signer_floor_cap`] reads it.
-const TEST_RATE: u64 = 1_000;
-
-fn lock_floor(
-    map: &Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-) -> anyhow::Result<std::sync::MutexGuard<'_, HashMap<B256, PoolFloorState>>> {
-    map.lock()
-        .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))
-}
-
-/// A serve REFUSED before the serve loop ran — [`FloorReservation::release_unspent`]
-/// called on the pre-spend refusal paths (the floor-`M` gate, the size gate, an
-/// upstream that refused the header handshake) — frees the live reservation at
-/// once. It fronted no USDC and delivered no byte, so the pool's floor headroom is
-/// fully restored and the signer row is pruned.
-#[test]
-fn floor_reservation_refused_unspent_releases_the_live_floor() -> anyhow::Result<()> {
-    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pool = B256::repeat_byte(0x5C);
-    let floor = floor_micro(1000);
-    {
-        let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor);
-        let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
-        anyhow::ensure!(
-            live == Some(floor),
-            "live reservation is held while the guard lives"
-        );
-        // Refused before any spend — release the live floor at once.
-        res.release_unspent();
-    } // drop → no-op: release_unspent already freed the live reservation
-    let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
-    anyhow::ensure!(
-        st.live_reservation == U256::ZERO && st.signers.is_empty(),
-        "a pre-spend refusal releases its reservation, so its row is pruned"
-    );
-    Ok(())
-}
-
-/// The pool-budget guard counts a pool's committed LIVE floor reservation against
-/// `remaining − M`. This is the re-check both the mid-stream gate and the
-/// direct-serve gate apply to a stream that already holds its reservation, so it is
-/// deliberately pool-level only and carries no signer dimension.
+/// The mid-stream solvency re-check stops at the refundable floor `M`: delivery
+/// continues while the pool's remaining deposit sits above `M` and stops once it
+/// reaches `M`. `M` covers every voucher in flight, so no other bound applies: the
+/// node sends only what a lane has paid for (ADR 003 § Pool solvency).
 #[tokio::test]
-async fn pool_budget_covers_reserve_accounts_committed_floor() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
-    let pool = B256::repeat_byte(0x11);
-    let floor = floor_micro(1_000_000);
-    // Empty pool, M = 0: remaining must cover the new reserve exactly.
-    anyhow::ensure!(
-        handler.pool_budget_covers_reserve(pool, floor, floor),
-        "remaining equal to the reserve is covered"
-    );
-    anyhow::ensure!(
-        !handler.pool_budget_covers_reserve(pool, floor.saturating_sub(U256::from(1u64)), floor),
-        "remaining one below the reserve is not covered"
-    );
-    // A live reservation consumes the budget: the same remaining no longer
-    // covers a second identical reserve.
-    let _guard = handler.reserve_floor(pool, TEST_SIGNER, floor);
-    anyhow::ensure!(
-        !handler.pool_budget_covers_reserve(pool, floor, floor),
-        "an in-flight floor reservation is committed against the budget"
-    );
-    // The signer dimension is absent by design: a co-tenant's reserve is
-    // counted here just the same, because this asks only whether the POOL can
-    // still pay.
-    anyhow::ensure!(
-        !handler.pool_budget_covers_reserve(pool, floor, floor),
-        "the pool-level re-check does not vary with the signer"
-    );
-    Ok(())
-}
-
-/// The mid-stream solvency re-check holds with an EMPTY committed-floor ledger.
-/// A stream releases its floor reservation once it is repaid, so on a pool whose
-/// streams have all repaid, `committed == 0` and the covers-check holds vacuously
-/// at ANY `remaining`; the `remaining > M` bound in `pool_funds_committed` is what
-/// stops a drained pool then (ADR 003 §Pool solvency).
-#[tokio::test]
-async fn pool_funds_committed_stops_at_floor_with_empty_ledger() -> anyhow::Result<()> {
+async fn pool_funds_committed_stops_at_the_floor() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let m = U256::from(5_000_000u64);
     let (handler, _dir) = handler_for_tests_with_floor(&metrics, m).await;
-    let pool = B256::repeat_byte(0x33);
-    // No floor row exists for the pool: committed == 0.
     anyhow::ensure!(
-        !handler.pool_funds_committed(pool, U256::ZERO),
+        !handler.pool_funds_committed(U256::ZERO),
         "a fully drained pool (remaining = 0) does not fund delivery"
     );
     anyhow::ensure!(
-        !handler.pool_funds_committed(pool, m),
+        !handler.pool_funds_committed(m),
         "remaining at the refundable floor M does not fund delivery"
     );
     anyhow::ensure!(
-        handler.pool_funds_committed(pool, m.saturating_add(U256::from(1u64))),
-        "remaining above M funds delivery while nothing is committed"
-    );
-    // A live reservation narrows the bound further: the headroom above M must
-    // still cover it, exactly as the covers-check always required.
-    let floor = floor_micro(1_000_000);
-    let _guard = handler.reserve_floor(pool, TEST_SIGNER, floor);
-    anyhow::ensure!(
-        handler.pool_funds_committed(pool, m.saturating_add(floor)),
-        "headroom above M covering the committed floor funds delivery"
-    );
-    anyhow::ensure!(
-        !handler.pool_funds_committed(
-            pool,
-            m.saturating_add(floor).saturating_sub(U256::from(1u64))
-        ),
-        "headroom above M one short of the committed floor does not"
-    );
-    Ok(())
-}
-
-/// `try_reserve_floor` reserves atomically: it charges the budget only when
-/// `remaining − M` covers the pool's committed live reservation plus the new floor,
-/// and the charge is visible to the very next call so a second reserve on an
-/// exhausted pool is refused. The no-op per-signer gates keep the pool ceiling the
-/// only bound under test.
-#[tokio::test]
-async fn try_reserve_floor_charges_only_when_budget_covers() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
-    let pool = B256::repeat_byte(0x22);
-    let floor = floor_micro(1_000_000);
-    // Budget covers exactly one floor: the first reserve succeeds.
-    let first = handler.try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor);
-    anyhow::ensure!(first.is_ok(), "a floor within remaining − M is reserved");
-    // The charge is live: a second identical reserve against the SAME remaining
-    // now sees `committed = floor` and is refused (no over-commit).
-    anyhow::ensure!(
-        handler
-            .try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor)
-            .err()
-            == Some(FloorRefusal::PoolExhausted),
-        "a second reserve over the same budget is refused as pool-exhausted"
-    );
-    // Dropping the reservation frees its live floor, reopening the budget.
-    drop(first);
-    anyhow::ensure!(
-        handler
-            .try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor)
-            .is_ok(),
-        "budget reopens once a released reservation frees its live floor"
-    );
-    Ok(())
-}
-
-/// The per-signer live cap isolates co-tenants of one shared pool: a signer that
-/// holds its `k`-window cap of live reservation is refused `SignerAtCap` while the
-/// pool can still pay, and a SECOND signer is admitted from its own cap at the same
-/// instant. Without the signer dimension the first signer's reservations would be
-/// the pool's, and the second would be refused too.
-#[tokio::test]
-async fn signer_live_cap_refuses_one_signer_and_admits_a_co_tenant() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    // k = 1 window each, a bottomless bucket, M = 0.
-    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1).await;
-    let pool = B256::repeat_byte(0x31);
-    let window = handler.one_window(TEST_RATE);
-    let remaining = window.saturating_mul(U256::from(4u64));
-    anyhow::ensure!(
-        handler.signer_floor_cap(TEST_RATE) == window,
-        "k = 1 gives a one-window live cap"
-    );
-    let held = handler.try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window);
-    anyhow::ensure!(held.is_ok(), "the first window fits inside the signer cap");
-    // Signer A is at its cap. The POOL is not — three windows of headroom are
-    // untouched — so the refusal must name the signer cap, not the pool.
-    anyhow::ensure!(
-        handler
-            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
-            .err()
-            .is_some_and(|e| matches!(e, FloorRefusal::SignerAtCap { .. })),
-        "a second window on the SAME signer exceeds its cap while the pool can still pay"
-    );
-    // A co-tenant draws on its own untouched cap.
-    anyhow::ensure!(
-        handler
-            .try_reserve_floor(pool, TEST_SIGNER_B, remaining, TEST_RATE, window)
-            .is_ok(),
-        "a distinct signer is admitted from its own cap while the first is capped"
-    );
-    Ok(())
-}
-
-/// The per-pool ceiling still bounds the AGGREGATE across signers: solvency
-/// cannot be escaped by spraying identities. With k = 1 window each, four signers
-/// each take their own window on a four-window pool, none exceeding its live cap,
-/// and the fifth is refused `PoolExhausted` — the pool, not the signer, ran out.
-#[tokio::test]
-async fn pool_ceiling_still_bounds_the_aggregate_across_signers() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1).await;
-    let pool = B256::repeat_byte(0x32);
-    let window = handler.one_window(TEST_RATE);
-    let remaining = window.saturating_mul(U256::from(4u64));
-    let mut held = Vec::new();
-    for i in 0u8..4 {
-        let signer = Address::new([i.saturating_add(1); 20]);
-        let guard = handler
-            .try_reserve_floor(pool, signer, remaining, TEST_RATE, window)
-            .map_err(|e| anyhow::anyhow!("signer {i} refused: {e:?}"))?;
-        held.push(guard);
-    }
-    // Every one of the four sits at exactly its own window, so no live cap is
-    // exceeded; what refuses the fifth is the pool ceiling.
-    anyhow::ensure!(
-        handler
-            .try_reserve_floor(pool, Address::new([0xee; 20]), remaining, TEST_RATE, window)
-            .err()
-            == Some(FloorRefusal::PoolExhausted),
-        "signer fan-out cannot push the aggregate past remaining − M"
-    );
-    Ok(())
-}
-
-/// A refused admission inserts nothing at either level. This is what stops a
-/// client probing a full pool with throwaway signer keys from growing a map that
-/// is locked on every admission — reading through `entry().or_default()` instead
-/// of `get` would make every refusal a permanent row.
-#[tokio::test]
-async fn a_refused_admission_leaves_no_row_at_either_level() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1).await;
-    let pool = B256::repeat_byte(0x38);
-    let window = handler.one_window(TEST_RATE);
-    let floor = window;
-    let remaining = window.saturating_mul(U256::from(4u64));
-
-    // Refused by the POOL ceiling, on a pool with no entry at all.
-    anyhow::ensure!(
-        handler
-            .try_reserve_floor(
-                pool,
-                TEST_SIGNER,
-                floor.saturating_sub(U256::from(1u64)),
-                TEST_RATE,
-                floor
-            )
-            .is_err(),
-        "a pool that cannot cover one floor refuses"
-    );
-    anyhow::ensure!(
-        !lock_floor(&handler.pool_floor)?.contains_key(&pool),
-        "a pool-ceiling refusal creates no pool entry"
-    );
-
-    // Now admit one signer, then spray fresh signer keys past the pool ceiling.
-    let mut held = Vec::new();
-    for i in 0u8..4 {
-        held.push(
-            handler
-                .try_reserve_floor(
-                    pool,
-                    Address::new([i.saturating_add(1); 20]),
-                    remaining,
-                    TEST_RATE,
-                    floor,
-                )
-                .map_err(|e| anyhow::anyhow!("signer {i} refused: {e:?}"))?,
-        );
-    }
-    for i in 0u8..8 {
-        anyhow::ensure!(
-            handler
-                .try_reserve_floor(
-                    pool,
-                    Address::new([i.saturating_add(0xc0); 20]),
-                    remaining,
-                    TEST_RATE,
-                    floor
-                )
-                .is_err(),
-            "prober {i} is refused on a full pool"
-        );
-    }
-    let signers = lock_floor(&handler.pool_floor)?
-        .get(&pool)
-        .map(|s| s.signers.len());
-    anyhow::ensure!(
-        signers == Some(4),
-        "only the four admitted signers hold rows; eight refused probes added none"
-    );
-    Ok(())
-}
-
-/// A guard whose pool was reclaimed reconciles against nothing, even when a
-/// later admission has re-entered the same `pool_id`. Without the generation
-/// stamp the stale drop finds the NEW entry and subtracts a reservation that entry
-/// never held — leaving the pool total below the sum of its signer rows, which is
-/// the direction that over-admits.
-#[test]
-fn a_stale_guard_does_not_reconcile_against_a_re_entered_pool() -> anyhow::Result<()> {
-    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pool = B256::repeat_byte(0x39);
-    let floor = floor_micro(1000);
-
-    let stale = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor);
-    // The pool is reclaimed on-chain: its whole entry goes, signer rows and all.
-    lock_floor(&map)?.remove(&pool);
-    // A later admission re-enters the same key — the cached `getPool` view can
-    // still show headroom for a moment after the reclaim lands.
-    let fresh = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER_B, floor);
-    drop(stale);
-
-    let st = lock_floor(&map)?.get(&pool).cloned().unwrap_or_default();
-    anyhow::ensure!(
-        st.live_reservation == floor,
-        "the stale drop must not release the new entry's live reservation"
-    );
-    anyhow::ensure!(
-        st.signers.len() == 1 && st.signers.contains_key(&TEST_SIGNER_B),
-        "the stale drop must not insert its own signer row under the new entry"
-    );
-    anyhow::ensure!(
-        st.live_reservation
-            == st
-                .signers
-                .values()
-                .fold(U256::ZERO, |acc, s| acc.saturating_add(s.live_reservation)),
-        "the pool live total stays the sum of its signer rows"
-    );
-    drop(fresh);
-    Ok(())
-}
-
-/// The live cap is `k · one_window`, lower-clamped to one window: `k = 0` (or an
-/// unset field) still admits a lone signer's first stream on any solvent pool
-/// rather than wedging it, and the cap is an ABSOLUTE window count — it does not
-/// scale with the pool's deposit.
-#[tokio::test]
-async fn signer_floor_cap_is_k_windows_lower_clamped_to_one() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    // k = 0 → lower-clamped to one window.
-    let (clamped, _c) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 0).await;
-    let one_window = clamped.one_window(TEST_RATE);
-    anyhow::ensure!(
-        clamped.signer_floor_cap(TEST_RATE) == one_window,
-        "k = 0 clamps the live cap up to one window"
-    );
-    let pool = B256::repeat_byte(0x34);
-    let remaining = one_window.saturating_mul(U256::from(2u64));
-    anyhow::ensure!(
-        clamped
-            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, one_window)
-            .is_ok(),
-        "a lone signer's first window is admitted even at k = 0"
-    );
-    // k = 8 → cap is eight windows, the same however large the pool's deposit.
-    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 8).await;
-    let eight = one_window.saturating_mul(U256::from(8u64));
-    anyhow::ensure!(
-        handler.signer_floor_cap(TEST_RATE) == eight,
-        "k = 8 gives an eight-window cap"
-    );
-    Ok(())
-}
-
-/// Headroom below one credit window: the one-window lower clamp then returns a
-/// live cap LARGER than the pool's entire headroom, and only the pool ceiling
-/// running FIRST keeps the node from admitting past the refundable minimum `M` the
-/// pool owner is guaranteed. Pins that order — the refusal must be `PoolExhausted`,
-/// never `Ok`, at any `k`.
-#[tokio::test]
-async fn pool_ceiling_refuses_below_one_window_whatever_the_cap() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    for k in [0u64, 1, 8] {
-        let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, k).await;
-        let pool = B256::repeat_byte(0x36);
-        let one_window =
-            decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
-        let remaining = one_window.saturating_sub(U256::from(1u64));
-        anyhow::ensure!(
-            handler.signer_floor_cap(TEST_RATE) > remaining,
-            "k {k}: the one-window lower clamp exceeds the headroom, which is what makes \
-             the check order load-bearing"
-        );
-        anyhow::ensure!(
-            handler
-                .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, one_window)
-                .err()
-                == Some(FloorRefusal::PoolExhausted),
-            "k {k}: a reserve past remaining − M must be refused by the pool ceiling, \
-             not admitted through the clamped live cap"
-        );
-    }
-    Ok(())
-}
-
-/// A signer that reserves, pays, and leaves takes its row with it. Without the
-/// prune the map only grows: ADR 003 §Revocation makes short-expiry session keys
-/// the intended usage, so a busy publisher mints signer identities steadily and
-/// every one that pays cleanly would leave a zero row alive until the pool is
-/// reclaimed on-chain — inside a map locked on every admission.
-#[tokio::test]
-async fn a_paid_out_signer_leaves_no_row_behind() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
-    let pool = B256::repeat_byte(0x37);
-    let floor = floor_micro(1_000_000);
-    let guard = handler
-        .try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor)
-        .map_err(|e| anyhow::anyhow!("refused: {e:?}"))?;
-    {
-        let map = handler
-            .pool_floor
-            .lock()
-            .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))?;
-        anyhow::ensure!(
-            map.get(&pool)
-                .is_some_and(|s| s.signers.contains_key(&TEST_SIGNER)),
-            "the row exists while the reservation is live"
-        );
-    }
-    // Paid in full, then dropped: the live reservation is released and the bucket
-    // is never debited, so the row carries no information and is pruned.
-    guard.release_live_repaid();
-    drop(guard);
-    let map = handler
-        .pool_floor
-        .lock()
-        .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))?;
-    let entry = map.get(&pool).cloned().unwrap_or_default();
-    anyhow::ensure!(
-        !entry.signers.contains_key(&TEST_SIGNER),
-        "a signer that carries no information must not keep a row for the pool's lifetime"
-    );
-    anyhow::ensure!(
-        entry.live_committed() == U256::ZERO,
-        "and the pool live total still agrees with the (now empty) signer set"
-    );
-    Ok(())
-}
-
-/// The live cap makes one signer's concurrent exposure an ABSOLUTE window count,
-/// not a slice of the deposit (#1857): `k · one_window`, the same however large the
-/// pool's headroom, and lower-clamped to one window so it never wedges a lone
-/// signer off a small pool.
-#[tokio::test]
-async fn signer_cap_is_a_window_count_not_a_slice_of_the_deposit() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 16).await;
-    let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
-    let ceiling = one_window.saturating_mul(U256::from(16u64));
-    // The cap does not vary with the request's rate scale beyond one_window, and it
-    // is exactly k windows — no deposit term enters.
-    anyhow::ensure!(
-        handler.signer_floor_cap(TEST_RATE) == ceiling,
-        "the live cap is exactly k windows"
-    );
-    // k = 0 clamps up to one window (already covered), and the cap is independent of
-    // any headroom value — it is not a function of remaining at all.
-    let (clamped, _c) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 0).await;
-    anyhow::ensure!(
-        clamped.signer_floor_cap(TEST_RATE) == one_window,
-        "k = 0 clamps up to one window regardless of the deposit"
+        handler.pool_funds_committed(m.saturating_add(U256::from(1u64))),
+        "remaining above M funds delivery"
     );
     Ok(())
 }
@@ -2192,7 +1723,7 @@ async fn midstream_signer_recheck_trips_when_signer_drains_at_other_nodes() -> a
     let (handler, projection, _dir) = handler_with_projection_view(&metrics).await;
     let pool = B256::repeat_byte(0x51);
     let signer = Address::new([0xa1; 20]);
-    let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+    let one_window = decdn_incentive::min_payment(CHUNK_BYTES, TEST_RATE);
     let ow = u64::try_from(one_window).expect("one window fits u64");
     // The signer holds a cap of ten windows on this lane; the pool is richly
     // funded, so only per-signer cap headroom can bind here.
@@ -2261,7 +1792,7 @@ async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() ->
         Arc::clone(&metrics),
     ));
     let (handler, _dir) = handler_with_pool_view(&metrics, Arc::clone(&view) as _).await;
-    let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+    let one_window = decdn_incentive::min_payment(CHUNK_BYTES, TEST_RATE);
     let ow = u64::try_from(one_window).expect("one window fits u64");
     let cap = ow.saturating_mul(10);
 
@@ -2324,7 +1855,7 @@ async fn midstream_signer_recheck_fails_toward_serving_on_projection_gap() -> an
     // the watcher's cold-start head): `signer_spent` under-counts to zero, so even
     // a cap of exactly one floor reads as full headroom and the stream serves.
     let (handler, _projection, _dir) = handler_with_projection_view(&metrics).await;
-    let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+    let one_window = decdn_incentive::min_payment(CHUNK_BYTES, TEST_RATE);
     anyhow::ensure!(
         !handler
             .signer_cap_drained_midstream(pool, signer, one_window, TEST_RATE)
@@ -2344,169 +1875,8 @@ async fn midstream_signer_recheck_fails_toward_serving_on_projection_gap() -> an
     Ok(())
 }
 
-/// The live cap scales the number of distinct signers needed to strand a pool's
-/// floor budget with the deposit. With a `k`-window cap on a pool holding `N`
-/// windows of headroom it takes `ceil(N / k)` signers — the escape a share alone
-/// could not give, where a constant number of keys strands any deposit.
-#[tokio::test]
-async fn live_cap_scales_the_signers_needed_to_strand_the_floor() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 16).await;
-    let pool = B256::repeat_byte(0x38);
-    let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
-    let remaining = one_window.saturating_mul(U256::from(144u64));
-    let ceiling = one_window.saturating_mul(U256::from(16u64));
-    anyhow::ensure!(
-        handler.signer_floor_cap(TEST_RATE) == ceiling,
-        "k = 16 gives a 16-window live cap"
-    );
-
-    // Eight signers each fill their own ceiling and stop there. The pool keeps a
-    // spare ceiling's worth of headroom throughout (8 × 16 == 128 of 144), so
-    // every refusal in this loop is the live cap and not the pool running out.
-    let mut held = Vec::new();
-    for i in 0u8..8 {
-        let signer = Address::new([i.saturating_add(1); 20]);
-        held.push(
-            handler
-                .try_reserve_floor(pool, signer, remaining, TEST_RATE, ceiling)
-                .map_err(|e| anyhow::anyhow!("signer {i} refused early: {e:?}"))?,
-        );
-        anyhow::ensure!(
-            handler
-                .try_reserve_floor(pool, signer, remaining, TEST_RATE, one_window)
-                .err()
-                .is_some_and(|e| matches!(e, FloorRefusal::SignerAtCap { .. })),
-            "signer {i} must stop at its window ceiling, not at a share of the deposit"
-        );
-    }
-    // A ninth signer takes the last ceiling's worth, and only then is the pool
-    // itself spent — after nine signers, not the four a bare quarter-share would
-    // have needed however large the deposit.
-    held.push(
-        handler
-            .try_reserve_floor(
-                pool,
-                Address::new([0x9au8; 20]),
-                remaining,
-                TEST_RATE,
-                ceiling,
-            )
-            .map_err(|e| anyhow::anyhow!("the ninth signer's own share must fit: {e:?}"))?,
-    );
-    anyhow::ensure!(
-        handler
-            .try_reserve_floor(
-                pool,
-                Address::new([0xeeu8; 20]),
-                remaining,
-                TEST_RATE,
-                one_window
-            )
-            .err()
-            == Some(FloorRefusal::PoolExhausted),
-        "the pool ceiling still bounds the aggregate once every share is spent"
-    );
-    Ok(())
-}
-
-/// A very large `k` makes the live cap wider than the pool's whole headroom, so
-/// the per-signer live gate never binds and the check collapses to exactly the
-/// pool-ceiling behavior. This is the escape hatch an operator serving
-/// single-signer pools sets.
-#[tokio::test]
-async fn wide_live_cap_reproduces_the_pool_only_bound() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) =
-        handler_for_tests_with_signer_policy(&metrics, U256::ZERO, u64::MAX).await;
-    let pool = B256::repeat_byte(0x35);
-    let floor = floor_micro(1_000_000);
-    let remaining = floor.saturating_mul(U256::from(3u64));
-    // ONE signer draws the pool's entire headroom, three floors, unrefused.
-    let mut held = Vec::new();
-    for _ in 0u8..3 {
-        held.push(
-            handler
-                .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, floor)
-                .map_err(|e| anyhow::anyhow!("refused under a wide live cap: {e:?}"))?,
-        );
-    }
-    anyhow::ensure!(
-        handler
-            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, floor)
-            .err()
-            == Some(FloorRefusal::PoolExhausted),
-        "the pool ceiling is the only bound left at a wide live cap"
-    );
-    Ok(())
-}
-
-/// A repayment that lands after the pool was reclaimed releases nothing:
-/// `forget_pool_floor` removed the entry (its live reservation went with
-/// it), so `release_live_repaid` must not re-insert a default state for the
-/// closed pool — the in-memory face of the #1781 resurrection race. The
-/// pool id never recurs, so a re-inserted entry would sit in the map for the
-/// process lifetime.
-#[test]
-fn repaid_release_after_forget_does_not_resurrect_entry() -> anyhow::Result<()> {
-    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pool = B256::repeat_byte(0x5F);
-    let floor = floor_micro(1000);
-    let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor);
-    // The pool closes mid-stream: the same in-memory remove
-    // `forget_pool_floor` performs.
-    lock_floor(&map)?.remove(&pool);
-    res.release_live_repaid();
-    anyhow::ensure!(
-        lock_floor(&map)?.get(&pool).is_none(),
-        "a repaid release on a reclaimed pool must not re-insert its entry"
-    );
-    drop(res);
-    anyhow::ensure!(
-        lock_floor(&map)?.get(&pool).is_none(),
-        "the subsequent drop leaves the reclaimed pool absent too"
-    );
-    Ok(())
-}
-
-/// A lane this process loads starts with an empty ramp-credit pool, so a
-/// restart carries no credit into the next stream. A stream that ends fully
-/// paid returns its credit, and the next stream on the lane opens above the
-/// floor (ADR 003 §Credit window).
-#[tokio::test]
-async fn a_loaded_lane_starts_empty_and_banks_for_the_next_stream() {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests(&metrics).await;
-    let state = LaneState::hydrate(
-        B256::repeat_byte(0x11),
-        Address::repeat_byte(0x22),
-        Address::repeat_byte(0x33),
-        U256::MAX,
-        u64::MAX,
-        U256::from(9_000_000u64),
-        U256::from(9u64 << 20),
-        None,
-        decdn_incentive::LaneChain::NONE,
-    );
-    let lane = Arc::new(Mutex::new(LaneDeliveryState::hydrated(state)));
-
-    let first = handler.take_ramp_carry(Some(&lane)).await;
-    assert_eq!(first.carried(), 0, "a loaded lane carries no credit");
-    assert_eq!(
-        handler.credit_window(CHUNK_BYTES, first.ramp_paid(0)),
-        CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES,
-        "a lane with no credit opens at the floor: one chunk plus the verify lag"
-    );
-    first.return_paid(8 << 20);
-
-    let second = handler.take_ramp_carry(Some(&lane)).await;
-    assert_eq!(second.carried(), 8 << 20);
-    assert_eq!(
-        handler.credit_window(CHUNK_BYTES, second.ramp_paid(0)),
-        (8 << 20) / handler.credit_ramp_divisor
-    );
-}
+/// The advertised `µUSDC`/MB rate the signer re-check tests price against.
+const TEST_RATE: u64 = 1_000;
 
 /// `LaneActivityClock::ages` reports a near-zero whole-seconds age for a
 /// stamped lane and OMITS an unstamped (`last_voucher_at == 0`) one, so the
@@ -2537,10 +1907,12 @@ async fn lane_activity_clock_ages_reports_stamped_and_omits_unstamped() {
                 None,
                 decdn_incentive::LaneChain::NONE,
             ),
-            bytes_delivered_cumulative: U256::ZERO,
-            paid_credited: U256::ZERO,
+            paid_bytes: U256::ZERO,
             last_voucher_at: AtomicU64::new(stamp),
-            ramp_pool: Arc::default(),
+            unclean_ends: HashMap::new(),
+            backfilled_bytes: 0,
+            credit_tx: tokio::sync::watch::Sender::new(0),
+            last_credit_conn: None,
         }))
     };
     let map = DashMap::new();

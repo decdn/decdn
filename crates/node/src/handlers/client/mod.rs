@@ -26,9 +26,9 @@
 //! [`ClientHandlerDeps`]) so the settlement service can redeem the accrued claim
 //! once it crosses its threshold.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -68,12 +68,12 @@ use outcome::ServeStop;
 // types, consts, and free functions stay in this module so every submodule
 // (and the test module) can reach them via `use super::*` — Rust makes a
 // module's private items visible to its descendants (#1254).
+mod credit;
 mod delivery;
 mod dispatch;
 mod fill;
 mod outcome;
 mod proof_wait;
-mod ramp;
 mod serve_encoder;
 mod serve_leg;
 mod serve_waits;
@@ -134,21 +134,21 @@ const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
 const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
-/// Per-lane delivery state: the validated voucher watermark plus the lane-wide
+/// Per-lane delivery state: the validated voucher watermark, the lane-wide
 /// cumulative byte counter that feeds voucher reconstruction (ADR 003 §Voucher
-/// wire format — `bytes_delivered` is not on the wire).
+/// wire format — `bytes_delivered` is not on the wire), and the lane's credit
+/// (ADR 003 § Credit Window).
+///
+/// The lane's credit is its paid bytes minus the bytes the node has sent on it
+/// ([`LaneState::credit_bytes`]). Every stream on the lane debits that one
+/// balance under this entry's lock before it sends a frame, so two streams never
+/// spend the same payment.
 #[derive(Debug)]
 struct LaneDeliveryState {
     state: LaneState,
     /// Lane-wide cumulative bytes the lane's claim covers: the signed bytes
     /// extended by the chunks the chain has proved.
-    bytes_delivered_cumulative: U256,
-    /// Cumulative wire bytes CREDITED to streams' paid headroom on this lane
-    /// (design rule #1). Monotone and never exceeds the chain-extended watermark
-    /// the lane has settled, so a benign already-satisfied proof — which does
-    /// not raise the watermark — can only advance a stream's window for bytes
-    /// the lane has actually settled, never for unpaid delivered bytes.
-    paid_credited: U256,
+    paid_bytes: U256,
     /// Wall-clock (Unix milliseconds) of the last accepted voucher on this lane,
     /// or `0` when this process has accepted none since it hydrated the lane
     /// (issue #1733). Stamped by [`ClientHandler::commit_one_proof`] under the
@@ -158,33 +158,83 @@ struct LaneDeliveryState {
     /// it gates nothing, and the stamp lifecycle follows the lane row (a
     /// forgotten lane drops it automatically).
     last_voucher_at: AtomicU64,
-    /// Paid wire bytes that finished streams on this lane returned for the next
-    /// stream's credit ramp (ADR 003 §Credit window). In memory only: a lane this
-    /// process loads or registers starts with an empty pool.
-    ramp_pool: Arc<ramp::RampPool>,
+    /// Where each stream of this lane that ended without a clean close left
+    /// off, by blob hash (ADR 003 § Credit Window, backfill). In memory only: a
+    /// node restart drops it, and the payer then pays for the gap.
+    unclean_ends: HashMap<Hash, u64>,
+    /// Bytes of backfill the lane has drawn so far, against its allowance of
+    /// `paid / backfill_divisor`. In memory only.
+    backfilled_bytes: u64,
+    /// Ticks each time the lane's credit rises: a proof that credits bytes, or
+    /// a backfill. A stream waiting for credit races its own proof read against
+    /// it, so a sibling's proof wakes it (ADR 003 § Credit Window).
+    credit_tx: tokio::sync::watch::Sender<u64>,
+    /// The connection whose proof last credited the lane, by its stable id. A
+    /// payer's streams share its connection, so a stale proof on a different
+    /// connection is a payer that lost its watermark, as a restarted one has.
+    last_credit_conn: Option<usize>,
 }
 
+/// Most unclean stream ends a lane remembers. A lane that leaves more streams
+/// unfinished than this forgets the older ones, and its payer pays for those gaps.
+const MAX_UNCLEAN_ENDS_PER_LANE: usize = 64;
+
 impl LaneDeliveryState {
-    /// The delivery state for a lane this process loads or registers, with its
-    /// whole claim — signed bytes and proved chain frontier — already credited.
-    ///
-    /// Every byte the lane's claim covers was delivered before this entry
-    /// existed — by an earlier process, or before the lane was last forgotten —
-    /// to a stream that either took the credit or ended with it unclaimed. No
-    /// stream outlives the entry it drew on. A new stream delivers
-    /// only new bytes, so none of that claim is headroom it may draw on.
-    /// Crediting only the signed half would hand each restart the proved
-    /// frontier — up to a whole chain — as free credit for proofs that pay
-    /// nothing.
+    /// The delivery state for a lane this process loads or registers. The lane's
+    /// credit is what its persisted claim and delivered count leave
+    /// ([`LaneState::credit_bytes`]), so credit survives a restart.
     fn hydrated(state: LaneState) -> Self {
-        let owed_bytes = state.owed_bytes();
+        let paid_bytes = state.owed_bytes();
         Self {
             state,
-            bytes_delivered_cumulative: owed_bytes,
-            paid_credited: owed_bytes,
+            paid_bytes,
             last_voucher_at: AtomicU64::new(0),
-            ramp_pool: Arc::default(),
+            unclean_ends: HashMap::new(),
+            backfilled_bytes: 0,
+            credit_tx: tokio::sync::watch::Sender::new(0),
+            last_credit_conn: None,
         }
+    }
+
+    /// Wake every stream of the lane that waits for credit.
+    fn note_credit_raised(&self) {
+        self.credit_tx
+            .send_modify(|tick| *tick = tick.wrapping_add(1));
+    }
+
+    /// Remember where a stream on `hash` ended without a clean close, so a resume
+    /// of the same blob can draw a backfill.
+    fn note_unclean_end(&mut self, hash: Hash, end_offset: u64) {
+        if self.unclean_ends.len() >= MAX_UNCLEAN_ENDS_PER_LANE
+            && !self.unclean_ends.contains_key(&hash)
+        {
+            self.unclean_ends.clear();
+        }
+        self.unclean_ends.insert(hash, end_offset);
+    }
+
+    /// Settle the backfill for a stream that starts at `byte_offset` of `hash`
+    /// (ADR 003 § Credit Window). The remembered end of the lane's last unclean
+    /// stream on the blob is consumed. A start before it returns the gap to the
+    /// lane's credit, within the lane's allowance and `window`. Returns the bytes
+    /// given back.
+    fn take_backfill(&mut self, hash: Hash, byte_offset: u64, window: u64, divisor: u64) -> u64 {
+        let Some(end_offset) = self.unclean_ends.remove(&hash) else {
+            return 0;
+        };
+        let gap = end_offset.saturating_sub(byte_offset);
+        if gap == 0 || divisor == 0 {
+            return 0;
+        }
+        let paid = u64::try_from(self.paid_bytes).unwrap_or(u64::MAX);
+        let allowance = (paid / divisor).saturating_sub(self.backfilled_bytes);
+        let granted = gap
+            .min(allowance)
+            .min(window)
+            .min(self.state.delivered_bytes);
+        self.backfilled_bytes = self.backfilled_bytes.saturating_add(granted);
+        self.state.refund(granted);
+        granted
     }
 }
 
@@ -267,10 +317,12 @@ impl LaneActivityClock {
                 key,
                 Arc::new(Mutex::new(LaneDeliveryState {
                     state,
-                    bytes_delivered_cumulative: U256::ZERO,
-                    paid_credited: U256::ZERO,
+                    paid_bytes: U256::ZERO,
                     last_voucher_at: AtomicU64::new(now),
-                    ramp_pool: Arc::default(),
+                    unclean_ends: HashMap::new(),
+                    backfilled_bytes: 0,
+                    credit_tx: tokio::sync::watch::Sender::new(0),
+                    last_credit_conn: None,
                 })),
             );
         }
@@ -302,305 +354,6 @@ impl ClientHandler {
     pub fn lane_activity_clock(&self) -> LaneActivityClock {
         LaneActivityClock {
             lanes: Arc::clone(&self.lanes),
-        }
-    }
-}
-
-/// One capability signer's slice of a pool's floor accounting (ADR 003 §Pool
-/// solvency, per-signer floor isolation).
-///
-/// `live_reservation` is the `µUSDC` this signer's in-flight streams currently
-/// reserve — un-vouchered floor delivered ahead of payment, released as each stream
-/// pays. It is the concurrency/solvency dimension: it carries no memory and never
-/// penalizes a signer for quitting. Bounding it per signer (`k · one_window`) is
-/// what stops one capability key from taking a shared pool's whole live floor
-/// budget from its co-tenants (ADR 003 §Pool solvency, per-signer floor isolation).
-#[derive(Debug, Default, Clone, Copy)]
-pub(super) struct SignerFloorState {
-    live_reservation: U256,
-}
-
-impl SignerFloorState {
-    /// A row that carries no information: no live reservation. An unseen signer reads
-    /// the same, so such a row can be pruned.
-    fn is_empty(self) -> bool {
-        self.live_reservation.is_zero()
-    }
-}
-
-/// One pool's floor accounting (ADR 003 §Pool solvency). `live_reservation` is the
-/// `µUSDC` currently reserved by in-flight streams — the hard money envelope, summed
-/// across every signer and bounded by `remaining − M`. It is ephemeral: no stream is
-/// live at restart, so it clears.
-///
-/// `signers` holds each capability signer's [`SignerFloorState`]: its slice of
-/// `live_reservation`, so admission can bound one signer's concurrent un-vouchered
-/// exposure. The pool's `live_reservation` stays the sum of the signer slices —
-/// every charge and release touches both levels under one lock hold.
-#[derive(Debug, Clone)]
-pub(super) struct PoolFloorState {
-    live_reservation: U256,
-    signers: HashMap<Address, SignerFloorState>,
-    /// Generation stamp, unique across every entry this process creates. A
-    /// [`FloorReservation`] copies it at charge time and both reconcile paths
-    /// compare it, so a guard whose pool was reclaimed
-    /// ([`ClientHandler::forget_pool_floor`] removed the entry) and whose `pool_id`
-    /// a later admission then re-entered reconciles against nothing, rather than
-    /// decrementing counters it never contributed to against a signer row belonging
-    /// to a different pool generation.
-    epoch: u64,
-}
-
-/// Source of [`PoolFloorState::epoch`]. Process-wide and monotonic, so no two
-/// entries share a stamp — including an entry re-created under a `pool_id` a
-/// removed entry previously held.
-static POOL_FLOOR_EPOCH: AtomicU64 = AtomicU64::new(0);
-
-impl Default for PoolFloorState {
-    fn default() -> Self {
-        Self {
-            live_reservation: U256::ZERO,
-            signers: HashMap::new(),
-            epoch: POOL_FLOOR_EPOCH.fetch_add(1, Ordering::Relaxed),
-        }
-    }
-}
-
-impl PoolFloorState {
-    /// Live floor credit committed across every signer on the pool — the pool
-    /// solvency quantity, bounded by `remaining − M`.
-    const fn live_committed(&self) -> U256 {
-        self.live_reservation
-    }
-
-    /// Drop a signer's entry once it carries no information — no live reservation. An
-    /// unseen signer reads the same way (zero live reservation), so keeping such a row
-    /// changes no decision.
-    ///
-    /// Without this the map only ever grows. ADR 003 §Revocation makes short-expiry
-    /// session keys the intended usage, so a busy publisher mints signer identities
-    /// steadily, and every one that reserves and pays cleanly would leave an empty row
-    /// alive until the pool is reclaimed on-chain — inside a map locked on every
-    /// admission.
-    ///
-    /// Safe against a live guard: a repaid guard's `Drop` returns before touching
-    /// the map at all, and an unrepaid guard holds `live_reservation > 0` — every
-    /// admission reserves at least one chunk at the on-chain-floored rate, so a
-    /// reservation is never zero — and it cannot have its row pruned out from
-    /// under it.
-    fn prune_spent(&mut self, signer: Address) {
-        if self
-            .signers
-            .get(&signer)
-            .is_some_and(|lane| lane.is_empty())
-        {
-            self.signers.remove(&signer);
-        }
-    }
-}
-
-/// RAII hold for one stream's span-capped reservation against a pool's budget.
-///
-/// Construction charges the reserved amount to the pool's `live_reservation` (and
-/// the signer's slice of it). [`Self::release_if_repaid`] frees the reservation
-/// once THIS stream's cumulative payment reaches the reserved floor. On drop (every
-/// exit path — success, `?`, disconnect, panic) the guard releases the live
-/// reservation if it was not already repaid, so an abandoned stream never holds a
-/// pool's floor headroom past its own lifetime. The reservation is owned by the
-/// guard and never adjusted by hand, and every counter update saturates.
-#[must_use = "dropping the guard at once releases its live reservation"]
-pub(super) struct FloorReservation {
-    map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-    pool_id: B256,
-    /// Generation of the [`PoolFloorState`] this reservation is charged against
-    /// (see [`PoolFloorState::epoch`]). Both reconcile paths skip an entry whose
-    /// stamp differs: such an entry belongs to a later pool generation, and this
-    /// guard's reservation went with the one that was removed.
-    epoch: u64,
-    /// The capability signer this reservation belongs to, so its live slice is
-    /// released on the same signer row it was charged to.
-    signer: Address,
-    reserved: U256,
-    /// Set by [`Self::release_live_repaid`]; makes drop a no-op (live already freed).
-    /// Idempotent.
-    repaid: AtomicBool,
-}
-
-impl FloorReservation {
-    /// Reserve `reserved` `µUSDC` of the pool's budget. Charges
-    /// `live_reservation += reserved` (saturating) under the sync lock — an O(1) map
-    /// touch with no `.await` held, so a blocking lock is correct even on the async
-    /// serve path (mirrors `lane_gauge_publish`). A poisoned lock recovers the
-    /// guard rather than panicking; the reservation is best-effort accounting, never
-    /// a safety gate.
-    ///
-    /// The standalone increment-then-build form, used only by the accumulator's
-    /// own unit tests. The serve path admits through
-    /// [`ClientHandler::try_reserve_floor`] instead, which needs the increment to
-    /// happen inside its own check-and-reserve lock hold and so builds the guard
-    /// via [`Self::new_charged`].
-    #[cfg(test)]
-    fn reserve(
-        map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-        pool_id: B256,
-        signer: Address,
-        reserved: U256,
-    ) -> Self {
-        let epoch = {
-            let mut guard = map
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = guard.entry(pool_id).or_default();
-            entry.live_reservation = entry.live_reservation.saturating_add(reserved);
-            let lane = entry.signers.entry(signer).or_default();
-            lane.live_reservation = lane.live_reservation.saturating_add(reserved);
-            entry.epoch
-        };
-        Self::new_charged(map, pool_id, signer, reserved, epoch)
-    }
-
-    /// Build a guard for a floor that is ALREADY charged to `live_reservation`
-    /// under the caller's own lock hold. This does NOT touch the map — the
-    /// increment happens exactly once, at the caller's atomic check-and-reserve,
-    /// so re-incrementing here would double-charge the pool. Used by
-    /// [`ClientHandler::try_reserve_floor`], whose single lock hold covers both the
-    /// budget check and the increment; `FloorReservation::reserve` is the test-only
-    /// standalone form that increments first, then delegates here.
-    const fn new_charged(
-        map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-        pool_id: B256,
-        signer: Address,
-        reserved: U256,
-        epoch: u64,
-    ) -> Self {
-        Self {
-            map,
-            pool_id,
-            epoch,
-            signer,
-            reserved,
-            repaid: AtomicBool::new(false),
-        }
-    }
-
-    /// Mark the reservation repaid: the lane's cumulative payment reached a floor,
-    /// so free the live reservation now (`live_reservation -= reserved`, saturating)
-    /// and make the eventual drop a no-op. Idempotent — only the first call moves
-    /// the live counter.
-    fn release_live_repaid(&self) {
-        if self.repaid.swap(true, Ordering::Relaxed) {
-            return; // already repaid; live already released
-        }
-        let mut guard = self
-            .map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // `get_mut`, not `entry().or_default()`, same as the drop guard: if the
-        // pool was reclaimed (`forget_pool_floor` removed its entry) the live
-        // reservation went with the entry, and re-inserting a default state here
-        // resurrects an entry for a closed pool that nothing removes again — the
-        // in-memory face of #1781. The epoch test covers the other half of that
-        // window: an entry present under this `pool_id` but stamped differently is
-        // a LATER generation, re-entered by an admission that ran after the remove,
-        // and subtracting from it would report a reservation this guard never
-        // charged to it.
-        if let Some(entry) = guard
-            .get_mut(&self.pool_id)
-            .filter(|entry| entry.epoch == self.epoch)
-        {
-            entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
-            // The signer entry moves with the pool total — the two levels are one
-            // accumulator, so a release that touched only one would leave the
-            // signer's share permanently consumed by a stream that paid for it.
-            if let Some(lane) = entry.signers.get_mut(&self.signer) {
-                lane.live_reservation = lane.live_reservation.saturating_sub(self.reserved);
-            }
-            entry.prune_spent(self.signer);
-        }
-    }
-
-    /// Release the live reservation once cumulative payment (`paid_micro`) reaches
-    /// the amount that was reserved. Matches release to the reserved size at any
-    /// `credit_ramp_divisor`: with the ramp disabled the reservation is the full
-    /// `credit_max`, so release must wait for that much to be paid rather than a
-    /// single chunk. Idempotent (delegates to [`Self::release_live_repaid`]).
-    fn release_if_repaid(&self, paid_micro: U256) {
-        if paid_micro >= self.reserved {
-            self.release_live_repaid();
-        }
-    }
-
-    /// Release the reservation for a serve that was REFUSED before the serve loop
-    /// ran — no upstream USDC fronted, no downstream byte delivered. Frees the live
-    /// reservation promptly (rather than at drop) and marks the guard repaid so the
-    /// drop is a clean no-op. Mechanically a refused-unspent serve and a fully-repaid
-    /// one both owe nothing, so this delegates to [`Self::release_live_repaid`]; the
-    /// distinct name states the intent at the refusal call sites.
-    fn release_unspent(&self) {
-        self.release_live_repaid();
-    }
-}
-
-impl Drop for FloorReservation {
-    fn drop(&mut self) {
-        // Release the live reservation on every exit path (success, `?`, disconnect,
-        // panic) unless a paying stream already released it via
-        // [`Self::release_live_repaid`]. An abandoned stream must not hold a pool's
-        // floor headroom past its own lifetime, so an unrepaid drop frees the
-        // reservation at both the pool and signer levels. No abandonment charge
-        // survives the drop: bounding un-vouchered floor is the admission-time job of
-        // the pool ceiling and the per-signer live cap (ADR 003 §Pool solvency).
-        self.release_live_repaid();
-    }
-}
-
-/// Which floor gate refused an admission
-/// ([`ClientHandler::try_reserve_floor`]). They stay distinct here so the
-/// per-reason metric separates "this pool cannot pay" from the node-local
-/// per-signer live cap, and they part on the wire too: the pool arm speaks
-/// [`StreamError::Unfunded`] to the proven requester (both floor gates run past
-/// the lane-ownership proof), while the signer arm stays a plain `NotFound`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FloorRefusal {
-    /// The pool-wide ceiling: `remaining − M` cannot cover the live floor
-    /// reservation already committed across every signer on the pool plus this new
-    /// floor. This is the hard money envelope; it clears with a top-up.
-    PoolExhausted,
-    /// The per-signer LIVE concurrency cap: the pool can still pay, but THIS signer
-    /// already holds `k` windows of live un-vouchered reservation, so admitting
-    /// another would let one signer front more concurrent credit than its share of
-    /// the pool covers. Carries the cap that refused, read under the same lock hold
-    /// as the decision, so the operator line reports the number that actually
-    /// applied. Clears as the signer's in-flight streams pay.
-    SignerAtCap { signer_cap: U256 },
-}
-
-/// What a floor-admission refusal needs to describe itself
-/// ([`ClientHandler::log_floor_refusal`]). Grouped rather than passed positionally
-/// because the two messages read different fields: the pool arm wants the pool's
-/// headroom against the reserved `ceiling`, the signer arm wants the signer. The
-/// signer's cap is NOT here — it rides on [`FloorRefusal::SignerAtCap`], read under
-/// the lock hold that made the decision. `remaining` is the raw `getPool` value, so
-/// the callee derives the headroom rather than every call site deriving it.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct FloorRefusalSite {
-    pub pool_id: B256,
-    pub signer: Address,
-    pub hash: Hash,
-    pub remaining: U256,
-    /// The `µUSDC` this admission asked to reserve.
-    pub ceiling: U256,
-}
-
-impl From<FloorRefusal> for ServeRejectReason {
-    /// The refusal reason a serve-path admission gate reports for this cap. Keeping
-    /// the mapping on the conversion makes an inconsistent cap/reason pairing
-    /// unrepresentable at the call sites, exactly as
-    /// [`ServeRejectReason::wire_error`] does for the wire codes.
-    fn from(refusal: FloorRefusal) -> Self {
-        match refusal {
-            FloorRefusal::PoolExhausted => Self::InsufficientDeposit,
-            FloorRefusal::SignerAtCap { .. } => Self::SignerFloorAtCap,
         }
     }
 }
@@ -669,14 +422,6 @@ enum ServeRejectReason {
     /// on a verified binding for a registered signer or a lane, so the
     /// requester is proven.
     CapabilityExpired,
-    /// One capability signer's live un-vouchered reservation already fills its
-    /// `k`-window concurrency cap (ADR 003 §Pool solvency, per-signer floor
-    /// isolation). The pool itself can still pay and co-tenants are unaffected; the
-    /// cap is signer-scoped and clears as that signer's in-flight streams pay.
-    /// Collapses to `NotFound` on the wire (see [`Self::wire_error`]) — a node-local
-    /// concurrency stop, cleared by waiting rather than by a top-up, so unlike
-    /// [`Self::InsufficientDeposit`] it names no funding state.
-    SignerFloorAtCap,
     /// A whole-blob request from an active staker, refused while this node's own
     /// upstream open for the blob is in progress and no live fill exists to
     /// coalesce onto (#2224). Answering it would let partial holders pull the
@@ -764,7 +509,6 @@ impl ServeRejectReason {
             | Self::OwnerMismatch
             | Self::PoolUnconfirmed
             | Self::PoolClosing { proven: false }
-            | Self::SignerFloorAtCap
             | Self::PullLoopGuard
             | Self::LoadShedHit
             | Self::LoadShedMiss
@@ -1072,31 +816,25 @@ pub struct ClientHandlerDeps {
     /// origin, tried ahead of any node-to-node path and independent of
     /// [`Self::pull_through`]. `None` skips the local-origin tier.
     pub local_populate: Option<Duration>,
-    /// Selects the window-paced node-to-node pull leg, which bounds
-    /// speculative spend to the ramped credit window. `None` falls back to the
+    /// Selects the credit-paced node-to-node pull leg, which draws upstream only
+    /// what the downstream lane has paid for. `None` falls back to the
     /// buffered `populate` path when [`Self::pull_through`] is set.
     pub pull_through_origin: Option<Arc<NodeOrigin>>,
-    /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window): the
-    /// per-stream window ramps toward this cap as the stream pays. Defaults to
-    /// `DEFAULT_CREDIT_MAX` (64 MiB); the runtime sets it from
-    /// `payment.credit_max`. The SAME ceiling paces the pull leg's upstream
-    /// speculative spend on a cache-miss pull (`RampPacer`, #1669), so the
-    /// upstream and downstream ramps never diverge. Floored at one chunk so
-    /// the serve loop can always make progress.
-    pub credit_max: u64,
-    /// Ramp divisor for the credit window (ADR 003 §Credit window): the window is
-    /// `paid / credit_ramp_divisor`, floored at one chunk and capped at
-    /// `credit_max`. Defaults to `DEFAULT_CREDIT_RAMP_DIVISOR` (2); the runtime
-    /// sets it from `payment.credit_ramp_divisor`. `0` opens the full ceiling
-    /// immediately.
-    pub credit_ramp_divisor: u64,
+    /// The most bytes one backfill returns to a lane's credit (ADR 003 § Credit
+    /// Window). Defaults to `DEFAULT_BACKFILL_WINDOW` (4 MiB); the runtime sets
+    /// it from `payment.backfill_window`.
+    pub backfill_window: u64,
+    /// A lane's total backfill allowance is `paid / backfill_divisor` bytes. Defaults
+    /// to `DEFAULT_BACKFILL_DIVISOR` (64); the runtime sets it from
+    /// `payment.backfill_divisor`. `0` turns backfill off.
+    pub backfill_divisor: u64,
     /// Target wire-frame size in bytes for the serve path (ADR 005
     /// §`cdn/client/v1`). Node-local policy, never negotiated: the payer accepts
     /// any non-empty frame, and neither payment nor bao verification is defined
     /// over frame boundaries. Defaults to `DEFAULT_FRAME_TARGET_BYTES` (1 MiB);
     /// the runtime sets it from `payment.frame_target_bytes`. The serve loop
-    /// clamps each request to the credit window's remaining room, so this is a
-    /// ceiling on frame size rather than an exact size.
+    /// clamps each request to the lane's credit, so this is a ceiling on frame
+    /// size rather than an exact size.
     pub frame_target_bytes: u64,
     /// Application-layer idle-close ceiling for a whole connection (ADR 005
     /// §Connection lifetime). `None` — the production path — reads as
@@ -1107,13 +845,6 @@ pub struct ClientHandlerDeps {
     /// [`crate::pool_view::POOL_RECHECK_INTERVAL`]; a shorter value is set at
     /// construction only by tests, so a drain case need not wait a real interval.
     pub pool_recheck_interval: Option<Duration>,
-    /// Per-signer LIVE concurrency cap `k`, in credit windows (ADR 003 §Pool solvency,
-    /// per-signer floor isolation): the most live un-vouchered reservation one signer
-    /// may hold, `k · one_window`. The runtime sets it from
-    /// `blockchain.pool_floor_signer_live_windows`; the default of `u64::MAX` leaves it
-    /// effectively unbounded, which is what unit tests that only exercise the pool-wide
-    /// bound want. Lower-clamped to one window at use.
-    pub pool_floor_signer_live_windows: u64,
     /// ADR 041 serve-credit boundary in front of the per-source warming
     /// allowance — the ledger the buy loop
     /// ([`crate::node_origin::NodeOriginConfig`]) debits and eviction forgets. On
@@ -1203,15 +934,11 @@ impl ClientHandlerDeps {
             pull_through: None,
             local_populate: None,
             pull_through_origin: None,
-            credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
-            credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+            backfill_window: decdn_common::config::DEFAULT_BACKFILL_WINDOW,
+            backfill_divisor: decdn_common::config::DEFAULT_BACKFILL_DIVISOR,
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             idle_timeout: None,
             pool_recheck_interval: None,
-            // No-op per-signer live cap by default: the runtime overrides it from
-            // config, and a caller that never sets it keeps the pool-wide ceiling as
-            // the only floor bound (an unbounded per-signer live cap).
-            pool_floor_signer_live_windows: u64::MAX,
             warming_credit: Arc::new(crate::warming_allowance::NoopWarmingCreditSink),
             operator_shares: crate::fee_shares::OperatorShares::new(0),
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
@@ -1403,18 +1130,6 @@ pub struct ClientHandler {
     /// capability on every request skips the per-request `ecrecover` in
     /// [`ClientHandler::intake_capability`].
     capability_verify_cache: std::sync::Mutex<CapabilityVerifyCache>,
-    /// Floor accounting (ADR 003 §Pool solvency): per pool `live_reservation` and, per
-    /// signer within each pool, that signer's live slice. Guards an O(1) map only and
-    /// is never held across `.await` — a plain `std::sync::Mutex`, so a
-    /// [`FloorReservation`]'s `Drop` can reconcile under it (a tokio mutex cannot be
-    /// locked in `Drop`). Purely in-memory: no stream is live at restart, so it clears.
-    pool_floor: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-    /// Per-signer LIVE concurrency cap `k`, in credit windows
-    /// (see [`ClientHandlerDeps::pool_floor_signer_live_windows`]). Read by
-    /// [`Self::signer_floor_cap`] on every admission
-    /// ([`Self::try_reserve_floor`]). The mid-stream and direct-serve re-checks
-    /// leave it out — see [`Self::pool_budget_covers_reserve`].
-    pool_floor_signer_live_windows: u64,
     /// Redeem-hint sender to the on-chain settlement service (#327), set at
     /// construction via [`ClientHandlerDeps`]. `None` when no settlement service
     /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
@@ -1446,24 +1161,19 @@ pub struct ClientHandler {
     /// miss for an offset-0 request that proves lane authority is served by
     /// fusing a progressive upstream pull with downstream delivery — forwarding
     /// each chunk to the paying client and teeing it into the cache — so
-    /// per-request speculative exposure is bounded to the ramped credit window
-    /// (#1669) instead of the whole blob. `None` keeps the buffered `populate`
+    /// per-request upstream spend is bounded to the credit the downstream lane
+    /// holds instead of the whole blob. `None` keeps the buffered `populate`
     /// path (`pull_through`) or a plain `NotFound`.
     pull_through_origin: Option<Arc<NodeOrigin>>,
-    /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window), set at
-    /// construction via [`ClientHandlerDeps`]. The serve loop keeps streaming
-    /// while `delivered − paid ≤ credit_window`, collecting cumulative vouchers as
-    /// they arrive instead of stalling a full round trip at every interval. Read
-    /// through [`Self::credit_window`], which ramps from one interval toward this
-    /// ceiling as `paid` grows.
-    credit_max: u64,
-    /// Ramp divisor for the credit window (ADR 003 §Credit window), set at
-    /// construction via [`ClientHandlerDeps`]. Read through
-    /// [`Self::credit_window`].
-    credit_ramp_divisor: u64,
+    /// Most bytes one backfill returns to a lane's credit
+    /// ([`ClientHandlerDeps::backfill_window`]).
+    backfill_window: u64,
+    /// A lane's backfill allowance divisor
+    /// ([`ClientHandlerDeps::backfill_divisor`]).
+    backfill_divisor: u64,
     /// Target wire-frame size in bytes, set at construction via
     /// [`ClientHandlerDeps`]. Read through [`Self::frame_target`], which clamps it
-    /// to the credit window's remaining room.
+    /// to the lane's credit.
     frame_target_bytes: u64,
     /// Live content deny-set (ADR 011), keyed on the pool FUNDER. Consulted at
     /// two points, both of which must gate or the check is bypassable: the
@@ -1483,11 +1193,6 @@ pub struct ClientHandler {
     /// "I am refusing everyone" — and the per-lane detail lives in the
     /// `debug!` beside it and in the counter.
     deposit_refusal_warn: WarnThrottle,
-    /// The same window for the per-signer LIVE-cap arm. Kept separate from the
-    /// pool arm because the two carry different remedies — a pool-wide shortfall
-    /// clears with a top-up, a signer at its share does not — so one must not
-    /// starve the other's line or pollute its `suppressed` count.
-    signer_cap_refusal_warn: WarnThrottle,
     /// Throttle for the `warn!` on a client binding whose signature is invalid
     /// or recovers a different address. A remote peer triggers it at will. The
     /// two causes share one window on purpose: both are the same client fault
@@ -1591,9 +1296,6 @@ impl ClientHandler {
         let open_lanes = map.len();
         let lane_count = AtomicUsize::new(open_lanes);
         deps.metrics.set_lanes_open(open_lanes);
-        // The floor accumulator is purely in-memory: no stream is live at boot, so
-        // every `live_reservation` starts at zero and nothing is loaded from disk.
-        let pool_floor: HashMap<B256, PoolFloorState> = HashMap::new();
         Ok(Self {
             node_id: deps.node_id,
             metrics: deps.metrics,
@@ -1617,20 +1319,17 @@ impl ClientHandler {
             lane_after_resolution: std::sync::Mutex::new(None),
             lane_gauge_publish: std::sync::Mutex::new(()),
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
-            pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
-            pool_floor_signer_live_windows: deps.pool_floor_signer_live_windows,
             redeem_hint: deps.redeem_hint,
             pull_through: deps.pull_through,
             local_populate: deps.local_populate,
             pull_through_origin: deps.pull_through_origin,
-            credit_max: deps.credit_max,
-            credit_ramp_divisor: deps.credit_ramp_divisor,
+            backfill_window: deps.backfill_window,
+            backfill_divisor: deps.backfill_divisor,
             frame_target_bytes: deps.frame_target_bytes,
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             max_concurrent_streams: deps.max_concurrent_streams,
             deposit_refusal_warn: WarnThrottle::new(Self::DEPOSIT_REFUSAL_WARN_INTERVAL),
-            signer_cap_refusal_warn: WarnThrottle::new(Self::DEPOSIT_REFUSAL_WARN_INTERVAL),
             binding_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             timestamp_skew_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unbound_request_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
@@ -1781,13 +1480,12 @@ impl ClientHandler {
             );
             return Some(ServeStop::PoolClosed);
         }
-        if !self.pool_funds_committed(lane_key.pool_id, status.remaining) {
-            // A paying in-flight download is being terminated, and the pool
-            // solvency bound only grows — an accumulator bug here is permanent per
-            // pool, so make the stop observable rather than silent.
+        if !self.pool_funds_committed(status.remaining) {
+            // A paying in-flight download is being terminated, so make the stop
+            // observable rather than silent.
             tracing::warn!(
                 pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
-                "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause; a per-signer gate refusal never reaches here"
+                "mid-stream PoolExhausted: the pool's remaining deposit has reached the refundable floor M; owner should top up the deposit. This is the POOL level — stopped_signer names the terminated stream, not the cause"
             );
             return Some(ServeStop::PoolExhausted);
         }
@@ -1820,9 +1518,9 @@ impl ClientHandler {
     /// capability). `spent` is the admit-time `getAuthorization` read (#1958) plus
     /// what the projection has folded for the signer since, the same number the
     /// admit-time gate reads; with no registered read held it is the projection's
-    /// fold alone. The floor is one ramp-start credit window, the SAME quantity the
-    /// admit-time gate confirms (`ClientHandler::serve_stream`), so the mid-stream
-    /// threshold matches admission.
+    /// fold alone. The floor is one chunk price, the SAME quantity the admit-time
+    /// gate confirms (`ClientHandler::serve_stream`), so the mid-stream threshold
+    /// matches admission.
     ///
     /// Error bounds: on a pool seeded from one `getPool`, a lane's first fold
     /// after the read counts its whole cumulative, including what the read's
@@ -1849,10 +1547,7 @@ impl ClientHandler {
             return false;
         };
         let headroom = held_cap.saturating_sub(U256::from(spent));
-        let floor_micro = U256::from(decdn_incentive::min_payment(
-            self.credit_window(CHUNK_BYTES, 0),
-            rate_per_mb,
-        ));
+        let floor_micro = decdn_incentive::min_payment(CHUNK_BYTES, rate_per_mb);
         headroom < floor_micro
     }
 
@@ -2225,66 +1920,6 @@ impl ClientHandler {
     /// the `suppressed` count.
     pub(super) const POOL_RECHECK_STALE_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
-    /// Emit the observable side of a floor-admission refusal, picking the message
-    /// the refusing gate actually justifies.
-    ///
-    /// The gates need different words and different remedies.
-    /// [`FloorRefusal::PoolExhausted`] is the pool running dry, which
-    /// [`Self::log_deposit_refusal`] already describes. The per-signer live cap is the
-    /// opposite situation: `try_reserve_floor` tests the pool ceiling FIRST, so
-    /// reaching it proves the pool can pay. Reporting it as a deposit shortfall
-    /// would print a headroom that visibly exceeds the ceiling beside a sentence
-    /// denying it, and would send the operator to check RPC health while the real cause
-    /// is one signer's node-local live cap.
-    fn log_floor_refusal(&self, refusal: FloorRefusal, at: FloorRefusalSite) {
-        let FloorRefusalSite {
-            pool_id,
-            signer,
-            hash,
-            remaining,
-            ceiling,
-        } = at;
-        let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
-        match refusal {
-            FloorRefusal::PoolExhausted => {
-                self.log_deposit_refusal(pool_id, hash, headroom, ceiling);
-            }
-            FloorRefusal::SignerAtCap { signer_cap } => {
-                self.log_signer_at_cap(pool_id, signer, hash, signer_cap, ceiling, headroom);
-            }
-        }
-    }
-
-    /// The observable side of a per-signer LIVE-cap refusal
-    /// ([`FloorRefusal::SignerAtCap`]).
-    fn log_signer_at_cap(
-        &self,
-        pool_id: B256,
-        signer: Address,
-        hash: Hash,
-        signer_cap: U256,
-        ceiling: U256,
-        headroom: U256,
-    ) {
-        tracing::debug!(
-            %pool_id, %signer, %hash, %signer_cap, %ceiling, %headroom,
-            "refusing delivery: this capability signer already holds its live concurrency cap \
-             of un-vouchered floor reservation; the pool itself can still pay"
-        );
-        if let Some(suppressed) = self.signer_cap_refusal_warn.admit() {
-            tracing::warn!(
-                %pool_id, %signer, %signer_cap, %headroom, suppressed,
-                interval = ?self.signer_cap_refusal_warn.interval(),
-                "refusing a paying client: one capability signer is running its whole live \
-                 concurrency cap of un-vouchered streams at once while the pool is solvent. This \
-                 clears as those streams pay; a sustained rate means that signer runs more \
-                 concurrent un-vouchered streams than its cap covers. Rotate the session key or \
-                 widen pool_floor_signer_live_windows — see docs/runbook.md, which covers why \
-                 widening it needs a restart"
-            );
-        }
-    }
-
     /// Emit the observable side of an insufficient-deposit refusal (#1520).
     ///
     /// Unconditional `debug!` so a support ticket is answerable at all, plus a
@@ -2316,62 +1951,43 @@ impl ClientHandler {
         }
     }
 
-    /// The frame size to request from a frame producer, given `unvouchered` — the
-    /// bytes delivered since the last payment-chunk boundary — and `interval_bytes`,
-    /// the payment quantum.
+    /// The frame size to request from a frame producer, given `into_chunk` — the
+    /// bytes this stream has sent since its last payment-chunk boundary — and
+    /// `interval_bytes`, the payment quantum.
     ///
-    /// **A frame never crosses a payment-chunk boundary.** Both sides meter the same
-    /// byte stream over the same frame sequence, and each waits for the other at
-    /// every `interval_bytes`: the node accumulates `unvouchered` until it reaches a
-    /// full interval and then demands a proof, while the payer releases one
-    /// hash-chain preimage per interval. A frame that straddled a boundary would
-    /// land the payer's counter PAST it, which is settled with a signed voucher for
-    /// the residual instead of a preimage — a per-frame signature on the hot path,
-    /// and a cadence the two sides no longer agree on. Cutting at the boundary keeps
-    /// the preimage path exact, whatever the target.
+    /// **A frame never crosses a payment-chunk boundary.** The payer releases one
+    /// hash-chain preimage per `interval_bytes` of the byte stream it receives. A
+    /// frame that straddled a boundary would land the payer's counter PAST it,
+    /// which is settled with a signed voucher for the residual instead of a
+    /// preimage: a per-frame signature on the hot path, and a cadence the two sides
+    /// no longer agree on. Cutting at the boundary keeps the preimage path exact,
+    /// whatever the target.
     ///
-    /// This also bounds the node's credit exposure. The serve loop checks the window
-    /// BEFORE each send, so `delivered - paid` overshoots by at most one frame; with
-    /// frames capped at one interval the overshoot is at most one payment chunk —
-    /// the same granularity the node bills at, and the bound ADR 003 §Credit window
-    /// states as "the window, plus at most one chunk".
+    /// `room` is the lane's credit, and it caps the request as well. The cap is
+    /// load-bearing on the **cache-miss** leg. The producer is fed by an upstream
+    /// pull that draws only what the lane's credit covers
+    /// ([`decdn_client::PULL_AHEAD_BYTES`] past it). Asking for a frame larger than
+    /// the credit would park the producer on bytes the pull may not draw.
     ///
-    /// `room` — the window's unused remainder, `window - (delivered - paid)` — caps
-    /// the request as well, and that cap is load-bearing on the **cache-miss** leg
-    /// rather than merely tidy. Both loops prefetch one frame ahead of the window
-    /// check, and on a miss the producer is fed by an upstream pull paced against
-    /// this stream's own served-and-paid frontier. Asking a closed window for a full
-    /// frame parks the prefetch on bytes that cannot arrive until the loop exits to
-    /// recoup — which it cannot do while parked. Sizing the request to the room that
-    /// actually remains keeps the prefetch satisfiable from what is already buffered.
-    ///
-    /// The room cap is floored at one bao chunk group so a shut window yields a
-    /// short frame rather than a single byte; that runt goes out once the recoup
-    /// reopens the window. A stream sitting at the one-chunk credit floor therefore
-    /// spends about two frames per payment chunk — a full frame, then the runt the
-    /// shut window produced — while a ramped stream keeps `room` far above the floor
-    /// and spends one.
-    ///
-    /// **The floor is exactly one group because the pull side reserves exactly one.**
-    /// On a cache miss the bytes this prefetch asks for can only come from the
-    /// upstream pull, and `decdn_client::PULL_WINDOW_FLOOR` carries a third
-    /// chunk group for precisely this request. Raising the floor here without
-    /// raising it there parks the serve leg on bytes the pull may not draw —
-    /// a hang, not a failed assertion. `frame_target_room_floor_matches_the_pull_reservation`
+    /// **The room is floored at one bao chunk group, and the pull reserves
+    /// [`decdn_client::PULL_AHEAD_BYTES`] for that frame.** A lane with a sliver of
+    /// credit still cuts a frame of one group, and the serve loop then waits for the
+    /// proof that pays for it. Raising the floor here without raising the pull's
+    /// slack parks the serve leg on bytes the pull may not draw. That is a hang,
+    /// not a failed assertion. `frame_target_room_floor_matches_the_pull_slack`
     /// pins the pair.
-    pub(super) fn frame_target(&self, unvouchered: u64, interval_bytes: u64, room: u64) -> usize {
-        // `unvouchered < interval_bytes` at every call site — both loops reset it to
-        // zero the moment it reaches a full interval. Were that ever to break, a
-        // saturating `0` would ask for one-byte frames forever: a stream that still
-        // "progresses" at six orders of magnitude below line rate, with no error and
-        // no metric. Fall back to a whole interval instead, which is wrong in the
-        // same direction as the rest of the clamp rather than catastrophically.
+    pub(super) fn frame_target(&self, into_chunk: u64, interval_bytes: u64, room: u64) -> usize {
+        // `into_chunk < interval_bytes` at every call site, because the loops
+        // reduce it modulo the interval. Were that ever to break, a saturating `0`
+        // would ask for one-byte frames forever, with no error and no metric. Fall
+        // back to a whole interval instead, which is wrong in the same direction
+        // as the rest of the clamp rather than catastrophically.
         debug_assert!(
-            unvouchered < interval_bytes,
-            "unvouchered {unvouchered} must stay below the {interval_bytes}-byte interval"
+            into_chunk < interval_bytes,
+            "into_chunk {into_chunk} must stay below the {interval_bytes}-byte interval"
         );
         let to_boundary = interval_bytes
-            .checked_sub(unvouchered)
+            .checked_sub(into_chunk)
             .filter(|remaining| *remaining > 0)
             .unwrap_or(interval_bytes);
         let want = self
@@ -2398,44 +2014,80 @@ impl ClientHandler {
             .min(cap)
     }
 
-    /// The effective downstream credit window in bytes for a stream whose voucher
-    /// interval is `interval_bytes` and whose ramp input is `paid` (ADR 003
-    /// §Credit window): the stream's own confirmed payment plus the credit it
-    /// carries from its lane ([`RampCarry::ramp_paid`](ramp::RampCarry::ramp_paid)).
-    /// The window ramps from its floor toward `credit_max` as `paid` grows:
-    /// `paid / credit_ramp_divisor` once that clears the floor, the floor itself
-    /// below that point (including at `paid == 0`), and the full `credit_max`
-    /// when `credit_ramp_divisor` is `0`. The floor is one interval plus
-    /// [`decdn_client::VERIFY_LAG_BYTES`]: the payer pays only for bytes it has
-    /// verified, so it must receive the leaf that straddles an interval boundary
-    /// before it can pay for that interval, and the loop always makes progress.
-    pub(super) fn credit_window(&self, interval_bytes: u64, paid: u64) -> u64 {
-        decdn_incentive::ramped_credit_window(
-            self.credit_ramp_divisor,
-            interval_bytes.saturating_add(decdn_client::VERIFY_LAG_BYTES),
-            self.credit_max,
-            paid,
-        )
+    /// Debit `len` bytes from `lane`'s credit (ADR 003 § Credit Window), once and
+    /// atomically under the lane's lock, and persist the lane's new delivered
+    /// count. Returns the credit the lane holds when it cannot cover `len`, so the
+    /// caller reads a proof. Two streams on one lane never spend one payment twice,
+    /// because both debit this one balance.
+    async fn debit_lane(&self, lane: &Arc<Mutex<LaneDeliveryState>>, len: u64) -> Result<(), u64> {
+        let mut guard = lane.lock().await;
+        guard.state.debit(len)?;
+        if let Err(e) = self.pool_state_store.record(&guard.state) {
+            tracing::error!(
+                pool_id = %guard.state.pool_id,
+                error = %e,
+                "could not record a lane's delivered count; credit may repeat after a restart"
+            );
+        }
+        Ok(())
     }
 
-    /// The most ramp credit a lane banks: the paid bytes that open one window at
-    /// `credit_max`. `0` when the ramp is disabled, because the window then starts
-    /// at the ceiling.
-    const fn ramp_credit_cap(&self) -> u64 {
-        self.credit_max.saturating_mul(self.credit_ramp_divisor)
+    /// The credit `lane` holds now, in wire bytes.
+    async fn lane_credit(&self, lane: &Arc<Mutex<LaneDeliveryState>>) -> u64 {
+        lane.lock().await.state.credit_bytes()
     }
 
-    /// Take `lane`'s banked ramp credit for one new stream (ADR 003 §Credit
-    /// window). A stream with no tracked lane carries nothing.
-    async fn take_ramp_carry(
+    /// Give a stream that resumes an unfinished one its backfill (ADR 003 § Credit
+    /// Window): the gap between the stream's `byte_offset` and the end the lane's
+    /// last unclean stream on `hash` reached, within the lane's allowance and
+    /// [`ClientHandlerDeps::backfill_window`]. Returns the bytes given back.
+    async fn apply_backfill(
         &self,
-        lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
-    ) -> ramp::RampCarry {
-        let Some(lane) = lane else {
-            return ramp::RampCarry::detached();
-        };
-        let pool = Arc::clone(&lane.lock().await.ramp_pool);
-        ramp::RampCarry::take(pool, self.ramp_credit_cap())
+        lane: &Arc<Mutex<LaneDeliveryState>>,
+        hash: Hash,
+        byte_offset: u64,
+    ) -> u64 {
+        let mut guard = lane.lock().await;
+        let granted = guard.take_backfill(
+            hash,
+            byte_offset,
+            self.backfill_window,
+            self.backfill_divisor,
+        );
+        if granted > 0 {
+            guard.note_credit_raised();
+        }
+        if granted > 0
+            && let Err(e) = self.pool_state_store.record(&guard.state)
+        {
+            tracing::error!(
+                pool_id = %guard.state.pool_id,
+                error = %e,
+                "could not record a lane's delivered count after a backfill"
+            );
+        }
+        granted
+    }
+
+    /// Log a backfill a resuming stream drew.
+    fn log_backfill(lane_key: LaneKey, hash: Hash, granted: u64) {
+        if granted > 0 {
+            tracing::debug!(
+                pool_id = %lane_key.pool_id, signer = %lane_key.signer, %hash, granted,
+                "returned the gap of an unfinished stream to the lane's credit"
+            );
+        }
+    }
+
+    /// Remember where a stream on `hash` stopped when it ended without a clean
+    /// close, so the lane's resume can draw a backfill.
+    async fn note_unclean_end(
+        &self,
+        lane: &Arc<Mutex<LaneDeliveryState>>,
+        hash: Hash,
+        end_offset: u64,
+    ) {
+        lane.lock().await.note_unclean_end(hash, end_offset);
     }
 
     /// The refundable floor-`M` serving guard (shared-payment-pool model): the
@@ -2461,209 +2113,12 @@ impl ClientHandler {
         refundable_headroom >= min_payment(reserved_bytes, rate_per_mb)
     }
 
-    /// Open a span-capped [`FloorReservation`] against `pool_id`'s budget for one
-    /// stream. The serve loop holds the returned guard for the stream's lifetime and
-    /// releases the reservation once a floor is repaid; on any other drop the guard
-    /// releases the live reservation, freeing the pool's floor headroom.
-    // Test-only: the serve path admits through `try_reserve_floor`, which checks
-    // every floor gate and reserves under one lock hold.
-    #[cfg(test)]
-    pub(super) fn reserve_floor(
-        &self,
-        pool_id: B256,
-        signer: Address,
-        reserved: U256,
-    ) -> FloorReservation {
-        FloorReservation::reserve(Arc::clone(&self.pool_floor), pool_id, signer, reserved)
-    }
-
-    /// One credit window in `µUSDC` priced at `rate_per_mb`: the ramp-start credit
-    /// window (one chunk normally, the full `credit_max` when
-    /// `credit_ramp_divisor == 0`), which is exactly what a fresh stream reserves. It
-    /// is the unit the per-signer live cap is denominated in.
-    pub(super) fn one_window(&self, rate_per_mb: u64) -> U256 {
-        min_payment(self.credit_window(CHUNK_BYTES, 0), rate_per_mb)
-    }
-
-    /// The per-signer LIVE concurrency cap on un-vouchered floor reservation (ADR 003
-    /// §Pool solvency, per-signer floor isolation): the most `live_reservation` any
-    /// ONE capability signer may hold against this pool, `k · one_window`.
-    ///
-    /// **The window is the unit being rationed.** A signer's honest need for
-    /// un-vouchered floor credit does not scale with the pool's size: every admission
-    /// reserves at most one window, and a paying stream releases its reservation as
-    /// soon as it covers it, so honest need is `concurrent un-vouchered streams × one
-    /// window` whether the pool holds ten dollars or a hundred thousand. An ABSOLUTE
-    /// `k`-window cap therefore fits the need directly, rather than a fraction of the
-    /// deposit that would be loose in both directions on a large pool.
-    ///
-    /// `k` is lower-clamped to one window, so a lone signer's first stream is always
-    /// admissible on any solvent pool. This carries no permanent memory: it is pure
-    /// concurrency, released as each stream pays, so it never penalizes a signer for
-    /// quitting.
-    ///
-    /// Pure and total (saturating), so it is testable without any chain access.
-    pub(super) fn signer_floor_cap(&self, rate_per_mb: u64) -> U256 {
-        let one_window = self.one_window(rate_per_mb);
-        // Lower-clamp `k` to one window: `k = 0` (or an unset field) still admits a
-        // lone signer's first stream rather than wedging it.
-        let k = self.pool_floor_signer_live_windows.max(1);
-        one_window.saturating_mul(U256::from(k))
-    }
-
-    /// POOL solvency: does the pool's `remaining − M` cover its already-committed LIVE
-    /// floor reservation across every signer, plus `new_reserve`? Reads the floor
-    /// accumulator; pure arithmetic otherwise. A poisoned
-    /// accumulator lock recovers the guard rather than panicking: every critical
-    /// section over this mutex is panic-free by construction — saturating `U256`
-    /// arithmetic and infallible map operations only, no indexing and no `unwrap` — so
-    /// a poison cannot originate from a holder of this lock, and a recovered guard
-    /// cannot observe a torn pool/signer split. Do NOT add a fallible or panicking
-    /// call under this lock; that argument is what the recovery rests on, because the
-    /// pool total and the signer entries must agree.
-    ///
-    /// (The recovery is not justified by the accumulator being "best-effort": it
-    /// gates whether the node fronts upstream USDC.)
-    ///
-    /// Deliberately the pool level ONLY. The per-signer gates are ADMISSION controls;
-    /// an admitted stream's reservation is already counted in the pool total, so
-    /// leaving them out of the pool-level view bounds nothing less.
-    /// [`Self::try_reserve_floor`] is where every gate applies. The in-flight
-    /// re-check is [`Self::pool_funds_committed`], which wraps this covers-check and
-    /// adds the `remaining > M` bound a repaid (empty) ledger needs.
-    pub(super) fn pool_budget_covers_reserve(
-        &self,
-        pool_id: B256,
-        remaining: U256,
-        new_reserve: U256,
-    ) -> bool {
-        let committed = {
-            let guard = self
-                .pool_floor
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard
-                .get(&pool_id)
-                .map_or(U256::ZERO, PoolFloorState::live_committed)
-        };
-        decdn_incentive::pool_budget_covers(
-            remaining,
-            self.pool_min_remaining_deposit,
-            committed,
-            new_reserve,
-        )
-    }
-
-    /// Mid-stream pool-solvency stop condition: `true` while the pool still funds
-    /// the delivery in flight on it.
-    ///
-    /// Two bounds, both required:
-    /// 1. `remaining > M` — the pool's remaining deposit sits above the refundable
-    ///    floor (ADR 003 §Pool solvency: delivery stops once `remaining ≤ M`).
-    ///    Streams release their own floor reservation once it is repaid, so a pool
-    ///    whose streams have all repaid has an empty committed ledger, the
-    ///    covers-check below holds vacuously, and only this bound stops a drained
-    ///    pool.
-    /// 2. `remaining − M` covers the pool's already-committed LIVE floor credit
-    ///    ([`Self::pool_budget_covers_reserve`] with no new reserve).
-    ///
-    /// Admission ([`Self::try_reserve_floor`]) and the direct-serve re-validation
-    /// keep their own gates: admission passes its own floor as the NEW RESERVE, and
-    /// the re-validation runs while the stream's reservation is still live in
-    /// `committed`, so the covers-check's right-hand side is nonzero and alone
-    /// bounds them — for a billable stream, that is: `min_payment` prices a floor
-    /// at zero only at a zero `rate_per_mb`, where nothing billable is at stake.
-    /// This is the in-flight re-check only.
-    pub(super) fn pool_funds_committed(&self, pool_id: B256, remaining: U256) -> bool {
+    /// Mid-stream pool-solvency stop condition: `true` while the pool's remaining
+    /// deposit sits above the refundable floor `M` (ADR 003 § Pool solvency:
+    /// delivery stops once `remaining ≤ M`). `M` covers every voucher in flight, so
+    /// nothing else bounds the pool: a node sends only what a lane has paid for.
+    pub(super) fn pool_funds_committed(&self, remaining: U256) -> bool {
         remaining > self.pool_min_remaining_deposit
-            && self.pool_budget_covers_reserve(pool_id, remaining, U256::ZERO)
-    }
-
-    /// Atomically check both floor gates and reserve one `floor` against the pool's
-    /// budget, returning the [`FloorReservation`] guard on success or the gate that
-    /// refused it.
-    ///
-    /// Two gates apply, both under ONE `pool_floor` lock hold so two concurrent
-    /// admissions cannot both pass a check and then both reserve (the TOCTOU
-    /// over-commit a separate check-then-reserve would allow):
-    /// 1. **Pool solvency** — `remaining − M` must cover the pool's committed LIVE
-    ///    reservation plus this floor. The hard money envelope.
-    /// 2. **Per-signer live cap** — this signer's live reservation plus this floor must
-    ///    stay within `k · one_window`.
-    ///
-    /// Only on success is the row inserted and the reservation charged, so probing a
-    /// full pool with fresh signer keys cannot grow the accumulator. The guard is built
-    /// from the already-charged state ([`FloorReservation::new_charged`]) so the
-    /// reserved amount is charged exactly once. A poisoned lock recovers the guard
-    /// rather than panicking (best-effort accounting, never a safety gate).
-    pub(super) fn try_reserve_floor(
-        &self,
-        pool_id: B256,
-        signer: Address,
-        remaining: U256,
-        rate_per_mb: u64,
-        reserved: U256,
-    ) -> Result<FloorReservation, FloorRefusal> {
-        let signer_cap = self.signer_floor_cap(rate_per_mb);
-        let epoch;
-        {
-            let mut guard = self
-                .pool_floor
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Read the pool's live total and this signer's live slice, without creating
-            // a row: a refused admission leaves no new pool or signer row behind, so a
-            // client probing a full pool with fresh signer keys cannot grow the map.
-            let (pool_live, signer_live) = match guard.get(&pool_id) {
-                Some(entry) => {
-                    let signer_live = entry
-                        .signers
-                        .get(&signer)
-                        .map_or(U256::ZERO, |lane| lane.live_reservation);
-                    (entry.live_reservation, signer_live)
-                }
-                None => (U256::ZERO, U256::ZERO),
-            };
-            // Pool ceiling first: it is the solvency bound, and it is what an
-            // operator reads as "this pool cannot pay".
-            if !decdn_incentive::pool_budget_covers(
-                remaining,
-                self.pool_min_remaining_deposit,
-                pool_live,
-                reserved,
-            ) {
-                return Err(FloorRefusal::PoolExhausted);
-            }
-            // Per-signer live concurrency cap: one signer cannot hold more than `k`
-            // windows of live un-vouchered reservation at once.
-            if signer_live.saturating_add(reserved) > signer_cap {
-                return Err(FloorRefusal::SignerAtCap { signer_cap });
-            }
-            let entry = guard.entry(pool_id).or_default();
-            entry.live_reservation = entry.live_reservation.saturating_add(reserved);
-            let lane = entry.signers.entry(signer).or_default();
-            lane.live_reservation = lane.live_reservation.saturating_add(reserved);
-            epoch = entry.epoch;
-        }
-        Ok(FloorReservation::new_charged(
-            Arc::clone(&self.pool_floor),
-            pool_id,
-            signer,
-            reserved,
-            epoch,
-        ))
-    }
-
-    /// Drop a reclaimed pool's floor accounting: remove its in-memory
-    /// `PoolFloorState`, which carries every signer's live slice with it. Called once
-    /// when a pool is reclaimed on-chain; a reclaimed `pool_id` never recurs (monotonic
-    /// open nonce), so the entry is permanently moot.
-    pub(crate) fn forget_pool_floor(&self, pool_id: B256) {
-        let mut guard = self
-            .pool_floor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.remove(&pool_id);
     }
 
     /// Has a takedown landed on this stream since it opened (ADR 011 §On
@@ -2738,13 +2193,16 @@ impl ClientHandler {
 /// [`ClientHandler::commit_one_proof`].
 enum VoucherStop {
     /// Verified and advanced in memory; keep serving. `credited_bytes` is the
-    /// watermark-capped wire bytes to advance the serve loop's `paid` by (rule
-    /// #1) — at most the amount the lane watermark advanced, so a benign
-    /// already-satisfied voucher contributes zero.
+    /// wire bytes the proof added to the lane's paid frontier, so a benign
+    /// already-satisfied proof contributes zero.
     Continue { credited_bytes: u64 },
     /// Rejected — the reject frame was written and the stream finishes cleanly;
     /// the loop returns `Ok(())`.
     Rejected,
+    /// The lane's credit rose while the stream waited for a proof of its own,
+    /// which it has not read: a sibling's proof paid the lane. The caller tries
+    /// its debit again.
+    Woken,
 }
 
 /// Router-facing `ProtocolHandler` for `cdn/client/v1`.
