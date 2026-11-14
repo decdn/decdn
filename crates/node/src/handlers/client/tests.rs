@@ -1911,6 +1911,8 @@ async fn lane_activity_clock_ages_reports_stamped_and_omits_unstamped() {
             last_voucher_at: AtomicU64::new(stamp),
             unclean_ends: HashMap::new(),
             backfilled_bytes: 0,
+            credit_tx: tokio::sync::watch::Sender::new(0),
+            last_credit_conn: None,
         }))
     };
     let map = DashMap::new();

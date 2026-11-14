@@ -3101,6 +3101,11 @@ pub struct UpstreamPull {
     /// Wire bytes the caller's decoder has verified against the root, never
     /// above `cumulative`. Payment follows this count, not `cumulative`.
     verified: u64,
+    /// Whether this stream has sent a payment of its own. The node wakes a
+    /// stream waiting for credit on a sibling's proof only once its own payer
+    /// has paid on it, so a stream that has not counts no lane credit and pays
+    /// its own first window.
+    paid_on_stream: bool,
     /// The credit the lane already held when this stream opened. A stream that
     /// ends without delivering a byte against it is the node not delivering
     /// against credit, which is a write-off ([`Self::reconcile_empty`]).
@@ -3426,6 +3431,7 @@ async fn open_progressive_pull_impl(
             max_received_wire,
             cumulative: 0,
             verified: 0,
+            paid_on_stream: false,
             credit_at_open,
             ended: false,
             returned_at: None,
@@ -3502,10 +3508,18 @@ impl UpstreamPull {
             return (0, 0);
         }
         let trust = self.ledger.trust();
+        // Lane credit is shared by every stream on the lane, as it is at the
+        // node. A stream counts it only once it has paid on itself: until then
+        // the node will not wake it for a sibling's proof, so it pays its own.
+        let held = if self.paid_on_stream {
+            self.ledger.prepaid()
+        } else {
+            0
+        };
         payer_window::due(
             trust.window_bytes(self.rate_per_mb),
             self.expected_wire_bytes.saturating_sub(self.cumulative),
-            self.ledger.prepaid(),
+            held,
             trust.cap_room_bytes(self.rate_per_mb),
         )
     }
@@ -3563,7 +3577,9 @@ impl UpstreamPull {
                 chunks,
                 residual,
             )
-            .await
+            .await?;
+        self.paid_on_stream = true;
+        Ok(())
     }
 
     /// Reconcile a stream that the node ended without a byte against the

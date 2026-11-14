@@ -48,6 +48,9 @@ pub(super) struct StreamAnchor {
     /// watermark: the payer's ledger trails the node's, as a restarted payer's
     /// does. An honest stream anchors at the watermark, never below it.
     trailing: bool,
+    /// A proof on this stream has credited the lane. A stale proof on such a
+    /// stream is an honest sibling race, never a payer that lost its watermark.
+    credited: bool,
 }
 
 impl StreamAnchor {
@@ -197,6 +200,7 @@ impl ClientHandler {
         client_node_id: B256,
         rate_per_mb: u64,
         proofs: &ChunkProofs,
+        credit_rx: Option<&mut tokio::sync::watch::Receiver<u64>>,
     ) -> anyhow::Result<VoucherStop> {
         // Unknown lane: `serve_stream` refuses one pre-serve, so this is a
         // defensive backstop matching the sole callers (which forward `Some`).
@@ -216,7 +220,23 @@ impl ClientHandler {
         // transport progress and the wait's ceiling in `proofs`) WITHOUT
         // holding the per-lane lock — a network read must not block same-lane
         // streams. The reader is cancellation-safe.
-        let proof = super::proof_wait::await_proof(reader.read(recv), conn, proofs).await?;
+        // A stream waiting for credit also wakes when a sibling's proof raises
+        // the lane's credit (`credit_rx`); the read is cancel-safe, so a wake
+        // leaves any partial proof buffered for the next read.
+        // Boxed: the select below would otherwise inline this future into every
+        // serve loop's future and trip `large_futures`.
+        let read = Box::pin(super::proof_wait::await_proof(
+            reader.read(recv),
+            conn,
+            proofs,
+        ));
+        let proof = match credit_rx {
+            Some(rx) => tokio::select! {
+                proof = read => proof?,
+                Ok(()) = rx.changed() => return Ok(VoucherStop::Woken),
+            },
+            None => read.await?,
+        };
 
         let wire = match proof {
             Proof::Voucher(wire) => wire,
@@ -224,6 +244,7 @@ impl ClientHandler {
                 return self
                     .commit_one_preimage(
                         send,
+                        conn.stable_id(),
                         anchor,
                         hash,
                         lane_key,
@@ -331,13 +352,17 @@ impl ClientHandler {
             };
 
         // A stale SEALED voucher — at or below the signed watermark, opening no
-        // chain — is a payer whose ledger trails the node's: a restarted payer
-        // re-signing a watermark it lost. A concurrent sibling's stale sealed
-        // voucher finds the lane still holding the credit a deeper voucher paid.
-        // On a lane with no credit the stale voucher can pay nothing and nothing
-        // else is coming, so reject it with the watermark bundle at once: the
-        // payer reseeds and resumes rather than wait out the proof timeout.
-        if wire.chain_root == [0u8; 32]
+        // chain — on a stream no proof has credited yet, and on a connection
+        // other than the one that last credited the lane, is a payer whose
+        // ledger trails the node's: a restarted payer re-signing a watermark it
+        // lost. A concurrent sibling's late voucher comes on its payer's
+        // connection, or on a stream its payer already paid on. On a lane with no credit the stale voucher can pay nothing
+        // and nothing else is coming, so reject it with the watermark bundle at
+        // once: the payer reseeds and resumes rather than wait out the proof
+        // timeout.
+        if !anchor.credited
+            && guard.last_credit_conn != Some(conn.stable_id())
+            && wire.chain_root == [0u8; 32]
             && U256::from(wire.amount) <= guard.state.last_amount()
             && guard.state.credit_bytes() == 0
         {
@@ -384,6 +409,11 @@ impl ClientHandler {
         guard
             .last_voucher_at
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
+        if credited_bytes > 0 {
+            guard.note_credit_raised();
+            guard.last_credit_conn = Some(conn.stable_id());
+            anchor.credited = true;
+        }
         drop(guard);
         self.metrics.voucher_received();
 
@@ -449,6 +479,7 @@ impl ClientHandler {
     async fn commit_one_preimage(
         &self,
         send: &mut SendStream,
+        conn_id: usize,
         anchor: &mut StreamAnchor,
         hash: Hash,
         lane_key: LaneKey,
@@ -604,6 +635,11 @@ impl ClientHandler {
         guard
             .last_voucher_at
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
+        if credited_bytes > 0 {
+            guard.note_credit_raised();
+            guard.last_credit_conn = Some(conn_id);
+            anchor.credited = true;
+        }
         drop(guard);
         self.metrics.preimage_reveal_received();
 

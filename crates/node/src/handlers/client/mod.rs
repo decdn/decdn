@@ -165,6 +165,14 @@ struct LaneDeliveryState {
     /// Bytes of backfill the lane has drawn so far, against its allowance of
     /// `paid / backfill_divisor`. In memory only.
     backfilled_bytes: u64,
+    /// Ticks each time the lane's credit rises: a proof that credits bytes, or
+    /// a backfill. A stream waiting for credit races its own proof read against
+    /// it, so a sibling's proof wakes it (ADR 003 § Credit Window).
+    credit_tx: tokio::sync::watch::Sender<u64>,
+    /// The connection whose proof last credited the lane, by its stable id. A
+    /// payer's streams share its connection, so a stale proof on a different
+    /// connection is a payer that lost its watermark, as a restarted one has.
+    last_credit_conn: Option<usize>,
 }
 
 /// Most unclean stream ends a lane remembers. A lane that leaves more streams
@@ -183,7 +191,15 @@ impl LaneDeliveryState {
             last_voucher_at: AtomicU64::new(0),
             unclean_ends: HashMap::new(),
             backfilled_bytes: 0,
+            credit_tx: tokio::sync::watch::Sender::new(0),
+            last_credit_conn: None,
         }
+    }
+
+    /// Wake every stream of the lane that waits for credit.
+    fn note_credit_raised(&self) {
+        self.credit_tx
+            .send_modify(|tick| *tick = tick.wrapping_add(1));
     }
 
     /// Remember where a stream on `hash` ended without a clean close, so a resume
@@ -305,6 +321,8 @@ impl LaneActivityClock {
                     last_voucher_at: AtomicU64::new(now),
                     unclean_ends: HashMap::new(),
                     backfilled_bytes: 0,
+                    credit_tx: tokio::sync::watch::Sender::new(0),
+                    last_credit_conn: None,
                 })),
             );
         }
@@ -2036,6 +2054,9 @@ impl ClientHandler {
             self.backfill_window,
             self.backfill_divisor,
         );
+        if granted > 0 {
+            guard.note_credit_raised();
+        }
         if granted > 0
             && let Err(e) = self.pool_state_store.record(&guard.state)
         {
@@ -2178,6 +2199,10 @@ enum VoucherStop {
     /// Rejected — the reject frame was written and the stream finishes cleanly;
     /// the loop returns `Ok(())`.
     Rejected,
+    /// The lane's credit rose while the stream waited for a proof of its own,
+    /// which it has not read: a sibling's proof paid the lane. The caller tries
+    /// its debit again.
+    Woken,
 }
 
 /// Router-facing `ProtocolHandler` for `cdn/client/v1`.

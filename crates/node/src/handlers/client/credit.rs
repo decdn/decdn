@@ -160,7 +160,13 @@ impl ClientHandler {
     ) -> anyhow::Result<Acquired> {
         // One proof budget and one proof-wait ceiling for the whole wait.
         let mut proofs = ChunkProofs::start();
+        // Ticks when any proof on the lane raises its credit, so a sibling's
+        // payment wakes this wait once this stream has paid on itself.
+        let mut credit_rx = lane.lock().await.credit_tx.subscribe();
         loop {
+            // Mark the current tick seen before the debit, so a credit rise
+            // after it wakes the proof read below.
+            credit_rx.borrow_and_update();
             if let Some(stop) = self
                 .pre_send_checks(send, recv, hash, &lane_key, rate_per_mb, guards)
                 .await?
@@ -210,6 +216,10 @@ impl ClientHandler {
                     client_node_id,
                     rate_per_mb,
                     &proofs,
+                    // A stream wakes for a sibling's proof only once its own
+                    // payer has paid on it, so a stream held open unread cannot
+                    // draw the credit its siblings paid for.
+                    (*paid > 0).then_some(&mut credit_rx),
                 )
                 .await;
             waits.end();
@@ -226,6 +236,7 @@ impl ClientHandler {
                 VoucherStop::Rejected => {
                     return Ok(Acquired::Stopped(ServeStop::VoucherRejected));
                 }
+                VoucherStop::Woken => proofs.refund_attempt(),
             }
         }
     }
