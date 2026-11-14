@@ -2,7 +2,7 @@ use alloy::primitives::Address;
 
 use proptest::prelude::*;
 
-use super::{PayAheadPolicy, PayerWindows, WINDOW_FLOOR_BYTES, due};
+use super::{PayAheadPolicy, PayerWindows, WINDOW_FLOOR_BYTES, due, due_after_sibling_spend};
 
 const MIB: u64 = 1 << 20;
 
@@ -21,6 +21,45 @@ fn a_stream_on_a_funded_lane_pays_nothing_of_its_own() {
 #[test]
 fn the_window_is_refilled_as_credit_runs_down() {
     assert_eq!(due(8 * MIB, 20 * MIB, 5 * MIB, u64::MAX), (3, 0));
+}
+
+#[test]
+fn a_shortfall_below_one_chunk_pays_nothing_of_its_own() {
+    assert_eq!(
+        due(
+            WINDOW_FLOOR_BYTES,
+            10 * MIB,
+            WINDOW_FLOOR_BYTES - MIB / 2,
+            u64::MAX
+        ),
+        (0, 0)
+    );
+}
+
+#[test]
+fn after_a_sibling_spend_a_shortfall_pays_a_chunk_or_the_rest() {
+    // Half a chunk of credit short of the window, far from the end: one whole
+    // chunk, so a frame the node cut before a sibling drew the lane down goes.
+    assert_eq!(
+        due_after_sibling_spend(
+            WINDOW_FLOOR_BYTES,
+            10 * MIB,
+            WINDOW_FLOOR_BYTES - MIB / 2,
+            u64::MAX
+        ),
+        (1, 0)
+    );
+    // Less than a chunk left unpaid: a closing residual for exactly the rest.
+    let held = WINDOW_FLOOR_BYTES - MIB / 4;
+    assert_eq!(
+        due_after_sibling_spend(WINDOW_FLOOR_BYTES, MIB + MIB / 2, held, u64::MAX),
+        (0, MIB + MIB / 2 - held)
+    );
+    // A lane holding the window pays nothing.
+    assert_eq!(
+        due_after_sibling_spend(WINDOW_FLOOR_BYTES, 10 * MIB, WINDOW_FLOOR_BYTES, u64::MAX),
+        (0, 0)
+    );
 }
 
 #[test]

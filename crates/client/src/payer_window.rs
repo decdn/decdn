@@ -137,6 +137,28 @@ pub(crate) fn due(window: u64, need: u64, held: u64, room: u64) -> (u64, u64) {
     (pay / CHUNK_BYTES, residual)
 }
 
+/// [`due`] after a sibling stream spent lane credit this stream counted on.
+///
+/// The node cuts each frame to the credit it saw and sends the whole frame or
+/// none, so a sibling that drew the lane down between the cut and the send
+/// leaves the frame short. A shortfall [`due`] rounds down to nothing then
+/// leaves the node waiting for a proof. It pays one whole chunk instead, or a
+/// closing residual for exactly the rest when less than a chunk is left unpaid,
+/// so no byte is paid twice.
+#[must_use]
+pub(crate) fn due_after_sibling_spend(window: u64, need: u64, held: u64, room: u64) -> (u64, u64) {
+    let owed = due(window, need, held, room);
+    if owed != (0, 0) || window.min(need) <= held {
+        return owed;
+    }
+    let unpaid = need.saturating_sub(held);
+    if unpaid <= CHUNK_BYTES {
+        (0, unpaid.min(room))
+    } else {
+        (u64::from(room >= CHUNK_BYTES), 0)
+    }
+}
+
 /// One node operator's track record with this payer, and the credit the payer
 /// holds there. Shared by every lane at that operator.
 #[derive(Debug)]

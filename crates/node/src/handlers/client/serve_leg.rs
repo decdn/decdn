@@ -562,9 +562,23 @@ impl ClientHandler {
             )
             .await?;
         let _ = send.finish();
-        // Drain the client's send half to its FIN before `recv` drops, so the
-        // client's finish is not stopped by the implicit `STOP_SENDING(0)` a
-        // dropped `RecvStream` issues (see `drain_recv_to_fin`).
+        // Credit the proofs the payer sent past the last frame, then drain its
+        // send half to its FIN before `recv` drops, so the client's finish is
+        // not stopped by the implicit `STOP_SENDING(0)` a dropped `RecvStream`
+        // issues (see `drain_recv_to_fin`).
+        self.settle_trailing_proofs(
+            conn,
+            send,
+            recv,
+            &mut reader,
+            &mut anchor,
+            hash,
+            lane_key,
+            lane,
+            client_node_id,
+            rate_per_mb,
+        )
+        .await;
         super::drain_recv_to_fin(recv).await;
         // ADR 040: emit the ONE hit sighting for this served request, only after the
         // terminal StreamEnd frame is written — so a serve that fails to finish cleanly

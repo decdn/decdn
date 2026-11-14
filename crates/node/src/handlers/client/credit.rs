@@ -240,4 +240,54 @@ impl ClientHandler {
             }
         }
     }
+
+    /// After a clean `StreamEnd`, read and credit the proofs the payer sent past
+    /// the last frame, until its FIN or [`super::POST_END_DRAIN_TIMEOUT`].
+    ///
+    /// The node reads a proof only while the lane's credit falls short, so a
+    /// stream that finishes on credit a sibling paid leaves its own proofs
+    /// unread. The payer counts them as lane credit. Dropping them would leave
+    /// the lane short of what the payer believes it paid, and a sibling stream
+    /// would wait for a proof the payer never sends.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn settle_trailing_proofs(
+        &self,
+        conn: &Connection,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        reader: &mut BufferedProofReader,
+        anchor: &mut StreamAnchor,
+        hash: Hash,
+        lane_key: LaneKey,
+        lane: &Arc<Mutex<LaneDeliveryState>>,
+        client_node_id: B256,
+        rate_per_mb: u64,
+    ) {
+        let settle = async {
+            loop {
+                let proofs = ChunkProofs::start();
+                let committed = self
+                    .commit_one_proof(
+                        conn,
+                        send,
+                        recv,
+                        reader,
+                        anchor,
+                        hash,
+                        lane_key,
+                        Some(lane),
+                        client_node_id,
+                        rate_per_mb,
+                        &proofs,
+                        None,
+                    )
+                    .await;
+                // The payer's FIN, a fault, or a rejection ends the settle.
+                if !matches!(committed, Ok(VoucherStop::Continue { .. })) {
+                    break;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(super::POST_END_DRAIN_TIMEOUT, Box::pin(settle)).await;
+    }
 }

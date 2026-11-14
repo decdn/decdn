@@ -556,6 +556,10 @@ pub struct PoolLedger {
     /// lane credit, and a later stream on the lane draws on it with no payment
     /// of its own.
     prepaid: AtomicU64,
+    /// Ticks each time [`Self::prepaid`] falls: a stream received bytes, or the
+    /// lane dropped its credit. A stream blocked on a read pays again when it
+    /// ticks, because a sibling may have spent the credit it was counting on.
+    prepaid_fell: tokio::sync::watch::Sender<u64>,
     /// Bytes this lane's streams received that no decoder has verified yet. A
     /// provable corruption writes them off with the credit still held.
     unverified: AtomicU64,
@@ -642,6 +646,7 @@ impl PoolLedger {
             evidence: OnceLock::new(),
             wire: AtomicU64::new(0),
             prepaid: AtomicU64::new(0),
+            prepaid_fell: tokio::sync::watch::Sender::new(0),
             unverified: AtomicU64::new(0),
             lane_verified: AtomicU64::new(0),
             quoted_rate: AtomicU64::new(0),
@@ -688,6 +693,19 @@ impl PoolLedger {
             })
             .map_or(0, |before| before.min(n));
         self.trust().note_spent(spent);
+        if spent > 0 {
+            self.note_prepaid_fell();
+        }
+    }
+
+    /// A receiver that ticks each time the lane's prepaid credit falls.
+    pub(crate) fn prepaid_falls(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.prepaid_fell.subscribe()
+    }
+
+    fn note_prepaid_fell(&self) {
+        self.prepaid_fell
+            .send_modify(|tick| *tick = tick.wrapping_add(1));
     }
 
     /// Record the rate a stream of this lane was quoted, which prices a later
@@ -732,6 +750,7 @@ impl PoolLedger {
     /// grows, so its next window shrinks. Returns the bytes written off.
     pub(crate) fn write_off_prepaid(&self) -> u64 {
         let held = self.prepaid.swap(0, Ordering::Relaxed);
+        self.note_prepaid_fell();
         let bad = self.unverified.swap(0, Ordering::Relaxed);
         self.trust()
             .write_off(held, bad, self.quoted_rate.load(Ordering::Relaxed));
@@ -743,6 +762,7 @@ impl PoolLedger {
     /// unknown, and the lane resumes from the node's own watermark.
     pub(crate) fn forget_prepaid(&self) {
         let held = self.prepaid.swap(0, Ordering::Relaxed);
+        self.note_prepaid_fell();
         self.trust().note_spent(held);
     }
 

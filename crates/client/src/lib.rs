@@ -3495,32 +3495,13 @@ impl UpstreamPull {
     /// this stream has left to receive and the credit the lane holds
     /// ([`payer_window::due`]).
     fn pay_ahead_due(&self) -> (u64, u64) {
-        // A capability near its expiry drains: the payer stops paying ahead, so
-        // the credit left at the node is only what proofs already in flight
-        // cover, and nothing is signed past the node's expiry margin.
-        if let Some(signed) = &self.ctx.capability
-            && decdn_common::config::inside_capability_expiry_margin(
-                signed.capability.expiry,
-                credential::NODE_EXPIRY_MARGIN_SECS,
-                credential::unix_now(),
-            )
-        {
-            return (0, 0);
-        }
-        let trust = self.ledger.trust();
-        // Lane credit is shared by every stream on the lane, as it is at the
-        // node. A stream counts it only once it has paid on itself: until then
-        // the node will not wake it for a sibling's proof, so it pays its own.
-        let held = if self.paid_on_stream {
-            self.ledger.prepaid()
-        } else {
-            0
-        };
-        payer_window::due(
-            trust.window_bytes(self.rate_per_mb),
+        pay_ahead_due(
+            &self.ctx,
+            &self.ledger,
+            self.rate_per_mb,
             self.expected_wire_bytes.saturating_sub(self.cumulative),
-            held,
-            trust.cap_room_bytes(self.rate_per_mb),
+            self.paid_on_stream,
+            false,
         )
     }
 
@@ -3653,10 +3634,44 @@ impl UpstreamPull {
         // throughput the floor would clear.
         let read = read_client_message(&mut reader);
         tokio::pin!(read);
+        // A sibling stream may spend the lane credit this stream counted on
+        // while it waits here, and the node then waits for a proof. Pay again
+        // when the lane's credit falls, without dropping the pinned read.
+        let mut prepaid_falls = self.ledger.prepaid_falls();
+        prepaid_falls.borrow_and_update();
+        let need = self.expected_wire_bytes.saturating_sub(cumulative);
         loop {
             tokio::select! {
                 biased;
                 r = &mut read => return r,
+                Ok(()) = prepaid_falls.changed() => {
+                    let (chunks, residual) = pay_ahead_due(
+                        &self.ctx,
+                        &self.ledger,
+                        self.rate_per_mb,
+                        need,
+                        self.paid_on_stream,
+                        true,
+                    );
+                    if chunks > 0 || residual > 0 {
+                        // A failed write surfaces through the read: the node's
+                        // terminal signal or the transport fault arrives there.
+                        let paid = self
+                            .meter
+                            .pay(
+                                &mut self.send,
+                                &self.ctx,
+                                &self.ledger,
+                                self.rate_per_mb,
+                                chunks,
+                                residual,
+                            )
+                            .await;
+                        if paid.is_ok() {
+                            self.paid_on_stream = true;
+                        }
+                    }
+                }
                 _ = sampler.tick() => {
                     let now = tokio::time::Instant::now();
                     let last_sample = floor.last_sampled_at();
@@ -4115,6 +4130,52 @@ impl Drop for UpstreamPull {
     fn drop(&mut self) {
         self.close_transport(0, b"upstream-pull-dropped");
     }
+}
+
+/// What a stream owes the node before it can send more, as `(whole chunks,
+/// closing residual bytes)`: the payer window toward the node
+/// ([`payer_window::PayAheadPolicy::window_bytes`]) against the `need` wire
+/// bytes the stream has left to receive and the credit the lane holds
+/// ([`payer_window::due`]).
+///
+/// Lane credit is shared by every stream on the lane, as it is at the node. A
+/// stream counts it only once it has paid on itself (`paid_on_stream`): until
+/// then the node will not wake it for a sibling's proof, so it pays its own.
+/// `after_sibling_spend` sizes the payment with
+/// [`payer_window::due_after_sibling_spend`].
+fn pay_ahead_due(
+    ctx: &PoolContext,
+    ledger: &PoolLedger,
+    rate_per_mb: u64,
+    need: u64,
+    paid_on_stream: bool,
+    after_sibling_spend: bool,
+) -> (u64, u64) {
+    // A capability near its expiry drains: the payer stops paying ahead, so the
+    // credit left at the node is only what proofs already in flight cover, and
+    // nothing is signed past the node's expiry margin.
+    if let Some(signed) = &ctx.capability
+        && decdn_common::config::inside_capability_expiry_margin(
+            signed.capability.expiry,
+            credential::NODE_EXPIRY_MARGIN_SECS,
+            credential::unix_now(),
+        )
+    {
+        return (0, 0);
+    }
+    let trust = ledger.trust();
+    let held = if paid_on_stream { ledger.prepaid() } else { 0 };
+    let due = if after_sibling_spend {
+        payer_window::due_after_sibling_spend
+    } else {
+        payer_window::due
+    };
+    due(
+        trust.window_bytes(rate_per_mb),
+        need,
+        held,
+        trust.cap_room_bytes(rate_per_mb),
+    )
 }
 
 /// Issue one cumulative voucher for `delta_bytes` newly delivered since the last
