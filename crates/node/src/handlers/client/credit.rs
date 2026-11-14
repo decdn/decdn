@@ -171,6 +171,26 @@ impl ClientHandler {
                 .pre_send_checks(send, recv, hash, &lane_key, rate_per_mb, guards)
                 .await?
             {
+                // A pool or signer stop is no verdict on the payer's proofs, and
+                // the payer counts the ones it sent as lane credit. Read and
+                // credit the proofs still in flight, so the credit the payer
+                // counts is the credit the lane holds. A takedown resets the
+                // stream, so nothing more arrives on it.
+                if stop != ServeStop::Takedown {
+                    Box::pin(self.settle_trailing_proofs(
+                        conn,
+                        send,
+                        recv,
+                        reader,
+                        anchor,
+                        hash,
+                        lane_key,
+                        lane,
+                        client_node_id,
+                        rate_per_mb,
+                    ))
+                    .await;
+                }
                 return Ok(Acquired::Stopped(stop));
             }
             let covered = if charge {
@@ -241,8 +261,9 @@ impl ClientHandler {
         }
     }
 
-    /// After a clean `StreamEnd`, read and credit the proofs the payer sent past
-    /// the last frame, until its FIN or [`super::POST_END_DRAIN_TIMEOUT`].
+    /// After a clean `StreamEnd`, or after a pool or signer stop, read and credit
+    /// the proofs the payer sent that the node has not read, until the payer's
+    /// FIN or [`super::POST_END_DRAIN_TIMEOUT`].
     ///
     /// The node reads a proof only while the lane's credit falls short, so a
     /// stream that finishes on credit a sibling paid leaves its own proofs

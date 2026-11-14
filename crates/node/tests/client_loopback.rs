@@ -6714,9 +6714,9 @@ impl decdn_node::pool_view::PoolView for CachedDrainPoolView {
 
 /// A mid-stream `PoolExhausted` between the epoch's root voucher and its first
 /// reveal: the node took the root voucher, and the client has already sent the
-/// reveal, which the node never reads. The client keeps the reveal
-/// (`VoucherRejectReason::refuses_proof`), so its ledger runs ahead of the node's
-/// claim. The next proof on the lane covers the unread one, so a resumed fetch on
+/// reveal. The client keeps the reveal (`VoucherRejectReason::refuses_proof`),
+/// and the node reads and credits it as a proof in flight before it closes the
+/// stream, so the client's ledger and the node's claim agree. A resumed fetch on
 /// the same ledger completes with no rebase and no rejection.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pool_exhausted_between_root_voucher_and_reveal_resumes_without_heal()
@@ -6780,9 +6780,9 @@ async fn a_pool_exhausted_between_root_voucher_and_reveal_resumes_without_heal()
         .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
     let kept = ledger.committed().amount;
     anyhow::ensure!(
-        kept > node_claim,
-        "the client keeps the reveal the node never read: ledger {kept} vs node claim \
-         {node_claim}"
+        kept == node_claim && kept > U256::ZERO,
+        "the node credits the reveal in flight, so the client's ledger matches its \
+         claim: ledger {kept} vs node claim {node_claim}"
     );
 
     // Funded again: the resumed fetch's first reveal covers the unread one.

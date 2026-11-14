@@ -4544,15 +4544,17 @@ fn voucher_rejection(
             // lane is shared, so the proof it last issued may belong to a
             // sibling; naming ours is what keeps the rejection from un-committing
             // a voucher the node accepted.
-            // Either way the lane's credit at the node is unknown: a refused
-            // proof was not taken, and a gate stop leaves the proofs in flight
-            // unread. The next stream pays from what the node proves, rather
-            // than wait on credit the node may not hold. Neither is a write-off.
-            ledger.forget_prepaid();
-            if reason.refuses_proof()
-                && let Some(proof) = meter.last_proof
-            {
-                ledger.resolve_reject(proof);
+            // A refused proof was not taken, so the lane's credit at the node
+            // is unknown until the next stream reseeds from its watermark. A
+            // gate stop (`PoolExhausted`, `SignerCapExhausted`) is no verdict
+            // on a proof: the node reads and credits the proofs in flight
+            // before it closes the stream, so the credit stays counted.
+            // Neither is a write-off.
+            if reason.refuses_proof() {
+                ledger.forget_prepaid();
+                if let Some(proof) = meter.last_proof {
+                    ledger.resolve_reject(proof);
+                }
             }
             let proof_generation = match meter.last_proof {
                 Some(StreamProof::Voucher { generation, .. }) => Some(generation),
