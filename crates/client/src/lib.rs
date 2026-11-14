@@ -3131,7 +3131,8 @@ pub struct UpstreamPull {
     /// Wire bytes received so far on this stream.
     cumulative: u64,
     /// Wire bytes the caller's decoder has verified against the root, never
-    /// above `cumulative`. Payment follows this count, not `cumulative`.
+    /// above `cumulative`. This count sizes the payer window toward the node;
+    /// payment runs ahead of delivery up to that window.
     verified: u64,
     /// Whether this stream has sent a payment of its own. The node wakes a
     /// stream waiting for credit on a sibling's proof only once its own payer
@@ -3634,6 +3635,11 @@ impl UpstreamPull {
     }
 
     /// [`Self::read_under_floor`] before a transport fault unpins the connection.
+    // One read raced against the floor's sampling tick. The select arms each
+    // justify a timing verdict inline (what a lost race means before and after
+    // the first byte); splitting them out would separate those from the race
+    // they judge.
+    #[allow(clippy::too_many_lines)]
     async fn read_under_floor_once(&mut self) -> anyhow::Result<ClientMessage> {
         let cumulative = self.cumulative;
         let window = self.window;
@@ -3691,9 +3697,13 @@ impl UpstreamPull {
                         true,
                     );
                     if chunks > 0 || residual > 0 {
-                        // A failed write surfaces through the read: the node's
-                        // terminal signal or the transport fault arrives there.
-                        let paid = self
+                        // A failed TRANSPORT write surfaces through the read:
+                        // the node's terminal signal or the fault arrives
+                        // there. A local fault (signing, a voucher past wire
+                        // width, the send deadline) does not, so name it here —
+                        // the stream then parks until the floor ends it, and
+                        // without this line that end blames the node.
+                        match self
                             .meter
                             .pay(
                                 &mut self.send,
@@ -3703,9 +3713,16 @@ impl UpstreamPull {
                                 chunks,
                                 residual,
                             )
-                            .await;
-                        if paid.is_ok() {
-                            self.paid_on_stream = true;
+                            .await
+                        {
+                            Ok(()) => self.paid_on_stream = true,
+                            Err(e) => tracing::warn!(
+                                peer = %peer,
+                                hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                                error = %format_args!("{e:#}"),
+                                "paying ahead after a sibling spend failed; the \
+                                 read surfaces the stream's end"
+                            ),
                         }
                     }
                 }
@@ -3837,8 +3854,10 @@ impl UpstreamPull {
                     // (`admit_bao_stream`), the ranged store's, or the in-memory
                     // test wrapper's — which checks every chunk group against the
                     // root as it lands (ADR 038) and reports what it verified
-                    // through `mark_verified`. Only verified bytes are paid for, so
-                    // a peer that sends a bad group bills nothing for it.
+                    // through `mark_verified`. Verified bytes size the payer
+                    // window, so a peer that sends a bad group earns no further
+                    // pay-ahead, and the loss is bounded by the window already
+                    // paid.
                     self.returned_at = Some(tokio::time::Instant::now());
                     Ok(Some(Bytes::from(chunk.into_bytes())))
                 }
@@ -4055,36 +4074,25 @@ impl UpstreamPull {
         self.progress()
     }
 
-    /// Stop the pull before its promised end, after paying for every wire byte
-    /// the caller's decoder verified. A steal that takes the tail of this pull's
-    /// range stops the pull at the split on its open stream, so the stolen tail
-    /// goes to one source and this one opens no new stream for the part it
-    /// keeps. Frames past the split that the stream already carried are not
-    /// verified, so they are not paid for, and the stolen tail is paid once.
+    /// Stop the pull before its promised end. The pull pays ahead and never
+    /// owes a verified byte, so a stop pays nothing more: the credit the lane
+    /// holds stays on the lane, and its next stream draws it. A steal that
+    /// takes the tail of this pull's range stops the pull at the split on its
+    /// open stream, so the stolen tail goes to one source and this one opens
+    /// no new stream for the part it keeps.
     ///
     /// A rejection the node already sent waits behind the `ChunkData` it sent
     /// first, so the stop first reads what has arrived, without waiting: a
     /// `VoucherRejected` there rewinds the rejected proof when its reason refuses
     /// it, and surfaces as the
     /// typed rejection, as it does at [`Self::finish`]. A rejection still in
-    /// flight reaches the lane's next leg instead. The closing voucher then
-    /// settles the verified residual, the send half is finished, and the
-    /// transport is torn down (this stream, or the whole connection when the
-    /// pull owns it), so the node sees its sending stopped. A node that stops
-    /// sending before it reads that voucher does not redeem it, and the lane's
-    /// next cumulative voucher covers the same bytes.
-    ///
-    /// A closing voucher that fails to send stays armed in the ledger:
-    /// [`PoolLedger::settlement`] counts it, and the lane's next voucher builds
-    /// on it. The caller's paid frontier, which reads
-    /// [`PoolLedger::committed`], stays behind the verified bytes, so its next
-    /// leg re-delivers and pays for them once more.
+    /// flight reaches the lane's next leg instead. The send half is finished
+    /// and the transport is torn down (this stream, or the whole connection
+    /// when the pull owns it), so the node sees its sending stopped.
     ///
     /// # Errors
     ///
-    /// The typed rejection of a `StreamError` that had already arrived, or a
-    /// closing voucher that fails on our side ([`LocalPullFault`]). Any other
-    /// send failure is logged and leaves the residual as above.
+    /// The typed rejection of a `StreamError` that had already arrived.
     #[allow(
         clippy::unused_async,
         reason = "the stop contract stays async for every caller, and a stop that pays ahead has nothing to await"

@@ -2,7 +2,10 @@ use alloy::primitives::Address;
 
 use proptest::prelude::*;
 
-use super::{PayAheadPolicy, PayerWindows, WINDOW_FLOOR_BYTES, due, due_after_sibling_spend};
+use super::{
+    DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC, PayAheadPolicy, PayerWindows, WINDOW_FLOOR_BYTES, due,
+    due_after_sibling_spend,
+};
 
 const MIB: u64 = 1 << 20;
 
@@ -231,4 +234,74 @@ fn seeding_keeps_the_larger_count() {
     assert_eq!(node.verified(), 9 * MIB);
     assert_eq!(node.lost(), 3);
     assert_eq!(windows.snapshot(), vec![(address, 9 * MIB, 3)]);
+}
+
+/// One `µUSDC` per byte: at this quoted rate a write-off's byte count converts
+/// 1:1 into the `µUSDC` the run's budget counts, so the boundary tests below
+/// can place the written-off total exactly.
+const ONE_MICRO_USDC_PER_BYTE: u64 = MIB;
+
+#[test]
+fn a_write_off_of_exactly_the_budget_spends_it() {
+    let windows = PayerWindows::new(PayAheadPolicy::new());
+    let node = windows.node(Address::repeat_byte(8));
+    node.note_verified(1000 * MIB);
+    node.note_prepaid(DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC);
+    node.write_off(
+        DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC,
+        0,
+        ONE_MICRO_USDC_PER_BYTE,
+    );
+    assert_eq!(
+        windows.written_off_micro_usdc(),
+        DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC
+    );
+    // The `>=` boundary: writing off EXACTLY the budget spends it.
+    assert!(node.budget_spent());
+    assert_eq!(
+        node.window_bytes(10),
+        WINDOW_FLOOR_BYTES,
+        "a spent budget pins the window to the floor"
+    );
+}
+
+#[test]
+fn a_write_off_one_micro_usdc_short_leaves_the_budget_unspent() {
+    let windows = PayerWindows::new(PayAheadPolicy::new());
+    let node = windows.node(Address::repeat_byte(9));
+    node.note_verified(1000 * MIB);
+    let short = DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC - 1;
+    node.note_prepaid(short);
+    node.write_off(short, 0, ONE_MICRO_USDC_PER_BYTE);
+    assert_eq!(windows.written_off_micro_usdc(), short);
+    assert!(!node.budget_spent());
+    assert!(
+        node.window_bytes(10) > WINDOW_FLOOR_BYTES,
+        "one µUSDC under the budget still ramps past the floor"
+    );
+}
+
+#[test]
+fn a_zero_budget_pins_the_floor_from_the_start() {
+    let windows = PayerWindows::new(PayAheadPolicy {
+        write_off_budget_micro_usdc: 0,
+        ..PayAheadPolicy::new()
+    });
+    let node = windows.node(Address::repeat_byte(10));
+    node.note_verified(1000 * MIB);
+    // Nothing has been written off, yet a zero budget reads as already spent.
+    assert!(node.budget_spent());
+    assert_eq!(node.window_bytes(10), WINDOW_FLOOR_BYTES);
+}
+
+/// Pins the documented default, beside the policy pins in
+/// `config::tests::pay_ahead_defaults_are_the_documented_policy`: four caps of
+/// 640 `µUSDC` each.
+#[test]
+fn the_default_write_off_budget_is_the_documented_four_caps() {
+    assert_eq!(DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC, 2560);
+    assert_eq!(
+        PayAheadPolicy::new().write_off_budget_micro_usdc,
+        DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC
+    );
 }

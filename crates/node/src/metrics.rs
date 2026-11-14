@@ -1502,14 +1502,13 @@ pub struct DecdnMetrics {
     /// upstream refused the stream open for backpressure (`NotFound` or a
     /// transport rate-limit), no other candidate covered the
     /// still-missing gap, and the assembly waited to ask the same upstream again
-    /// instead of dropping it. The common cause is this node's own other pulls
-    /// filling the upstream's per-signer live cap: the refusal clears as those
-    /// pulls pay.
+    /// instead of dropping it. The common cause is a load shed at the upstream:
+    /// the refusal clears as its load drains.
     ///
     /// Each tick is one completed wait, and each wait follows one refusal already
     /// counted in `node_pull_refused_unattributable` or
     /// `node_upstream_rate_limited`. A sustained rate most often means an
-    /// upstream's cap is too small for the concurrency this node's clients drive
+    /// upstream too loaded for the concurrency this node's clients drive
     /// through it.
     pub node_pull_backpressure_backoffs: Counter,
     /// `decdn_node_pull_backpressure_exhausted_total` (#2178): the only holder of
@@ -1519,8 +1518,9 @@ pub struct DecdnMetrics {
     /// short refusal TTL, and a `warn!` names it.
     ///
     /// Zero is the expected value. A non-zero rate means a refusal that waiting
-    /// does not clear: a holder whose cap never releases, or one of the refusals
-    /// the seller collapses onto `NotFound` that is not a cap at all.
+    /// does not clear: a holder whose overload never drains, or one of the
+    /// refusals the seller collapses onto `NotFound` that is not backpressure
+    /// at all.
     pub node_pull_backpressure_exhausted: Counter,
     /// `decdn_node_pull_leg_no_progress_total` (#2194): a pull leg streamed and
     /// finished cleanly, yet moved neither the gap's paid frontier nor the store's
@@ -1652,16 +1652,17 @@ pub struct DecdnMetrics {
     /// and the local-origin populate (#1116).
     pub node_pull_through_errors: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
-    /// window-paced serve loop paused the upstream pull because the per-request
-    /// unrecouped frontier (`bytes pulled − bytes paid`) reached the ramped
-    /// credit window (ADR 003 §Credit window, #1669) and it waited for the
-    /// downstream voucher to clear. A high rate is benign (the window is
-    /// doing its job pacing speculation); a flat zero under real pull-through
-    /// traffic means the window never binds.
+    /// credit-paced serve loop paused the upstream pull because the pull
+    /// frontier reached the downstream lane's paid frontier plus
+    /// `PULL_AHEAD_BYTES` (ADR 003 § Credit Window) and it waited for the
+    /// downstream proof to clear. A high rate is benign (the pacer is
+    /// doing its job bounding unpaid pull); a flat zero under real pull-through
+    /// traffic means the bound never binds.
     pub node_pull_through_window_paused: Counter,
     /// `decdn_node_pull_through_min_draw_waits_total` (#2061): times the
-    /// window-paced serve loop paused the upstream pull because the ramped
-    /// window had room, but less than the minimum draw of half the window, and
+    /// credit-paced serve loop paused the upstream pull because the lane's
+    /// credit opened room, but less than the minimum draw of half a chunk
+    /// (`MIN_CREDIT_DRAW`), and
     /// no serve leg was parked at the pull's frontier. Each draw opens a new
     /// upstream request, so the pause batches the room into fewer, larger draws.
     /// A high rate is benign; it grows with the number of vouchers per draw.
@@ -1676,10 +1677,11 @@ pub struct DecdnMetrics {
     /// also logs a warning.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub node_pull_through_wait_seconds: Histogram,
-    /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced
+    /// `decdn_node_pull_through_client_abandoned_total` (#856): credit-paced
     /// serves the requesting client dropped or underpaid mid-pull, so the node
     /// aborted the upstream pull and abandoned the partial fill. The per-request
-    /// loss is bounded to the ramped credit window; a sustained rate flags a leech.
+    /// loss is bounded to `PULL_AHEAD_BYTES` of unpaid pull; a sustained rate
+    /// flags a leech.
     /// A node-side fault on the serve leg is not an abandon: it counts on
     /// `decdn_serve_stream_node_fault_total` only. Nor is an owed chunk that passes
     /// its proof-wait ceiling while its connection still sends: a slow path or a
@@ -1758,9 +1760,9 @@ pub struct DecdnMetrics {
     /// `decdn_serve_cache_miss_total`: paid serves the gate could not satisfy
     /// from locally-held bytes. Counts the ADMISSION decision and nothing
     /// downstream of it — a fill tier may never run at all, because the bump
-    /// precedes the load-shed gate, the pre-spend floor reservation, and the
+    /// precedes the load-shed gate, the pre-spend deposit gate, and the
     /// `pull_authorized` check that every tier is gated on. A shed refusal, a
-    /// floor refusal and an unbound request therefore all count here having
+    /// deposit refusal and an unbound request therefore all count here having
     /// asked no origin and no peer. Where a tier does run and satisfies the
     /// blob, the request still counts here; the refusal siblings
     /// (`serve_stream_rejected_*`) say whether it ended in a refusal.
@@ -1817,9 +1819,9 @@ pub struct DecdnMetrics {
     pub serve_response_hit_seconds: Histogram,
     /// `decdn_serve_response_miss_seconds`: the response phase of a paid miss,
     /// from the load-shed admit to the signed `StreamResponse` written. It
-    /// covers the floor reservation, the origin size and range probes, and on a
-    /// node-to-node fill the upstream discovery, pool open and handshake. A
-    /// buffered fill imports the whole blob in this phase.
+    /// covers the pre-spend deposit gate, the origin size and range probes, and
+    /// on a node-to-node fill the upstream discovery, pool open and handshake.
+    /// A buffered fill imports the whole blob in this phase.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_response_miss_seconds: Histogram,
     /// `decdn_serve_first_frame_hit_seconds`: the first-frame phase of a paid
@@ -2488,8 +2490,9 @@ pub struct DecdnMetrics {
     /// only; settlement is unaffected.
     pub receipt_write_failures: Counter,
     /// `decdn_serve_stream_midstream_pool_exhausted_total`: paying streams this
-    /// node stopped mid-delivery because the pool could no longer fund the
-    /// floor credit committed across its signers. The pool-level sibling of
+    /// node stopped mid-delivery because the pool's remaining deposit, minus
+    /// the refundable floor `M`, can no longer fund the next chunk. The
+    /// pool-level sibling of
     /// `serve_stream_midstream_signer_cap_exhausted`.
     pub serve_stream_midstream_pool_exhausted: Counter,
     /// `decdn_serve_stream_midstream_pool_closed_total`: paying streams stopped
@@ -3533,10 +3536,6 @@ recorders! {
     /// fill ended at this node's cap on bytes held for the blob.
     serve_stream_midstream_blob_too_large => serve_stream_midstream_blob_too_large.inc();
 
-    /// Record a `serve_stream` delivery refused because this capability signer hit its
-    /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
-    /// whole can still pay.
-
     /// Record a whole-blob request from an active staker refused while this
     /// node's own upstream open for the blob was in progress (#2224).
     serve_stream_rejected_pull_loop_guard => serve_stream_rejected_pull_loop_guard.inc();
@@ -3636,15 +3635,16 @@ recorders! {
     /// (ADR 041), sampled beside the egress EWMA.
     warming_sources_blocked(n: usize) => warming_sources_blocked.set(sat(n));
 
-    /// The window-paced serve loop paused the upstream pull at the ramped credit
-    /// window to wait for the downstream voucher to clear (#856, #1669).
+    /// The credit-paced serve loop paused the upstream pull at the lane's
+    /// credit frontier (plus `PULL_AHEAD_BYTES`) to wait for the downstream
+    /// proof to clear (#856).
     node_pull_through_window_paused => node_pull_through_window_paused.inc();
 
-    /// The window-paced serve loop paused the upstream pull until the ramped
-    /// window opened to the minimum draw (#2061).
+    /// The credit-paced serve loop paused the upstream pull until the lane's
+    /// credit opened the minimum draw (`MIN_CREDIT_DRAW`, #2061).
     node_pull_through_min_draw_waits => node_pull_through_min_draw_waits.inc();
 
-    /// A window-paced pause of the upstream pull ended after `elapsed`.
+    /// A credit-paced pause of the upstream pull ended after `elapsed`.
     node_pull_through_wait(elapsed: Duration) =>
         node_pull_through_wait_seconds.observe(elapsed.as_secs_f64());
 

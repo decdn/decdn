@@ -1384,10 +1384,10 @@ async fn build_chain_and_handlers(
         let stall = Duration::from_secs(cfg.cache.node_pull_stall_window_sec);
         let outer_deadline = crate::selection::outer_pull_deadline(per_candidate, stall);
         pull_through = Some(outer_deadline);
-        // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
+        // Credit-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
         // available, serve cache misses by fusing the upstream pull with downstream
-        // delivery, paced by the ramped credit window (ADR 003 §Credit window,
-        // #1669) instead of the buffered `populate`.
+        // delivery, paced by the downstream lane's credit (ADR 003 § Credit
+        // Window) instead of the buffered `populate`.
         if let Some(origin) = &infra.pull_through_origin {
             pull_through_origin = Some(Arc::clone(origin));
         }

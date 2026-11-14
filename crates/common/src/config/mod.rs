@@ -456,13 +456,13 @@ pub const DEFAULT_BACKFILL_WINDOW: u64 = 4 * 1024 * 1024;
 /// off.
 pub const DEFAULT_BACKFILL_DIVISOR: u64 = 64;
 /// Default serve-path wire-frame target (ADR 005 §`cdn/client/v1`): 1 MiB, matching
-/// the payment quantum so a fully-ramped stream sends about one frame per priced
+/// the payment quantum so a well-funded stream sends about one frame per priced
 /// chunk. Node-local policy that travels on no message: the payer accepts any
 /// non-empty frame, and neither the bao codec's chunk groups nor the payment meter
 /// is defined over frame boundaries. Larger frames cost proportionally less
 /// per-frame CPU per byte served, and one payment interval is both the default and
 /// the maximum — a frame never crosses a payment-chunk boundary. The serve loop also
-/// clamps each frame to the credit window's remaining room, so this is a ceiling
+/// clamps each frame to the lane's remaining credit, so this is a ceiling
 /// rather than an exact size.
 pub const DEFAULT_FRAME_TARGET_BYTES: u64 = decdn_protocol::CHUNK_BYTES;
 /// Default background flush period in milliseconds when

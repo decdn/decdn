@@ -21,14 +21,15 @@ fn sample_record() -> PeerRecord {
 }
 
 #[test]
-fn a_record_without_pay_ahead_counts_still_loads() {
+fn a_record_without_pay_ahead_counts_fails_to_decode() {
     let rec = sample_record();
     let mut json: serde_json::Value = serde_json::to_value(&rec).unwrap();
     let object = json.as_object_mut().unwrap();
     object.remove("verified_bytes");
     object.remove("lost_bytes");
-    let loaded: PeerRecord = serde_json::from_value(json).unwrap();
-    assert_eq!((loaded.verified_bytes, loaded.lost_bytes), (0, 0));
+    // The counts are required: silently defaulting them to zero would reset
+    // an operator's track record instead of surfacing the stale store.
+    assert!(serde_json::from_value::<PeerRecord>(json).is_err());
 }
 
 #[test]

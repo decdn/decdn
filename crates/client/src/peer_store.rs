@@ -102,13 +102,13 @@ pub struct PeerRecord {
     /// [`Self::eth_address`]. It sizes the payer's credit window toward that
     /// operator ([`crate::payer_window`]). The count follows the bonded operator
     /// address, not the iroh endpoint id, and never ages out: a record that
-    /// holds it is exempt from identity pruning.
-    #[serde(default)]
+    /// holds it is exempt from identity pruning. Required: a record without it
+    /// fails to decode rather than silently resetting the operator's history.
     pub verified_bytes: u64,
     /// Paid bytes this payer has written off at the operator at
     /// [`Self::eth_address`]. Each one cancels `loss_weight` verified bytes when
-    /// the window is sized. Exempt from pruning like [`Self::verified_bytes`].
-    #[serde(default)]
+    /// the window is sized. Exempt from pruning, and required, like
+    /// [`Self::verified_bytes`].
     pub lost_bytes: u64,
 }
 

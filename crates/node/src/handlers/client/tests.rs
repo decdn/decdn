@@ -27,7 +27,7 @@ async fn a_loaded_lane_keeps_its_credit_across_a_restart() {
     );
     let owed_bytes = lane.owed_bytes();
     assert_eq!(owed_bytes, U256::from(8 * CHUNK_BYTES));
-    lane.delivered_bytes = 2 * CHUNK_BYTES;
+    lane.set_delivered_bytes(2 * CHUNK_BYTES);
 
     let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new());
     store.record(&lane).expect("record the seeded lane");
@@ -390,8 +390,8 @@ async fn distinct_lanes_register_resolve_and_forget_concurrently() {
 
 /// The floor-`M` solvency arithmetic with a NON-ZERO floor `M`
 /// (`pool_remaining_covers_window`, ADR 003 §Sizing). The node keeps serving a
-/// pool only while its on-chain remaining minus `M` still covers the reserved
-/// credit window; it refuses once the refundable floor would be dipped into.
+/// pool only while its on-chain remaining minus `M` still covers the priced
+/// span; it refuses once the refundable floor would be dipped into.
 #[tokio::test]
 async fn pool_remaining_covers_window_reserves_the_floor_m() {
     let metrics = Arc::new(Metrics::new());
@@ -652,8 +652,8 @@ async fn racing_first_streams_record_the_fresh_lane_once() {
     assert_eq!(handler.lane_count.load(Ordering::Relaxed), 1);
 }
 
-/// Floor-`M` serving policy: the pool serves a full credit window while
-/// `remaining − M` covers it and stops the instant it cannot. `M` is the
+/// Floor-`M` serving policy: the node keeps serving while `remaining − M`
+/// covers the priced span and stops the instant it cannot. `M` is the
 /// refundable minimum the pool owner is guaranteed to keep.
 #[tokio::test]
 async fn floor_m_serves_above_the_floor_and_stops_at_it() {
@@ -2019,4 +2019,202 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
             .is_err()
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Backfill accounting (ADR 003 § Credit Window): `note_unclean_end` +
+// `take_backfill` on a lone `LaneDeliveryState`, no handler or wire involved.
+// ---------------------------------------------------------------------------
+
+/// One voucher accounting interval, the unit the backfill numbers below count in.
+const MIB: u64 = 1 << 20;
+
+/// A delivery state over a lane whose claim covers `paid` bytes, `delivered` of
+/// which the node has already sent. Built through [`LaneDeliveryState::hydrated`],
+/// so `paid_bytes` is exactly what a restart would compute from the claim.
+fn delivery_state(paid: u64, delivered: u64) -> LaneDeliveryState {
+    let signature = if paid == 0 { None } else { Some([9u8; 65]) };
+    let mut state = LaneState::hydrate(
+        B256::repeat_byte(0x21),
+        Address::repeat_byte(0x33),
+        Address::repeat_byte(0x55),
+        U256::MAX,
+        u64::MAX,
+        U256::from(paid),
+        U256::from(paid),
+        signature,
+        decdn_incentive::LaneChain::NONE,
+    );
+    state.set_delivered_bytes(delivered);
+    LaneDeliveryState::hydrated(state)
+}
+
+/// A distinct blob hash per index, for the multi-entry backfill tests.
+fn hash_n(n: u64) -> Hash {
+    Hash::new(n.to_le_bytes())
+}
+
+/// The happy path: a resume that starts before the remembered unclean end gets
+/// the whole gap back, when the gap sits inside both the lane's allowance
+/// (`paid / divisor`) and the per-backfill window — and the remembered end is
+/// consumed, so the same gap cannot be drawn twice.
+#[test]
+fn a_backfill_returns_the_whole_gap_within_allowance_and_window() {
+    let mut lane = delivery_state(64 * MIB, 10 * MIB);
+    let credit_before = lane.state.credit_bytes();
+    lane.note_unclean_end(hash_n(1), 8 * MIB);
+
+    // Gap of 2 MiB; allowance 64/16 = 4 MiB; window 4 MiB: the gap binds.
+    let granted = lane.take_backfill(hash_n(1), 6 * MIB, 4 * MIB, 16);
+    assert_eq!(granted, 2 * MIB, "the grant is exactly the gap");
+    assert_eq!(
+        lane.state.credit_bytes(),
+        credit_before + 2 * MIB,
+        "the gap returns to the lane's credit"
+    );
+    assert_eq!(lane.backfilled_bytes, 2 * MIB);
+
+    // The remembered end was consumed with the grant.
+    assert_eq!(
+        lane.take_backfill(hash_n(1), 6 * MIB, 4 * MIB, 16),
+        0,
+        "a consumed unclean end grants nothing again"
+    );
+}
+
+/// The allowance bound, at its exact boundary: a lane's backfills accumulate in
+/// `backfilled_bytes` against `paid / divisor` in total, so repeated unclean
+/// ends spend the allowance down and a lane cannot farm credit by cycling
+/// unclean streams — once the allowance is spent, further backfills grant zero.
+#[test]
+fn repeated_backfills_spend_the_allowance_down_to_zero() {
+    // paid 64 MiB at divisor 64: the lane's whole allowance is exactly 1 MiB.
+    let mut lane = delivery_state(64 * MIB, 32 * MIB);
+    let window = 8 * MIB;
+
+    // First unclean end: half the allowance.
+    lane.note_unclean_end(hash_n(1), 4 * MIB);
+    assert_eq!(
+        lane.take_backfill(hash_n(1), 4 * MIB - MIB / 2, window, 64),
+        MIB / 2,
+        "the first backfill grants its whole half-MiB gap"
+    );
+
+    // Second: a 1 MiB gap, but only the other half of the allowance is left —
+    // the exact boundary, spending the allowance to zero.
+    lane.note_unclean_end(hash_n(2), 4 * MIB);
+    assert_eq!(
+        lane.take_backfill(hash_n(2), 3 * MIB, window, 64),
+        MIB / 2,
+        "the second backfill is capped at the remaining allowance"
+    );
+    assert_eq!(lane.backfilled_bytes, MIB, "the whole allowance is spent");
+
+    // Third: the allowance is spent, so farming further unclean ends yields 0.
+    lane.note_unclean_end(hash_n(3), 4 * MIB);
+    assert_eq!(
+        lane.take_backfill(hash_n(3), 2 * MIB, window, 64),
+        0,
+        "a spent allowance grants nothing, whatever the gap"
+    );
+}
+
+/// The per-backfill window caps one grant below both the gap and the allowance.
+#[test]
+fn a_backfill_is_capped_at_the_window() {
+    let mut lane = delivery_state(64 * MIB, 32 * MIB);
+    lane.note_unclean_end(hash_n(1), 9 * MIB);
+    // Gap 8 MiB, allowance 64/4 = 16 MiB, window 1 MiB: the window binds.
+    assert_eq!(lane.take_backfill(hash_n(1), MIB, MIB, 4), MIB);
+    assert_eq!(lane.backfilled_bytes, MIB);
+}
+
+/// A fresh lane has been paid nothing, so its allowance is zero and an unclean
+/// end on it grants no backfill.
+#[test]
+fn a_fresh_lane_with_nothing_paid_grants_no_backfill() {
+    let mut lane = delivery_state(0, 0);
+    lane.note_unclean_end(hash_n(1), 2 * MIB);
+    assert_eq!(lane.take_backfill(hash_n(1), 0, 4 * MIB, 64), 0);
+    assert_eq!(lane.backfilled_bytes, 0);
+}
+
+/// A divisor of zero turns backfill off: the gap is remembered but grants
+/// nothing, and no allowance is spent.
+#[test]
+fn a_zero_divisor_turns_backfill_off() {
+    let mut lane = delivery_state(64 * MIB, 32 * MIB);
+    lane.note_unclean_end(hash_n(1), 2 * MIB);
+    assert_eq!(lane.take_backfill(hash_n(1), 0, 4 * MIB, 0), 0);
+    assert_eq!(lane.backfilled_bytes, 0);
+}
+
+/// A clean close leaves no remembered end, so a later stream on the same blob
+/// draws no backfill.
+#[test]
+fn a_clean_close_grants_no_backfill() {
+    let mut lane = delivery_state(64 * MIB, 32 * MIB);
+    assert_eq!(lane.take_backfill(hash_n(1), 0, 4 * MIB, 64), 0);
+    assert_eq!(lane.backfilled_bytes, 0);
+}
+
+/// The refund clamp: a backfill returns at most the bytes the lane was actually
+/// sent, so the lane's credit can never exceed what it paid for — and only the
+/// APPLIED amount counts against the allowance.
+#[test]
+fn a_backfill_is_clamped_to_the_bytes_the_lane_was_sent() {
+    // Only 256 KiB delivered, but a 2 MiB gap remembered.
+    let delivered = 256 * 1024;
+    let mut lane = delivery_state(64 * MIB, delivered);
+    lane.note_unclean_end(hash_n(1), 2 * MIB);
+    let granted = lane.take_backfill(hash_n(1), 0, 4 * MIB, 16);
+    assert_eq!(
+        granted, delivered,
+        "the grant is clamped to delivered bytes"
+    );
+    assert_eq!(
+        lane.state.delivered_bytes(),
+        0,
+        "the clamped refund gives back every delivered byte and no more"
+    );
+    assert_eq!(
+        lane.backfilled_bytes, delivered,
+        "only the applied amount spends the allowance"
+    );
+}
+
+/// The eviction bound: a lane remembers at most [`MAX_UNCLEAN_ENDS_PER_LANE`]
+/// unclean ends, and one more evicts exactly ONE remembered end — never the
+/// whole map — while the newest entry is kept.
+#[test]
+fn the_sixty_fifth_unclean_end_evicts_exactly_one_remembered_end() {
+    let mut lane = delivery_state(64 * MIB, 32 * MIB);
+    let max = u64::try_from(MAX_UNCLEAN_ENDS_PER_LANE).expect("64 fits u64");
+    for n in 0..max {
+        lane.note_unclean_end(hash_n(n), MIB);
+    }
+    assert_eq!(lane.unclean_ends.len(), MAX_UNCLEAN_ENDS_PER_LANE);
+
+    lane.note_unclean_end(hash_n(max), MIB);
+    assert_eq!(
+        lane.unclean_ends.len(),
+        MAX_UNCLEAN_ENDS_PER_LANE,
+        "one entry is evicted for the one inserted"
+    );
+    assert!(
+        lane.unclean_ends.contains_key(&hash_n(max)),
+        "the newest unclean end is the one kept"
+    );
+    let survivors = (0..max)
+        .filter(|&n| lane.unclean_ends.contains_key(&hash_n(n)))
+        .count();
+    assert_eq!(
+        survivors,
+        MAX_UNCLEAN_ENDS_PER_LANE - 1,
+        "exactly one earlier entry was evicted, not the whole map"
+    );
+
+    // A re-noted KNOWN hash evicts nothing: the map is already at its bound.
+    lane.note_unclean_end(hash_n(max), 2 * MIB);
+    assert_eq!(lane.unclean_ends.len(), MAX_UNCLEAN_ENDS_PER_LANE);
 }

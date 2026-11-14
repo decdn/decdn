@@ -437,11 +437,31 @@ impl ClientHandler {
                     )
                     .await;
                 // The payer's FIN, a fault, or a rejection ends the settle.
-                if !matches!(committed, Ok(VoucherStop::Continue { .. })) {
-                    break;
+                match committed {
+                    Ok(VoucherStop::Continue { .. }) => {}
+                    Ok(_) => break,
+                    // The payer's FIN lands here too, so debug, not warn — but
+                    // a lane-store fault mid-drain leaves the lane holding
+                    // less credit than the payer counts, which this drain
+                    // exists to prevent, so it must not vanish without a line.
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %format_args!("{e:#}"),
+                            "the post-end proof drain stopped on a read or \
+                             commit end"
+                        );
+                        break;
+                    }
                 }
             }
         };
-        let _ = tokio::time::timeout(super::POST_END_DRAIN_TIMEOUT, Box::pin(settle)).await;
+        if tokio::time::timeout(super::POST_END_DRAIN_TIMEOUT, Box::pin(settle))
+            .await
+            .is_err()
+        {
+            // A drain cut off with proofs unread leaves the lane short of what
+            // the payer counts; the payer heals it at its next silent stall.
+            tracing::debug!("the post-end proof drain hit its timeout with proofs possibly unread");
+        }
     }
 }

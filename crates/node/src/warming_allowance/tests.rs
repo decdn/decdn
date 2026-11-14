@@ -152,7 +152,7 @@ fn a_blocked_debit_has_not_published_its_tag() {
 /// finish while it is held. The credit goes over a bounded channel and lands
 /// anyway; applying it inline on the stream task would make the serve's
 /// final step wait for the holder to be done, with the stream's lane slot
-/// and floor reservation still charged for the wait.
+/// still charged for the wait.
 #[tokio::test]
 async fn credit_does_not_wait_on_the_ledger_lock() {
     let allowance = Arc::new(WarmingAllowance::new(1000, 0));

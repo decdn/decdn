@@ -57,7 +57,9 @@ pub struct PayAheadPolicy {
     /// How many verified bytes one written-off byte cancels.
     pub loss_weight: u64,
     /// The most USDC (base units) this run writes off in total before every
-    /// node's window stops ramping past the floor.
+    /// node's window stops ramping past the floor. A zero budget is spent from
+    /// the start: every node's window stays at the floor for the whole run,
+    /// before any loss.
     pub write_off_budget_micro_usdc: u64,
 }
 
@@ -284,11 +286,25 @@ impl NodeTrust {
         });
         let value = u128::from(n) * u128::from(rate_per_mb) / BYTES_PER_MIB;
         let value = u64::try_from(value).unwrap_or(u64::MAX);
-        self.shared
-            .written_off_micro_usdc
-            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                v.saturating_add(value)
-            });
+        let before =
+            self.shared
+                .written_off_micro_usdc
+                .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    v.saturating_add(value)
+                });
+        // Say once, at the crossing, what a spent budget does: without this
+        // line the only symptom is a throughput collapse with no cause
+        // anywhere. `update` returns the previous total, so exactly one
+        // write-off observes the crossing.
+        let budget = self.shared.policy().write_off_budget_micro_usdc;
+        if before < budget && before.saturating_add(value) >= budget {
+            tracing::warn!(
+                written_off_micro_usdc = before.saturating_add(value),
+                budget_micro_usdc = budget,
+                "the run's write-off budget is spent; every node's pay-ahead \
+                 window stays at the floor for the rest of this run"
+            );
+        }
     }
 
     /// Whether this run's write-offs have used up the policy's budget.

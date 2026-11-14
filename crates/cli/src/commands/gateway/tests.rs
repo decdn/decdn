@@ -4318,3 +4318,12 @@ async fn another_namespace_does_not_wait_on_a_fill() {
     abort_held(first).await;
     abort_held(second).await;
 }
+
+/// Pins the locally priced pay-ahead bound to the documented default policy:
+/// the client's default cap is the price of 64 MiB at the default node rate,
+/// so the gateway's conversion at its own `DEFAULT_RATE_PER_MB` copy must give
+/// exactly 64 MiB. Moving either constant without the other breaks this.
+#[test]
+fn the_drop_penalty_prices_the_default_cap_at_the_default_rate() {
+    assert_eq!(PUBLIC_PAY_AHEAD_BYTES, 64 << 20);
+}

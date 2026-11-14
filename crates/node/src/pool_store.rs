@@ -429,7 +429,7 @@ impl From<&LaneState> for StoredLaneState {
             registered_until: state.registered_until,
             owner_sig: state.owner_sig.map_or_else(Vec::new, |s| s.to_vec()),
             paid_cumulative: state.paid_cumulative.to_be_bytes(),
-            delivered_bytes: state.delivered_bytes,
+            delivered_bytes: state.delivered_bytes(),
             chain_root: state.chain().chain_root.into(),
             chunk_price: state.chain().chunk_price.to_be_bytes(),
             verified_index: state.chain().verified_index,
@@ -500,7 +500,7 @@ impl StoredLaneState {
         state.registered_until = self.registered_until;
         state.owner_sig = owner_sig;
         state.paid_cumulative = U256::from_be_bytes(self.paid_cumulative);
-        state.delivered_bytes = self.delivered_bytes;
+        state.set_delivered_bytes(self.delivered_bytes);
         Ok(state)
     }
 }

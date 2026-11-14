@@ -604,16 +604,18 @@ pub struct FillSession {
     /// The pull leg's terminal outcome — `None` while running, `Some(Ok)` on a
     /// clean end, `Some(Err)` on a failure.
     ended: StdMutex<Option<Result<(), FillError>>>,
-    /// The client's PAID content frontier: the serve leg raises it after each
-    /// voucher batch commits ([`Self::advance_served`]), the pull leg's pacer reads
-    /// it to bound `pulled − served_paid ≤ window`, plus one floor to serve
-    /// `serve_demand`. A cloneable handle, so a pull leg on its own runtime can hold
-    /// an owned copy.
+    /// The content frontier the downstream lane has paid for: the stream's
+    /// delivered wire plus the credit its lane holds, mapped into content. The
+    /// serve leg raises it before each frame it cuts ([`Self::advance_served`]);
+    /// the pull leg's pacer (`CreditPacer`) reads it and draws only what the
+    /// lane has paid for, plus a small pull-ahead bound, plus one bound to
+    /// serve `serve_demand`. A cloneable handle, so a pull leg on its own
+    /// runtime can hold an owned copy.
     served_paid: Frontier,
     /// The ABSOLUTE content offset the owning request starts at — the value
-    /// `served_paid` is seeded with. A pull leg's `RampPacer` ramps on
-    /// `served_paid − served_start` plus the owning stream's carried lane credit,
-    /// so a resumed request ramps from that credit, not from its blob offset.
+    /// `served_paid` is seeded with. The pull leg's pacer (`CreditPacer`)
+    /// compares `served_paid` against it: the frontier has moved past it only
+    /// once the lane holds credit for this stream.
     served_start: u64,
     /// Where the starved serve legs reading this fill's content wait. A serve leg's
     /// frame consumer stands a demand through its [`DemandSlot`] when it has no
@@ -621,10 +623,11 @@ pub struct FillSession {
     /// has produced ([`SessionOutboardReader::parked_on`]), and withdraws it once
     /// the encode moves again. A park with encoded bytes still buffered is
     /// look-ahead and stands nothing, so a client that stops paying cannot drag a
-    /// pull past its window. When the nearest demand lies within one chunk group
-    /// past a pull's frontier, that pull's pacer draws one window floor even with
-    /// its window full. Without it, a pull window that closes before the serve leg's
-    /// credit window leaves both legs waiting on each other. Shares one wakeup with
+    /// pull past the credit frontier. When the nearest demand lies within one chunk
+    /// group past a pull's frontier, that pull's pacer draws one pull-ahead bound
+    /// even with no credit room. Without it, a pull that stops at the credit
+    /// frontier while the serve leg's encoder needs one more leaf leaves both
+    /// legs waiting on each other. Shares one wakeup with
     /// `served_paid`, so a parked pull wakes on either.
     serve_demand: Demand,
     /// The chunk ranges THIS fill will produce — exactly the bytes this pull
@@ -1583,8 +1586,8 @@ impl FillRegistry {
                     if session.is_dead() {
                         continue;
                     }
-                    // A live fill advances only as ITS payer pays: the pull runs one
-                    // credit window past `served_paid` and parks. A request that
+                    // A live fill advances only as ITS payer pays: the pull runs a
+                    // small pull-ahead bound past `served_paid` and parks. A request that
                     // starts AHEAD of that frontier would park on it too, and an
                     // observer's payments extend a fill's paid prefix only once the
                     // prefix reaches the observer's start (`extend_served_from`).
@@ -1600,8 +1603,8 @@ impl FillRegistry {
                     // part of it not yet in the store: the owner's pull fills just
                     // the gaps the store is missing when it starts, so an overlap
                     // the live fill already landed is never fetched again. The
-                    // part still to land is at most the live fill's credit window
-                    // plus its in-flight draws, and only attaching could save it,
+                    // part still to land is at most the live fill's pull-ahead
+                    // bound plus its in-flight draws, and only attaching could save it,
                     // which is what starves. So the rule stays, and a claim that
                     // skips an overlapping session is counted once.
                     if fetch_start > session.served_paid() {

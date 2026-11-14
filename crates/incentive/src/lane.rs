@@ -125,10 +125,12 @@ pub struct LaneState {
     /// sends, and credits a backfill back to it ([`Self::credit_bytes`]). The
     /// lane's credit is [`Self::owed_bytes`] minus this count. A crash can lose
     /// a debit the background flush has not written, which makes the node send
-    /// bytes again that the lane already paid for. That costs the node egress
-    /// and the payer nothing, so the count is not replay-critical and stays
-    /// `pub` like `paid_cumulative`.
-    pub delivered_bytes: u64,
+    /// bytes again that the lane already paid for; that costs the node egress
+    /// and the payer nothing. Private so the credit invariants (never negative,
+    /// never above the owed bytes) hold through [`Self::debit`] and
+    /// [`Self::refund`]; the on-disk decoder restores it through
+    /// [`Self::set_delivered_bytes`].
+    delivered_bytes: u64,
     /// Cumulative amount of the most-recently-accepted voucher (token base
     /// units). `U256::ZERO` until the first voucher is applied. Private
     /// (#527/#751) — read via [`Self::last_amount`].
@@ -434,10 +436,31 @@ impl LaneState {
         Ok(())
     }
 
-    /// Give `len` bytes back to the lane's credit, saturating at the bytes the
-    /// lane has been sent. Used by a backfill.
-    pub const fn refund(&mut self, len: u64) {
-        self.delivered_bytes = self.delivered_bytes.saturating_sub(len);
+    /// Give up to `len` bytes back to the lane's credit, clamped to the bytes
+    /// the lane has been sent, so credit never exceeds the owed bytes. Used by
+    /// a backfill. Returns the bytes actually given back.
+    pub const fn refund(&mut self, len: u64) -> u64 {
+        let applied = if len < self.delivered_bytes {
+            len
+        } else {
+            self.delivered_bytes
+        };
+        self.delivered_bytes -= applied;
+        applied
+    }
+
+    /// The wire bytes the node has sent on this lane ([`Self::credit_bytes`]
+    /// subtracts them from the owed bytes).
+    #[must_use]
+    pub const fn delivered_bytes(&self) -> u64 {
+        self.delivered_bytes
+    }
+
+    /// Restore the delivered count from its persisted record. The on-disk
+    /// decoder's door; everything live moves the count through [`Self::debit`]
+    /// and [`Self::refund`].
+    pub const fn set_delivered_bytes(&mut self, n: u64) {
+        self.delivered_bytes = n;
     }
 
     /// What this lane is **owed**: the value of its strongest claim, or zero if

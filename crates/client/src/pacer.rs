@@ -10,8 +10,10 @@
 //! (order-free: it never waits on the counterparty's state). A lane whose
 //! deposit cannot cover the next voucher refuses; the buyer adds funds only
 //! through the funding recovery step at the exhausted candidate set (ADR 003
-//! § Funding recovery), never inside a lane. The node's window pacer (ADR 037)
-//! is a separate impl handed to the same driver.
+//! § Funding recovery), never inside a lane. [`CreditPacer`] (the node's pull
+//! leg on a cache miss) and [`WindowPacer`] (the client streamer's consumption
+//! pacing) are separate impls handed to the same driver; each shapes only how
+//! much a `Draw` takes in one pass.
 
 use alloy::primitives::U256;
 use decdn_bao_range::CHUNK_GROUP_BYTES;
@@ -24,32 +26,35 @@ use decdn_protocol::client::CHUNK_BYTES;
 pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + VERIFY_LAG_BYTES + 3 * CHUNK_GROUP_BYTES;
 
 /// The most wire bytes a payer receives past a chunk boundary before it has
-/// verified that boundary and pays for the chunk: one bao chunk group, the
-/// largest item (a leaf) the decoder checks in one step. A payer pays only for
-/// verified bytes, so the node's credit window floors at one chunk plus this
-/// lag (ADR 003 § Credit Window): a stream at the floor then delivers the leaf
-/// that straddles the boundary, and the payer can verify it and pay.
+/// verified that boundary: one bao chunk group, the largest item (a leaf) the
+/// decoder checks in one step. Verified bytes size the payer's window, so the
+/// window floors at one chunk plus this lag (ADR 003 § Credit Window): a
+/// stream at the floor still delivers the leaf that straddles the boundary,
+/// so the payer can verify it and pay on.
 pub const VERIFY_LAG_BYTES: u64 = CHUNK_GROUP_BYTES;
 
-/// The node's downstream content frontiers the pull leg paces against (ADR
-/// 037): what the downstream client has paid for, and how far the serve leg waits
-/// on bytes. The node hands `drive` a reader of these; the client path has no
-/// downstream leg and passes none. [`BudgetPacer`] ignores both.
+/// The downstream content frontiers a paced pull reads. On the node's pull
+/// leg ([`CreditPacer`], ADR 037): what the downstream client has paid for,
+/// and how far the serve leg waits on bytes. On the client streamer
+/// ([`WindowPacer`]): the consumer's read cursor stands in as `served_paid`,
+/// and no serve leg stands a demand. [`BudgetPacer`] ignores both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DownstreamFrontier {
-    /// Content bytes the node has already served AND been paid for on its
-    /// downstream (serve) leg. Paired with [`PaceState::pulled_frontier`] for
-    /// [`WindowPacer`]'s window check. Inert on the client path, same as
-    /// `pulled_frontier`.
+    /// The downstream frontier the pull may run ahead of: on the node's pull
+    /// leg, the content frontier the downstream lane has paid for
+    /// ([`CreditPacer`]); on the client streamer, the consumer's read cursor
+    /// ([`WindowPacer`]). Paired with [`PaceState::pulled_frontier`] for the
+    /// bound check.
     pub served_paid: u64,
     /// Content end of the nearest span a starved downstream serve leg waits on for
     /// this pull's content, or `0` when none waits. Each serve leg stands its own
     /// demand and withdraws it once it moves again, so a leg parked further down
     /// the blob never hides one parked at this pull's frontier. When it lies within
     /// one chunk group past [`PaceState::pulled_frontier`], a serve leg is parked on
-    /// this pull, collecting no payment; [`WindowPacer`] then draws one
-    /// [`PULL_WINDOW_FLOOR`] even with its window full, or neither leg moves again.
-    /// A demand further out is ignored. `0` on the client path.
+    /// this pull, collecting no payment; the pacer then draws past its bound
+    /// ([`WindowPacer`] one [`PULL_WINDOW_FLOOR`], [`CreditPacer`] one
+    /// [`PULL_AHEAD_BYTES`]), or neither leg moves again.
+    /// A demand further out is ignored. `0` on the client streamer path.
     pub serve_demand: u64,
 }
 
@@ -58,14 +63,13 @@ pub struct DownstreamFrontier {
 /// trivially reproducible in a test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaceState {
-    /// Content bytes of the requested range already PAID FOR — the driver's
-    /// per-leg [`content_paid_frontier`](crate::sink::content_paid_frontier)
-    /// progress, NOT the store's delivered frontier. Completion must track
-    /// PAYMENT, not delivery: the node streams a full credit window ahead of the
-    /// voucher that pays for it (ADR 003), and the store checkpoints that tail
-    /// payment-agnostically, so a delivered-frontier gate would return `Done`
-    /// before the delivered-but-unpaid tail is billed (under-pay). When this
-    /// reaches [`requested_bytes`](Self::requested_bytes) the range is fully paid.
+    /// Content bytes of the requested range already verified and present —
+    /// the store's contiguous delivered frontier, clamped into the gap.
+    /// Completion follows the verified frontier: the payer pays ahead of
+    /// delivery (ADR 003 § Credit Window), so payment runs at or past this
+    /// count, and a byte the payer prepaid but has not received is not
+    /// counted. When this reaches
+    /// [`requested_bytes`](Self::requested_bytes) the range is complete.
     pub cleared_bytes: u64,
     /// Total content bytes the caller requested.
     pub requested_bytes: u64,
@@ -75,12 +79,12 @@ pub struct PaceState {
     /// (`ceil(interval_bytes * rate_per_mb / MiB)`), priced by the driver from the
     /// [`crate::UpstreamPullHeader`] of the last open.
     pub next_voucher_cost: U256,
-    /// Content bytes the node's upstream pull leg has drawn so far (the pull-side
-    /// frontier). [`BudgetPacer`] never reads this field — it exists for
-    /// [`WindowPacer`] (ADR 037), which bounds `pulled_frontier -
-    /// downstream.served_paid` by its window. On the client path (which always uses
-    /// `BudgetPacer`, never `WindowPacer`) this field is inert; callers may set it
-    /// to `0` or to the already-computed delivered frontier — either is safe.
+    /// Content bytes the pull has drawn so far (the pull-side frontier).
+    /// [`BudgetPacer`] never reads this field — it exists for [`WindowPacer`]
+    /// and [`CreditPacer`], which bound how far it runs past
+    /// `downstream.served_paid`. Under [`BudgetPacer`] this field is inert;
+    /// callers may set it to `0` or to the already-computed delivered
+    /// frontier — either is safe.
     pub pulled_frontier: u64,
     /// Content bytes of the current gap not yet pulled: from
     /// [`pulled_frontier`](Self::pulled_frontier) to the gap's end. [`WindowPacer`]
@@ -109,17 +113,19 @@ pub enum PaceDecision {
     /// lane: the driver ends it with [`crate::PoolExhausted`], which marks its
     /// source priced out at the current deposit.
     Refuse,
-    /// The pull leg has run its full window ahead of the downstream paid frontier
-    /// ([`WindowPacer`], ADR 037) and no serve leg is parked at its frontier: pause
-    /// and re-decide once either [`PaceState::downstream`] frontier advances.
-    /// [`BudgetPacer`] never returns this — only a window-bounded pacer does, so it
-    /// only appears on the node's pull leg, never on the client path.
+    /// The pull has run its full bound ahead of the downstream `served_paid`
+    /// frontier ([`WindowPacer`]'s window, or the lane credit plus
+    /// [`PULL_AHEAD_BYTES`] that [`CreditPacer`] paces) and no serve leg is
+    /// parked at its frontier: pause and re-decide once either
+    /// [`PaceState::downstream`] frontier advances. [`BudgetPacer`] never
+    /// returns this — only a bounded pacer does.
     Wait,
-    /// The window has room, but less than [`WindowPacer`]'s minimum draw, and no
+    /// The bound has room, but less than the pacer's minimum draw
+    /// ([`WindowPacer`] half the window, [`CreditPacer`] [`MIN_CREDIT_DRAW`]), and no
     /// serve leg is parked at the pull's frontier: pause and re-decide once
     /// either [`PaceState::downstream`] frontier advances, as for
     /// [`Self::Wait`]. A separate variant so the caller can meter the two
-    /// pauses apart. Like `Wait`, only a window-bounded pacer returns it.
+    /// pauses apart. Like `Wait`, only a bounded pacer returns it.
     WaitForMinDraw,
 }
 
@@ -147,11 +153,9 @@ impl BudgetPacer {
 
 impl Pacer for BudgetPacer {
     fn decide(&self, s: &PaceState) -> PaceDecision {
-        // 1. The range is fully PAID — nothing left to pull or pay for. Gating on
-        //    paid (not delivered) progress is what bills the credit-window tail the
-        //    store checkpointed ahead of payment: an exhaustion leaves paid < the
-        //    delivered frontier, so this stays below `requested` and the draw
-        //    branch below re-opens the unpaid tail until payment catches up.
+        // 1. The range is complete: `cleared_bytes` is the verified delivered
+        //    frontier (payment runs ahead of it, ADR 003 § Credit Window), so
+        //    nothing is left to pull.
         if s.cleared_bytes >= s.requested_bytes {
             return PaceDecision::Done;
         }
@@ -161,19 +165,20 @@ impl Pacer for BudgetPacer {
         if s.remaining_deposit < s.next_voucher_cost {
             return PaceDecision::Refuse;
         }
-        // 3. The deposit covers the next voucher and the range is not fully paid:
-        //    keep drawing the UNPAID remainder (the driver re-opens it at the paid
-        //    frontier, re-delivering any delivered-but-unpaid span idempotently).
+        // 3. The deposit covers the next voucher and the range is not complete:
+        //    keep drawing the remainder past the verified frontier.
         PaceDecision::Draw {
             up_to_bytes: s.requested_bytes.saturating_sub(s.cleared_bytes),
         }
     }
 }
 
-/// The node's pull-leg pacing policy (ADR 037): reuse [`BudgetPacer`]'s
-/// money logic VERBATIM — a window pacer never overrides a money decision — and,
-/// only on a `Draw`, clamp `up_to_bytes` so the pull never runs more than
-/// `window_bytes` ahead of the downstream serve leg's paid frontier — plus one
+/// The window-bounded pacing policy — in production the client streamer's
+/// consumption pacing, whose window is the read-ahead ahead of the consumer's
+/// cursor: reuse [`BudgetPacer`]'s money logic VERBATIM — a window pacer never
+/// overrides a money decision — and, only on a `Draw`, clamp `up_to_bytes` so
+/// the pull never runs more than `window_bytes` ahead of the downstream
+/// [`DownstreamFrontier::served_paid`] frontier — plus one
 /// [`PULL_WINDOW_FLOOR`] when [`DownstreamFrontier::serve_demand`] shows a serve leg parked
 /// at the pull's frontier. When the window is already full and no serve leg is
 /// parked there, wait instead of drawing zero bytes.

@@ -4018,10 +4018,10 @@ where
                                 return Err(err);
                             }
                             log_extra_fault(provider, hash, range, &err);
-                            // Only an uncovered range: a node's per-signer live
-                            // cap, which extra streams hit, refuses as a plain
-                            // `NotFound` too, and inside the coverage that says
-                            // nothing about the blocks it holds.
+                            // Only an uncovered range: a load shed refuses an
+                            // extra stream as a plain `NotFound` too, and inside
+                            // the coverage that says nothing about the blocks
+                            // the node holds.
                             if range.uncovered {
                                 sources.record_extra_refusal(provider, &err, range, at);
                             }

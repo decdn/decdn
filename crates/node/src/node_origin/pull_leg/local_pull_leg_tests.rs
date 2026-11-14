@@ -192,8 +192,8 @@ async fn engine_with_origin(
 /// Drive `run_local_pull_leg` to termination under a hard timeout — a hang (the
 /// failure mode THE CRUX must rule out) surfaces as the timeout error rather
 /// than wedging the test runner. `served_paid` is pre-advanced to `total` so the
-/// downstream `RampPacer` never gates the pull (this test exercises the
-/// completion path, not the window).
+/// downstream `CreditPacer` never gates the pull (this test exercises the
+/// completion path, not the credit pacing).
 ///
 /// Returns the recorded `pull_result`. The leg sets `pull_result`
 /// UNCONDITIONALLY on the line immediately before it fires `pull_ended` and

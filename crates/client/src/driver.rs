@@ -26,17 +26,15 @@
 //!   The acquire loop marks its source priced out at the current deposit, and
 //!   adds funds only through the funding recovery step at the exhausted
 //!   candidate set (ADR 003 § Funding recovery).
-//! - **Paid-frontier resume**: within a gap, each new leg opens at the gap's
-//!   PAID frontier, NOT its checkpointed (delivered) frontier.
-//!   [`crate::ClientRangedStore::ingest_stream`] checkpoints delivered+verified
-//!   bytes payment-agnostically (the ADR 003 credit window lets the node stream a
-//!   full interval before the voucher that pays for it is due), so a leg can
-//!   leave the store's present-range frontier AHEAD of the last PAID byte. The
-//!   per-leg resume offset is [`sink::content_paid_frontier`] of the leg's paid
-//!   wire watermark: the tail is re-delivered (`ingest_stream` re-writes it
-//!   idempotently) and re-billed. A lane whose leg any fault ends (a funding
-//!   refusal, a lost connection, a stall) records that tail on its ledger, and
-//!   the lane's next drive opens at its paid frontier and bills it.
+//! - **Verified-frontier resume**: within a gap, each new leg opens at the
+//!   store's contiguous delivered (verified) frontier, which
+//!   [`crate::ClientRangedStore::ingest_stream`] checkpoints. The payer pays
+//!   ahead of delivery (ADR 003 § Credit Window), so the lane's payment runs at
+//!   or past that frontier: a byte the store holds is never fetched or paid
+//!   again. A hole the store left before present bytes caps the frontier at the
+//!   hole, so the next leg opens there and re-delivers the present bytes after
+//!   it (`ingest_stream` re-writes them idempotently), paying for them again —
+//!   a bounded over-pay, never an under-pay.
 //! - **Reseed** (wallet-less resync, #1481): an authenticated
 //!   [`WatermarkBundle`] that ADVANCES our committed watermark is a healable
 //!   desync — the driver reseeds the ledger
@@ -914,6 +912,10 @@ fn warn_on_new_hole(
 // watermark heals a desync, why a stall is terminal); splitting them out would
 // separate those from the loop state they act on.
 #[allow(clippy::too_many_lines)]
+// The same loop's branch structure: every arm is one decide -> act -> classify
+// pass over shared counters, and extracting arms would multiply the state they
+// thread.
+#[allow(clippy::cognitive_complexity)]
 pub(crate) async fn fill_gap<St, S, P>(
     store: &St,
     source: &S,
@@ -1066,27 +1068,6 @@ where
             .get_or_insert((gap_start, ledger.settlement().bytes));
         let paid_wire_this_leg =
             u64::try_from(committed.bytes.saturating_sub(leg_baseline)).unwrap_or(u64::MAX);
-        // The gap's PAID content frontier, clamped to the store's DELIVERED frontier:
-        // a gap is done — and may resume — only at bytes that are BOTH paid AND
-        // present, tracking the MIN of the two. `content_paid_frontier` prices ONE
-        // leg's paid wire, but the `PoolLedger` is SHARED by every concurrent pull on
-        // the lane (`BuyerLedgers`), so a concurrent pull's acked vouchers inflate
-        // `committed.bytes` — and thus `paid_wire_this_leg` — past what THIS leg
-        // delivered. Left unclamped, that overshoot makes `paid_cleared` report the
-        // gap `Done` (or trips the `paid_frontier >= gap_end` spin-guard in the Draw
-        // arm) before the bytes are in the store, so `drive` returns `Ok` with the
-        // blob incomplete and never finalizes it: success for a blob that is not
-        // there. Clamping to `delivered_frontier` is the same guard against that
-        // overshoot every resumable pull needs. When the store keeps every byte a leg
-        // delivers, delivery runs AHEAD of payment (ADR 003's credit window), so
-        // `delivered_frontier >= paid_frontier` and the clamp is a no-op: resume
-        // still starts at the true paid frontier and the delivered-but-unpaid tail is
-        // still re-billed (no under-pay). The clamp bites in two cases. A
-        // shared-ledger concurrent pull overshoots this leg's delivery. Or the
-        // store leaves a hole before present bytes: the contiguous delivered
-        // frontier stops at the hole, so the paid frontier stops there too and
-        // the next leg opens at the hole.
-        //
         // The payer pays ahead of delivery, so the lane's payment runs at or
         // past what it received. Completion and resume therefore follow the
         // verified frontier, which is the store's contiguous delivered
@@ -1188,16 +1169,13 @@ where
             // `draw_len`/`aligned` here is what actually enforces the window — the
             // open below must never request more than the pacer authorized.
             PaceDecision::Draw { up_to_bytes } => {
-                // Draw the UNPAID tail `[paid_frontier, gap_end)`. This is the
-                // still-missing part when payment tracks delivery, and additionally
-                // the delivered-but-unpaid span `[paid_frontier, delivered_frontier)`
-                // a previous leg left: `ingest_stream` re-writes the already-present
-                // bytes idempotently and the pull re-bills them, so the credit-window
-                // tail the store checkpointed ahead of payment is finally paid. A
-                // hole the store left before present bytes caps the paid frontier
-                // at the hole, so the leg opens there and re-delivers the present
-                // bytes after it the same idempotent way. The pull pays for those
-                // present bytes again: a bounded over-pay, never an under-pay.
+                // Draw the missing tail `[paid_frontier, gap_end)` — the part
+                // past the verified delivered frontier. A hole the store left
+                // before present bytes caps that frontier at the hole, so the
+                // leg opens there and re-delivers the present bytes after it
+                // idempotently (`ingest_stream` re-writes them). The pull pays
+                // for those present bytes again: a bounded over-pay, never an
+                // under-pay.
                 if paid_frontier >= gap_end {
                     // Paid AND delivered to the gap end (`paid_frontier` is clamped to
                     // the delivered frontier above) — the pacer should have returned
@@ -1383,8 +1361,9 @@ where
                         // A reseed (its jump already lifted out of the leg's
                         // baseline above) and a stale heal, which moves no
                         // watermark, keep the leg's anchor. Neither says the node
-                        // holds vouchers for the delivered frontier: delivery runs
-                        // ahead of payment by up to a credit window. So the next
+                        // holds vouchers for the delivered frontier: a rejection
+                        // can refuse proofs in flight, leaving received bytes
+                        // ahead of the accepted watermark. So the next
                         // pass prices the paid frontier from the leg's start over
                         // the leg's own spend, and the next leg re-delivers and
                         // bills the rest.
@@ -1412,18 +1391,23 @@ where
                     //    mismatch, local I/O fault, a funding refusal or
                     //    rejection, a voucher rejection no heal takes) ends the
                     //    lane. The acquire loop classifies it
-                    //    ([`crate::classify`]). Whatever ended it, the lane keeps
-                    //    the span it delivered and did not pay for: the credit
-                    //    window lets the node stream ahead of the voucher that
-                    //    pays, so a leg cut short leaves verified bytes unpaid.
-                    //    The lane's next drive, if it runs again, opens at the
-                    //    paid frontier and bills them.
+                    //    ([`crate::classify`]). Whatever ended it, the payer
+                    //    pays ahead of delivery, so a leg cut short leaves no
+                    //    verified byte unpaid: the lane's next drive, if it
+                    //    runs again, opens at the verified frontier and draws
+                    //    the credit the lane still holds.
                     // A decode that proves the node's bytes corrupt is the node
                     // not delivering against the credit it took: write the held
                     // credit and the corrupt bytes off at this reconciliation.
-                    // A disconnect or a cancel is not one.
+                    // A disconnect or a cancel is not one; a silent stall wrote
+                    // itself off inside the pull.
                     if err.downcast_ref::<crate::HashMismatch>().is_some() {
-                        ledger.write_off_prepaid();
+                        let written = ledger.write_off_prepaid();
+                        tracing::warn!(
+                            written_off_bytes = written,
+                            "corrupt bytes proved; wrote the lane's counted credit \
+                             and unverified bytes off"
+                        );
                     }
                     return Err(err);
                 }

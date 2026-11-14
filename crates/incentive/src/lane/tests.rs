@@ -1389,7 +1389,7 @@ fn a_lane_with_no_claim_has_no_credit() {
     let mut lane = lane_with_terms(1, u64::MAX);
     assert_eq!(lane.credit_bytes(), 0);
     assert_eq!(lane.debit(1), Err(0));
-    assert_eq!(lane.delivered_bytes, 0);
+    assert_eq!(lane.delivered_bytes(), 0);
 }
 
 /// A debit takes from the credit once. Two debits that together exceed the
@@ -1402,7 +1402,7 @@ fn a_debit_spends_the_credit_once() {
     assert_eq!(lane.debit(600), Ok(()));
     assert_eq!(lane.credit_bytes(), 400);
     assert_eq!(lane.debit(600), Err(400));
-    assert_eq!(lane.delivered_bytes, 600);
+    assert_eq!(lane.delivered_bytes(), 600);
     assert_eq!(lane.debit(400), Ok(()));
     assert_eq!(lane.credit_bytes(), 0);
 }
@@ -1413,9 +1413,9 @@ fn a_debit_spends_the_credit_once() {
 fn a_refund_returns_credit_and_saturates() {
     let mut lane = lane_paid(1_000);
     assert_eq!(lane.debit(1_000), Ok(()));
-    lane.refund(300);
+    assert_eq!(lane.refund(300), 300);
     assert_eq!(lane.credit_bytes(), 300);
-    lane.refund(u64::MAX);
-    assert_eq!(lane.delivered_bytes, 0);
+    assert_eq!(lane.refund(u64::MAX), 700);
+    assert_eq!(lane.delivered_bytes(), 0);
     assert_eq!(lane.credit_bytes(), 1_000);
 }

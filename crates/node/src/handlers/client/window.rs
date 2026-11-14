@@ -366,11 +366,12 @@ impl ClientHandler {
         // `ProtocolHandler::accept` bound), and it is (its cache streams are `Send`).
         // The PULL leg's `drive` is non-`Send`, so it runs OFF this task on a dedicated
         // current-thread runtime, coordinating only through the `Send + Sync`
-        // `FillSession`: the shared PAID content frontier the pull's `WindowPacer` reads,
+        // `FillSession`: the shared PAID content frontier the pull's `CreditPacer` reads,
         // the captured-outboard the serve leg's coherent encoder reads, and the pull's
         // terminal signal the serve leg races so a pull that cannot fill a gap fails the
-        // serve (no hang). `Notify` wakers + atomics are runtime-agnostic. `interval_bytes`
-        // and the pacing `credit_floor` were resolved with the floor-M guard above.
+        // serve (no hang). `Notify` wakers + atomics are runtime-agnostic. The
+        // floor-M guard above already priced one chunk against the pool's
+        // remaining deposit before any leg spends.
 
         // (6a) Atomically claim the fill (ADR 038): under one registry lock,
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an

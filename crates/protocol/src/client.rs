@@ -1290,9 +1290,9 @@ pub enum VoucherRejectReason {
     /// `cdn/client/v1` handler (the node holds the clock), not via the `PoolError`
     /// bridge.
     CapabilityExpired,
-    /// The pool's on-chain remaining deposit, minus the refundable floor `M` and
-    /// the pool's already-committed concurrent floor credit, can no longer fund
-    /// further credit for this stream (ADR 003 §Pool solvency). The node also
+    /// The pool's on-chain remaining deposit, minus the refundable floor `M`,
+    /// can no longer fund this stream's next chunk (ADR 003 §Pool solvency).
+    /// The node also
     /// sends it when the pool closed under the stream, or is `Closing` with its
     /// dispute deadline inside the node's redeem margin. A pool-wide condition,
     /// not this signer's. Recovery: the pool **owner tops up the deposit**, or

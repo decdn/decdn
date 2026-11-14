@@ -11,8 +11,8 @@ fn write_config(body: &str) -> tempfile::NamedTempFile {
 
 #[test]
 fn client_transport_windows_are_sized_and_ordered() {
-    // Pin the configured sizes: the per-stream window matches a default
-    // node's `credit_max` ceiling, and the connection window sits above it.
+    // Pin the configured sizes: the per-stream window matches the default
+    // `pay_ahead_cap`'s 64 MiB pricing, and the connection window sits above it.
     assert_eq!(CLIENT_STREAM_RECEIVE_WINDOW, 64 * 1024 * 1024);
     assert_eq!(CLIENT_RECEIVE_WINDOW, 128 * 1024 * 1024);
     // The builder accepts these values and yields a config. (The

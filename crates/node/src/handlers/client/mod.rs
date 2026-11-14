@@ -5,9 +5,10 @@
 //! [`ChunkData`](decdn_protocol::client::ChunkData) frames, collecting one
 //! hash-chain preimage per delivered
 //! `CHUNK_BYTES` chunk — with a signed `Voucher` to open a chain, to roll one,
-//! and to settle a sub-chunk residual — and pausing only when the unpaid balance
-//! (`delivered − paid`) reaches the credit window — so delivery pipelines
-//! several intervals ahead of payment rather than stopping at each one — and
+//! and to settle a sub-chunk residual — and pausing a stream only when the
+//! lane's credit (`paid − delivered`) cannot cover the next frame — the payer
+//! pays ahead of delivery, so payment pipelines rather than stopping at each
+//! chunk — and
 //! finishing with [`ClientMessage::StreamEnd`]. A delivery fault rides in the
 //! initial response (`ok: false` + [`StreamError`]); a mid-stream voucher
 //! rejection is sent as a [`ClientMessage::StreamError`] and the stream is
@@ -176,7 +177,8 @@ struct LaneDeliveryState {
 }
 
 /// Most unclean stream ends a lane remembers. A lane that leaves more streams
-/// unfinished than this forgets the older ones, and its payer pays for those gaps.
+/// unfinished than this forgets one remembered end for each further one, and
+/// its payer pays for that gap.
 const MAX_UNCLEAN_ENDS_PER_LANE: usize = 64;
 
 impl LaneDeliveryState {
@@ -208,7 +210,12 @@ impl LaneDeliveryState {
         if self.unclean_ends.len() >= MAX_UNCLEAN_ENDS_PER_LANE
             && !self.unclean_ends.contains_key(&hash)
         {
-            self.unclean_ends.clear();
+            // Evict one remembered end (the map holds no order, so an
+            // arbitrary one) rather than the whole map, so one busy lane
+            // does not void every other blob's backfill at once.
+            if let Some(evicted) = self.unclean_ends.keys().next().copied() {
+                self.unclean_ends.remove(&evicted);
+            }
         }
         self.unclean_ends.insert(hash, end_offset);
     }
@@ -228,12 +235,10 @@ impl LaneDeliveryState {
         }
         let paid = u64::try_from(self.paid_bytes).unwrap_or(u64::MAX);
         let allowance = (paid / divisor).saturating_sub(self.backfilled_bytes);
-        let granted = gap
-            .min(allowance)
-            .min(window)
-            .min(self.state.delivered_bytes);
+        // `refund` clamps to the bytes the lane was sent, so credit never
+        // exceeds what the lane paid for.
+        let granted = self.state.refund(gap.min(allowance).min(window));
         self.backfilled_bytes = self.backfilled_bytes.saturating_add(granted);
-        self.state.refund(granted);
         granted
     }
 }
@@ -376,7 +381,7 @@ enum ServeRejectReason {
     UnknownLane,
     OwnerMismatch,
     /// The pool's on-chain remaining deposit, minus the node's refundable floor
-    /// `M`, can no longer cover a credit window (ADR 003 §Pool solvency). It is
+    /// `M`, can no longer price one chunk (ADR 003 §Pool solvency). It is
     /// reachable only past the lane-ownership proof (a known lane keyed to a
     /// verified signer holding an owner-signed capability), so its audience is the
     /// proven requester — never an unauthenticated prober — and it ships the wire
@@ -772,7 +777,7 @@ pub struct ClientHandlerDeps {
     /// Refundable minimum-remaining-deposit floor `M` (token base units). The
     /// seller refuses to serve a lane's pool once its on-chain remaining
     /// (`getPool.deposit − getPool.totalRedeemed`) minus this floor can no
-    /// longer cover the next credit window. Threaded from config by E4/F; here
+    /// longer price one chunk. Threaded from config by E4/F; here
     /// it is a plain field the floor-M guard reads.
     pub pool_min_remaining_deposit: U256,
     /// The served per-MB price, fixed at startup. Reprice by restarting the
@@ -1441,8 +1446,8 @@ impl ClientHandler {
     ///   [`ServeStop::PoolClosed`]. `redeemMany` reverts past the deadline, and
     ///   the margin leaves the redeemer one redeem interval to sweep the last
     ///   voucher and the landing slack to land it.
-    /// - The pool can no longer fund the floor credit committed across its
-    ///   signers ([`Self::pool_funds_committed`]): [`ServeStop::PoolExhausted`].
+    /// - The pool's remaining deposit no longer sits above the refundable
+    ///   floor `M` ([`Self::pool_funds_committed`]): [`ServeStop::PoolExhausted`].
     ///
     /// The closed checks run first, because a closed pool's `remaining` pays
     /// nothing. The caller sends `PoolExhausted` on the wire for either stop: the
@@ -2093,8 +2098,9 @@ impl ClientHandler {
     /// The refundable floor-`M` serving guard (shared-payment-pool model): the
     /// seller keeps serving a pool only while its on-chain **remaining**
     /// (`getPool.deposit − getPool.totalRedeemed`) minus the configured
-    /// minimum-remaining-deposit floor `M` can still cover the reserved credit
-    /// window, i.e. `remaining − M ≥ min_payment(reserved_bytes, rate)`. `M` is
+    /// minimum-remaining-deposit floor `M` can still cover the span the caller
+    /// prices — one chunk, capped by the request's own aligned span — i.e.
+    /// `remaining − M ≥ min_payment(reserved_bytes, rate)`. `M` is
     /// the refundable minimum the pool owner is guaranteed to keep, so the node
     /// refuses to serve into it. Pure and total (saturating), so it is testable
     /// without any chain access.
@@ -2384,7 +2390,8 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 ///
 /// The bound matters because without it a payer could hold a stream open
 /// indefinitely with a run of zero-credit vouchers, each one refreshing the
-/// no-progress timeout while the delivered-but-unpaid balance never moves — the
+/// no-progress timeout while the lane's credit never rises enough to cover the
+/// next frame — the
 /// same shape of stall the non-empty-`ChunkData` floor closes on the delivery
 /// side. This budget bounds the number of proofs for one owed chunk, not the
 /// time. [`proof_wait::ChunkProofs`] counts them, and it also holds the chunk's

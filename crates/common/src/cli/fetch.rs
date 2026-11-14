@@ -245,8 +245,9 @@ pub struct ClientFetchArgs {
     pub pay_ahead_divisor: u64,
 
     /// How many verified bytes one written-off byte cancels when the payer sizes
-    /// a node's window. A node that takes credit and does not deliver loses its
-    /// window for good, so a higher value forgives less.
+    /// a node's window. A node that takes credit and does not deliver loses the
+    /// window it had earned — new verified bytes must outgrow the loss — so a
+    /// higher value forgives less.
     #[arg(long, value_name = "N", default_value_t = 20)]
     pub loss_weight: u64,
 

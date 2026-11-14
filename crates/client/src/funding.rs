@@ -592,8 +592,8 @@ where
     /// sign past the deposit before a check stops it. A node redeems that
     /// overdraft out of the next top-up on its next redeem sweep, so the step
     /// adds the overdraft to the top-up. Without it, the remaining deposit after
-    /// that redeem can sit below a node's floor `M` plus one floor credit, and
-    /// every node keeps refusing the pool.
+    /// that redeem can sit below a node's floor `M` plus the price of one
+    /// chunk, and every node keeps refusing the pool.
     ///
     /// A failed read, or a pool the chain does not show as this owner's, keeps
     /// the run's `remaining` and takes the overdraft from the run's own view:

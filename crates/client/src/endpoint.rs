@@ -21,16 +21,14 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 ///
 /// QUIC flow control is receiver-advertised, and a download makes the client
 /// the receiver, so this window — not any node-side setting — bounds
-/// single-stream throughput at roughly `window / RTT`. It is sized to a
-/// default-configured node's paid-pull pacing envelope: a node serves at most
-/// one credit window of unpaid bytes ahead of the paid frontier, and that
-/// window ramps as `clamp(paid / credit_ramp_divisor, 1 MiB, credit_max)`
-/// toward `credit_max` (ADR 003 §Credit window), whose default is 64 MiB but is
-/// operator-configurable with no hard upper bound. Matching this window to that
-/// 64 MiB default keeps transport from being the bottleneck against a default
-/// node at any RTT. An operator who raises `payment.credit_max` past 64 MiB
-/// makes transport the binding cap again; the fixed default here needs no
-/// knowledge of the node's config and covers the common case.
+/// single-stream throughput at roughly `window / RTT`. It is sized to the
+/// payer's own pay-ahead envelope: a node sends only what the lane has paid
+/// for, and the payer pays ahead up to its window, whose default cap
+/// (`pay_ahead_cap`) prices 64 MiB at the default node rate (ADR 003 § Credit
+/// Window). Matching this receive window to that 64 MiB default keeps
+/// transport from being the bottleneck at any RTT. A payer that raises its cap
+/// past 64 MiB makes transport the binding cap again; the fixed default here
+/// covers the common case.
 const CLIENT_STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 
 /// Whole-connection QUIC receive window for a client pull. A pull holds one

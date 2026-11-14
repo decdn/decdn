@@ -7596,8 +7596,9 @@ async fn build_node_b_with_store(
         &domains,
         16,
         |deps| {
-            // Window-paced pull-through: the deadline accommodates the full
-            // discover→probe→pull, paced by the ramped credit window (#1669).
+            // Credit-paced pull-through (ADR 037): the deadline accommodates the
+            // full discover→probe→pull, paced by what the downstream lane has
+            // paid.
             deps.pull_through = Some(Duration::from_secs(20));
             deps.pull_through_origin = Some(Arc::new(origin));
             deps.pool_view = Some(pool_view);
@@ -7963,18 +7964,18 @@ async fn window_pull_through_handshake_is_the_first_pull_leg() -> Result<()> {
     Ok(())
 }
 
-/// A multi-MB blob completes on the fused serve-miss path once both credit windows
-/// have left their floors and ramp with payment (#1893).
+/// A multi-MB blob completes on the fused serve-miss path with payment running
+/// well past the window floor (#1893).
 ///
-/// The serve leg ramps its window on paid WIRE bytes; the pull leg ramps on the
-/// paid CONTENT frontier, which is always smaller. Past the floor, the pull window
-/// therefore closes while the serve window still has room, and the serve encoder
-/// waits on a leaf or a proof node that only the pull can fetch — while it waits,
-/// it collects no voucher. The pull must still fetch the span the encoder waits on,
-/// or neither leg ever moves again. At 8 MiB and the default ramp divisor, several
-/// MiB of the delivery run in the ramp regime.
+/// The serve leg sends against paid WIRE bytes; the pull leg draws on the paid
+/// CONTENT frontier, which is always smaller. The pull's draw can therefore
+/// close while the serve leg still has credit, and the serve encoder waits on
+/// a leaf or a proof node that only the pull can fetch — while it waits, it
+/// collects no voucher. The pull must still fetch the span the encoder waits
+/// on, or neither leg ever moves again. At 8 MiB, several MiB of the delivery
+/// run in that regime.
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_completes_a_blob_past_the_ramp_floor() -> Result<()> {
+async fn window_pull_through_completes_a_multi_mb_blob() -> Result<()> {
     let payload_len: usize = 8 * 1024 * 1024;
     let mut payload = vec![0u8; payload_len];
     let mut x: u32 = 0x2545_f491;
@@ -9138,8 +9139,9 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     // before dropping (asserted above), so the content it received is the concrete
     // stand-in for its paid frontier (~one window).
     let paid = outcome.received;
-    // The ramped credit window (#1669): at `paid = 0` it floors to one voucher
-    // interval, 1 MiB here.
+    // One voucher interval of slack: a generous ceiling over the credit-paced
+    // leg's lead, which ADR 037 bounds to a few chunk groups
+    // (`PULL_AHEAD_BYTES`) past the downstream paid frontier.
     let one_window = MB_BYTES;
     // `upstream_bytes` is the bao WIRE (content + interleaved proof, ADR 038); one
     // chunk group of slack absorbs the boundary chunk group plus the proof overhead
@@ -9163,12 +9165,12 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
 #[allow(clippy::too_many_lines)]
 async fn window_pull_through_connected_nonpaying_leaf_bounds_upstream_spend() -> Result<()> {
     let spans = support::capture_spans();
-    // A leaf pays three vouchers, so both of B's windows ramp past their floors,
-    // then stays connected and keeps reading without paying. B's unrecouped
-    // upstream lead must stay within the ramped credit window plus one
-    // serve-demand pull-window floor (ADR 037), however large the blob is. This
-    // bounds the lead from above; `serve_demand_at_a_full_window_draws_one_floor`
-    // in the pacer pins the exact demand draw.
+    // A leaf pays three vouchers, then stays connected and keeps reading
+    // without paying. B's unrecouped upstream lead must stay within one
+    // pull-window floor plus bounded per-open proof overhead (ADR 037), however
+    // large the blob is. This bounds the lead from above;
+    // `serve_demand_at_a_full_window_draws_one_floor` in the pacer pins the
+    // exact demand draw.
     let payload_len = 8 * CHUNK_BYTES;
     let payload = vec![0x5Au8; usize::try_from(payload_len)?];
     let hash = support::register_payload(&payload);
@@ -9199,11 +9201,11 @@ async fn window_pull_through_connected_nonpaying_leaf_bounds_upstream_spend() ->
     let leaf_sk = fresh_key();
     let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
     let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
-    // Three paid intervals put `paid / DEFAULT_CREDIT_RAMP_DIVISOR` above
-    // `PULL_WINDOW_FLOOR`, so the pull window has ramped. The 2 s hold is shorter
-    // than B's proof-wait backstop (10 s with no transport progress,
-    // `VOUCHER_READ_TIMEOUT`), so B does not end the stream while the leaf holds
-    // it open.
+    // Three paid intervals move the downstream paid frontier well past the pull
+    // leg's floor draws, so the lead bound below runs with real payment behind
+    // it. The 2 s hold is shorter than B's proof-wait backstop (10 s with no
+    // transport progress, `VOUCHER_READ_TIMEOUT`), so B does not end the stream
+    // while the leaf holds it open.
     let outcome = tokio::time::timeout(
         Duration::from_mins(1),
         leaf_paced_pull_mode(
@@ -10131,11 +10133,11 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
         "an underpaid serve must not promote the partial blob"
     );
     let upstream_bytes: u64 = u64::try_from(settled).unwrap_or(u64::MAX);
-    // The ramped credit window (#1669) at `paid = 0` is the pacing floor, which is
-    // `credit_floor.max(PULL_WINDOW_FLOOR)`. `PULL_WINDOW_FLOOR` carries the verify
-    // lag and the chunk-group roundings on top of one voucher interval, so the pull
-    // cannot park short of the chunk the client must verify to pay. The floor is
-    // NOT one bare interval.
+    // The credit-paced leg (ADR 037) draws against the downstream paid
+    // frontier, and its lead here stays within `PULL_WINDOW_FLOOR`, which
+    // carries the verify lag and the chunk-group roundings on top of one
+    // voucher interval — so the pull cannot park short of the chunk the client
+    // must verify to pay. The bound is NOT one bare interval.
     let one_window = decdn_client::PULL_WINDOW_FLOOR;
     // The window bounds CONTENT bytes; the upstream watermark meters WIRE bytes (bao
     // content plus interleaved proof, ADR 038). Convert rather than adding slack: the
@@ -14379,9 +14381,9 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
 /// `decdn_client::driver::drive`.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_pulls_resume_at_their_own_frontier_not_the_lanes() -> Result<()> {
-    // Four chunks of content per blob: large enough that each stream's ramped
-    // credit window (floored at one chunk plus the verify lag) cannot front the whole payload on
-    // credit, so real proofs come due mid-pull.
+    // Four chunks of content per blob: large enough that the payer's pay-ahead
+    // window (floored at one chunk plus the verify lag) cannot front the whole
+    // payload, so real proofs come due mid-pull.
     let len = usize::try_from(CHUNK_BYTES).unwrap_or(usize::MAX) * 4 + 777;
     let payload_a: Arc<Vec<u8>> = Arc::new(
         (0..len)

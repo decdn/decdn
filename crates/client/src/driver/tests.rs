@@ -1858,7 +1858,7 @@ impl super::PacingWait for CatchingUpWait<'_> {
     }
 }
 
-/// With a ramped window past [`crate::pacer::MIN_DRAW_WINDOW`], a caught-up client
+/// With a window past [`crate::pacer::MIN_DRAW_WINDOW`], a caught-up client
 /// sees the pull draw at least half the window per upstream open, except the
 /// last piece of the gap, and the drive completes: the minimum draw batches
 /// the room without stalling the pull. The variant with a parked serve leg
@@ -2806,6 +2806,11 @@ async fn a_lost_connection_resumes_at_the_verified_frontier() {
         .await
         .expect_err("the lost connection ends the lane");
     assert_ne!(crate::classify(&err), crate::Fault::Unaffordable, "{err:#}");
+    assert_eq!(
+        ledger.trust().lost(),
+        0,
+        "a mere disconnect is not a write-off: nothing is booked lost"
+    );
     let missing = store.missing_ranges(0, 0).await.expect("missing");
     let delivered = contiguous_byte_ranges(&missing, total)
         .first()
@@ -3122,4 +3127,61 @@ async fn a_streamed_drive_adopts_a_pull_primed_at_its_first_leg() {
             plaintext.as_slice()
         );
     }
+}
+
+/// The `UnderFold | AmountRegression` arm of the watermark heal: an
+/// `AmountRegression` rejection whose bundle the ledger already covers on both
+/// axes resolves as a retry ([`crate::Healed::Stale`]) WITHOUT moving the
+/// ledger — and retires the live chain the node never adopted, so the retry
+/// opens a fresh root instead of re-anchoring under the refused one and
+/// drawing the same rejection again.
+#[tokio::test]
+async fn an_amount_regression_bundle_behind_the_ledger_retires_the_unadopted_chain() {
+    let ledger = PoolLedger::new(Cumulative::default());
+    // The restarted-payer shape: the ledger opens a fresh chain the node never
+    // adopts and pays two chunks ahead under it.
+    ledger
+        .issue(0, 10, crate::EpochAction::Open, |_next, _chain| async {
+            Ok(())
+        })
+        .await
+        .expect("open a chain");
+    for _ in 0..2u8 {
+        ledger
+            .meter(ledger.chain_root(), |_released| async { Ok(()) })
+            .await
+            .expect("release a reveal");
+    }
+    let root = ledger.chain_root().expect("a live chain is metered");
+    let committed = ledger.committed();
+    // The node's bundle sits one chunk BEHIND the ledger's committed watermark.
+    let chunk = decdn_protocol::client::CHUNK_BYTES;
+    let bundle = Cumulative {
+        bytes: committed.bytes - U256::from(chunk),
+        amount: committed.amount - U256::from(10u64),
+    };
+    assert!(bundle.amount < committed.amount && bundle.bytes < committed.bytes);
+
+    let err = anyhow::Error::new(UpstreamVoucherRejected {
+        reason: VoucherRejectReason::AmountRegression,
+        bundle: None,
+        proof_generation: None,
+    });
+    let healed = crate::heal_watermark_desync(&err, bundle, &ledger).await;
+    assert_eq!(
+        healed,
+        Some(crate::Healed::Stale),
+        "a covered AmountRegression bundle retries from the ledger"
+    );
+    assert_eq!(
+        ledger.committed(),
+        committed,
+        "the heal moves no watermark: the ledger already covers the bundle"
+    );
+    assert_ne!(ledger.chain_root(), Some(root), "the refused root is gone");
+    assert_eq!(
+        ledger.chain_root(),
+        None,
+        "the unadopted chain is retired, so the retry opens a fresh one"
+    );
 }

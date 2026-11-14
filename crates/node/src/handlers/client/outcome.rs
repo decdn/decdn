@@ -109,7 +109,8 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
 pub(super) enum ServeStop {
     /// The client sent a voucher the node rejected.
     VoucherRejected,
-    /// The pool can no longer fund the floor credit (`PoolExhausted`).
+    /// The pool's remaining deposit fell to the refundable floor `M`
+    /// (`PoolExhausted`).
     PoolExhausted,
     /// The pool closed under the stream, or it is `Closing` and its dispute
     /// deadline falls inside the node's redeem margin. The wire reason is

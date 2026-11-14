@@ -893,8 +893,8 @@ impl ClientHandler {
                 // The miss sibling of the two hit counters above, on the same
                 // pre-shed footing: the gate cannot satisfy this request from
                 // held bytes. It records that classification only — the shed
-                // gate below, the floor reservation, and `pull_authorized` can
-                // each end the request before any fill tier runs.
+                // gate below, the pre-spend deposit gate, and `pull_authorized`
+                // can each end the request before any fill tier runs.
                 self.metrics.serve_cache_miss();
                 request_class = RequestClass::CacheMiss;
                 match self.shed.try_admit(request_class, client_node_id) {
@@ -1146,9 +1146,9 @@ impl ClientHandler {
                 // blob via `populate` and only THEN serving (fronting 100% of the
                 // upstream cost before any downstream voucher), it runs the pull
                 // leg (fill the cache from upstream) beside the serve leg (stream
-                // the filling cache to the paying client), so the per-request
-                // speculative exposure is bounded to the ramped credit window
-                // (#1669).
+                // the filling cache to the paying client), so the pull draws
+                // only what the downstream lane has paid for, plus the small
+                // `PULL_AHEAD_BYTES` bound.
                 //
                 // Any request shape routes here. `serve_leg` clamps delivery to
                 // `[offset, offset + len)` and bills only the wire it delivers; the

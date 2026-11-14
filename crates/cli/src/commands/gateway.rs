@@ -1295,15 +1295,22 @@ impl Gateway {
     /// Count what a pull that did not end cleanly may have paid past the
     /// frames its response delivered ([`DROP_PENALTY_BYTES`]) against
     /// `bucket`.
-    fn charge_drop(&self, bucket: Option<u64>) {
+    fn charge_drop(&self, bucket: Option<u64>, span: Option<u64>) {
         if let Some(public) = &self.public {
+            // A ranged pull pays ahead at most to its span's end, so its drop
+            // cannot strand more than the span plus the buffered frames. The
+            // flat bound is for a pull whose length nothing stated; without
+            // the cap, every dropped media range request would charge the
+            // full pay-ahead cap and a handful of them would spend the day's
+            // allowance.
+            let penalty = span.map_or(DROP_PENALTY_BYTES, |span| {
+                DROP_PENALTY_BYTES.min(span.saturating_add(PIPE_BYTES as u64 + CHUNK_BYTES as u64))
+            });
             tracing::info!(
-                penalty = DROP_PENALTY_BYTES,
+                penalty,
                 "a pull ended short of clean; its read-ahead counts against the allowance"
             );
-            public
-                .allowance
-                .charge(bucket, DROP_PENALTY_BYTES, now_secs());
+            public.allowance.charge(bucket, penalty, now_secs());
         }
     }
 
@@ -3036,6 +3043,9 @@ struct PullGuard {
     armed: bool,
     /// The allowance bucket the pull spends.
     bucket: Option<u64>,
+    /// The ranged request's byte length, which bounds what a drop can have
+    /// stranded; `None` for a whole-blob pull, whose length nothing stated.
+    span: Option<u64>,
     /// The pull's entry in [`Gateway::active`].
     id: u64,
     /// Content bytes its response delivered so far, shared with that entry.
@@ -3077,6 +3087,7 @@ impl PullGuard {
             gateway,
             armed,
             bucket: paying.bucket(),
+            span: range.map(|(_, len)| len),
             id,
             delivered,
         }
@@ -3096,7 +3107,7 @@ impl Drop for PullGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
         if self.armed {
-            self.gateway.charge_drop(self.bucket);
+            self.gateway.charge_drop(self.bucket, self.span);
         }
     }
 }
