@@ -44,14 +44,19 @@ pub(super) struct StreamAnchor {
     /// The root this stream has carried a voucher for, or `None` if it has
     /// carried none — or if the last one it carried was sealed.
     root: Option<B256>,
+    /// The anchoring voucher signed an amount below the lane's signed
+    /// watermark: the payer's ledger trails the node's, as a restarted payer's
+    /// does. An honest stream anchors at the watermark, never below it.
+    trailing: bool,
 }
 
 impl StreamAnchor {
     /// Re-anchor to whatever an accepted voucher committed. A sealed voucher
     /// (`chain_root == 0`) clears the anchor: it meters nothing, so a reveal
     /// arriving afterwards on this stream would have no chain to belong to.
-    fn adopt(&mut self, chain_root: B256) {
+    fn adopt(&mut self, chain_root: B256, trailing: bool) {
         self.root = (!chain_root.is_zero()).then_some(chain_root);
+        self.trailing = trailing && self.root.is_some();
     }
 }
 
@@ -325,6 +330,25 @@ impl ClientHandler {
                 }
             };
 
+        // A stale SEALED voucher — at or below the signed watermark, opening no
+        // chain — is a payer whose ledger trails the node's: a restarted payer
+        // re-signing a watermark it lost. A concurrent sibling's stale sealed
+        // voucher finds the lane still holding the credit a deeper voucher paid.
+        // On a lane with no credit the stale voucher can pay nothing and nothing
+        // else is coming, so reject it with the watermark bundle at once: the
+        // payer reseeds and resumes rather than wait out the proof timeout.
+        if wire.chain_root == [0u8; 32]
+            && U256::from(wire.amount) <= guard.state.last_amount()
+            && guard.state.credit_bytes() == 0
+        {
+            let reason = VoucherRejectReason::AmountRegression;
+            let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
+            drop(guard);
+            return self
+                .reject_proof(send, "voucher", &lane_key, reason, bundle)
+                .await;
+        }
+
         // The voucher's full value is lane credit: the lane's credit is its paid
         // bytes minus its delivered bytes (`LaneState::credit_bytes`), so raising
         // the watermark raises the credit of every stream on the lane. A voucher at
@@ -340,12 +364,13 @@ impl ClientHandler {
         // remaining clone is the store's own and is the buffer resharding's to
         // remove (issue #1792 item 3; `verified.{new_bytes,amount}` are `Copy`, so
         // the partial move leaves them readable below).
+        let trailing = U256::from(wire.amount) < guard.state.last_amount();
         guard.state = verified.next_state;
         guard.paid_bytes = verified.new_bytes;
         // This stream now knows which chain the payer is metering against, so a
         // bare reveal arriving on it afterwards is placeable. A sealed voucher
         // clears the anchor instead — it opens no chain to reveal against.
-        anchor.adopt(B256::from(wire.chain_root));
+        anchor.adopt(B256::from(wire.chain_root), trailing);
         if let Err(e) = self.pool_state_store.record(&guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
@@ -544,8 +569,20 @@ impl ClientHandler {
         // rollover voucher folded this very reveal into the watermark. That money
         // is already lane credit, which the serve loop reads before it sends. The
         // proof budget bounds a payer that keeps sending proofs that credit
-        // nothing.
+        // nothing. A stream anchored below the lane's watermark is a payer whose
+        // ledger trails the node's (a restarted payer): on a lane with no credit
+        // its reveal pays nothing and no sibling's money waits behind it, so
+        // reject it with the watermark bundle at once and let the payer reseed
+        // rather than wait out the proof timeout.
         if !applied.advanced() {
+            if anchor.trailing && guard.state.credit_bytes() == 0 {
+                let reason = VoucherRejectReason::AmountRegression;
+                let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
+                drop(guard);
+                return self
+                    .reject_proof(send, "reveal", &lane_key, reason, bundle)
+                    .await;
+            }
             drop(guard);
             return Ok(VoucherStop::Continue { credited_bytes: 0 });
         }

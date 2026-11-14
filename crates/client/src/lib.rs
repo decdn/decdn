@@ -2722,9 +2722,11 @@ async fn heal_bytes_regression(
 /// node refused to adopt. The second state follows an `UnderFold` on a fresh
 /// root: the stream released reveals under it before the rejection landed, and
 /// only the last one rewound. A retry would re-anchor under that root and draw
-/// the same rejection, so an `UnderFold` retires it
+/// the same rejection, so the heal retires it
 /// ([`PoolLedger::retire_unadopted_chain`]), unless a heal has already taken
-/// this bundle.
+/// this bundle. An `AmountRegression` on a reveal is the same state: a
+/// restarted payer anchored a fresh root below the node's signed anchor and
+/// paid ahead under it.
 async fn already_covered(
     reason: VoucherRejectReason,
     watermark: Cumulative,
@@ -2742,7 +2744,10 @@ async fn already_covered(
         );
         return None;
     }
-    let retired = if reason == VoucherRejectReason::UnderFold {
+    let retired = if matches!(
+        reason,
+        VoucherRejectReason::UnderFold | VoucherRejectReason::AmountRegression
+    ) {
         ledger.retire_unadopted_chain(watermark).await
     } else {
         None
@@ -4462,14 +4467,15 @@ fn voucher_rejection(
             // lane is shared, so the proof it last issued may belong to a
             // sibling; naming ours is what keeps the rejection from un-committing
             // a voucher the node accepted.
-            if reason.refuses_proof() {
-                // The node did not take the proof, so the lane's credit at the
-                // node is unknown until the next stream reseeds from its
-                // watermark. A refusal is not a write-off.
-                ledger.forget_prepaid();
-                if let Some(proof) = meter.last_proof {
-                    ledger.resolve_reject(proof);
-                }
+            // Either way the lane's credit at the node is unknown: a refused
+            // proof was not taken, and a gate stop leaves the proofs in flight
+            // unread. The next stream pays from what the node proves, rather
+            // than wait on credit the node may not hold. Neither is a write-off.
+            ledger.forget_prepaid();
+            if reason.refuses_proof()
+                && let Some(proof) = meter.last_proof
+            {
+                ledger.resolve_reject(proof);
             }
             let proof_generation = match meter.last_proof {
                 Some(StreamProof::Voucher { generation, .. }) => Some(generation),

@@ -152,10 +152,10 @@ fn counter_value(metrics: &Arc<Metrics>, name: &str) -> anyhow::Result<u64> {
 /// A manual `cdn/client/v1` client that requests the bounded range
 /// `[byte_offset, byte_offset + byte_len)` with an ownership binding (so the
 /// server's `pull_authorized` gate passes), pays the vouchers the server
-/// collects, and returns the assembled range bytes. Modeled on
-/// `node_origin_pull::leaf_paced_pull`, but the closing-voucher trigger keys on
-/// the requested `byte_len` — the server advertises the *whole-blob*
-/// `total_bytes`, yet only the range is delivered.
+/// collects ahead of delivery, and returns the assembled range bytes. Modeled on
+/// `node_origin_pull::leaf_paced_pull`, but the last voucher keys on the
+/// requested `byte_len` — the server proves the *whole-blob* size, yet only the
+/// range is delivered.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn ranged_paid_pull(
     client_ep: &iroh::Endpoint,
@@ -240,43 +240,42 @@ async fn ranged_paid_pull(
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
-    let mut unvouchered: u64 = 0;
+    // The node sends only against the lane's credit (ADR 003 § Credit Window),
+    // so the client pays one interval ahead and tops the credit up each time
+    // delivery reaches it. The last voucher pays exactly `expected_wire`.
+    // Cumulative amounts over the lane's lifetime — vouchers are monotone in
+    // `amount` (there is no nonce). Acceptance is implicit (ADR 005): a
+    // rejection arrives as a mid-stream `StreamError`.
+    let pay = |paid: u64| -> anyhow::Result<ClientMessage> {
+        let amount = U256::from(paid)
+            .saturating_mul(U256::from(rate))
+            .div_ceil(U256::from(MB_BYTES));
+        let signed = Voucher {
+            pool_id,
+            signer: client_eth.address(),
+            provider,
+            amount,
+            bytes_delivered: U256::from(paid),
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
+        }
+        .sign(client_eth.as_ref(), &voucher_dom())
+        .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+        Ok(ClientMessage::Voucher(signed_to_wire_voucher(&signed)?))
+    };
+    let mut paid = interval_bytes.min(expected_wire);
+    if paid > 0 {
+        write_client_msg(&mut send, &pay(paid)?).await?;
+    }
     loop {
         match read_client_msg(&mut recv).await? {
             ClientMessage::ChunkData(chunk) => {
                 buf.extend_from_slice(chunk.bytes());
                 let len = u64::try_from(chunk.bytes().len()).unwrap_or(u64::MAX);
                 cumulative = cumulative.saturating_add(len);
-                unvouchered = unvouchered.saturating_add(len);
-                let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;
-                let closing = cumulative >= expected_wire && unvouchered > 0;
-                if boundary || closing {
-                    // Cumulative amount over the lane's lifetime — vouchers are
-                    // monotone in `amount` (there is no nonce), so the running
-                    // cumulative is both the payment and the replay-ordering key.
-                    let amount = U256::from(cumulative)
-                        .saturating_mul(U256::from(rate))
-                        .div_ceil(U256::from(MB_BYTES));
-                    let signed = Voucher {
-                        pool_id,
-                        signer: client_eth.address(),
-                        provider,
-                        amount,
-                        bytes_delivered: U256::from(cumulative),
-                        chain_root: B256::ZERO,
-                        chunk_price: U256::ZERO,
-                    }
-                    .sign(client_eth.as_ref(), &voucher_dom())
-                    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-                    // Acceptance is implicit — continued delivery is the ack (ADR
-                    // 005), so no reply is read here; a rejection would arrive as a
-                    // mid-stream `StreamError` and is caught by the loop's arm below.
-                    write_client_msg(
-                        &mut send,
-                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
-                    )
-                    .await?;
-                    unvouchered = 0;
+                if cumulative >= paid && paid < expected_wire {
+                    paid = paid.saturating_add(interval_bytes).min(expected_wire);
+                    write_client_msg(&mut send, &pay(paid)?).await?;
                 }
             }
             ClientMessage::StreamEnd => break,
@@ -356,8 +355,8 @@ async fn throwaway_open(
 }
 
 /// A bound `(0, 0)` open that reads the signed `StreamResponse` and then does
-/// NOTHING — neither pays nor closes. The node's fill for it parks at the ramp
-/// floor with its paid frontier at 0 for as long as the connection lives: the
+/// NOTHING — neither pays nor closes. The node's fill for it parks with no
+/// lane credit and its paid frontier at 0 for as long as the connection lives: the
 /// stalled-owner shape. Returns the live connection (drop it to end the stream)
 /// and the advertised total.
 async fn idle_open(
