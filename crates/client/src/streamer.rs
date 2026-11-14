@@ -701,7 +701,6 @@ where
         P: 'a,
         F: 'a,
     {
-        config.apply_pay_ahead();
         let total_bytes = size.get();
         let (offset, len) = window;
         anyhow::ensure!(

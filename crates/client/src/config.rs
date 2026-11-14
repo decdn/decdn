@@ -118,7 +118,9 @@ impl PullConfig {
     }
 
     /// Put these tunables' window policy in force for every lane of this
-    /// process.
+    /// process. The policy is process-wide, so a caller applies it once, at its
+    /// entry point: opening a stream does not apply it, or a config built with
+    /// default tunables would override the caller's policy for every pull.
     pub fn apply_pay_ahead(&self) {
         crate::payer_window::PayerWindows::process().configure(self.pay_ahead_policy());
     }
