@@ -427,12 +427,20 @@ impl ClientHandler {
         // the pull alive (#2194).
         let mut client_left = std::pin::pin!(send.stopped());
 
+        // The wire this stream carries in all. A payer that paid exactly for it
+        // leaves the lane with no credit once the last frame is sent, so the loop
+        // waits for credit only while wire remains to send.
+        let wire_total = decdn_bao_range::bao_encoded_size(
+            total_bytes,
+            &super::serve_encoder::encoded_ranges(offset, end, total_bytes)?,
+        );
+
         loop {
             // The lane must hold credit before the pull leg draws anything. A
             // payer that never pays costs the node no upstream payment, because
             // this wait ends only when a proof raises the lane's credit.
             let mut credit = self.lane_credit(lane).await;
-            if credit == 0 {
+            if credit == 0 && *delivered < wire_total {
                 if let Acquired::Stopped(stop) = self
                     .acquire_credit_for_leg(
                         conn,

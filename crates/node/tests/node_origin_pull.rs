@@ -3161,7 +3161,7 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
 /// A dishonest upstream (valid response, wrong bytes) is detected by the
 /// verifying decoder at the first chunk group and scored `Corruption`
 /// (`data_correct`: false), the local score drops, the corruption counter moves,
-/// no bytes surface, and the upstream is paid nothing.
+/// no bytes surface, and the upstream keeps no more than the buyer's prepayment.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
@@ -3231,13 +3231,14 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     );
     assert_counter(&b_metrics, "node_pull_corruption_total", 1)?;
 
-    // The buyer pays only for verified bytes. The blob is one 4096-byte leaf and
-    // that leaf fails verification, so no byte verifies, no voucher is signed,
-    // and no watermark is persisted: the lying upstream is paid nothing.
+    // The buyer fronts credit before the first byte (ADR 003 § Credit Window),
+    // so the lying upstream keeps at most that prepayment: the blob is one
+    // 4096-byte leaf, so at most its wire, and nothing past it.
+    let log = progress_log(&recorded)?;
     anyhow::ensure!(
-        progress_log(&recorded)?.is_empty(),
-        "a delivery with no verified byte must pay nothing, got {:?}",
-        progress_log(&recorded)?
+        log.iter()
+            .all(|(_, bytes, _)| *bytes <= U256::from(total_bytes)),
+        "a corrupt delivery must cost no more than the prepaid stream, got {log:?}"
     );
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
@@ -4306,9 +4307,10 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
          silent-but-paid upstream) when the cancellation dropped it"
     );
 
-    // The upstream acked one chunk before going quiet: CHUNK_BYTES of bytes,
-    // `ceil(CHUNK_BYTES × RATE / 1 MiB)` in amount. That is real USDC, and it must be on the buyer's books even though
-    // the pull that spent it never returned.
+    // The buyer fronts credit before delivery (ADR 003 § Credit Window), so it
+    // signed for the chunk the upstream sent and for the credit ahead of it, up to
+    // the stream's wire end. That is real USDC, and it must be on the buyer's books
+    // even though the pull that spent it never returned.
     //
     // The persist happens on the PULL THREAD, not on the dropped `fetch` future:
     // dropping the future cancels the token, and the pull thread then stops `drive`,
@@ -4317,19 +4319,32 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     // not synchronously with it — poll for it rather than reading once. (Were the
     // settle still on the outer future, or missing, this poll would time out: that is
     // the wedge this test guards.)
-    let interval_amount = min_payment(CHUNK_BYTES, RATE);
-    let want = vec![(a_eth.address(), U256::from(CHUNK_BYTES), interval_amount)];
+    let whole_wire = u64::try_from(honest_bao_wire(&payload)?.len())?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while progress_log(&recorded)? != want {
+    let want = loop {
+        let log = progress_log(&recorded)?;
+        if !log.is_empty() {
+            break log;
+        }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
             "a cancelled pull must persist the watermark the upstream already acked, \
              from the pull thread — otherwise the next reuse re-signs from a stale \
-             cumulative amount and the lane wedges, suppressing the provider. Got {:?}",
-            progress_log(&recorded)?
+             cumulative amount and the lane wedges, suppressing the provider"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    };
+    let [(provider, bytes, amount)] = want.as_slice() else {
+        anyhow::bail!("a cancelled pull settles one watermark, got {want:?}");
+    };
+    let bytes = u64::try_from(*bytes)?;
+    anyhow::ensure!(
+        *provider == a_eth.address()
+            && (CHUNK_BYTES..=whole_wire).contains(&bytes)
+            && *amount == min_payment(bytes, RATE),
+        "the settled watermark must cover the delivered chunk and no more than the \
+         stream's {whole_wire} wire bytes, priced at the rate; got {want:?}"
+    );
 
     // And it settles EXACTLY once, at that acked watermark: the pull thread stopped the
     // instant it was cancelled (#1610), so it never advances the ledger past the acked
@@ -7000,37 +7015,21 @@ async fn leaf_ranged_paid_pull(
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
-    let mut unvouchered: u64 = 0;
+    // B sends only against credit, so the leaf pays one interval ahead and tops
+    // the credit up each time delivery reaches it.
+    let mut paid: u64 = interval_bytes.min(expected_wire);
+    if paid > 0 {
+        leaf_pay(&mut send, leaf_eth, pool_id, provider, rate, paid).await?;
+    }
     loop {
         match read_client(&mut recv).await? {
             ClientMessage::ChunkData(chunk) => {
                 buf.extend_from_slice(chunk.bytes());
                 let len = u64::try_from(chunk.bytes().len()).unwrap_or(u64::MAX);
                 cumulative = cumulative.saturating_add(len);
-                unvouchered = unvouchered.saturating_add(len);
-                let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;
-                let closing = cumulative >= expected_wire && unvouchered > 0;
-                if boundary || closing {
-                    let amount = U256::from(cumulative)
-                        .saturating_mul(U256::from(rate))
-                        .div_ceil(U256::from(MB_BYTES));
-                    let signed = Voucher {
-                        pool_id,
-                        signer: leaf_eth.address(),
-                        provider,
-                        amount,
-                        bytes_delivered: U256::from(cumulative),
-                        chain_root: B256::ZERO,
-                        chunk_price: U256::ZERO,
-                    }
-                    .sign(leaf_eth.as_ref(), &voucher_dom())
-                    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-                    write_client(
-                        &mut send,
-                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
-                    )
-                    .await?;
-                    unvouchered = 0;
+                if cumulative >= paid && paid < expected_wire {
+                    paid = paid.saturating_add(interval_bytes).min(expected_wire);
+                    leaf_pay(&mut send, leaf_eth, pool_id, provider, rate, paid).await?;
                 }
             }
             ClientMessage::StreamEnd => break,
@@ -7072,6 +7071,38 @@ async fn leaf_ranged_paid_pull(
         .get(lead..end)
         .map(<[u8]>::to_vec)
         .ok_or_else(|| anyhow::anyhow!("decoded range shorter than requested span"))
+}
+
+/// Write one cumulative voucher from the leaf paying for `paid_wire` wire bytes
+/// at `rate`. Acceptance is implicit (ADR 005): a rejection arrives as a
+/// mid-stream `StreamError`.
+async fn leaf_pay(
+    send: &mut iroh::endpoint::SendStream,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    pool_id: B256,
+    provider: Address,
+    rate: u64,
+    paid_wire: u64,
+) -> Result<()> {
+    let amount = U256::from(paid_wire)
+        .saturating_mul(U256::from(rate))
+        .div_ceil(U256::from(MB_BYTES));
+    let signed = Voucher {
+        pool_id,
+        signer: leaf_eth.address(),
+        provider,
+        amount,
+        bytes_delivered: U256::from(paid_wire),
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
+    }
+    .sign(leaf_eth.as_ref(), &voucher_dom())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client(
+        send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
+    )
+    .await
 }
 
 async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMessage> {
@@ -7266,12 +7297,34 @@ async fn leaf_paced_pull_mode(
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
-    let mut unvouchered: u64 = 0;
     let mut acks: u64 = 0;
     let mut paid_wire: u64 = 0;
     // Set once a `StopPayingAfter` leaf has paid its last voucher.
     let mut hold_until: Option<tokio::time::Instant> = None;
+    // B sends only against credit, so the leaf pays one interval ahead and tops
+    // the credit up each time delivery reaches it. Each voucher is one ack.
     loop {
+        if hold_until.is_none() && cumulative >= paid_wire && paid_wire < expected_wire {
+            paid_wire = paid_wire.saturating_add(interval_bytes).min(expected_wire);
+            leaf_pay(&mut send, leaf_eth, pool_id, provider, rate, paid_wire).await?;
+            acks += 1;
+            match mode {
+                LeafMode::DropAfter(n) if n == acks => {
+                    conn.close(0u32.into(), b"leaf-drop");
+                    return Ok(LeafOutcome {
+                        received: cumulative,
+                        acks,
+                        paid_wire,
+                        completed: false,
+                        hash_ok: false,
+                    });
+                }
+                LeafMode::StopPayingAfter { acks: n, hold } if n == acks => {
+                    hold_until = Some(tokio::time::Instant::now() + hold);
+                }
+                _ => {}
+            }
+        }
         let msg = match hold_until {
             None => read_client(&mut recv).await?,
             Some(deadline) => match tokio::time::timeout_at(deadline, read_client(&mut recv)).await
@@ -7298,53 +7351,7 @@ async fn leaf_paced_pull_mode(
         match msg {
             ClientMessage::ChunkData(chunk) => {
                 buf.extend_from_slice(chunk.bytes());
-                let len = chunk.bytes().len() as u64;
-                cumulative = cumulative.saturating_add(len);
-                unvouchered = unvouchered.saturating_add(len);
-                let boundary = unvouchered >= interval_bytes && interval_bytes > 0;
-                let closing = cumulative >= expected_wire && unvouchered > 0;
-                if (boundary || closing) && hold_until.is_none() {
-                    acks += 1;
-                    let amount = U256::from(cumulative)
-                        .saturating_mul(U256::from(rate))
-                        .div_ceil(U256::from(MB_BYTES));
-                    let signed = Voucher {
-                        pool_id,
-                        signer: leaf_eth.address(),
-                        provider,
-                        amount,
-                        bytes_delivered: U256::from(cumulative),
-                        chain_root: B256::ZERO,
-                        chunk_price: U256::ZERO,
-                    }
-                    .sign(leaf_eth.as_ref(), &voucher_dom())
-                    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-                    write_client(
-                        &mut send,
-                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
-                    )
-                    .await?;
-                    // Acceptance is implicit (ADR 005): no ack is read; a rejection
-                    // would arrive as a mid-stream `StreamError`.
-                    unvouchered = 0;
-                    paid_wire = cumulative;
-                    match mode {
-                        LeafMode::DropAfter(n) if n == acks => {
-                            conn.close(0u32.into(), b"leaf-drop");
-                            return Ok(LeafOutcome {
-                                received: cumulative,
-                                acks,
-                                paid_wire,
-                                completed: false,
-                                hash_ok: false,
-                            });
-                        }
-                        LeafMode::StopPayingAfter { acks: n, hold } if n == acks => {
-                            hold_until = Some(tokio::time::Instant::now() + hold);
-                        }
-                        _ => {}
-                    }
-                }
+                cumulative = cumulative.saturating_add(chunk.bytes().len() as u64);
             }
             ClientMessage::StreamEnd => break,
             ClientMessage::StreamError(e) => anyhow::bail!("leaf saw stream error: {e:?}"),
@@ -7834,37 +7841,28 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         cache_b.has(hash).await?,
         "B must promote the teed blob on a complete delivery"
     );
-    // B's buyer lane to A advanced under the DECOUPLED window-paced cadence (#1621),
-    // which is not a single-open shape: the pull leg opens the blob in more than one
-    // span, because the window pause at the frontier (proven above) forces a second
-    // upstream open, each with its OWN voucher accounting starting fresh at that open
-    // (#856) rather than continuing the cumulative total. The wire total re-emits the
-    // span boundary's bao parent once more than a single-span encoding would (ADR 038
-    // meters WIRE: content + interleaved proof), and each leg's own wire is chunked and
-    // ceiling-rounded independently, so the two legs' summed payment is more than a
-    // single cumulative ceiling over the whole wire would be.
-    let leg1_wire =
-        u64::try_from(honest_bao_wire_range(&payload, 0, window)?.len()).unwrap_or(u64::MAX);
-    let leg2_wire =
-        u64::try_from(honest_bao_wire_range(&payload, window, 0)?.len()).unwrap_or(u64::MAX);
-    let expected_wire = leg1_wire.saturating_add(leg2_wire);
-    let per_leg_amount = |wire: u64| -> U256 {
-        let mut amount = U256::ZERO;
-        let mut remaining = wire;
-        while remaining > 0 {
-            let chunk = remaining.min(CHUNK_BYTES);
-            amount += min_payment(chunk, RATE);
-            remaining -= chunk;
-        }
-        amount
+    // B's buyer lane to A advanced across two upstream legs: the pull leg paces
+    // on the lane credit the leaf has paid for, so the window pause at the
+    // frontier (proven above) forces a second open. Where the first leg ends
+    // depends on when the leaf's next payment lands. Each leg re-sends the bao
+    // proof path to its start (ADR 038 meters WIRE: content + interleaved proof),
+    // so the watermark is the single encoding plus at most one proof path, and
+    // each leg rounds its amount up per chunk on its own.
+    let single_wire = u64::try_from(honest_bao_wire_range(&payload, 0, 0)?.len())?;
+    let group = decdn_cache::CHUNK_GROUP_BYTES;
+    let proof_path = support::bao_wire_len(total_bytes, 0, group).saturating_sub(group);
+    let log = progress_log(&recorded)?;
+    let [(provider, bytes, amount)] = log.as_slice() else {
+        anyhow::bail!("expected one upstream watermark for A, got {log:?}");
     };
-    let expected_amount = per_leg_amount(leg1_wire) + per_leg_amount(leg2_wire);
+    let bytes = u64::try_from(*bytes)?;
     anyhow::ensure!(
-        progress_log(&recorded)?
-            == vec![(a_eth.address(), U256::from(expected_wire), expected_amount)],
-        "expected B's upstream watermark at the full blob ({expected_wire} wire bytes, \
-         {expected_amount} paid), got {:?}",
-        progress_log(&recorded)?
+        *provider == a_eth.address()
+            && (single_wire..=single_wire + proof_path).contains(&bytes)
+            && *amount >= min_payment(bytes, RATE)
+            && *amount <= min_payment(bytes, RATE) + U256::from(2u64),
+        "expected B's upstream watermark at the full blob ({single_wire} wire bytes plus at \
+         most one {proof_path}-byte proof path), got {log:?}"
     );
 
     // Two upstream legs: the primed handshake pull, then the open after the window
@@ -7890,7 +7888,10 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     };
     anyhow::ensure!(
         leg_parent("0") == Some("serve_stream")
-            && leg_parent(&window.to_string()) == Some("upstream_stream"),
+            && opens.iter().any(|s| {
+                s.fields.get("byte_offset").map(String::as_str) != Some("0")
+                    && s.parent == Some("upstream_stream")
+            }),
         "the handshake leg nests under serve_stream, the later leg under upstream_stream: \
          {opens:?}"
     );
@@ -8611,182 +8612,6 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     );
 
     shutdown([task_a, task_b], [&ep_b, &ep_a]).await?;
-    Ok(())
-}
-
-/// The per-pool floor ceiling covers the window pull-through MISS path, not only
-/// the cache-hit path: a same-lane stream already in flight makes a concurrent
-/// same-lane MISS refuse — with the `Unfunded` wire code, since the bound leaf
-/// is a proven lane owner — before it
-/// ever opens a second upstream pull.
-///
-/// Both leaves share ONE lane — same `pool_id` (the gated upstream's pool id
-/// reused as the leaf pool) and same signer, dialed over two independent
-/// connections, mirroring two concurrent client streams on one payment lane.
-/// A whole-blob miss reserves a full floor before it spends upstream, so
-/// `remaining` covers `min_payment(floor, RATE)` with a little slack (`floor` =
-/// one `CHUNK_BYTES`) — enough for the first stream's pre-spend floor reservation
-/// inside `serve_via_window_pull_through` — but not `min_payment(2 * floor, RATE)`,
-/// the two reservations two same-lane streams commit to the pool's floor
-/// accumulator. The pool ceiling (`remaining − M`) refuses the second. This is the
-/// same one-floor headroom tuning as
-/// `second_same_lane_stream_refused_when_budget_covers_one` in `client_loopback.rs`,
-/// extended to a request that MISSES locally and fills via the window-paced
-/// pull-through provider instead of a cache hit.
-///
-/// Determinism: leaf 1 is admitted and its floor reservation committed at the
-/// pre-spend gate — which runs before B ever dials upstream — strictly before A's
-/// gated server observes the upstream `StreamRequest`. Waiting on `received`
-/// therefore guarantees leaf 1's reservation is held before leaf 2 opens, so leaf 2
-/// deterministically finds the pool ceiling full and is refused pre-serve (it never
-/// reaches A at all).
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines, clippy::similar_names)]
-async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
-    use alloy::signers::SignerSync;
-
-    let payload = vec![0xC7u8; 4096];
-    let hash = support::register_payload(&payload);
-
-    let ab_pool_id = B256::repeat_byte(0xA9);
-    let b_buyer = Arc::new(PrivateKeySigner::random());
-    let (a_id, a_addr, a_eth, ep_a, task_a, received, release) =
-        spawn_gated_node_a(&payload).await?;
-
-    // One lane: one leaf pool, one signer, shared by both concurrent opens.
-    let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_pool_id = B256::repeat_byte(0x8A);
-    // Exactly one floor's worth of reserved credit-window headroom, plus slack
-    // strictly under a second floor. Derived from the payment quantum rather
-    // than hard-coded, so it tracks `CHUNK_BYTES` instead of drifting with it.
-    let remaining = decdn_incentive::min_payment(CHUNK_BYTES, RATE) + U256::from(2u64);
-    let (handler_b, b_target, ep_b, _recorded, cache_b, _b_metrics, _local_rep, b_operator) =
-        build_node_b_with_leaves(
-            a_id,
-            a_addr,
-            a_eth.address(),
-            hash,
-            ab_pool_id,
-            &b_buyer,
-            &[(
-                leaf_pool_id,
-                leaf_eth.address(),
-                leaf_eth.address(),
-                remaining,
-            )],
-            0,
-            64,
-            None,
-            DEFAULT_TEST_PULL_DEADLINES,
-        )
-        .await?;
-    let task_b = spawn_server_concurrent(ep_b.clone(), handler_b);
-
-    // Leaf 1: opens the lane's only slot. Spawn it, then wait for A to observe
-    // the upstream request — proof the hoisted gate already admitted and
-    // incremented before this point.
-    let leaf1_sk = fresh_key();
-    let leaf1_node_id = B256::from(*leaf1_sk.public().as_bytes());
-    let (leaf1_ep, _) = local_endpoint(leaf1_sk, vec![]).await?;
-    let leaf1_target = b_target.clone();
-    let leaf1_eth = Arc::clone(&leaf_eth);
-    let leaf1_task = tokio::spawn(async move {
-        leaf_paced_pull(
-            &leaf1_ep,
-            leaf1_target,
-            leaf1_node_id,
-            &leaf1_eth,
-            b_operator,
-            leaf_pool_id,
-            hash,
-            RATE,
-            None,
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(20), received.notified())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "gated upstream A never signaled `received` — leaf 1 likely never \
-                 reached the pull-through path"
-            )
-        })?;
-
-    // Leaf 2: same lane, concurrent with leaf 1 still in flight. Drive the
-    // request by hand (rather than `leaf_paced_pull`, which bails on a refusal)
-    // so the refusal itself — the `Unfunded` wire code, spoken because this
-    // bound leaf is a proven lane owner —
-    // is asserted.
-    let leaf2_sk = fresh_key();
-    let leaf2_node_id = B256::from(*leaf2_sk.public().as_bytes());
-    let (leaf2_ep, _) = local_endpoint(leaf2_sk, vec![]).await?;
-    let conn2 = leaf2_ep
-        .connect(b_target.clone(), ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("leaf2 connect: {e}"))?;
-    let (mut send2, mut recv2) = conn2
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("leaf2 open_bi: {e}"))?;
-    let binding_hash = binding_signing_hash(leaf2_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
-    let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
-    let ext = StreamRequestExt {
-        binding: Some(ClientBinding {
-            ethereum_address: leaf_eth.address().into(),
-            binding_signature,
-        }),
-        capability: None,
-    };
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        pool_id: leaf_pool_id.into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    let payload2 =
-        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
-    write_frame(&mut send2, &payload2)
-        .await
-        .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
-    let frame2 = read_frame(&mut recv2, decdn_protocol::MAX_CHUNK_FRAME)
-        .await
-        .map_err(|e| anyhow::anyhow!("read resp: {e}"))?;
-    let (msg2, rest2) = decode_message::<ClientMessage>(&frame2)
-        .map_err(|e| anyhow::anyhow!("decode resp: {e}"))?;
-    let ClientMessage::StreamResponse(resp2) = msg2 else {
-        anyhow::bail!("leaf2: expected StreamResponse, got {msg2:?}");
-    };
-    let resp2_ext = decdn_protocol::parse_stream_response_ext(rest2)
-        .map_err(|e| anyhow::anyhow!("decode resp ext: {e}"))?;
-    anyhow::ensure!(
-        !resp2.body.ok,
-        "concurrent same-lane MISS must be refused while budget covers only one floor"
-    );
-    anyhow::ensure!(
-        matches!(resp2_ext.error(), Some(StreamError::Unfunded)),
-        "expected the Unfunded wire code for the pool-ceiling refusal, \
-         got {:?}",
-        resp2_ext.error()
-    );
-    conn2.close(0u32.into(), b"refused");
-
-    // Release A: leaf 1, the lane's admitted stream, completes and settles —
-    // proving the cap released neither wedged the lane nor blocked the admitted
-    // stream.
-    release.notify_one();
-    let out1 = leaf1_task.await??;
-    anyhow::ensure!(out1.completed, "leaf 1 delivery did not complete");
-    anyhow::ensure!(out1.hash_ok, "leaf 1 received bytes failed the hash check");
-    anyhow::ensure!(
-        cache_b.has(hash).await?,
-        "leaf 1's fill must promote the blob"
-    );
-
-    shutdown([task_a, task_b], [&leaf2_ep, &ep_b, &ep_a]).await?;
     Ok(())
 }
 
@@ -9601,10 +9426,14 @@ struct ScriptedLane {
     /// The root the lane meters against. Tracked because it is what decides
     /// whether an incoming voucher retires the frontier or merely re-states it.
     root: B256,
-    /// The part of the claim already credited to served chunks, across every
-    /// stream on the lane. `claim − credited` is the headroom a stale proof is
-    /// paid from.
-    credited: U256,
+    /// The lane-cumulative wire bytes the live root's anchoring voucher pays for.
+    /// Each reveal on that root adds one `CHUNK_BYTES` on top.
+    anchor_bytes: u64,
+    /// The lane-cumulative wire bytes the proofs so far pay for.
+    paid_bytes: u64,
+    /// The lane-cumulative wire bytes sent against that payment, across every
+    /// stream on the lane. `paid_bytes − sent_bytes` is the lane's credit.
+    sent_bytes: u64,
 }
 
 impl ScriptedLane {
@@ -9649,6 +9478,7 @@ impl ScriptedLane {
                 // An already-satisfied voucher does not move the node's watermark,
                 // so take the high-water mark rather than whatever this one carries.
                 self.anchor = self.anchor.max(U256::from(v.amount));
+                self.anchor_bytes = self.anchor_bytes.max(v.bytes_delivered);
                 self.price = U256::from(v.chunk_price);
             }
             ClientMessage::ChunkPreimage(p) => {
@@ -9658,60 +9488,17 @@ impl ScriptedLane {
             }
             _ => return false,
         }
+        let chained = CHUNK_BYTES.saturating_mul(u64::from(self.index));
+        self.paid_bytes = self
+            .paid_bytes
+            .max(self.anchor_bytes.saturating_add(chained));
         self.claim() > before
     }
 
-    /// Credit one served chunk of `served` wire bytes, after `proof` was applied
-    /// (`advanced` is what [`Self::apply`] returned).
-    ///
-    /// Mirrors the real node's `credit_advance` / `credit_stale`. A proof that
-    /// advanced the claim credits the chunk up to the claim. A proof that did not
-    /// is stale — the lane already holds its payment, because a sibling stream's
-    /// later proof folded it in first — and pays the whole chunk from headroom, or
-    /// is [`Credit::Refused`], which the node answers with `AmountRegression`.
-    /// Without the stale arm, a proof overtaken on a sibling connection leaves the
-    /// stream waiting on a proof the payer never sends.
-    ///
-    /// A metering voucher (non-zero root) on a whole chunk is accepted and pays
-    /// nothing, advanced or stale, as in `voucher_credit_delta`: it anchors the stream, and the
-    /// reveal after it settles the chunk. A reveal, a sealed voucher, or a voucher
-    /// closing a partial chunk is the chunk's payment.
-    ///
-    /// One deliberate difference: an advancing proof pays the chunk even when
-    /// headroom covers only part of `due`. The node credits exact wire bytes; this
-    /// fixture prices in money through `chunk_due`'s rounding, so demanding all of
-    /// `due` would turn a rounding difference into a wait on a proof the payer
-    /// never sends. The deposit cap, not this credit, is what the top-up tests
-    /// measure.
-    fn credit(&mut self, proof: &ClientMessage, advanced: bool, served: u64) -> Credit {
-        if matches!(proof, ClientMessage::Voucher(v) if v.chain_root != [0u8; 32])
-            && served >= CHUNK_BYTES
-        {
-            return Credit::Unpaid;
-        }
-        let due = chunk_due(self.price, served);
-        let headroom = self.claim().saturating_sub(self.credited);
-        if advanced {
-            self.credited = self.credited.saturating_add(due.min(headroom));
-            Credit::Paid
-        } else if headroom >= due {
-            self.credited = self.credited.saturating_add(due);
-            Credit::Paid
-        } else {
-            Credit::Refused
-        }
+    /// The wire bytes the lane has paid for and not yet sent.
+    const fn credit_bytes(self) -> u64 {
+        self.paid_bytes.saturating_sub(self.sent_bytes)
     }
-}
-
-/// What one proof did for the chunk being settled ([`ScriptedLane::credit`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Credit {
-    /// Accepted, and the chunk is paid.
-    Paid,
-    /// Accepted, but the chunk still waits for its paying proof.
-    Unpaid,
-    /// A stale proof that lane headroom cannot pay: refused, and no state changes.
-    Refused,
 }
 
 /// Read one payment proof — a `Voucher` or a `ChunkPreimage`, the whole
@@ -10093,25 +9880,34 @@ struct LeafStream {
     delivered: u64,
 }
 
-/// Open a paid stream from the leaf to B for `hash` and read chunks until B
-/// parks for the first voucher. B's credit window floors at one interval plus
-/// [`decdn_client::VERIFY_LAG_BYTES`], so it sends the leaf that straddles the
-/// first interval boundary before it waits for that interval's proof.
+/// Open a paid stream from the leaf to B for `hash`, pay the first interval
+/// ahead, and read it. B sends only against the lane's credit, so it then waits
+/// for the next proof.
 async fn leaf_reads_first_interval(
     leaf_ep: &iroh::Endpoint,
     target: EndpointAddr,
     leaf_node_id: B256,
     leaf_eth: &Arc<PrivateKeySigner>,
+    provider: Address,
     pool_id: B256,
     hash: Hash,
 ) -> Result<LeafStream> {
     let LeafStream {
         conn,
-        send,
+        mut send,
         mut recv,
         ..
     } = leaf_opens_paid_stream(leaf_ep, target, leaf_node_id, leaf_eth, pool_id, hash).await?;
-    let parks_at = CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES;
+    let parks_at = CHUNK_BYTES;
+    leaf_sends_voucher(
+        &mut send,
+        leaf_eth,
+        provider,
+        pool_id,
+        parks_at,
+        min_payment(parks_at, RATE),
+    )
+    .await?;
 
     let mut delivered: u64 = 0;
     loop {
@@ -10218,9 +10014,9 @@ async fn leaf_sends_voucher(
     .await
 }
 
-/// A leaf that takes the first interval of bytes, then signs and sends a voucher
-/// that *underpays* (a token amount well below the quoted rate) instead of paying.
-/// B answers with an `Underpaid` rejection mid-window. Returns once it observes
+/// A leaf that pays for and takes the first interval of bytes, then signs and
+/// sends a voucher for the second interval that *underpays* (a token amount well
+/// below the quoted rate). B answers with an `Underpaid` rejection. Returns once it observes
 /// B's `StreamError` rejection (or the stream drops).
 async fn leaf_underpays_first_voucher(
     leaf_ep: &iroh::Endpoint,
@@ -10231,16 +10027,24 @@ async fn leaf_underpays_first_voucher(
     pool_id: B256,
     hash: Hash,
 ) -> Result<()> {
-    let mut leaf =
-        leaf_reads_first_interval(leaf_ep, target, leaf_node_id, leaf_eth, pool_id, hash).await?;
-    // Far below the quoted rate for one interval.
+    let mut leaf = leaf_reads_first_interval(
+        leaf_ep,
+        target,
+        leaf_node_id,
+        leaf_eth,
+        provider,
+        pool_id,
+        hash,
+    )
+    .await?;
+    // Far below the quoted rate for two intervals.
     leaf_sends_voucher(
         &mut leaf.send,
         leaf_eth,
         provider,
         pool_id,
-        leaf.delivered,
-        U256::from(1u64),
+        leaf.delivered.saturating_mul(2),
+        min_payment(leaf.delivered, RATE) + U256::from(1u64),
     )
     .await?;
 
@@ -10356,14 +10160,15 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     Ok(())
 }
 
-/// A proof that pays part of an outstanding chunk leaves the rest owed on the
-/// miss path too (#2132).
+/// A proof that pays a sliver past the paid frontier credits only the sliver on
+/// the miss path too (#2132).
 ///
-/// The leaf pays the first interval by a sliver only. B must keep the rest of
-/// that interval owed and deliver nothing more until a proof pays it. If B drops
-/// the remainder, the sliver reopens the credit window for bytes nobody paid for.
-/// Once the leaf pays the rest, the stream must run to a clean, fully paid end.
+/// The leaf pays the first interval, reads it, then pays the second by a sliver
+/// only. B must send exactly the sliver and nothing more until a proof pays the
+/// rest. Once the leaf pays ahead again, the stream must run to a clean, fully
+/// paid end.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()> {
     const SLIVER_BYTES: u64 = 64 * 1024;
     // Three intervals, so the stream is still mid-blob when the first one is paid.
@@ -10402,20 +10207,22 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
         b_target,
         leaf_node_id,
         &leaf_eth,
+        b_operator,
         leaf_pool_id,
         hash,
     )
     .await?;
 
-    // Pay the first interval by a sliver. The voucher pays the quoted rate for
+    // Pay the second interval by a sliver. The voucher pays the quoted rate for
     // the span it claims, so B accepts it and credits exactly the sliver.
-    let mut amount = min_payment(SLIVER_BYTES, RATE);
+    let mut paid = CHUNK_BYTES + SLIVER_BYTES;
+    let mut amount = min_payment(CHUNK_BYTES, RATE) + min_payment(SLIVER_BYTES, RATE);
     leaf_sends_voucher(
         &mut leaf.send,
         &leaf_eth,
         b_operator,
         leaf_pool_id,
-        SLIVER_BYTES,
+        paid,
         amount,
     )
     .await?;
@@ -10423,6 +10230,21 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
     // Every read from here on can time out and then read the same stream again,
     // so it goes through one cancel-safe reader (#2306).
     let mut reader = BufferedClientReader::default();
+
+    // B sends exactly the sliver.
+    while leaf.delivered < paid {
+        match tokio::time::timeout(Duration::from_secs(10), reader.read(&mut leaf.recv)).await {
+            Ok(Ok(ClientMessage::ChunkData(chunk))) => {
+                leaf.delivered = leaf.delivered.saturating_add(chunk.bytes().len() as u64);
+            }
+            other => anyhow::bail!("expected the sliver's bytes, got {other:?}"),
+        }
+    }
+    anyhow::ensure!(
+        leaf.delivered == paid,
+        "B sent {} bytes past the sliver",
+        leaf.delivered - paid
+    );
 
     // The rest of the interval is still owed, so B delivers nothing more.
     match tokio::time::timeout(Duration::from_secs(2), reader.read(&mut leaf.recv)).await {
@@ -10434,17 +10256,17 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
         Ok(other) => anyhow::bail!("expected B to wait for the rest of the payment, got {other:?}"),
     }
 
-    // From here on the leaf pays whenever B goes quiet, one proof per interval
-    // as an honest payer does: up to the last whole interval it has read, or,
-    // once every whole interval is paid, the closing residual. B answers each
-    // owed interval with one proof, so a single voucher spanning the last whole
-    // interval and the closing residual would leave the residual waiting on a
-    // proof that never comes. The first voucher settles the rest of the first
-    // interval, and the stream must run to a clean `StreamEnd`, fully paid. A
-    // quiet spell with every byte paid is B pulling from A, so the leaf just
-    // waits, within an overall deadline.
+    // From here on the leaf pays ahead whenever B goes quiet with every byte it
+    // sent paid for: up to the next interval boundary, capped at the stream's
+    // wire end. The first such voucher settles the rest of the second interval,
+    // and the stream must run to a clean `StreamEnd`, fully paid. A quiet spell
+    // with credit left is B pulling from A, so the leaf just waits, within an
+    // overall deadline.
+    let wire_end = decdn_cache::range_pull::bao_encoded_size(
+        u64::try_from(payload_len)?,
+        &bao_tree::ChunkRanges::all(),
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut paid = SLIVER_BYTES;
     loop {
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
@@ -10456,10 +10278,11 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
                 leaf.delivered = leaf.delivered.saturating_add(chunk.bytes().len() as u64);
             }
             Ok(Ok(ClientMessage::StreamEnd)) => break,
-            Err(_quiet) if leaf.delivered == paid => {}
+            Err(_quiet) if leaf.delivered < paid || paid >= wire_end => {}
             Err(_quiet) => {
-                let whole = leaf.delivered / CHUNK_BYTES * CHUNK_BYTES;
-                let upto = if whole > paid { whole } else { leaf.delivered };
+                let upto = (paid / CHUNK_BYTES + 1)
+                    .saturating_mul(CHUNK_BYTES)
+                    .min(wire_end);
                 amount += min_payment(upto - paid, RATE);
                 paid = upto;
                 leaf_sends_voucher(
@@ -10486,19 +10309,23 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
     Ok(())
 }
 
-/// A leaf that answers one chunk with sliver after sliver hits the per-chunk
+/// A leaf that answers one frame with sliver after sliver hits the per-frame
 /// proof budget on the miss path too (#2132). Each sliver credits something, but
-/// none settles the chunk, so B ends the stream and meters both the client
-/// abandon and the spent proof budget instead of holding the stream and its
-/// upstream pull open one sliver at a time.
+/// the slivers together stay short of the smallest frame B sends (one chunk
+/// group), so B ends the stream and meters both the client abandon and the spent
+/// proof budget instead of holding the stream and its upstream pull open one
+/// sliver at a time.
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Result<()> {
-    const SLIVER_BYTES: u64 = 64 * 1024;
+    const SLIVER_BYTES: u64 = 1024;
     // The node's private `MAX_PROOFS_PER_CHUNK`; keep the two in step.
     const PROOF_BUDGET: u64 = 8;
+    // On the miss path the first sliver ends B's wait for any credit at all,
+    // which is a wait of its own, so the frame's wait needs the budget after it.
+    const SLIVERS: u64 = PROOF_BUDGET + 1;
     anyhow::ensure!(
-        PROOF_BUDGET * SLIVER_BYTES < CHUNK_BYTES,
-        "the slivers must not add up to a whole interval"
+        SLIVERS * SLIVER_BYTES < decdn_cache::CHUNK_GROUP_BYTES,
+        "the slivers must not add up to one frame"
     );
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x3Eu8; payload_len];
@@ -10535,20 +10362,21 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
         b_target,
         leaf_node_id,
         &leaf_eth,
+        b_operator,
         leaf_pool_id,
         hash,
     )
     .await?;
 
-    let mut amount = U256::ZERO;
-    for n in 1..=PROOF_BUDGET {
+    let mut amount = min_payment(CHUNK_BYTES, RATE);
+    for n in 1..=SLIVERS {
         amount += min_payment(SLIVER_BYTES, RATE);
         leaf_sends_voucher(
             &mut leaf.send,
             &leaf_eth,
             b_operator,
             leaf_pool_id,
-            n * SLIVER_BYTES,
+            CHUNK_BYTES + n * SLIVER_BYTES,
             amount,
         )
         .await?;
@@ -10574,8 +10402,8 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
 }
 
 /// A lane-store fault while B recoups a proof on the miss path is B's own fault,
-/// not a client abandon (#2134). The leaf pays a valid voucher, B's `record`
-/// fails, and the stream ends. The dispatch sink meters the fault as a node
+/// not a client abandon (#2134). The leaf pays the first interval ahead with a
+/// valid voucher, B's `record` fails, and the stream ends. The dispatch sink meters the fault as a node
 /// fault; the client-abandon counter stays at zero.
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon() -> Result<()> {
@@ -10618,7 +10446,7 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
     let leaf_sk = fresh_key();
     let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
     let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
-    let mut leaf = leaf_reads_first_interval(
+    let mut leaf = leaf_opens_paid_stream(
         &leaf_ep,
         b_target,
         leaf_node_id,
@@ -10662,8 +10490,9 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
 }
 
 /// A leaf that drops while B waits for its first proof is a pull-through abandon
-/// (#2134) and a serve-stream decline (#2073). The proof read fails on a
-/// peer-attributable transport error, so B meters the pull-through abandon. The
+/// (#2134) and a serve-stream decline (#2073). B sends nothing before the lane
+/// holds credit, so it waits on the proof read, which fails on a
+/// peer-attributable transport error, and B meters the pull-through abandon. The
 /// leaf never paid, so the inbound stream counts as a decline. It is neither a
 /// node fault nor a spent proof budget.
 #[tokio::test(flavor = "multi_thread")]
@@ -10698,7 +10527,7 @@ async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline
     let leaf_sk = fresh_key();
     let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
     let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
-    let leaf = leaf_reads_first_interval(
+    let leaf = leaf_opens_paid_stream(
         &leaf_ep,
         b_target,
         leaf_node_id,
@@ -10707,7 +10536,7 @@ async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline
         hash,
     )
     .await?;
-    // B has put the first interval on the wire and waits for its proof.
+    // B waits for the first proof before it sends a byte.
     leaf.conn.close(0u32.into(), b"gone");
 
     // The inbound stream fails once dispatch sees the error, and dispatch
@@ -13459,10 +13288,10 @@ impl PoolOpener for FundingOpener {
     }
 }
 
-/// Serve `payload` with real per-interval voucher pacing, honouring the request's
-/// `byte_offset`, and REFUSE any voucher the shared deposit cannot cover. Like an
-/// honest node, it parks for an interval's proof only once the payer can verify
-/// that interval ([`payable_interval`]).
+/// Serve `payload` against the lane's credit, honouring the request's
+/// `byte_offset`, and REFUSE any proof the shared deposit cannot cover. Like an
+/// honest node (ADR 003 § Credit Window), it sends a frame only when the lane's
+/// paid credit covers it, and reads proofs while the credit falls short.
 ///
 /// The upstream half of the recovery-top-up round trip, and the only fixture in this
 /// file that can produce a mid-blob `Unfunded`: `serve_then_reject_voucher`
@@ -13516,41 +13345,74 @@ async fn serve_with_deposit_ceiling(
     }
 
     let wire = honest_bao_wire_from(payload, req.byte_offset)?;
-    let frames = wire.len().div_ceil(WIRE_FRAME);
-    let mut wire_sent: u64 = 0;
-    let mut settled: u64 = 0;
+    // Proofs arrive on their own reader task, so a wait for one can also wake on a
+    // sibling stream's credit without losing a half-read frame.
+    let (proof_tx, mut proofs) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(proof) = read_proof(&mut recv).await {
+            if proof_tx.send(proof).is_err() {
+                break;
+            }
+        }
+    });
     // The root this stream's reveals are checked against: set by each voucher the
     // stream carries, not by the lane, which a sibling stream can roll.
     let mut stream_root: Option<B256> = None;
-    for (ix, chunk) in wire.chunks(WIRE_FRAME).enumerate() {
+    let mut wire_pos: usize = 0;
+    while wire_pos < wire.len() {
+        let remaining = wire.len() - wire_pos;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut credited_nothing: u8 = 0;
+        let len = loop {
+            {
+                let mut lane = lane
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scripted lane lock poisoned"))?;
+                let credit = usize::try_from(lane.credit_bytes()).unwrap_or(usize::MAX);
+                if credit > 0 {
+                    let len = WIRE_FRAME.min(remaining).min(credit);
+                    lane.sent_bytes = lane.sent_bytes.saturating_add(len as u64);
+                    break len;
+                }
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "deposit-capped upstream: no credit for 15 s"
+            );
+            let proof = match tokio::time::timeout(Duration::from_millis(20), proofs.recv()).await {
+                // A sibling stream's proof may have raised the lane's credit.
+                Err(_elapsed) => continue,
+                // The payer left.
+                Ok(None) => return Ok(()),
+                Ok(Some(proof)) => proof,
+            };
+            if let Some(reason) = apply_capped_proof(lane, deposit, &proof, &mut stream_root)? {
+                write_rejection(&mut send, reason).await?;
+                // Hold the stream until the buyer reads the rejection frame, so it
+                // sees the frame rather than a reset (which would score as
+                // unreachable).
+                let _ = send.finish();
+                let _ = send.stopped().await;
+                return Ok(());
+            }
+            credited_nothing = credited_nothing.saturating_add(1);
+            if credited_nothing > 8 {
+                write_rejection(&mut send, VoucherRejectReason::AmountRegression).await?;
+                let _ = send.finish();
+                let _ = send.stopped().await;
+                return Ok(());
+            }
+        };
+        let chunk = wire
+            .get(wire_pos..wire_pos + len)
+            .ok_or_else(|| anyhow::anyhow!("frame past the wire"))?;
         write_frame(
             &mut send,
             &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
         )
         .await
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
-        wire_sent = wire_sent.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        let done = ix + 1 == frames;
-        while let Some(served) = payable_interval(wire_sent, settled, done) {
-            if !settle_voucher(
-                &mut send,
-                &mut recv,
-                deposit,
-                lane,
-                &mut stream_root,
-                served,
-            )
-            .await?
-            {
-                // Refused: hold the stream until the buyer reads the rejection frame,
-                // so it sees the frame rather than a reset (which would score as
-                // unreachable).
-                let _ = send.finish();
-                let _ = send.stopped().await;
-                return Ok(());
-            }
-            settled = settled.saturating_add(served);
-        }
+        wire_pos += len;
     }
     write_frame(&mut send, &encode_message(&ClientMessage::StreamEnd)?)
         .await
@@ -13560,98 +13422,49 @@ async fn serve_with_deposit_ceiling(
     Ok(())
 }
 
-/// Read the buyer's voucher and either accept it or refuse it `SpendingCapExhausted`,
-/// exactly as the `PaymentPool` would: the voucher's CUMULATIVE amount is what the
-/// deposit has to cover. Returns whether it was accepted.
+/// Fold one of the buyer's proofs into the lane, or refuse it, exactly as the
+/// `PaymentPool` would: the CUMULATIVE claim is what the deposit has to cover, so
+/// a proof whose claim passes the deposit is refused `SpendingCapExhausted` and
+/// leaves the lane as it found it. A reveal on a stream with no anchor is refused
+/// `UnanchoredPreimage`. Returns the refusal, or `None` when the proof is
+/// accepted.
 ///
-/// `bundle: None`, which is what a real node attaches when it holds no prior accepted
+/// A real node attaches no watermark bundle when it holds no prior accepted
 /// voucher to echo, which keeps the watermark heal out of the way. A bundle that
 /// ADVANCED our watermark would (correctly) route to the reseed path instead of
 /// to funding.
-///
-/// Acceptance is implicit (continued delivery is the ack, ADR 005), so on accept no
-/// reply is written; only a rejection sends a message.
-///
-/// `served` is the wire bytes of the chunk being settled, and `stream_root` the root
-/// this stream is anchored to; every voucher read here re-anchors it.
-#[expect(
-    clippy::print_stderr,
-    reason = "test harness diagnostic surfaced in the nextest log"
-)]
-async fn settle_voucher(
-    send: &mut iroh::endpoint::SendStream,
-    recv: &mut iroh::endpoint::RecvStream,
-    deposit: &SharedDeposit,
+fn apply_capped_proof(
     lane: &Mutex<ScriptedLane>,
+    deposit: &SharedDeposit,
+    proof: &ClientMessage,
     stream_root: &mut Option<B256>,
-    served: u64,
-) -> Result<bool> {
-    // Read proofs until one credits this chunk. The payer sends housekeeping
-    // vouchers ahead of a reveal (a stream's first root voucher for an epoch, a
-    // rollover), and neither advances the claim.
-    for _ in 0..4u8 {
-        let proof = read_proof(recv).await?;
-        // A reveal on an unanchored stream has no chain to belong to.
-        if matches!(proof, ClientMessage::ChunkPreimage(_)) && stream_root.is_none() {
-            write_rejection(send, VoucherRejectReason::UnanchoredPreimage).await?;
-            return Ok(false);
-        }
-        // Evaluate against a COPY first. A rejected proof must leave the lane
-        // exactly as it found it — the real node stages a candidate and discards it
-        // on refusal (`stage_voucher_rejects_without_advancing_candidate`), and a
-        // fixture that kept the amount of a voucher it just refused would credit
-        // the payer with money the upstream declined to be paid. One lock spans the
-        // evaluation and the store, so a sibling stream's proof cannot land in
-        // between and be overwritten.
-        let (advanced, credit, claim, dep) = {
-            let mut lane = lane
-                .lock()
-                .map_err(|_| anyhow::anyhow!("scripted lane lock poisoned"))?;
-            let mut candidate = *lane;
-            let advanced = candidate.apply(&proof, *stream_root);
-            let claim = candidate.claim();
-            let dep = read_deposit(deposit)?;
-            // The deposit has to cover the CHAIN-EXTENDED claim, not just the signed
-            // anchor — a reveal spends real money without a signature.
-            let credit = (claim <= dep).then(|| candidate.credit(&proof, advanced, served));
-            if matches!(credit, Some(Credit::Paid | Credit::Unpaid)) {
-                *lane = candidate;
-            }
-            (advanced, credit, claim, dep)
-        };
-        eprintln!(
-            "DIAG proof={} adv={advanced} credit={credit:?} claim={claim} dep={dep}",
-            match &proof {
-                ClientMessage::Voucher(v) =>
-                    format!("V(amt={},root={:02x})", v.amount, v.chain_root[0]),
-                ClientMessage::ChunkPreimage(p) => format!("P(idx={})", p.index),
-                _ => "?".to_string(),
-            },
-        );
-        match credit {
-            None => {
-                write_rejection(send, VoucherRejectReason::SpendingCapExhausted).await?;
-                return Ok(false);
-            }
-            Some(Credit::Refused) => {
-                write_rejection(send, VoucherRejectReason::AmountRegression).await?;
-                return Ok(false);
-            }
-            Some(accepted) => {
-                // Only an accepted voucher re-anchors the stream, as in the node. A
-                // sealed voucher (`chain_root == 0`) meters nothing, so it clears the
-                // anchor, as `StreamAnchor::adopt` does.
-                if let ClientMessage::Voucher(v) = &proof {
-                    let root = B256::from(v.chain_root);
-                    *stream_root = (!root.is_zero()).then_some(root);
-                }
-                if accepted == Credit::Paid {
-                    return Ok(true);
-                }
-            }
-        }
+) -> Result<Option<VoucherRejectReason>> {
+    // A reveal on an unanchored stream has no chain to belong to.
+    if matches!(proof, ClientMessage::ChunkPreimage(_)) && stream_root.is_none() {
+        return Ok(Some(VoucherRejectReason::UnanchoredPreimage));
     }
-    anyhow::bail!("deposit-capped upstream: four proofs in a row credited nothing")
+    // Evaluate against a COPY first, so a refused proof leaves the lane as it
+    // found it. One lock spans the evaluation and the store, so a sibling
+    // stream's proof cannot land in between and be overwritten.
+    let mut lane = lane
+        .lock()
+        .map_err(|_| anyhow::anyhow!("scripted lane lock poisoned"))?;
+    let mut candidate = *lane;
+    candidate.apply(proof, *stream_root);
+    // The deposit has to cover the CHAIN-EXTENDED claim, not just the signed
+    // anchor — a reveal spends real money without a signature.
+    if candidate.claim() > read_deposit(deposit)? {
+        return Ok(Some(VoucherRejectReason::SpendingCapExhausted));
+    }
+    *lane = candidate;
+    // Only an accepted voucher re-anchors the stream, as in the node. A sealed
+    // voucher (`chain_root == 0`) meters nothing, so it clears the anchor, as
+    // `StreamAnchor::adopt` does.
+    if let ClientMessage::Voucher(v) = proof {
+        let root = B256::from(v.chain_root);
+        *stream_root = (!root.is_zero()).then_some(root);
+    }
+    Ok(None)
 }
 
 /// Refuse the stream's last proof with `reason` and no watermark bundle.
@@ -13689,13 +13502,6 @@ fn payable_interval(sent: u64, settled: u64, done: bool) -> Option<u64> {
     } else {
         None
     }
-}
-
-/// What `served` wire bytes cost at `chunk_price` per `CHUNK_BYTES`, rounded up as
-/// the payer rounds a partial chunk's closing voucher.
-fn chunk_due(chunk_price: U256, served: u64) -> U256 {
-    let chunk = U256::from(CHUNK_BYTES);
-    (chunk_price.saturating_mul(U256::from(served)) + chunk - U256::from(1)) / chunk
 }
 
 /// Spawn a provider that answers probes truthfully and serves under a live deposit
@@ -14158,10 +13964,11 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
 ///   taken from the upstream. Computed in WIRE bytes, not content: a content-sized
 ///   floor would pass while the bao proof overhead went unbilled, which is exactly
 ///   the mistake `content_paid_frontier` exists to prevent.
-/// - the UPPER bound allows the resumed leg's re-sent root->offset proof path plus
+/// - the UPPER bound allows the resumed leg's re-sent root->offset proof path,
 ///   strictly under one chunk group of re-fetched content — the bounded, deliberate
-///   over-pay of resuming at a group boundary. It does NOT allow a second copy of
-///   the blob.
+///   over-pay of resuming at a group boundary — and the one interval of credit the
+///   payer fronted before the refusal. It does NOT allow a second copy of the
+///   blob.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_resumed_leg_does_not_re_pay_for_delivered_bytes() -> Result<()> {
     let payload = multi_interval_payload();
@@ -14199,9 +14006,14 @@ async fn the_resumed_leg_does_not_re_pay_for_delivered_bytes() -> Result<()> {
     // The resumed leg re-sends a proof path from the root down to its offset. Bounded
     // by the whole tree's proof overhead, which is `wire - content`.
     let proof_slack = whole_blob_wire.saturating_sub(total_bytes);
+    // The payer fronts one interval of credit (ADR 003 § Credit Window). The
+    // upstream refuses that prepayment for want of deposit, the payer forgets
+    // it, and the resumed leg pays for the interval again, so the bound allows
+    // one interval on top.
     let ceiling = whole_blob_wire
         .saturating_add(proof_slack)
-        .saturating_add(decdn_cache::CHUNK_GROUP_BYTES);
+        .saturating_add(decdn_cache::CHUNK_GROUP_BYTES)
+        .saturating_add(CHUNK_BYTES);
 
     anyhow::ensure!(
         billed_wire >= whole_blob_wire,
@@ -14321,16 +14133,14 @@ async fn a_topup_that_adds_no_headroom_ends_the_pull() -> Result<()> {
 /// A landing that falls short of the owed debt ends the fill "funding needed"
 /// after exactly one recovery step (ADR 003 § Funding recovery).
 ///
-/// The initial deposit covers two MiB at `RATE`. The blob's wire past the third
-/// MiB is shorter than [`decdn_client::VERIFY_LAG_BYTES`], so the upstream sends
-/// the whole range before it parks for the third MiB's proof, and the fill
-/// verifies every byte, the tail included, before the upstream refuses that
-/// proof. The step's landing covers one MiB. The next leg re-bills the tail in
-/// one voucher that also folds the third MiB's reveal, which the raised deposit
-/// still cannot cover, so the upstream refuses it. No byte was verified since the step, so
-/// the progress rule allows no second step and the fill ends. The store holds
-/// the whole blob's verified bytes, and the lane's books stop at the three MiB
-/// its reveals released: the tail stays owed.
+/// The initial deposit covers two MiB at `RATE`. The upstream sends only
+/// against the lane's credit, so it refuses the third MiB's reveal and the fill
+/// stops after two MiB. The step's landing covers one MiB. The next leg pays the
+/// rest in one voucher that also folds the third MiB's reveal, which the raised
+/// deposit still cannot cover, so the upstream refuses it. No byte was verified
+/// since the step, so the progress rule allows no second step and the fill ends.
+/// The store holds only the paid bytes, and the lane's books stop at the three
+/// MiB its reveals released: the tail stays owed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_landing_short_of_the_owed_debt_ends_the_fill_after_one_step() -> Result<()> {
     let payload = multi_interval_payload();
@@ -14366,10 +14176,11 @@ async fn a_landing_short_of_the_owed_debt_ends_the_fill_after_one_step() -> Resu
         "the one step raises the deposit by exactly what landed"
     );
 
-    // Every byte verified before the step, so the store holds the whole blob.
+    // The upstream sends only against the lane's credit, so the store holds
+    // what the deposit paid for before the refusals, and not the whole blob.
     anyhow::ensure!(
-        fixture.engine.present_ranges(hash).await?.is_complete(),
-        "the fill verifies the whole blob, tail included, before the first step"
+        !fixture.engine.present_ranges(hash).await?.is_complete(),
+        "an upstream that sends only paid bytes leaves the unpaid tail out of the store"
     );
 
     // The lane's books hold the three MiB its reveals released: a released

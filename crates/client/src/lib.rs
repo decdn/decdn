@@ -823,8 +823,9 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
 #[derive(Debug)]
 #[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct BlobTooLarge {
-    /// The byte count past `ceiling` — wire bytes one stream received (receive
-    /// loop), or content bytes the store holds or would hold for the blob
+    /// The byte count past `ceiling` — wire bytes one stream would carry (open,
+    /// from the proven size) or received (receive loop), or content bytes the
+    /// store holds or would hold for the blob
     /// (driver, [`acquire`]). Same unit as `ceiling` (see the type's **Units**
     /// note).
     pub reached: u64,
@@ -3371,6 +3372,15 @@ async fn open_progressive_pull_impl(
         } else {
             aligned_wire_len(byte_offset, max_blob_size_bytes, total_bytes)?
         };
+        // The size is proven, so a stream whose wire runs past the cap can never
+        // complete. Refuse it before paying anything, rather than pay ahead for
+        // bytes the cap would refuse.
+        if max_received_wire > 0 && expected_wire_bytes > max_received_wire {
+            return Err(anyhow::Error::new(BlobTooLarge {
+                reached: expected_wire_bytes,
+                ceiling: max_received_wire,
+            }));
+        }
         let header = UpstreamPullHeader {
             total_bytes,
             size_proof: resp_ext.size_proof().cloned(),
@@ -3674,8 +3684,7 @@ impl UpstreamPull {
     /// # Errors
     ///
     /// More bytes than promised, received bytes crossing the cap's worth of content
-    /// from this stream's offset ([`BlobTooLarge`], raised before the crossing chunk is
-    /// paid), a mid-stream `StreamError`
+    /// from this stream's offset ([`BlobTooLarge`]), a mid-stream `StreamError`
     /// (typed [`UpstreamRefused`]), an unexpected message, a [`UpstreamVoucherRejected`] /
     /// transport error while paying, or —
     /// on the throughput floor — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
@@ -3732,10 +3741,10 @@ impl UpstreamPull {
                     // bytes that ACTUALLY arrive. `max_received_wire` is the wire size of the
                     // cap's worth of content from this stream's offset, so this is the
                     // wire form of "this stream carried more content than the cap" —
-                    // distinct from the claim-derived `expected_wire_bytes` overrun
-                    // guard above. Abort BEFORE paying for the chunk that crosses it,
-                    // so one stream's spend stays bounded to the cap's worth.
-                    // `0` = unlimited.
+                    // distinct from the size-derived `expected_wire_bytes` overrun
+                    // guard above. The open refuses a stream whose proven wire runs
+                    // past the cap, so this trips only on a node that sends more
+                    // than it proved. `0` = unlimited.
                     if self.max_received_wire > 0 && self.cumulative > self.max_received_wire {
                         return Err(anyhow::Error::new(BlobTooLarge {
                             reached: self.cumulative,

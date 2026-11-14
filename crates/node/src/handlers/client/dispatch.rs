@@ -958,11 +958,47 @@ impl ClientHandler {
                 // on a resolved lane the same way.
                 //
                 // Every fill tier below fronts the operator's own origin egress or
-                // real upstream USDC. The pre-spend deposit floor (#1519) lives in
-                // each tier: it refuses a pool whose `remaining − M` cannot cover one
-                // chunk before the tier spends, so a dust-deposit pool cannot make
-                // the node pay for absent hashes.
+                // real upstream USDC, and the own-origin tier reads the origin
+                // before any later gate runs. So the pre-spend deposit floor
+                // (#1519) runs HERE, before any tier: a pool whose `remaining − M`
+                // cannot cover one chunk (capped by the request's own aligned span
+                // when it bounds itself) is refused before the node spends, so a
+                // dust-deposit pool cannot make the node pay for absent hashes.
+                // `window.rs` keeps its own guard for the pull-through tier. A
+                // `None` view fails open (the on-chain `redeem` is the backstop).
+                // With no authority no tier spends, so the gate is skipped.
                 let authority = Self::pull_authorized(lane_key, known_lane.as_ref());
+                if authority.is_some()
+                    && let Some(status) = pool_status
+                {
+                    let guard_bytes = if req.byte_len > 0 {
+                        aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(CHUNK_BYTES)
+                    } else {
+                        CHUNK_BYTES
+                    };
+                    if !self.pool_remaining_covers_window(
+                        status.remaining,
+                        guard_bytes,
+                        rate_per_mb,
+                    ) {
+                        self.log_deposit_refusal(
+                            B256::from(req.pool_id),
+                            hash,
+                            status
+                                .remaining
+                                .saturating_sub(self.pool_min_remaining_deposit),
+                            decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+                        );
+                        return self
+                            .respond_error(
+                                &mut send,
+                                &req,
+                                ServeRejectReason::InsufficientDeposit,
+                                rate_per_mb,
+                            )
+                            .await;
+                    }
+                }
 
                 let mut fault_seen = false;
 
