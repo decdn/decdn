@@ -969,6 +969,8 @@ pub fn decdn_client::PoolLedger::settlement(&self) -> decdn_client::Cumulative
 pub fn decdn_client::PoolLedger::take_unsaved_rebase(&self) -> core::option::Option<decdn_client::Cumulative>
 pub fn decdn_client::PoolLedger::trust(&self) -> &alloc::sync::Arc<decdn_client::payer_window::NodeTrust>
 pub fn decdn_client::PoolLedger::wire_bytes(&self) -> u64
+impl core::ops::drop::Drop for decdn_client::PoolLedger
+pub fn decdn_client::PoolLedger::drop(&mut self)
 pub struct decdn_client::PoolReplaced
 pub decdn_client::PoolReplaced::closed: decdn_incentive::lane::PoolId
 pub decdn_client::PoolReplaced::opened: decdn_incentive::lane::PoolId
