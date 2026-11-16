@@ -85,7 +85,7 @@ use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{
-    CheckpointKey, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore,
+    CheckpointKey, Deployment, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore,
     SettlementLedger, StoreError,
 };
 use futures_util::StreamExt as _;
@@ -495,12 +495,12 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     /// # Errors
     ///
     /// Returns an error if the `usdc()` self-check fails deterministically — a
-    /// bad `payment_pool_address` is fatal at bring-up — or if `boot`'s budget
+    /// bad payment pool address is fatal at bring-up — or if `boot`'s budget
     /// runs out on transient RPC failures.
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap(
         provider: P,
-        payment_pool_addr: Address,
+        deployment: Deployment,
         self_address: Address,
         store: Arc<dyn PoolStateStore>,
         checkpoint_store: Arc<dyn KeyedCheckpointStore>,
@@ -515,10 +515,12 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         redeem_tx: mpsc::Sender<LaneKey>,
         redeem_rx: mpsc::Receiver<LaneKey>,
     ) -> Result<(Self, Route)> {
+        let payment_pool_addr = deployment.payment_pool;
         let contract = PaymentPool::new(payment_pool_addr, provider);
         // One recorder for both ledger writers: the redeemer (receipt in hand)
         // and the `PoolRedeemed` sink (backfill of a landing it never saw).
-        let recorder = SettlementRecorder::new(ledger, self_address, Arc::clone(&metrics));
+        let recorder =
+            SettlementRecorder::new(ledger, self_address, deployment, Arc::clone(&metrics));
         let schedule = RedeemSchedule::default();
 
         let usdc_token = usdc_self_check(&contract, boot).await?;

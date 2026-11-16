@@ -163,7 +163,9 @@ pub fn decdn_client::buyer_pool::ProgressWrite::of(&decdn_client::VoucherProgres
 pub const fn decdn_client::buyer_pool::ProgressWrite::totals(&self) -> decdn_incentive::buyer_pool::BuyerLaneProgress
 #[non_exhaustive] pub enum decdn_client::buyer_pool::WatermarkRow
 pub decdn_client::buyer_pool::WatermarkRow::Delegated(decdn_incentive::deployment::Deployment)
-pub decdn_client::buyer_pool::WatermarkRow::Owned(alloy_primitives::bits::address::Address)
+pub decdn_client::buyer_pool::WatermarkRow::Owned
+pub decdn_client::buyer_pool::WatermarkRow::Owned::deployment: decdn_incentive::deployment::Deployment
+pub decdn_client::buyer_pool::WatermarkRow::Owned::owner: alloy_primitives::bits::address::Address
 pub struct decdn_client::buyer_pool::AllowanceShortfall
 impl core::error::Error for decdn_client::buyer_pool::AllowanceShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::AllowanceShortfall

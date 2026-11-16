@@ -327,17 +327,24 @@ fn verify_fails_on_a_tampered_file_and_passes_an_empty_one() {
 
 #[test]
 fn a_known_chain_pins_the_contract_addresses() {
-    let chain = known_chains::by_chain_id(421_614).unwrap();
+    let chain = &known_chains::tests::FIXTURE;
     let addresses = chain.addresses().unwrap();
-    let mut receipt = bundle_receipt(421_614);
-    let ChainCheck::Known(faults) = check_chain(&receipt.chain).unwrap() else {
-        panic!("421614 is a known chain");
+    let pool = chain
+        .payment_chains()
+        .unwrap()
+        .remove(0)
+        .payment_pools
+        .remove(0);
+    let mut receipt = bundle_receipt(chain.chain_id);
+    let ChainCheck::Known(faults) = check_chain_against(&receipt.chain, Some(chain)).unwrap()
+    else {
+        panic!("the fixture is a known chain");
     };
     assert_eq!(faults.len(), 2);
-    receipt.chain.payment_pool = addresses.payment_pool.parse().unwrap();
+    receipt.chain.payment_pool = pool.parse().unwrap();
     receipt.chain.slash_judge = addresses.slash_judge.parse().unwrap();
     assert_eq!(
-        check_chain(&receipt.chain).unwrap(),
+        check_chain_against(&receipt.chain, Some(chain)).unwrap(),
         ChainCheck::Known(Vec::new())
     );
     assert_eq!(

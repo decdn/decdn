@@ -457,6 +457,15 @@ impl ChainFixture {
         self.addrs
     }
 
+    /// The fixture's `PaymentPool` deployment: this chain and its pool.
+    #[must_use]
+    pub const fn deployment(&self) -> decdn_incentive::Deployment {
+        decdn_incentive::Deployment {
+            chain_id: self.chain_id,
+            payment_pool: self.addrs.payment_pool,
+        }
+    }
+
     /// Mock USDC (mintable) the settlement token points at.
     #[must_use]
     pub const fn usdc(&self) -> Address {

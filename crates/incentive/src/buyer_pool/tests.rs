@@ -99,7 +99,7 @@ fn memory_store_round_trip() -> anyhow::Result<()> {
     store.record(&b)?;
     anyhow::ensure!(store.len() == 2);
     let got = store
-        .get_by_owner(a.owner)?
+        .get_by_owner(DEPLOYMENT, a.owner)?
         .ok_or_else(|| anyhow::anyhow!("missing a"))?;
     anyhow::ensure!(got == a);
     Ok(())
@@ -114,7 +114,7 @@ fn memory_store_record_overwrites_by_owner() -> anyhow::Result<()> {
     store.record(&s)?;
     anyhow::ensure!(store.len() == 1, "same owner overwrites");
     let only = store
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("missing entry"))?;
     anyhow::ensure!(only.deposit == U256::from(99u64));
     Ok(())
@@ -125,10 +125,13 @@ fn memory_store_forget_removes_entry() -> anyhow::Result<()> {
     let store = MemoryBuyerPoolStore::new();
     let s = sample(1);
     store.record(&s)?;
-    store.forget(s.owner)?;
+    store.forget(DEPLOYMENT, s.owner)?;
     anyhow::ensure!(store.is_empty());
     // Forgetting an unknown owner is a no-op.
-    store.forget(address!("00000000000000000000000000000000000000ff"))?;
+    store.forget(
+        DEPLOYMENT,
+        address!("00000000000000000000000000000000000000ff"),
+    )?;
     Ok(())
 }
 
@@ -204,6 +207,7 @@ fn forget_if_pool_only_deletes_matching_pool() -> anyhow::Result<()> {
 
     // Wrong pool id → no delete, row preserved.
     let deleted = store.forget_if_pool(
+        DEPLOYMENT,
         s.owner,
         b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
     )?;
@@ -211,12 +215,13 @@ fn forget_if_pool_only_deletes_matching_pool() -> anyhow::Result<()> {
     anyhow::ensure!(store.len() == 1, "row must survive a mismatched CAS");
 
     // Matching pool id → deletes.
-    let deleted = store.forget_if_pool(s.owner, s.pool_id)?;
+    let deleted = store.forget_if_pool(DEPLOYMENT, s.owner, s.pool_id)?;
     anyhow::ensure!(deleted, "matching pool must delete");
     anyhow::ensure!(store.is_empty());
 
     // Unknown owner → false, no-op.
     anyhow::ensure!(!store.forget_if_pool(
+        DEPLOYMENT,
         address!("00000000000000000000000000000000000000ff"),
         s.pool_id
     )?);
@@ -241,6 +246,7 @@ fn advance_progress_advances_committed_watermark() -> anyhow::Result<()> {
     };
 
     let outcome = store.advance_progress(
+        DEPLOYMENT,
         s.owner,
         s.pool_id,
         lane,
@@ -249,7 +255,7 @@ fn advance_progress_advances_committed_watermark() -> anyhow::Result<()> {
     )?;
     anyhow::ensure!(outcome == AdvanceOutcome::Advanced, "got {outcome:?}");
     let stored = store
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("missing row"))?;
     let progress = stored
         .lane_progress(lane)
@@ -277,13 +283,14 @@ fn advance_progress_rejects_regression_without_writing() -> anyhow::Result<()> {
         ((U256::from(9_000u64), U256::from(8_999u64)), "amount"),
     ];
     for ((bytes, amount), expected_field) in cases {
-        let outcome = store.advance_progress(s.owner, s.pool_id, lane, bytes, amount)?;
+        let outcome =
+            store.advance_progress(DEPLOYMENT, s.owner, s.pool_id, lane, bytes, amount)?;
         anyhow::ensure!(
             matches!(outcome, AdvanceOutcome::Regressed(BuyerProgressError::Regressed { field, .. }) if field == expected_field),
             "expected {expected_field} regression, got {outcome:?}"
         );
         let stored = store
-            .get_by_owner(s.owner)?
+            .get_by_owner(DEPLOYMENT, s.owner)?
             .ok_or_else(|| anyhow::anyhow!("missing row"))?;
         let progress = stored
             .lane_progress(lane)
@@ -309,6 +316,7 @@ fn advance_and_deposit_guard_on_pool_and_owner() -> anyhow::Result<()> {
     // Pool-id mismatch → stale, no write.
     anyhow::ensure!(
         store.advance_progress(
+            DEPLOYMENT,
             s.owner,
             other_pool,
             lane,
@@ -317,20 +325,28 @@ fn advance_and_deposit_guard_on_pool_and_owner() -> anyhow::Result<()> {
         )? == AdvanceOutcome::PoolMismatch
     );
     anyhow::ensure!(
-        store.add_deposit(s.owner, other_pool, U256::from(1u64))? == DepositOutcome::PoolMismatch
+        store.add_deposit(DEPLOYMENT, s.owner, other_pool, U256::from(1u64))?
+            == DepositOutcome::PoolMismatch
     );
     let stored = store
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("missing row"))?;
     anyhow::ensure!(stored == s, "mismatched calls must not mutate the row");
 
     // Unknown owner → UnknownPool, no write.
     anyhow::ensure!(
-        store.advance_progress(unknown, s.pool_id, lane, U256::from(1u64), U256::from(1u64),)?
-            == AdvanceOutcome::UnknownPool
+        store.advance_progress(
+            DEPLOYMENT,
+            unknown,
+            s.pool_id,
+            lane,
+            U256::from(1u64),
+            U256::from(1u64),
+        )? == AdvanceOutcome::UnknownPool
     );
     anyhow::ensure!(
-        store.add_deposit(unknown, s.pool_id, U256::from(1u64))? == DepositOutcome::UnknownPool
+        store.add_deposit(DEPLOYMENT, unknown, s.pool_id, U256::from(1u64))?
+            == DepositOutcome::UnknownPool
     );
     Ok(())
 }
@@ -342,13 +358,13 @@ fn add_deposit_accumulates_committed_deposit() -> anyhow::Result<()> {
     s.deposit = U256::from(100u64);
     store.record(&s)?;
 
-    let outcome = store.add_deposit(s.owner, s.pool_id, U256::from(40u64))?;
+    let outcome = store.add_deposit(DEPLOYMENT, s.owner, s.pool_id, U256::from(40u64))?;
     anyhow::ensure!(
         outcome == DepositOutcome::Added(U256::from(140u64)),
         "got {outcome:?}"
     );
     let stored = store
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("missing row"))?;
     anyhow::ensure!(stored.deposit == U256::from(140u64));
     Ok(())

@@ -10,6 +10,11 @@
 //! ripening-prev-region — the region logic lives entirely inside the contract
 //! view, so the watcher never repacks a region).
 //!
+//! The append-only mutation ledger (`mutationCount`, `getMutations`, the
+//! `Mutation` record and its `MutationKind`) is the `eth_call` surface that
+//! follows every deny-set change in order (ADR 011 § Following the mutation
+//! ledger).
+//!
 //! The write + `getHashEntry` surface is mirrored for the cross-layer e2e
 //! harness (`decdn-e2e`), which drives governance blacklist adds and reads
 //! `addedAt` to time the compliance / slashability windows.
@@ -176,6 +181,60 @@ mod sol_types {
             /// Grace (seconds) between a standard/regional add and the moment the
             /// entry becomes slashable (ADR 011 § Compliance Window).
             function complianceWindow() external view returns (uint64);
+
+            // -----------------------------------------------------------------
+            // Mutation ledger (ADR 011 § Following the mutation ledger)
+            // -----------------------------------------------------------------
+
+            /// What one ledger record changed. MUST match
+            /// `ContentBlacklist.MutationKind` member-for-member and in order:
+            /// the ABI carries the ordinal, so a reordering mis-decodes
+            /// silently.
+            enum MutationKind {
+                HASH_ADD,
+                HASH_EMERGENCY_ADD,
+                HASH_RATIFY,
+                HASH_REMOVE,
+                HASH_EXPIRE,
+                ORIGIN_SET,
+                ORIGIN_CLEAR,
+                ORIGIN_EMERGENCY_ADD,
+                ORIGIN_EXPIRE,
+                OPERATOR_ADD,
+                OPERATOR_REMOVE,
+                BODY_REGISTER,
+                BODY_DEREGISTER,
+                BODY_SUSPEND,
+                BODY_SUSPENSION_RATIFY,
+                BODY_UNSUSPEND,
+                COMPLIANCE_WINDOW_SET,
+                EMERGENCY_COMPLIANCE_WINDOW_SET
+            }
+
+            /// One append-only ledger record. `at` is the block timestamp of
+            /// the change, `expiresAt` an emergency deadline (`0` when none),
+            /// `region` the scope, and `key` the hash, the address (left-padded),
+            /// or the window in seconds, by `kind`. MUST match
+            /// `ContentBlacklist.Mutation` field-for-field and in order.
+            struct Mutation {
+                MutationKind kind;
+                uint64 at;
+                uint64 expiresAt;
+                bytes32 region;
+                bytes32 key;
+            }
+
+            /// Length of the mutation ledger. A node polls it and reads
+            /// `getMutations` only when it moves.
+            function mutationCount() external view returns (uint256);
+
+            /// A page of the mutation ledger starting at `from`, at most
+            /// `limit` long, in append order. A page shorter than `limit` is
+            /// the end of the ledger. A record's index never changes.
+            function getMutations(uint256 from, uint256 limit)
+                external
+                view
+                returns (Mutation[] memory);
 
             // -----------------------------------------------------------------
             // Membership events (watcher re-read signals)

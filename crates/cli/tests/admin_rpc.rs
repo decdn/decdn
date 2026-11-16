@@ -1152,6 +1152,10 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
         .as_secs();
     let ledger = Arc::new(MemorySettlementLedger::default());
     let row = |block: u64, landed_at: u64, net: u64| SettlementRecord {
+        deployment: decdn_incentive::Deployment {
+            chain_id: 31_337,
+            payment_pool: Address::repeat_byte(0x9c),
+        },
         block_number: block,
         log_index: 0,
         tx_hash: B256::repeat_byte(u8::try_from(block).unwrap_or(0)),

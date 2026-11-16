@@ -48,7 +48,7 @@ fn config(body: &str) -> FileConfig {
 fn keystore_password_file_flows_through_and_defaults_to_none() {
     let file = config(
         "[blockchain]\nrpc_url = \"http://config:8545\"\n\
-         payment_pool_address = \"0x3333333333333333333333333333333333333333\"\n\
+         payment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\n\
          slash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
     );
     assert!(
@@ -365,7 +365,7 @@ fn flags_override_config() {
     c.payment_pool_address = Some(pp.into());
     c.slash_judge_address = Some("0x2222222222222222222222222222222222222222".into());
     let file = config(
-        "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
     );
     let r = resolve_chain(&c, &file).unwrap();
     assert_eq!(r.config.rpc_url, "http://flag:8545");
@@ -376,7 +376,7 @@ fn flags_override_config() {
 #[test]
 fn config_fills_unset_flags_and_defaults() {
     let file = config(
-        "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_working_deposit_micro_usdc = 5000000\n",
+        "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_working_deposit_micro_usdc = 5000000\n",
     );
     let r = resolve_chain(&common(), &file).unwrap();
     assert_eq!(r.config.rpc_url, "http://config:8545");
@@ -399,7 +399,7 @@ fn config_fills_unset_flags_and_defaults() {
 /// and surface as an opaque `openPool` `ZeroAmount` revert.
 #[test]
 fn resolve_chain_rejects_deposits_the_daemon_resolver_would_reject() {
-    let base = "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n";
+    let base = "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n";
 
     // A zero working deposit can never open a pool.
     let err = resolve_chain(

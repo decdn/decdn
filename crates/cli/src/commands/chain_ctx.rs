@@ -52,11 +52,12 @@ impl FileConfig {
         self.blockchain.as_ref().and_then(|b| b.chain_id)
     }
 
-    /// `blockchain.payment_pool_address`, when the file sets it.
-    pub fn payment_pool_address(&self) -> Option<&str> {
+    /// The first `[[blockchain.payment_chains]]` entry, when the file names
+    /// one.
+    pub fn first_payment_chain(&self) -> Option<&FilePaymentChain> {
         self.blockchain
             .as_ref()
-            .and_then(|b| b.payment_pool_address.as_deref())
+            .and_then(|b| b.payment_chains.first())
     }
 
     /// `blockchain.buyer_working_deposit_micro_usdc`, or its default: what the
@@ -113,9 +114,22 @@ struct FileBlockchain {
     publisher_registry_address: Option<String>,
     origin_assignment_address: Option<String>,
     slash_appeal_address: Option<String>,
-    payment_pool_address: Option<String>,
+    #[serde(default)]
+    payment_chains: Vec<FilePaymentChain>,
     get_logs_max_block_span: Option<u64>,
     buyer_working_deposit_micro_usdc: Option<u64>,
+}
+
+/// The fields of a `[[blockchain.payment_chains]]` entry these commands read.
+#[derive(Debug, Default, Deserialize)]
+pub struct FilePaymentChain {
+    /// The payment chain's JSON-RPC endpoint.
+    pub rpc_url: Option<String>,
+    /// The payment chain's EIP-155 id.
+    pub chain_id: Option<u64>,
+    /// The `PaymentPool` addresses on it, as written.
+    #[serde(default)]
+    pub payment_pools: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

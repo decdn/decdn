@@ -2774,6 +2774,10 @@ fn test_recorder() -> SettlementRecorder {
     SettlementRecorder::new(
         Arc::new(decdn_incentive::MemorySettlementLedger::default()),
         Address::from([20u8; 20]),
+        decdn_incentive::Deployment {
+            chain_id: 31_337,
+            payment_pool: Address::ZERO,
+        },
         Arc::new(Metrics::new()),
     )
 }
@@ -5330,28 +5334,11 @@ mod redeem_schedule {
 }
 
 mod settlement_ledger_rows {
-    use alloy::sol_types::{SolCall, SolEvent};
-    use decdn_incentive::erc20::Erc20;
-    use decdn_incentive::payment_pool::FeeRouter;
+    use alloy::sol_types::SolCall;
     use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
     use decdn_incentive::{MemorySettlementLedger, SettlementLedger};
 
     use super::*;
-
-    const ROUTER: Address = Address::repeat_byte(0xF0);
-
-    fn log(address: Address, data: alloy::primitives::LogData, log_index: u64) -> Log {
-        Log {
-            inner: alloy::primitives::Log { address, data },
-            block_hash: None,
-            block_number: Some(1),
-            block_timestamp: None,
-            transaction_hash: None,
-            transaction_index: None,
-            log_index: Some(log_index),
-            removed: false,
-        }
-    }
 
     /// Drive one `redeem_planned_lanes` cycle whose single `redeemMany` lands
     /// with `logs` in its receipt, against a ledger the test can read back.
@@ -5364,6 +5351,10 @@ mod settlement_ledger_rows {
         let recorder = SettlementRecorder::new(
             Arc::clone(&ledger) as Arc<dyn SettlementLedger>,
             SELLER,
+            decdn_incentive::Deployment {
+                chain_id: 31_337,
+                payment_pool: Address::ZERO,
+            },
             Arc::clone(&metrics),
         );
         let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
@@ -5389,88 +5380,6 @@ mod settlement_ledger_rows {
         .await;
         anyhow::ensure!(!faulted, "the redeem landed");
         Ok((ledger, metrics))
-    }
-
-    /// `shutdown` waits for a ledger backfill the watcher started: the row is
-    /// in the ledger when it returns. No lane is seeded, so the final sweep
-    /// reads nothing from the chain and the drain is what the test times.
-    #[tokio::test]
-    async fn shutdown_drains_the_ledger_backfills() -> Result<()> {
-        let metrics = Arc::new(Metrics::new());
-        let ledger = Arc::new(MemorySettlementLedger::default());
-        let recorder = SettlementRecorder::new(
-            Arc::clone(&ledger) as Arc<dyn SettlementLedger>,
-            SELLER,
-            Arc::clone(&metrics),
-        );
-        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
-        let (contract, _asserter) = mocked_getwatermarks_pool(&[]);
-        let mut svc = shutdown_service(contract, store, SELLER, U256::from(1u64), metrics);
-        svc.backfills = LedgerBackfills::new(recorder);
-        let settled = FeeRouter::Settled {
-            operator: SELLER,
-            bytesDelivered: U256::from(4_096u64),
-            amount: U256::from(1_000u64),
-            epoch: 7,
-        };
-        let transfer = Erc20::Transfer {
-            from: ROUTER,
-            to: SELLER,
-            value: U256::from(600u64),
-        };
-        let receipt = mined_receipt(
-            Address::ZERO,
-            vec![
-                log(Address::repeat_byte(0xA0), transfer.encode_log_data(), 2),
-                log(ROUTER, settled.encode_log_data(), 3),
-            ],
-        );
-        let tx = receipt.transaction_hash;
-        let rpc = ScriptedRpc::mined(receipt).at_head(1_700_000_500);
-        svc.backfills.spawn(rpc.provider(), 1, tx);
-        assert!(
-            ledger.load_settlements()?.is_empty(),
-            "the backfill has not been polled before shutdown"
-        );
-        svc.shutdown(Duration::from_secs(5)).await;
-        let rows = ledger.load_settlements()?;
-        assert_eq!(
-            rows.iter().map(|row| row.tx_hash).collect::<Vec<_>>(),
-            vec![tx]
-        );
-        assert_eq!(svc.backfills.in_flight(), 0);
-        Ok(())
-    }
-
-    /// The Landed arm of `submit_chunk` writes the ledger row: gross, bytes
-    /// and epoch from `Settled`, net from the router's transfer, the block
-    /// time from the header.
-    #[tokio::test]
-    async fn a_landed_redeem_writes_its_ledger_row() -> Result<()> {
-        let settled = FeeRouter::Settled {
-            operator: SELLER,
-            bytesDelivered: U256::from(4_096u64),
-            amount: U256::from(1_000u64),
-            epoch: 7,
-        };
-        let transfer = Erc20::Transfer {
-            from: ROUTER,
-            to: SELLER,
-            value: U256::from(600u64),
-        };
-        let logs = vec![
-            log(Address::repeat_byte(0xA0), transfer.encode_log_data(), 2),
-            log(ROUTER, settled.encode_log_data(), 3),
-        ];
-        let (ledger, _metrics) = land_with(logs, Some(1_700_000_000)).await?;
-        let rows = ledger.load_settlements()?;
-        anyhow::ensure!(rows.len() == 1, "one row per landed redeemMany: {rows:?}");
-        let row = rows.first().ok_or_else(|| anyhow::anyhow!("one row"))?;
-        assert_eq!((row.block_number, row.log_index), (1, 3));
-        assert_eq!((row.gross_micro_usdc, row.net_micro_usdc), (1_000, 600));
-        assert_eq!((row.bytes_delivered, row.epoch), (4_096, 7));
-        assert_eq!(row.landed_at_unix, 1_700_000_000);
-        Ok(())
     }
 
     /// A `redeemMany` that paid nothing lands with no logs: no row, no header

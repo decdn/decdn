@@ -145,20 +145,29 @@ impl BuyerPoolStore for UnreadableSalt {
     fn record(&self, _: &BuyerPoolState) -> Result<(), StoreError> {
         Err(StoreError::Backend("unused".into()))
     }
-    fn forget(&self, _: Address) -> Result<(), StoreError> {
+    fn forget(&self, _: Deployment, _: Address) -> Result<(), StoreError> {
         Err(StoreError::Backend("unused".into()))
     }
-    fn get_by_pool_id(&self, _: PoolId) -> Result<Option<BuyerPoolState>, StoreError> {
+    fn get_by_pool_id(
+        &self,
+        _: Deployment,
+        _: PoolId,
+    ) -> Result<Option<BuyerPoolState>, StoreError> {
         Err(StoreError::Backend("unused".into()))
     }
-    fn forget_if_pool(&self, _: Address, _: PoolId) -> Result<bool, StoreError> {
+    fn forget_if_pool(&self, _: Deployment, _: Address, _: PoolId) -> Result<bool, StoreError> {
         Err(StoreError::Backend("unused".into()))
     }
-    fn get_by_owner(&self, _: Address) -> Result<Option<BuyerPoolState>, StoreError> {
+    fn get_by_owner(
+        &self,
+        _: Deployment,
+        _: Address,
+    ) -> Result<Option<BuyerPoolState>, StoreError> {
         Err(StoreError::Backend("unused".into()))
     }
     fn advance_progress(
         &self,
+        _: Deployment,
         _: Address,
         _: PoolId,
         _: LaneKey,
@@ -169,6 +178,7 @@ impl BuyerPoolStore for UnreadableSalt {
     }
     fn rebase_progress(
         &self,
+        _: Deployment,
         _: Address,
         _: PoolId,
         _: LaneKey,
@@ -179,6 +189,7 @@ impl BuyerPoolStore for UnreadableSalt {
     }
     fn seed_progress(
         &self,
+        _: Deployment,
         _: Address,
         _: PoolId,
         _: LaneKey,
@@ -189,6 +200,7 @@ impl BuyerPoolStore for UnreadableSalt {
     }
     fn add_deposit(
         &self,
+        _: Deployment,
         _: Address,
         _: PoolId,
         _: U256,

@@ -1068,7 +1068,7 @@ bind_port = {bind_port}
 rpc_url = "{rpc_url}"
 eth_keystore = '{keystore}'
 chain_id = {chain_id}
-payment_pool_address = "{payment_pool}"
+payment_chains = [{{ rpc_url = "{rpc_url}", chain_id = {chain_id}, payment_pools = ["{payment_pool}"] }}]
 capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
 slash_appeal_address = "{slash_appeal}"
@@ -1224,24 +1224,29 @@ fn rewrite_pool_min_remaining_deposit(config: &str, micro_usdc: u64) -> anyhow::
     toml::to_string(&doc).context("render node config")
 }
 
-/// Rewrite `blockchain.payment_pool_address` in a node TOML config, preserving
-/// every other key. Separate from [`NodeFixture::set_payment_pool_address`] so
-/// its parse → mutate → `toml::to_string` round-trip is testable without a live
-/// daemon, mirroring [`rewrite_rate_per_mb`].
+/// Rewrite the first payment chain's pool list in a node TOML config to
+/// `[payment_pool]`, preserving every other key. Separate from
+/// [`NodeFixture::set_payment_pool_address`] so its parse → mutate →
+/// `toml::to_string` round-trip is testable without a live daemon, mirroring
+/// [`rewrite_rate_per_mb`].
 fn rewrite_payment_pool_address(config: &str, payment_pool: Address) -> anyhow::Result<String> {
     let mut doc: toml::Table = config.parse().context("parse node config")?;
-    let blockchain = doc
+    let chain = doc
         .get_mut("blockchain")
         .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("node config has no [blockchain] table"))?;
-    blockchain.insert(
-        "payment_pool_address".to_string(),
-        toml::Value::String(payment_pool.to_string()),
+        .and_then(|blockchain| blockchain.get_mut("payment_chains"))
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|chains| chains.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("node config names no payment chain"))?;
+    chain.insert(
+        "payment_pools".to_string(),
+        toml::Value::Array(vec![toml::Value::String(payment_pool.to_string())]),
     );
     toml::to_string(&doc).context("render node config")
 }
 
-/// Rewrite `blockchain.payment_pool_address` (through
+/// Rewrite the first payment chain's pool list (through
 /// [`rewrite_payment_pool_address`]) and replace `[network.discovery.peers]`
 /// with `discovery_peers` in a node TOML config, preserving every other key.
 /// Separate from [`NodeFixture::repoint_payment_pool`] so its parse → mutate →

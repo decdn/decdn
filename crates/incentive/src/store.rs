@@ -16,9 +16,17 @@ use std::sync::Mutex;
 
 use alloy::primitives::{Address, B256, U256};
 
+use crate::deployment::Deployment;
 use crate::lane::{LaneKey, LaneState, PoolId};
 
 /// Durable backing store for [`LaneState`], keyed by [`LaneKey`].
+///
+/// One store value serves the lanes of one `PaymentPool` [`Deployment`]: a
+/// [`LaneKey`] names a pool id, and a pool id repeats across deployments. A
+/// disk-backed implementation that keeps several deployments in one file
+/// prefixes every row key with the deployment, so a store opened for one
+/// deployment never reads or drops another's rows. [`PendingSettleStore`] and
+/// [`KeyedCheckpointStore`] are scoped the same way.
 ///
 /// The trait is intentionally synchronous. `record` and `forget` mutate a working
 /// set and MAY defer durability to [`flush`](PoolStateStore::flush); an
@@ -461,22 +469,24 @@ impl PoolStateStore for MemoryPoolStateStore {
 }
 
 /// One landed `redeemMany`, as the node decoded it from the transaction
-/// receipt: the `FeeRouter.Settled` log for gross amount, bytes and epoch, and
-/// the USDC `Transfer` from the router to the operator for the net payout.
-/// The rows back `admin_v1_earnings` (#2598).
+/// receipt. The rows back `admin_v1_earnings` (#2598).
 ///
-/// Rows order by `(block_number, log_index)`, which is chain order; the
-/// `landed_at_unix` timestamp is for period bucketing only and never orders
-/// rows. Every amount is in micro-USDC, narrowed from the on-chain `uint256`
-/// with saturation (the `PaymentPool` counters are `uint64`, so a real value
-/// never saturates). Not a disk or wire shape: the node's store has its own
-/// row layout, and the admin DTOs carry the sums.
+/// Rows order by `(deployment, block_number, log_index)`: within one
+/// `PaymentPool` deployment that is chain order. The `landed_at_unix`
+/// timestamp is for period bucketing only and never orders rows. Every amount
+/// is in micro-USDC, narrowed from the on-chain `uint256` with saturation (the
+/// `PaymentPool` counters are `uint64`, so a real value never saturates). Not a
+/// disk or wire shape: the node's store has its own row layout, and the admin
+/// DTOs carry the sums.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettlementRecord {
+    /// The `PaymentPool` deployment the `redeemMany` landed on. Block numbers
+    /// and log indexes are per chain, so they identify a row only within it.
+    pub deployment: Deployment,
     /// The block the `redeemMany` landed in.
     pub block_number: u64,
-    /// The `Settled` log's index within that block. With `block_number` it is
-    /// the row's identity: one `Settled` per `redeemMany`, so one row per
+    /// The index within that block of the log the row was decoded from. With
+    /// `deployment` and `block_number` it is the row's identity: one row per
     /// transaction.
     pub log_index: u64,
     /// The `redeemMany` transaction hash.
@@ -486,27 +496,32 @@ pub struct SettlementRecord {
     /// read, which the node logs. `0` on a row the producer has not stamped:
     /// `decdn node earnings --address` stamps only the rows it prints.
     pub landed_at_unix: u64,
-    /// `FeeRouter.Settled.epoch`: the router's `block.timestamp / epochLength`.
+    /// The settlement epoch the row counts toward.
     pub epoch: u64,
-    /// `FeeRouter.Settled.amount`: the gross payout before the fee split.
+    /// The gross payout the redemption paid.
     pub gross_micro_usdc: u64,
-    /// The USDC the operator received: the `Transfer` from the router to the
-    /// operator in the same transaction. `0` when the operator share is `0`.
+    /// The USDC the operator received in the same transaction. `0` when the
+    /// operator share is `0`.
     pub net_micro_usdc: u64,
-    /// `FeeRouter.Settled.bytesDelivered`: the bytes this settlement paid for.
+    /// The bytes this settlement paid for.
     pub bytes_delivered: u64,
-    /// `FeeRouter.Settled.operator`: the address the payout went to. The
-    /// ledger outlives an Ethereum key rotation (`decdn node rotate-key eth`
-    /// keeps the data directory), so the earnings figures filter on it rather
-    /// than attribute an earlier operator's rows to the current one.
+    /// The address the payout went to. The ledger outlives an Ethereum key
+    /// rotation (`decdn node rotate-key eth` keeps the data directory), so the
+    /// earnings figures filter on it rather than attribute an earlier
+    /// operator's rows to the current one.
     pub operator: Address,
 }
 
+/// A [`SettlementRecord`]'s identity and sort key: its deployment, block and
+/// log index.
+pub type SettlementKey = (Deployment, u64, u64);
+
 impl SettlementRecord {
-    /// The row's identity and chain-order key: `(block_number, log_index)`.
+    /// The row's identity and sort key:
+    /// `(deployment, block_number, log_index)`.
     #[must_use]
-    pub const fn key(&self) -> (u64, u64) {
-        (self.block_number, self.log_index)
+    pub const fn key(&self) -> SettlementKey {
+        (self.deployment, self.block_number, self.log_index)
     }
 }
 
@@ -516,14 +531,13 @@ impl SettlementRecord {
 /// the `PoolRedeemed` watcher for a transaction whose receipt it missed (a
 /// receipt wait that timed out, or a landing across a restart), so a row may
 /// be written twice; [`record_settlement`](Self::record_settlement) is
-/// idempotent on the row key. The key is the `Settled` log's `(block_number,
+/// idempotent on the row key. The key is `(deployment, block_number,
 /// log_index)`, so absent a reorg a transaction hash appears in one row; a
 /// reorg that moves a landed `redeemMany` to another position is not
 /// reconciled and can leave two rows for one hash, because the ledger is
-/// observability, not a claim. Nothing ever
-/// removes a row except a repoint to another `PaymentPool` deployment, which
-/// drops the whole ledger with the other seller tables. A disk-backed
-/// implementation commits durably before returning `Ok`.
+/// observability, not a claim. Rows of every `PaymentPool` deployment share
+/// the ledger and nothing removes a row. A disk-backed implementation commits
+/// durably before returning `Ok`.
 pub trait SettlementLedger: Send + Sync {
     /// Append one row, or overwrite the row with the same
     /// [`key`](SettlementRecord::key).
@@ -533,7 +547,8 @@ pub trait SettlementLedger: Send + Sync {
     /// Returns a [`StoreError`] if the durable write fails.
     fn record_settlement(&self, row: &SettlementRecord) -> Result<(), StoreError>;
 
-    /// Every row, in chain order (`block_number` then `log_index`, ascending).
+    /// Every row, ordered by [`SettlementRecord::key`]: per deployment, in
+    /// chain order.
     ///
     /// # Errors
     ///
@@ -541,8 +556,8 @@ pub trait SettlementLedger: Send + Sync {
     /// row this binary cannot decode.
     fn load_settlements(&self) -> Result<Vec<SettlementRecord>, StoreError>;
 
-    /// Whether a row for `tx_hash`, landed in `block_number`, exists: the
-    /// watcher's guard before it fetches a receipt it may already have
+    /// Whether a row for `tx_hash`, landed in `block_number` on `deployment`,
+    /// exists: the guard before a receipt fetch that may already have been
     /// recorded. The block narrows the read to that block's rows, so the cost
     /// does not grow with the ledger and a row elsewhere that does not decode
     /// does not stop the guard.
@@ -551,7 +566,12 @@ pub trait SettlementLedger: Send + Sync {
     ///
     /// Returns a [`StoreError`] if the backing store is unreadable or a row of
     /// that block does not decode.
-    fn has_settlement_tx(&self, block_number: u64, tx_hash: B256) -> Result<bool, StoreError>;
+    fn has_settlement_tx(
+        &self,
+        deployment: Deployment,
+        block_number: u64,
+        tx_hash: B256,
+    ) -> Result<bool, StoreError>;
 }
 
 /// In-memory [`SettlementLedger`] for tests and the trait's reference
@@ -563,7 +583,7 @@ pub struct MemorySettlementLedger {
 }
 
 /// [`MemorySettlementLedger`]'s rows, keyed by [`SettlementRecord::key`].
-type LedgerRows = BTreeMap<(u64, u64), SettlementRecord>;
+type LedgerRows = BTreeMap<SettlementKey, SettlementRecord>;
 
 impl MemorySettlementLedger {
     /// The rows, or [`StoreError::Backend`] when the mutex is poisoned.
@@ -584,10 +604,15 @@ impl SettlementLedger for MemorySettlementLedger {
         Ok(self.lock()?.values().copied().collect())
     }
 
-    fn has_settlement_tx(&self, block_number: u64, tx_hash: B256) -> Result<bool, StoreError> {
+    fn has_settlement_tx(
+        &self,
+        deployment: Deployment,
+        block_number: u64,
+        tx_hash: B256,
+    ) -> Result<bool, StoreError> {
         Ok(self
             .lock()?
-            .range((block_number, 0)..=(block_number, u64::MAX))
+            .range((deployment, block_number, 0)..=(deployment, block_number, u64::MAX))
             .any(|(_, row)| row.tx_hash == tx_hash))
     }
 }

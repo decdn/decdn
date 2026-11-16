@@ -184,7 +184,7 @@ async fn run() -> anyhow::Result<()> {
     // salt, not the wallet key itself (#2468).
     let store = RedbBuyerPoolStore::open(client_dir.path()).context("reopen client store")?;
     let state = store
-        .get_by_owner(buyer_addr)
+        .get_by_owner(chain.deployment(), buyer_addr)
         .context("read buyer pool")?
         .ok_or_else(|| anyhow::anyhow!("no pool was recorded for owner {buyer_addr}"))?;
     anyhow::ensure!(

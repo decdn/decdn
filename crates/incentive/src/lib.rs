@@ -20,7 +20,7 @@
 //! | Buyer bookkeeping | [`buyer_pool`] (the buyer's pools and lanes), `buyer_pool_table` and `buyer_pool_redb` (an on-disk `redb` store, behind the `buyer-store-core` and `redb` features) |
 //! | Response signatures | [`probe_sig`] and [`stream_sig`] (the `slash_sig` on probe and stream responses), [`bind_sig`] (client bindings), [`sig_canon`] (canonical `s`) |
 //! | Keys | [`eth_identity`] (Web3 Secret Storage keystores and the `PrivateKeySigner` they load) |
-//! | Contract bindings | [`payment_pool`], [`capacity_bond`], [`node_register`], [`erc20`], [`slash_judge`], [`slash_appeal`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
+//! | Contract bindings | [`payment_pool`] (`PaymentPool`, `FeeRouter`, `CctpSweepReceiver`),[`capacity_bond`], [`node_register`], [`erc20`], [`slash_judge`], [`slash_appeal`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
 //! | Transactions | [`tx`] (send, await the receipt, fail on a revert), [`pool_open_error`] (`PaymentPool` revert decoding), [`log_scan`] (bounded `eth_getLogs` windows that learn a provider's range cap) |
 //!
 //! # Sign and verify a voucher
@@ -138,8 +138,8 @@ pub use rate::{
 };
 pub use store::{
     CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, MemorySettlementLedger,
-    PendingSettle, PendingSettleStore, PoolStateStore, SettlementLedger, SettlementRecord,
-    StoreError,
+    PendingSettle, PendingSettleStore, PoolStateStore, SettlementKey, SettlementLedger,
+    SettlementRecord, StoreError,
 };
 pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSlashData, StreamSlashError};
 pub use voucher::{

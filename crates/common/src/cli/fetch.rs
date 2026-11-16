@@ -87,14 +87,14 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "0xADDR")]
     pub provider_address: Option<String>,
 
-    /// JSON-RPC endpoint for on-chain pool open. Overrides
-    /// `blockchain.rpc_url` from config.
+    /// Payment-chain JSON-RPC endpoint for on-chain pool open. Overrides the
+    /// first `[[blockchain.payment_chains]]` entry's `rpc_url`.
     #[arg(long, value_name = "URL")]
     pub rpc_url: Option<String>,
 
     /// `PaymentPool` contract address (0x hex) — the voucher EIP-712
-    /// `verifyingContract` and the `openPool` target. Overrides
-    /// `blockchain.payment_pool_address`.
+    /// `verifyingContract` and the `openPool` target. Overrides the first
+    /// pool of the first `[[blockchain.payment_chains]]` entry.
     #[arg(long, value_name = "0xADDR")]
     pub payment_pool_address: Option<String>,
 

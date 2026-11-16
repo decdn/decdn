@@ -98,26 +98,33 @@ fn resolve_data_dir(data_dir: Option<PathBuf>, file: &FileConfig) -> anyhow::Res
 
 fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
     let bc = file.blockchain.as_ref();
+    // The command acts on the first configured payment chain's first pool; the
+    // flags override each part.
+    let payment = bc.and_then(|b| b.payment_chains.first());
     let rpc_url = args
         .rpc_url
         .clone()
-        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
-        .ok_or_else(|| anyhow::anyhow!("rpc_url not set (--rpc-url or blockchain.rpc_url)"))?;
+        .or_else(|| payment.and_then(|p| p.rpc_url.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "rpc_url not set (--rpc-url or a [[blockchain.payment_chains]] rpc_url)"
+            )
+        })?;
     let payment_pool_raw = args
         .payment_pool_address
         .clone()
-        .or_else(|| bc.and_then(|b| b.payment_pool_address.clone()))
+        .or_else(|| payment.and_then(|p| p.payment_pools.first().cloned()))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "payment_pool_address not set (--payment-pool-address or \
-                 blockchain.payment_pool_address)"
+                "payment pool not set (--payment-pool-address or a \
+                 [[blockchain.payment_chains]] payment_pools entry)"
             )
         })?;
     let payment_pool =
         super::chain_ctx::parse_nonzero_address(&payment_pool_raw, "payment_pool_address")?;
     let chain_id = args
         .chain_id
-        .or_else(|| bc.and_then(|b| b.chain_id))
+        .or_else(|| payment.and_then(|p| p.chain_id))
         .unwrap_or(DEFAULT_CHAIN_ID);
     let data_dir = resolve_data_dir(args.data_dir.clone(), file)?;
     let keystore = args
@@ -306,7 +313,15 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     // `topUp`, so the command names it rather than dying with no hash.
     let escrows = UnconfirmedEscrows::default();
     let mut interrupt = Interrupt::watch(escrows.clone());
-    let topped_up = top_up_and_credit(&contract, &store, owner, pool_id, additional, &escrows);
+    let topped_up = top_up_and_credit(
+        &contract,
+        &store,
+        chain.deployment(),
+        owner,
+        pool_id,
+        additional,
+        &escrows,
+    );
     let result = tokio::select! {
         result = topped_up => result,
         () = interrupt.wait() => Err(Interrupted.into()),
@@ -328,6 +343,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
 async fn top_up_and_credit<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &dyn BuyerPoolStore,
+    deployment: Deployment,
     owner: Address,
     pool_id: PoolId,
     additional: U256,
@@ -353,14 +369,17 @@ where
     // low-water check re-fires on every later fetch, and re-running this
     // command escrows again.
     let effect = topped_up_effect(pool_id, credited);
-    let new_deposit =
-        match grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx) {
-            Ok(deposit) => {
-                unrecorded.recorded();
-                deposit
-            }
-            Err(err) => return Err(unrecorded.untracked(err)),
-        };
+    let new_deposit = match grade_deposit_credit(
+        store.add_deposit(deployment, owner, pool_id, credited),
+        &effect,
+        tx,
+    ) {
+        Ok(deposit) => {
+            unrecorded.recorded();
+            deposit
+        }
+        Err(err) => return Err(unrecorded.untracked(err)),
+    };
     Ok((credited, new_deposit))
 }
 
@@ -547,22 +566,17 @@ impl LocalBookkeeping<'_> {
     }
 }
 
-/// Compare-and-delete `owner`'s row for `pool_id`, but only when the store's
-/// row for that id is on `deployment`. A pool id is `keccak256(owner, nonce)`,
-/// so it repeats on every `PaymentPool` deployment, and `forget_if_pool` alone
-/// cannot tell the pools apart. The read and the delete are two transactions;
-/// the client store is held exclusively by this process, so nothing writes in
-/// between. Returns whether a row was deleted.
+/// Compare-and-delete `owner`'s row for `pool_id` on `deployment`. A pool id is
+/// `keccak256(owner, nonce)`, so it repeats on every `PaymentPool` deployment;
+/// the store keys rows by deployment, so a same-numbered pool elsewhere is
+/// another row and is left alone. Returns whether a row was deleted.
 fn forget_on(
     store: &dyn BuyerPoolStore,
     deployment: Deployment,
     owner: Address,
     pool_id: PoolId,
 ) -> Result<bool, decdn_incentive::StoreError> {
-    match store.get_by_pool_id(pool_id)? {
-        Some(state) if state.is_on(deployment) => store.forget_if_pool(owner, pool_id),
-        _ => Ok(false),
-    }
+    store.forget_if_pool(deployment, owner, pool_id)
 }
 
 /// True for the statuses that mean a pool is winding down or done: `Closing`

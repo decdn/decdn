@@ -107,7 +107,7 @@ async fn run() -> anyhow::Result<()> {
     // A opens the wallet's pool. The first run can race the node's view of the
     // fresh pool, so it retries until it lands.
     run_get_until_ready(dir_a.path(), &get(dir_a.path(), "a1.bin")).await?;
-    let (pool_a, lane_a) = recorded_lane(dir_a.path(), &wallet, provider)?;
+    let (pool_a, lane_a) = recorded_lane(dir_a.path(), chain.deployment(), &wallet, provider)?;
     anyhow::ensure!(
         lane_a.progress == wire,
         "A's first fetch must record exactly its own {wire} wire bytes, got {}",
@@ -125,7 +125,7 @@ async fn run() -> anyhow::Result<()> {
     // B has no pool row, so it adopts A's pool from chain and signs on its own
     // lane, which starts at zero.
     run_get_until_ready(dir_b.path(), &get(dir_b.path(), "b1.bin")).await?;
-    let (pool_b, lane_b) = recorded_lane(dir_b.path(), &wallet, provider)?;
+    let (pool_b, lane_b) = recorded_lane(dir_b.path(), chain.deployment(), &wallet, provider)?;
     anyhow::ensure!(
         pool_b == pool_a,
         "B opened pool {pool_b} instead of adopting {pool_a}"
@@ -163,7 +163,7 @@ async fn run() -> anyhow::Result<()> {
     }
     let two_fetches = wire * U256::from(2u64);
     for (label, dir, earlier) in [("A", &dir_a, lane_a), ("B", &dir_b, lane_b)] {
-        let (pool, lane) = recorded_lane(dir.path(), &wallet, provider)?;
+        let (pool, lane) = recorded_lane(dir.path(), chain.deployment(), &wallet, provider)?;
         anyhow::ensure!(pool == pool_a, "{label} moved to pool {pool}");
         anyhow::ensure!(
             lane.signer == earlier.signer,
@@ -194,12 +194,13 @@ struct RecordedLane {
 /// return, so a later `decdn get` can open the file.
 fn recorded_lane(
     dir: &Path,
+    deployment: decdn_incentive::Deployment,
     wallet: &PrivateKeySigner,
     provider: Address,
 ) -> anyhow::Result<(B256, RecordedLane)> {
     let store = RedbBuyerPoolStore::open(dir).context("open buyer store")?;
     let state = store
-        .get_by_owner(wallet.address())
+        .get_by_owner(deployment, wallet.address())
         .context("read buyer pool")?
         .ok_or_else(|| anyhow::anyhow!("no pool recorded in {}", dir.display()))?;
     let signer = derive_lane_signer(wallet, &store.lane_salt()?)?.address();

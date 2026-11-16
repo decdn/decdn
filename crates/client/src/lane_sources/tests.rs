@@ -657,7 +657,10 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         None,
         &recovery,
     );
-    let row = WatermarkRow::Owned(owner.owner().address());
+    let row = WatermarkRow::Owned {
+        deployment: deps.chain.deployment(),
+        owner: owner.owner().address(),
+    };
     anyhow::ensure!(owner.lane().address() != owner.owner().address());
     anyhow::ensure!(self_owned.watermark_row() == row);
     anyhow::ensure!(self_owned.funder().owner == owner.owner().address());

@@ -114,10 +114,7 @@ impl Buyer {
         // store's salt, so another data dir on the same wallet signs on its
         // own lanes of the same pool.
         let payer = OwnedPayer::for_store(Arc::clone(&signer), &store)?;
-        // A row from another deployment names a pool this contract never saw.
-        let reusable = store
-            .get_by_owner(owner)?
-            .filter(|pool| pool.is_on(deployment));
+        let reusable = store.get_by_owner(deployment, owner)?;
         let pool = if let Some(pool) = reusable {
             pool
         } else {
@@ -305,7 +302,10 @@ impl Buyer {
             let Some(write) = ProgressWrite::of(&progress) else {
                 continue;
             };
-            let row = WatermarkRow::Owned(self.payer.owner().address());
+            let row = WatermarkRow::Owned {
+                deployment: self.pool.deployment,
+                owner: self.payer.owner().address(),
+            };
             if let Err(err) = write.apply(&self.store, row, lane.key) {
                 tracing::warn!(provider = %lane.key.provider, error = %err, "lane not recorded");
             }

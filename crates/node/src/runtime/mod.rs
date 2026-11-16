@@ -146,14 +146,13 @@ const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 /// The per-stream window stays at the transport default.
 const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 
-/// The `FeeRouter` contract's own `OPERATOR_BPS_FLOOR` (`contracts/src/FeeRouter.sol`):
-/// the minimum operator share governance can configure. Used as the startup
-/// fallback for the live operator fee-share seed (ADR 041) — a conservative
-/// UNDER-estimate of the true operator share, which only makes the `margin`
+/// The startup fallback for the operator fee-share seed (ADR 041) when
+/// `PaymentPool.operatorBps()` cannot be read: a conservative UNDER-estimate of
+/// the reference deployment's 6000 bps, which only makes the `margin`
 /// serve-economics policy's buy ceiling more conservative (it assumes MORE
-/// future serve revenue is skimmed by fees than governance has actually set),
+/// future serve revenue is skimmed by fees than the pool actually takes),
 /// never a griefing surface.
-const FEE_ROUTER_OPERATOR_BPS_FLOOR: u16 = 4000;
+const OPERATOR_BPS_FLOOR: u16 = 4000;
 
 /// The most of the boot deadline the best-effort fee-share reads may spend on
 /// retries. It covers a short provider blip; a longer outage falls back to the
@@ -493,29 +492,29 @@ async fn build_infra(
     // Failure here MUST abort startup: continuing with a fresh in-memory
     // map silently reopens the replay window the store exists to close.
     let pool_store_data_dir = cfg.identity.data_dir.clone();
-    // The store binds to the configured `PaymentPool` deployment and drops the
-    // seller-side rows another deployment wrote: pool ids repeat across
-    // deployments, so a stale row would shadow a returning buyer's new pool.
+    // The node serves the first pool of the first configured payment chain.
+    // The store keys every row by this deployment, so rows of any other
+    // deployment stay on disk untouched.
+    let (payment_chain, payment_pool) = cfg
+        .blockchain
+        .first_payment_pool()
+        .ok_or_else(|| anyhow::anyhow!("blockchain.payment_chains names no payment pool"))?;
+    anyhow::ensure!(
+        !payment_pool.is_zero(),
+        "blockchain.payment_chains names the zero address as a payment pool"
+    );
     let pool_store_deployment = crate::pool_store::Deployment {
-        chain_id: cfg.blockchain.chain_id,
-        payment_pool: parse_nonzero_address(
-            &cfg.blockchain.payment_pool_address,
-            "blockchain.payment_pool_address",
-        )?,
+        chain_id: payment_chain.chain_id,
+        payment_pool,
     };
     // Verify the configured deployment against the live chain BEFORE the store
-    // opens: `bind_deployment` drops the seller lane state when the stamp
-    // differs, so a typo'd chain id or contract address must abort bring-up
-    // here, while the store is untouched, rather than trigger an irreversible
-    // drop on a WARN.
+    // opens, so a typo'd chain id or contract address aborts bring-up before
+    // any row is written under a deployment that does not exist.
     // The URL is not echoed on a parse failure: it can embed a provider API
-    // key, and the reachability probe above has already reported unusable
-    // endpoints with a sanitized display.
-    let preflight_rpc_url: HttpUrl = cfg
-        .blockchain
-        .rpc_url
-        .parse()
-        .context("blockchain.rpc_url is not a valid URL (value redacted; check the config)")?;
+    // key.
+    let preflight_rpc_url: HttpUrl = payment_chain.rpc_url.parse().context(
+        "blockchain.payment_chains rpc_url is not a valid URL (value redacted; check the config)",
+    )?;
     check_deployment_preflight(
         ProviderFactory::new(preflight_rpc_url, Arc::clone(&node_metrics)).shared_head(),
         pool_store_deployment,
@@ -523,9 +522,9 @@ async fn build_infra(
     )
     .await?;
     // Keep the concrete store `Arc` so it can back the seller
-    // `PoolStateStore` (lane_state_v1 table), the pending-settle store
-    // (pending_settle_v1 table, PR #743 review), and the buyer
-    // `BuyerPoolStore` (buyer_pool_state_v1 table, #744) — redb forbids a
+    // `PoolStateStore` (lane_state_v2 table), the pending-settle store
+    // (pending_settle_v2 table, PR #743 review), and the buyer
+    // `BuyerPoolStore` (buyer_pool_state_v2 table, #744) — redb forbids a
     // second `Database` handle to the same file, so one shared store owns all.
     let concrete_pool_store: Arc<PersistentPoolStateStore> = Arc::new(
         tokio::task::spawn_blocking(move || {
@@ -1281,30 +1280,19 @@ async fn build_chain_and_handlers(
     // a restart cannot replay an already-accepted voucher (#527).
     let payment_pool_addr = infra.payment_pool_deployment.payment_pool;
 
-    // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics):
-    // `PaymentPool.feeRouter()` resolves the router address, then
-    // `FeeRouter.getShares()` reads the current 3-way split, narrowed to the
-    // operator's bps. Unlike the fail-closed reads, NO leg of this chain is fatal
-    // to boot: a failure falls back to `FEE_ROUTER_OPERATOR_BPS_FLOOR` and the
-    // node still comes up. Both reads retry transient errors; the `feeRouter()`
-    // retry matters most, because `feeRouter` is immutable and a missed read
-    // leaves the `SharesUpdated` route below unregistered until restart. They
-    // retry on a `FEE_SHARE_BOOT_BUDGET` sub-budget of the boot deadline, so a
-    // flapping provider cannot spend the time the later `usdc()` and blacklist
-    // reads need.
-    let crate::fee_shares::FeeShareSeed {
-        router: fee_router_addr,
-        operator_bps: seed_operator_bps,
-    } = crate::fee_shares::seed_from_chain(
+    // Operator fee-share seed (ADR 041): the immutable
+    // `PaymentPool.operatorBps()`. Unlike the fail-closed reads, it is not fatal
+    // to boot: a failure falls back to `OPERATOR_BPS_FLOOR` and the node still
+    // comes up. The read retries on a `FEE_SHARE_BOOT_BUDGET` sub-budget of the
+    // boot deadline, so a flapping provider cannot spend the time the later
+    // `usdc()` and blacklist reads need.
+    let seed_operator_bps = crate::fee_shares::seed_from_chain(
         providers.read_only(event_poll_interval),
         payment_pool_addr,
-        FEE_ROUTER_OPERATOR_BPS_FLOOR,
+        OPERATOR_BPS_FLOOR,
         &boot.capped(FEE_SHARE_BOOT_BUDGET),
     )
     .await;
-    infra
-        .node_metrics
-        .fee_shares_watcher_unregistered(fee_router_addr.is_none());
     let operator_shares = crate::fee_shares::OperatorShares::new(seed_operator_bps);
     tracing::info!(
         bps = seed_operator_bps,
@@ -1546,7 +1534,7 @@ async fn build_chain_and_handlers(
     // it); it moves into the service here.
     let (payment_service, settlement_route) = PoolSettlementService::bootstrap(
         wallet_provider,
-        payment_pool_addr,
+        infra.payment_pool_deployment,
         infra.eth_signer.address(),
         Arc::clone(&infra.pool_state_store),
         Arc::clone(&infra.watcher_checkpoint_store),
@@ -1596,29 +1584,9 @@ async fn build_chain_and_handlers(
     .context("blacklist compliance watcher boot enumeration")?;
     poller_routes.push(blacklist_route);
 
-    // Fee-shares route (ADR 041 / ADR 016 § Tunable Economics): follows
-    // `SharesUpdated` on the shared poller and re-reads `getShares()`
-    // authoritatively every `fee_shares_poll_interval_sec` as a safety net,
-    // storing into the same shared `operator_shares` cell seeded by the startup
-    // read above. Only registered when the startup `feeRouter()` read succeeded
-    // — with no router address there is nothing to watch, and the seed already
-    // fell back to `FEE_ROUTER_OPERATOR_BPS_FLOOR`. Read-only, no durable cursor.
-    if let Some(addr) = fee_router_addr {
-        let fee_shares_route = crate::fee_shares_watcher::route(
-            providers.read_only(event_poll_interval),
-            addr,
-            operator_shares.clone(),
-            Duration::from_secs(cfg.blockchain.fee_shares_poll_interval_sec),
-            &infra.node_metrics,
-        );
-        poller_routes.push(fee_shares_route);
-    }
-
     // Assemble and spawn the ONE poller for all routes. `build` fails fast if
     // two routes claim the same `(address, topic0)` — a wiring bug, not a
-    // runtime condition — surfacing it at boot. Up to four contract addresses
-    // (payment_pool, capacity_bond, content_blacklist, fee_router) with
-    // disjoint topic0s per (address, topic0).
+    // runtime condition — surfacing it at boot.
     let poller = chain_poller_builder(
         Arc::clone(&head),
         event_poll_interval,
@@ -3810,29 +3778,22 @@ enum RpcProbe {
 /// outage should not hold the lane store hostage for long.
 const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 
-/// Verify the configured `PaymentPool` deployment against the live chain:
-/// the RPC's `eth_chainId` must equal `blockchain.chain_id`, the configured
-/// address must have code, and that code must answer
-/// `PaymentPool.getRateBounds()` — a code-presence check alone would pass a
-/// sibling contract pasted from the same deploy manifest (`CapacityBond`,
-/// `FeeRouter`, `BuybackBurner`, `DecdnGovernor`, the USDC token), and that is
-/// the likeliest wrong-address typo. `getRateBounds()` is the probe because
-/// only `PaymentPool` declares it: `usdc()` is also a view on `FeeRouter` and
-/// `BuybackBurner`, and `feeRouter()` is also a view on `DecdnGovernor`. The
-/// probe holds only while that stays true: no other contract in the deployment
-/// may declare a function with the `getRateBounds()` selector, and
-/// `contracts/src/PaymentPool.sol` carries the same warning on the view. The
+/// Verify a configured `PaymentPool` deployment against the live chain: the
+/// RPC's `eth_chainId` must equal the payment chain's `chain_id`, the
+/// configured address must have code, and that code must answer
+/// `PaymentPool.operatorBps()` and `PaymentPool.sweepDomain()` — a
+/// code-presence check alone would pass a sibling contract pasted from a
+/// deploy manifest (`CapacityBond`, `FeeRouter`, `CctpSweepReceiver`, the USDC
+/// token), and that is the likeliest wrong-address typo. The two views are the
+/// probe because only a `PaymentPool` declares them. The
 /// `deployment_preflight_guard` e2e boots against every contract in the deploy
 /// manifest to catch a collision, and the `payment_pool_probe_selector` e2e
-/// fails if any contract in `contracts/src` other than `PaymentPool` exposes
-/// the selector, deployed or not. Runs BEFORE the lane store opens, because
-/// the store's deployment binding
-/// ([`crate::pool_store::Deployment`]) drops the seller lane state when
-/// the stamp differs — a typo in either field must abort bring-up while the
-/// store is untouched, not destroy unredeemed lane state on a WARN. The
-/// reads retry transient RPC errors on `retry`; the mismatch verdicts are
-/// deterministic and fail at once, and a non-`PaymentPool` target surfaces
-/// from `getRateBounds()` as a permanent contract error, not a retry spin.
+/// fails if any contract in `contracts/src` other than a `PaymentPool` exposes
+/// the selectors, deployed or not. Runs BEFORE the lane store opens, so a typo
+/// aborts bring-up before any row is written under a deployment that does not
+/// exist. The reads retry transient RPC errors on `retry`; the mismatch
+/// verdicts are deterministic and fail at once, and a non-`PaymentPool` target
+/// surfaces from the probe as a permanent contract error, not a retry spin.
 async fn check_deployment_preflight<P: Provider + Clone>(
     provider: P,
     deployment: crate::pool_store::Deployment,
@@ -3856,37 +3817,41 @@ async fn check_deployment_preflight<P: Provider + Clone>(
         .await?;
     anyhow::ensure!(
         rpc_chain_id == deployment.chain_id,
-        "blockchain.chain_id is {} but the RPC endpoint serves chain {rpc_chain_id}; a \
-         mismatched chain id would rebind the lane store and drop its seller state — fix \
-         blockchain.chain_id or blockchain.rpc_url",
+        "blockchain.payment_chains entry chain_id is {} but its rpc_url serves chain \
+         {rpc_chain_id} — fix the payment chain's chain_id or rpc_url",
         deployment.chain_id,
     );
     anyhow::ensure!(
         code_len > 0,
-        "blockchain.payment_pool_address {} has no code on chain {rpc_chain_id}; a wrong \
-         address would rebind the lane store and drop its seller state — fix \
-         blockchain.payment_pool_address",
+        "payment pool {} has no code on chain {rpc_chain_id} — fix \
+         blockchain.payment_chains payment_pools",
         deployment.payment_pool,
     );
-    // Contract-identity probe: `getRateBounds()` is a cheap view every
-    // `PaymentPool` answers and no sibling contract declares. A contract
-    // without it reverts (or, with no code path at all, returns no data), and
-    // either answer is a permanent contract error that aborts at once.
+    // Contract-identity probe: `operatorBps()` and `sweepDomain()` are cheap
+    // views every `PaymentPool` answers and no sibling contract declares. A
+    // contract without them reverts (or, with no code path at all, returns no
+    // data), and either answer is a permanent contract error that aborts at
+    // once.
     let contract =
         decdn_incentive::payment_pool::PaymentPool::new(deployment.payment_pool, provider);
     retry
         .run(
-            "deployment preflight (PaymentPool.getRateBounds())",
+            "deployment preflight (PaymentPool.operatorBps() + sweepDomain())",
             || async {
-                contract.getRateBounds().call().await.with_context(|| {
+                let not_a_pool = || {
                     format!(
-                        "blockchain.payment_pool_address {} does not answer \
-                     PaymentPool.getRateBounds() on chain {rpc_chain_id}; the address hosts \
-                     some other contract, and a wrong address would rebind the lane store and \
-                     drop its seller state — fix blockchain.payment_pool_address",
+                        "payment pool {} does not answer PaymentPool.operatorBps() and \
+                         sweepDomain() on chain {rpc_chain_id}; the address hosts some other \
+                         contract — fix blockchain.payment_chains payment_pools",
                         deployment.payment_pool,
                     )
-                })
+                };
+                contract
+                    .operatorBps()
+                    .call()
+                    .await
+                    .with_context(not_a_pool)?;
+                contract.sweepDomain().call().await.with_context(not_a_pool)
             },
         )
         .await?;

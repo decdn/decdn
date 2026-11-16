@@ -317,12 +317,16 @@ fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, Resolve
             rpc_url: "http://localhost:8545".into(),
             eth_keystore: PathBuf::from("/tmp/keystore.json"),
             keystore_password_file: None,
-            payment_pool_address: "0x0000000000000000000000000000000000000001".into(),
+            payment_chains: vec![decdn_common::config::ResolvedPaymentChain {
+                rpc_url: "http://localhost:8545".into(),
+                chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
+                payment_pools: vec![alloy::primitives::Address::with_last_byte(1)],
+            }],
+            cctp_sweep_receiver_address: None,
             capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 7000,
             get_logs_max_block_span: decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
-            fee_shares_poll_interval_sec: 3600,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
@@ -1519,8 +1523,8 @@ enum MockAnswer {
 }
 
 /// A mocked provider answering the preflight's reads in order:
-/// `eth_chainId`, `eth_getCode`, then (when reached) the `getRateBounds()`
-/// call.
+/// `eth_chainId`, `eth_getCode`, then (when reached) the `operatorBps()` and
+/// `sweepDomain()` calls.
 fn preflight_provider(answers: Vec<MockAnswer>) -> impl Provider + Clone {
     let asserter = alloy::providers::mock::Asserter::new();
     for answer in answers {
@@ -1551,12 +1555,16 @@ fn code_present() -> serde_json::Value {
     serde_json::json!(alloy::primitives::Bytes::from(vec![0x60]))
 }
 
-/// `getRateBounds()` answering a per-MB rate floor, as every `PaymentPool`
+/// `operatorBps()` then `sweepDomain()` answering, as every `PaymentPool`
 /// does.
-fn rate_bounds_answers() -> serde_json::Value {
+fn pool_identity_answers() -> [MockAnswer; 2] {
     use alloy::sol_types::SolValue;
-    let floor = alloy::primitives::U256::from(10u64);
-    serde_json::json!(alloy::primitives::Bytes::from(floor.abi_encode()))
+    let word = |value: u64| {
+        serde_json::json!(alloy::primitives::Bytes::from(
+            alloy::primitives::U256::from(value).abi_encode()
+        ))
+    };
+    [MockAnswer::Ok(word(6_000)), MockAnswer::Ok(word(0))]
 }
 
 /// An empty-bytes answer: no code at the address for `eth_getCode`, or no
@@ -1572,15 +1580,16 @@ fn preflight_retry_budget() -> BootRetry {
     )
 }
 
-/// The healthy path: matching chain id, code present, `getRateBounds()`
-/// answers.
+/// The healthy path: matching chain id, code present, `operatorBps()` and
+/// `sweepDomain()` answer.
 #[tokio::test]
 async fn a_matching_deployment_passes_the_preflight() {
-    let provider = preflight_provider(vec![
+    let mut answers = vec![
         MockAnswer::Ok(chain_id_ok()),
         MockAnswer::Ok(code_present()),
-        MockAnswer::Ok(rate_bounds_answers()),
-    ]);
+    ];
+    answers.extend(pool_identity_answers());
+    let provider = preflight_provider(answers);
     check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
         .await
         .expect("a matching deployment must pass");
@@ -1603,8 +1612,8 @@ async fn a_chain_id_mismatch_aborts_the_preflight() {
     .expect_err("a mismatched chain id must abort");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("blockchain.chain_id") && msg.contains("rebind the lane store"),
-        "the error must name the key and the consequence: {msg}"
+        msg.contains("chain_id") && msg.contains("serves chain 1"),
+        "the error must name the key and the served chain: {msg}"
     );
 }
 
@@ -1624,12 +1633,12 @@ async fn a_codeless_payment_pool_address_aborts_the_preflight() {
     .expect_err("a codeless address must abort");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("has no code") && msg.contains("blockchain.payment_pool_address"),
+        msg.contains("has no code") && msg.contains("payment_pools"),
         "the error must name the key: {msg}"
     );
 }
 
-/// A contract that does not answer `getRateBounds()` — a sibling address
+/// A contract that does not answer `operatorBps()` — a sibling address
 /// pasted from the same deploy manifest — aborts as a permanent contract
 /// error rather than passing on code presence alone. Both shapes of "no such
 /// view" are covered: the revert a real node answers (JSON-RPC code 3) and
@@ -1654,7 +1663,7 @@ async fn a_non_payment_pool_contract_aborts_the_preflight() {
                 .expect_err("a non-PaymentPool target must abort");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("does not answer PaymentPool.getRateBounds()"),
+            msg.contains("does not answer PaymentPool.operatorBps()"),
             "{shape}: the error must say the contract identity check failed: {msg}"
         );
         assert!(
@@ -1670,12 +1679,13 @@ async fn a_non_payment_pool_contract_aborts_the_preflight() {
 /// retry backoff sleep cost no real time.
 #[tokio::test(start_paused = true)]
 async fn a_transient_rpc_error_is_retried_by_the_preflight() {
-    let provider = preflight_provider(vec![
+    let mut answers = vec![
         MockAnswer::TransientError,
         MockAnswer::Ok(chain_id_ok()),
         MockAnswer::Ok(code_present()),
-        MockAnswer::Ok(rate_bounds_answers()),
-    ]);
+    ];
+    answers.extend(pool_identity_answers());
+    let provider = preflight_provider(answers);
     check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
         .await
         .expect("a transient fault must be retried to success");

@@ -73,10 +73,11 @@ pub struct ResolvedDiscoveryPeer {
     pub addrs: Vec<String>,
 }
 
-/// Resolved blockchain fields.
+/// Resolved blockchain fields: the governance chain's coordinates and
+/// contracts, and the payment chains ([`ResolvedPaymentChain`]).
 #[derive(Debug)]
 pub struct ResolvedBlockchain {
-    /// JSON-RPC endpoint URL.
+    /// Governance-chain JSON-RPC endpoint URL.
     pub rpc_url: String,
     /// Ethereum keystore file path.
     pub eth_keystore: PathBuf,
@@ -87,9 +88,12 @@ pub struct ResolvedBlockchain {
     /// stdin if connected to a TTY. Each source is chosen by presence, so a
     /// set-but-empty env var and an empty file both mean an empty password.
     pub keystore_password_file: Option<PathBuf>,
-    /// `PaymentPool` contract address — the shared payment pool this node
-    /// registers against for buyer and seller flows alike.
-    pub payment_pool_address: String,
+    /// The payment chains in configured order. Successful resolution yields
+    /// at least one, each with at least one pool, and no pool twice.
+    pub payment_chains: Vec<ResolvedPaymentChain>,
+    /// Governance-chain `CctpSweepReceiver` contract address, when configured.
+    /// Read only by the CLI command that submits attested sweeps.
+    pub cctp_sweep_receiver_address: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: String,
     /// `OriginAssignment` contract address. `Some` only when the operator opts
@@ -127,7 +131,8 @@ pub struct ResolvedBlockchain {
     /// [`super::DEFAULT_CHAIN_STALENESS_GRACE_SEC`]. Always evaluated; a large
     /// value opts out. Only used when `content_blacklist_address` is set.
     pub chain_staleness_grace_sec: u64,
-    /// EIP-712 `chainId` for the `slash_sig` domain separator. Defaults to
+    /// Governance-chain EIP-712 `chainId` for the `slash_sig`, attestation,
+    /// bind-node and pointer domain separators. Defaults to
     /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia) when unset.
     pub chain_id: u64,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the
@@ -154,12 +159,6 @@ pub struct ResolvedBlockchain {
     /// accepted windows. Defaults to [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`];
     /// always `>= 1`.
     pub get_logs_max_block_span: u64,
-    /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
-    /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). Safety-net
-    /// cadence alongside the `SharesUpdated` event subscription. Defaults to
-    /// 3600s (`DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC`); the resolver rejects
-    /// `0`.
-    pub fee_shares_poll_interval_sec: u64,
     /// Per-chunk redemption floor (base units, `µUSDC`). The seller
     /// settlement path submits an on-chain redemption transaction for a
     /// chunk of lanes only once the aggregate un-redeemed value across that
@@ -197,6 +196,32 @@ pub struct ResolvedBlockchain {
     /// window`. Lower-clamped to one window at use. Defaults to `8` — see
     /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS`.
     pub pool_floor_signer_live_windows: u64,
+}
+
+impl ResolvedBlockchain {
+    /// The first configured pool of the first payment chain, with its chain.
+    /// `None` only on a value resolution would not produce (no payment chain,
+    /// or a chain with no pool).
+    #[must_use]
+    pub fn first_payment_pool(
+        &self,
+    ) -> Option<(&ResolvedPaymentChain, alloy::primitives::Address)> {
+        let chain = self.payment_chains.first()?;
+        Some((chain, *chain.payment_pools.first()?))
+    }
+}
+
+/// One resolved `[[blockchain.payment_chains]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPaymentChain {
+    /// The payment chain's JSON-RPC endpoint URL, normalized.
+    pub rpc_url: String,
+    /// The payment chain's EIP-155 chain id: the voucher and capability
+    /// domain chain id of every pool listed here.
+    pub chain_id: u64,
+    /// The accepted `PaymentPool` contracts on this chain, in configured
+    /// order, none twice.
+    pub payment_pools: Vec<alloy::primitives::Address>,
 }
 
 /// Resolved cache fields.
@@ -779,7 +804,7 @@ impl Default for ResolvedReceipts {
 /// CLI flag > config file > built-in default.
 ///
 /// Required fields that have no default (`rpc_url`,
-/// `payment_pool_address`, `capacity_bond_address`) cause
+/// `capacity_bond_address`, a `[[blockchain.payment_chains]]` entry) cause
 /// [`super::resolve_config`] to return an error if not provided.
 #[derive(Debug)]
 pub struct ResolvedConfig {

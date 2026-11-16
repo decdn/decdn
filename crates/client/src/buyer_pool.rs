@@ -435,16 +435,18 @@ impl ProgressWrite {
         lane: LaneKey,
     ) -> Result<AdvanceOutcome, StoreError> {
         match (row, *self) {
-            (WatermarkRow::Owned(owner), Self::Rebase { anchor, totals }) => {
-                store.rebase_progress(owner, lane.pool_id, lane, anchor, totals)
+            (WatermarkRow::Owned { deployment, owner }, Self::Rebase { anchor, totals }) => {
+                store.rebase_progress(deployment, owner, lane.pool_id, lane, anchor, totals)
             }
-            (WatermarkRow::Owned(owner), Self::Advance { totals }) => store.advance_progress(
-                owner,
-                lane.pool_id,
-                lane,
-                totals.last_bytes,
-                totals.last_amount,
-            ),
+            (WatermarkRow::Owned { deployment, owner }, Self::Advance { totals }) => store
+                .advance_progress(
+                    deployment,
+                    owner,
+                    lane.pool_id,
+                    lane,
+                    totals.last_bytes,
+                    totals.last_amount,
+                ),
             (WatermarkRow::Delegated(deployment), Self::Rebase { anchor, totals }) => {
                 store.rebase_delegate_progress(deployment, lane, anchor, totals)
             }
@@ -459,8 +461,14 @@ impl ProgressWrite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WatermarkRow {
-    /// The pool row of this owner: a lane on the buyer's own pool.
-    Owned(Address),
+    /// The pool row of this owner on this deployment: a lane on the buyer's
+    /// own pool.
+    Owned {
+        /// The `PaymentPool` deployment the pool lives on.
+        deployment: Deployment,
+        /// The pool owner the row is indexed under.
+        owner: Address,
+    },
     /// The delegate lanes on this deployment: a lane a key signs under an
     /// owner-signed capability on a pool another owner funds
     /// ([`BuyerPoolStore::delegate_lanes`]).

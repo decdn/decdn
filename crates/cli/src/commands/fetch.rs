@@ -207,22 +207,19 @@ pub(crate) fn resolve_chain(
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedChain> {
     let bc = file.blockchain.as_ref();
+    // The pull pays on the first configured payment chain's first pool; the
+    // flags override each part.
+    let payment = bc.and_then(|b| b.payment_chains.first());
     let rpc_url = args
         .rpc_url
         .clone()
-        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
-        .ok_or_else(|| anyhow::anyhow!("rpc_url not set (--rpc-url or blockchain.rpc_url)"))?;
-
+        .or_else(|| payment.and_then(|p| p.rpc_url.clone()))
+        .context("rpc_url not set (--rpc-url or a [[blockchain.payment_chains]] rpc_url)")?;
     let pp_raw = args
         .payment_pool_address
         .clone()
-        .or_else(|| bc.and_then(|b| b.payment_pool_address.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "payment_pool_address not set (--payment-pool-address or \
-                 blockchain.payment_pool_address)"
-            )
-        })?;
+        .or_else(|| payment.and_then(|p| p.payment_pools.first().cloned()))
+        .context("payment pool not set (--payment-pool-address or a payment_pools entry)")?;
     let payment_pool = super::chain_ctx::parse_nonzero_address(&pp_raw, "payment_pool_address")?;
 
     let sj_raw = args
@@ -256,7 +253,7 @@ pub(crate) fn resolve_chain(
 
     let chain_id = args
         .chain_id
-        .or_else(|| bc.and_then(|b| b.chain_id))
+        .or_else(|| payment.and_then(|p| p.chain_id))
         .unwrap_or(DEFAULT_CHAIN_ID);
 
     // Client data dir: an explicit `--data-dir`/`identity.data_dir` wins,

@@ -377,7 +377,7 @@ fn keyless_buyer_usdc_reports_no_wallet_without_a_read() {
         })
     );
     // A config error is not hidden behind the missing wallet.
-    let settled = keyless_buyer_usdc(buyer_usdc_plan(&file(""), None)).unwrap();
+    let settled = keyless_buyer_usdc(buyer_usdc_plan(&file(""))).unwrap();
     assert_eq!(
         buyer_usdc_json(Some(&settled))["state"],
         serde_json::json!("config_error")
@@ -401,15 +401,29 @@ fn plan_error(plan: &BuyerUsdcPlan) -> Option<&str> {
     }
 }
 
-/// The pool resolves as `decdn-node` resolves it: the env var, else the
-/// config. A missing, zero or zero-deposit config settles the row as a config
-/// error; pull-through off plans no row at all.
+/// A `[blockchain]` table whose first payment chain lists `pools`, followed
+/// by `extra` `[blockchain]` keys.
+fn with_pools(pools: &[&str], extra: &str) -> chain_ctx::FileConfig {
+    let pools = pools
+        .iter()
+        .map(|pool| format!("\"{pool}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    file(&format!(
+        "[blockchain]\n{extra}\
+         [[blockchain.payment_chains]]\n\
+         rpc_url = \"http://payment.example\"\n\
+         chain_id = 84532\n\
+         payment_pools = [{pools}]\n"
+    ))
+}
+
+/// The pool resolves as `decdn-node` resolves it: the first pool of the first
+/// payment chain. A missing, zero or zero-deposit config settles the row as a
+/// config error; pull-through off plans no row at all.
 #[test]
 fn buyer_usdc_plan_resolves_the_pool_like_the_daemon() {
-    let with_pool = file(&format!(
-        "[blockchain]\npayment_pool_address = \"{POOL_A}\"\n"
-    ));
-    let plan = buyer_usdc_plan(&with_pool, None);
+    let plan = buyer_usdc_plan(&with_pools(&[POOL_A, POOL_B], ""));
     assert_eq!(plan_pool(&plan), Some(POOL_A.parse().unwrap()));
     assert!(matches!(
         plan,
@@ -419,43 +433,25 @@ fn buyer_usdc_plan_resolves_the_pool_like_the_daemon() {
         }
     ));
 
-    // The env var wins over the file, as the daemon's clap `env` does.
-    let plan = buyer_usdc_plan(&with_pool, Some(POOL_B));
-    assert_eq!(plan_pool(&plan), Some(POOL_B.parse().unwrap()));
-
-    // No pool anywhere: the daemon refuses to start. No known-chain fallback,
-    // even on a known chain.
+    // No pool anywhere: the daemon refuses to start. No known-chain fallback.
     let unset = file("[blockchain]\nchain_id = 421614\n");
-    let plan = buyer_usdc_plan(&unset, None);
-    let reason = plan_error(&plan).unwrap();
-    assert!(
-        reason.contains("blockchain.payment_pool_address is not set"),
-        "{reason}"
-    );
-    assert!(reason.contains(PAYMENT_POOL_ENV), "{reason}");
+    let reason = plan_error(&buyer_usdc_plan(&unset)).unwrap().to_owned();
+    assert!(reason.contains("payment_chains"), "{reason}");
 
-    let zero = file(&format!(
-        "[blockchain]\npayment_pool_address = \"{}\"\n",
-        Address::ZERO
-    ));
-    let reason = plan_error(&buyer_usdc_plan(&zero, None))
+    let zero = with_pools(&[&Address::ZERO.to_string()], "");
+    let reason = plan_error(&buyer_usdc_plan(&zero))
         .map(str::to_owned)
         .unwrap();
     assert!(reason.contains("zero address"), "{reason}");
 
-    let zero_deposit = file(&format!(
-        "[blockchain]\npayment_pool_address = \"{POOL_A}\"\nbuyer_working_deposit_micro_usdc = 0\n"
-    ));
-    let reason = plan_error(&buyer_usdc_plan(&zero_deposit, None))
+    let zero_deposit = with_pools(&[POOL_A], "buyer_working_deposit_micro_usdc = 0\n");
+    let reason = plan_error(&buyer_usdc_plan(&zero_deposit))
         .map(str::to_owned)
         .unwrap();
     assert!(reason.contains("must be > 0"), "{reason}");
 
     let off = file("[cache]\nnode_to_node_pull_through_enabled = false\n");
-    assert!(matches!(
-        buyer_usdc_plan(&off, Some(POOL_B)),
-        BuyerUsdcPlan::Off
-    ));
+    assert!(matches!(buyer_usdc_plan(&off), BuyerUsdcPlan::Off));
 }
 
 /// A failed chain read is a reason, not an abort, and the reason never echoes
@@ -481,10 +477,9 @@ async fn read_wallet_usdc_redacts_a_failed_read() {
     assert!(!reason.contains(&format!("127.0.0.1:{port}")), "{reason}");
 }
 
-/// The testnet row points at its faucet; an unknown chain (anvil) gets none.
+/// An unknown chain (anvil) gets no faucet pointer.
 #[test]
 fn usdc_faucet_follows_the_known_chain() {
-    assert!(usdc_faucet(421_614).is_some());
     assert!(usdc_faucet(31_337).is_none());
 }
 

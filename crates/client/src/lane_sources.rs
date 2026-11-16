@@ -578,7 +578,10 @@ where
     /// pool row, or the delegate lanes on the fetch's deployment.
     fn watermark_row(&self) -> WatermarkRow {
         match self.payer {
-            LanePayer::Owned(payer) => WatermarkRow::Owned(payer.owner().address()),
+            LanePayer::Owned(payer) => WatermarkRow::Owned {
+                deployment: self.deps.chain.deployment(),
+                owner: payer.owner().address(),
+            },
             LanePayer::Delegated(_) => WatermarkRow::Delegated(self.deps.chain.deployment()),
         }
     }

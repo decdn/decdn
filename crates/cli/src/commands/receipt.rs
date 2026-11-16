@@ -377,7 +377,16 @@ pub(crate) enum ChainCheck {
 /// This build's manifest for the chain does not read, or names an address
 /// that does not parse: a build fault, never a pass.
 pub(crate) fn check_chain(chain: &ReceiptChain) -> anyhow::Result<ChainCheck> {
-    let Some(known) = known_chains::by_chain_id(chain.chain_id) else {
+    check_chain_against(chain, known_chains::by_chain_id(chain.chain_id))
+}
+
+/// [`check_chain`] against `known`, the target this build knows for the
+/// receipt's chain, if any.
+fn check_chain_against(
+    chain: &ReceiptChain,
+    known: Option<&known_chains::KnownChain>,
+) -> anyhow::Result<ChainCheck> {
+    let Some(known) = known else {
         return Ok(ChainCheck::Unknown);
     };
     let addresses = known.addresses().with_context(|| {
@@ -387,22 +396,37 @@ pub(crate) fn check_chain(chain: &ReceiptChain) -> anyhow::Result<ChainCheck> {
         )
     })?;
     let mut faults = Vec::new();
-    for (name, stated, known) in [
-        ("payment_pool", chain.payment_pool, &addresses.payment_pool),
-        ("slash_judge", chain.slash_judge, &addresses.slash_judge),
-    ] {
-        let known: Address = known.parse().with_context(|| {
-            format!(
-                "this build's {name} for chain {} is not an address: {known:?}",
-                chain.chain_id
-            )
-        })?;
-        if known != stated {
-            faults.push(format!(
-                "{name} {stated} is not chain {}'s contract {known} in this build",
-                chain.chain_id
-            ));
-        }
+    let known_pools = known
+        .payment_chains()?
+        .into_iter()
+        .flat_map(|payment| payment.payment_pools)
+        .map(|pool| {
+            pool.parse::<Address>().with_context(|| {
+                format!(
+                    "this build's payment_pool for chain {} is not an address: {pool:?}",
+                    chain.chain_id
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if !known_pools.contains(&chain.payment_pool) {
+        faults.push(format!(
+            "payment_pool {} is not one of chain {}'s payment pools in this build",
+            chain.payment_pool, chain.chain_id
+        ));
+    }
+    let raw_judge = &addresses.slash_judge;
+    let slash_judge: Address = raw_judge.parse().with_context(|| {
+        format!(
+            "this build's slash_judge for chain {} is not an address: {raw_judge:?}",
+            chain.chain_id
+        )
+    })?;
+    if slash_judge != chain.slash_judge {
+        faults.push(format!(
+            "slash_judge {} is not chain {}'s contract {slash_judge} in this build",
+            chain.slash_judge, chain.chain_id
+        ));
     }
     Ok(ChainCheck::Known(faults))
 }

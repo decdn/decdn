@@ -1,6 +1,8 @@
 use alloy::primitives::{Address, B256, U256};
 use alloy::sol_types::SolEvent;
 
+use alloy::sol_types::SolCall;
+
 use super::{PaymentPool, to_pool_u64};
 
 /// Pins the `PoolRedeemed` event signature (and therefore its topic-0
@@ -313,10 +315,6 @@ fn lifecycle_event_signatures_match_contract() {
         PaymentPool::PoolReclaimed::SIGNATURE,
         "PoolReclaimed(bytes32,address,uint256)"
     );
-    assert_eq!(
-        PaymentPool::RateBoundsUpdated::SIGNATURE,
-        "RateBoundsUpdated(uint256)"
-    );
 }
 
 /// Batch companion selector for `getAuthorization` (ADR 003 § redeemer
@@ -377,14 +375,36 @@ fn signer_authorization_covers_a_floor_within_headroom_and_expiry() {
     assert!(SignerAuthorization::Unregistered.covers(U256::MAX, u64::MAX));
 }
 
-/// Pins the `FeeRouter.Settled` event signature to
-/// `contracts/src/FeeRouter.sol`, so a drift fails here instead of silently
-/// mis-decoding the settlement ledger's receipts and the earnings scan.
+/// Pins the sweep and deposit events to `contracts/src/PaymentPoolBase.sol`,
+/// `FeeRouter.sol` and `CctpSweepReceiver.sol`, so a drift fails here instead
+/// of matching no logs.
 #[test]
-fn fee_router_settled_signature_matches_contract() {
+fn sweep_event_signatures_match_contracts() {
     assert_eq!(
-        super::FeeRouter::Settled::SIGNATURE,
-        "Settled(address,uint256,uint256,uint64)"
+        PaymentPool::Swept::SIGNATURE,
+        "Swept(address,uint256,uint256,uint256)"
+    );
+    assert_eq!(
+        super::FeeRouter::Deposited::SIGNATURE,
+        "Deposited(address,address,uint256,uint256,uint256,uint64)"
+    );
+    assert_eq!(
+        super::CctpSweepReceiver::SweepReceived::SIGNATURE,
+        "SweepReceived(uint32,address,address,uint256)"
+    );
+}
+
+/// Pins the immutables a node reads to tell a `PaymentPool` from another
+/// contract and to size its sweep.
+#[test]
+fn pool_immutable_selectors_match_contract() {
+    assert_eq!(PaymentPool::operatorBpsCall::SIGNATURE, "operatorBps()");
+    assert_eq!(PaymentPool::sweepDomainCall::SIGNATURE, "sweepDomain()");
+    assert_eq!(PaymentPool::pendingCall::SIGNATURE, "pending(address)");
+    assert_eq!(PaymentPool::sweepCall::SIGNATURE, "sweep(address)");
+    assert_eq!(
+        super::CctpSweepReceiver::receiveSweepCall::SIGNATURE,
+        "receiveSweep(bytes,bytes)"
     );
 }
 

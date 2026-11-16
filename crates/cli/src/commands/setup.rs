@@ -297,7 +297,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         .await
         .context("failed to read gas price")?;
     let clock_skew = measure_clock_skew(&resolved.rpc_url).await;
-    let buyer_usdc = match buyer_usdc_plan(&file, payment_pool_env().as_deref()) {
+    let buyer_usdc = match buyer_usdc_plan(&file) {
         BuyerUsdcPlan::Off => None,
         BuyerUsdcPlan::Settled(row) => Some(row),
         BuyerUsdcPlan::Read {
@@ -810,7 +810,7 @@ async fn dry_run_without_keys(
         .await
         .context("failed to read minBond")?;
     let target = min_bond.max(required);
-    let buyer_usdc = keyless_buyer_usdc(buyer_usdc_plan(file, payment_pool_env().as_deref()));
+    let buyer_usdc = keyless_buyer_usdc(buyer_usdc_plan(file));
     if json {
         let value = serde_json::json!({
             "dry_run": true,
@@ -887,25 +887,12 @@ fn clock_detail(skew: Option<i64>) -> String {
     }
 }
 
-/// The env var `decdn-node` reads `PaymentPool`'s address from ahead of the
-/// config file. Setup honours it the same way, so a deployment that sets the
-/// address there gets the row for the pool the node uses. An empty value counts
-/// as unset, as it does for the daemon's flag.
-const PAYMENT_POOL_ENV: &str = "DECDN_PAYMENT_POOL_ADDRESS";
-
-/// [`PAYMENT_POOL_ENV`], when set and not empty.
-fn payment_pool_env() -> Option<String> {
-    std::env::var(PAYMENT_POOL_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-}
-
 /// Decide the buyer-USDC row from the config, as `decdn-node` resolves it:
 /// pull-through by the daemon's role rule, the working deposit, and the
-/// `PaymentPool` address from `pool_env` ([`PAYMENT_POOL_ENV`]) else
-/// `blockchain.payment_pool_address`. A value the daemon refuses to start
+/// `PaymentPool` the node buys on, the first pool of the first
+/// `[[blockchain.payment_chains]]` entry. A value the daemon refuses to start
 /// with settles the row as a config error.
-fn buyer_usdc_plan(file: &chain_ctx::FileConfig, pool_env: Option<&str>) -> BuyerUsdcPlan {
+fn buyer_usdc_plan(file: &chain_ctx::FileConfig) -> BuyerUsdcPlan {
     if !file.pull_through() {
         return BuyerUsdcPlan::Off;
     }
@@ -919,10 +906,13 @@ fn buyer_usdc_plan(file: &chain_ctx::FileConfig, pool_env: Option<&str>) -> Buye
     if working_deposit == 0 {
         return config_error("blockchain.buyer_working_deposit_micro_usdc must be > 0".to_owned());
     }
-    let Some(raw) = pool_env.or_else(|| file.payment_pool_address()) else {
-        return config_error(format!(
-            "blockchain.payment_pool_address is not set (nor {PAYMENT_POOL_ENV})"
-        ));
+    let Some(raw) = file
+        .first_payment_chain()
+        .and_then(|chain| chain.payment_pools.first())
+    else {
+        return config_error(
+            "no [[blockchain.payment_chains]] entry names a payment pool".to_owned(),
+        );
     };
     match chain_ctx::parse_nonzero_address(raw, "payment_pool_address") {
         Ok(pool) => BuyerUsdcPlan::Read {

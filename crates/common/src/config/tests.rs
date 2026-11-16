@@ -640,11 +640,9 @@ fn expand_env_per_field_error_context() -> anyhow::Result<()> {
                 ..Default::default()
             });
         }),
-        ("blockchain.payment_pool_address", |c, v| {
+        ("blockchain.cctp_sweep_receiver_address", |c, v| {
             c.blockchain = Some(types::BlockchainConfig {
-                origin_assignment_address: None,
-                publisher_registry_address: None,
-                payment_pool_address: Some(v.to_string()),
+                cctp_sweep_receiver_address: Some(v.to_string()),
                 ..Default::default()
             });
         }),
@@ -1226,21 +1224,240 @@ fn resolve_cache_rejects_empty_fs_origin_path() -> anyhow::Result<()> {
     Ok(())
 }
 
+// -------------------------------------------------------------------
+// Governance / payment-chain split
+// -------------------------------------------------------------------
+
+/// The payment chain `resolve_blockchain` fills in for a test of the
+/// governance fields.
+pub(super) fn test_payment_chain() -> types::PaymentChainConfig {
+    types::PaymentChainConfig {
+        rpc_url: Some("https://payment.example/rpc".to_owned()),
+        chain_id: Some(84_532),
+        payment_pools: vec![ALT_ADDR_1.to_owned()],
+    }
+}
+
+/// A `[blockchain]` table in TOML: the governance fields every node needs,
+/// followed by `rest` (payment-chain tables and any extra keys).
+fn blockchain_toml(rest: &str) -> String {
+    format!(
+        "[blockchain]\n\
+         rpc_url = \"https://gov.example/rpc\"\n\
+         chain_id = 11155111\n\
+         capacity_bond_address = \"{GOOD_ADDR}\"\n\
+         slash_judge_address = \"{GOOD_ADDR}\"\n\
+         content_blacklist_address = \"{GOOD_ADDR}\"\n\
+         {rest}"
+    )
+}
+
+/// Parse `toml` and resolve its `[blockchain]` table exactly as written.
+fn resolve_blockchain_toml(toml: &str) -> anyhow::Result<ResolvedBlockchain> {
+    let file: FileConfig = ::toml::from_str(toml)?;
+    let dir = data_dir_with_keystore()?;
+    resolve_blockchain_as_written(
+        &empty_blockchain_cli(),
+        file.blockchain.as_ref(),
+        dir.path(),
+    )
+}
+
+fn empty_blockchain_cli() -> BlockchainArgs {
+    BlockchainArgs {
+        origin_assignment_address: None,
+        publisher_registry_address: None,
+        rpc_url: None,
+        eth_keystore: None,
+        keystore_password_file: None,
+        capacity_bond_address: None,
+        slash_judge_address: None,
+        content_blacklist_address: None,
+        chain_id: None,
+    }
+}
+
 #[test]
-fn blockchain_usdc_address_parses_under_deny_unknown_fields() -> anyhow::Result<()> {
-    // `usdc_address` is the settlement token a client config names, and
-    // `BlockchainConfig` has `deny_unknown_fields`, so a client config must
-    // parse here (and via `decdn config validate`) — otherwise the schema
-    // forks. Assert it deserializes without an "unknown field" error.
-    let toml = "\
-[blockchain]
-usdc_address = \"0xUsdc\"
-";
-    let file: crate::config::FileConfig = ::toml::from_str(toml)?;
-    let bc = file
+fn split_config_resolves_governance_and_payment_chains() -> anyhow::Result<()> {
+    let resolved = resolve_blockchain_toml(&blockchain_toml(&format!(
+        "cctp_sweep_receiver_address = \"{ALT_ADDR_3}\"\n\
+         [[blockchain.payment_chains]]\n\
+         rpc_url = \"https://base.example/rpc\"\n\
+         chain_id = 84532\n\
+         payment_pools = [\"{ALT_ADDR_1}\", \"{ALT_ADDR_2}\"]\n\
+         [[blockchain.payment_chains]]\n\
+         rpc_url = \"https://arb.example/rpc\"\n\
+         chain_id = 421614\n\
+         payment_pools = [\"{ALT_ADDR_1}\"]\n"
+    )))?;
+    anyhow::ensure!(resolved.rpc_url == "https://gov.example/rpc");
+    anyhow::ensure!(resolved.chain_id == 11_155_111);
+    anyhow::ensure!(resolved.cctp_sweep_receiver_address.as_deref() == Some(ALT_ADDR_3));
+    let one: Address = ALT_ADDR_1.parse()?;
+    let two: Address = ALT_ADDR_2.parse()?;
+    anyhow::ensure!(
+        resolved.payment_chains
+            == vec![
+                ResolvedPaymentChain {
+                    rpc_url: "https://base.example/rpc".to_owned(),
+                    chain_id: 84_532,
+                    payment_pools: vec![one, two],
+                },
+                ResolvedPaymentChain {
+                    rpc_url: "https://arb.example/rpc".to_owned(),
+                    chain_id: 421_614,
+                    payment_pools: vec![one],
+                },
+            ],
+        "{:?}",
+        resolved.payment_chains
+    );
+    let (chain, pool) = resolved
+        .first_payment_pool()
+        .ok_or_else(|| anyhow::anyhow!("no first pool"))?;
+    anyhow::ensure!(chain.chain_id == 84_532 && pool == one);
+    Ok(())
+}
+
+#[test]
+fn a_config_without_a_payment_chain_is_refused() -> anyhow::Result<()> {
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml("")) else {
+        anyhow::bail!("a config with no payment chain must not resolve");
+    };
+    let msg = format!("{err:#}");
+    anyhow::ensure!(msg.contains("blockchain.payment_chains"), "{msg}");
+    Ok(())
+}
+
+#[test]
+fn a_payment_chain_with_no_pool_is_refused() -> anyhow::Result<()> {
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml(
+        "[[blockchain.payment_chains]]\n\
+         rpc_url = \"https://base.example/rpc\"\n\
+         chain_id = 84532\n\
+         payment_pools = []\n",
+    )) else {
+        anyhow::bail!("an empty pool list must not resolve");
+    };
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("blockchain.payment_chains[0].payment_pools"),
+        "{msg}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_duplicate_pool_is_refused() -> anyhow::Result<()> {
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml(&format!(
+        "[[blockchain.payment_chains]]\n\
+         rpc_url = \"https://base.example/rpc\"\n\
+         chain_id = 84532\n\
+         payment_pools = [\"{ALT_ADDR_1}\", \"{ALT_ADDR_1}\"]\n"
+    ))) else {
+        anyhow::bail!("a pool listed twice must not resolve");
+    };
+    let msg = format!("{err:#}");
+    anyhow::ensure!(msg.contains("twice"), "{msg}");
+    Ok(())
+}
+
+#[test]
+fn a_repeated_payment_chain_is_refused() -> anyhow::Result<()> {
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml(&format!(
+        "[[blockchain.payment_chains]]\n\
+         rpc_url = \"https://base.example/rpc\"\n\
+         chain_id = 84532\n\
+         payment_pools = [\"{ALT_ADDR_1}\"]\n\
+         [[blockchain.payment_chains]]\n\
+         rpc_url = \"https://base2.example/rpc\"\n\
+         chain_id = 84532\n\
+         payment_pools = [\"{ALT_ADDR_2}\"]\n"
+    ))) else {
+        anyhow::bail!("a chain listed twice must not resolve");
+    };
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("blockchain.payment_chains[1].chain_id"),
+        "{msg}"
+    );
+    Ok(())
+}
+
+/// Every missing or malformed payment-chain field is reported, each under
+/// its own indexed path.
+#[test]
+fn every_payment_chain_problem_is_named_by_index() -> anyhow::Result<()> {
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml(
+        "[[blockchain.payment_chains]]\n\
+         payment_pools = [\"0x0000000000000000000000000000000000000000\", \"0xnothex\"]\n",
+    )) else {
+        anyhow::bail!("a malformed payment chain must not resolve");
+    };
+    let msg = format!("{err:#}");
+    for field in [
+        "blockchain.payment_chains[0].rpc_url",
+        "blockchain.payment_chains[0].chain_id",
+        "zero address",
+        "invalid payment_pools",
+    ] {
+        anyhow::ensure!(msg.contains(field), "missing {field}: {msg}");
+    }
+    Ok(())
+}
+
+#[test]
+fn unknown_payment_chain_fields_are_rejected() {
+    let toml = blockchain_toml(&format!(
+        "[[blockchain.payment_chains]]\n\
+         rpc_url = \"https://base.example/rpc\"\n\
+         chain_id = 84532\n\
+         payment_pools = [\"{ALT_ADDR_1}\"]\n\
+         usdc_address = \"{ALT_ADDR_2}\"\n"
+    ));
+    assert!(::toml::from_str::<FileConfig>(&toml).is_err());
+}
+
+/// The single-pool shape and the fields this split deletes are unknown
+/// fields now, so a stale config fails at parse rather than silently
+/// running without its pool.
+#[test]
+fn removed_blockchain_fields_are_rejected() {
+    for stale in [
+        format!("payment_pool_address = \"{ALT_ADDR_1}\"\n"),
+        format!("usdc_address = \"{ALT_ADDR_1}\"\n"),
+        "fee_shares_poll_interval_sec = 3600\n".to_owned(),
+    ] {
+        let toml = blockchain_toml(&stale);
+        assert!(
+            ::toml::from_str::<FileConfig>(&toml).is_err(),
+            "{stale} must be an unknown field"
+        );
+    }
+}
+
+/// A payment chain's `${VAR}` references expand like the governance fields.
+#[test]
+fn payment_chain_fields_expand_env() -> anyhow::Result<()> {
+    let home = home_str()?;
+    let mut cfg = FileConfig {
+        blockchain: Some(types::BlockchainConfig {
+            payment_chains: vec![types::PaymentChainConfig {
+                rpc_url: Some("${HOME}/rpc".to_owned()),
+                chain_id: Some(84_532),
+                payment_pools: vec!["${HOME}/pool".to_owned()],
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    expand_env(&mut cfg)?;
+    let chain = cfg
         .blockchain
-        .ok_or_else(|| anyhow::anyhow!("missing [blockchain] section"))?;
-    anyhow::ensure!(bc.usdc_address.as_deref() == Some("0xUsdc"));
+        .and_then(|b| b.payment_chains.into_iter().next())
+        .ok_or_else(|| anyhow::anyhow!("no payment chain"))?;
+    anyhow::ensure!(chain.rpc_url == Some(format!("{home}/rpc")));
+    anyhow::ensure!(chain.payment_pools == vec![format!("{home}/pool")]);
     Ok(())
 }
 
@@ -4082,7 +4299,6 @@ fn run_subcommand_args_are_wired_to_decdn_env_vars() {
         ("rpc_url", "DECDN_RPC_URL"),
         ("eth_keystore", "DECDN_ETH_KEYSTORE"),
         ("keystore_password_file", "DECDN_KEYSTORE_PASSWORD_FILE"),
-        ("payment_pool_address", "DECDN_PAYMENT_POOL_ADDRESS"),
         ("capacity_bond_address", "DECDN_CAPACITY_BOND_ADDRESS"),
         (
             "origin_assignment_address",
@@ -4162,7 +4378,6 @@ fn resolve_blockchain_names_correct_field_for_bad_address() -> anyhow::Result<()
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some("0xNOTHEX".to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -4178,37 +4393,7 @@ fn resolve_blockchain_names_correct_field_for_bad_address() -> anyhow::Result<()
         "error should name capacity_bond_address: {msg}"
     );
     assert!(
-        !msg.contains("payment_pool_address"),
-        "error must not name the valid field: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_blockchain_names_correct_field_for_bad_payment_address() -> anyhow::Result<()> {
-    let cli = BlockchainArgs {
-        origin_assignment_address: None,
-        publisher_registry_address: None,
-        rpc_url: Some("https://example/rpc".to_string()),
-        eth_keystore: None,
-        keystore_password_file: None,
-        payment_pool_address: Some("0xNOTHEX".to_string()),
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        content_blacklist_address: None,
-        chain_id: None,
-    };
-    let dir = data_dir_with_keystore()?;
-    let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-        anyhow::bail!("expected resolve_blockchain to fail on bad payment address");
-    };
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("payment_pool_address"),
-        "error should name payment_pool_address: {msg}"
-    );
-    assert!(
-        !msg.contains("capacity_bond_address"),
+        !msg.contains("payment_chains"),
         "error must not name the valid field: {msg}"
     );
     Ok(())
@@ -4225,7 +4410,6 @@ fn resolve_blockchain_origin_directory_unset_resolves_to_none() -> anyhow::Resul
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -4246,7 +4430,6 @@ fn resolve_blockchain_origin_directory_both_set_resolves_to_some() -> anyhow::Re
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -4270,7 +4453,6 @@ fn resolve_blockchain_lone_origin_assignment_resolves() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -4294,7 +4476,6 @@ fn resolve_blockchain_lone_publisher_registry_resolves() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -4315,7 +4496,6 @@ fn resolve_blockchain_origin_directory_ttls_default_when_unset() -> anyhow::Resu
     let cli = empty_blockchain_args();
     let file = types::BlockchainConfig {
         rpc_url: Some("https://example/rpc".to_string()),
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         origin_directory_positive_ttl_sec: None,
         origin_directory_negative_ttl_sec: None,
@@ -4345,7 +4525,6 @@ fn resolve_blockchain_origin_directory_ttls_pass_through() -> anyhow::Result<()>
     let cli = empty_blockchain_args();
     let file = types::BlockchainConfig {
         rpc_url: Some("https://example/rpc".to_string()),
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         origin_directory_positive_ttl_sec: Some(600),
         origin_directory_negative_ttl_sec: Some(5),
@@ -4366,7 +4545,6 @@ fn resolve_blockchain_chain_staleness_grace_defaults_when_unset() -> anyhow::Res
     let cli = empty_blockchain_args();
     let file = types::BlockchainConfig {
         rpc_url: Some("https://example/rpc".to_string()),
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         chain_staleness_grace_sec: None,
         ..Default::default()
@@ -4387,7 +4565,6 @@ fn resolve_blockchain_chain_staleness_grace_passes_through() -> anyhow::Result<(
     let cli = empty_blockchain_args();
     let file = types::BlockchainConfig {
         rpc_url: Some("https://example/rpc".to_string()),
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         chain_staleness_grace_sec: Some(31_536_000),
         ..Default::default()
@@ -4405,7 +4582,6 @@ fn resolve_blockchain_rejects_zero_chain_staleness_grace() -> anyhow::Result<()>
     let cli = empty_blockchain_args();
     let file = types::BlockchainConfig {
         rpc_url: Some("https://example/rpc".to_string()),
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         chain_staleness_grace_sec: Some(0),
         ..Default::default()
@@ -4430,7 +4606,6 @@ fn resolve_blockchain_fails_when_keystore_missing() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -4461,7 +4636,6 @@ fn resolve_blockchain_fails_when_cli_keystore_override_missing() -> anyhow::Resu
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: Some(bogus),
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -4491,7 +4665,6 @@ fn resolve_blockchain_rejects_directory_as_keystore() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -4532,7 +4705,6 @@ fn empty_blockchain_args() -> crate::cli::run::BlockchainArgs {
         rpc_url: None,
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: None,
         capacity_bond_address: None,
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5177,7 +5349,6 @@ fn resolve_blockchain_cli_rpc_url_overrides_file() -> anyhow::Result<()> {
         rpc_url: Some("https://cli-wins.example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5189,7 +5360,6 @@ fn resolve_blockchain_cli_rpc_url_overrides_file() -> anyhow::Result<()> {
         publisher_registry_address: None,
         rpc_url: Some("https://file-loses.example/rpc".to_string()),
         eth_keystore: None,
-        payment_pool_address: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: None,
         event_poll_interval_ms: None,
@@ -5225,7 +5395,6 @@ fn resolve_blockchain_uses_file_rpc_url_when_cli_absent() -> anyhow::Result<()> 
         publisher_registry_address: None,
         rpc_url: Some("https://file-only.example/rpc".to_string()),
         eth_keystore: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         rpc_watchdog_interval_sec: None,
         event_poll_interval_ms: None,
@@ -5259,7 +5428,6 @@ fn resolve_blockchain_errors_when_rpc_url_missing() -> anyhow::Result<()> {
         rpc_url: None,
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5277,32 +5445,6 @@ fn resolve_blockchain_errors_when_rpc_url_missing() -> anyhow::Result<()> {
 }
 
 #[test]
-fn resolve_blockchain_errors_when_payment_pool_address_missing() -> anyhow::Result<()> {
-    let dir = data_dir_with_keystore()?;
-    let cli = BlockchainArgs {
-        origin_assignment_address: None,
-        publisher_registry_address: None,
-        rpc_url: Some("https://example/rpc".to_string()),
-        eth_keystore: None,
-        keystore_password_file: None,
-        payment_pool_address: None,
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        content_blacklist_address: None,
-        chain_id: None,
-    };
-    let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-        anyhow::bail!("expected error when payment_pool_address missing");
-    };
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("payment_pool_address"),
-        "error should mention payment_pool_address: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
 fn resolve_blockchain_errors_when_capacity_bond_address_missing() -> anyhow::Result<()> {
     let dir = data_dir_with_keystore()?;
     let cli = BlockchainArgs {
@@ -5311,7 +5453,6 @@ fn resolve_blockchain_errors_when_capacity_bond_address_missing() -> anyhow::Res
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: None,
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5337,7 +5478,6 @@ fn resolve_blockchain_errors_when_slash_judge_address_missing() -> anyhow::Resul
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: None,
         content_blacklist_address: None,
@@ -5363,7 +5503,6 @@ fn resolve_blockchain_errors_when_content_blacklist_address_missing() -> anyhow:
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5389,7 +5528,6 @@ fn resolve_blockchain_rejects_zero_slash_judge_address() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some("0x0000000000000000000000000000000000000000".to_string()),
         content_blacklist_address: None,
@@ -5418,7 +5556,6 @@ fn resolve_blockchain_rejects_zero_content_blacklist_address() -> anyhow::Result
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some("0x0000000000000000000000000000000000000000".to_string()),
@@ -5436,32 +5573,6 @@ fn resolve_blockchain_rejects_zero_content_blacklist_address() -> anyhow::Result
 }
 
 #[test]
-fn resolve_blockchain_rejects_zero_payment_pool_address() -> anyhow::Result<()> {
-    let dir = data_dir_with_keystore()?;
-    let cli = BlockchainArgs {
-        origin_assignment_address: None,
-        publisher_registry_address: None,
-        rpc_url: Some("https://example/rpc".to_string()),
-        eth_keystore: None,
-        keystore_password_file: None,
-        payment_pool_address: Some("0x0000000000000000000000000000000000000000".to_string()),
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        content_blacklist_address: None,
-        chain_id: None,
-    };
-    let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-        anyhow::bail!("expected error for zero payment_pool_address");
-    };
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("payment_pool_address") && msg.contains("zero address"),
-        "error should reject the zero address: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
 fn resolve_blockchain_rejects_zero_capacity_bond_address() -> anyhow::Result<()> {
     let dir = data_dir_with_keystore()?;
     let cli = BlockchainArgs {
@@ -5470,7 +5581,6 @@ fn resolve_blockchain_rejects_zero_capacity_bond_address() -> anyhow::Result<()>
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some("0x0000000000000000000000000000000000000000".to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5499,7 +5609,6 @@ fn resolve_blockchain_rejects_zero_origin_assignment_address() -> anyhow::Result
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5525,7 +5634,6 @@ fn resolve_blockchain_rejects_zero_publisher_registry_address() -> anyhow::Resul
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5552,7 +5660,6 @@ fn resolve_blockchain_rejects_zero_content_blacklist_poll_interval() -> anyhow::
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5582,7 +5689,6 @@ fn resolve_blockchain_rejects_zero_chain_id() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5611,7 +5717,6 @@ fn resolve_blockchain_treats_empty_string_rpc_url_as_missing() -> anyhow::Result
         rpc_url: Some(String::new()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5637,7 +5742,6 @@ fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Resul
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5649,7 +5753,6 @@ fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Resul
         publisher_registry_address: None,
         rpc_url: None,
         eth_keystore: None,
-        payment_pool_address: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(1),
         event_poll_interval_ms: None,
@@ -5684,7 +5787,6 @@ fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5696,7 +5798,6 @@ fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
         publisher_registry_address: None,
         rpc_url: None,
         eth_keystore: None,
-        payment_pool_address: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: None,
         event_poll_interval_ms: None,
@@ -5730,7 +5831,6 @@ fn resolve_blockchain_rejects_zero_redeem_interval() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5761,7 +5861,6 @@ fn resolve_blockchain_applies_default_redeem_interval_when_absent() -> anyhow::R
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5781,7 +5880,6 @@ fn resolve_blockchain_rejects_redeem_interval_above_grace_margin() -> anyhow::Re
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5812,7 +5910,6 @@ fn resolve_blockchain_accepts_redeem_interval_at_grace_margin() -> anyhow::Resul
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5837,7 +5934,6 @@ fn resolve_blockchain_rejects_zero_redeem_max_vouchers_per_tx() -> anyhow::Resul
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -5869,7 +5965,6 @@ fn resolve_blockchain_applies_default_redeem_max_vouchers_per_tx_when_absent() -
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5892,7 +5987,6 @@ fn resolve_blockchain_applies_default_pool_floor_when_absent() -> anyhow::Result
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5915,7 +6009,6 @@ fn resolve_blockchain_threads_explicit_pool_floor() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5942,7 +6035,6 @@ fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5954,7 +6046,6 @@ fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
         publisher_registry_address: None,
         rpc_url: None,
         eth_keystore: None,
-        payment_pool_address: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(0),
         event_poll_interval_ms: None,
@@ -5982,7 +6073,6 @@ fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -5994,7 +6084,6 @@ fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
         publisher_registry_address: None,
         rpc_url: None,
         eth_keystore: None,
-        payment_pool_address: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
         event_poll_interval_ms: None,
@@ -6028,7 +6117,6 @@ fn resolve_blockchain_applies_default_watchdog_interval_when_absent() -> anyhow:
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -6051,7 +6139,6 @@ fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -6063,7 +6150,6 @@ fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
         publisher_registry_address: None,
         rpc_url: None,
         eth_keystore: None,
-        payment_pool_address: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: None,
         event_poll_interval_ms: None,
@@ -6100,7 +6186,6 @@ fn pool_floor_signer_knobs_default_and_thread() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -6133,7 +6218,6 @@ fn buyer_working_deposit_defaults_when_absent() -> anyhow::Result<()> {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -6156,7 +6240,6 @@ fn resolve_blockchain_rejects_event_poll_interval_below_minimum() -> anyhow::Res
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
@@ -6192,7 +6275,6 @@ fn resolve_blockchain_applies_default_event_poll_interval_when_absent() -> anyho
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -6220,7 +6302,6 @@ fn resolve_blockchain_accepts_min_and_in_range_event_poll_interval() -> anyhow::
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -6255,7 +6336,6 @@ fn get_logs_span_cli() -> BlockchainArgs {
         rpc_url: Some("https://example/rpc".to_string()),
         eth_keystore: None,
         keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -6523,7 +6603,7 @@ fn complete_toml_body() -> &'static str {
     r#"
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 "#
 }
@@ -6541,7 +6621,7 @@ fn blockchain_toml_body(
         r#"
 [blockchain]
 rpc_url = "{rpc_url}"
-payment_pool_address = "{payment_pool_address}"
+payment_chains = [{{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["{payment_pool_address}"] }}]
 capacity_bond_address = "{capacity_bond_address}"
 {watchdog}"#
     )
@@ -6604,7 +6684,6 @@ fn resolve_config_blockchain_override_layer_beats_file_for_required_fields() -> 
     )?;
     let mut args = run_args_with_data_dir(dir.path());
     args.blockchain.rpc_url = Some("https://override.example/rpc".to_string());
-    args.blockchain.payment_pool_address = Some(GOOD_ADDR.to_string());
     args.blockchain.capacity_bond_address = Some(ALT_ADDR_3.to_string());
 
     let (resolved, _notices) = resolve_config(Some(&path), &args)?;
@@ -6617,7 +6696,14 @@ fn resolve_config_blockchain_override_layer_beats_file_for_required_fields() -> 
         "override-layer rpc_url should win, got {}",
         resolved.blockchain.rpc_url,
     );
-    assert_eq!(resolved.blockchain.payment_pool_address, GOOD_ADDR);
+    assert_eq!(
+        resolved
+            .blockchain
+            .first_payment_pool()
+            .map(|(_, pool)| pool),
+        Some(ALT_ADDR_1.parse()?),
+        "payment pools come from the file only"
+    );
     assert_eq!(resolved.blockchain.capacity_bond_address, ALT_ADDR_3);
     Ok(())
 }
@@ -6646,7 +6732,13 @@ fn resolve_config_accepts_file_only_blockchain_fields_at_watchdog_min() -> anyho
         "file-only rpc_url should be used, got {}",
         resolved.blockchain.rpc_url,
     );
-    assert_eq!(resolved.blockchain.payment_pool_address, ALT_ADDR_1);
+    assert_eq!(
+        resolved
+            .blockchain
+            .first_payment_pool()
+            .map(|(_, pool)| pool),
+        Some(ALT_ADDR_1.parse()?)
+    );
     assert_eq!(resolved.blockchain.capacity_bond_address, ALT_ADDR_2);
     assert_eq!(
         resolved.blockchain.rpc_watchdog_interval_sec,
@@ -6715,7 +6807,7 @@ region = "US"
 
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_chains = [{{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }}]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [cache]
@@ -6750,7 +6842,7 @@ fn resolve_config_aggregates_all_problems_in_one_pass() -> anyhow::Result<()> {
 region = "USA"
 
 [blockchain]
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
@@ -6798,7 +6890,7 @@ relay_urls = ["https://ok.example", "not a url"]
 
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 "#;
@@ -6829,7 +6921,7 @@ fn resolve_config_missing_rpc_url_emits_no_parse_cascade() -> anyhow::Result<()>
     // "is not a valid URL").
     let body = r#"
 [blockchain]
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 "#;
@@ -6866,7 +6958,7 @@ fn resolve_config_malformed_slash_judge_emits_no_zero_address_cascade() -> anyho
     let body = r#"
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 "#;
@@ -6906,7 +6998,7 @@ fn resolve_config_missing_home_dir_emits_no_keystore_cascade() -> anyhow::Result
     let body = r#"
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 "#;
@@ -6945,7 +7037,7 @@ region = "USA"
 
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 

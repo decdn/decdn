@@ -129,10 +129,14 @@ fn a_resolve_notice_becomes_a_doctor_finding() {
 const MINIMAL_CONFIG: &str = r#"
 [blockchain]
 rpc_url = "http://127.0.0.1:8545"
-payment_pool_address = "0x0000000000000000000000000000000000000001"
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 content_blacklist_address = "0x0000000000000000000000000000000000000004"
+
+[[blockchain.payment_chains]]
+rpc_url = "http://127.0.0.1:8545"
+chain_id = 31337
+payment_pools = ["0x0000000000000000000000000000000000000001"]
 
 [cache]
 cache_size_mb = 1024

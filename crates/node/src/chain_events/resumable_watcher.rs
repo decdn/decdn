@@ -93,10 +93,14 @@ pub(crate) enum CursorStart {
         cold_start: ColdStart,
     },
     /// Re-derive the floor from head each boot as `head - window_blocks` (clamped
-    /// `>= from_block`); do not persist. Used where a resume cursor is unsafe or
-    /// unnecessary — a bounded recent window re-scanned every boot (the rate-bounds
-    /// watcher's `window_blocks: 0` live-from-head follow). `window_blocks` is
+    /// `>= from_block`); do not persist. For a route where a resume cursor is
+    /// unsafe or unnecessary — a bounded recent window re-scanned every boot, or
+    /// `window_blocks: 0` for a live-from-head follow. `window_blocks` is
     /// always a *bounded* recent window.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no production route follows from head")
+    )]
     HeadMinusWindow { window_blocks: u64 },
 }
 

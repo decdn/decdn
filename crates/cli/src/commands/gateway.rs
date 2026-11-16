@@ -618,16 +618,21 @@ fn fill_chain_defaults(common: &mut ClientFetchArgs, file: &FileConfig) -> anyho
         return Ok(());
     };
     let addresses = chain.addresses()?;
-    if common.rpc_url.is_none() && bc.and_then(|b| b.rpc_url.as_ref()).is_none() {
-        common.rpc_url = Some(chain.public_rpc.to_owned());
-    }
-    if common.chain_id.is_none() && bc.and_then(|b| b.chain_id).is_none() {
-        common.chain_id = Some(chain.chain_id);
-    }
-    if common.payment_pool_address.is_none()
-        && bc.and_then(|b| b.payment_pool_address.as_ref()).is_none()
+    // The gateway pays on the first payment chain's first pool, as `decdn get`
+    // does; a config file that names any payment chain supplies all three.
+    let configured_payment = bc.is_some_and(|b| !b.payment_chains.is_empty());
+    if let Some(payment) = chain.payment_chains()?.into_iter().next()
+        && !configured_payment
     {
-        common.payment_pool_address = Some(addresses.payment_pool);
+        if common.rpc_url.is_none() {
+            common.rpc_url = Some(payment.public_rpc.to_owned());
+        }
+        if common.chain_id.is_none() {
+            common.chain_id = Some(payment.chain_id);
+        }
+        if common.payment_pool_address.is_none() {
+            common.payment_pool_address = payment.payment_pools.into_iter().next();
+        }
     }
     if common.slash_judge_address.is_none()
         && bc.and_then(|b| b.slash_judge_address.as_ref()).is_none()

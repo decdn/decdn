@@ -219,7 +219,7 @@ fn repoint_payment_pool_round_trips_through_toml() {
     let doc: toml::Value = toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
 
     assert_eq!(
-        doc["blockchain"]["payment_pool_address"].as_str(),
+        doc["blockchain"]["payment_chains"][0]["payment_pools"][0].as_str(),
         Some(redeployed.to_string().as_str())
     );
     let peers = doc["network"]["discovery"]["peers"]
@@ -258,7 +258,7 @@ fn rewrite_payment_pool_address_keeps_peers_and_cache() {
     let doc: toml::Value = toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
 
     assert_eq!(
-        doc["blockchain"]["payment_pool_address"].as_str(),
+        doc["blockchain"]["payment_chains"][0]["payment_pools"][0].as_str(),
         Some(codeless.to_string().as_str())
     );
     let peers = doc["network"]["discovery"]["peers"]

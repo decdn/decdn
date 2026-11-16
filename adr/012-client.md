@@ -227,11 +227,14 @@ in current schema terms:
 
 - `[identity]` — `data_dir` (holds the buyer payment-pool store and, by default, the ETH
   keystore) and an optional ISO 3166-1 alpha-2 `region`.
-- `[blockchain]` — `eth_keystore` and two chain coordinate sets. The governance-chain registry
-  set is an RPC endpoint, the chain id, `capacity_bond`, and `slash_judge`. The payment-chain set
-  is an RPC endpoint, the chain id, and `payment_pool`. A client reads the registry from the
-  governance chain and pays on the payment chain ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
-  A client with pools on several payment chains lists one payment-chain set for each. For each
+- `[blockchain]` — `eth_keystore`, the governance-chain set, and the payment chains. The
+  governance-chain set is the table's own keys: `rpc_url`, `chain_id`, `capacity_bond_address`,
+  and `slash_judge_address`. Each payment chain is one `[[blockchain.payment_chains]]` entry:
+  `rpc_url`, `chain_id`, and `payment_pools`, a list of one or more `PaymentPool` contract
+  addresses. The config names at least one entry, and no pool appears twice. The settlement token
+  is the `usdc()` of each pool, so the config does not name it. A client reads the registry from
+  the governance chain and pays on a payment chain ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
+  A client with pools on several payment chains lists one entry for each. For each
   candidate node it picks a `PaymentPool` contract that is in its own list and in the node's
   `payment_pools` probe hint, and it sets that contract as `payment_pool` in the `StreamRequest`
   ([ADR 005 § Payment pool routing](005-protocol.md#payment-pool-routing)). A node that refuses

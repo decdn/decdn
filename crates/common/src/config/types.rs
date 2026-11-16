@@ -159,16 +159,29 @@ pub struct DiscoveryPeer {
 }
 
 /// Blockchain section of the config file.
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// The section's own fields name the **governance chain**: the chain that runs
+/// `CapacityBond`, `SlashJudge`, `ContentBlacklist` and the other protocol
+/// contracts, whose chain id binds every slash, probe, stream, attestation,
+/// bind-node and pointer signature. Payments run on one or more **payment
+/// chains**, each a `[[blockchain.payment_chains]]` entry naming its own RPC
+/// endpoint, chain id and the `PaymentPool` contracts this node accepts there
+/// ([`PaymentChainConfig`]).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockchainConfig {
-    /// JSON-RPC endpoint URL.
+    /// Governance-chain JSON-RPC endpoint URL.
     pub rpc_url: Option<String>,
     /// Ethereum keystore file path.
     pub eth_keystore: Option<PathBuf>,
-    /// `PaymentPool` contract address — the shared payment pool this node
-    /// registers against for buyer and seller flows alike.
-    pub payment_pool_address: Option<String>,
+    /// The payment chains and the `PaymentPool` contracts on each. At least
+    /// one entry, each with at least one pool; no pool appears twice.
+    #[serde(default)]
+    pub payment_chains: Vec<PaymentChainConfig>,
+    /// `CctpSweepReceiver` contract address on the governance chain: where a
+    /// payment pool's CCTP sweep lands. Optional; read only by the CLI command
+    /// that submits attested sweeps.
+    pub cctp_sweep_receiver_address: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
     /// `OriginAssignment` contract address. Optional: when set, the node runs the
@@ -228,9 +241,10 @@ pub struct BlockchainConfig {
     /// 30 min). Must not be `0` (that would refuse every serve). Only consulted
     /// when `content_blacklist_address` is set.
     pub chain_staleness_grace_sec: Option<u64>,
-    /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
-    /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
-    /// network target — matches the chain id bound on the runtime signer).
+    /// Governance-chain EIP-712 `chainId`, bound into every `slash_sig`,
+    /// attestation, bind-node and pointer domain separator. Absent =>
+    /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial network
+    /// target — matches the chain id bound on the runtime signer).
     pub chain_id: Option<u64>,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the
     /// watchdog entirely; absent => default (30s). Non-zero values below
@@ -257,14 +271,6 @@ pub struct BlockchainConfig {
     /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`;
     /// rejected at config resolution.
     pub get_logs_max_block_span: Option<u64>,
-    /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
-    /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). This is the
-    /// safety-net cadence *in addition to* the `SharesUpdated` event
-    /// subscription (which follows [`Self::event_poll_interval_ms`]); it
-    /// reconciles any log the event tail missed. Absent =>
-    /// [`super::DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
-    /// be `0` (that would poll every tick); rejected at config resolution.
-    pub fee_shares_poll_interval_sec: Option<u64>,
     /// Per-chunk redemption floor (base units, `µUSDC`, ADR 003 § Operator
     /// early withdrawal). The node submits an on-chain redemption
     /// transaction for a chunk of lanes only once the aggregate un-redeemed
@@ -342,12 +348,23 @@ pub struct BlockchainConfig {
     /// always admissible). Absent => default (`8`). See
     /// `DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS`.
     pub pool_floor_signer_live_windows: Option<u64>,
-    /// USDC settlement-token contract address — the ERC-20 clients spend on
-    /// deposits into a payment pool. Declared here so a client config that names
-    /// it passes `decdn config validate` under this section's
-    /// `deny_unknown_fields`; the running client resolves the token at runtime
-    /// from `PaymentPool.usdc()`.
-    pub usdc_address: Option<String>,
+}
+
+/// One `[[blockchain.payment_chains]]` entry: a payment chain and the
+/// `PaymentPool` contracts this node accepts payment through on it. The
+/// settlement token is each pool's own `usdc()`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentChainConfig {
+    /// The payment chain's JSON-RPC endpoint URL.
+    pub rpc_url: Option<String>,
+    /// The payment chain's EIP-155 chain id, bound into the voucher and
+    /// capability EIP-712 domains of its pools.
+    pub chain_id: Option<u64>,
+    /// The `PaymentPool` contract addresses on this chain, EIP-55 checksummed.
+    /// At least one.
+    #[serde(default)]
+    pub payment_pools: Vec<String>,
 }
 
 /// Cache section of the config file.

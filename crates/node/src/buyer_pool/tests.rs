@@ -204,7 +204,10 @@ async fn reconcile_adopts_the_newest_open_pool() {
         bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
         Reconciled::Adopted(newer)
     );
-    let adopted = store.get_by_owner(owner).unwrap().expect("row recorded");
+    let adopted = store
+        .get_by_owner(DEPLOYMENT, owner)
+        .unwrap()
+        .expect("row recorded");
     assert_eq!(adopted.pool_id, newer);
     assert_eq!(adopted.deposit, U256::from(10_000_000u64));
     assert_eq!(adopted.token, token);
@@ -232,7 +235,10 @@ async fn an_adopted_drained_pool_keeps_its_redeemed_spend_and_refills() {
         bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
         Reconciled::Adopted(_)
     ));
-    let row = store.get_by_owner(owner).unwrap().expect("row recorded");
+    let row = store
+        .get_by_owner(DEPLOYMENT, owner)
+        .unwrap()
+        .expect("row recorded");
     assert_eq!(row.redeemed_elsewhere(), U256::from(9_500_000u64));
     assert_eq!(row.pool_spend(), U256::from(9_500_000u64));
 
@@ -324,7 +330,10 @@ async fn reconcile_drops_a_row_from(foreign: Deployment) {
         Reconciled::Adopted(_)
     ));
 
-    let row = store.get_by_owner(owner).unwrap().expect("row recorded");
+    let row = store
+        .get_by_owner(DEPLOYMENT, owner)
+        .unwrap()
+        .expect("row recorded");
     assert_eq!(
         row.deployment, DEPLOYMENT,
         "the surviving row must belong to the deployment this node is configured against"
@@ -401,7 +410,7 @@ async fn a_foreign_row_is_dropped_with_nothing_to_adopt(deployment: Deployment) 
         "nothing to adopt, so the reconcile reports no adoption"
     );
     assert!(
-        store.get_by_owner(owner).unwrap().is_none(),
+        store.get_by_owner(DEPLOYMENT, owner).unwrap().is_none(),
         "the foreign row must be gone even though no replacement was adopted — otherwise \
          the next pull reuses it and pays against a contract that never saw its lanes"
     );
@@ -432,11 +441,11 @@ fn adoption_tracks_a_row_on_the_configured_deployment() {
     );
 }
 
-/// A row on the configured contract address but another chain is foreign,
-/// and the check carries the chain it came from: that deployment is the
-/// only one its deposit can be reclaimed against.
+/// A row on the configured contract address but another chain is another
+/// deployment's row: the keyed lookup does not see it, so adoption applies,
+/// and the row stays in the store for its own deployment.
 #[test]
-fn adoption_treats_a_row_on_the_same_address_on_another_chain_as_foreign() {
+fn adoption_does_not_see_a_row_on_the_same_address_on_another_chain() {
     let owner = Address::repeat_byte(1);
     let pool_id = PoolId::from([0xAA; 32]);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
@@ -452,11 +461,15 @@ fn adoption_treats_a_row_on_the_same_address_on_another_chain_as_foreign() {
 
     assert_eq!(
         adoption_applies(&store, owner, DEPLOYMENT, ReconcileRun::Bootstrap),
-        AdoptionCheck::Foreign {
-            pool_id,
-            was_on: OTHER_CHAIN,
-        },
+        AdoptionCheck::Applies,
         "the same PaymentPool address on another chain is another deployment"
+    );
+    assert!(
+        store
+            .get_by_owner(OTHER_CHAIN, owner)
+            .expect("an in-memory read cannot fail")
+            .is_some(),
+        "the other deployment's row is kept"
     );
 }
 
@@ -493,7 +506,14 @@ async fn reconcile_skips_a_closing_pool_for_the_open_one_behind_it() {
         .await,
         Reconciled::Adopted(open)
     );
-    assert_eq!(store.get_by_owner(owner).unwrap().unwrap().pool_id, open);
+    assert_eq!(
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
+        open
+    );
 }
 
 /// An owner with no pools on chain has nothing to adopt, and the first miss
@@ -518,7 +538,7 @@ async fn reconcile_adopts_nothing_when_the_owner_holds_no_pool() {
         .await,
         Reconciled::NoneHeld
     );
-    assert!(store.get_by_owner(owner).unwrap().is_none());
+    assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_none());
 }
 
 /// A store that already tracks a pool it still owns is left alone, while
@@ -570,7 +590,11 @@ async fn reconcile_is_a_no_op_when_the_store_already_tracks_a_pool() {
         Reconciled::KeptTracked
     );
     assert_eq!(
-        store.get_by_owner(owner).unwrap().unwrap().pool_id,
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
         existing
     );
 }
@@ -679,7 +703,11 @@ async fn reconcile_sweeps_for_stranded_pools_when_the_store_is_intact() {
     );
     // Nothing adopted: the tracked row is untouched.
     assert_eq!(
-        store.get_by_owner(owner).unwrap().unwrap().pool_id,
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
         existing
     );
     // The discriminating assertion. `Asserter` faults only on over-calls,
@@ -741,7 +769,11 @@ async fn a_tracked_pool_the_chain_has_closed_is_dropped_and_replaced() {
         "a stale row must not block adoption of a pool this owner really holds"
     );
     assert_eq!(
-        store.get_by_owner(owner).unwrap().unwrap().pool_id,
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
         live,
         "the stale row must be replaced by the live pool, not kept beside it"
     );
@@ -792,7 +824,11 @@ async fn a_tracked_pool_whose_status_read_failed_keeps_its_row() {
         Reconciled::Unknown
     );
     assert_eq!(
-        store.get_by_owner(owner).unwrap().unwrap().pool_id,
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
         tracked,
         "a getPool fault must never cost the node its tracked pool"
     );
@@ -841,7 +877,11 @@ async fn a_tracked_pool_the_chain_does_not_list_keeps_its_row() {
         Reconciled::Unknown
     );
     assert_eq!(
-        store.get_by_owner(owner).unwrap().unwrap().pool_id,
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
         tracked,
         "an id the chain does not list is unknown, not closed"
     );
@@ -881,7 +921,7 @@ async fn a_stale_row_is_dropped_even_when_no_other_pool_is_open() {
         Reconciled::NoneHeld
     );
     assert!(
-        store.get_by_owner(owner).unwrap().is_none(),
+        store.get_by_owner(DEPLOYMENT, owner).unwrap().is_none(),
         "the row must be gone so the next miss opens a fresh pool"
     );
 }
@@ -919,7 +959,11 @@ async fn a_failed_stranded_sweep_is_not_counted_as_an_adoption_failure() {
         "a stranded sweep that could not run is not an adoption failure"
     );
     assert_eq!(
-        store.get_by_owner(owner).unwrap().unwrap().pool_id,
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
         existing,
         "a chain read that failed must never cost the node its tracked pool"
     );
@@ -992,7 +1036,7 @@ async fn record_progress_overwrites_down_only_with_a_rebase_anchor() {
     let svc = mocked_service(Vec::new(), Arc::clone(&store), Arc::clone(&signer), owner);
     let lane_record = || {
         store
-            .get_by_owner(owner)
+            .get_by_owner(DEPLOYMENT, owner)
             .expect("read")
             .and_then(|s| s.lane_progress(lane))
             .expect("lane record")
@@ -1067,7 +1111,7 @@ async fn record_progress_takes_a_rebase_anchor_ahead_on_bytes() {
         .expect("the rebase write lands");
     assert_eq!(
         store
-            .get_by_owner(owner)
+            .get_by_owner(DEPLOYMENT, owner)
             .expect("read")
             .and_then(|s| s.lane_progress(lane)),
         Some(totals),
@@ -1075,15 +1119,8 @@ async fn record_progress_takes_a_rebase_anchor_ahead_on_bytes() {
     );
 }
 
-/// The pull hot path refuses a foreign row on its own, without relying on
-/// bootstrap having cleaned up.
-///
-/// Bootstrap's drop can fail — the store faults, and `drop_foreign_row`
-/// leaves the row where it is. If this read trusted bootstrap, that single
-/// failure would make every pull for the life of the process pay against a
-/// pool whose contract has never heard of it. The guard has to live at the
-/// read that decides what gets paid, which makes it structural rather than
-/// a property of boot ordering.
+/// The pull hot path reads the row keyed by its own deployment, so a row of
+/// another deployment under the same owner never answers it.
 #[tokio::test]
 async fn the_pull_path_ignores_a_row_from_another_deployment() {
     the_pull_path_ignores_a_row_on(OTHER_CONTRACT);
@@ -1123,8 +1160,8 @@ fn the_pull_path_ignores_a_row_on(foreign: Deployment) {
          opens a fresh pool instead of paying against it"
     );
     assert!(
-        store.get_by_owner(owner).unwrap().is_some(),
-        "the read is a filter, not a write: dropping the row is bootstrap's job"
+        store.get_by_owner(foreign, owner).unwrap().is_some(),
+        "the other deployment's row stays in the store under its own key"
     );
 }
 
@@ -1266,7 +1303,7 @@ async fn a_lane_with_no_local_record_resumes_from_the_chain_watermark() {
     // And it is durable, so the next pull does not re-read the chain.
     assert!(
         store
-            .get_by_owner(owner)
+            .get_by_owner(DEPLOYMENT, owner)
             .unwrap()
             .unwrap()
             .lane_progress(lane)
@@ -1406,7 +1443,7 @@ async fn a_lane_seeded_on_an_adopted_row_counts_its_watermark_once() {
         .expect("seed succeeds");
     assert_eq!(seeded.redeemed_elsewhere(), U256::from(8_500_000u64));
     assert_eq!(seeded.pool_spend(), U256::from(9_500_000u64));
-    let row = store.get_by_owner(owner).unwrap().unwrap();
+    let row = store.get_by_owner(DEPLOYMENT, owner).unwrap().unwrap();
     assert_eq!(row.redeemed_elsewhere(), U256::from(8_500_000u64));
     assert_eq!(row.pool_spend(), U256::from(9_500_000u64));
 }
@@ -1496,7 +1533,11 @@ async fn a_never_paid_lane_is_left_at_zero() {
     assert_eq!(out, state);
     assert_eq!(out.lane_count(), 0);
     assert_eq!(
-        store.get_by_owner(owner).unwrap().unwrap().lane_count(),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .lane_count(),
         0,
         "a zero watermark must not be committed as a lane"
     );
@@ -1691,17 +1732,19 @@ impl BuyerPoolStore for FailingStore {
     fn record(&self, _state: &BuyerPoolState) -> std::result::Result<(), StoreError> {
         Err(StoreError::Backend("record faulted".into()))
     }
-    fn forget(&self, _owner: Address) -> std::result::Result<(), StoreError> {
+    fn forget(&self, _d: Deployment, _owner: Address) -> std::result::Result<(), StoreError> {
         Err(StoreError::Backend("forget faulted".into()))
     }
     fn get_by_pool_id(
         &self,
+        _d: Deployment,
         _pool_id: PoolId,
     ) -> std::result::Result<Option<BuyerPoolState>, StoreError> {
         Err(StoreError::Backend("get_by_pool_id faulted".into()))
     }
     fn forget_if_pool(
         &self,
+        _d: Deployment,
         _owner: Address,
         _pool_id: PoolId,
     ) -> std::result::Result<bool, StoreError> {
@@ -1709,12 +1752,14 @@ impl BuyerPoolStore for FailingStore {
     }
     fn get_by_owner(
         &self,
+        _d: Deployment,
         _owner: Address,
     ) -> std::result::Result<Option<BuyerPoolState>, StoreError> {
         Err(StoreError::Backend("get_by_owner faulted".into()))
     }
     fn advance_progress(
         &self,
+        _d: Deployment,
         _owner: Address,
         _pool_id: PoolId,
         _lane: LaneKey,
@@ -1725,6 +1770,7 @@ impl BuyerPoolStore for FailingStore {
     }
     fn rebase_progress(
         &self,
+        _d: Deployment,
         _owner: Address,
         _pool_id: PoolId,
         _lane: LaneKey,
@@ -1735,6 +1781,7 @@ impl BuyerPoolStore for FailingStore {
     }
     fn seed_progress(
         &self,
+        _d: Deployment,
         _owner: Address,
         _pool_id: PoolId,
         _lane: LaneKey,
@@ -1745,6 +1792,7 @@ impl BuyerPoolStore for FailingStore {
     }
     fn add_deposit(
         &self,
+        _d: Deployment,
         _owner: Address,
         _pool_id: PoolId,
         _additional: U256,
@@ -1821,7 +1869,14 @@ async fn reconcile_skips_a_fully_redeemed_pool() {
         .await,
         Reconciled::Adopted(solvent)
     );
-    assert_eq!(store.get_by_owner(owner).unwrap().unwrap().pool_id, solvent);
+    assert_eq!(
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
+        solvent
+    );
 }
 
 /// An unreadable store adopts nothing and counts the fault. Writing an
@@ -1884,50 +1939,58 @@ impl BuyerPoolStore for WriteOnlyFault {
     fn record(&self, _state: &BuyerPoolState) -> std::result::Result<(), StoreError> {
         Err(StoreError::Backend("disk full".into()))
     }
-    fn forget(&self, owner: Address) -> std::result::Result<(), StoreError> {
-        self.0.forget(owner)
+    fn forget(&self, d: Deployment, owner: Address) -> std::result::Result<(), StoreError> {
+        self.0.forget(d, owner)
     }
     fn get_by_pool_id(
         &self,
+        d: Deployment,
         pool_id: PoolId,
     ) -> std::result::Result<Option<BuyerPoolState>, StoreError> {
-        self.0.get_by_pool_id(pool_id)
+        self.0.get_by_pool_id(d, pool_id)
     }
     fn forget_if_pool(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
     ) -> std::result::Result<bool, StoreError> {
-        self.0.forget_if_pool(owner, pool_id)
+        self.0.forget_if_pool(d, owner, pool_id)
     }
     fn get_by_owner(
         &self,
+        d: Deployment,
         owner: Address,
     ) -> std::result::Result<Option<BuyerPoolState>, StoreError> {
-        self.0.get_by_owner(owner)
+        self.0.get_by_owner(d, owner)
     }
     fn advance_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         bytes: U256,
         amount: U256,
     ) -> std::result::Result<AdvanceOutcome, StoreError> {
-        self.0.advance_progress(owner, pool_id, lane, bytes, amount)
+        self.0
+            .advance_progress(d, owner, pool_id, lane, bytes, amount)
     }
     fn rebase_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         anchor: BuyerLaneProgress,
         totals: BuyerLaneProgress,
     ) -> std::result::Result<AdvanceOutcome, StoreError> {
-        self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
+        self.0
+            .rebase_progress(d, owner, pool_id, lane, anchor, totals)
     }
     fn seed_progress(
         &self,
+        _d: Deployment,
         _owner: Address,
         _pool_id: PoolId,
         _lane: LaneKey,
@@ -1942,11 +2005,12 @@ impl BuyerPoolStore for WriteOnlyFault {
     }
     fn add_deposit(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         additional: U256,
     ) -> std::result::Result<decdn_incentive::DepositOutcome, StoreError> {
-        self.0.add_deposit(owner, pool_id, additional)
+        self.0.add_deposit(d, owner, pool_id, additional)
     }
     fn delegate_lanes(
         &self,
@@ -1991,17 +2055,19 @@ impl BuyerPoolStore for ForgetFault {
     fn record(&self, state: &BuyerPoolState) -> std::result::Result<(), StoreError> {
         self.0.record(state)
     }
-    fn forget(&self, owner: Address) -> std::result::Result<(), StoreError> {
-        self.0.forget(owner)
+    fn forget(&self, d: Deployment, owner: Address) -> std::result::Result<(), StoreError> {
+        self.0.forget(d, owner)
     }
     fn get_by_pool_id(
         &self,
+        d: Deployment,
         pool_id: PoolId,
     ) -> std::result::Result<Option<BuyerPoolState>, StoreError> {
-        self.0.get_by_pool_id(pool_id)
+        self.0.get_by_pool_id(d, pool_id)
     }
     fn forget_if_pool(
         &self,
+        _d: Deployment,
         _owner: Address,
         _pool_id: PoolId,
     ) -> std::result::Result<bool, StoreError> {
@@ -2009,47 +2075,54 @@ impl BuyerPoolStore for ForgetFault {
     }
     fn get_by_owner(
         &self,
+        d: Deployment,
         owner: Address,
     ) -> std::result::Result<Option<BuyerPoolState>, StoreError> {
-        self.0.get_by_owner(owner)
+        self.0.get_by_owner(d, owner)
     }
     fn advance_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         bytes: U256,
         amount: U256,
     ) -> std::result::Result<AdvanceOutcome, StoreError> {
-        self.0.advance_progress(owner, pool_id, lane, bytes, amount)
+        self.0
+            .advance_progress(d, owner, pool_id, lane, bytes, amount)
     }
     fn rebase_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         anchor: BuyerLaneProgress,
         totals: BuyerLaneProgress,
     ) -> std::result::Result<AdvanceOutcome, StoreError> {
-        self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
+        self.0
+            .rebase_progress(d, owner, pool_id, lane, anchor, totals)
     }
     fn seed_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         bytes: U256,
         amount: U256,
     ) -> std::result::Result<AdvanceOutcome, StoreError> {
-        self.0.seed_progress(owner, pool_id, lane, bytes, amount)
+        self.0.seed_progress(d, owner, pool_id, lane, bytes, amount)
     }
     fn add_deposit(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         additional: U256,
     ) -> std::result::Result<decdn_incentive::DepositOutcome, StoreError> {
-        self.0.add_deposit(owner, pool_id, additional)
+        self.0.add_deposit(d, owner, pool_id, additional)
     }
     fn delegate_lanes(
         &self,
@@ -2081,60 +2154,6 @@ impl BuyerPoolStore for ForgetFault {
     fn lane_salt(&self) -> std::result::Result<decdn_incentive::lane_signer::LaneSalt, StoreError> {
         self.0.lane_salt()
     }
-}
-
-/// A foreign row that cannot be dropped refuses the adoption and leaves the
-/// row exactly where it was — it must not be adopted around, because the
-/// reuse lookup can still reach it.
-///
-/// It is also not an adoption *failure*: that counter means "about to
-/// escrow a second deposit beside one it already holds", and this node
-/// escrows nothing. It is stuck on a row it already has, which is the
-/// opposite state, so counting it would send an operator hunting a
-/// duplicate deposit that does not exist.
-#[tokio::test]
-async fn reconcile_refuses_when_a_foreign_row_cannot_be_dropped() {
-    let owner = Address::repeat_byte(1);
-    let foreign = PoolId::from([0xAA; 32]);
-    let inner = MemoryBuyerPoolStore::new();
-    inner
-        .record(&BuyerPoolState::new(
-            foreign,
-            OTHER_CONTRACT,
-            owner,
-            Address::repeat_byte(2),
-            U256::from(10_000_000u64),
-        ))
-        .expect("seed the foreign row");
-    let store: Arc<dyn BuyerPoolStore> = Arc::new(ForgetFault(inner));
-    let metrics = metrics();
-    // Empty queue: reaching the chain at all would mean it adopted around
-    // a row it could not drop.
-    let contract = mocked_pool_contract(Vec::new());
-
-    assert_eq!(
-        bootstrap_reconcile(
-            &contract,
-            DEPLOYMENT,
-            &store,
-            owner,
-            Address::repeat_byte(2),
-            &metrics
-        )
-        .await,
-        Reconciled::Unknown
-    );
-    assert_eq!(
-        adoption_failures(&metrics),
-        0,
-        "a node stuck on a row it cannot drop escrows nothing; counting it as an \
-         adoption failure would describe the opposite state"
-    );
-    let survivor = store.get_by_owner(owner).unwrap().expect("row survives");
-    assert_eq!(
-        survivor.pool_id, foreign,
-        "a refused drop must leave the store untouched"
-    );
 }
 
 /// A store that cannot persist the adopted row counts the fault, so an
@@ -2208,7 +2227,7 @@ async fn reconcile_leaves_the_store_untouched_when_the_chain_is_unreachable() {
         .await,
         Reconciled::Unknown
     );
-    assert!(store.get_by_owner(owner).unwrap().is_none());
+    assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_none());
 }
 
 fn pool_with_lane(
@@ -3011,7 +3030,10 @@ async fn the_reclaim_sweep_drops_a_pool_someone_else_reclaimed() {
         let svc = recovery_service(&asserter, 10_000_000);
         svc.sweep_reclaimable_once().await;
         assert_eq!(
-            svc.store.get_by_owner(svc.owner).unwrap().is_some(),
+            svc.store
+                .get_by_owner(svc.deployment, svc.owner)
+                .unwrap()
+                .is_some(),
             kept,
             "a pool read {}",
             if kept { "open" } else { "closed" }
@@ -3131,7 +3153,7 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
         .finish();
     {
         let _guard = tracing::subscriber::set_default(subscriber);
-        reclaim_once(&contract, &store, owner, &metrics).await;
+        reclaim_once(&contract, &store, DEPLOYMENT, owner, &metrics).await;
     }
 
     let text = String::from_utf8(
@@ -3150,7 +3172,10 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
         "{exported}"
     );
     // The reclaim may still mine, so the row stays for the next sweep.
-    assert!(store.get_by_owner(owner)?.is_some(), "the row survives");
+    assert!(
+        store.get_by_owner(DEPLOYMENT, owner)?.is_some(),
+        "the row survives"
+    );
     Ok(())
 }
 
@@ -3220,7 +3245,7 @@ async fn sweep_with_a_failed_reclaim_send(
         .finish();
     {
         let _guard = tracing::subscriber::set_default(subscriber);
-        reclaim_once(&contract, &store, owner, &metrics).await;
+        reclaim_once(&contract, &store, DEPLOYMENT, owner, &metrics).await;
     }
 
     let text = String::from_utf8(
@@ -3229,7 +3254,10 @@ async fn sweep_with_a_failed_reclaim_send(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone(),
     )?;
-    assert!(store.get_by_owner(owner)?.is_some(), "the row survives");
+    assert!(
+        store.get_by_owner(DEPLOYMENT, owner)?.is_some(),
+        "the row survives"
+    );
     Ok((text, metrics.encode()?))
 }
 
@@ -3371,7 +3399,10 @@ async fn a_sweep_reclaim_that_never_mines_lapses_and_keeps_the_row() -> anyhow::
         1
     );
     // The reclaim may still mine, so the row stays for the next sweep.
-    assert!(store.get_by_owner(owner)?.is_some(), "the row survives");
+    assert!(
+        store.get_by_owner(DEPLOYMENT, owner)?.is_some(),
+        "the row survives"
+    );
     Ok(())
 }
 
@@ -3878,7 +3909,10 @@ async fn a_spent_nonce_adopts_the_pool_the_open_bought() {
         .expect("the adoption settles the open");
     assert!(matches!(landed, Landed::Adopted), "{landed:?}");
     assert_eq!(
-        store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .map(|row| row.pool_id),
         Some(pool_id)
     );
     assert_eq!(adoption_failures(&metrics), 0);
@@ -3931,7 +3965,10 @@ async fn a_replacement_open_settles_onto_the_new_pool() {
     .expect("the replacement settles");
     assert!(matches!(landed, Landed::Adopted), "{landed:?}");
     assert_eq!(
-        store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .map(|row| row.pool_id),
         Some(opened)
     );
 }
@@ -3964,7 +4001,7 @@ async fn an_open_that_escrowed_nothing_fails_as_a_resolved_rpc_fault() {
         "{err:#}"
     );
     assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
-    assert!(store.get_by_owner(owner).unwrap().is_none());
+    assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_none());
 }
 
 /// A mined open that reverted escrowed nothing, and says so by its own
@@ -3993,7 +4030,7 @@ async fn a_reverted_unconfirmed_open_fails_as_a_contract_revert() {
         Some(&PoolOpenFailureReason::ContractRevert),
         "{err:#}"
     );
-    assert!(store.get_by_owner(owner).unwrap().is_none());
+    assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_none());
 }
 
 /// A pool the open resolved to that cannot be recorded is escrowed and
@@ -4160,7 +4197,10 @@ async fn a_transport_failed_open_adopts_its_pool_once_the_nonce_is_spent() {
     assert!(!*svc.open_hold.held.borrow(), "the hold is released");
     assert_eq!(open_unresolved(&svc.metrics), 0);
     assert_eq!(
-        store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .map(|row| row.pool_id),
         Some(pool_id),
         "the adopted pool is tracked, so the next miss reuses it"
     );
@@ -4203,7 +4243,7 @@ async fn a_read_failed_open_holds_no_slot() {
     );
     assert!(!*svc.open_hold.held.borrow(), "the hold is not taken");
     assert_eq!(open_unresolved(&svc.metrics), 0);
-    assert!(store.get_by_owner(owner).unwrap().is_none());
+    assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_none());
 
     // The next miss sends again: the nonce read is the first call.
     push(&asserter, vec![Reply::Nonce(5)]);
@@ -4397,6 +4437,7 @@ fn scripted_handles(
         store,
         token: Address::repeat_byte(2),
         owner,
+        deployment: DEPLOYMENT,
         payment_pool_addr: Address::ZERO,
         metrics: metrics(),
         hold: SlotHold::top_up(),
@@ -4776,7 +4817,10 @@ async fn a_dropped_top_up_is_re_sent_at_its_nonce_and_credited_once() {
     assert!(!svc.topup_hold.is_held(), "the hold is released");
     assert_eq!(topup_unresolved(&svc.metrics), 0, "the gauge is cleared");
     assert_eq!(
-        store.get_by_owner(owner).unwrap().map(|row| row.deposit),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .map(|row| row.deposit),
         Some(U256::from(ROW_DEPOSIT + TOP_UP)),
         "the row is credited once"
     );
@@ -4902,7 +4946,10 @@ async fn a_settled_top_up_credits_the_row_once() {
     );
     assert!(asserter.read_q().is_empty(), "every scripted read was made");
     assert_eq!(
-        store.get_by_owner(owner).unwrap().map(|row| row.deposit),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .map(|row| row.deposit),
         Some(U256::from(ROW_DEPOSIT + TOP_UP)),
         "the row is credited once"
     );
@@ -4952,7 +4999,10 @@ async fn a_settled_top_up_that_escrowed_nothing_frees_the_slot() {
     assert!(format!("{err:#}").contains("escrowed nothing"), "{err:#}");
     assert!(err.downcast_ref::<EscrowedUntracked>().is_none(), "{err:#}");
     assert_eq!(
-        store.get_by_owner(owner).unwrap().map(|row| row.deposit),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .map(|row| row.deposit),
         Some(U256::from(ROW_DEPOSIT))
     );
     assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_ok_total"), 0);
@@ -5035,7 +5085,10 @@ async fn a_top_up_whose_nonce_a_redemption_took_is_sent_again() {
     );
     assert!(asserter.read_q().is_empty(), "every scripted read was made");
     assert_eq!(
-        store.get_by_owner(owner).unwrap().map(|row| row.deposit),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .map(|row| row.deposit),
         Some(U256::from(ROW_DEPOSIT + TOP_UP)),
         "the row is credited once"
     );

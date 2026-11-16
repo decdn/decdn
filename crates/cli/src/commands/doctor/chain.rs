@@ -96,15 +96,27 @@ pub(crate) async fn check_chain(report: &mut Report, cfg: &ResolvedConfig, timeo
     });
     report.push(classify_chain_id(cfg.blockchain.chain_id, onchain));
 
+    // Payment pools on a payment chain that is the governance chain answer on
+    // this RPC; pools on another chain are not this endpoint's to check.
+    let same_chain_pools: Vec<String> = cfg
+        .blockchain
+        .payment_chains
+        .iter()
+        .filter(|chain| chain.chain_id == cfg.blockchain.chain_id)
+        .flat_map(|chain| chain.payment_pools.iter().map(Address::to_string))
+        .collect();
     // (name, address) pairs: required first, then optional configured ones.
-    let mut targets: Vec<(&str, &str)> = vec![
-        ("payment_pool", cfg.blockchain.payment_pool_address.as_str()),
+    let mut targets: Vec<(&str, &str)> = same_chain_pools
+        .iter()
+        .map(|pool| ("payment_pool", pool.as_str()))
+        .collect();
+    targets.extend([
         (
             "capacity_bond",
             cfg.blockchain.capacity_bond_address.as_str(),
         ),
         ("slash_judge", cfg.blockchain.slash_judge_address.as_str()),
-    ];
+    ]);
     if let Some(addr) = cfg.blockchain.content_blacklist_address.as_deref() {
         targets.push(("content_blacklist", addr));
     }

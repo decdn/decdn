@@ -63,8 +63,7 @@ pub fn cached_pool_token(
     deployment: Deployment,
 ) -> anyhow::Result<Option<Address>> {
     Ok(store
-        .get_by_owner(self_address)?
-        .filter(|state| state.is_on(deployment))
+        .get_by_owner(deployment, self_address)?
         .map(|state| state.token))
 }
 
@@ -537,7 +536,8 @@ where
             // and the pool, and is fatal ([`grade_deposit_credit`]).
             let effect = topped_up_effect(pool_id, credited);
             let new_deposit = match grade_deposit_credit(
-                self.store.add_deposit(self.owner, pool_id, credited),
+                self.store
+                    .add_deposit(self.deployment, self.owner, pool_id, credited),
                 &effect,
                 tx,
             ) {
@@ -699,7 +699,7 @@ where
     /// The deposit the buyer store records for `pool_id`, or `None` when it
     /// holds no row or cannot be read.
     fn recorded_deposit(&self, pool_id: PoolId) -> Option<U256> {
-        match self.store.get_by_pool_id(pool_id) {
+        match self.store.get_by_pool_id(self.deployment, pool_id) {
             Ok(row) => row.map(|row| row.deposit),
             Err(error) => {
                 tracing::warn!(
@@ -739,7 +739,7 @@ where
         // The settle step escrows nothing, so an estimate is safe here: it only
         // names the deposit the nodes are asked again at.
         let estimate = || remaining.saturating_add(self.funding.pool_spent().unwrap_or(U256::ZERO));
-        let deposit = match self.store.get_by_pool_id(pool_id) {
+        let deposit = match self.store.get_by_pool_id(self.deployment, pool_id) {
             Ok(Some(row)) => row.deposit,
             Ok(None) => estimate(),
             Err(error) => {
@@ -1149,13 +1149,9 @@ where
 /// The pool this buy reuses, if any, and what that pool has already paid out
 /// beyond what its row's lanes account for.
 ///
-/// A tracked row is reused only if it is on `deployment` — the same chain and
-/// the same `PaymentPool` address. A row from another deployment is not this
-/// contract's pool, whatever its id says: `pool_id` is
-/// `keccak256(owner, ownerPoolNonce)` and a redeploy restarts that nonce, so the
-/// id alone will eventually name an existing, unrelated pool here, and its lane
-/// progress would seed the first voucher at a cumulative this pool has never
-/// redeemed against. It is treated as no row.
+/// The tracked row is the one the store indexes under `(deployment, owner)`:
+/// a row of another `PaymentPool` deployment is another key, so it never
+/// answers here.
 ///
 /// A tracked row is reused only while its pool is open. Only the owner closes a
 /// pool, but the owner key can close it from another machine, and anyone can
@@ -1190,22 +1186,7 @@ async fn pool_to_reuse<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let tracked = match store.get_by_owner(self_address)? {
-        Some(state) if state.is_on(deployment) => Some(state),
-        Some(state) => {
-            tracing::warn!(
-                pool_id = %state.pool_id,
-                foreign_payment_pool = %state.deployment.payment_pool,
-                foreign_chain_id = state.deployment.chain_id,
-                configured_payment_pool = %deployment.payment_pool,
-                configured_chain_id = deployment.chain_id,
-                "ignoring a tracked buyer pool from another PaymentPool deployment; its deposit, \
-                 if any, is recoverable only against `foreign_payment_pool`"
-            );
-            None
-        }
-        None => None,
-    };
+    let tracked = store.get_by_owner(deployment, self_address)?;
     // A lane of this run already pays from the pool, so its first build read it.
     let tracked = match tracked {
         Some(state) if funding.pool_id() != Some(state.pool_id) => {
@@ -1341,8 +1322,9 @@ fn seed_lane(
         return Ok((state, bytes, amount));
     }
     let pool_id = state.pool_id;
+    let deployment = state.deployment;
     let outcome = store
-        .seed_progress(state.owner, pool_id, lane, bytes, amount)
+        .seed_progress(deployment, state.owner, pool_id, lane, bytes, amount)
         .with_context(|| {
             format!(
                 "record the on-chain watermark of lane {} in pool {pool_id}",
@@ -1358,7 +1340,7 @@ fn seed_lane(
             Ok((state, bytes, amount))
         }
         AdvanceOutcome::Regressed(_) => {
-            let row = store.get_by_pool_id(pool_id)?.ok_or_else(|| {
+            let row = store.get_by_pool_id(deployment, pool_id)?.ok_or_else(|| {
                 anyhow::anyhow!("buyer row for pool {pool_id} vanished during a lane seed")
             })?;
             let progress = row.lane_progress(lane).ok_or_else(|| {
@@ -1575,7 +1557,7 @@ where
             // (`PoolFunder::recover`).
             let effect = topped_up_effect(state.pool_id, credited);
             if let Err(err) = grade_deposit_credit(
-                store.add_deposit(self_address, state.pool_id, credited),
+                store.add_deposit(state.deployment, self_address, state.pool_id, credited),
                 &effect,
                 tx,
             ) {
@@ -1587,7 +1569,7 @@ where
             // condition, not something to paper over with the pre-top-up
             // snapshot. A read that fails leaves the committed credit
             // standing.
-            return match store.get_by_pool_id(state.pool_id) {
+            return match store.get_by_pool_id(state.deployment, state.pool_id) {
                 Ok(Some(row)) => {
                     unrecorded.recorded();
                     Ok(row)

@@ -11,6 +11,10 @@ fn row(
     bytes: u64,
 ) -> SettlementRecord {
     SettlementRecord {
+        deployment: crate::Deployment {
+            chain_id: 421_614,
+            payment_pool: alloy::primitives::Address::repeat_byte(0x9c),
+        },
         block_number: block,
         log_index,
         tx_hash: B256::repeat_byte(u8::try_from(block % 256).unwrap_or(0)),

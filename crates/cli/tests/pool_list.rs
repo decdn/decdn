@@ -77,7 +77,13 @@ fn seed(data_dir: &std::path::Path, owner_byte: u8) {
 
 fn seed_corrupt(data_dir: &std::path::Path, pool_id: B256) {
     let store = RedbBuyerPoolStore::open(data_dir).unwrap();
-    store.insert_raw_buyer_record(pool_id, &[0u8; 8]).unwrap();
+    let deployment = decdn_incentive::Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(0x9c),
+    };
+    store
+        .insert_raw_buyer_record(deployment, pool_id, &[0u8; 8])
+        .unwrap();
 }
 
 /// Hermetic empty config so `load_file_config` never reads the developer's real
@@ -200,8 +206,7 @@ async fn list_with_data_dir_ignores_broken_config_env_expansion() {
 fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
     use decdn_node::pool_store::{BuyerPoolStoreHandle, PersistentPoolStateStore};
 
-    // The buyer table ignores the seller-side deployment stamp: each buyer row
-    // carries its own tag. The row below reuses this deployment for both.
+    // The store's seller side and the buyer row below share this deployment.
     let deployment = decdn_node::pool_store::Deployment {
         chain_id: 31_337,
         payment_pool: Address::repeat_byte(0x9c),

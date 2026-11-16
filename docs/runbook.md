@@ -992,27 +992,20 @@ identity rotation, host clock skew breaking TLS.
 
 ## Repointing at a redeployed PaymentPool
 
-**Changing `blockchain.payment_pool_address` or `blockchain.chain_id` drops
-seller payment state.** The lane store binds to one `PaymentPool` deployment
-(ADR 003 § Off-chain voucher state persistence): on the first boot against a
-different deployment the node deletes its seller lane frontiers, both
-pending-settle sets, the event-scan checkpoints, and the settlement ledger
-`decdn node earnings` reads, because their pool ids repeat on the new
-deployment. Unredeemed vouchers on the old deployment are forfeit after the
-drop, and the earnings history starts over: the `covered_from=<date>` that
-`decdn node earnings` prints is that boot. The old deployment's settlements
-are still on the chain:
-
-```bash
-decdn node earnings --address <operator> \
-  --payment-pool-address <old PaymentPool> --from-block <old deployment's L2 block>
-```
+Every row of the node's payment stores is keyed by its `PaymentPool`
+deployment: the payment chain id and the pool address (ADR 003 § Off-chain
+voucher state persistence). A pool id repeats across deployments, so the key
+keeps them apart. Changing a `[[blockchain.payment_chains]]` entry's `chain_id`
+or `payment_pools` therefore drops nothing: the node serves the pools now
+configured, and the rows of a pool no longer configured stay in `lanes.redb`,
+`settle.redb`, `checkpoint.redb` and `buyer.redb` untouched. Put the pool back
+in the list to redeem its unredeemed vouchers before its owner reclaims it.
 
 ## A settlement ledger row that does not decode
 
 `decdn node earnings` and `decdn node status` answer
 `settlement ledger load failed: corrupt record … settlement ledger row at block
-N log M does not decode` when a row in `settle.redb`'s `settlement_ledger_v1`
+N log M does not decode` when a row in `settle.redb`'s `settlement_ledger_v2`
 table is not in this binary's layout. The redeemer keeps landing redemptions
 and the watcher keeps its paid watermarks; only the earnings figures are
 affected, and the watcher's ledger backfill skips that block. The ledger shares
