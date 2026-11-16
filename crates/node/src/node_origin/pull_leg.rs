@@ -21,7 +21,7 @@
 //! - [`run_pull_leg`] — assembles the blob across the partial holders via the
 //!   ranged-drive loop (#1506): it plans the missing range into runs by coverage
 //!   ([`decdn_client::plan_covered_runs`]) and drives them in offset order,
-//!   opening ONE payment lane ([`NodeAdmitStore`] sink, [`PeerSource`],
+//!   opening ONE payment lane ([`CacheStore`] sink, [`PeerSource`],
 //!   [`CreditPacer`], [`super::funder::NodeFunder`]) per run and re-planning a non-terminal run
 //!   fault onto the survivors. It scores each provider as its run ends and records
 //!   the assembly's terminal outcome via the shared
@@ -60,7 +60,7 @@ use iroh::{EndpointAddr, PublicKey};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, debug, warn};
 
-use super::admit_store::NodeAdmitStore;
+use super::CacheStore;
 use super::backend_source::BackendSource;
 use super::funder::{SETTLE_POLL_STEP, settle_window};
 use super::ranged_pull::{AssembleOutcome, RecoveryEnd, RunOutcome, RunSink, assemble};
@@ -508,7 +508,7 @@ fn content_len(ranges: &ChunkRanges, total: u64) -> u64 {
 /// Three shapes reach the decoupled serve-miss pull leg, all provider corruption:
 ///
 /// - [`CacheError::VerifyFailed`] / [`CacheError::HashMismatch`] — the node's cache
-///   decoder ([`NodeAdmitStore`] → `admit_bao_stream`) rejected a chunk group or
+///   decoder ([`CacheStore`] → `admit_bao_stream`) rejected a chunk group or
 ///   the whole-blob root. This is how a wire-complete lie surfaces.
 /// - [`decdn_client::HashMismatch`] — the `decdn-client` decoder's typed
 ///   content-addressing sentinel, matched defensively for the paths that surface it
@@ -1150,11 +1150,11 @@ fn handshake_verdict(
 ///
 /// A blob can live spread across nodes — one holds discovery block 0, another
 /// block 1. The loop derives the still-missing gap from the shared
-/// [`NodeAdmitStore`], plans it into contiguous runs by each candidate's
+/// [`CacheStore`], plans it into contiguous runs by each candidate's
 /// probe-fresh coverage ([`decdn_client::plan_covered_runs`], concentrate +
 /// sticky), and drives the runs in offset order. Each run opens ONE buyer lane to
 /// its source — one `(signer, provider)` payment lane — and runs are SEQUENTIAL,
-/// so two lanes never pay at once. The [`NodeAdmitStore`], [`CreditPacer`], the
+/// so two lanes never pay at once. The [`CacheStore`], [`CreditPacer`], the
 /// downstream frontier reader and wait ([`DownstreamWait`]) are SHARED across
 /// every run, so the demand window is continuous: it is keyed on the downstream
 /// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
@@ -1242,8 +1242,9 @@ pub(crate) async fn run_pull_leg(
         }
     };
 
-    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)))
-        .counting_received(Arc::clone(&deps.metrics));
+    let admit_store = CacheStore::new(engine, hash, total_bytes)
+        .with_session(Some(Arc::clone(&session)))
+        .on_admitted(super::counting_received(&deps.metrics));
     // The credit pacer (ADR 003 § Credit Window / ADR 037), SHARED across every
     // run so the pull never runs further ahead of the downstream credit frontier
     // than its slack allows, in lockstep with the serve leg.
@@ -1376,7 +1377,7 @@ struct PeerRunSink<'a> {
     namespace_id: [u8; 32],
     total_bytes: u64,
     deadlines: PullDeadlines,
-    admit_store: &'a NodeAdmitStore,
+    admit_store: &'a CacheStore,
     pacer: &'a CreditPacer,
     /// The shared downstream wait, which is also the frontier reader every run's
     /// `drive` paces against, so the demand window is continuous across runs.
@@ -1972,7 +1973,8 @@ pub(crate) async fn run_local_pull_leg(
 ) {
     let hash_bytes = *hash.as_bytes();
 
-    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)));
+    let admit_store =
+        CacheStore::new(engine, hash, total_bytes).with_session(Some(Arc::clone(&session)));
 
     // The LOCAL bookkeeping axes (THE CRUX). The `ledger` is the SAME `Arc` the
     // source advances on `finish`, so the paid-frontier the gap loop reads for

@@ -24,7 +24,8 @@ Two passes:
   `sponsord` and `sponsord-onramp` servers. Their
   transitive normal and build dependencies must not include the blob store,
   the AWS SDK, the aws-lc crypto library or the JSON-RPC server
-  (MUST_NOT_LINK). The direct table cannot see this: `client → common` is
+  (MUST_NOT_LINK), except what MAY_LINK grants one of them: the CLI's gateway
+  cache is the blob store. The direct table cannot see this: `client → common` is
   allowed, so `common` quietly growing an `iroh-blobs` edge would pass the
   first pass and still put the blob store in the SDK and the CLI. The SDK is
   guarded on its own, not only through the CLI, because a third party links it
@@ -82,6 +83,7 @@ ALLOWED: dict[str, frozenset[str]] = {
     "decdn-cli": frozenset(
         {
             "decdn-bao-range",
+            "decdn-cache",
             "decdn-client",
             "decdn-common",
             "decdn-config-types",
@@ -103,13 +105,13 @@ ALLOWED: dict[str, frozenset[str]] = {
 }
 # Nothing may depend on these, dev-deps aside.
 SINKS = frozenset({"decdn-cli", "decdn-e2e", "sponsord", "sponsord-e2e"})
-# The publisher CLI and the client SDK are iroh-blobs-free and AWS-free (#578,
-# #1150): neither links a blob store or an S3 SDK, so `cargo install decdn-cli`
-# builds no such thing and a crate built on `decdn-client` inherits none. They
-# also link one TLS backend, ring, and no JSON-RPC server (#2454): aws-lc is a
-# second crypto library and a C build on every client target, and only the
-# daemon serves the admin RPC. The sponsord daemon and onramp are built on
-# the client SDK and the wire types, and ship the same way.
+# The client SDK is iroh-blobs-free and AWS-free (#578, #1150): it links no
+# blob store or S3 SDK, so a crate built on `decdn-client` inherits none. The
+# CLI links the blob store for `decdn gateway`'s cache (#2881) and no S3 SDK.
+# All of them link one TLS backend, ring, and no JSON-RPC server (#2454):
+# aws-lc is a second crypto library and a C build on every client target, and
+# only the daemon serves the admin RPC. The sponsord daemon and onramp are
+# built on the client SDK and the wire types, and ship the same way.
 FOOTPRINT_GUARDED = ("decdn-cli", "decdn-client", "sponsord", "sponsord-onramp")
 MUST_NOT_LINK = frozenset(
     {
@@ -125,6 +127,9 @@ MUST_NOT_LINK = frozenset(
 # By prefix: the AWS SDK's service and smithy crates, and aws-lc (`aws-lc-rs`,
 # `aws-lc-sys`, `aws-lc-fips-sys`).
 MUST_NOT_LINK_PREFIXES = ("aws-sdk-", "aws-smithy-", "aws-lc-")
+# What a guarded crate may link despite MUST_NOT_LINK: the CLI's gateway cache
+# is the blob store.
+MAY_LINK: dict[str, frozenset[str]] = {"decdn-cli": frozenset({"iroh-blobs"})}
 # A build script compiles the crate too, so a build-dependency is an edge the
 # design has to allow; only dev-dependencies are exempt.
 EDGE_KINDS = frozenset({None, "build"})
@@ -141,7 +146,9 @@ TREE_ARGS = (
 TREE_LINE = re.compile(r"(\d+)(\S+) v\S+")
 
 
-def is_forbidden(name: str) -> bool:
+def is_forbidden(name: str, root: str) -> bool:
+    if name in MAY_LINK.get(root, frozenset()):
+        return False
     return name in MUST_NOT_LINK or name.startswith(MUST_NOT_LINK_PREFIXES)
 
 
@@ -260,15 +267,15 @@ def check_closure(root: str, tree: str) -> list[str]:
             f"{root} has no dependencies in its `cargo tree` — the closure walk inspected nothing"
         )
     for name, via in sorted(parent.items()):
-        if is_forbidden(name):
+        if is_forbidden(name, root):
             path = [name]
             while via is not None:
                 path.append(via)
                 via = parent[via]
             errors.append(
-                f"{root} links {name} via " + " ← ".join(path) + " — the publisher CLI and "
-                "the client SDK link no blob store or AWS SDK (#578), and no aws-lc or "
-                "JSON-RPC server (#2454); the edge that introduced it must go"
+                f"{root} links {name} via " + " ← ".join(path) + " — the client SDK links "
+                "no blob store, the CLI and the SDK link no AWS SDK (#578), and none links "
+                "aws-lc or a JSON-RPC server (#2454); the edge that introduced it must go"
             )
     return errors
 

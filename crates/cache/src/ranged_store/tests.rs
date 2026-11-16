@@ -3,8 +3,8 @@ use crate::engine::CacheEngine;
 use iroh_blobs::Hash;
 
 /// The `hash`/`engine` accessors round-trip the values
-/// `new` was constructed with — the node-crate `NodeAdmitStore` wrapper
-/// reaches `admit_bao_stream` through these rather than duplicating the
+/// `new` was constructed with — `CacheStore` reaches
+/// `admit_bao_stream_until` through these rather than duplicating the
 /// `(engine, hash, total_bytes)` triple.
 #[tokio::test]
 async fn node_ranged_store_accessors_round_trip() {

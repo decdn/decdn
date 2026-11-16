@@ -53,6 +53,8 @@ it answers only a loopback `Host`. The series and the state are listed in
 
 The keystore under the volume funds the pool (`--working-deposit-micro-usdc` sizes it),
 and `gateway/store` under the same volume keeps the pool and its lanes across restarts.
+`gateway/cache` keeps what the gateway pulled, up to `--cache-mb` (10 GiB by default), and
+serves a repeat request from it with no pull and no allowance charge.
 `--allowance-bytes-per-day` bounds the bytes the gateway delivers per UTC day. A request
 past the allowance, or one whose size does not fit what is left, gets `402` with the
 canonical `decdn:` URI to fetch with a paying client; a pool that cannot pay gets `503`.

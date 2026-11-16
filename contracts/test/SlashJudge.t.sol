@@ -94,6 +94,16 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
         return unbondingPeriodValue;
     }
 
+    uint64 internal _pausedTotal;
+
+    function setPausedTotal(uint64 total) external {
+        _pausedTotal = total;
+    }
+
+    function pausedTotal() external view override returns (uint64) {
+        return _pausedTotal;
+    }
+
     function nodeIdOf(address operator) external view override returns (bytes32, bool) {
         bytes32 id = boundNodeId[operator];
         return (id, id != bytes32(0));
@@ -731,9 +741,11 @@ contract SlashJudgeTest is Test {
         // entry the node actually served is therefore out of scope -> NOT slashable.
         // Reconstructing the serve-time region would need multi-level history
         // (rejected on EIP-170 grounds); this pins the limitation so widening
-        // `regionPrev` history is a conscious change. In production the two flips are
-        // window-spaced, so this is reachable only when MAX_EVIDENCE_AGE_US exceeds
-        // the window; the mock isolates the scope logic from that spacing.
+        // `regionPrev` history is a conscious change. `CapacityBond` spaces the two
+        // flips at least one window apart on every path (`updateRegion` and a
+        // deregister/re-register cycle both enforce the cooldown, #2837), so this is
+        // reachable only when MAX_EVIDENCE_AGE_US exceeds the window; the mock
+        // isolates the scope logic from that spacing.
         uint64 nowSec = uint64(block.timestamp);
         uint64 responseTsSec = nowSec - 1 hours; // served while in us-east, before both flips
         uint64 effective = nowSec - 30 minutes; // most recent flip (eu-west -> ap-south)
@@ -1002,6 +1014,58 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
         vm.prank(challenger);
         vm.expectRevert();
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    /// @notice #2695: a SlashJudge pause longer than `maxEvidenceAge` does not
+    ///         void a pending offense. The paused time comes off the evidence
+    ///         age. A commitment does not outlive a pause longer than the reveal
+    ///         window, so the challenger re-commits after the unpause.
+    function test_pause_longerThanEvidenceAge_revealStillLands() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.RateManipulation);
+        _commitAs(challenger, evidenceHash);
+
+        vm.prank(pauser);
+        judge.pause();
+        vm.warp(block.timestamp + 6 days); // > MAX_EVIDENCE_AGE_US (5d)
+        vm.prank(pauser);
+        judge.unpause();
+        assertEq(judge.pausedTotal(), 6 days, "the pause is accumulated");
+
+        _commitAndMature(evidenceHash);
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1, "the offense survives the pause");
+    }
+
+    /// @notice A `CapacityBond` pause also blocks every reveal (its `slash` is
+    ///         `whenNotPaused`), so its `pausedTotal` comes off the age too.
+    function test_capacityBondPause_extendsEvidenceAge() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        vm.warp(block.timestamp + 6 days);
+        slasher.setPausedTotal(2 days);
+
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    /// @notice The credit is the paused time only: evidence older than
+    ///         `maxEvidenceAge` plus the paused time is still stale.
+    function test_pause_creditIsBounded() public {
+        uint256 nowUs = block.timestamp * 1_000_000;
+        uint64 oldProbe = uint64(nowUs - (8 days * 1_000_000));
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, oldProbe);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, oldProbe + 5_000_000);
+        slasher.setPausedTotal(2 days);
+        vm.prank(challenger);
+        vm.expectRevert(
+            abi.encodeWithSelector(SlashJudge.EvidenceTooOld.selector, uint256(6 days * 1_000_000), MAX_EVIDENCE_AGE_US)
+        );
         judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 

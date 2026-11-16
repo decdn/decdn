@@ -73,6 +73,14 @@ pub use crate::lane_sources::FaultContext;
 /// and `<hex>` once it is verified and before it lands at its paths.
 pub const STAGING_DIR: &str = ".decdn-partial";
 
+/// The largest bundle manifest a pull fetches, in bytes. A manifest fetch
+/// runs under this cap or the run's own blob cap, whichever is lower, so a
+/// blob that is not a manifest costs the fetch at most the cap in paid bytes.
+pub const MAX_MANIFEST_BYTES: usize = 64 << 20;
+
+/// [`MAX_MANIFEST_BYTES`] in MiB.
+pub const MAX_MANIFEST_MB: u64 = 64;
+
 /// Parse a BLAKE3 hash as a bundle manifest or a user names it: 64 hex
 /// characters, with an optional `0x` or `b3:` prefix.
 ///

@@ -766,17 +766,9 @@ impl VoucherProgress {
 /// message string. The `Display` text is kept stable for logs and the existing
 /// requester tests. The node's cache admit reports the same fault as
 /// `CacheError::VerifyFailed` / `CacheError::HashMismatch`, which `decdn-node`'s
-/// `is_bao_corruption` folds together with this type.
-#[derive(Debug)]
-pub struct HashMismatch;
-
-impl std::fmt::Display for HashMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("received bytes do not match requested hash")
-    }
-}
-
-impl std::error::Error for HashMismatch {}
+/// `is_bao_corruption` folds together with this type. Defined in
+/// `decdn-bao-range`, beside the store contract whose stores return it.
+pub use decdn_bao_range::HashMismatch;
 
 /// Reject a `total_bytes == 0` claim for a non-empty root as the typed
 /// [`HashMismatch`] (#1054).
@@ -899,33 +891,8 @@ impl std::fmt::Display for UnprovenSize {
 impl std::error::Error for UnprovenSize {}
 
 /// A blob size whose size proof verified against the blob's hash (ADR 005 §
-/// Bounded byte ranges). [`check_size_proof`] is the only way to make one, so
-/// a raw `u64` from a node never reaches planning, allocation, a cap or
-/// payment. Read the size with [`Self::get`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProvenSize(u64);
-
-impl ProvenSize {
-    /// The size in bytes.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    /// Take `size` as proven with no proof. Only tests build one this way:
-    /// their fixtures know the true size of the blobs they make.
-    #[cfg(any(test, feature = "test-util"))]
-    #[must_use]
-    pub const fn assume_for_tests(size: u64) -> Self {
-        Self(size)
-    }
-}
-
-impl std::fmt::Display for ProvenSize {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
+/// Bounded byte ranges); [`check_size_proof`] makes one from a node's proof.
+pub use decdn_bao_range::ProvenSize;
 
 /// Check that `proof` proves that the blob with hash `hash` is the size the
 /// proof states. Every size a node states is a proof, and passes through here
@@ -939,11 +906,7 @@ pub fn check_size_proof(
     proof: &decdn_protocol::SizeProof,
 ) -> Result<ProvenSize, UnprovenSize> {
     let total_bytes = proof.size();
-    if decdn_bao_range::verify_size_proof(hash, total_bytes, proof.as_bytes()) {
-        Ok(ProvenSize(total_bytes))
-    } else {
-        Err(UnprovenSize { total_bytes })
-    }
+    ProvenSize::verify(hash, total_bytes, proof.as_bytes()).ok_or(UnprovenSize { total_bytes })
 }
 
 impl std::fmt::Display for BlobTooLarge {

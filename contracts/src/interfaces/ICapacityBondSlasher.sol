@@ -37,4 +37,9 @@ interface ICapacityBondSlasher {
     /// @notice Unbonding window in seconds. Read by `setMaxEvidenceAge` and the
     ///         constructor to enforce `maxEvidenceAgeUs < unbondingPeriod * 1e6`.
     function unbondingPeriod() external view returns (uint256);
+
+    /// @notice Seconds `CapacityBond` (and, credited to it, `SlashAppeal`) has
+    ///         spent paused. `SlashJudge` takes it off the evidence age, since a
+    ///         paused `slash` blocks every reveal.
+    function pausedTotal() external view returns (uint64);
 }

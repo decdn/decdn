@@ -479,9 +479,13 @@ pub(crate) fn contiguous_byte_ranges(ranges: &ChunkRanges, total_bytes: u64) -> 
     let boundaries = ranges.boundaries();
     let mut out = Vec::new();
     let mut it = boundaries.iter();
-    while let (Some(a), Some(b)) = (it.next(), it.next()) {
+    while let Some(a) = it.next() {
         let start = a.0.saturating_mul(CHUNK_BYTES).min(total_bytes);
-        let end = b.0.saturating_mul(CHUNK_BYTES).min(total_bytes);
+        // A span with no end runs to the end of the blob: the cache's bitfield
+        // gives the span that holds the last chunk an open end.
+        let end = it.next().map_or(total_bytes, |b| {
+            b.0.saturating_mul(CHUNK_BYTES).min(total_bytes)
+        });
         if end > start {
             out.push((start, end - start));
         }

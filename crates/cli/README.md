@@ -23,9 +23,9 @@ decdn config init --chain arbitrum-sepolia
 Container images are published as `ghcr.io/decdn/decdn` and `decdn/decdn`, with `decdn` as
 the entrypoint.
 
-Deliberately links no blob store and no AWS SDK: the range verification the publish path
-needs lives in the `iroh-blobs`-free `decdn-bao-range`, reached through
-`decdn-client`.
+Links no AWS SDK. The range verification the publish and fetch paths need lives in the
+`iroh-blobs`-free `decdn-bao-range`, reached through `decdn-client`. The one blob store it
+links is the `decdn gateway` cache, `decdn-cache` without its `s3` feature.
 
 ## License
 

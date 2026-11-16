@@ -36,6 +36,12 @@ fn the_allowance_defaults_to_one_gib_and_needs_the_public_url() {
 }
 
 #[test]
+fn the_cache_defaults_to_ten_gib_and_zero_turns_it_off() {
+    assert_eq!(parse(&[]).unwrap().cache_mb, 10_240);
+    assert_eq!(parse(&["--cache-mb", "0"]).unwrap().cache_mb, 0);
+}
+
+#[test]
 fn a_malformed_public_url_or_allowance_is_refused() {
     assert!(parse(&["--public-url", "not a url"]).is_err());
     for bad in ["", "x", "1XiB"] {

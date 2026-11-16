@@ -516,6 +516,24 @@ async fn create_parent(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A base directory removed after construction is a permanent fault, not an
+/// absence of every hash: a probe of one hash between rescans surfaces it.
+#[tokio::test]
+async fn a_vanished_base_is_permanent_not_absent() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let base = parent.path().join("origin");
+    tokio::fs::create_dir_all(&base).await?;
+    let origin = FilesystemOrigin::new(&base).await?;
+    let hash = Hash::new(b"vanished-base");
+    anyhow::ensure!(
+        origin.size(hash).await?.is_none(),
+        "a missing hash under a present base is an absence"
+    );
+
+    tokio::fs::remove_dir_all(&base).await?;
+    ensure_permanent("size", origin.size(hash).await.err(), "no longer exists")
+}
+
 /// Require a `Permanent` error whose message carries `needle`.
 fn ensure_permanent(what: &str, err: Option<OriginPullError>, needle: &str) -> anyhow::Result<()> {
     let err = err.ok_or_else(|| anyhow::anyhow!("{what}: expected an error"))?;

@@ -57,8 +57,8 @@ use decdn_client::targets::{
 use decdn_client::{
     Connections, CredentialSlot, DownloadTarget, Downloader, Holder, LaneLedgers,
     NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerStore, PoolContext, PoolReplaced,
-    ProgressCallback, ProgressClock, PullConfig, PullDeadlines, RecoveryGate, StopPolicy, Streamer,
-    UpstreamRefused, UpstreamVoucherRejected,
+    ProgressCallback, ProgressClock, PullConfig, PullDeadlines, RecoveryGate, ScratchStores,
+    StopPolicy, StreamStores, Streamer, UpstreamRefused, UpstreamVoucherRejected,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -517,8 +517,10 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 }
 
 /// The largest bundle manifest that the gateway and
-/// `decdn get decdn:<hash>/<path> -o -` read into memory.
-pub(crate) const MAX_MANIFEST_BYTES: usize = 64 << 20;
+/// `decdn get decdn:<hash>/<path> -o -` read into memory, in bytes and in MiB
+/// (the unit of `--max-blob-mb`). A bundle pull's manifest fetch takes the
+/// same cap.
+pub(crate) use decdn_client::bundle::{MAX_MANIFEST_BYTES, MAX_MANIFEST_MB};
 
 /// The context of a [`MalformedManifest`] error: the raw blob is the same
 /// manifest bytes, so only the publisher can fix it.
@@ -537,9 +539,6 @@ where
         err.context(not_a_manifest)
     }
 }
-
-/// [`MAX_MANIFEST_BYTES`] in MiB, the unit of `--max-blob-mb`.
-pub(crate) const MAX_MANIFEST_MB: u64 = 64;
 
 /// The `--max-blob-mb` a manifest fetch runs with, given the caller's. The cap
 /// bounds what the lanes request, and so pay for, to the largest manifest.
@@ -855,6 +854,10 @@ pub(crate) struct FetchHost {
     /// The proven sizes of blobs fetches on this host learned, up to
     /// [`MAX_SIZE_HINTS`].
     sizes: Mutex<SizeHints>,
+    /// Where a streamed fetch fills: the gateway's cache, so a later request
+    /// for the blob is served from it, or `None` for a scratch directory the
+    /// stream removes when it ends.
+    stream_cache: Option<CacheStores>,
 }
 
 /// The most blob sizes a [`FetchHost`] remembers.
@@ -969,8 +972,16 @@ impl FetchHost {
             escrows: UnconfirmedEscrows::default(),
             token: tokio::sync::OnceCell::new(),
             sizes: Mutex::new(SizeHints::default()),
+            stream_cache: None,
         };
         Ok((host, grant))
+    }
+
+    /// Fill every streamed fetch on this host into `cache` rather than a
+    /// scratch directory.
+    pub(crate) fn with_stream_cache(mut self, cache: Option<CacheStores>) -> Self {
+        self.stream_cache = cache;
+        self
     }
 
     /// The buyer-pool store every fetch on this host records into.
@@ -1215,6 +1226,7 @@ pub(crate) async fn fetch_on(
         escrows,
         token,
         sizes,
+        stream_cache,
     } = host;
     let hash = args.hash;
     let common = &args.common;
@@ -1439,6 +1451,7 @@ pub(crate) async fn fetch_on(
                     (common.max_sources, args.read_ahead, args.range, timings),
                     args.progress.as_deref(),
                     &mut *sink,
+                    stream_cache.as_ref(),
                 )
                 .await
             } else {
@@ -1699,18 +1712,19 @@ fn stream_scratch<P>(deps: &LaneDeps<'_, P>) -> anyhow::Result<tempfile::TempDir
     tempfile::tempdir_in(&deps.site.data_dir).context("open stream scratch dir")
 }
 
-/// A [`Streamer`] over `sources`, from `holders`, filling into `scratch`.
-fn streamer_over<'a, 'b, P>(
+/// A [`Streamer`] over `sources`, from `holders`, filling the stores `stores`
+/// opens.
+fn streamer_over<'a, 'b, P, O>(
     deps: &LaneDeps<'_, P>,
     sources: &'a LaneSources<'b, P>,
     holders: Vec<Holder>,
     health: Arc<PeerHealth>,
-    scratch: &'a Path,
-) -> Streamer<'a, &'a LaneSources<'b, P>, PoolFunder<'a, P>>
+    stores: O,
+) -> Streamer<'a, &'a LaneSources<'b, P>, PoolFunder<'a, P>, O>
 where
     P: alloy::providers::Provider + Clone,
 {
-    let mut streamer = Streamer::new(sources, sources.funder(), scratch)
+    let mut streamer = Streamer::with_stores(sources, sources.funder(), stores)
         .holders(holders)
         .health(health)
         .recovery(Arc::clone(sources.recovery()))
@@ -1738,6 +1752,10 @@ fn stream_read_ahead(read_ahead: Option<u64>) -> u64 {
 /// only when stderr is a terminal; stdout carries nothing but the verified
 /// bytes. The caller persists each lane's voucher watermark after the stream.
 /// Returns the verified bytes streamed.
+///
+/// The stream fills `stream_cache` when the host has one, so the bytes it
+/// pays for stay for a later request; otherwise a scratch directory under the
+/// data dir that it removes when it ends.
 #[allow(clippy::too_many_arguments)]
 async fn stream_out<P>(
     deps: &LaneDeps<'_, P>,
@@ -1755,6 +1773,7 @@ async fn stream_out<P>(
     ),
     also: Option<&ProgressCallback>,
     sink: &mut Sink,
+    stream_cache: Option<&CacheStores>,
 ) -> anyhow::Result<u64>
 where
     P: alloy::providers::Provider + Clone,
@@ -1762,8 +1781,32 @@ where
     let pull_config = PullConfig::new()
         .with_streamer_lane_cap(max_sources.max(1))
         .with_read_ahead_bytes(stream_read_ahead(read_ahead));
-    let scratch = stream_scratch(deps)?;
-    let streamer = streamer_over(deps, sources, holders, health, scratch.path());
+    let what = (hash, total_bytes, range, stop);
+    if let Some(stores) = stream_cache {
+        let streamer = streamer_over(deps, sources, holders, health, stores.clone());
+        copy_stream(streamer, what, &pull_config, (timings, also), sink).await
+    } else {
+        let scratch = stream_scratch(deps)?;
+        let stores = ScratchStores::new(scratch.path());
+        let streamer = streamer_over(deps, sources, holders, health, stores);
+        copy_stream(streamer, what, &pull_config, (timings, also), sink).await
+    }
+}
+
+/// Open `streamer` on `hash` (the byte window `range`, or the whole blob) and
+/// copy its verified bytes to `sink`, as [`stream_out`] describes.
+async fn copy_stream<Pv, F, O>(
+    streamer: Streamer<'_, Pv, F, O>,
+    (hash, total_bytes, range, stop): ([u8; 32], ProvenSize, Option<(u64, u64)>, StopPolicy),
+    pull_config: &PullConfig,
+    (timings, also): (&FetchTimings, Option<&ProgressCallback>),
+    sink: &mut Sink,
+) -> anyhow::Result<u64>
+where
+    Pv: decdn_client::SourceProvider,
+    F: decdn_client::Funder,
+    O: StreamStores,
+{
     // A window streams exactly its bytes, paid for by the aligned span around
     // them; the whole blob otherwise.
     let (mut reader, mut drive) = match range {
@@ -1773,7 +1816,7 @@ where
                     hash,
                     total_bytes,
                     window,
-                    &pull_config,
+                    pull_config,
                     Arc::new(NoCache),
                     stop,
                 )
@@ -1781,7 +1824,7 @@ where
         }
         None => {
             streamer
-                .open(hash, total_bytes, &pull_config, Arc::new(NoCache), stop)
+                .open(hash, total_bytes, pull_config, Arc::new(NoCache), stop)
                 .await?
         }
     };
@@ -2164,6 +2207,9 @@ pub(crate) fn resolve_delegation_grant(
     }
     Ok(grant)
 }
+
+mod cache_store;
+pub(crate) use cache_store::CacheStores;
 
 #[cfg(test)]
 #[allow(
