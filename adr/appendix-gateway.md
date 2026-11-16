@@ -16,9 +16,9 @@ A client that holds no key, no USDC and no `decdn` binary cannot fetch from
 the network. A publisher has no URL to put in a release note. The public
 gateway gives them one. It is the loopback gateway of
 [Directory Bundles](appendix-bundles.md#appendix-directory-bundles) with no
-token, and an allowance that bounds what it spends. Both gateways pay with
-the [capabilities](#capabilities) that pool owners register. A public
-gateway that names a keystore also pays from the operator's own pool.
+token. Both gateways pay only with the [capabilities](#capabilities) that
+pool owners register. A gateway holds no keystore, no pool and no payment
+state on disk. The caps of its capabilities bound what it spends.
 
 ## Capabilities
 
@@ -92,36 +92,17 @@ host on the Public Suffix List.
 The API (`/_delegate`, `/_capability`, `/_pointer` and
 [`/_status`](#state)) answers on the bare host only. On every other host it
 answers 404. `/` keeps its short page.
-The browser's `Sec-Fetch-*` headers decide nothing: the gateway pays, within
-the allowance. A `/_decdn/` request with no `Sec-Fetch-Mode` is a navigation.
+The browser's `Sec-Fetch-*` headers decide nothing: the gateway pays. A
+`/_decdn/` request with no `Sec-Fetch-Mode` is a navigation.
 
-## Payment and allowance
+## Payment
 
-Each pull pays with the first [capability](#capabilities) that can pay. When
-no capability can pay, the pull pays from the operator's pool. The gateway
-has a pool only when the operator names a keystore (`--keystore` or
-`blockchain.eth_keystore`). Without a keystore, the gateway pays with
-capabilities only. The pull worker builds one payer from the keystore when
-the gateway starts, and every pool pull shares it. Pool open and top-up run
-inside the pull path ([ADR 003](003-payments.md#adr-003-payment-model)). A
-gateway with a pool keeps its buyer store in `<data-dir>/store`. A gateway
-without one keeps the store only while it runs, as its keys live in memory.
-
-`--allowance-bytes-per-day` bounds the bytes the gateway delivers per UTC
-day, over every request. The namespace hint buys no bucket of its own: a
-client sets it. `--allowance <ns>=<bytes>` gives one namespace a bucket of
-its own. That bucket replaces the shared one for the requests the
-namespace's pointer serves, on `<ns>.<host>`, and for those alone. A pointer
-is signed by the namespace's owner, so a request on that host is the
-namespace's. A `?ns=` query or a `<ns>.<hash32>.` label is anyone's to
-write, so it spends the shared bucket. The gateway counts:
-
-- every byte a pull lands, a manifest that does not parse included;
-- an entry's declared size or a raw blob's verified size before its pull,
-  and refuses one that does not fit;
-- the chunk-group-aligned span of a range, not the window alone;
-- a bound of what a pull may have paid past the frames it delivered, when a
-  response does not end whole.
+Each pull pays with the first [capability](#capabilities) that can pay. The
+pulls under one capability that run at one time share one payer. The buyer
+store lives in a directory that the gateway removes when it stops, because
+the keys whose lanes it records live in memory. A pull keeps a small
+read-ahead, so a client that drops a response leaves little paid and not
+delivered.
 
 An entry's pull is capped at the size its manifest declares. A manifest
 cannot make the gateway pay for more than it says. An entry whose pull, by
@@ -139,8 +120,8 @@ needs no pull.
 Before it answers a raw blob of unknown size, the gateway learns its size. It
 resolves the holders of the blob and takes the first size that one of them
 proves: a probe answer, or the header of an open of the blob's first byte.
-That open pays for one chunk group at most, and the lookup charges the
-allowance nothing. The gateway keeps the size as a verified size. A
+That open pays for one chunk group at most. The gateway keeps the size as a
+verified size. A
 response whose pull passes `--max-blob-mb` answers 413 before any pull. The
 pull is the whole blob, or the chunk-group span of the one `Range`, so a
 range of a large blob is served. A
@@ -151,18 +132,17 @@ A blob that is not a manifest does not become one. Its hash fixes its bytes.
 The manifest cap stops a pull only on verified bytes or a proven size. The
 gateway keeps up to 1024 such hashes. It drops the least recently used hash
 first. A repeat request for a kept hash as a bundle answers 404 and starts no
-pull. The gateway does not keep a pull that fails upstream, on funding or on
-the allowance.
+pull. The gateway does not keep a pull that fails upstream or on funding.
 
 The answers:
 
 | Status | When | Carries |
 |--------|------|---------|
-| 402 | The allowance is spent, or the request does not fit what is left. | `Retry-After`, `Link: <decdn:…>; rel="alternate"`, JSON `{"error", "uri", "retry_after_secs"}` |
-| 503 | Nothing the gateway holds can pay. | The same as 402. |
+| 503 | No capability that the gateway holds can pay, and the cache does not hold the response. | `Retry-After: 60`, `Link: <decdn:…>; rel="alternate"`, JSON `{"error", "uri", "retry_after_secs"}` |
 | 502 | The upstream pull failed. | A bare body. The detail is in the log. |
 
-A paying client continues from the `decdn:` URI on its own.
+A paying client continues from the `decdn:` URI on its own. A loopback
+gateway answers 402 with a text body when no capability can pay.
 
 ## Namespace pointer
 
@@ -247,9 +227,9 @@ BEP 19 webseed is a plain URL with ranges, so it needs nothing more.
 `HEAD` on an entry answers from the bundle manifest: the entry's length and
 hash, at no pull of the entry. `HEAD` on a raw blob, on the bare host or under
 a site's `/_decdn/`, answers from the verified size, at no pull. `HEAD` on a
-raw blob of unknown size learns its size first, as its `GET` does. A spent
-allowance refuses the `HEAD` with 402. A fault that ends the size lookup ends the
-`HEAD` with the status that it gives a `GET`. `HEAD`
+raw blob of unknown size learns its size first, as its `GET` does. A fault
+that ends the size lookup ends the `HEAD` with the status that it gives a
+`GET`. `HEAD`
 of a bundle or an entry under a site's `/_decdn/` redirects to the site of
 that bundle.
 
@@ -265,8 +245,8 @@ Every answer carries `Access-Control-Allow-Origin: *`.
 `ETag`, `Retry-After` and `Link`. The gateway does not encode a body. A proxy
 in front of it can. `Content-Encoding` then tells a page that
 `Content-Length` counts the encoded bytes. A page can also read a refusal. A
-402 or 503 answer names the `decdn:` URI to fetch elsewhere, in its body and
-in `Link`.
+503 answer names the `decdn:` URI to fetch elsewhere, in its body and in
+`Link`.
 
 `OPTIONS` on a known host is a preflight. A preflight pulls nothing. It
 counts as an ok answer in the metrics. On a content path the answer is 204,
@@ -297,10 +277,8 @@ that a holder proved.
 A request is a cache hit when the cache holds every byte of the response:
 the whole blob, or the chunk groups of its one `Range`. The cache must also
 hold the blob under the size that the response states. The gateway serves a
-hit from the cache. A hit starts no pull, spends no capability and charges
-the allowance nothing. The allowance meters what the gateway pays for, and a
-hit pays for nothing. Thus a hit is served when the allowance is spent, and
-when no capability can pay. A blob that the
+hit from the cache. A hit starts no pull and spends no capability. Thus a hit
+is served when no capability can pay. A blob that the
 cache holds whole answers `HEAD` with its length, and needs no size lookup.
 
 A bundle manifest that the cache holds whole is read from the cache, with no
@@ -308,8 +286,7 @@ pull. Thus a site entry, or the `index.html` at a site's `/`, is a hit when
 the cache holds the manifest and the entry.
 
 A request that the cache holds only in part is not a hit. It streams as a
-pull, and the allowance charges it as a pull. The pull fetches only the
-chunk groups that the cache does not hold.
+pull. The pull fetches only the chunk groups that the cache does not hold.
 
 The eviction loop of the node runs on the cache. It keeps the cache under
 `--cache-mb` (10240 by default). It also keeps the free-disk margin of the
@@ -350,12 +327,12 @@ start.
 | `decdn_gateway_requests_ok_total` | counter | Answers with success or a redirect. |
 | `decdn_gateway_requests_not_found_total` | counter | Answers 404. |
 | `decdn_gateway_requests_refused_total` | counter | Answers refused before a pull: an unknown host, a missing token, a bad URI, a method, a range past the end. |
-| `decdn_gateway_requests_allowance_exhausted_total` | counter | Answers 402. On a public gateway, the allowance of the day is spent. On a loopback gateway, no capability can pay. |
-| `decdn_gateway_pull_failures_funding_total` | counter | Answers 503. |
+| `decdn_gateway_requests_payment_required_total` | counter | Answers 402: a loopback gateway holds no capability that can pay. |
+| `decdn_gateway_pull_failures_funding_total` | counter | Answers 503: a public gateway holds no capability that can pay. |
 | `decdn_gateway_pull_failures_other_total` | counter | Answers 502. |
 | `decdn_gateway_pulls_active` | gauge | Pulls handed to the worker and not yet ended. |
 | `decdn_gateway_pointer_updates_total` | counter | Namespace pointers stored through `PUT /_pointer`. |
-| `decdn_gateway_cache_hits_total` | counter | Responses served from the cache, with no pull and no allowance charge (see [Cache](#cache)). |
+| `decdn_gateway_cache_hits_total` | counter | Responses served from the cache, with no pull (see [Cache](#cache)). |
 
 The exposition is for the operator's scraper. The listener takes a loopback
 address only.
@@ -382,28 +359,22 @@ when the operator sets it. It needs no token in either place.
 | `started_unix`, `uptime_secs`, `listen` | When the gateway started, and its main listen address. |
 | `chain_id`, `payment_pool` | The deployment the gateway pays on. |
 | `counters` | The [metrics](#metrics) series, each by its name without the `decdn_gateway_` prefix and the `_total` suffix. |
-| `active_pulls` | Each pull in flight: blob hash, namespace, byte window, payer (the pool, or a capability by its key and pool), age, bytes delivered. |
+| `active_pulls` | Each pull in flight: blob hash, namespace, byte window, payer (the capability, by its key and pool), age, bytes delivered. |
 | `capabilities` | The registered capabilities, in the shape and order of `GET /_capability`. |
-| `allowance` | A public gateway's buckets: the shared bucket first, then each namespace. Each has its bytes per day (`null` for no bound), the bytes delivered today, the bytes left (`null` for no bound) and the seconds until the UTC day turns. `null` on loopback. |
 | `pointers` | A public gateway's namespace pointers: namespace, root, `seq`, signer. `null` on loopback. |
-| `pools` | The buyer-pool store: each pool with its deposit, its spend and its lanes, and the lanes of each registered capability's key. Each key also has its spend and its bytes. These include the pulls in flight. |
+| `pools` | The buyer-pool store: the lanes of each registered capability's key, with the key's spend and bytes. These include the pulls in flight. |
 | `pool_error` | Why `pools` is `null`. The text has its secrets removed. |
 
 Each kind of value has one spelling. An address is EIP-55 checksummed hex, as
 `GET /_capability` writes it. A pool id is `0x` hex. A content hash is bare
 hex, as a gateway URL carries it.
 
-The pool spend is the pool's spend as the store knows it: the lanes of the
-store plus the spend that other signers redeemed. The spend is a lower bound.
-A voucher that another signer issued and that no provider redeemed is not in
-it. Thus all signers of the pool can still spend at most the deposit less
-the spend. `decdn dashboard` shows that value as an upper bound. The store
-keeps the lanes of capabilities apart from the pool rows, so `pools` lists
-them per key and pool.
+A key's spend is what it signed for on this gateway. Other signers of the
+same pool spend from it too, so the pool can hold less than the cap less the
+spend. The capability's `cap` bounds the key's spend over every gateway.
 
 The pull worker owns the store and reads it. The store holds what each pull
-wrote when it ended. Thus the lanes and the pool rows in `pools` lag the
-pulls in flight. A key's spend and bytes include the pulls in flight. For
+wrote when it ended. Thus the lanes in `pools` lag the pulls in flight. A key's spend and bytes include the pulls in flight. For
 each lane, the gateway uses the larger of two values: the stored value, and
 the value in the live voucher ledger of a pull in flight. The gateway reads
 the live ledgers before the store, so a pull that ends during the read is
@@ -420,8 +391,8 @@ answers 403. A public gateway's `/_status` is readable by every origin.
   Two gateways may hold different pointers for one namespace; the publisher
   points each.
 - A token on the public gateway.
-- A bucket per client-supplied namespace hint. The hint is not a trust
-  anchor.
+- A keystore, a pool or a daily allowance on the gateway. An operator funds
+  a gateway from outside, with capabilities, and the caps bound its spend.
 - A capability chosen per page or per host. The gateway pays every pull with
   the capabilities it holds, in the order of registration.
 - Keys that outlive a restart. The operator's controller provisions them

@@ -12,7 +12,6 @@ import type {
   RunningPull,
 } from "./api";
 import {
-  buckets,
   capabilities,
   earningsRows,
   gatewayLine,
@@ -47,7 +46,7 @@ function status(overrides: Partial<GatewayStatus> = {}): GatewayStatus {
       requests_ok: 0,
       requests_not_found: 0,
       requests_refused: 0,
-      requests_allowance_exhausted: 0,
+      requests_payment_required: 0,
       pull_failures_funding: 0,
       pull_failures_other: 0,
       pulls_active: 0,
@@ -56,7 +55,6 @@ function status(overrides: Partial<GatewayStatus> = {}): GatewayStatus {
     },
     active_pulls: [],
     capabilities: [],
-    allowance: null,
     pointers: null,
     pools: null,
     pool_error: null,
@@ -141,7 +139,7 @@ describe("capabilities", () => {
             hash: "ab",
             namespace: null,
             range: null,
-            payer: { kind: "capability", signer: signer.toLowerCase(), pool },
+            payer: { signer: signer.toLowerCase(), pool },
             since_secs: 1,
             delivered_bytes: 0,
           },
@@ -149,7 +147,7 @@ describe("capabilities", () => {
             hash: "cd",
             namespace: null,
             range: null,
-            payer: { kind: "pool" },
+            payer: { signer: "0x99", pool },
             since_secs: 1,
             delivered_bytes: 0,
           },
@@ -211,40 +209,6 @@ describe("capabilities", () => {
     );
     expect(rows[0]?.spentMicro).toBeNull();
     expect(rows[0]?.used).toBeNull();
-  });
-});
-
-describe("buckets", () => {
-  it("labels the shared bucket and each namespace, and leaves an unbounded one unmetered", () => {
-    const rows = buckets(
-      status({
-        mode: "public",
-        allowance: [
-          {
-            namespace: null,
-            per_day: 1_000,
-            used: 250,
-            remaining: 750,
-            resets_in_secs: 60,
-          },
-          {
-            namespace: 7,
-            per_day: null,
-            used: 0,
-            remaining: null,
-            resets_in_secs: 60,
-          },
-        ],
-      }),
-    );
-    expect(rows.map((r) => [r.label, r.used])).toEqual([
-      ["Shared", 0.25],
-      ["Namespace 7", null],
-    ]);
-  });
-
-  it("is empty on a loopback gateway", () => {
-    expect(buckets(status())).toEqual([]);
   });
 });
 
@@ -653,8 +617,8 @@ describe("gatewayShapeProblem", () => {
     expect(gatewayShapeProblem({ ...status(), capabilities: undefined })).toBe(
       "capabilities is not a list",
     );
-    expect(gatewayShapeProblem({ ...status(), allowance: {} })).toBe(
-      "allowance is not a list",
+    expect(gatewayShapeProblem({ ...status(), pointers: {} })).toBe(
+      "pointers is not a list",
     );
     expect(gatewayShapeProblem({ ...status(), pools: { pools: [] } })).toBe(
       "pools is not a pool snapshot",

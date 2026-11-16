@@ -9,7 +9,6 @@ import { describe, expect, it } from "vitest";
 import type {
   ActivePull,
   BucketStat,
-  Bucket,
   BuyerLaneSnapshot,
   BuyerPoolSnapshot,
   BuyerPoolsResponse,
@@ -33,6 +32,7 @@ import type {
   Paid,
   Part,
   PendingRedeem,
+  Payer,
   Pointer,
   Pool,
   PoolSnapshot,
@@ -56,7 +56,6 @@ import loopback from "./fixtures/status-loopback.json";
 import poolError from "./fixtures/status-pool-error.json";
 import publicStatus from "./fixtures/status-public.json";
 import {
-  buckets,
   capabilities,
   earningsRows,
   gatewayLine,
@@ -65,7 +64,6 @@ import {
   nodeView,
   partNote,
   poolRows,
-  pools,
   recentPulls,
   unreadableView,
 } from "./view";
@@ -98,7 +96,6 @@ const STATUS: Keys<GatewayStatus> = {
   counters: true,
   active_pulls: true,
   capabilities: true,
-  allowance: true,
   pointers: true,
   pools: true,
   pool_error: true,
@@ -108,7 +105,7 @@ const COUNTERS: Keys<Counters> = {
   requests_ok: true,
   requests_not_found: true,
   requests_refused: true,
-  requests_allowance_exhausted: true,
+  requests_payment_required: true,
   pull_failures_funding: true,
   pull_failures_other: true,
   pulls_active: true,
@@ -130,13 +127,7 @@ const CAPABILITY: Keys<Capability> = {
   signer: true,
   spent: true,
 };
-const BUCKET: Keys<Bucket> = {
-  namespace: true,
-  per_day: true,
-  used: true,
-  remaining: true,
-  resets_in_secs: true,
-};
+const PAYER: Keys<Payer> = { pool: true, signer: true };
 const POINTER: Keys<Pointer> = {
   namespace: true,
   root: true,
@@ -398,15 +389,9 @@ function expectStatus(raw: unknown) {
   expectShape(s.counters, COUNTERS, "counters");
   for (const p of s.active_pulls) {
     expectShape(p, PULL, "active_pulls[]");
-    expect(["pool", "capability"]).toContain(p.payer.kind);
-    expectShape(
-      p.payer,
-      p.payer.kind === "pool" ? { kind: 1 } : { kind: 1, pool: 1, signer: 1 },
-      "payer",
-    );
+    expectShape(p.payer, PAYER, "payer");
   }
   s.capabilities.forEach((c) => expectShape(c, CAPABILITY, "capabilities[]"));
-  s.allowance?.forEach((b) => expectShape(b, BUCKET, "allowance[]"));
   s.pointers?.forEach((p) => expectShape(p, POINTER, "pointers[]"));
   if (s.pools) {
     expectShape(s.pools, SNAPSHOT, "pools");
@@ -625,14 +610,15 @@ describe("the gateway's /_status fixtures", () => {
     const s = expectStatus(publicStatus);
     expect(s.mode).toBe("public");
     expect(s.active_pulls[0]?.range).toEqual([1_048_576, 4_194_304]);
-    expect(pools(s)[0]).toMatchObject({ headroom: 6_750_000 });
-    expect(buckets(s).map((b) => b.label)).toEqual(["Shared", "Namespace 9"]);
+    expect(capabilities(s)[0]).toMatchObject({
+      spentMicro: 3_250_000,
+      inFlight: 1,
+    });
   });
 
   it("match api.ts on a loopback gateway, and tie a capability to its key's lanes", () => {
     const s = expectStatus(loopback);
     expect(s.mode).toBe("loopback");
-    expect(s.allowance).toBeNull();
     expect(s.pointers).toBeNull();
     expect(capabilities(s)[0]).toMatchObject({
       spentMicro: 1_250_000,

@@ -7,9 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::B256;
-use decdn_common::admin::{BuyerLaneSnapshot, BuyerPoolSnapshot, BuyerPoolsResponse};
+use decdn_common::admin::{BuyerLaneSnapshot, BuyerPoolsResponse};
 
-use super::super::allowance::BucketView;
 use super::super::metrics::Counters;
 use super::super::pointer::Held;
 use super::super::worker::{DelegateLanes, PoolSnapshot};
@@ -50,7 +49,7 @@ fn counters() -> Counters {
         requests_ok: 128_400,
         requests_not_found: 312,
         requests_refused: 41,
-        requests_allowance_exhausted: 7,
+        requests_payment_required: 7,
         pull_failures_funding: 1,
         pull_failures_other: 3,
         pulls_active: 2,
@@ -80,7 +79,6 @@ fn base(mode: Mode) -> Status {
         counters: counters(),
         active_pulls: Vec::new(),
         capabilities: Vec::new(),
-        allowance: None,
         pointers: None,
         pools: None,
         pool_error: None,
@@ -95,26 +93,20 @@ fn a_public_status_keeps_its_shape() {
             hash: alloy::hex::encode([0xea; 32]),
             namespace: Some(7),
             range: Some((1_048_576, 4_194_304)),
-            payer: PayerLabel::Pool,
+            payer: PayerLabel {
+                signer: DELEGATE,
+                pool,
+            },
             since_secs: 12,
             delivered_bytes: 3_400_000,
         }],
-        allowance: Some(vec![
-            BucketView {
-                namespace: None,
-                per_day: Some(21_474_836_480),
-                used: 17_179_869_184,
-                remaining: Some(4_294_967_296),
-                resets_in_secs: 30_000,
-            },
-            BucketView {
-                namespace: Some(9),
-                per_day: None,
-                used: 0,
-                remaining: None,
-                resets_in_secs: 30_000,
-            },
-        ]),
+        capabilities: vec![Capability {
+            cap: 20_000_000,
+            expiry: 1_900_000_000,
+            pool: pool.to_string(),
+            signer: DELEGATE.to_string(),
+            spent: false,
+        }],
         pointers: Some(vec![Held {
             namespace: 7,
             root: B256::repeat_byte(0xcd),
@@ -122,20 +114,12 @@ fn a_public_status_keeps_its_shape() {
             signer: OWNER,
         }]),
         pools: Some(PoolSnapshot {
-            pools: BuyerPoolsResponse {
-                pools: vec![BuyerPoolSnapshot {
-                    pool_id: format!("{pool:#x}"),
-                    chain_id: 421_614,
-                    payment_pool: Address::repeat_byte(0x35).to_string(),
-                    owner: OWNER.to_string(),
-                    token: Address::repeat_byte(0xcc).to_string(),
-                    deposit_micro_usdc: 10_000_000,
-                    spent_micro_usdc: 3_250_000,
-                    lanes: vec![lane(OWNER, 3_250_000, 48_000_000_000)],
-                }],
-                skipped: vec![format!("{:#x}", B256::repeat_byte(0x44))],
-            },
-            delegate_lanes: Vec::new(),
+            pools: BuyerPoolsResponse::default(),
+            delegate_lanes: vec![DelegateLanes::new(
+                DELEGATE,
+                pool,
+                vec![lane(DELEGATE, 3_250_000, 48_000_000_000)],
+            )],
         }),
         ..base(Mode::Public)
     };
@@ -150,7 +134,7 @@ fn a_loopback_status_keeps_its_shape() {
             hash: alloy::hex::encode([0xbb; 32]),
             namespace: None,
             range: None,
-            payer: PayerLabel::Capability {
+            payer: PayerLabel {
                 signer: DELEGATE,
                 pool,
             },

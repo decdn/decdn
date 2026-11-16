@@ -8,8 +8,9 @@
 //!
 //!   1. [`Mode::Public`]: a node serves a blob and a bundle (a text entry, a
 //!      page that links the blob, a 256 KiB entry), a publisher owns two
-//!      namespaces, and a public gateway pinned to the node runs as a
-//!      subprocess.
+//!      namespaces, a public gateway pinned to the node runs as a
+//!      subprocess, and the harness registers it a capability from an
+//!      owner's pool, as an operator's controller does.
 //!   2. [`Mode::Loopback`]: the gateway holds one pending delegate key, and
 //!      one owner per client flavour opens a pool and issues that key a
 //!      capability from it (`decdn pool assign`), which the suite registers.
@@ -38,26 +39,20 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
 use anyhow::Context;
-use decdn_cache::Hash;
 use decdn_incentive::eth_identity;
 use reqwest::StatusCode;
 
 use crate::chain::ChainFixture;
 use crate::cli::{decdn_command, ensure_decdn_cli_built};
 use crate::node::NodeFixture;
+use crate::pool_owner::{PoolOwner, chain_flags, node_flags, private_tempdir, register_capability};
 use crate::ports::PortReservation;
 
 mod junit;
 
-/// The gateway's or the owner's pool deposit: 10 USDC.
-const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// The delegate's cap: 5 USDC, far above what the suite pulls.
-const CAP_MICRO_USDC: u64 = 5_000_000;
 const KEYSTORE_PASSWORD: &str = "gateway-sdk-e2e-password";
 /// The public origin the gateway serves. Nothing resolves it: the suite sends
 /// every request to the loopback listener with this `Host`.
@@ -68,9 +63,9 @@ const MAX_FLAVOURS: usize = 2;
 /// The longest one harness request may take: a stuck request fails here, not
 /// at the overall timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Heavy journey tier (see [`crate::timeout`] for the tier rule): the
-/// loopback run polls up to 90s (the owner's warm-up) and 60s (the token),
-/// the public run up to 90s (the first pull), and each then runs the suite.
+/// Heavy journey tier (see [`crate::timeout`] for the tier rule): each run
+/// polls up to 90s (an owner's warm-up) and 60s (the gateway's start), the
+/// public run up to 90s more (the first pull), and each then runs the suite.
 const OVERALL_TIMEOUT: Duration = crate::timeout::HEAVY;
 
 /// The gateway a contract run sets up, and the suite file that runs against
@@ -78,7 +73,7 @@ const OVERALL_TIMEOUT: Duration = crate::timeout::HEAVY;
 #[derive(Debug, Clone, Copy)]
 pub enum Mode {
     /// A public gateway that serves `http://decdn.test` and its namespace
-    /// hosts, and pays from its operator's pool.
+    /// hosts, and pays with the capability the harness registers.
     Public,
     /// A loopback gateway that holds a delegate key and pays from the
     /// owners' pools through the capabilities the suite registers.
@@ -550,7 +545,7 @@ fn loopback_fixture(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one sequential setup: node, publisher, operator, gateway, then the suite"
+    reason = "one sequential setup: node, publisher, owner, gateway, then the suite"
 )]
 async fn public<S: Suite>(suite: &S) -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
@@ -600,55 +595,45 @@ async fn public<S: Suite>(suite: &S) -> anyhow::Result<()> {
         );
     }
 
-    // ---- OPERATOR: a funded keystore the gateway pays from ----
-    let gateway_dir = private_tempdir("gateway")?;
-    eth_identity::generate_and_persist(gateway_dir.path(), KEYSTORE_PASSWORD, false)
-        .context("generate the gateway keystore")?;
-    let operator = eth_identity::load_signer(
-        &eth_identity::keystore_path(gateway_dir.path()),
-        KEYSTORE_PASSWORD,
-    )?
-    .address();
-    chain.fund_eth(operator, 100).await?;
-    chain
-        .mint_usdc(operator, U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64))
-        .await?;
+    // ---- OWNER: the pool that funds the gateway, through a capability ----
+    let warm = *hashes
+        .last()
+        .context("the node returned no hash for the manifest")?;
+    let owner = PoolOwner::open(&chain, &node, &warm).await?;
 
     // ---- GATEWAY: public, pinned to the node ----
+    let gateway_dir = private_tempdir("gateway")?;
     // Held until the test ends, so no other process takes the port first.
     let gateway_port = PortReservation::tcp()?;
     let listen = gateway_port.addr().to_string();
-    let mut gateway =
-        tokio::process::Command::from(decdn_command(gateway_dir.path(), KEYSTORE_PASSWORD)?)
-            .args(
-                [
-                    strs(&[
-                        "gateway",
-                        "--public-url",
-                        &format!("http://{DOMAIN}"),
-                        "--listen",
-                        &listen,
-                        "--data-dir",
-                        &gateway_dir.path().display().to_string(),
-                        "--working-deposit-micro-usdc",
-                        &DEPOSIT_MICRO_USDC.to_string(),
-                        "--allowance-bytes-per-day",
-                        "1GiB",
-                        "--publisher-registry-address",
-                        &registry,
-                    ]),
-                    chain_flags(&chain),
-                    node_flags(&chain, &node),
-                ]
-                .concat(),
-            )
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawn decdn gateway")?;
+    let mut gateway = tokio::process::Command::from(decdn_command(gateway_dir.path(), "")?)
+        .args(
+            [
+                strs(&[
+                    "gateway",
+                    "--public-url",
+                    &format!("http://{DOMAIN}"),
+                    "--listen",
+                    &listen,
+                    "--data-dir",
+                    &gateway_dir.path().display().to_string(),
+                    "--publisher-registry-address",
+                    &registry,
+                ]),
+                chain_flags(&chain),
+                node_flags(&chain, &node),
+            ]
+            .concat(),
+        )
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn decdn gateway")?;
     let base = format!("http://{listen}");
     let http = http_client()?;
-    // The gateway's first pull opens its pool, and the node serves it once
-    // its chain watcher has seen the pool: the suite starts after that.
+    still_running(&mut gateway, "start-up")?;
+    register_capability(&http, &base, DOMAIN, &chain, &owner).await?;
+    // The capability's first pull opens its lanes: the suite starts once a
+    // pull has gone through.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         still_running(&mut gateway, "start-up")?;
@@ -700,84 +685,6 @@ async fn public<S: Suite>(suite: &S) -> anyhow::Result<()> {
     stop(gateway).await
 }
 
-/// A pool owner: a funded keystore under its own data dir, and the pool it
-/// opened.
-struct Owner {
-    dir: tempfile::TempDir,
-    keystore: PathBuf,
-    pool_id: B256,
-}
-
-impl Owner {
-    /// A funded owner whose pool the node already serves: its own fetch of
-    /// `warm` waits out the node's view of the fresh pool, so the gateway
-    /// never takes that race for a funding stop.
-    async fn open(chain: &ChainFixture, node: &NodeFixture, warm: &Hash) -> anyhow::Result<Self> {
-        let dir = private_tempdir("owner")?;
-        eth_identity::generate_and_persist(dir.path(), KEYSTORE_PASSWORD, false)
-            .context("generate owner keystore")?;
-        let keystore = eth_identity::keystore_path(dir.path());
-        let owner = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD)?.address();
-        chain.fund_eth(owner, 100).await?;
-        chain
-            .mint_usdc(owner, U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64))
-            .await?;
-        let opened = decdn_ok(
-            dir.path(),
-            &[
-                strs(&[
-                    "pool",
-                    "open",
-                    "--deposit-micro-usdc",
-                    &DEPOSIT_MICRO_USDC.to_string(),
-                ]),
-                chain_flags(chain),
-                owner_flags(&keystore, dir.path()),
-            ]
-            .concat(),
-        )
-        .await?;
-        let pool_id = parse_pool_id(&opened)?;
-        warm_up(chain, node, dir.path(), &keystore, warm).await?;
-        Ok(Self {
-            dir,
-            keystore,
-            pool_id,
-        })
-    }
-
-    /// The `dcap1:` capability this owner issues `signer` from its pool.
-    async fn assign(&self, chain: &ChainFixture, signer: &str) -> anyhow::Result<String> {
-        let assigned = decdn_ok(
-            self.dir.path(),
-            &[
-                strs(&[
-                    "pool",
-                    "assign",
-                    "--pool",
-                    &format!("{:#x}", self.pool_id),
-                    "--signer",
-                    signer,
-                    "--cap-micro-usdc",
-                    &CAP_MICRO_USDC.to_string(),
-                    "--expiry-secs",
-                    "3600",
-                ]),
-                chain_flags(chain),
-                owner_flags(&self.keystore, self.dir.path()),
-            ]
-            .concat(),
-        )
-        .await?;
-        assigned
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("dcap1:"))
-            .map(str::to_owned)
-            .with_context(|| format!("the dcap1: token in `pool assign` output for {signer}"))
-    }
-}
-
 async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
@@ -793,7 +700,7 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
     // ---- OWNERS: one pool per client flavour ----
     let mut owners = Vec::with_capacity(suite.flavours());
     for _ in 0..suite.flavours() {
-        owners.push(Owner::open(&chain, &node, &hash_warm).await?);
+        owners.push(PoolOwner::open(&chain, &node, &hash_warm).await?);
     }
 
     // ---- GATEWAY: loopback, pinned to the node ----
@@ -931,56 +838,6 @@ fn strs(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// A fresh owner-only temp dir: the buyer store refuses one others can read.
-fn private_tempdir(role: &str) -> anyhow::Result<tempfile::TempDir> {
-    let dir = tempfile::tempdir().with_context(|| format!("{role} tempdir"))?;
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        dir.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .with_context(|| format!("chmod {role} dir 0o700"))?;
-    Ok(dir)
-}
-
-/// The chain coordinates as flags, so no config file is needed.
-fn chain_flags(chain: &ChainFixture) -> Vec<String> {
-    vec![
-        "--rpc-url".into(),
-        chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
-    ]
-}
-
-/// The paid-pull flags that pin `node`. `--capacity-bond-address` is the
-/// EIP-712 `verifyingContract` of the client identity binding a node requires.
-fn node_flags(chain: &ChainFixture, node: &NodeFixture) -> Vec<String> {
-    vec![
-        "--node-id".into(),
-        node.node_id().to_string(),
-        "--addr".into(),
-        format!("127.0.0.1:{}", node.bind_port()),
-        "--provider-address".into(),
-        format!("{}", node.operator_addr()),
-        "--capacity-bond-address".into(),
-        format!("{}", chain.addrs().capacity_bond),
-        "--slash-judge-address".into(),
-        format!("{}", chain.addrs().slash_judge),
-    ]
-}
-
-fn owner_flags(keystore: &Path, data_dir: &Path) -> Vec<String> {
-    vec![
-        "--keystore".into(),
-        keystore.display().to_string(),
-        "--data-dir".into(),
-        data_dir.display().to_string(),
-    ]
-}
-
 /// Run `decdn <args>` from `home`, requiring success, and return its stdout.
 async fn decdn_ok(home: &Path, args: &[String]) -> anyhow::Result<String> {
     let output = tokio::process::Command::from(decdn_command(home, KEYSTORE_PASSWORD)?)
@@ -995,47 +852,6 @@ async fn decdn_ok(home: &Path, args: &[String]) -> anyhow::Result<String> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(String::from_utf8(output.stdout)?)
-}
-
-/// The owner's own `decdn get` of `hash`, retried until the node serves its
-/// fresh pool.
-async fn warm_up(
-    chain: &ChainFixture,
-    node: &NodeFixture,
-    home: &Path,
-    keystore: &Path,
-    hash: &Hash,
-) -> anyhow::Result<()> {
-    let out = home.join("warm.bin");
-    let args = [
-        vec![
-            "get".to_owned(),
-            format!("decdn:{}", hash.to_hex()),
-            "-o".to_owned(),
-            out.display().to_string(),
-        ],
-        chain_flags(chain),
-        node_flags(chain, node),
-        owner_flags(keystore, home),
-    ]
-    .concat();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        let output = tokio::process::Command::from(decdn_command(home, KEYSTORE_PASSWORD)?)
-            .args(&args)
-            .output()
-            .await
-            .context("spawn the owner's decdn get")?;
-        if output.status.success() {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "the owner's warm-up get never succeeded: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        tokio::time::sleep(Duration::from_millis(750)).await;
-    }
 }
 
 /// The gateway token, once the gateway has written all of it and answers on
@@ -1063,17 +879,6 @@ async fn wait_for_token(
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-}
-
-/// Parse the `{"poolId": "0x…"}` document `decdn pool open` prints.
-fn parse_pool_id(stdout: &str) -> anyhow::Result<B256> {
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .with_context(|| format!("pool open output was not JSON: {stdout:?}"))?;
-    let raw = parsed
-        .get("poolId")
-        .and_then(serde_json::Value::as_str)
-        .with_context(|| format!("no poolId in {stdout:?}"))?;
-    B256::from_str(raw).context("poolId is not a 32-byte hash")
 }
 
 #[cfg(test)]

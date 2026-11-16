@@ -2,15 +2,14 @@
 //!
 //! Shape: a node serves a 2 MiB blob and a bundle manifest naming it, a
 //! publisher creates a namespace on-chain, and a public gateway pinned to the
-//! node runs as a subprocess with an allowance of its own for that namespace.
+//! node runs as a subprocess, paying with a capability a pool owner
+//! registers to its pending key.
 //!
 //!   1. `decdn publish point <ns> decdn:<manifest>/ --gateway …` signs a
 //!      pointer with the publisher's keystore; the gateway verifies it against
 //!      `PublisherRegistry.ownerOf` and stores it.
 //!   2. `Host: <ns>.decdn.test` serves the entry byte-exact.
-//!   3. The namespace's own allowance is spent: its host answers `402` naming
-//!      `decdn:<manifest>/a.bin?ns=<ns>`, while the bundle's own site, on the
-//!      shared allowance, still serves.
+//!   3. The bundle's own site serves the same entry.
 //!   4. The same `seq` again is `409`; a pointer signed by a key that does not
 //!      own the namespace is `403`.
 //!
@@ -36,21 +35,18 @@
 use std::path::Path;
 use std::time::Duration;
 
-use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
+use decdn_e2e::pool_owner::{
+    PoolOwner, chain_flags, node_flags, private_tempdir, register_capability,
+};
 use decdn_e2e::ports::PortReservation;
 use decdn_incentive::eth_identity;
 use reqwest::StatusCode;
 
 const MIB: usize = 1024 * 1024;
-/// The gateway's working deposit: 10 USDC.
-const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// The namespace's own allowance: the manifest and one 2 MiB entry fit, a
-/// second entry does not.
-const NAMESPACE_ALLOWANCE: &str = "3MiB";
 const KEYSTORE_PASSWORD: &str = "gateway-pointer-e2e-password";
 /// The public origin the gateway serves. Nothing resolves it: every request
 /// goes to the loopback listener with this `Host`.
@@ -81,8 +77,8 @@ async fn a_namespace_pointer_names_the_bundle_its_host_serves() -> anyhow::Resul
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one sequential journey: node, publisher, gateway, then the requests that depend on \
-              all three"
+    reason = "one sequential journey: node, publisher, owner, gateway, then the requests that \
+              depend on all four"
 )]
 async fn run() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
@@ -145,60 +141,47 @@ async fn run() -> anyhow::Result<()> {
         .as_u64()
         .with_context(|| format!("namespace_id in {created}"))?;
 
-    // ---- OPERATOR: a funded keystore the gateway pays from ----
-    let gateway_dir = private_tempdir("gateway")?;
-    eth_identity::generate_and_persist(gateway_dir.path(), KEYSTORE_PASSWORD, false)
-        .context("generate the gateway keystore")?;
-    let operator = eth_identity::load_signer(
-        &eth_identity::keystore_path(gateway_dir.path()),
-        KEYSTORE_PASSWORD,
-    )?
-    .address();
-    chain.fund_eth(operator, 100).await?;
-    chain
-        .mint_usdc(operator, U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64))
-        .await?;
+    // ---- STRANGER: a keystore that owns no namespace ----
+    let stranger_dir = private_tempdir("stranger")?;
+    eth_identity::generate_and_persist(stranger_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate the stranger keystore")?;
 
-    // ---- GATEWAY: public, pinned to the node, with the namespace's allowance ----
+    // ---- OWNER: the pool that funds the gateway, through a capability ----
+    let owner = PoolOwner::open(&chain, &node, &hashes[1]).await?;
+
+    // ---- GATEWAY: public, pinned to the node ----
+    let gateway_dir = private_tempdir("gateway")?;
     // Held until the test ends, so no other process takes the port first.
     let gateway_port = PortReservation::tcp()?;
     let listen = gateway_port.addr().to_string();
-    let mut gateway =
-        tokio::process::Command::from(decdn_command(gateway_dir.path(), KEYSTORE_PASSWORD)?)
-            .args(
-                [
-                    strs(&[
-                        "gateway",
-                        "--public-url",
-                        &format!("http://{DOMAIN}"),
-                        "--listen",
-                        &listen,
-                        "--data-dir",
-                        &gateway_dir.path().display().to_string(),
-                        "--working-deposit-micro-usdc",
-                        &DEPOSIT_MICRO_USDC.to_string(),
-                        "--publisher-registry-address",
-                        &registry,
-                        "--allowance",
-                        &format!("{namespace}={NAMESPACE_ALLOWANCE}"),
-                        // A repeat request pulls, so it spends the allowance;
-                        // with the cache on it would be a free hit.
-                        "--cache-mb",
-                        "0",
-                    ]),
-                    chain_flags(&chain),
-                    node_flags(&chain, &node),
-                ]
-                .concat(),
-            )
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawn decdn gateway")?;
+    let mut gateway = tokio::process::Command::from(decdn_command(gateway_dir.path(), "")?)
+        .args(
+            [
+                strs(&[
+                    "gateway",
+                    "--public-url",
+                    &format!("http://{DOMAIN}"),
+                    "--listen",
+                    &listen,
+                    "--data-dir",
+                    &gateway_dir.path().display().to_string(),
+                    "--publisher-registry-address",
+                    &registry,
+                ]),
+                chain_flags(&chain),
+                node_flags(&chain, &node),
+            ]
+            .concat(),
+        )
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn decdn gateway")?;
     let base = format!("http://{listen}");
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     wait_for_gateway(&http, &base).await?;
+    register_capability(&http, &base, DOMAIN, &chain, &owner).await?;
     let get = |host: &str, path: &str| {
         let request = http.get(format!("{base}{path}")).header("host", host);
         async move {
@@ -259,19 +242,13 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- (2) The namespace host serves the entry ----
-    // The gateway's first pull opens its pool; the node serves it once its
-    // chain watcher has seen the pool, so the first request is retried.
+    // The first request is retried while the capability's first lane opens.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let got = loop {
         let (status, _, body) = get(&ns_host, "/a.bin").await?;
         if status.is_success() {
             break body;
         }
-        anyhow::ensure!(
-            status != StatusCode::PAYMENT_REQUIRED,
-            "a failed attempt spent the namespace's allowance: {}",
-            String::from_utf8_lossy(&body)
-        );
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
             "the namespace host never served its entry: {status} {}",
@@ -285,20 +262,7 @@ async fn run() -> anyhow::Result<()> {
         got.len()
     );
 
-    // ---- (3) The namespace's own allowance is spent; the shared one is not ----
-    let (status, headers, body) = get(&ns_host, "/a.bin").await?;
-    anyhow::ensure!(
-        status == StatusCode::PAYMENT_REQUIRED,
-        "past the namespace allowance: {status} {}",
-        String::from_utf8_lossy(&body)
-    );
-    let uri = format!("decdn:{hash_manifest}/a.bin?ns={namespace}");
-    anyhow::ensure!(
-        headers.get("link").and_then(|v| v.to_str().ok())
-            == Some(format!("<{uri}>; rel=\"alternate\"").as_str()),
-        "402 Link: {:?}",
-        headers.get("link")
-    );
+    // ---- (3) The bundle's own site serves the same entry ----
     let (status, headers, _) = get(DOMAIN, &format!("/{hash_manifest}/a.bin")).await?;
     anyhow::ensure!(
         status == StatusCode::FOUND,
@@ -314,7 +278,7 @@ async fn run() -> anyhow::Result<()> {
     let (status, _, got) = get(&site, "/a.bin").await?;
     anyhow::ensure!(
         status == StatusCode::OK && got == a,
-        "the bundle's own site still serves: {status}, {} bytes",
+        "the bundle's own site serves: {status}, {} bytes",
         got.len()
     );
 
@@ -323,7 +287,7 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(!replayed.status.success(), "the same seq was accepted");
     let stderr = String::from_utf8_lossy(&replayed.stderr);
     anyhow::ensure!(stderr.contains("409"), "replay: {stderr}");
-    let stranger = point(gateway_dir.path(), "2").await?;
+    let stranger = point(stranger_dir.path(), "2").await?;
     anyhow::ensure!(
         !stranger.status.success(),
         "a stranger's pointer was accepted"
@@ -339,47 +303,6 @@ async fn run() -> anyhow::Result<()> {
 
 fn strs(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_owned()).collect()
-}
-
-/// A fresh owner-only temp dir: the buyer store refuses one others can read.
-fn private_tempdir(role: &str) -> anyhow::Result<tempfile::TempDir> {
-    let dir = tempfile::tempdir().with_context(|| format!("{role} tempdir"))?;
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        dir.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .with_context(|| format!("chmod {role} dir 0o700"))?;
-    Ok(dir)
-}
-
-/// The chain coordinates as flags, so no config file is needed.
-fn chain_flags(chain: &ChainFixture) -> Vec<String> {
-    vec![
-        "--rpc-url".into(),
-        chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
-    ]
-}
-
-/// The paid-pull flags that pin `node`. `--capacity-bond-address` is the
-/// EIP-712 `verifyingContract` of the client identity binding a node requires.
-fn node_flags(chain: &ChainFixture, node: &NodeFixture) -> Vec<String> {
-    vec![
-        "--node-id".into(),
-        node.node_id().to_string(),
-        "--addr".into(),
-        format!("127.0.0.1:{}", node.bind_port()),
-        "--provider-address".into(),
-        format!("{}", node.operator_addr()),
-        "--capacity-bond-address".into(),
-        format!("{}", chain.addrs().capacity_bond),
-        "--slash-judge-address".into(),
-        format!("{}", chain.addrs().slash_judge),
-    ]
 }
 
 /// Wait until the gateway answers its landing page on `base`.

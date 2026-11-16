@@ -33,39 +33,52 @@ the keystore password and point `DECDN_KEYSTORE_PASSWORD_FILE` at it.
 
 ## Public gateway
 
-The same image runs a public HTTP gateway that pays for every request from its own
-pool, behind a proxy that terminates TLS for `decdn.link` and `*.decdn.link` (register
-the host on the Public Suffix List, so the per-bundle sites' cookies stay apart):
+The same image runs a public HTTP gateway behind a proxy that terminates TLS for
+`decdn.link` and `*.decdn.link` (register the host on the Public Suffix List, so the
+per-bundle sites' cookies stay apart). The gateway holds no keystore and no pool: it
+pays with the capabilities a pool owner registers to it, so the container keeps no
+secret and you can replace it with nothing to tear down:
 
 ```bash
 docker run -d --name decdn-gateway -p 127.0.0.1:8080:8080 \
   -v ~/.decdn:/home/decdn/.decdn \
-  -v /etc/decdn/keystore-password:/run/secrets/keystore-password:ro \
-  -e DECDN_KEYSTORE_PASSWORD_FILE=/run/secrets/keystore-password \
   decdn/decdn gateway --public-url https://decdn.link --listen 0.0.0.0:8080 \
-  --allowance-bytes-per-day 20GiB --metrics-listen 127.0.0.1:9100
+  --metrics-listen 127.0.0.1:9100
 ```
+
+Fund it from the pool owner's machine: read the gateway's pending key, issue it a
+capability, and register that:
+
+```bash
+KEY=$(curl -s https://decdn.link/_delegate | jq -r .address)
+CAP=$(decdn pool assign --pool <pool-id> --signer "$KEY" --cap-micro-usdc 5000000 \
+  --expiry-secs 86400 | grep '^dcap1:')
+curl -X PUT https://decdn.link/_capability -H 'content-type: application/json' \
+  -d "{\"capability\": \"$CAP\"}"
+```
+
+`GET /_capability` and `GET /_status` show each capability's cap, expiry and spend.
+Register the next capability before the current one runs low or nears its expiry: the
+gateway pays with the first one that can pay. The keys live in memory, so a restarted
+gateway needs new capabilities. The routes take no authentication; put it on the proxy
+if you want it.
 
 `--metrics-listen` serves Prometheus text at `GET /metrics` on that loopback address, for
 your scraper, and the gateway's state at `GET /_status` for `decdn dashboard --gateway`;
 it answers only a loopback `Host`. The series and the state are listed in
 [`adr/appendix-gateway.md`](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#metrics).
 
-The keystore under the volume funds the pool (`--working-deposit-micro-usdc` sizes it),
-and `gateway/store` under the same volume keeps the pool and its lanes across restarts.
-`gateway/cache` keeps what the gateway pulled, up to `--cache-mb` (10 GiB by default), and
-serves a repeat request from it with no pull and no allowance charge.
-`--allowance-bytes-per-day` bounds the bytes the gateway delivers per UTC day. A request
-past the allowance, or one whose size does not fit what is left, gets `402` with the
-canonical `decdn:` URI to fetch with a paying client; a pool that cannot pay gets `503`.
-A bundle entry with a size in its manifest takes one `Range` (`curl -r`, a resumed
+`gateway/cache` under the volume keeps what the gateway pulled, up to `--cache-mb`
+(10 GiB by default), and serves a repeat request from it with no pull. A request no
+capability can pay for gets `503` with the canonical `decdn:` URI to fetch with a paying
+client. A bundle entry with a size in its manifest takes one `Range` (`curl -r`, a resumed
 download, a BEP 19 webseed `url-list`): the response is `206` over exactly that window,
 paid for by the chunk-group-aligned span around it.
 
 Every answer is readable from any origin (`Access-Control-Allow-Origin: *`), so a web page
 or the [TypeScript SDK](https://github.com/decdn/sdk-typescript) in a browser fetches
 straight from the gateway. `OPTIONS` is a preflight that admits `Range` on content and a
-JSON `PUT /_pointer` on the bare host. Let the proxy pass `OPTIONS` and the gateway's CORS
+JSON `PUT` to `/_pointer` and `/_capability` on the bare host. Let the proxy pass `OPTIONS` and the gateway's CORS
 headers through unchanged, and add none of its own: a second `Access-Control-Allow-Origin`
 makes a browser refuse the answer. See
 [`adr/appendix-gateway.md`](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#cross-origin-reads).
@@ -75,9 +88,7 @@ bundle: `decdn publish point <ns> decdn:<hash>/ --gateway https://decdn.link` si
 pointer with the namespace owner's keystore and `PUT`s it; the gateway checks the
 signer against `PublisherRegistry.ownerOf` and keeps the pointer in `gateway/pointers`
 under the volume. The registry comes from `--publisher-registry-address`, the config
-file, or the built-in testnet. `--allowance <ns>=20GiB` (repeatable) gives one namespace
-a daily allowance of its own for the requests its pointer serves, in place of the shared
-one. See
+file, or the built-in testnet. See
 [`adr/appendix-gateway.md`](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#namespace-pointer).
 
 ## Tags

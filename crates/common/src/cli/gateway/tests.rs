@@ -12,27 +12,13 @@ fn parse(args: &[&str]) -> Result<GatewayArgs, clap::Error> {
 }
 
 #[test]
-fn a_public_gateway_parses_its_url_and_allowance() {
-    let args = parse(&[
-        "--public-url",
-        "https://decdn.link",
-        "--allowance-bytes-per-day",
-        "512MiB",
-    ])
-    .unwrap();
+fn a_public_gateway_parses_its_url() {
+    let args = parse(&["--public-url", "https://decdn.link"]).unwrap();
     assert_eq!(
         args.public.public_url.as_ref().map(ToString::to_string),
         Some("https://decdn.link/".to_owned())
     );
-    assert_eq!(args.public.allowance_bytes_per_day, 512 << 20);
-}
-
-#[test]
-fn the_allowance_defaults_to_one_gib_and_needs_the_public_url() {
-    let args = parse(&[]).unwrap();
-    assert!(args.public.public_url.is_none());
-    assert_eq!(args.public.allowance_bytes_per_day, 1 << 30);
-    assert!(parse(&["--allowance-bytes-per-day", "1"]).is_err());
+    assert!(parse(&[]).unwrap().public.public_url.is_none());
 }
 
 #[test]
@@ -42,19 +28,21 @@ fn the_cache_defaults_to_ten_gib_and_zero_turns_it_off() {
 }
 
 #[test]
-fn a_malformed_public_url_or_allowance_is_refused() {
+fn a_malformed_public_url_is_refused() {
     assert!(parse(&["--public-url", "not a url"]).is_err());
-    for bad in ["", "x", "1XiB"] {
-        assert!(
-            parse(&[
-                "--public-url",
-                "https://decdn.link",
-                "--allowance-bytes-per-day",
-                bad
-            ])
-            .is_err(),
-            "{bad:?}"
-        );
+}
+
+/// The capabilities' caps bound what a gateway spends: it takes no daily
+/// allowance.
+#[test]
+fn the_gateway_takes_no_allowance() {
+    for flags in [
+        &["--allowance-bytes-per-day", "1GiB"][..],
+        &["--allowance", "7=1GiB"][..],
+    ] {
+        let mut args = vec!["--public-url", "https://decdn.link"];
+        args.extend_from_slice(flags);
+        assert!(parse(&args).is_err(), "{flags:?}");
     }
 }
 
@@ -82,34 +70,6 @@ fn metrics_listen_parses_without_public_url() {
         args.metrics_listen.map(|a| a.to_string()),
         Some("127.0.0.1:9100".to_owned())
     );
-}
-
-#[test]
-fn a_namespace_allowance_parses_as_ns_equals_bytes_and_repeats() {
-    let args = parse(&[
-        "--public-url",
-        "https://decdn.link",
-        "--allowance",
-        "7=20GiB",
-        "--allowance",
-        "9=1024",
-    ])
-    .unwrap();
-    assert_eq!(args.public.allowance, vec![(7, 20 << 30), (9, 1024)]);
-    assert!(
-        parse(&["--public-url", "https://decdn.link"])
-            .unwrap()
-            .public
-            .allowance
-            .is_empty()
-    );
-    for bad in ["7", "=1GiB", "0=1GiB", "07=1GiB", "x=1GiB", "7=", "7=1XiB"] {
-        assert!(
-            parse(&["--public-url", "https://decdn.link", "--allowance", bad]).is_err(),
-            "{bad:?}"
-        );
-    }
-    assert!(parse(&["--allowance", "7=1GiB"]).is_err());
 }
 
 #[test]
@@ -141,8 +101,8 @@ fn the_publisher_registry_address_needs_the_public_url() {
     );
 }
 
-/// The listener serves the operator with no token on a public gateway, so it
-/// takes a loopback address only, refused at parse time.
+/// The listener serves the operator with no token, so it takes a loopback
+/// address only, refused at parse time.
 #[test]
 fn metrics_listen_takes_a_loopback_address_only() {
     for given in ["127.0.0.1:9100", "[::1]:9100", "127.0.0.2:9100"] {

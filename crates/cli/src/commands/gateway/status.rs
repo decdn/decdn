@@ -9,11 +9,10 @@ use alloy::primitives::Address;
 use decdn_common::redact::sanitize_err_chain;
 use serde::Serialize;
 
-use super::allowance::BucketView;
 use super::metrics::Counters;
 use super::pointer::Held;
 use super::worker::PoolSnapshot;
-use super::{ActivePullView, Capability, Gateway, now_secs};
+use super::{ActivePullView, Capability, Gateway};
 
 /// How long `/_status` waits for the worker to read the store.
 const POOL_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,8 +46,6 @@ pub(super) struct Status {
     active_pulls: Vec<ActivePullView>,
     /// The capabilities the gateway holds, in the order it pays with them.
     capabilities: Vec<Capability>,
-    /// A public gateway's allowance buckets; `None` on loopback.
-    allowance: Option<Vec<BucketView>>,
     /// A public gateway's pointers; `None` on loopback.
     pointers: Option<Vec<Held>>,
     /// What the buyer-pool store holds; `None` when it could not be read.
@@ -68,7 +65,6 @@ impl Gateway {
                 Ok(Err(e)) => (None, Some(sanitize_err_chain(&e))),
                 Err(_) => (None, Some("the store read timed out".to_owned())),
             };
-        let now = now_secs();
         Status {
             mode: if self.public() {
                 Mode::Public
@@ -84,7 +80,6 @@ impl Gateway {
             counters: self.metrics.snapshot(),
             active_pulls: self.active_pulls(),
             capabilities: self.capabilities(),
-            allowance: self.public.as_ref().map(|p| p.allowance.view(now)),
             pointers: self.public.as_ref().map(|p| p.pointers.all()),
             pools,
             pool_error,
