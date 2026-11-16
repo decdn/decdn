@@ -16,6 +16,7 @@
 //! | Know how many wire bytes a range costs, proof included | [`bao_encoded_size`], [`AlignedRange::wire_len`] |
 //! | Encode a whole blob as a stream, without buffering it | [`streaming`] |
 //! | Implement a range-aware blob backend | [`RangedStore`] |
+//! | Let a paid pull fill that backend, or read it back as it fills | [`IngestStore`], [`StreamStore`] ([`ingest`]) |
 //! | Write or find a blob's outboard in a filesystem origin | [`encode_outboard`], [`OBAO4_SUFFIX`], [`shard_prefix`] |
 //!
 //! # Verifying an origin range
@@ -43,17 +44,22 @@ use positioned_io::ReadAt;
 
 #[cfg(feature = "test-util")]
 pub mod conformance;
+pub mod ingest;
 pub mod origin_seed;
 pub mod ranged_store;
 pub mod size_proof;
 pub mod streaming;
+pub use ingest::{
+    BaoRangeReader, HashMismatch, IngestEnd, IngestFuture, IngestStore, SourceFuture, StashedFault,
+    StreamStore,
+};
 pub use origin_seed::{
     EncodedOutboard, MAX_SIZE_PROOF_OBJECT_BYTES, OBAO4_SUFFIX, SIZE_PROOF_SUFFIX, encode_outboard,
     parse_size_proof_object, shard_prefix, size_proof_object,
 };
 pub use ranged_store::{RangedFuture, RangedStore, RangedStoreError};
 pub use size_proof::{
-    MAX_SIZE_PROOF_BYTES, SizeProofError, encode_size_proof, size_proof_from_tail_wire,
+    MAX_SIZE_PROOF_BYTES, ProvenSize, SizeProofError, encode_size_proof, size_proof_from_tail_wire,
     size_proof_tail_start, verify_size_proof,
 };
 

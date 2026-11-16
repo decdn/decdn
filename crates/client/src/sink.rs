@@ -133,40 +133,16 @@ impl iroh_io::AsyncStreamReader for PullReader {
     }
 }
 
-/// A reader that may be holding back a richer error than the one the bao decoder
-/// will report.
-///
-/// The decoder can only say "the bytes stopped arriving". When the reader knows
-/// WHY — a stalled peer, a mid-stream refusal, a rejected voucher — that reason
-/// is what the caller needs in order to score the peer, so it wins.
-///
-/// Public because it is a supertrait of [`crate::source::BaoRangeReader`]: a
-/// [`crate::source::BlobSource`]'s reader must preserve the pull's typed faults
-/// so the gap-driven driver (#1608) surfaces them for scoring.
+/// A reader that may be holding back a richer error than the one the bao
+/// decoder will report: a supertrait of [`crate::source::BaoRangeReader`], so a
+/// [`crate::source::BlobSource`]'s reader preserves the pull's typed faults for
+/// scoring (#1608).
 #[doc(hidden)]
-pub trait StashedFault {
-    /// Take the parked typed fault, if any. Returns `None` on a source whose
-    /// bytes carry the whole story (an in-memory buffer, a scripted double).
-    fn take_fault(&mut self) -> Option<anyhow::Error>;
-}
+pub use decdn_bao_range::StashedFault;
 
 impl StashedFault for PullReader {
     fn take_fault(&mut self) -> Option<anyhow::Error> {
         self.fault.take()
-    }
-}
-
-/// A plain in-memory wire buffer has no out-of-band failure mode: whatever the
-/// decoder says about it is the whole story.
-///
-/// Test-only, and gated to say so: it exists purely so the streaming ingest
-/// loop can be driven from a fixed wire buffer. A test using it exercises the
-/// `None` branch, where the decoder's error is the whole story, so it must not
-/// be the only coverage of the fault-precedence rule.
-#[cfg(test)]
-impl StashedFault for Bytes {
-    fn take_fault(&mut self) -> Option<anyhow::Error> {
-        None
     }
 }
 

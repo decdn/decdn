@@ -14,7 +14,7 @@ use decdn_client::{BlobSource, Cumulative, IngestStore, PoolLedger, VoucherProgr
 use iroh_io::AsyncStreamReader;
 
 use super::{BackendReader, BackendSource, WireChunks};
-use crate::node_origin::NodeAdmitStore;
+use crate::node_origin::CacheStore;
 use std::assert_matches;
 
 /// A minimal own-origin double: serves one blob's aligned ranges plus its
@@ -111,7 +111,7 @@ fn fresh_ledger() -> Arc<PoolLedger> {
 }
 
 /// (a) Full-miss whole-blob: `BackendSource::open` yields wire that a fresh
-/// `NodeAdmitStore` ingests to a complete, byte-exact blob under `H`.
+/// `CacheStore` ingests to a complete, byte-exact blob under `H`.
 #[tokio::test]
 async fn backend_source_full_miss_admits_complete_blob() -> anyhow::Result<()> {
     let data = test_blob();
@@ -133,11 +133,11 @@ async fn backend_source_full_miss_admits_complete_blob() -> anyhow::Result<()> {
     assert_eq!(header.rate_per_mb, 0, "unpaid source quotes rate 0");
     assert_eq!(header.interval_bytes, 0, "unpaid source quotes interval 0");
 
-    // Ingest into a FRESH engine's NodeAdmitStore — the driver's sink — which
+    // Ingest into a FRESH engine's CacheStore — the driver's sink — which
     // verifies the wire against `H` as it stores it.
     let tmp2 = tempfile::tempdir()?;
     let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
-    let store = NodeAdmitStore::new(engine2.clone(), hash, total, None);
+    let store = CacheStore::new(engine2.clone(), hash, total);
     let (mut drained, _) =
         IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size(), None)
             .await?;
@@ -193,7 +193,7 @@ async fn backend_source_mismatch_is_local_verify_fault() -> anyhow::Result<()> {
 
     let tmp2 = tempfile::tempdir()?;
     let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
-    let store = NodeAdmitStore::new(engine2, hash, total, None);
+    let store = CacheStore::new(engine2, hash, total);
     let err = IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size(), None)
         .await
         .err()
@@ -295,7 +295,7 @@ async fn backend_reader_reassembles_a_finely_chunked_wire() -> anyhow::Result<()
 
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
-    let store = NodeAdmitStore::new(engine.clone(), hash, total, None);
+    let store = CacheStore::new(engine.clone(), hash, total);
     IngestStore::ingest_stream(
         &store,
         &aligned,

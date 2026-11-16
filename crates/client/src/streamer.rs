@@ -45,7 +45,7 @@ use crate::pacer::{DownstreamFrontier, PULL_WINDOW_FLOOR, WindowPacer};
 use crate::recovery::RecoveryGate;
 use crate::scheduler::{AcquireEnv, AcquireTarget, ConsumptionPacing, LaneLease, acquire};
 use crate::sink::BlobCache;
-use crate::source::{Funder, IngestStore};
+use crate::source::Funder;
 use crate::source_set::{Holder, SourceProvider, SourceSet};
 use crate::stop::{ProgressClock, StopPolicy};
 use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig};
@@ -55,16 +55,10 @@ use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig};
 const MAX_READ_CHUNK: u64 = 1024 * 1024;
 
 /// A fill store a [`Streamer`] writes and reads back at the same time: an
-/// [`IngestStore`] that also wakes a waiting reader when an ingest checkpoint
+/// [`IngestStore`](crate::IngestStore) that also wakes a waiting reader when an ingest checkpoint
 /// makes more verified bytes present.
 #[doc(hidden)]
-pub trait StreamStore: IngestStore + 'static {
-    /// Woken each time an ingest checkpoint makes more verified bytes
-    /// present. The reader registers on it before it reads the present
-    /// frontier, so a checkpoint that lands between the read and the wait
-    /// still wakes it.
-    fn present_grew(&self) -> &Notify;
-}
+pub use decdn_bao_range::StreamStore;
 
 impl StreamStore for ClientRangedStore {
     fn present_grew(&self) -> &Notify {
@@ -158,7 +152,7 @@ struct StreamState<S> {
     /// size a leg proves. The stream ends at the smaller of the two.
     end: Option<u64>,
     /// The caller's proven size, which the acquire loop records in the store
-    /// ([`IngestStore::prove_size`]).
+    /// ([`IngestStore::prove_size`](crate::IngestStore::prove_size)).
     size: crate::ProvenSize,
     /// Woken by the reader when `cursor` advances, so a pull parked on a full
     /// read-ahead window ([`PaceDecision::Wait`](crate::pacer::PaceDecision::Wait))

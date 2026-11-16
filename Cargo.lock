@@ -2758,10 +2758,13 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 name = "decdn-bao-range"
 version = "0.3.1"
 dependencies = [
+ "anyhow",
  "bao-tree",
  "bytes",
+ "iroh-io",
  "positioned-io",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

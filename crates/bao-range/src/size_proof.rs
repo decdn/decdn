@@ -95,6 +95,42 @@ impl WriteAt for Discard {
     }
 }
 
+/// A blob size whose size proof verified against the blob's hash (ADR 005 §
+/// Bounded byte ranges). [`Self::verify`] is the only way to make one, so a
+/// raw `u64` from a node never reaches planning, allocation, a cap or
+/// payment. Read the size with [`Self::get`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProvenSize(u64);
+
+impl ProvenSize {
+    /// `size`, when `proof` proves that the blob with hash `root` is that
+    /// long ([`verify_size_proof`]).
+    #[must_use]
+    pub fn verify(root: [u8; 32], size: u64, proof: &[u8]) -> Option<Self> {
+        verify_size_proof(root, size, proof).then_some(Self(size))
+    }
+
+    /// The size in bytes.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Take `size` as proven with no proof. Only tests build one this way:
+    /// their fixtures know the true size of the blobs they make.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub const fn assume_for_tests(size: u64) -> Self {
+        Self(size)
+    }
+}
+
+impl std::fmt::Display for ProvenSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Whether `proof` proves that the blob with BLAKE3 hash `root` is `size`
 /// bytes long.
 ///

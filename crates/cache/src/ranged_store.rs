@@ -42,9 +42,9 @@ impl NodeRangedStore {
         self.hash
     }
 
-    /// The wrapped [`CacheEngine`] handle. Lets a node-crate wrapper (#1621 Task
-    /// 10, `NodeAdmitStore`) reach the engine's `admit_bao_stream` without
-    /// duplicating the `(engine, hash, total_bytes)` triple it already holds.
+    /// The wrapped [`CacheEngine`] handle. Lets a wrapper ([`crate::CacheStore`])
+    /// reach the engine's `admit_bao_stream_until` without duplicating the
+    /// `(engine, hash, total_bytes)` triple it already holds.
     #[must_use]
     pub const fn engine(&self) -> &CacheEngine {
         &self.engine

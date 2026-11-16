@@ -25,7 +25,6 @@
 //! self-owned pool's `PoolFunder`, the node's `NodeFunder`) rather than the loop naming a
 //! contract instance directly.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -36,34 +35,24 @@ use decdn_bao_range::AlignedRange;
 use decdn_incentive::PoolId;
 use iroh::{Endpoint, EndpointAddr};
 
-use crate::sink::{PullReader, StashedFault};
+use crate::sink::PullReader;
 use crate::{
     Connections, PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader,
     VoucherProgress,
 };
 
-/// A boxed, `Send` future returned by the async trait methods in this module —
-/// the same boxed-future async-trait shape [`decdn_bao_range::RangedStore`] and
-/// `cache::Origin` use, so a [`Funder`] can be held as `&dyn Funder`.
-pub type SourceFuture<'a, T> =
-    core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
+/// A boxed, `Send` future returned by the async trait methods in this module,
+/// so a [`Funder`] can be held as `&dyn Funder`.
+pub use decdn_bao_range::SourceFuture;
+/// The pull-side store contract, defined beside [`decdn_bao_range::RangedStore`]
+/// so a store need not depend on this crate to be filled by it.
+#[doc(hidden)]
+pub use decdn_bao_range::{BaoRangeReader, IngestEnd, IngestFuture, IngestStore};
 
 /// A boxed, `Send` stream returned by the streaming methods in this module,
 /// the stream sibling of [`SourceFuture`].
 #[doc(hidden)]
 pub type SourceStream<'a, T> = core::pin::Pin<Box<dyn futures_util::Stream<Item = T> + Send + 'a>>;
-
-/// A reader over the raw interleaved bao encoding of one range.
-///
-/// The store's ingest decoder pulls bytes on demand through
-/// [`iroh_io::AsyncStreamReader`]; a typed peer fault (stall, refusal, voucher
-/// rejection) is preserved through [`StashedFault`] so it beats the decoder's
-/// generic "bytes stopped arriving". Blanket-implemented, so any reader that is
-/// both is a `BaoRangeReader` with no extra code.
-#[doc(hidden)]
-pub trait BaoRangeReader: iroh_io::AsyncStreamReader + StashedFault + Send {}
-
-impl<T> BaoRangeReader for T where T: iroh_io::AsyncStreamReader + StashedFault + Send {}
 
 /// A source of raw, unverified interleaved bao bytes for contiguous ranges of one
 /// blob. Dumb: it produces bytes (and, for paid sources, pays) — it never decodes
@@ -135,119 +124,6 @@ pub trait BlobSource: Send + Sync {
     /// bytes.
     fn max_blob_size_bytes(&self) -> u64 {
         0
-    }
-}
-
-/// The future [`IngestStore::ingest_stream`] returns: the reader back, and how
-/// the ingest ended.
-#[doc(hidden)]
-pub type IngestFuture<'a, R> =
-    core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<(R, IngestEnd)>> + 'a>>;
-
-/// How an [`IngestStore::ingest_stream`] ended without a fault.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum IngestEnd {
-    /// The decoder reached the end of the range: the source
-    /// [`finish`](BlobSource::finish)es the pull.
-    Drained,
-    /// The verified prefix reached the lowered `stop_at` before the end of the
-    /// range: the source [`stop`](BlobSource::stop)s the pull.
-    Stopped,
-}
-
-/// The store/sink capability the gap-driven [`crate::drive`] needs beyond
-/// [`decdn_bao_range::RangedStore`]'s queries: ingest one gap's raw bao. The
-/// client backend writes `.partial`; a node backend admits to the cache and
-/// tees to its downstream client. Kept a generic method (not
-/// `dyn`) so an impl can stream any [`BaoRangeReader`]; `drive` is already
-/// fully generic.
-///
-/// The returned future is intentionally NOT `Send`-bounded, unlike
-/// [`SourceFuture`]. [`iroh_io::AsyncStreamReader`]'s methods are
-/// return-position-impl-trait-in-trait with no `Send` bound on the trait
-/// itself, so a method generic over `R: BaoRangeReader` (as this one must be,
-/// to stream ANY reader an [`IngestStore`] impl is handed) can never prove its
-/// decode-loop future is `Send` for an arbitrary `R` — only a concrete,
-/// non-generic instantiation could. `drive`/`fill_gap` only ever `.await` this
-/// future in place (never spawn it across a task boundary), so dropping `Send`
-/// here is behavior-preserving.
-#[doc(hidden)]
-pub trait IngestStore: decdn_bao_range::RangedStore {
-    /// Decode-and-admit the raw bao bytes in `reader` as `range`'s content,
-    /// verifying against the store's rooted hash as it streams. Returns the
-    /// drained `reader` (its typed fault, if any, surfaces via
-    /// [`StashedFault`] on the caller's copy) so the
-    /// source can [`finish`](BlobSource::finish) the pull.
-    ///
-    /// `claimed_total` is the blob size the leg's sender signs in its header.
-    /// The sender serves `range` clamped to that size and encodes it under
-    /// that size's tree, so a store keyed by offset verifies the leg under
-    /// it.
-    ///
-    /// `stop_at` is an end the caller can lower while the leg streams. Once
-    /// the verified prefix reaches it, the ingest checkpoints that prefix and
-    /// returns [`IngestEnd::Stopped`] without reading further. After each
-    /// verified group it reports the prefix through `on_progress` first, then
-    /// reads `stop_at` with `SeqCst`. A caller that records the prefix with
-    /// `SeqCst`, lowers `stop_at`, and then reads the recorded prefix with
-    /// `SeqCst` knows where the leg stops: at the lowered end when the prefix
-    /// read is short of it, and within one group past that prefix otherwise. A steal lowers
-    /// it to the split, so the leg stops there on its open stream. A
-    /// chunk-group-aligned end cuts the pre-order bao encoding of `range`
-    /// between two items, so the stopped prefix verifies on its own.
-    fn ingest_stream<'a, R>(
-        &'a self,
-        range: &'a AlignedRange,
-        reader: R,
-        on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
-        claimed_total: u64,
-        stop_at: Option<&'a AtomicU64>,
-    ) -> IngestFuture<'a, R>
-    where
-        R: BaoRangeReader + 'a;
-
-    /// Persist the store's current in-memory present-range snapshot to its
-    /// durable record. The single-writer flush point: several
-    /// `ingest_stream` calls can run concurrently on one store (the
-    /// multi-source scheduler), so no checkpoint writes the record — callers
-    /// flush it explicitly instead. `drive` calls this once after its gap loop,
-    /// before `finalize`, so the single-source path keeps its resume durability
-    /// without per-checkpoint fsyncs.
-    ///
-    /// The snapshot is taken when this is called; the returned future writes
-    /// it. An implementation that touches the disk does so off the runtime
-    /// workers, because the paid pulls that share the runtime pay from their
-    /// decode loops.
-    ///
-    /// # Errors
-    ///
-    /// Any I/O failure persisting the record.
-    fn flush_present_record(&self) -> SourceFuture<'_, ()>;
-
-    /// The size a verified final chunk proved, if any leg has proved one. A
-    /// store keyed by a fixed size knows that size from the start, so the
-    /// default is [`total_bytes`](decdn_bao_range::RangedStore::total_bytes).
-    /// [`crate::acquire`] completes once a size is proven and every byte below
-    /// it is present.
-    fn proven(&self) -> Option<u64> {
-        Some(self.total_bytes())
-    }
-
-    /// Move the planner's bound ([`total_bytes`](decdn_bao_range::RangedStore::total_bytes))
-    /// to `bound`. [`crate::acquire`] clamps a first size to the cap's reach
-    /// this way while no size is proven. A store keyed by a fixed size keeps
-    /// it, so the default does nothing.
-    fn set_bound(&self, bound: u64) {
-        let _ = bound;
-    }
-
-    /// Record `size` as the blob's proven size: a node's size proof verified
-    /// it against the root before the leg that carried it opened. The
-    /// planner's bound becomes it at once. A store keyed by a fixed size knows
-    /// its size already, so the default does nothing.
-    fn prove_size(&self, size: crate::ProvenSize) {
-        let _ = size;
     }
 }
 
@@ -886,7 +762,8 @@ mod doubles {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::{Recovery, SourceFuture, StashedFault};
+    use super::{Recovery, SourceFuture};
+    use crate::sink::StashedFault;
     use crate::{UpstreamPullHeader, VoucherProgress};
     use alloy::primitives::U256;
     use bao_tree::io::outboard::PreOrderMemOutboard;

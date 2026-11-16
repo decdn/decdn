@@ -4038,7 +4038,7 @@ impl CacheEngine {
     /// Stream the header-less interleaved bao **wire** (ADR 038) for
     /// `aligned`'s span out of the configured origins, verified against the
     /// root `H` — the raw-fetch half of a range pull WITHOUT the import (the
-    /// node's `NodeAdmitStore` sink admits, fed by
+    /// node's [`crate::CacheStore`] sink admits, fed by
     /// `decdn_client::BlobSource`).
     ///
     /// Each origin serves both halves of its own attempt: the outboard and the
