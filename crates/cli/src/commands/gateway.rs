@@ -141,7 +141,9 @@
 //! verified against the blob's hash. A request whose bytes the cache holds,
 //! the whole blob or its one `Range`, at the size a holder proved, is served
 //! out of the cache (`Gateway::cache_hit`): no pull, no capability spent, and
-//! no allowance charged. A blob the cache holds whole answers `HEAD` and gives
+//! no allowance charged, so a spent allowance or a page no capability covers
+//! still gets it (`Gateway::cached_only`). A manifest the cache holds whole is
+//! read from it with no pull. A blob the cache holds whole answers `HEAD` and gives
 //! its length with no size lookup. A request the cache holds only part of
 //! streams as a pull, which fetches only what the cache lacks, and is charged
 //! as a pull is. The eviction loop holds the cache under `--cache-mb`, and
@@ -2128,14 +2130,23 @@ impl Gateway {
         present: Present,
         ask: Ask<'_>,
     ) -> Response<Body> {
+        // Neither gate below meters a response the cache holds whole: it
+        // costs no pull, so a spent allowance or a page no capability covers
+        // still gets it.
         if let Some(refused) = self.allowance_refusal(pointer, uri) {
-            return refused;
+            return match self.cached_only(uri, present, ask).await {
+                Some(response) => response,
+                None => refused,
+            };
         }
         // A funding stop retires the capability and the next covering one
         // takes the request, so a capability that cannot pay costs a retry,
         // never a failed load. Each pass retires one, so the loop ends.
         loop {
             let Some(paying) = self.paying_for(page_host, pointer).await else {
+                if let Some(response) = self.cached_only(uri, present, ask).await {
+                    return response;
+                }
                 return text(
                     StatusCode::PAYMENT_REQUIRED,
                     &format!("no capability covers {page_host}\n"),
@@ -2156,6 +2167,48 @@ impl Gateway {
                 Err(e) => return pull_failed(e, uri, page_host, self.public()),
             }
         }
+    }
+
+    /// `uri` answered out of the cache alone, at no pull: a blob, a bundle
+    /// entry, or a site's `index.html`, whose response bytes the cache holds
+    /// ([`Self::cache_hit`]), at a size the gateway knows with no pull. The
+    /// manifest comes from what the gateway already holds
+    /// ([`Self::known_manifest`]). An empty blob and an unsatisfiable range
+    /// are answered too, as they cost nothing. `None` for anything else: a
+    /// `HEAD`, a listing, a manifest or a byte the cache lacks.
+    async fn cached_only(
+        self: &Arc<Self>,
+        uri: &DecdnUri,
+        present: Present,
+        ask: Ask<'_>,
+    ) -> Option<Response<Body>> {
+        let Ask::Get(range) = ask else {
+            return None;
+        };
+        let manifest;
+        let (hash, path, size) = if matches!(uri.target, UriTarget::Blob) {
+            (uri.hash, None, Some(self.blob_size(uri.hash).await?))
+        } else {
+            let wanted = match &uri.target {
+                UriTarget::BundleEntry(path) => path.as_str(),
+                UriTarget::Bundle if present == Present::Site => "index.html",
+                _ => return None,
+            };
+            let cap_mb = manifest_cap_mb(self.common.max_blob_mb);
+            manifest = self.known_manifest(uri.hash, cap_mb).await?.ok()?;
+            let entry = manifest.entries.iter().find(|e| e.path == wanted)?;
+            (entry.hash, Some(entry.path.as_str()), entry.size)
+        };
+        let name = served_name(hash, path);
+        let extent = match Extent::of(size, range, rewrites(present, path.unwrap_or(&name))) {
+            Ok(extent) => extent,
+            Err(size) => return Some(not_satisfiable(size)),
+        };
+        if size == Some(0) {
+            return Some(empty_entry(&name, hash, present));
+        }
+        let engine = self.cache_hit(hash, &extent).await?;
+        self.from_cache(engine, hash, path, &extent, present).ok()
     }
 
     /// The 402 for `uri` once the public allowance `bucket` ran out under a
@@ -2418,6 +2471,11 @@ impl Gateway {
                 Ok(extent) => extent,
                 Err(size) => return Ok(not_satisfiable(size)),
             };
+            if entry.size != Some(0)
+                && let Some(engine) = self.cache_hit(entry.hash, &extent).await
+            {
+                return self.from_cache(engine, entry.hash, Some(&entry.path), &extent, present);
+            }
             if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
             }
@@ -2490,6 +2548,56 @@ impl Gateway {
 
     /// What the gateway knows of `hash` as a manifest: the parsed manifest,
     /// or why it is none.
+    /// What the gateway knows of `hash` as a manifest with no pull: a parsed
+    /// manifest or a verdict it kept ([`Self::cached_manifest`]), else the
+    /// blob the cache holds whole ([`Self::manifest_from_cache`]).
+    async fn known_manifest(
+        &self,
+        hash: [u8; 32],
+        cap_mb: u64,
+    ) -> Option<Result<Arc<BundleManifest>, NotManifest>> {
+        match self.cached_manifest(&hash) {
+            Some(known) => Some(known),
+            None => self.manifest_from_cache(hash, cap_mb).await,
+        }
+    }
+
+    /// The manifest `hash` read out of the cache, when the cache holds the
+    /// blob whole and it fits the manifest cap `cap_mb`: parsed with no pull,
+    /// and kept as a pulled manifest or verdict is. A blob past the cap is
+    /// left to a pull, whose cap stop names the raw blob.
+    async fn manifest_from_cache(
+        &self,
+        hash: [u8; 32],
+        cap_mb: u64,
+    ) -> Option<Result<Arc<BundleManifest>, NotManifest>> {
+        let engine = self.cache.as_ref()?;
+        let size = self.cached_size(hash).await?;
+        if size == 0 || size > cap_mb.saturating_mul(1024 * 1024) {
+            return None;
+        }
+        let bytes = engine
+            .export_range(decdn_cache::Hash::from_bytes(hash), 0, size)
+            .await
+            .ok()?;
+        let verdict = BundleManifest::parse(&bytes)
+            .map(Arc::new)
+            .map_err(NotManifest::unparsed);
+        match &verdict {
+            Ok(manifest) => self
+                .manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(hash, Arc::clone(manifest), bytes.len()),
+            Err(not) => self
+                .not_manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(hash, not.clone()),
+        }
+        Some(verdict)
+    }
+
     fn cached_manifest(&self, hash: &[u8; 32]) -> Option<Result<Arc<BundleManifest>, NotManifest>> {
         let manifest = self
             .manifests
@@ -2527,7 +2635,7 @@ impl Gateway {
         let not_manifest = |verdict: &NotManifest| {
             PullError::NotManifest(verdict.error(cap_mb, &raw, raw_past_cap))
         };
-        if let Some(known) = self.cached_manifest(&hash) {
+        if let Some(known) = self.known_manifest(hash, cap_mb).await {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
         let flight = self.manifest_flight((hash, namespace));
@@ -2535,7 +2643,7 @@ impl Gateway {
         let mut failed = flight.failed.lock().await;
         // A request that waited on the fill lock finds what the one before it
         // pulled.
-        if let Some(known) = self.cached_manifest(&hash) {
+        if let Some(known) = self.known_manifest(hash, cap_mb).await {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
         if flight.ended.load(Ordering::Relaxed) > seen

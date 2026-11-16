@@ -238,8 +238,13 @@ the whole blob, or the chunk groups of its one `Range`. The cache must also
 hold the blob under the size that the response states. The gateway serves a
 hit from the cache. A hit starts no pull, spends no capability and charges
 the allowance nothing. The allowance meters what the gateway pays for, and a
-hit pays for nothing. A blob that the cache holds whole answers `HEAD` with
-its length, and needs no size lookup.
+hit pays for nothing. Thus a hit is served when the allowance is spent, and
+on a loopback gateway when no capability covers the page. A blob that the
+cache holds whole answers `HEAD` with its length, and needs no size lookup.
+
+A bundle manifest that the cache holds whole is read from the cache, with no
+pull. Thus a site entry, or the `index.html` at a site's `/`, is a hit when
+the cache holds the manifest and the entry.
 
 A request that the cache holds only in part is not a hit. It streams as a
 pull, and the allowance charges it as a pull. The pull fetches only the
