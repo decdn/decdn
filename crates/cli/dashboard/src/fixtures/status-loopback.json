@@ -25,7 +25,8 @@
       "range": null,
       "payer": {
         "kind": "capability",
-        "signer": "0xCdCDCdCdcdcdcdCdcDcDCdcDcDCdCdcdCdcDCDcD"
+        "signer": "0xCdCDCdCdcdcdcdCdcDcDCdcDcDCdCdcdCdcDCDcD",
+        "pool": "0x0202020202020202020202020202020202020202020202020202020202020202"
       },
       "since_secs": 2,
       "delivered_bytes": 65536
@@ -35,9 +36,7 @@
     {
       "cap": 4000000,
       "expiry": 1900000000,
-      "origin": "https://decdn.org",
       "pool": "0x0202020202020202020202020202020202020202020202020202020202020202",
-      "scope": "decdn.org",
       "signer": "0xCdCDCdCdcdcdcdCdcDcDCdcDcDCdCdcdCdcDCDcD",
       "spent": false
     }

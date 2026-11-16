@@ -126,9 +126,7 @@ const PULL: Keys<ActivePull> = {
 const CAPABILITY: Keys<Capability> = {
   cap: true,
   expiry: true,
-  origin: true,
   pool: true,
-  scope: true,
   signer: true,
   spent: true,
 };
@@ -403,7 +401,7 @@ function expectStatus(raw: unknown) {
     expect(["pool", "capability"]).toContain(p.payer.kind);
     expectShape(
       p.payer,
-      p.payer.kind === "pool" ? { kind: 1 } : { kind: 1, signer: 1 },
+      p.payer.kind === "pool" ? { kind: 1 } : { kind: 1, pool: 1, signer: 1 },
       "payer",
     );
   }

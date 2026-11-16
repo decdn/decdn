@@ -4,16 +4,11 @@
 //! **Content.** `GET /<hash>[/<path>][?ns=<id>]` serves
 //! `decdn:<hash>[/<path>][?ns=<id>]`. A blob or a bundle entry streams its
 //! verified bytes in order as they arrive; a whole bundle (`/<hash>/`) gets an
-//! HTML index of its entries. A content request carries [`TOKEN_HEADER`] (the
-//! gateway token) and [`HOST_HEADER`] (the host of the page it serves); the
-//! browser extension adds both, so page scripts never see the token. The
-//! gateway pays with the registered capability whose scope covers that host:
-//! an exact host first, then `*.<domain>`, then `*`; between equal scopes, the
-//! token holder's own registration before a page's, then the earlier
-//! registration. A capability whose pull stops for funding before its first
-//! byte is retired and the next covering one takes the request. `HEAD` gets
-//! 405, since answering it would cost a paid pull. A bundle request without
-//! the token redirects to the bundle's site, at no cost.
+//! HTML index of its entries. A content request carries [`TOKEN_HEADER`], the
+//! gateway token, and the gateway pays for it with the capabilities it holds
+//! (**Capabilities**). `HEAD` gets 405, since answering it would cost a paid
+//! pull. A bundle request without the token redirects to the bundle's site, at
+//! no cost.
 //!
 //! **Sites.** Every bundle is also a website on its own browser origin,
 //! `http://[<ns>.]<hash32>.localhost:<port>/` (`site`), so its pages run
@@ -26,49 +21,54 @@
 //! that content to the page's own requests and redirects a navigation to the
 //! other bundle's site. The site origin takes no token: the browser's
 //! `Sec-Fetch-*` headers decide what may spend (`site::may_spend`), and a
-//! site pays with the capability that covers its host, as a page's request
-//! does. `/_delegate` and `/_capability` answer on the gateway origin only.
+//! site pays with the capabilities the gateway holds, as a content request
+//! does. The API paths answer on the gateway origin only.
 //!
-//! **Capabilities.** The gateway holds one delegate key per capability, in
-//! memory only. `GET /_delegate` mints a fresh key and returns its address, so
-//! no two callers see the same address and none can follow the user across
-//! sites; a key no capability claims within [`PENDING_TTL`] is dropped. A
-//! caller is a web page by its `http(s)` `Origin`, or the gateway token holder
-//! from outside any page. The pages of one site (a registrable domain by the
-//! Public Suffix List, so subdomains share it) hold at most a few keys,
-//! pending or registered, within a bound shared by all pages; the token
-//! holder mints outside both bounds.
-//! `PUT /_capability` registers a `dcap1:` capability issued to a minted
-//! address, with a scope. The capability's owner signature must recover the
-//! on-chain owner of its pool on the gateway's deployment. A page registers
-//! through CORS, and its scope must cover its own origin's host, whether or
-//! not the request also carries the token: `example.com` may register
-//! `example.com`, `*.example.com` or `*`, never another host, and never a
-//! wildcard over a public suffix such as `*.com` or `*.github.io`. The token
-//! holder registers any scope. `GET /_capability` lists the registrations to
-//! the token holder. A restart drops every key, and with it every capability
-//! issued to one.
+//! **Capabilities.** A capability (ADR 003 § Capability delegation) lets a
+//! delegate key the gateway holds spend from a pool, so a pool owner funds a
+//! gateway with no funded wallet on its machine. The gateway holds at most one
+//! pending key, which no capability claims yet: `GET /_delegate` returns its
+//! address and creates it when there is none, so repeated calls get the same
+//! address until a capability claims the key. `PUT /_capability` takes a
+//! `dcap1:` capability issued to a key the gateway holds, and its owner
+//! signature must recover the on-chain owner of its pool on the gateway's
+//! deployment. A key holds at most one capability per pool: a key the
+//! gateway does not hold, or a second capability from one pool, answers 409.
+//! A zero cap, or an expiry already inside the expiry margin nodes apply
+//! ([`EXPIRY_MARGIN_SECS`]), is refused before the chain is read.
+//! `GET /_capability` lists the capabilities in the order they were
+//! registered, which is the order the gateway pays with them: a pull goes to
+//! the first one that no funding stop retired and that is outside the expiry
+//! margin, and one whose pull stops for funding before its first byte is
+//! retired and the next one takes the request. The gateway holds several at
+//! once, so an operator registers the next capability before the current one
+//! runs low. These routes take no token and no `Origin`: nothing they do
+//! spends money without a pool owner's signature, and an operator who wants
+//! authentication puts a proxy in front. Keys and capabilities live in memory
+//! only: a restart drops every one, and the operator provisions them again.
 //!
-//! **Boundaries.** On a loopback gateway only `/_delegate` and `/_capability`
-//! answer cross-origin; content never does, so a page can neither read a
-//! response nor set the token or host headers itself. The token lives in `<data-dir>/token`,
-//! owner-only. The gateway listens on loopback only and checks `Host` against
-//! DNS rebinding: it answers its own loopback names and well-formed site
-//! names on its port, nothing else.
+//! **Boundaries.** A loopback gateway answers nothing cross-origin, so a page
+//! can neither read a response nor set the token itself. The token lives in
+//! `<data-dir>/token`, owner-only. The gateway listens on loopback only and
+//! checks `Host` against DNS rebinding: it answers its own loopback names and
+//! well-formed site names on its port, nothing else.
 //!
 //! **Public.** With `--public-url <origin>` the gateway serves anyone at that
 //! origin, behind a proxy that terminates TLS: `<origin>/<hash>[/<path>]`,
 //! every bundle as a site at `<scheme>://[<ns>.]<hash32>.<host>/`, and a
 //! namespace at `<scheme>://<ns>.<host>/` once it has a pointer here. There
-//! is no token and no capability: every request pays from the keystore's own
-//! pool (`worker::Payment::Pool`), and the allowance (`allowance`) bounds the
-//! bytes the gateway delivers per day over every request; a namespace the
-//! operator gave `--allowance <ns>=<bytes>` spends that on the requests its
-//! pointer serves instead. A request past it,
+//! is no token. A request pays with a held capability first, as on a loopback
+//! gateway, else from the gateway's own pool (`worker::Payment::Pool`) when it
+//! names a keystore (`--keystore` or `blockchain.eth_keystore`); a gateway
+//! with no keystore pays with capabilities only. The allowance (`allowance`)
+//! bounds the bytes the gateway delivers per day over every request, whoever
+//! pays; a namespace the operator gave `--allowance <ns>=<bytes>` spends that
+//! on the requests its pointer serves instead. A request past it,
 //! or one whose known size does not fit what is left, answers `402` with the
 //! canonical `decdn:` URI in a `Link` header and a JSON body, so a paying
 //! client continues on its own; a stream of unknown size is cut when the
-//! allowance runs out; a pool that cannot pay answers `503` as a `402` does.
+//! allowance runs out; a request nothing can pay for answers `503` as a `402`
+//! does.
 //! An entry's pull is capped at the size its manifest declares, so a manifest
 //! cannot make the gateway pay for more than it says, and a declared size is
 //! what `Content-Length` and the allowance count on. A raw blob's size is
@@ -87,8 +87,8 @@
 //! `HEAD` on an entry is answered from the bundle manifest, at no pull of the
 //! entry, and on a raw blob from its verified size, at no pull at all; a
 //! raw blob of unknown size first learns its size, as its `GET` would. The
-//! API paths answer `404`,
-//! and a site's `Sec-Fetch-*` headers decide nothing: the operator pays,
+//! API paths answer on the bare host alone and `404` on every other,
+//! and a site's `Sec-Fetch-*` headers decide nothing: the gateway pays,
 //! within the allowance. Every answer is readable by every origin
 //! (`readable_anywhere`), and `OPTIONS` is a preflight
 //! (`public_preflight`). A pull runs a small read-ahead
@@ -96,19 +96,20 @@
 //! client that drops it, a cut, a fault) is charged what the pull may have
 //! paid past the frames it delivered (`DROP_PENALTY_BYTES`), so a client
 //! that connects and drops spends no more than it is charged. An upstream
-//! failure answers a bare `502`, with the detail in the log. The buyer store
-//! lives in `<data-dir>/store`, so the pool and its lanes survive a restart.
+//! failure answers a bare `502`, with the detail in the log. A gateway that
+//! pays from its own pool keeps the buyer store in `<data-dir>/store`, so the
+//! pool and its lanes survive a restart; otherwise the store lives as long as
+//! the in-memory keys whose lanes it records.
 //!
 //! **State.** Every gateway counts what it served, refused and failed
 //! (`metrics`). `GET /_status` returns that, the pulls in flight, the
 //! capabilities, a public gateway's allowance and pointers, and what the
-//! buyer-pool store holds, as one JSON document (`status`), which
-//! `decdn dashboard` polls. A loopback gateway answers it on its own host,
-//! behind the token; a public gateway does not answer it on its public host.
-//! `--metrics-listen` serves `GET /metrics` (Prometheus text) and `/_status`
-//! on a loopback address, for the operator: a public gateway's `/_status`
-//! there takes no token, a loopback gateway's takes its token. The
-//! dashboard's own polls are not counted.
+//! buyer-pool store holds, with each capability key's spend, as one JSON
+//! document (`status`), which `decdn dashboard` polls and an operator's
+//! controller reads to see what is left of each capability. Every gateway
+//! answers it on its bare host, with no token. `--metrics-listen` serves
+//! `GET /metrics` (Prometheus text) and `/_status` on a loopback address, for
+//! the operator. The dashboard's own polls are not counted.
 //!
 //! **Pointers.** `PUT /_pointer` on the bare host takes a namespace pointer
 //! (`pointer`): an EIP-712 record, signed by the namespace's owner on the
@@ -142,9 +143,8 @@
 //! the whole blob or its one `Range`, at the size a holder proved, is served
 //! out of the cache (`Gateway::cache_hit`): no pull, no capability spent, and
 //! no allowance charged, so a spent allowance still gets it
-//! (`Gateway::cached_only`). A loopback page no capability covers gets its
-//! 402 all the same, as that refusal is how a page learns to register a
-//! capability. A manifest the cache holds whole is
+//! (`Gateway::cached_only`), and so does a gateway that holds nothing that
+//! can pay. A manifest the cache holds whole is
 //! read from it with no pull. A blob the cache holds whole answers `HEAD` and gives
 //! its length with no size lookup. A request the cache holds only part of
 //! streams as a pull, which fetches only what the cache lacks, and is charged
@@ -164,7 +164,6 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
-use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::Eip712Domain;
 use anyhow::Context as _;
 use bytes::Bytes;
@@ -173,7 +172,7 @@ use decdn_client::session::ChainConfig;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::address::parse_nonzero_address;
 use decdn_common::cli::{self, ClientFetchArgs, GatewayArgs};
-use decdn_common::config::{FileConfig, load_file_config};
+use decdn_common::config::{FileConfig, inside_capability_expiry_margin, load_file_config};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::publisher_registry::PublisherRegistry;
@@ -200,6 +199,7 @@ use super::local_http::{
 use crate::known_chains;
 
 mod allowance;
+mod delegates;
 mod metrics;
 pub(crate) mod pointer;
 mod rewrite;
@@ -208,6 +208,7 @@ mod status;
 mod worker;
 
 use allowance::Allowance;
+use delegates::{Capability, Delegates};
 use metrics::Metrics;
 use pointer::{Pointers, SetError, SignedPointer, pointer_domain};
 use rewrite::Rewrite;
@@ -217,20 +218,13 @@ use worker::{FetchBackend, Job, Payment, PullWorker};
 /// The request header carrying the gateway token.
 pub const TOKEN_HEADER: &str = super::local_http::TOKEN_HEADER;
 
-/// The request header naming the host of the page a content request serves.
-pub const HOST_HEADER: &str = "x-decdn-host";
-
-/// How long a minted delegate waits for a capability before it is dropped.
-pub const PENDING_TTL: Duration = Duration::from_mins(15);
-
-/// The most live delegates, pending or registered, the pages of one site
-/// hold, so no site can use up another's room or stock capabilities without
-/// bound, however many subdomains it serves pages from.
-const MAX_DELEGATES_PER_SITE: usize = 8;
-
-/// The most live delegates all pages hold together: the gateway holds page
-/// keys within a fixed bound.
-const MAX_PAGE_DELEGATES: usize = 1024;
+/// The capability expiry margin nodes apply at the default redeem interval
+/// (ADR 003 § Revocation): inside it a node accepts no voucher under the
+/// capability, so the gateway pays with it no more and refuses to register
+/// one already inside it.
+pub const EXPIRY_MARGIN_SECS: u64 = decdn_common::config::capability_expiry_margin_secs(
+    decdn_common::config::DEFAULT_REDEEM_INTERVAL_SECS,
+);
 
 /// The largest `PUT /_capability` or `PUT /_pointer` body.
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -347,9 +341,11 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     let file = load_file_config(config_path)?;
     fill_chain_defaults(&mut common, &file)?;
     let resolved = resolve_chain(&common, &file)?;
-    if public_url.is_some() && common.keystore.is_none() {
-        // The keystore resolves under the data dir; the buyer store moves
-        // under it below, so the keystore is pinned first.
+    // A public gateway pays from its own pool only when the operator names a
+    // keystore; the buyer store moves under the data dir below, so the
+    // keystore is pinned first.
+    let pool = public_url.is_some() && names_keystore(&common, &file);
+    if pool {
         common.keystore = Some(resolved.keystore.clone());
     }
     let chain = resolved.config;
@@ -363,7 +359,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         Some(_) => None,
         None => Some(load_or_create_token(&root.join("token"))?),
     };
-    let (store_dir, temp_store) = store_dir(&root, public_url.is_some())?;
+    let (store_dir, temp_store) = store_dir(&root, pool)?;
     common.data_dir = Some(store_dir);
     let (sites, public) = mode(args, &root, chain.chain_id, &file)?;
 
@@ -379,7 +375,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         FetchBackend {
             common: common.clone(),
             config_path: config_path.map(Path::to_path_buf),
-            pool: public_url.is_some(),
+            pool,
             cache: cache.clone().map(CacheStores::new),
         },
         MAX_PULLS,
@@ -391,7 +387,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         token,
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
-        delegates: Mutex::new(HashMap::new()),
+        delegates: std::sync::Mutex::default(),
         pulls,
         cache: cache.clone(),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
@@ -407,6 +403,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         started_unix: now_secs(),
         listen: args.listen,
         public,
+        pool,
     });
 
     if let Some(metrics) = args.metrics_listen {
@@ -533,12 +530,23 @@ fn announce(gateway: &Gateway, root: &Path) {
     }
 }
 
-/// Where the buyer store lives, created owner-only. A public gateway's pool
-/// and lanes outlive the process, so its store stays under `root`. A loopback
-/// gateway's keys die with the process, so their lane records do too: its
-/// store lives in a directory removed when the returned guard drops.
-fn store_dir(root: &Path, public: bool) -> anyhow::Result<(PathBuf, Option<tempfile::TempDir>)> {
-    let (dir, guard) = if public {
+/// Whether the operator names a keystore, by `--keystore` or
+/// `blockchain.eth_keystore`.
+fn names_keystore(common: &ClientFetchArgs, file: &FileConfig) -> bool {
+    common.keystore.is_some()
+        || file
+            .blockchain
+            .as_ref()
+            .is_some_and(|b| b.eth_keystore.is_some())
+}
+
+/// Where the buyer store lives, created owner-only. A gateway's own `pool`
+/// and its lanes outlive the process, so a gateway that pays from one keeps
+/// its store under `root`. Delegate keys die with the process, so their lane
+/// records do too: any other gateway's store lives in a directory removed
+/// when the returned guard drops.
+fn store_dir(root: &Path, pool: bool) -> anyhow::Result<(PathBuf, Option<tempfile::TempDir>)> {
+    let (dir, guard) = if pool {
         (root.join("store"), None)
     } else {
         let dir = tempfile::Builder::new()
@@ -628,11 +636,9 @@ fn registry_address(
 
 /// Serve the operator's routes on `listener`, a loopback address, for as
 /// long as the gateway runs: `GET /metrics` answers Prometheus text, and
-/// `/_status` answers as on a loopback gateway's host. A
-/// public gateway's `/_status` takes no token here; a loopback gateway's
-/// takes its token, as on its host. A `Host` other than the listener's own
-/// loopback names is refused, so a page whose name was rebound to this
-/// address reads nothing.
+/// `/_status` answers as on the gateway's bare host. A `Host` other than the
+/// listener's own loopback names is refused, so a page whose name was
+/// rebound to this address reads nothing.
 async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
     let hosts = Arc::new(listener.local_addr().map(allowed_hosts).unwrap_or_default());
     loop {
@@ -645,9 +651,6 @@ async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
             let service =
                 service_fn(move |req: Request<hyper::body::Incoming>| {
                     let gateway = Arc::clone(&gateway);
-                    // The capabilities a loopback gateway lists are the token
-                    // holder's: its listener asks for the token, as its host does.
-                    let authorized = gateway.public() || gateway.authorized(req.headers());
                     let known = hosts
                         .iter()
                         .any(|allowed| allowed == host_header(req.headers()));
@@ -661,7 +664,9 @@ async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
                                 gateway.metrics.render(),
                                 "text/plain; version=0.0.4; charset=utf-8",
                             )),
-                            (&Method::GET, path) => gateway.operator(path, authorized).await,
+                            (&Method::GET, "/_status") => {
+                                Some(json(StatusCode::OK, &gateway.status().await))
+                            }
                             _ => None,
                         };
                         Ok::<_, Infallible>(response.unwrap_or_else(|| {
@@ -766,172 +771,6 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The hosts a capability pays for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Scope {
-    /// Every host (`*`).
-    Any,
-    /// A domain and its subdomains (`*.example.com`).
-    Domain(String),
-    /// One host (`example.com`).
-    Host(String),
-}
-
-impl Scope {
-    fn parse(s: &str) -> Result<Self, String> {
-        let s = s.trim().to_ascii_lowercase();
-        if s == "*" {
-            return Ok(Self::Any);
-        }
-        if let Some(domain) = s.strip_prefix("*.") {
-            return valid_host(domain).map(|()| Self::Domain(domain.to_owned()));
-        }
-        valid_host(&s).map(|()| Self::Host(s))
-    }
-
-    fn covers(&self, host: &str) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Domain(domain) => {
-                host == domain
-                    || host
-                        .strip_suffix(domain.as_str())
-                        .is_some_and(|prefix| prefix.ends_with('.'))
-            }
-            Self::Host(h) => host == h,
-        }
-    }
-
-    /// More specific scopes win when several cover a host.
-    const fn rank(&self) -> u8 {
-        match self {
-            Self::Host(_) => 2,
-            Self::Domain(_) => 1,
-            Self::Any => 0,
-        }
-    }
-}
-
-impl std::fmt::Display for Scope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Any => f.write_str("*"),
-            Self::Domain(d) => write!(f, "*.{d}"),
-            Self::Host(h) => f.write_str(h),
-        }
-    }
-}
-
-fn valid_host(host: &str) -> Result<(), String> {
-    let ok = !host.is_empty()
-        && host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        });
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("`{host}` is not a host name"))
-    }
-}
-
-/// The host of a web page's `Origin` header (`https://example.com:8443` gives
-/// `example.com`). `None` for an opaque origin and for every scheme other
-/// than `http` and `https`, such as an extension's.
-fn origin_host(origin: &str) -> Option<String> {
-    let rest = origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))?;
-    let host = rest.split(['/', ':']).next()?;
-    let host = host.to_ascii_lowercase();
-    valid_host(&host).ok().map(|()| host)
-}
-
-/// Who calls `/_delegate` or `/_capability`.
-#[derive(Debug, PartialEq, Eq)]
-enum Caller {
-    /// A web page, by its `Origin` and that origin's host. A page stays a
-    /// page when its request also carries the token.
-    Page { origin: String, host: String },
-    /// The token holder, from outside any web page.
-    Token,
-}
-
-impl Caller {
-    fn of(origin: Option<&str>, authorized: bool) -> Result<Self, &'static str> {
-        match origin {
-            Some(origin) => {
-                if let Some(host) = origin_host(origin) {
-                    Ok(Self::Page {
-                        origin: origin.to_owned(),
-                        host,
-                    })
-                } else if origin == "null" {
-                    Err("an opaque origin may not call the gateway\n")
-                } else if authorized {
-                    Ok(Self::Token)
-                } else {
-                    Err("token required\n")
-                }
-            }
-            None if authorized => Ok(Self::Token),
-            None => Err("a page calls with its Origin; use the gateway token otherwise\n"),
-        }
-    }
-
-    /// The page origin, or `None` for the token holder.
-    fn origin(&self) -> Option<&str> {
-        match self {
-            Self::Page { origin, .. } => Some(origin),
-            Self::Token => None,
-        }
-    }
-
-    /// The page's site, or `None` for the token holder.
-    fn site(&self) -> Option<String> {
-        match self {
-            Self::Page { host, .. } => Some(site(host)),
-            Self::Token => None,
-        }
-    }
-}
-
-/// The site `host` belongs to: its registrable domain by the Public Suffix
-/// List (`a.b.example.co.uk` gives `example.co.uk`), or the host itself for an
-/// IP address and a name with no registrable domain, such as `localhost`.
-fn site(host: &str) -> String {
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return host.to_owned();
-    }
-    psl::domain_str(host).unwrap_or(host).to_owned()
-}
-
-/// Whether `caller` may register `scope`: a page only a scope that covers its
-/// own host and is no wildcard over a public suffix (`*.io`, `*.github.io`),
-/// the token holder any scope.
-fn may_register(caller: &Caller, scope: &Scope) -> Result<(), String> {
-    let Caller::Page { host, .. } = caller else {
-        return Ok(());
-    };
-    if !scope.covers(host) {
-        return Err(format!(
-            "{host} may not register scope `{scope}`: it does not cover {host}"
-        ));
-    }
-    if let Scope::Domain(domain) = scope
-        && psl::suffix_str(domain) == Some(domain.as_str())
-    {
-        return Err(format!(
-            "{host} may not register scope `{scope}`: {domain} is a public suffix"
-        ));
-    }
-    Ok(())
-}
-
 /// Whether a pool whose on-chain owner is `on_chain` accepts a capability its
 /// signature recovers to `signed_by`.
 fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Result<(), String> {
@@ -948,86 +787,12 @@ fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Resu
     }
 }
 
-/// A delegate key and the capability registered to it, if any.
-struct Delegate {
-    signer: Arc<PrivateKeySigner>,
-    minted: Instant,
-    /// The site of the page that minted it, or `None` for the token holder.
-    site: Option<String>,
-    capability: Option<Registered>,
-}
-
-/// Whether a page of `site` may mint one more delegate beside `delegates`.
-/// Pages share [`MAX_PAGE_DELEGATES`] and each site holds at most
-/// [`MAX_DELEGATES_PER_SITE`], pending or registered; the token holder
-/// (`None`) mints outside both bounds, so no page can stop the user's own
-/// handshake.
-fn may_mint(delegates: &HashMap<Address, Delegate>, site: Option<&str>) -> Result<(), String> {
-    let Some(site) = site else {
-        return Ok(());
-    };
-    let pages = || delegates.values().filter(|d| d.site.is_some());
-    if pages().count() >= MAX_PAGE_DELEGATES {
-        return Err("too many pages hold delegates\n".to_owned());
-    }
-    if pages().filter(|d| d.site.as_deref() == Some(site)).count() >= MAX_DELEGATES_PER_SITE {
-        return Err(format!(
-            "pages of {site} hold {MAX_DELEGATES_PER_SITE} delegates\n"
-        ));
-    }
-    Ok(())
-}
-
-/// One registered capability as `GET /_capability` and `/_status` list it.
-/// The fields are declared in sorted key order, which is the body's key
-/// order: the TypeScript SDK reads this body, and its shape is a contract
-/// (`the_capability_list_keeps_its_shape`).
-#[derive(serde::Serialize)]
-struct Capability {
-    /// The spending cap, in micro-USDC.
-    cap: u64,
-    /// The capability's expiry, Unix seconds.
-    expiry: u64,
-    /// The origin that registered it, or `None` for the token holder.
-    origin: Option<String>,
-    /// The pool it spends, `0x` hex.
-    pool: String,
-    /// The hosts it pays for.
-    scope: String,
-    /// The delegate key, EIP-55 hex.
-    signer: String,
-    /// Whether a pull ran out of its cap.
-    spent: bool,
-}
-
-struct Registered {
-    grant: CapabilityGrant,
-    scope: Scope,
-    /// The origin that registered it, or `None` for the token holder.
-    origin: Option<String>,
-    /// When it was registered.
-    since: Instant,
-    spent: bool,
-}
-
-impl Registered {
-    /// The order among capabilities that cover one host, highest first: the
-    /// more specific scope, then the token holder's own registration over a
-    /// page's, then the earlier registration, so a later one never shadows
-    /// a capability already in use.
-    const fn preference(&self) -> (u8, bool, std::cmp::Reverse<Instant>) {
-        (
-            self.scope.rank(),
-            self.origin.is_none(),
-            std::cmp::Reverse(self.since),
-        )
-    }
-}
-
+/// The body of `PUT /_capability`.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterRequest {
+    /// The `dcap1:` capability.
     capability: String,
-    scope: String,
 }
 
 struct Gateway {
@@ -1039,7 +804,8 @@ struct Gateway {
     chain: ChainConfig,
     /// The EIP-712 domain a capability's owner signs under.
     domain: Eip712Domain,
-    delegates: Mutex<HashMap<Address, Delegate>>,
+    /// The delegate keys and the capabilities registered to them.
+    delegates: std::sync::Mutex<Delegates>,
     /// Runs every pull, on one endpoint and one buyer-pool store.
     pulls: PullWorker,
     /// What the pulls filled, for a later request to read with no pull and
@@ -1072,6 +838,9 @@ struct Gateway {
     listen: SocketAddr,
     /// What a public gateway holds beyond a loopback one; `None` on loopback.
     public: Option<Public>,
+    /// Whether a public gateway pays from its own pool, after the
+    /// capabilities it holds.
+    pool: bool,
 }
 
 /// What a public gateway holds beyond a loopback one.
@@ -1522,11 +1291,6 @@ impl Gateway {
             }
             Some(Route::Bare) | None => {}
         }
-        let origin = req
-            .headers()
-            .get(header::ORIGIN)
-            .and_then(|o| o.to_str().ok())
-            .map(str::to_owned);
         let authorized = self.authorized(req.headers());
         let path = req.uri().path().to_owned();
         let method = req.method().clone();
@@ -1539,39 +1303,19 @@ impl Gateway {
             Ok(response) => return response,
             Err(req) => *req,
         };
-        if !self.public()
-            && method == Method::GET
-            && let Some(response) = self.operator(&path, authorized).await
-        {
-            return response;
-        }
         match (method, path.as_str()) {
-            (Method::OPTIONS, "/_delegate" | "/_capability") => preflight(origin.as_deref()),
             (Method::OPTIONS, _) => text(StatusCode::FORBIDDEN, "no cross-origin access\n"),
             (Method::GET, "/") => html(
                 StatusCode::OK,
                 "<h1>decdn gateway</h1><p>Running. Open a bundle as a website at \
-                 <code>/&lt;hash&gt;/</code>. Connect the deCDN browser extension with the \
-                 token <code>decdn gateway</code> printed when it started. Run \
-                 <code>decdn dashboard</code> to see what the gateway holds and did.</p>",
+                 <code>/&lt;hash&gt;/</code>. Run <code>decdn dashboard</code> to see what \
+                 the gateway holds and did.</p>",
             ),
             (Method::GET, "/favicon.ico") => text(StatusCode::NOT_FOUND, ""),
-            (Method::GET, "/_delegate") => {
-                let response = match Caller::of(origin.as_deref(), authorized) {
-                    Ok(caller) => self.mint(&caller).await,
-                    Err(e) => text(StatusCode::FORBIDDEN, e),
-                };
-                with_cors(response, origin.as_deref())
-            }
-            (Method::PUT, "/_capability") => {
-                let response = match Caller::of(origin.as_deref(), authorized) {
-                    Ok(caller) => self.register(req, &caller).await,
-                    Err(e) => text(StatusCode::FORBIDDEN, e),
-                };
-                with_cors(response, origin.as_deref())
-            }
-            (Method::GET, "/_capability") if authorized => self.list().await,
-            (Method::GET, "/_capability") => text(StatusCode::UNAUTHORIZED, "token required\n"),
+            (Method::GET, "/_delegate") => self.pending(),
+            (Method::PUT, "/_capability") => self.register(req).await,
+            (Method::GET, "/_capability") => self.list(),
+            (Method::GET, "/_status") => json(StatusCode::OK, &self.status().await),
             (Method::PUT, "/_pointer") => text(
                 StatusCode::NOT_FOUND,
                 "a loopback gateway holds no namespace pointers\n",
@@ -1586,9 +1330,9 @@ impl Gateway {
     }
 
     /// What a public gateway answers on its bare host before the routes it
-    /// shares with a loopback one: no API but `PUT /_pointer`, and `HEAD` of
-    /// content. `Err(req)` when the request is not one of those,
-    /// and on a loopback gateway.
+    /// shares with a loopback one: `PUT /_pointer`, and `HEAD` of content.
+    /// `Err(req)` when the request is not one of those, and on a loopback
+    /// gateway.
     async fn public_bare<B>(
         self: &Arc<Self>,
         req: Request<B>,
@@ -1603,13 +1347,10 @@ impl Gateway {
             return Err(Box::new(req));
         }
         Ok(match (req.method(), path) {
-            (_, "/_delegate" | "/_capability" | "/_status") => {
-                text(StatusCode::NOT_FOUND, "a public gateway has no API\n")
-            }
             (&Method::PUT, "/_pointer") => self.put_pointer(req).await,
             (&Method::HEAD, "/" | "/favicon.ico") => text(StatusCode::OK, ""),
             (&Method::HEAD, _) => {
-                self.head_blob(target.trim_start_matches('/'), Present::Bare, "", |_| None)
+                self.head_blob(target.trim_start_matches('/'), Present::Bare, |_| None)
                     .await
             }
             _ => return Err(Box::new(req)),
@@ -1625,16 +1366,6 @@ impl Gateway {
             && req.method() == Method::GET
             && self.hosts.iter().any(|allowed| allowed == host)
             && path == "/_status"
-    }
-
-    /// The operator's route at `path`: `/_status` when `authorized`. `None`
-    /// for any other path.
-    async fn operator(&self, path: &str, authorized: bool) -> Option<Response<Body>> {
-        match path {
-            "/_status" if authorized => Some(json(StatusCode::OK, &self.status().await)),
-            "/_status" => Some(text(StatusCode::UNAUTHORIZED, "token required\n")),
-            _ => None,
-        }
     }
 
     /// The site policy on `response`.
@@ -1683,10 +1414,6 @@ impl Gateway {
         {
             return text(status, why);
         }
-        let page_host = match pointer {
-            Some(ns) => self.sites.namespace_host(ns),
-            None => self.sites.site_host(&site),
-        };
         let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
         if head {
             return match target.strip_prefix("/_decdn/") {
@@ -1694,8 +1421,7 @@ impl Gateway {
                     // The bucket a `GET` of it under `/_decdn/` would spend.
                     let bundle = site.hash;
                     let bucket = move |hash| pointer.filter(|_| hash == bundle);
-                    self.head_blob(rest, Present::Site, &page_host, bucket)
-                        .await
+                    self.head_blob(rest, Present::Site, bucket).await
                 }
                 None => self.head_site(&site, path, pointer).await,
             };
@@ -1711,13 +1437,13 @@ impl Gateway {
             let bucket = pointer.filter(|_| uri.hash == site.hash);
             if !site::is_navigation(headers) {
                 return self
-                    .paid(&page_host, bucket, &uri, Present::Site, Ask::Get(range))
+                    .paid(bucket, &uri, Present::Site, Ask::Get(range))
                     .await;
             }
             // Another bundle's pages run on their own origin; a blob has none.
             return match uri.target {
                 UriTarget::Blob => {
-                    self.paid(&page_host, bucket, &uri, Present::Download, Ask::Get(range))
+                    self.paid(bucket, &uri, Present::Download, Ask::Get(range))
                         .await
                 }
                 _ => self.to_site(&uri),
@@ -1735,7 +1461,7 @@ impl Gateway {
             Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
             Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
         };
-        self.paid(&page_host, pointer, &uri, Present::Site, Ask::Get(range))
+        self.paid(pointer, &uri, Present::Site, Ask::Get(range))
             .await
     }
 
@@ -1860,41 +1586,30 @@ impl Gateway {
         carries_token(headers, token)
     }
 
-    /// Drop delegates that waited too long for a capability, and those whose
-    /// capability expired.
-    fn prune(delegates: &mut HashMap<Address, Delegate>) {
-        let now = now_secs();
-        delegates.retain(|_, d| match &d.capability {
-            None => d.minted.elapsed() < PENDING_TTL,
-            Some(registered) => registered.grant.expiry > now,
-        });
+    /// The delegate keys, with every capability expired by now dropped. No
+    /// caller holds the lock across an await.
+    fn delegates(&self) -> std::sync::MutexGuard<'_, Delegates> {
+        let mut delegates = self
+            .delegates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        delegates.prune(now_secs());
+        delegates
     }
 
-    async fn mint(&self, caller: &Caller) -> Response<Body> {
-        let mut delegates = self.delegates.lock().await;
-        Self::prune(&mut delegates);
-        let site = caller.site();
-        if let Err(e) = may_mint(&delegates, site.as_deref()) {
-            return text(StatusCode::TOO_MANY_REQUESTS, &e);
-        }
-        let signer = PrivateKeySigner::random();
-        let address = signer.address();
-        delegates.insert(
-            address,
-            Delegate {
-                signer: Arc::new(signer),
-                minted: Instant::now(),
-                site,
-                capability: None,
-            },
-        );
+    /// `GET /_delegate`: the pending key's address.
+    fn pending(&self) -> Response<Body> {
+        let address = self.delegates().pending();
         json(
             StatusCode::OK,
             &serde_json::json!({ "address": address.to_string() }),
         )
     }
 
-    async fn register<B>(&self, req: Request<B>, caller: &Caller) -> Response<Body>
+    /// `PUT /_capability`: register a capability to a key the gateway holds.
+    /// Every check that needs no chain read runs first, so a capability that
+    /// cannot register costs the operator's RPC nothing.
+    async fn register<B>(&self, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
         B::Error: std::error::Error + Send + Sync + 'static,
@@ -1911,57 +1626,45 @@ impl Gateway {
             Err(e) => {
                 return text(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    &format!("expected {{\"capability\", \"scope\"}}: {e}\n"),
+                    &format!("expected {{\"capability\"}}: {e}\n"),
                 );
             }
         };
-        let scope = match Scope::parse(&request.scope) {
-            Ok(scope) => scope,
-            Err(e) => return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n")),
-        };
-        if let Err(e) = may_register(caller, &scope) {
-            return text(StatusCode::FORBIDDEN, &format!("{e}\n"));
-        }
         let grant = match CapabilityGrant::from_token(request.capability.trim()) {
             Ok(grant) => grant,
             Err(e) => return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n")),
         };
-        if grant.expiry <= now_secs() {
+        if grant.spending_cap == 0 {
             return text(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "the capability has expired\n",
+                "the capability's cap is zero\n",
             );
+        }
+        if inside_capability_expiry_margin(grant.expiry, EXPIRY_MARGIN_SECS, now_secs()) {
+            return text(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "the capability expires within {EXPIRY_MARGIN_SECS} s, inside the margin \
+                     nodes stop accepting it\n"
+                ),
+            );
+        }
+        if let Err(refusal) = self.delegates().admits(&grant) {
+            return text(StatusCode::CONFLICT, refusal.text());
         }
         if let Err((status, e)) = self.verify_owner(&grant).await {
             return text(status, &e);
         }
-        let mut delegates = self.delegates.lock().await;
-        Self::prune(&mut delegates);
-        let Some(delegate) = delegates.get_mut(&grant.signer) else {
-            return text(
-                StatusCode::CONFLICT,
-                "the capability names no delegate this gateway is holding: get one from \
-                 GET /_delegate\n",
-            );
-        };
-        if delegate.capability.is_some() {
-            return text(
-                StatusCode::CONFLICT,
-                "that delegate already holds a capability: get a new one from GET /_delegate\n",
-            );
-        }
         let response = serde_json::json!({
-            "signer": grant.signer.to_string(),
-            "scope": scope.to_string(),
             "expiry": grant.expiry,
+            "pool": grant.pool_id.to_string(),
+            "signer": grant.signer.to_string(),
         });
-        delegate.capability = Some(Registered {
-            grant,
-            scope,
-            origin: caller.origin().map(str::to_owned),
-            since: Instant::now(),
-            spent: false,
-        });
+        let (signer, pool) = (grant.signer, grant.pool_id);
+        if let Err(refusal) = self.delegates().register(grant) {
+            return text(StatusCode::CONFLICT, refusal.text());
+        }
+        tracing::info!(%signer, %pool, "a capability was registered");
         json(StatusCode::CREATED, &response)
     }
 
@@ -1989,27 +1692,16 @@ impl Gateway {
         owner_matches(pool.owner, signed_by, grant.pool_id).map_err(unprocessable)
     }
 
-    async fn list(&self) -> Response<Body> {
-        json(StatusCode::OK, &self.capabilities().await)
+    /// `GET /_capability`: every capability not yet expired, in the order
+    /// the gateway pays with them.
+    fn list(&self) -> Response<Body> {
+        json(StatusCode::OK, &self.capabilities())
     }
 
-    /// Every capability registered and not yet expired.
-    async fn capabilities(&self) -> Vec<Capability> {
-        let mut delegates = self.delegates.lock().await;
-        Self::prune(&mut delegates);
-        delegates
-            .values()
-            .filter_map(|d| d.capability.as_ref())
-            .map(|r| Capability {
-                cap: r.grant.spending_cap,
-                expiry: r.grant.expiry,
-                origin: r.origin.clone(),
-                pool: r.grant.pool_id.to_string(),
-                scope: r.scope.to_string(),
-                signer: r.grant.signer.to_string(),
-                spent: r.spent,
-            })
-            .collect()
+    /// Every capability registered and not yet expired, in registration
+    /// order.
+    fn capabilities(&self) -> Vec<Capability> {
+        self.delegates().list()
     }
 
     /// The owner of namespace `ns` on this deployment's registry, read
@@ -2047,45 +1739,26 @@ impl Gateway {
         Ok(owner)
     }
 
-    /// Who pays a request for `host`: the gateway's own pool on a public
-    /// gateway, against the allowance of `pointer`'s namespace when the
-    /// request is on its host, else the live capability whose scope covers
-    /// `host` most specifically, by [`Registered::preference`].
-    async fn paying_for(&self, host: &str, pointer: Option<u64>) -> Option<Payment> {
-        if self.public() {
-            return Some(Payment::Pool { namespace: pointer });
+    /// Who pays a request, against the allowance of `pointer`'s namespace
+    /// when a public request is on its host: the first capability the
+    /// gateway holds that can pay ([`Delegates::paying`]), else a public
+    /// gateway's own pool when it has one. `None` when nothing can pay.
+    fn paying_for(&self, pointer: Option<u64>) -> Option<Payment> {
+        let held = self.delegates().paying(now_secs(), EXPIRY_MARGIN_SECS);
+        match held {
+            Some(credential) => Some(Payment::Held {
+                credential,
+                namespace: pointer,
+            }),
+            None => self.pool.then_some(Payment::Pool { namespace: pointer }),
         }
-        let mut delegates = self.delegates.lock().await;
-        Self::prune(&mut delegates);
-        delegates
-            .values()
-            .filter_map(|d| d.capability.as_ref().map(|r| (d, r)))
-            .filter(|(_, r)| !r.spent && r.scope.covers(host))
-            .max_by_key(|(_, r)| r.preference())
-            .map(|(d, r)| {
-                Payment::Held(Credential {
-                    signer: Arc::clone(&d.signer),
-                    grant: r.grant.clone(),
-                })
-            })
     }
 
-    /// Retire the capability `signer` pays with after a funding stop. A page's
-    /// is dropped, freeing its origin's room; the token holder's stays listed
-    /// as spent.
-    async fn mark_spent(&self, signer: Address) {
-        let mut delegates = self.delegates.lock().await;
-        let Some(registered) = delegates
-            .get_mut(&signer)
-            .and_then(|d| d.capability.as_mut())
-        else {
-            return;
-        };
-        if registered.origin.is_some() {
-            delegates.remove(&signer);
-        } else {
-            registered.spent = true;
-        }
+    /// Retire the capability `credential` pays with after a funding stop. It
+    /// stays listed, as spent, until it expires.
+    fn mark_spent(&self, credential: &Credential) {
+        self.delegates()
+            .retire(credential.signer.address(), credential.grant.pool_id);
     }
 
     async fn content(
@@ -2100,34 +1773,22 @@ impl Gateway {
         };
         let range = range_header(headers);
         if !authorized {
-            // A browser without the extension opens a bundle as its site. On
-            // a public gateway a blob streams from the bare host as bytes.
+            // A browser opens a bundle as its site. On a public gateway a
+            // blob streams from the bare host as bytes.
             return match uri.target {
                 UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
-                _ if self.public() => {
-                    self.paid("", None, &uri, Present::Bare, Ask::Get(range))
-                        .await
-                }
+                _ if self.public() => self.paid(None, &uri, Present::Bare, Ask::Get(range)).await,
                 _ => text(StatusCode::UNAUTHORIZED, "token required\n"),
             };
         }
-        let Some(page_host) = headers
-            .get(HOST_HEADER)
-            .and_then(|h| h.to_str().ok())
-            .map(str::to_ascii_lowercase)
-        else {
-            return text(StatusCode::UNAUTHORIZED, "page host required\n");
-        };
-        self.paid(&page_host, None, &uri, Present::Bare, Ask::Get(range))
-            .await
+        self.paid(None, &uri, Present::Bare, Ask::Get(range)).await
     }
 
-    /// Serve `uri` as `present` says, paid with the capability that covers
-    /// `page_host`, or on a public gateway from the pool against the
-    /// allowance of `pointer`'s namespace when the request is on its host.
+    /// Serve `uri` as `present` says, paid by [`Self::paying_for`], against
+    /// the allowance of `pointer`'s namespace when a public request is on its
+    /// host.
     async fn paid(
         self: &Arc<Self>,
-        page_host: &str,
         pointer: Option<u64>,
         uri: &DecdnUri,
         present: Present,
@@ -2141,33 +1802,51 @@ impl Gateway {
                 None => refused,
             };
         }
-        // A funding stop retires the capability and the next covering one
-        // takes the request, so a capability that cannot pay costs a retry,
-        // never a failed load. Each pass retires one, so the loop ends. A page
-        // no capability covers gets the 402 even for a cached blob: the
-        // refusal is how the page learns to register a capability.
+        // A funding stop retires the capability and the next one takes the
+        // request, so a capability that cannot pay costs a retry, never a
+        // failed load. Each pass retires one, so the loop ends. With nothing
+        // left that can pay, a response the cache holds whole is still served.
         loop {
-            let Some(paying) = self.paying_for(page_host, pointer).await else {
-                return text(
-                    StatusCode::PAYMENT_REQUIRED,
-                    &format!("no capability covers {page_host}\n"),
-                );
+            let Some(paying) = self.paying_for(pointer) else {
+                if let Some(response) = self.cached_only(uri, present, ask).await {
+                    return response;
+                }
+                return self.nothing_pays(uri);
             };
             match self.serve(uri, &paying, present, ask).await {
                 Ok(response) => return response,
                 Err(PullError::Allowance) => return self.allowance_spent(pointer, uri),
                 Err(PullError::Funding(e)) => match &paying {
-                    Payment::Held(credential) => {
-                        tracing::info!(error = %e, host = %page_host, "a capability ran out");
-                        self.mark_spent(credential.signer.address()).await;
+                    Payment::Held { credential, .. } => {
+                        tracing::info!(
+                            error = %e,
+                            signer = %credential.signer.address(),
+                            pool = %credential.grant.pool_id,
+                            "a capability ran out"
+                        );
+                        self.mark_spent(credential);
                     }
                     Payment::Pool { .. } => {
-                        return pull_failed(PullError::Funding(e), uri, page_host, true);
+                        return pull_failed(PullError::Funding(e), uri, true);
                     }
                 },
-                Err(e) => return pull_failed(e, uri, page_host, self.public()),
+                Err(e) => return pull_failed(e, uri, self.public()),
             }
         }
+    }
+
+    /// The answer for `uri` when nothing the gateway holds can pay: a
+    /// loopback gateway's user registers a capability; a public gateway's
+    /// client retries, or fetches the URI with a paying client of its own.
+    fn nothing_pays(&self, uri: &DecdnUri) -> Response<Body> {
+        if self.public() {
+            tracing::warn!(%uri, "nothing the gateway holds can pay");
+            return cannot_pay(uri);
+        }
+        text(
+            StatusCode::PAYMENT_REQUIRED,
+            "the gateway holds no capability that can pay: register one with PUT /_capability\n",
+        )
     }
 
     /// `uri` answered out of the cache alone, at no pull: a blob, a bundle
@@ -2836,11 +2515,11 @@ impl Gateway {
             size,
             guard,
         };
-        let signer = match paying {
-            Payment::Held(credential) => Some(credential.signer.address()),
+        let held = match paying {
+            Payment::Held { credential, .. } => Some(Arc::new(credential.clone())),
             Payment::Pool { .. } => None,
         };
-        let body = futures_util::stream::unfold(state, move |s| next_frame(s, signer));
+        let body = futures_util::stream::unfold(state, move |s| next_frame(s, held.clone()));
         streamed_response(&name, &content_type, present, &extent, body)
     }
 
@@ -2913,7 +2592,6 @@ impl Gateway {
         self: &Arc<Self>,
         rest: &str,
         present: Present,
-        page_host: &str,
         bucket: impl FnOnce([u8; 32]) -> Option<u64>,
     ) -> Response<Body> {
         let uri: DecdnUri = match format!("decdn:{rest}").parse() {
@@ -2926,10 +2604,7 @@ impl Gateway {
                     let name = alloy::hex::encode(uri.hash);
                     head_response(&blob_type(present, &name), Some(size), uri.hash, present)
                 }
-                None => {
-                    self.paid(page_host, bucket(uri.hash), &uri, present, Ask::Head)
-                        .await
-                }
+                None => self.paid(bucket(uri.hash), &uri, present, Ask::Head).await,
             },
             UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
             _ => text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
@@ -2963,10 +2638,19 @@ impl Gateway {
         if let Some(refused) = self.allowance_refusal(pointer, &uri) {
             return refused;
         }
-        let paying = Payment::Pool { namespace: pointer };
-        let manifest = match self.manifest(site.hash, site.namespace, &paying).await {
-            Ok(manifest) => manifest,
-            Err(e) => return pull_failed(e, &uri, path, true),
+        // As in `paid`: a funding stop retires the capability and the next
+        // payer takes the pull.
+        let manifest = loop {
+            let Some(paying) = self.paying_for(pointer) else {
+                return self.nothing_pays(&uri);
+            };
+            match self.manifest(site.hash, site.namespace, &paying).await {
+                Ok(manifest) => break manifest,
+                Err(PullError::Funding(_)) if let Payment::Held { credential, .. } = &paying => {
+                    self.mark_spent(credential);
+                }
+                Err(e) => return pull_failed(e, &uri, true),
+            }
         };
         let path = match &uri.target {
             // The root is the bundle's `index.html`, else its listing: a page
@@ -3095,10 +2779,10 @@ impl Gateway {
 /// bytes, then each chunk off the pipe, charged against the allowance and
 /// passed through the rewrite. A pull error after the first byte ends the
 /// body with an error, so a browser never takes a verified prefix for the
-/// whole file; `signer` is the capability to retire on a funding stop.
+/// whole file; `held` is the capability to retire on a funding stop.
 async fn next_frame(
     mut s: Streaming,
-    signer: Option<Address>,
+    held: Option<Arc<Credential>>,
 ) -> Option<(Result<Frame<Bytes>, std::io::Error>, Streaming)> {
     let gateway = Arc::clone(&s.guard.gateway);
     let chunk = if let Some(first) = s.first.take() {
@@ -3108,8 +2792,8 @@ async fn next_frame(
         match s.reader.read(&mut buf).await {
             Ok(0) => {
                 if let Err(e) = finished(s.done.take()?).await {
-                    if let (PullError::Funding(_), Some(signer)) = (&e, signer) {
-                        gateway.mark_spent(signer).await;
+                    if let (PullError::Funding(_), Some(held)) = (&e, &held) {
+                        gateway.mark_spent(held);
                     }
                     s.rewrite = None;
                     let e = std::io::Error::other(pull_error_text(&e));
@@ -3375,14 +3059,17 @@ enum PayerLabel {
         /// The delegate key.
         #[serde(serialize_with = "eip55")]
         signer: Address,
+        /// The pool the capability spends, `0x` hex.
+        pool: PoolId,
     },
 }
 
 impl PayerLabel {
     fn of(paying: &Payment) -> Self {
         match paying {
-            Payment::Held(credential) => Self::Capability {
+            Payment::Held { credential, .. } => Self::Capability {
                 signer: credential.signer.address(),
+                pool: credential.grant.pool_id,
             },
             Payment::Pool { .. } => Self::Pool,
         }
@@ -3607,34 +3294,6 @@ fn pull_error_text(e: &PullError) -> String {
     }
 }
 
-/// The CORS preflight answer for `/_delegate` and `/_capability`: any origin
-/// may call them, with a JSON body.
-fn preflight(origin: Option<&str>) -> Response<Body> {
-    let Some(origin) = origin else {
-        return text(StatusCode::FORBIDDEN, "no Origin\n");
-    };
-    let mut response = with_cors(text(StatusCode::NO_CONTENT, ""), Some(origin));
-    let headers = response.headers_mut();
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        header::HeaderValue::from_static("GET, PUT"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        header::HeaderValue::from_static("content-type"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_MAX_AGE,
-        header::HeaderValue::from_static("600"),
-    );
-    // Chrome asks before a public page reaches a loopback address.
-    headers.insert(
-        "access-control-allow-private-network",
-        header::HeaderValue::from_static("true"),
-    );
-    response
-}
-
 /// The response headers a page on another origin may read from a public
 /// gateway: the body's length and type, the hash (`ETag`), the window
 /// (`Content-Range`, `Accept-Ranges`) and, on a 402 or 503, when to retry and
@@ -3652,10 +3311,11 @@ const ANY_ORIGIN: header::HeaderValue = header::HeaderValue::from_static("*");
 /// The preflight answer of a public gateway for `path`, `bare` when on its
 /// own host rather than a site or namespace host. The gateway asks for no
 /// credentials and holds no token, so any origin may read its content, with a
-/// `Range`, and `PUT /_pointer` on the bare host with a JSON body. The API
-/// paths answer 404 on every other host, and `/_delegate` and `/_capability`
-/// on the bare host too. It sets no `Access-Control-Allow-Origin`:
-/// [`readable_anywhere`] does, in [`Gateway::handle`].
+/// `Range`, and call the API on the bare host: `PUT /_pointer` and
+/// `PUT /_capability` with a JSON body, `GET /_delegate`, `GET /_capability`
+/// and `GET /_status`. The API paths answer 404 on every other host. It sets
+/// no `Access-Control-Allow-Origin`: [`readable_anywhere`] does, in
+/// [`Gateway::handle`].
 fn public_preflight(path: &str, bare: bool) -> Response<Body> {
     let (methods, headers) = match path {
         "/_delegate" | "/_capability" | "/_pointer" | "/_status" if !bare => {
@@ -3664,9 +3324,8 @@ fn public_preflight(path: &str, bare: bool) -> Response<Body> {
                 "the gateway API answers on the gateway origin only\n",
             );
         }
-        "/_delegate" | "/_capability" | "/_status" => {
-            return text(StatusCode::NOT_FOUND, "a public gateway has no API\n");
-        }
+        "/_delegate" | "/_status" => ("GET", "content-type"),
+        "/_capability" => ("GET, PUT", "content-type"),
         "/_pointer" => ("PUT", "content-type"),
         _ => ("GET, HEAD", "range"),
     };
@@ -3692,16 +3351,6 @@ fn readable_anywhere(mut response: Response<Body>) -> Response<Body> {
     let headers = response.headers_mut();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, ANY_ORIGIN);
     headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, PUBLIC_EXPOSED);
-    response
-}
-
-/// `response` readable by `origin`.
-fn with_cors(mut response: Response<Body>, origin: Option<&str>) -> Response<Body> {
-    if let Some(value) = origin.and_then(|o| header::HeaderValue::from_str(o).ok()) {
-        let headers = response.headers_mut();
-        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
-        headers.insert(header::VARY, header::HeaderValue::from_static("Origin"));
-    }
     response
 }
 
@@ -3957,13 +3606,12 @@ fn head_response(
         .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "bad head response\n"))
 }
 
-/// The answer to a request for `uri` (on `page_host`) whose pull ended with
-/// `e`: a blob that is no manifest is not found, a pool that cannot pay asks
-/// the client to pay elsewhere, and anything else failed upstream. A
-/// `public` gateway keeps the upstream detail (node ids, addresses, chain
-/// errors) in its log and answers a bare 502; a loopback gateway shows its
-/// own user the detail.
-fn pull_failed(e: PullError, uri: &DecdnUri, page_host: &str, public: bool) -> Response<Body> {
+/// The answer to a request for `uri` whose pull ended with `e`: a blob that
+/// is no manifest is not found, a pool that cannot pay asks the client to pay
+/// elsewhere, and anything else failed upstream. A `public` gateway keeps the
+/// upstream detail (node ids, addresses, chain errors) in its log and answers
+/// a bare 502; a loopback gateway shows its own user the detail.
+fn pull_failed(e: PullError, uri: &DecdnUri, public: bool) -> Response<Body> {
     match e {
         PullError::Allowance => pay_elsewhere(
             StatusCode::PAYMENT_REQUIRED,
@@ -3973,12 +3621,12 @@ fn pull_failed(e: PullError, uri: &DecdnUri, page_host: &str, public: bool) -> R
         ),
         PullError::NotManifest(e) => {
             let error = format!("{e:#}");
-            tracing::info!(%error, host = %page_host, "a bundle URI names no manifest");
+            tracing::info!(%error, %uri, "a bundle URI names no manifest");
             text(StatusCode::NOT_FOUND, &format!("{error}\n"))
         }
         PullError::Funding(e) => {
             tracing::warn!(error = %e, "the gateway's pool cannot pay");
-            pool_cannot_pay(uri)
+            cannot_pay(uri)
         }
         PullError::Other(e) if public => {
             tracing::warn!(error = format!("{e:#}"), %uri, "an upstream pull failed");
@@ -4000,15 +3648,15 @@ fn stale_pointer(current: u64) -> Response<Body> {
     )
 }
 
-/// The answer when the gateway's own pool cannot pay for `uri` right now: the
+/// The answer when a public gateway cannot pay for `uri` right now: the
 /// client did nothing wrong, so it may retry, or fetch the URI with a paying
 /// client of its own.
-fn pool_cannot_pay(uri: &DecdnUri) -> Response<Body> {
+fn cannot_pay(uri: &DecdnUri) -> Response<Body> {
     pay_elsewhere(
         StatusCode::SERVICE_UNAVAILABLE,
         uri,
         60,
-        "the gateway's pool cannot pay right now",
+        "the gateway cannot pay right now",
     )
 }
 

@@ -51,12 +51,17 @@ use super::super::fetch_timings::FetchTimings;
 #[derive(Clone)]
 pub(super) enum Payment {
     /// A capability held in memory, with the delegate key it was issued to.
-    Held(Credential),
-    /// The gateway's own pool, from its keystore.
+    Held {
+        /// The key and its capability.
+        credential: Credential,
+        /// The namespace whose pointer a public request is served under, so
+        /// its bytes count against that namespace's allowance; `None` for
+        /// every other request.
+        namespace: Option<u64>,
+    },
+    /// A public gateway's own pool, from its keystore.
     Pool {
-        /// The namespace whose pointer the request is served under, so its
-        /// bytes count against that namespace's allowance; `None` for every
-        /// other request.
+        /// As [`Payment::Held`]'s.
         namespace: Option<u64>,
     },
 }
@@ -66,8 +71,7 @@ impl Payment {
     /// shared one.
     pub(super) const fn bucket(&self) -> Option<u64> {
         match self {
-            Self::Held(_) => None,
-            Self::Pool { namespace } => *namespace,
+            Self::Held { namespace, .. } | Self::Pool { namespace } => *namespace,
         }
     }
 }
@@ -500,8 +504,9 @@ impl PullWorker {
 /// Whose payer a pull runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum PayerId {
-    /// The delegate key a held credential was issued to.
-    Signer(Address),
+    /// A held capability, by the delegate key it was issued to and the pool
+    /// it spends: one key holds at most one capability per pool.
+    Capability(Address, PoolId),
     /// The gateway's own pool.
     Pool,
 }
@@ -509,7 +514,9 @@ enum PayerId {
 impl PayerId {
     fn of(paying: &Payment) -> Self {
         match paying {
-            Payment::Held(credential) => Self::Signer(credential.signer.address()),
+            Payment::Held { credential, .. } => {
+                Self::Capability(credential.signer.address(), credential.grant.pool_id)
+            }
             Payment::Pool { .. } => Self::Pool,
         }
     }
@@ -646,7 +653,7 @@ async fn pull<B: Backend>(
                 rebuild_pool_payer(&*backend, &host, &payers, &payer, *replaced).await;
             }
         }
-        PayerId::Signer(_) => release(&payers, id, &payer),
+        PayerId::Capability(..) => release(&payers, id, &payer),
     }
     drop(payer);
     let _ = done.send(result);
@@ -669,7 +676,7 @@ fn payer_for<B: Backend>(
     if let Some(payer) = payers.get(&id) {
         return Ok(Rc::clone(payer));
     }
-    let Payment::Held(credential) = paying else {
+    let Payment::Held { credential, .. } = paying else {
         anyhow::bail!("this gateway has no pool of its own to pay from");
     };
     let payer = Rc::new(backend.payer(credential)?);

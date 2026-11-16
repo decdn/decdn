@@ -10,15 +10,14 @@
 //!      page that links the blob, a 256 KiB entry), a publisher owns two
 //!      namespaces, and a public gateway pinned to the node runs as a
 //!      subprocess.
-//!   2. [`Mode::Loopback`]: an owner opens a pool, the gateway mints two
-//!      delegates, and the owner issues each a capability (`decdn pool
-//!      assign`) for its own page host, which the suite registers.
+//!   2. [`Mode::Loopback`]: the gateway holds one pending delegate key, and
+//!      one owner per client flavour opens a pool and issues that key a
+//!      capability from it (`decdn pool assign`), which the suite registers.
 //!
 //! Each client flavour of a suite (see [`Suite::flavours`]) gets its own
 //! namespace or capability, so no flavour sees another flavour's state. The
-//! fixture names all of them (`pointer.namespaces`, `capabilities`); its
-//! single-value fields (`pointer.namespace`, `host`, `capability`) name the
-//! first.
+//! fixture names all of them (`pointer.namespaces`, `capabilities`); the
+//! public fixture's `pointer.namespace` names the first.
 //!
 //! The harness writes what the suite needs (URLs, token, hashes, bytes, the
 //! namespace key) to a JSON file and gives its path to [`Suite::run`]. The
@@ -66,9 +65,6 @@ const DOMAIN: &str = "decdn.test";
 /// The most client flavours a suite can run: the harness sets up one
 /// namespace (public) or one capability (loopback) per flavour.
 const MAX_FLAVOURS: usize = 2;
-/// The page hosts whose capabilities pay on the loopback gateway, one per
-/// client flavour, the first flavour's first.
-const PAGE_HOSTS: [&str; MAX_FLAVOURS] = ["example.com", "example.net"];
 /// The longest one harness request may take: a stuck request fails here, not
 /// at the overall timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,8 +80,8 @@ pub enum Mode {
     /// A public gateway that serves `http://decdn.test` and its namespace
     /// hosts, and pays from its operator's pool.
     Public,
-    /// A loopback gateway that holds a delegate and pays from the owner's
-    /// pool through the capability the suite registers.
+    /// A loopback gateway that holds a delegate key and pays from the
+    /// owners' pools through the capabilities the suite registers.
     Loopback,
 }
 
@@ -521,34 +517,33 @@ fn public_fixture(
 }
 
 /// The loopback run's fixture: `content`'s fields, the gateway at `base` on
-/// `connect` with its `token`, and `grants`, one `(page host, dcap1:
-/// capability)` per client flavour. `host` and `capability` are the first
-/// grant's.
+/// `connect` with its `token`, and `capabilities`, one `dcap1:` capability
+/// per client flavour, each from its own pool and all issued to the
+/// gateway's pending key.
 ///
 /// # Errors
 ///
-/// Fails when `grants` is empty.
+/// Fails when `capabilities` is empty.
 fn loopback_fixture(
     content: &Content,
     base: &str,
     connect: &str,
     token: &str,
-    grants: &[(&str, &str)],
+    capabilities: &[&str],
 ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
-    let (host, capability) = grants
-        .first()
-        .context("the loopback fixture needs at least one capability")?;
-    let capabilities: Vec<serde_json::Value> = grants
+    anyhow::ensure!(
+        !capabilities.is_empty(),
+        "the loopback fixture needs at least one capability"
+    );
+    let capabilities: Vec<serde_json::Value> = capabilities
         .iter()
-        .map(|(host, capability)| serde_json::json!({ "host": host, "capability": capability }))
+        .map(|capability| serde_json::json!({ "capability": capability }))
         .collect();
     let mut fixture = content.fixture();
     fixture.insert("mode".to_owned(), Mode::Loopback.label().into());
     fixture.insert("gatewayUrl".to_owned(), base.into());
     fixture.insert("connect".to_owned(), connect.into());
     fixture.insert("token".to_owned(), token.into());
-    fixture.insert("host".to_owned(), (*host).into());
-    fixture.insert("capability".to_owned(), (*capability).into());
     fixture.insert("capabilities".to_owned(), capabilities.into());
     Ok(fixture)
 }
@@ -705,10 +700,84 @@ async fn public<S: Suite>(suite: &S) -> anyhow::Result<()> {
     stop(gateway).await
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one sequential setup: node, owner, gateway, capability, then the suite"
-)]
+/// A pool owner: a funded keystore under its own data dir, and the pool it
+/// opened.
+struct Owner {
+    dir: tempfile::TempDir,
+    keystore: PathBuf,
+    pool_id: B256,
+}
+
+impl Owner {
+    /// A funded owner whose pool the node already serves: its own fetch of
+    /// `warm` waits out the node's view of the fresh pool, so the gateway
+    /// never takes that race for a funding stop.
+    async fn open(chain: &ChainFixture, node: &NodeFixture, warm: &Hash) -> anyhow::Result<Self> {
+        let dir = private_tempdir("owner")?;
+        eth_identity::generate_and_persist(dir.path(), KEYSTORE_PASSWORD, false)
+            .context("generate owner keystore")?;
+        let keystore = eth_identity::keystore_path(dir.path());
+        let owner = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD)?.address();
+        chain.fund_eth(owner, 100).await?;
+        chain
+            .mint_usdc(owner, U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64))
+            .await?;
+        let opened = decdn_ok(
+            dir.path(),
+            &[
+                strs(&[
+                    "pool",
+                    "open",
+                    "--deposit-micro-usdc",
+                    &DEPOSIT_MICRO_USDC.to_string(),
+                ]),
+                chain_flags(chain),
+                owner_flags(&keystore, dir.path()),
+            ]
+            .concat(),
+        )
+        .await?;
+        let pool_id = parse_pool_id(&opened)?;
+        warm_up(chain, node, dir.path(), &keystore, warm).await?;
+        Ok(Self {
+            dir,
+            keystore,
+            pool_id,
+        })
+    }
+
+    /// The `dcap1:` capability this owner issues `signer` from its pool.
+    async fn assign(&self, chain: &ChainFixture, signer: &str) -> anyhow::Result<String> {
+        let assigned = decdn_ok(
+            self.dir.path(),
+            &[
+                strs(&[
+                    "pool",
+                    "assign",
+                    "--pool",
+                    &format!("{:#x}", self.pool_id),
+                    "--signer",
+                    signer,
+                    "--cap-micro-usdc",
+                    &CAP_MICRO_USDC.to_string(),
+                    "--expiry-secs",
+                    "3600",
+                ]),
+                chain_flags(chain),
+                owner_flags(&self.keystore, self.dir.path()),
+            ]
+            .concat(),
+        )
+        .await?;
+        assigned
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("dcap1:"))
+            .map(str::to_owned)
+            .with_context(|| format!("the dcap1: token in `pool assign` output for {signer}"))
+    }
+}
+
 async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
@@ -721,35 +790,11 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
         .last()
         .context("the node returned no hash for the warm-up blob")?;
 
-    // ---- OWNER: a funded keystore that opens the pool ----
-    let owner_dir = private_tempdir("owner")?;
-    eth_identity::generate_and_persist(owner_dir.path(), KEYSTORE_PASSWORD, false)
-        .context("generate owner keystore")?;
-    let owner_keystore = eth_identity::keystore_path(owner_dir.path());
-    let owner = eth_identity::load_signer(&owner_keystore, KEYSTORE_PASSWORD)?.address();
-    chain.fund_eth(owner, 100).await?;
-    chain
-        .mint_usdc(owner, U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64))
-        .await?;
-    let opened = decdn_ok(
-        owner_dir.path(),
-        &[
-            strs(&[
-                "pool",
-                "open",
-                "--deposit-micro-usdc",
-                &DEPOSIT_MICRO_USDC.to_string(),
-            ]),
-            chain_flags(&chain),
-            owner_flags(&owner_keystore, owner_dir.path()),
-        ]
-        .concat(),
-    )
-    .await?;
-    let pool_id = parse_pool_id(&opened)?;
-    // The owner's own fetch waits out the node's view of the fresh pool, so
-    // the gateway never takes that race for a funding stop.
-    warm_up(&chain, &node, owner_dir.path(), &owner_keystore, &hash_warm).await?;
+    // ---- OWNERS: one pool per client flavour ----
+    let mut owners = Vec::with_capacity(suite.flavours());
+    for _ in 0..suite.flavours() {
+        owners.push(Owner::open(&chain, &node, &hash_warm).await?);
+    }
 
     // ---- GATEWAY: loopback, pinned to the node ----
     let gateway_dir = private_tempdir("gateway")?;
@@ -784,86 +829,54 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
     )
     .await?;
 
-    // ---- Per client flavour: a delegate the gateway holds, and a capability
-    // the owner issues it from the one pool ----
-    let mut delegates = Vec::with_capacity(PAGE_HOSTS.len());
-    let mut capabilities = Vec::with_capacity(PAGE_HOSTS.len());
-    for _ in PAGE_HOSTS {
-        let minted: serde_json::Value = http
-            .get(format!("{base}/_delegate"))
-            .header("x-decdn-token", &token)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .context("mint a delegate with the gateway token")?
-            .json()
-            .await?;
-        let delegate = minted
-            .get("address")
-            .and_then(serde_json::Value::as_str)
-            .context("the minted delegate's address")?
-            .to_owned();
-        let assigned = decdn_ok(
-            owner_dir.path(),
-            &[
-                strs(&[
-                    "pool",
-                    "assign",
-                    "--pool",
-                    &format!("{pool_id:#x}"),
-                    "--signer",
-                    &delegate,
-                    "--cap-micro-usdc",
-                    &CAP_MICRO_USDC.to_string(),
-                    "--expiry-secs",
-                    "3600",
-                ]),
-                chain_flags(&chain),
-                owner_flags(&owner_keystore, owner_dir.path()),
-            ]
-            .concat(),
-        )
+    // ---- The gateway's pending key, and one capability for it per owner ----
+    let pending: serde_json::Value = http
+        .get(format!("{base}/_delegate"))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .context("read the gateway's pending key")?
+        .json()
         .await?;
-        let capability = assigned
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("dcap1:"))
-            .with_context(|| format!("the dcap1: token in `pool assign` output for {delegate}"))?
-            .to_owned();
-        delegates.push(delegate);
-        capabilities.push(capability);
+    let delegate = pending
+        .get("address")
+        .and_then(serde_json::Value::as_str)
+        .context("the pending key's address")?
+        .to_owned();
+    let mut capabilities = Vec::with_capacity(owners.len());
+    for owner in &owners {
+        capabilities.push(owner.assign(&chain, &delegate).await?);
     }
 
-    let grants: Vec<(&str, &str)> = PAGE_HOSTS
-        .into_iter()
-        .zip(capabilities.iter().map(String::as_str))
-        .collect();
+    let grants: Vec<&str> = capabilities.iter().map(String::as_str).collect();
     let fixture = loopback_fixture(&content, &base, &listen, &token, &grants)?;
     run_file(suite, Mode::Loopback, &fixture.into()).await?;
 
-    // Only the suite's own `registerCapability` gives a delegate a scope, and
-    // flavour `i` registers `delegates[i]` for `PAGE_HOSTS[i]`.
+    // Only the suite's own `registerCapability` gives the key a capability,
+    // and flavour `i` registers the one from `owners[i]`'s pool.
     let held: serde_json::Value = http
         .get(format!("{base}/_capability"))
-        .header("x-decdn-token", &token)
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
         .context("list the gateway's capabilities")?
         .json()
         .await?;
-    for (delegate, host) in delegates.iter().zip(PAGE_HOSTS).take(suite.flavours()) {
+    for owner in &owners {
+        let pool = format!("{:#x}", owner.pool_id);
         let registered = held.as_array().is_some_and(|held| {
             held.iter().any(|c| {
                 c.get("signer")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|s| s.eq_ignore_ascii_case(delegate))
-                    && c.get("scope").and_then(serde_json::Value::as_str) == Some(host)
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&delegate))
+                    && c.get("pool")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|p| p.eq_ignore_ascii_case(&pool))
             })
         });
         anyhow::ensure!(
             registered,
-            "the gateway holds no capability for {delegate} on {host}: the suite never \
+            "the gateway holds no capability for {delegate} from pool {pool}: the suite never \
              registered it on this gateway ({held})"
         );
     }

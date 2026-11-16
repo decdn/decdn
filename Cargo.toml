@@ -377,10 +377,6 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 # `decdn gateway` guesses an entry's `Content-Type` from its file name.
 mime_guess = "2"
-# `decdn gateway` bounds page delegates per registrable domain and refuses a
-# page's wildcard scope over a public suffix, from the Public Suffix List
-# compiled into the crate.
-psl = "2"
 # `decdn gateway` names a site origin by its bundle hash in lowercase base32.
 data-encoding = "2"
 # `decdn gateway` rewrites `decdn:` URIs in a site's HTML as it streams it.

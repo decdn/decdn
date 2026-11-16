@@ -19,7 +19,8 @@ export interface Counters {
   cache_hits: number;
 }
 
-export type Payer = { kind: "pool" } | { kind: "capability"; signer: string };
+export type Payer =
+  { kind: "pool" } | { kind: "capability"; signer: string; pool: string };
 
 export interface ActivePull {
   hash: string;
@@ -34,9 +35,7 @@ export interface ActivePull {
 export interface Capability {
   cap: number;
   expiry: number;
-  origin: string | null;
   pool: string;
-  scope: string;
   signer: string;
   spent: boolean;
 }

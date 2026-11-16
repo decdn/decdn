@@ -1,5 +1,6 @@
 use super::*;
 use crate::commands::fetch::{MALFORMED_MANIFEST, MAX_MANIFEST_MB};
+use alloy::signers::local::PrivateKeySigner;
 use http_body_util::Full;
 
 fn manifest() -> Arc<BundleManifest> {
@@ -90,245 +91,25 @@ fn verdict_text_is_clipped_on_a_character_boundary() {
     assert!(clipped.ends_with('…'));
 }
 
-#[test]
-fn scope_parses_any_domain_and_host() {
-    assert_eq!(Scope::parse("*").unwrap(), Scope::Any);
-    assert_eq!(
-        Scope::parse(" *.Decdn.org ").unwrap(),
-        Scope::Domain("decdn.org".into())
-    );
-    assert_eq!(
-        Scope::parse("up.decdn.org").unwrap(),
-        Scope::Host("up.decdn.org".into())
-    );
-    for bad in [
-        "",
-        "*.",
-        "**",
-        "*.*.org",
-        "a..b",
-        "a b",
-        "https://x.org",
-        "x.org/",
-        "-x.org!",
-    ] {
-        assert!(Scope::parse(bad).is_err(), "{bad}");
+/// A capability from pool `pool` (every byte `pool`) to `signer`, with a cap
+/// of one and `expiry`.
+fn grant(signer: Address, pool: u8, expiry: u64) -> CapabilityGrant {
+    CapabilityGrant {
+        pool_id: alloy::primitives::B256::repeat_byte(pool),
+        signer,
+        spending_cap: 1,
+        expiry,
+        owner_signature: vec![0; 65],
     }
 }
 
-#[test]
-fn domain_scope_covers_the_apex_and_subdomains_only() {
-    let scope = Scope::Domain("decdn.org".into());
-    assert!(scope.covers("decdn.org"));
-    assert!(scope.covers("up.decdn.org"));
-    assert!(scope.covers("a.b.decdn.org"));
-    assert!(!scope.covers("evildecdn.org"));
-    assert!(!scope.covers("decdn.org.evil.com"));
-    assert!(!scope.covers("org"));
-}
-
-#[test]
-fn host_scope_covers_one_host() {
-    let scope = Scope::Host("decdn.org".into());
-    assert!(scope.covers("decdn.org"));
-    assert!(!scope.covers("up.decdn.org"));
-}
-
-#[test]
-fn more_specific_scopes_rank_higher() {
-    assert!(Scope::Host("a.org".into()).rank() > Scope::Domain("a.org".into()).rank());
-    assert!(Scope::Domain("a.org".into()).rank() > Scope::Any.rank());
-}
-
-#[test]
-fn origin_host_reads_the_host_of_an_origin() {
-    assert_eq!(
-        origin_host("https://up.decdn.org").as_deref(),
-        Some("up.decdn.org")
-    );
-    assert_eq!(
-        origin_host("http://Example.COM:8080").as_deref(),
-        Some("example.com")
-    );
-    assert_eq!(origin_host("null"), None);
-    assert_eq!(origin_host("https://"), None);
-    assert_eq!(origin_host("chrome-extension://abcdefgh"), None);
-}
-
-fn page(origin: &str) -> Caller {
-    Caller::of(Some(origin), false).unwrap()
-}
-
-#[test]
-fn a_page_registers_only_scopes_that_cover_itself() {
-    let origin = page("https://decdn.org");
-    for scope in ["decdn.org", "*.decdn.org", "*"] {
-        assert!(
-            may_register(&origin, &Scope::parse(scope).unwrap()).is_ok(),
-            "{scope}"
-        );
-    }
-    for scope in ["netflix.com", "*.netflix.com", "up.decdn.org"] {
-        assert!(
-            may_register(&origin, &Scope::parse(scope).unwrap()).is_err(),
-            "{scope}"
-        );
-    }
-    let sub = page("https://up.decdn.org");
-    assert!(may_register(&sub, &Scope::parse("*.decdn.org").unwrap()).is_ok());
-    assert!(may_register(&sub, &Scope::parse("decdn.org").unwrap()).is_err());
-}
-
-#[test]
-fn a_page_may_not_register_a_public_suffix_wildcard() {
-    for (origin, scope) in [
-        ("https://attacker.io", "*.io"),
-        ("https://attacker.github.io", "*.github.io"),
-        ("https://shop.example.co.uk", "*.co.uk"),
-    ] {
-        assert!(
-            may_register(&page(origin), &Scope::parse(scope).unwrap()).is_err(),
-            "{scope}"
-        );
-    }
-    // The site's own wildcard and `*` stay open to it.
-    let origin = page("https://attacker.github.io");
-    assert!(may_register(&origin, &Scope::parse("*.attacker.github.io").unwrap()).is_ok());
-    assert!(may_register(&origin, &Scope::Any).is_ok());
-    let origin = page("https://shop.example.co.uk");
-    assert!(may_register(&origin, &Scope::parse("*.example.co.uk").unwrap()).is_ok());
-    // The token holder registers any scope.
-    assert!(may_register(&Caller::Token, &Scope::parse("*.io").unwrap()).is_ok());
-}
-
-#[test]
-fn a_page_stays_a_page_with_the_token() {
-    let caller = Caller::of(Some("https://decdn.org"), true).unwrap();
-    assert_eq!(caller.origin(), Some("https://decdn.org"));
-    assert!(may_register(&caller, &Scope::parse("netflix.com").unwrap()).is_err());
-}
-
-#[test]
-fn the_token_holder_registers_any_scope_outside_a_page() {
-    for origin in [None, Some("chrome-extension://abcdefgh")] {
-        let caller = Caller::of(origin, true).unwrap();
-        assert_eq!(caller, Caller::Token);
-        assert!(may_register(&caller, &Scope::parse("netflix.com").unwrap()).is_ok());
-    }
-}
-
-#[test]
-fn callers_without_a_page_origin_need_the_token() {
-    assert!(Caller::of(None, false).is_err());
-    assert!(Caller::of(Some("chrome-extension://abcdefgh"), false).is_err());
-    assert!(Caller::of(Some("null"), false).is_err());
-    assert!(Caller::of(Some("null"), true).is_err());
-}
-
-fn registered(scope: &str, origin: Option<&str>, registered: Instant) -> Registered {
-    Registered {
-        grant: CapabilityGrant {
-            pool_id: alloy::primitives::B256::ZERO,
-            signer: Address::ZERO,
-            spending_cap: 1,
-            expiry: u64::MAX,
-            owner_signature: vec![0; 65],
-        },
-        scope: Scope::parse(scope).unwrap(),
-        origin: origin.map(str::to_owned),
-        since: registered,
-        spent: false,
-    }
-}
-
-#[test]
-fn the_token_holders_capability_wins_a_tie_with_a_pages() {
-    let now = Instant::now();
-    let page = registered("*", Some("https://evil.example"), now);
-    let own = registered("*", None, now + Duration::from_secs(1));
-    assert!(own.preference() > page.preference());
-    // A more specific scope still wins over the token holder's `*`.
-    let site = registered("decdn.org", Some("https://decdn.org"), now);
-    assert!(site.preference() > own.preference());
-}
-
-#[test]
-fn a_later_registration_never_shadows_an_earlier_one() {
-    let now = Instant::now();
-    let incumbent = registered("*.example.com", Some("https://example.com"), now);
-    let newcomer = registered(
-        "*.example.com",
-        Some("https://x.example.com"),
-        now + Duration::from_secs(1),
-    );
-    assert!(incumbent.preference() > newcomer.preference());
-}
-
-fn delegate(site: Option<&str>, capability: Option<Registered>) -> Delegate {
-    Delegate {
-        signer: Arc::new(PrivateKeySigner::random()),
-        minted: Instant::now(),
-        site: site.map(str::to_owned),
-        capability,
-    }
-}
-
-fn insert(delegates: &mut HashMap<Address, Delegate>, d: Delegate) {
-    delegates.insert(d.signer.address(), d);
-}
-
-#[test]
-fn a_site_is_the_registrable_domain() {
-    assert_eq!(site("decdn.org"), "decdn.org");
-    assert_eq!(site("a.b.decdn.org"), "decdn.org");
-    assert_eq!(site("www.example.co.uk"), "example.co.uk");
-    // A public suffix that hosts user sites keeps each user apart.
-    assert_eq!(site("alice.github.io"), "alice.github.io");
-    assert_eq!(site("x.alice.github.io"), "alice.github.io");
-    assert_eq!(site("127.0.0.1"), "127.0.0.1");
-    assert_eq!(site("localhost"), "localhost");
-}
-
-#[test]
-fn the_pages_of_one_site_share_its_room() {
-    let page = |origin| page(origin).site();
-    assert_eq!(
-        page("https://a.evil.example.com"),
-        page("https://b.evil.example.com")
-    );
-    let mut delegates = HashMap::new();
-    for _ in 0..MAX_DELEGATES_PER_SITE {
-        insert(&mut delegates, delegate(Some("example.com"), None));
-    }
-    assert!(may_mint(&delegates, Some("example.com")).is_err());
-    assert!(may_mint(&delegates, Some("decdn.org")).is_ok());
-    assert!(may_mint(&delegates, None).is_ok());
-}
-
-#[test]
-fn registering_does_not_free_a_sites_room() {
-    let mut delegates = HashMap::new();
-    for _ in 0..MAX_DELEGATES_PER_SITE {
-        let capability = registered("*", Some("https://evil.example"), Instant::now());
-        insert(
-            &mut delegates,
-            delegate(Some("evil.example"), Some(capability)),
-        );
-    }
-    assert!(may_mint(&delegates, Some("evil.example")).is_err());
-}
-
-#[test]
-fn pages_stop_at_the_global_bound_and_the_token_holder_does_not() {
-    let mut delegates = HashMap::new();
-    for n in 0..MAX_PAGE_DELEGATES {
-        insert(
-            &mut delegates,
-            delegate(Some(&format!("site{n}.example")), None),
-        );
-    }
-    assert!(may_mint(&delegates, Some("decdn.org")).is_err());
-    assert!(may_mint(&delegates, None).is_ok());
+/// Register a capability from pool `pool` to the gateway's pending key, as a
+/// `PUT /_capability` the chain accepts does, and return the key.
+fn hold_capability(gateway: &Gateway, pool: u8) -> Address {
+    let mut delegates = gateway.delegates();
+    let signer = delegates.pending();
+    delegates.register(grant(signer, pool, u64::MAX)).unwrap();
+    signer
 }
 
 #[test]
@@ -447,7 +228,7 @@ async fn test_gateway_cached(
         token,
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
-        delegates: Mutex::new(HashMap::new()),
+        delegates: std::sync::Mutex::default(),
         pulls: PullWorker::start(backend, worker_slots).await.unwrap(),
         cache,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
@@ -462,6 +243,7 @@ async fn test_gateway_cached(
         started: Instant::now(),
         started_unix: now_secs(),
         listen: "127.0.0.1:8484".parse().unwrap(),
+        pool: public.is_some(),
         public,
     })
 }
@@ -491,65 +273,147 @@ async fn head_never_starts_a_pull() {
         &gateway,
         Method::HEAD,
         &format!("/{}", "ab".repeat(32)),
-        &[(TOKEN_HEADER, TEST_TOKEN), (HOST_HEADER, "decdn.org")],
+        &[(TOKEN_HEADER, TEST_TOKEN)],
         "",
     )
     .await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
-#[tokio::test]
-async fn minting_needs_a_page_origin_or_the_token_and_stops_per_site() {
-    let gateway = test_gateway().await;
-    assert_eq!(
-        call(&gateway, Method::GET, "/_delegate", &[], "").await,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        call(
-            &gateway,
-            Method::GET,
-            "/_delegate",
-            &[(TOKEN_HEADER, TEST_TOKEN)],
-            ""
-        )
-        .await,
-        StatusCode::OK
-    );
-    // Every page is a fresh subdomain of one site, as with wildcard DNS.
-    let mint = |n: usize| {
-        let gateway = Arc::clone(&gateway);
-        async move {
-            let origin = format!("https://p{n}.evil.com");
-            let page = [(header::ORIGIN.as_str(), origin.as_str())];
-            call(&gateway, Method::GET, "/_delegate", &page, "").await
-        }
-    };
-    for n in 0..MAX_DELEGATES_PER_SITE {
-        assert_eq!(mint(n).await, StatusCode::OK);
+/// `method path` with `headers` and `body`: the response's status, headers
+/// and body as text.
+async fn exchange(
+    gateway: &Arc<Gateway>,
+    method: Method,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (StatusCode, HeaderMap, String) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, "127.0.0.1:8484");
+    for (name, value) in headers {
+        req = req.header(*name, *value);
     }
-    assert_eq!(
-        mint(MAX_DELEGATES_PER_SITE).await,
-        StatusCode::TOO_MANY_REQUESTS
-    );
+    let req = req.body(Full::new(Bytes::from(body.to_owned()))).unwrap();
+    let response = Arc::clone(gateway).handle(req).await;
+    let (parts, body) = response.into_parts();
+    let body = body.collect().await.unwrap().to_bytes();
+    (
+        parts.status,
+        parts.headers,
+        String::from_utf8(body.to_vec()).unwrap(),
+    )
+}
+
+/// The address `GET /_delegate` returns, asked with no token and no
+/// `Origin`.
+async fn pending_address(gateway: &Arc<Gateway>) -> Address {
+    let (status, _, body) = exchange(gateway, Method::GET, "/_delegate", &[], "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    body["address"].as_str().unwrap().parse().unwrap()
 }
 
 #[tokio::test]
-async fn a_page_with_the_token_still_registers_only_its_own_scope() {
+async fn the_pending_key_answers_anyone_until_a_capability_claims_it() {
     let gateway = test_gateway().await;
-    let body = r#"{"capability": "dcap1:x", "scope": "netflix.com"}"#;
-    let status = call(
+    let pending = pending_address(&gateway).await;
+    assert_eq!(pending_address(&gateway).await, pending, "one pending key");
+    gateway
+        .delegates()
+        .register(grant(pending, 1, u64::MAX))
+        .unwrap();
+    let next = pending_address(&gateway).await;
+    assert_ne!(next, pending, "a claimed key is no longer pending");
+    assert_eq!(pending_address(&gateway).await, next);
+}
+
+/// `PUT /_capability` with `grant`: the status and the body.
+async fn put_capability(gateway: &Arc<Gateway>, grant: &CapabilityGrant) -> (StatusCode, String) {
+    let body = serde_json::json!({ "capability": grant.to_token() }).to_string();
+    let (status, _, body) = exchange(gateway, Method::PUT, "/_capability", &[], &body).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn a_capability_that_cannot_register_is_refused_before_the_chain_is_read() {
+    // The gateway's RPC is unreachable, so every answer here comes before a
+    // chain read.
+    let gateway = test_gateway().await;
+    let far = now_secs() + 86_400;
+    let pending = pending_address(&gateway).await;
+
+    let scoped =
+        serde_json::json!({ "capability": grant(pending, 1, far).to_token(), "scope": "*" });
+    let (status, _, body) = exchange(
         &gateway,
         Method::PUT,
         "/_capability",
-        &[
-            (header::ORIGIN.as_str(), "https://decdn.org"),
-            (TOKEN_HEADER, TEST_TOKEN),
-        ],
-        body,
+        &[],
+        &scoped.to_string(),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let mut zero = grant(pending, 1, far);
+    zero.spending_cap = 0;
+    let (status, body) = put_capability(&gateway, &zero).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("cap is zero"), "{body}");
+
+    let expiring = grant(pending, 1, now_secs() + EXPIRY_MARGIN_SECS);
+    let (status, body) = put_capability(&gateway, &expiring).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("inside the margin"), "{body}");
+
+    let stranger = alloy::primitives::Address::repeat_byte(9);
+    let (status, body) = put_capability(&gateway, &grant(stranger, 1, far)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let held = hold_capability(&gateway, 1);
+    let (status, body) = put_capability(&gateway, &grant(held, 1, far)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("from this pool"), "{body}");
+    // Another pool passes the key checks and stops at the owner signature,
+    // which this grant does not carry.
+    let (status, body) = put_capability(&gateway, &grant(held, 2, far)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn a_loopback_gateway_answers_nothing_cross_origin() {
+    let gateway = test_gateway().await;
+    let page = [(header::ORIGIN.as_str(), "https://decdn.org")];
+    for path in ["/_delegate", "/_capability", "/_status"] {
+        let (status, _, _) = exchange(&gateway, Method::OPTIONS, path, &page, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+    }
+    let (status, headers, _) = exchange(&gateway, Method::GET, "/_delegate", &page, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+}
+
+#[tokio::test]
+async fn the_capability_list_and_the_status_need_no_token() {
+    let gateway = test_gateway().await;
+    let first = hold_capability(&gateway, 1);
+    let second = hold_capability(&gateway, 2);
+    let (status, _, body) = exchange(&gateway, Method::GET, "/_capability", &[], "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let signers: Vec<_> = listed
+        .iter()
+        .map(|c| c["signer"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        signers,
+        [first.to_string(), second.to_string()],
+        "registration order"
+    );
+    let (status, _, body) = exchange(&gateway, Method::GET, "/_status", &[], "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// What [`Recording`] answers a pull of one blob with.
@@ -743,10 +607,7 @@ async fn recording_gateway_proving(
         proves,
     };
     let gateway = test_gateway_slots(backend, flags(args), worker_slots).await;
-    insert(
-        &mut *gateway.delegates.lock().await,
-        delegate(None, Some(registered("*", None, Instant::now()))),
-    );
+    hold_capability(&gateway, 0);
     (gateway, caps, proofs)
 }
 
@@ -757,7 +618,6 @@ async fn get(gateway: &Arc<Gateway>, path: &str) -> (StatusCode, String) {
         .uri(path)
         .header(header::HOST, "127.0.0.1:8484")
         .header(TOKEN_HEADER, TEST_TOKEN)
-        .header(HOST_HEADER, "decdn.org")
         .body(Full::new(Bytes::new()))
         .unwrap();
     let response = Arc::clone(gateway).handle(req).await;
@@ -1199,11 +1059,7 @@ async fn a_site_answers_no_gateway_api_and_a_bad_site_host_is_refused() {
         assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
     }
     let answer = request(&gateway, "127.0.0.1:8484", "/_delegate", &[]).await;
-    assert_eq!(
-        answer.status,
-        StatusCode::FORBIDDEN,
-        "the bare origin answers it"
-    );
+    assert_eq!(answer.status, StatusCode::OK, "the bare origin answers it");
     for bad in [
         format!("1{}", &host[1..]),
         host.replace("8484", "8485"),
@@ -1260,7 +1116,6 @@ async fn the_bare_origin_still_serves_markup_as_text() {
         .uri(format!("/{}/index.html", alloy::hex::encode(BLOB)))
         .header(header::HOST, "127.0.0.1:8484")
         .header(TOKEN_HEADER, TEST_TOKEN)
-        .header(HOST_HEADER, "decdn.org")
         .body(Full::new(Bytes::new()))
         .unwrap();
     let response = Arc::clone(&gateway).handle(req).await;
@@ -1288,7 +1143,7 @@ async fn the_bare_origin_still_serves_markup_as_text() {
 async fn the_bare_origin_neutralises_and_sandboxes_an_rss_entry() {
     let (gateway, _) = site_gateway().await;
     let blob = alloy::hex::encode(BLOB);
-    let token = &[(TOKEN_HEADER, TEST_TOKEN), (HOST_HEADER, "decdn.org")];
+    let token = &[(TOKEN_HEADER, TEST_TOKEN)];
     for (path, body) in [("feed.rss", RSS), ("empty.rss", "")] {
         let answer = request(
             &gateway,
@@ -1639,30 +1494,6 @@ fn the_token_is_created_owner_only_and_read_back() {
     }
     std::fs::write(&path, "not a token").unwrap();
     assert!(load_or_create_token(&path).is_err());
-}
-
-#[test]
-fn prune_drops_stale_pending_and_expired_delegates() {
-    let mut delegates = HashMap::new();
-    let fresh = PrivateKeySigner::random();
-    let stale = PrivateKeySigner::random();
-    let stale_minted = Instant::now()
-        .checked_sub(PENDING_TTL + Duration::from_secs(1))
-        .unwrap();
-    for (signer, minted) in [(&fresh, Instant::now()), (&stale, stale_minted)] {
-        delegates.insert(
-            signer.address(),
-            Delegate {
-                signer: Arc::new(signer.clone()),
-                minted,
-                site: None,
-                capability: None,
-            },
-        );
-    }
-    Gateway::prune(&mut delegates);
-    assert!(delegates.contains_key(&fresh.address()));
-    assert!(!delegates.contains_key(&stale.address()));
 }
 
 /// The entry blob of the public gateway's bundle.
@@ -2147,30 +1978,70 @@ async fn a_public_site_serves_to_anyone() {
     assert!(!policy.contains("http"), "{policy}");
 }
 
-/// A public gateway has no delegates and no capabilities: its API paths
-/// answer 404 on every origin, a preflight included.
+/// A public gateway answers its capability API on its bare host, to any
+/// origin, and on no site host.
 #[tokio::test]
-async fn the_public_gateway_api_is_closed() {
+async fn the_public_gateway_api_answers_on_the_bare_host_only() {
     let (gateway, logs, host) = public_gateway().await;
-    for (method, path) in [
-        (Method::GET, "/_delegate"),
-        (Method::PUT, "/_capability"),
-        (Method::GET, "/_capability"),
-        (Method::OPTIONS, "/_delegate"),
-        (Method::OPTIONS, "/_capability"),
+    for (method, path, bare) in [
+        (Method::GET, "/_delegate", StatusCode::OK),
+        (
+            Method::PUT,
+            "/_capability",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (Method::GET, "/_capability", StatusCode::OK),
+        (Method::OPTIONS, "/_delegate", StatusCode::NO_CONTENT),
+        (Method::OPTIONS, "/_capability", StatusCode::NO_CONTENT),
     ] {
-        for origin in ["decdn.test", host.as_str()] {
-            let answer = send(&gateway, method.clone(), origin, path, &[]).await;
-            assert_eq!(
-                answer.status,
-                StatusCode::NOT_FOUND,
-                "{method} {path} on {origin}"
-            );
-        }
+        let answer = send(&gateway, method.clone(), "decdn.test", path, &[]).await;
+        assert_eq!(answer.status, bare, "{method} {path} on the bare host");
+        assert!(readable_anywhere(&answer), "{method} {path}");
+        let answer = send(&gateway, method.clone(), &host, path, &[]).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::NOT_FOUND,
+            "{method} {path} on {host}"
+        );
     }
     let landing = request(&gateway, "decdn.test", "/", &[]).await;
     assert_eq!(landing.status, StatusCode::OK);
     assert!(logs.caps.lock().unwrap().is_empty(), "nothing was pulled");
+}
+
+/// A public gateway with no keystore pays with the capabilities it holds
+/// alone: with none it answers 503, with one it serves, and one that runs out
+/// is retired.
+#[tokio::test]
+async fn a_public_gateway_with_no_pool_pays_with_capabilities() {
+    let (mut gateway, _logs, _) = public_gateway().await;
+    Arc::get_mut(&mut gateway).unwrap().pool = false;
+    let other = format!("/{}", alloy::hex::encode(OTHER));
+    let refused = request(&gateway, "decdn.test", &other, &[]).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        refused.body
+    );
+    assert!(refused.body.contains("cannot pay"), "{}", refused.body);
+
+    hold_capability(&gateway, 1);
+    let served = request(&gateway, "decdn.test", &other, &[]).await;
+    assert_eq!(served.status, StatusCode::OK, "{}", served.body);
+    assert_eq!(served.body, "other bytes");
+
+    let unfunded = format!("/{}", alloy::hex::encode(UNFUNDED));
+    let stopped = request(&gateway, "decdn.test", &unfunded, &[]).await;
+    assert_eq!(
+        stopped.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        stopped.body
+    );
+    let listed = gateway.capabilities();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].spent, "the capability that ran out is retired");
 }
 
 /// On the public bare host a bundle or an entry redirects to its site over
@@ -3582,8 +3453,8 @@ async fn every_public_answer_is_readable_by_any_origin() {
 }
 
 /// A loopback gateway keeps content same-origin: no CORS header on content
-/// and no preflight outside its API, so no page on another origin can send
-/// the token header to content.
+/// and no preflight, so no page on another origin can send the token header
+/// to content.
 #[tokio::test]
 async fn a_loopback_gateway_answers_content_to_no_other_origin() {
     let (gateway, host) = site_gateway().await;
@@ -3610,36 +3481,27 @@ async fn a_loopback_gateway_answers_content_to_no_other_origin() {
 }
 
 /// `GET /_capability` answers this exact body for one registered capability:
-/// the TypeScript SDK reads it, so its keys and spelling are the contract.
+/// the SDKs read it, so its keys and spelling are the contract.
 #[tokio::test]
 async fn the_capability_list_keeps_its_shape() {
     let gateway = test_gateway().await;
-    let mut held = registered("decdn.org", Some("https://decdn.org"), Instant::now());
-    held.grant.signer = Address::repeat_byte(0xab);
-    held.grant.pool_id = alloy::primitives::B256::repeat_byte(0x01);
-    held.grant.spending_cap = 5_000;
-    held.grant.expiry = 1_900_000_000;
-    held.spent = true;
-    insert(
-        &mut *gateway.delegates.lock().await,
-        delegate(None, Some(held)),
-    );
-    let answer = send(
-        &gateway,
-        Method::GET,
-        "127.0.0.1:8484",
-        "/_capability",
-        &[(TOKEN_HEADER, TEST_TOKEN)],
-    )
-    .await;
+    let signer = {
+        let mut delegates = gateway.delegates();
+        let signer = delegates.pending();
+        let mut held = grant(signer, 0x01, 1_900_000_000);
+        held.spending_cap = 5_000;
+        delegates.register(held.clone()).unwrap();
+        delegates.retire(signer, held.pool_id);
+        signer
+    };
+    let answer = send(&gateway, Method::GET, "127.0.0.1:8484", "/_capability", &[]).await;
     assert_eq!(answer.status, StatusCode::OK);
     assert_eq!(
         answer.body,
         format!(
-            "[{{\"cap\":5000,\"expiry\":1900000000,\"origin\":\"https://decdn.org\",\"pool\":\
-             \"0x{}\",\"scope\":\"decdn.org\",\"signer\":\"{}\",\"spent\":true}}]",
+            "[{{\"cap\":5000,\"expiry\":1900000000,\"pool\":\"0x{}\",\"signer\":\"{signer}\",\
+             \"spent\":true}}]",
             "01".repeat(32),
-            Address::repeat_byte(0xab)
         )
     );
 }
@@ -3695,19 +3557,14 @@ async fn loopback_get(gateway: &Arc<Gateway>, path: &str, token: bool) -> Answer
     send(gateway, Method::GET, "127.0.0.1:8484", path, headers).await
 }
 
-/// `/_status` on a loopback gateway takes the token, as `/_capability` does,
-/// and lists the same capabilities. A loopback gateway has no allowance and
-/// no pointers, so both are null.
+/// `/_status` on a loopback gateway takes no token, as `/_capability` does
+/// not, and lists the same capabilities. A loopback gateway has no allowance
+/// and no pointers, so both are null.
 #[tokio::test]
-async fn status_needs_the_token_on_loopback() {
+async fn status_needs_no_token_on_loopback() {
     let gateway = test_gateway().await;
-    insert(
-        &mut *gateway.delegates.lock().await,
-        delegate(None, Some(registered("*", None, Instant::now()))),
-    );
-    let refused = loopback_get(&gateway, "/_status", false).await;
-    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
-    let answer = loopback_get(&gateway, "/_status", true).await;
+    hold_capability(&gateway, 0);
+    let answer = loopback_get(&gateway, "/_status", false).await;
     assert_eq!(answer.status, StatusCode::OK);
     assert_eq!(
         answer.header(header::CONTENT_TYPE),
@@ -3723,12 +3580,11 @@ async fn status_needs_the_token_on_loopback() {
     assert!(status["pointers"].is_null(), "{status}");
     assert!(status["pool_error"].is_null(), "{status}");
     assert!(status["pools"].is_object(), "{status}");
-    // The 401 before it is the dashboard's own request, and not counted.
-    assert_eq!(status["counters"]["requests_refused"], 0, "{status}");
-    let listed = loopback_get(&gateway, "/_capability", true).await;
+    let listed = loopback_get(&gateway, "/_capability", false).await;
     let listed: serde_json::Value = serde_json::from_str(&listed.body).unwrap();
     assert_eq!(status["capabilities"], listed);
-    // A page cannot send the token header cross-origin: no preflight passes.
+    assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+    // A page cannot read it cross-origin: no preflight passes.
     let preflight = send(
         &gateway,
         Method::OPTIONS,
@@ -3755,15 +3611,17 @@ async fn a_loopback_gateway_serves_no_dashboard() {
     }
 }
 
-/// A public gateway serves no state on its public host: it lives on the
-/// metrics listener. `/` keeps its stub.
+/// A public gateway answers its state on its bare host, readable by any
+/// origin, and on no site host. `/` keeps its stub.
 #[tokio::test]
-async fn status_is_404_on_a_public_bare_host() {
+async fn status_answers_on_a_public_bare_host_only() {
     let (gateway, _logs, host) = public_gateway().await;
     let answer = request(&gateway, "decdn.test", "/_status", &[]).await;
-    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    let status: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(status["mode"], "public");
     let preflight = send(&gateway, Method::OPTIONS, "decdn.test", "/_status", &[]).await;
-    assert_eq!(preflight.status, StatusCode::NOT_FOUND);
+    assert_eq!(preflight.status, StatusCode::NO_CONTENT);
     let site = request(&gateway, &host, "/_status", &[]).await;
     assert_eq!(site.status, StatusCode::NOT_FOUND);
     let root = request(&gateway, "decdn.test", "/", &[]).await;
@@ -3865,26 +3723,20 @@ async fn status_reports_a_pool_snapshot_failure() {
     assert!(!error.contains("secret"), "{error}");
 }
 
-/// A loopback gateway's metrics listener asks for the token before it lists
-/// the capabilities, as the gateway's own host does: the token-free state is
-/// for a public gateway's operator alone.
+/// A loopback gateway's metrics listener answers `/_status` and `/metrics`
+/// with no token, as the gateway's own host answers `/_status`.
 #[tokio::test]
-async fn a_loopback_metrics_listener_needs_the_token_for_status() {
+async fn a_loopback_metrics_listener_answers_status_with_no_token() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let gateway = test_gateway().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve_metrics(Arc::clone(&gateway), listener));
-    let fetch = |path: &'static str, token: bool| async move {
+    let fetch = |path: &'static str| async move {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let header = if token {
-            format!("{TOKEN_HEADER}: {TEST_TOKEN}\r\n")
-        } else {
-            String::new()
-        };
         stream
             .write_all(
-                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{header}Connection: close\r\n\r\n")
+                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
                     .as_bytes(),
             )
             .await
@@ -3893,16 +3745,14 @@ async fn a_loopback_metrics_listener_needs_the_token_for_status() {
         stream.read_to_string(&mut out).await.unwrap();
         out
     };
-    let refused = fetch("/_status", false).await;
-    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
-    let status = fetch("/_status", true).await;
+    let status = fetch("/_status").await;
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
-    let metrics = fetch("/metrics", false).await;
+    let metrics = fetch("/metrics").await;
     assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
 }
 
 /// A dashboard's polls are not what the gateway served: each poll of
-/// `/_status`, refused or answered, leaves the counters alone.
+/// `/_status` leaves the counters alone.
 #[tokio::test]
 async fn the_dashboard_does_not_count_itself() {
     let gateway = test_gateway().await;
@@ -3923,9 +3773,14 @@ async fn status_spells_addresses_eip55_and_hashes_bare() {
         format!("{mixed:#x}"),
         "a mixed-case address"
     );
-    let payer = serde_json::to_value(PayerLabel::Capability { signer: mixed }).unwrap();
-    assert_eq!(payer["signer"], mixed.to_string());
     let pool = alloy::primitives::B256::repeat_byte(0x01);
+    let payer = serde_json::to_value(PayerLabel::Capability {
+        signer: mixed,
+        pool,
+    })
+    .unwrap();
+    assert_eq!(payer["signer"], mixed.to_string());
+    assert_eq!(payer["pool"], format!("{pool:#x}"));
     let lanes = serde_json::to_value(worker::DelegateLanes::new(mixed, pool, Vec::new())).unwrap();
     assert_eq!(lanes["signer"], mixed.to_string());
     assert_eq!(lanes["pool_id"], format!("{pool:#x}"));
@@ -4014,7 +3869,6 @@ async fn a_loopback_raw_blob_answers_with_its_proven_length() {
         .uri(format!("/{}", alloy::hex::encode(BLOB)))
         .header(header::HOST, "127.0.0.1:8484")
         .header(TOKEN_HEADER, TEST_TOKEN)
-        .header(HOST_HEADER, "decdn.org")
         .body(Full::new(Bytes::new()))
         .unwrap();
     let response = Arc::clone(&gateway).handle(req).await;
@@ -4038,7 +3892,7 @@ async fn a_capability_that_runs_out_at_a_proof_is_retired() {
     let (gateway, caps, proofs) = recording_gateway_proving(replies, HashMap::new(), &[], 1).await;
     let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(BLOB))).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
-    assert!(body.contains("no capability covers"), "{body}");
+    assert!(body.contains("no capability that can pay"), "{body}");
     assert_eq!(*proofs.lock().unwrap(), [BLOB]);
     assert!(caps.lock().unwrap().is_empty(), "nothing was pulled");
 }
@@ -4539,11 +4393,10 @@ async fn a_spent_allowance_still_serves_a_cached_site() {
     assert_eq!(gateway.metrics.snapshot().cache_hits, 2);
 }
 
-/// A loopback page no capability covers gets the 402 even for a blob the
-/// cache holds whole: the refusal is how the page learns to register a
-/// capability, and the SDK contract pins it.
+/// A loopback gateway that holds no capability still serves a blob the cache
+/// holds whole, at no cost; a blob it lacks gets the 402.
 #[tokio::test]
-async fn a_page_with_no_capability_gets_402_even_for_a_cached_blob() {
+async fn a_gateway_with_no_capability_serves_a_cached_blob() {
     let dir = tempfile::tempdir().unwrap();
     let text = cached_text();
     let len = u64::try_from(text.len()).unwrap();
@@ -4554,7 +4407,11 @@ async fn a_page_with_no_capability_gets_402_even_for_a_cached_blob() {
     let gateway = test_gateway_cached(NoPulls, flags(&[]), sites, None, 1, Some(cache)).await;
 
     let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(hash))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, text);
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 1);
+
+    let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(OTHER))).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
-    assert!(body.contains("no capability covers"), "{body}");
-    assert_eq!(gateway.metrics.snapshot().cache_hits, 0);
+    assert!(body.contains("no capability that can pay"), "{body}");
 }

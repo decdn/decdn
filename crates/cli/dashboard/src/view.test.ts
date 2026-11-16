@@ -141,7 +141,7 @@ describe("capabilities", () => {
             hash: "ab",
             namespace: null,
             range: null,
-            payer: { kind: "capability", signer: signer.toLowerCase() },
+            payer: { kind: "capability", signer: signer.toLowerCase(), pool },
             since_secs: 1,
             delivered_bytes: 0,
           },
@@ -158,9 +158,7 @@ describe("capabilities", () => {
           {
             cap: 4_000,
             expiry: 2_000_000_000,
-            origin: null,
             pool,
-            scope: "*",
             signer,
             spent: false,
           },
@@ -204,9 +202,7 @@ describe("capabilities", () => {
           {
             cap: 1,
             expiry: 0,
-            origin: null,
             pool,
-            scope: "*",
             signer,
             spent: true,
           },

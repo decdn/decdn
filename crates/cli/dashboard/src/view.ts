@@ -67,8 +67,6 @@ export function poolRows(list: Pool[]): PoolRow[] {
 export interface CapabilityRow {
   signer: string;
   pool: string;
-  scope: string;
-  origin: string | null;
   cap: number;
   expiry: number;
   exhausted: boolean;
@@ -96,13 +94,14 @@ export function capabilities(status: GatewayStatus): CapabilityRow[] {
     const bytes = mine?.reduce((sum, d) => sum + d.bytes_delivered, 0) ?? null;
     const used = spentMicro === null ? null : share(spentMicro, c.cap);
     const inFlight = status.active_pulls.filter(
-      (p) => p.payer.kind === "capability" && same(p.payer.signer, c.signer),
+      (p) =>
+        p.payer.kind === "capability" &&
+        same(p.payer.signer, c.signer) &&
+        same(p.payer.pool, c.pool),
     ).length;
     return {
       signer: c.signer,
       pool: c.pool,
-      scope: c.scope,
-      origin: c.origin,
       cap: c.cap,
       expiry: c.expiry,
       exhausted: c.spent,

@@ -200,7 +200,11 @@ fn send(
     tokio::io::DuplexStream,
     oneshot::Receiver<anyhow::Result<()>>,
 ) {
-    send_paid(worker, kind, Payment::Held(credential(signer)), pipe)
+    let paying = Payment::Held {
+        credential: credential(signer),
+        namespace: None,
+    };
+    send_paid(worker, kind, paying, pipe)
 }
 
 /// Hand the worker a pull of blob `kind` paid from the gateway's own pool.
