@@ -4,12 +4,18 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { SunsettingPausable } from "../src/SunsettingPausable.sol";
-import { ICapacityBondEpoch } from "../src/interfaces/ICapacityBondEpoch.sol";
+import { ICapacityBondCredit } from "../src/interfaces/ICapacityBondCredit.sol";
+import { MockCreditBond } from "./mocks/MockCreditBond.sol";
 
-contract MockUSDC is ERC20 {
+/// @dev USDC stand-in with Circle-style address blocking, so a test can make
+///      the rebate transfer to an operator fail.
+contract BlockingUSDC is ERC20 {
+    mapping(address => bool) public blocked;
+
     constructor() ERC20("USDC", "USDC") {
         _mint(msg.sender, 1_000_000_000e6);
     }
@@ -17,150 +23,283 @@ contract MockUSDC is ERC20 {
     function decimals() public pure override returns (uint8) {
         return 6;
     }
-}
 
-contract MockBondEpoch is ICapacityBondEpoch {
-    uint64 public epochLengthValue;
-
-    constructor(uint64 epochLengthValue_) {
-        epochLengthValue = epochLengthValue_;
+    function setBlocked(address account, bool isBlocked) external {
+        blocked[account] = isBlocked;
     }
 
-    function epochLength() external view override returns (uint64) {
-        return epochLengthValue;
+    function _update(address from, address to, uint256 value) internal override {
+        require(!blocked[to], "blocked");
+        super._update(from, to, value);
     }
 }
 
 contract FeeRouterTest is Test {
-    MockUSDC internal usdc;
-    MockBondEpoch internal bondEpoch;
+    BlockingUSDC internal usdc;
+    MockCreditBond internal bond;
     FeeRouter internal router;
 
     address internal admin = address(0xA11CE);
-    address internal channel = address(0xCAFE);
+    address internal adapter = address(0xCAFE);
     address internal operator = address(0xB0B);
     address internal treasury = address(0xD7);
     address internal buyback = address(0xBB);
 
     uint64 internal constant EPOCH = 7 days;
+    uint256 internal constant MIB = 1_048_576;
+    /// @dev 1 Gbps declared: the clamp is 1000 * 7 days * 125_000 bytes.
+    uint256 internal constant MBPS = 1000;
+    uint256 internal constant CLAMP = MBPS * uint256(EPOCH) * 125_000;
+
+    event Deposited(
+        address indexed depositor,
+        address indexed operator,
+        uint256 amount,
+        uint256 servedBytes,
+        uint256 credit,
+        uint64 indexed epoch
+    );
 
     function setUp() public {
-        usdc = new MockUSDC();
-        bondEpoch = new MockBondEpoch(EPOCH);
+        usdc = new BlockingUSDC();
+        bond = new MockCreditBond(EPOCH);
+        bond.set(operator, true, MBPS);
 
-        // Same construction the constructor-guard tests use, so the shared
-        // values (shares, windowEpochs) live in exactly one place.
-        router = _deployRouter(bondEpoch, EPOCH);
+        // Launch split from ADR 016 § Tunable Economics example: 75% rebate,
+        // no buyback, 25% treasury. Floor 1 (the launch value).
+        router = _deployRouter(bond, EPOCH, 7500, 0, address(0), 1);
 
-        vm.startPrank(admin);
-        router.grantRole(router.ROUTER_CALLER_ROLE(), channel);
-        vm.stopPrank();
-
-        // Fund the channel with USDC and approve router.
-        usdc.transfer(channel, 1_000_000e6);
-        vm.prank(channel);
+        usdc.transfer(adapter, 1_000_000e6);
+        vm.prank(adapter);
         usdc.approve(address(router), type(uint256).max);
+        vm.warp(EPOCH + 1);
     }
 
-    // -----------------------------------------------------------------
-    // Constructor guards. Since `recordSettlement` was removed (#1434) the
-    // `capacityBond_` argument has exactly ONE remaining purpose: proving at
-    // deploy time that the bond's epoch length matches the router's. Both
-    // `CapacityBond.EPOCH_LENGTH` and `FeeRouter.epochLength` are
-    // constant/immutable, so this one-shot check is a permanent guarantee — and
-    // it is now the sole justification for the argument existing, which is why
-    // it needs its own coverage rather than riding on the deploy fixtures.
-    // A mismatch would silently mis-anchor `DecdnGovernor` epoch arithmetic by
-    // mixing epoch indices derived from two different lengths.
-    // -----------------------------------------------------------------
-
-    function _deployRouter(ICapacityBondEpoch bond_, uint64 epochLength_) internal returns (FeeRouter) {
-        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
+    function _deployRouter(
+        ICapacityBondCredit bond_,
+        uint64 epochLength_,
+        uint256 rebateBps_,
+        uint256 buybackBps_,
+        address burner_,
+        uint256 floor_
+    ) internal returns (FeeRouter) {
         return new FeeRouter({
             usdc_: usdc,
             capacityBond_: bond_,
             treasury_: treasury,
             epochLength_: epochLength_,
             windowEpochs_: 13,
+            deliveryFloor_: floor_,
             admin: admin,
-            initialShares: shares,
-            buybackBurner_: buyback
+            rebateBps_: rebateBps_,
+            buybackBps_: buybackBps_,
+            buybackBurner_: burner_
         });
     }
 
+    function _deposit(uint256 servedBytes, uint256 amount) internal {
+        vm.prank(adapter);
+        router.deposit(operator, servedBytes, amount);
+    }
+
+    function _epoch() internal view returns (uint64) {
+        return uint64(block.timestamp / EPOCH);
+    }
+
+    // -----------------------------------------------------------------
+    // Constructor guards
+    // -----------------------------------------------------------------
+
     function test_constructor_revertsOnEpochLengthMismatch() public {
-        MockBondEpoch mismatched = new MockBondEpoch(EPOCH + 1 days);
+        MockCreditBond mismatched = new MockCreditBond(EPOCH + 1 days);
         vm.expectRevert(abi.encodeWithSelector(FeeRouter.EpochLengthMismatch.selector, EPOCH + 1 days, EPOCH));
-        _deployRouter(mismatched, EPOCH);
+        _deployRouter(mismatched, EPOCH, 7500, 0, address(0), 1);
     }
 
-    /// Passing `epochLength_ = 0` against a 7-day bond leaves BOTH guards live,
-    /// so this only proves the zero check is ordered first.
-    function test_constructor_revertsOnZeroEpochLength() public {
-        vm.expectRevert(FeeRouter.ZeroEpochLength.selector);
-        _deployRouter(bondEpoch, 0);
-    }
-
-    /// The case the zero guard uniquely defends, and the one the test above
-    /// cannot reach: a misdeployed `CapacityBond` that itself reports `0`. The
-    /// mismatch check passes cleanly (0 == 0), so without `ZeroEpochLength` the
-    /// router deploys with `epochLength() == 0` and every downstream epoch
-    /// computation divides by zero.
     function test_constructor_revertsOnZeroEpochLengthEvenWhenBondAgrees() public {
-        // Deploy the mock BEFORE `expectRevert`: a `new` in the argument list is
-        // itself a CREATE, and `expectRevert` latches onto the next call — it
-        // would target the mock's construction, which succeeds.
-        MockBondEpoch zeroBond = new MockBondEpoch(0);
+        MockCreditBond zeroBond = new MockCreditBond(0);
         vm.expectRevert(FeeRouter.ZeroEpochLength.selector);
-        _deployRouter(zeroBond, 0);
+        _deployRouter(zeroBond, 0, 7500, 0, address(0), 1);
     }
 
-    function test_routeSettlement_distributesThreeLegs() public {
-        uint256 amount = 1000e6;
-        uint256 bytesDelivered = 100_000_000;
-
-        vm.warp(EPOCH + 1);
-        vm.prank(channel);
-        router.routeSettlement(operator, bytesDelivered, amount);
-
-        // Shares: 6000/3000/1000.
-        assertEq(usdc.balanceOf(operator), 600e6);
-        assertEq(usdc.balanceOf(buyback), 300e6);
-        assertEq(usdc.balanceOf(treasury), 100e6);
+    function test_constructor_revertsOnSplitAboveWhole() public {
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.SplitExceedsWhole.selector, uint256(7500), uint256(3000)));
+        _deployRouter(bond, EPOCH, 7500, 3000, buyback, 1);
     }
 
-    function test_routeSettlement_incrementsBytesPerEpoch() public {
-        vm.warp(EPOCH + 1);
-        vm.prank(channel);
-        router.routeSettlement(operator, 100, 1000e6);
-
-        uint64 epoch = uint64((EPOCH + 1) / EPOCH);
-        assertEq(router.bytesPerEpoch(operator, epoch), 100);
-        assertEq(router.totalBytesPerEpoch(epoch), 100);
+    function test_constructor_revertsOnBuybackWithoutBurner() public {
+        vm.expectRevert(FeeRouter.BuybackNeedsBurner.selector);
+        _deployRouter(bond, EPOCH, 0, 7500, address(0), 1);
     }
+
+    function test_constructor_revertsOnFloorOutOfBounds() public {
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.DeliveryFloorOutOfBounds.selector, uint256(0)));
+        _deployRouter(bond, EPOCH, 7500, 0, address(0), 0);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.DeliveryFloorOutOfBounds.selector, uint256(1001)));
+        _deployRouter(bond, EPOCH, 7500, 0, address(0), 1001);
+    }
+
+    // -----------------------------------------------------------------
+    // deposit: split
+    // -----------------------------------------------------------------
+
+    function test_deposit_activeOperatorGetsRebate() public {
+        _deposit(0, 1000e6);
+        assertEq(usdc.balanceOf(operator), 750e6, "rebate");
+        assertEq(usdc.balanceOf(treasury), 250e6, "treasury remainder");
+        assertEq(usdc.balanceOf(address(router)), 0, "router holds nothing");
+    }
+
+    function test_deposit_buybackSplit() public {
+        vm.startPrank(admin);
+        router.setBuybackBurner(buyback);
+        router.setSplit(0, 7500);
+        vm.stopPrank();
+
+        _deposit(0, 1000e6);
+        assertEq(usdc.balanceOf(operator), 0, "no rebate");
+        assertEq(usdc.balanceOf(buyback), 750e6, "buyback");
+        assertEq(usdc.balanceOf(treasury), 250e6, "treasury");
+    }
+
+    function test_deposit_inactiveOperatorRebateGoesToTreasury() public {
+        bond.set(operator, false, MBPS);
+        _deposit(5_000_000, 1000e6);
+        assertEq(usdc.balanceOf(operator), 0, "no rebate");
+        assertEq(usdc.balanceOf(treasury), 1000e6, "whole deposit to treasury");
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 0, "no credit");
+        assertEq(router.totalBytesPerEpoch(_epoch()), 0, "no total");
+    }
+
+    function test_deposit_failedRebateFallsBackToTreasury() public {
+        usdc.setBlocked(operator, true);
+        _deposit(100, 1000e6);
+        assertEq(usdc.balanceOf(operator), 0, "blocked operator");
+        assertEq(usdc.balanceOf(treasury), 1000e6, "rebate fell back");
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 100, "credit still lands");
+    }
+
+    function test_deposit_dustRoundsToTreasury() public {
+        _deposit(0, 1);
+        assertEq(usdc.balanceOf(operator), 0, "rebate rounds down");
+        assertEq(usdc.balanceOf(treasury), 1, "remainder");
+    }
+
+    function test_deposit_isPermissionless() public {
+        address stranger = address(0x5157);
+        usdc.transfer(stranger, 10e6);
+        vm.startPrank(stranger);
+        usdc.approve(address(router), 10e6);
+        router.deposit(operator, 7, 10e6);
+        vm.stopPrank();
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 7);
+    }
+
+    function test_deposit_revertsOnZeroOperatorOrAmount() public {
+        vm.prank(adapter);
+        vm.expectRevert(FeeRouter.ZeroAddress.selector);
+        router.deposit(address(0), 1, 1);
+        vm.prank(adapter);
+        vm.expectRevert(FeeRouter.ZeroAmount.selector);
+        router.deposit(operator, 1, 0);
+    }
+
+    function test_deposit_revertsWhenPaused() public {
+        bytes32 role = router.PAUSER_ROLE();
+        vm.startPrank(admin);
+        router.grantRole(role, admin);
+        router.pause();
+        vm.stopPrank();
+
+        vm.prank(adapter);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        router.deposit(operator, 1, 1e6);
+    }
+
+    function test_deposit_emitsDeposited() public {
+        vm.expectEmit(true, true, true, true, address(router));
+        emit Deposited(adapter, operator, 1000e6, 42, 42, _epoch());
+        _deposit(42, 1000e6);
+    }
+
+    // -----------------------------------------------------------------
+    // deposit: credit
+    // -----------------------------------------------------------------
+
+    /// Net (treasury + buyback) is 25% of the deposit; at floor 1 one net
+    /// base unit buys one MiB of credit, so `bytes` binds here.
+    function test_deposit_creditIsBytesWhenNetCoversThem() public {
+        _deposit(1_000_000, 1000e6);
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 1_000_000);
+        assertEq(router.totalBytesPerEpoch(_epoch()), 1_000_000);
+    }
+
+    /// Net 25 base units at floor 1 back 25 MiB, below the claimed bytes.
+    function test_deposit_creditIsCappedByNetUsdc() public {
+        _deposit(1000 * MIB, 100);
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 25 * MIB);
+    }
+
+    /// The rebate does not back credit: at a 100% rebate there is no net.
+    function test_deposit_fullRebateCreditsNothing() public {
+        vm.prank(admin);
+        router.setSplit(10_000, 0);
+        _deposit(1_000_000, 1000e6);
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 0);
+        assertEq(usdc.balanceOf(operator), 1000e6);
+    }
+
+    function test_deposit_floorPricesCredit() public {
+        vm.prank(admin);
+        router.setDeliveryFloor(1000);
+        // Net 250e6 at 1000 base units per MiB backs 250_000 MiB.
+        _deposit(type(uint64).max, 1000e6);
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 250_000 * MIB > CLAMP ? CLAMP : 250_000 * MIB);
+    }
+
+    function test_deposit_capacityClampBindsOperatorAndTotal() public {
+        _deposit(CLAMP - 10, 1_000_000e6 / 10);
+        _deposit(100, 1e6);
+        assertEq(router.bytesPerEpoch(operator, _epoch()), CLAMP, "operator clamped");
+        assertEq(router.totalBytesPerEpoch(_epoch()), CLAMP, "total clamped alike");
+        _deposit(100, 1e6);
+        assertEq(router.bytesPerEpoch(operator, _epoch()), CLAMP, "no room left");
+    }
+
+    function test_deposit_zeroDeclaredCapacityCreditsNothing() public {
+        bond.set(operator, true, 0);
+        _deposit(1000, 1000e6);
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 0);
+        assertEq(usdc.balanceOf(operator), 750e6, "rebate still paid");
+    }
+
+    function test_deposit_stampsArrivalEpoch() public {
+        _deposit(10, 1e6);
+        uint64 first = _epoch();
+        vm.warp(block.timestamp + EPOCH);
+        _deposit(20, 1e6);
+        assertEq(router.bytesPerEpoch(operator, first), 10);
+        assertEq(router.bytesPerEpoch(operator, first + 1), 20);
+    }
+
+    // -----------------------------------------------------------------
+    // Windows
+    // -----------------------------------------------------------------
 
     function test_bytesInWindow_sumsTrailingWindow() public {
-        // Drive 4 epochs of settlement.
         for (uint64 i = 1; i <= 4; i++) {
             vm.warp(uint256(i) * EPOCH + 1);
-            vm.prank(channel);
-            router.routeSettlement(operator, i * 1000, 100e6);
+            _deposit(i * 1000, 100e6);
         }
-        // Window of 4 ending at epoch 4: should sum 1k+2k+3k+4k = 10k.
         assertEq(router.bytesInWindow(operator, 4, 4), 10_000);
         assertEq(router.totalBytesInWindow(4, 4), 10_000);
     }
 
     function test_bytesInWindow_clampsOversizedWindow() public {
-        // Drive 4 epochs of settlement.
         for (uint64 i = 1; i <= 4; i++) {
             vm.warp(uint256(i) * EPOCH + 1);
-            vm.prank(channel);
-            router.routeSettlement(operator, i * 1000, 100e6);
+            _deposit(i * 1000, 100e6);
         }
-        // A massive `n` must not loop unbounded: it clamps to the 26-epoch
-        // ceiling, which (ending at epoch 4) covers all 4 populated epochs and
-        // returns the same sum as an explicit ceiling-length window.
         uint256 clamped = router.bytesInWindow(operator, 4, type(uint64).max);
         assertEq(clamped, 10_000);
         assertEq(clamped, router.bytesInWindow(operator, 4, 26));
@@ -173,99 +312,78 @@ contract FeeRouterTest is Test {
     }
 
     function test_setWindowEpochs_enforcesBounds() public {
-        vm.prank(admin);
-        vm.expectRevert();
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.WindowOutOfBounds.selector, uint64(3), uint64(4), uint64(26)));
         router.setWindowEpochs(3);
-
-        vm.prank(admin);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.WindowOutOfBounds.selector, uint64(27), uint64(4), uint64(26)));
         router.setWindowEpochs(27);
-
-        vm.prank(admin);
         router.setWindowEpochs(20);
+        vm.stopPrank();
         assertEq(router.windowEpochs(), 20);
     }
 
-    function test_setShares_rejectsSumNot10000() public {
-        // [5000, 3000, 1000] sums to 9000 → SharesDoNotSum(9000).
-        uint256[3] memory bad = [uint256(5000), uint256(3000), uint256(1000)];
+    // -----------------------------------------------------------------
+    // Governance setters
+    // -----------------------------------------------------------------
+
+    function test_setSplit_rejectsAboveWhole() public {
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(FeeRouter.SharesDoNotSum.selector, uint256(9000)));
-        router.setShares(bad);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.SplitExceedsWhole.selector, uint256(10_000), uint256(1)));
+        router.setSplit(10_000, 1);
     }
 
-    function test_setShares_rejectsNonZeroShareWithoutDestination() public {
-        // Clear buyback burner (bucket index 1) while its share is non-zero.
+    function test_setSplit_buybackNeedsBurner() public {
+        vm.prank(admin);
+        vm.expectRevert(FeeRouter.BuybackNeedsBurner.selector);
+        router.setSplit(0, 1);
+    }
+
+    function test_setBuybackBurner_cannotClearWhileBuybackActive() public {
         vm.startPrank(admin);
-        vm.expectRevert(abi.encodeWithSelector(FeeRouter.NonZeroShareNeedsDestination.selector, uint256(1)));
+        router.setBuybackBurner(buyback);
+        router.setSplit(5000, 2500);
+        vm.expectRevert(FeeRouter.BuybackNeedsBurner.selector);
         router.setBuybackBurner(address(0));
         vm.stopPrank();
     }
 
-    /// @notice routeSettlement is gated on ROUTER_CALLER_ROLE — the role
-    ///         exists specifically to prevent any account from inflating
-    ///         their own per-epoch served-bytes (which would translate to
-    ///         voting weight via ADR 036). A caller without the role MUST
-    ///         revert before the bytesPerEpoch increment.
-    function test_routeSettlement_revertsWithoutRouterRole() public {
-        // `operator` does not hold ROUTER_CALLER_ROLE. Fund + approve so
-        // any failure can only come from the role gate, not the
-        // safeTransferFrom or address checks.
-        usdc.transfer(operator, 1000e6);
-        vm.prank(operator);
-        usdc.approve(address(router), type(uint256).max);
-
-        vm.warp(EPOCH + 1);
-        vm.prank(operator);
-        vm.expectRevert();
-        router.routeSettlement(operator, 1_000_000, 1000e6);
-
-        // bytesPerEpoch unaffected — the revert happened before the write.
-        uint64 epoch = uint64((EPOCH + 1) / EPOCH);
-        assertEq(router.bytesPerEpoch(operator, epoch), 0);
-        assertEq(router.totalBytesPerEpoch(epoch), 0);
+    function test_setTreasury_rejectsZero() public {
+        vm.prank(admin);
+        vm.expectRevert(FeeRouter.ZeroAddress.selector);
+        router.setTreasury(address(0));
     }
 
-    // -----------------------------------------------------------------
-    // Access-control guards on governance setters
-    // -----------------------------------------------------------------
-
-    function test_setShares_revertsWithoutRole() public {
-        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
-        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
-        vm.prank(operator);
-        router.setShares(shares);
+    function test_setDeliveryFloor_enforcesBounds() public {
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.DeliveryFloorOutOfBounds.selector, uint256(0)));
+        router.setDeliveryFloor(0);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.DeliveryFloorOutOfBounds.selector, uint256(1001)));
+        router.setDeliveryFloor(1001);
+        router.setDeliveryFloor(1000);
+        vm.stopPrank();
+        assertEq(router.deliveryFloor(), 1000);
     }
 
-    function test_setSharesAndDestinations_revertsWithoutRole() public {
-        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
-        FeeRouter.ShareDestinations memory dests =
-            FeeRouter.ShareDestinations({ buybackBurner: buyback, treasury: treasury });
-        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
-        vm.prank(operator);
-        router.setSharesAndDestinations(shares, dests);
-    }
-
-    function test_setBuybackBurner_revertsWithoutRole() public {
-        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
-        vm.prank(operator);
+    function test_setters_revertWithoutRole() public {
+        bytes32 gov = router.GOVERNANCE_ROLE();
+        vm.startPrank(operator);
+        _expectMissingRole(operator, gov);
+        router.setSplit(0, 0);
+        _expectMissingRole(operator, gov);
         router.setBuybackBurner(address(0x9999));
-    }
-
-    function test_setTreasury_revertsWithoutRole() public {
-        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
-        vm.prank(operator);
+        _expectMissingRole(operator, gov);
         router.setTreasury(address(0x9999));
-    }
-
-    function test_setWindowEpochs_revertsWithoutRole() public {
-        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
-        vm.prank(operator);
+        _expectMissingRole(operator, gov);
+        router.setDeliveryFloor(2);
+        _expectMissingRole(operator, gov);
         router.setWindowEpochs(20);
+        vm.stopPrank();
     }
 
-    // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
-    // each contract's own construction time + 365 days; afterwards `pause()` reverts for everyone.
+    // -----------------------------------------------------------------
+    // Pause
+    // -----------------------------------------------------------------
+
     function test_pause_revertsAfterSunset() public {
         bytes32 pauserRole = router.PAUSER_ROLE();
         vm.prank(admin);
@@ -278,51 +396,13 @@ contract FeeRouterTest is Test {
     }
 
     function test_pause_revertsWithoutRole() public {
-        _expectMissingRole(operator, router.PAUSER_ROLE());
-        vm.prank(operator);
-        router.pause();
-    }
-
-    function test_unpause_revertsWithoutRole() public {
         bytes32 pauserRole = router.PAUSER_ROLE();
-        vm.startPrank(admin);
-        router.grantRole(pauserRole, admin);
-        router.pause();
-        vm.stopPrank();
-
         _expectMissingRole(operator, pauserRole);
         vm.prank(operator);
-        router.unpause();
+        router.pause();
     }
 
-    /// @dev See `CapacityBond.t.sol:_expectMissingRole` for the rationale on
-    ///      reading the role bytes32 outside the helper (prank-consumption
-    ///      avoidance). The helper is local to each test file rather than
-    ///      shared via a base contract to keep test deps shallow.
     function _expectMissingRole(address caller, bytes32 role) internal {
         vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, caller, role));
-    }
-
-    /// @notice T-1 — `opShare` absorbs the rounding remainder so a 1-wei
-    ///         settlement with zero buyback share + zero buybackBurner does
-    ///         NOT attempt `safeTransfer(address(0), 1)` and revert.
-    ///         Regression test for the dust-to-address(0) bug that would
-    ///         brick settlements.
-    function test_routeSettlement_dustRoutesToOperatorWhenBuybackUnset() public {
-        // Valid bps split with buyback = 0 so buybackBurner can be address(0).
-        // Operator floor is 4000, treasury ceiling 3000. Pick 9000/0/1000.
-        uint256[3] memory split = [uint256(9000), uint256(0), uint256(1000)];
-        FeeRouter.ShareDestinations memory dests =
-            FeeRouter.ShareDestinations({ buybackBurner: address(0), treasury: treasury });
-        vm.prank(admin);
-        router.setSharesAndDestinations(split, dests);
-
-        // Settle 1 wei. With these shares all computed legs round to
-        // zero except the operator remainder; opShare = 1 - 0 - 0 = 1.
-        uint256 opBefore = usdc.balanceOf(operator);
-        vm.warp(EPOCH + 1);
-        vm.prank(channel);
-        router.routeSettlement(operator, 0, 1);
-        assertEq(usdc.balanceOf(operator) - opBefore, 1);
     }
 }

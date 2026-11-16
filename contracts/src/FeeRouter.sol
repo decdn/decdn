@@ -7,69 +7,69 @@ import { SunsettingPausable } from "./SunsettingPausable.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
-import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { Time } from "@openzeppelin/contracts/utils/types/Time.sol";
 
 import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
-import { ICapacityBondEpoch } from "./interfaces/ICapacityBondEpoch.sol";
+import { ICapacityBondCredit } from "./interfaces/ICapacityBondCredit.sol";
 
 /// @title FeeRouter
-/// @notice Three-bucket settlement distributor + canonical served-bytes
-///         accountant. Per ADR 026 § FeeRouter split, every settlement
-///         transfers `amount` USDC as 60% operator base / 30% buyback /
-///         10% treasury in the same transaction. Per ADR 036,
-///         `bytesPerEpoch[op][e]` and `totalBytesPerEpoch[e]` are
-///         incremented inline on every settlement and consumed by
-///         `DecdnGovernor._getVotes` over the trailing `windowEpochs` window.
-/// @dev    Bucket shares and dependency addresses are governance-mutable
-///         under the `setShares` / `set*` setters with a cross-validation
-///         invariant (any non-zero share ⇒ non-zero destination — note the
-///         one-way implication: a non-zero destination with a zero share is
-///         allowed during launch wiring). Buyback / treasury
-///         buckets short-circuit before the `safeTransfer` when their share
-///         is 0; the operator share is bounded away from 0 by
-///         `OPERATOR_BPS_FLOOR` and absorbs the rounding remainder so dust
-///         never gets routed to an inactive bucket's `address(0)` sink.
+/// @notice Governance-chain receiver of payment-chain sweeps and the canonical
+///         served-bytes accountant (ADR 016 § Contract: FeeRouter, ADR 026 §
+///         FeeRouter split, ADR 036). `deposit` is permissionless and knows no
+///         bridge: a bridge adapter receives a sweep and deposits the USDC that
+///         arrived (ADR 016 § Bridge adapters).
+/// @dev    Each deposit splits into a rebate to the operator (`rebateBps`, only
+///         while the operator is active), a buyback leg (`buybackBps`), and a
+///         treasury remainder, all in the same transaction. The weight credit
+///         is priced on the buyback and treasury legs (`net`), never on the
+///         rebate, and is clamped to the operator's declared capacity for the
+///         arrival epoch.
 contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPausable {
     using SafeERC20 for IERC20;
     using Checkpoints for Checkpoints.Trace208;
-    using SafeCast for uint256;
 
     // -----------------------------------------------------------------
     // Roles
     // -----------------------------------------------------------------
 
+    /// @notice Holder of every governance setter (the `TimelockController`).
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
-    bytes32 public constant ROUTER_CALLER_ROLE = keccak256("ROUTER_CALLER_ROLE");
+    /// @notice Holder of `pause` and `unpause` (the emergency multisig).
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     // -----------------------------------------------------------------
-    // Bucket index constants — see `_shares` layout
+    // Constants
     // -----------------------------------------------------------------
-
-    uint256 internal constant BUCKET_OPERATOR = 0;
-    uint256 internal constant BUCKET_BUYBACK = 1;
-    uint256 internal constant BUCKET_TREASURY = 2;
 
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
-    // Per-share bounds (ADR 026 § Governable parameters with safety bounds).
-    uint256 internal constant OPERATOR_BPS_FLOOR = 4000;
-    uint256 internal constant OPERATOR_BPS_CEILING = 9000;
-    uint256 internal constant BUYBACK_BPS_FLOOR = 500;
-    uint256 internal constant BUYBACK_BPS_CEILING = 5000;
-    uint256 internal constant TREASURY_BPS_CEILING = 3000;
+    /// @dev 1 MiB in bytes, the unit `deliveryFloor` prices.
+    uint256 internal constant BYTES_PER_MIB = 1_048_576;
+
+    /// @dev Bytes per second carried by one Mbps (1e6 bits / 8).
+    uint256 internal constant BYTES_PER_MBPS_SECOND = 125_000;
 
     // Window bounds (ADR 036 § Governable parameters with safety bounds).
     uint64 internal constant WINDOW_EPOCHS_FLOOR = 4;
     uint64 internal constant WINDOW_EPOCHS_CEILING = 26;
 
+    // Delivery-floor bounds (ADR 016 § Tunable Economics).
+    uint256 internal constant DELIVERY_FLOOR_MIN = 1;
+    uint256 internal constant DELIVERY_FLOOR_MAX = 1000;
+
     // -----------------------------------------------------------------
     // Immutables
     // -----------------------------------------------------------------
 
+    /// @notice The settlement token.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IERC20 public immutable usdc;
+
+    /// @notice Operator registry read for the active gate and the capacity
+    ///         clamp.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    ICapacityBondCredit public immutable capacityBond;
 
     /// @inheritdoc IFeeRouter
     /// @dev Immutable; changing it would shift every stored epoch index.
@@ -77,160 +77,164 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     uint64 public immutable override epochLength;
 
     // -----------------------------------------------------------------
-    // Storage — shares + destinations
+    // Storage
     // -----------------------------------------------------------------
 
-    /// @dev Layout `[operatorBase, buyback, treasury]`, in bps.
-    ///      Sum-to-10_000 invariant enforced by every setter.
-    uint256[3] internal _shares;
-
-    address public buybackBurner;
-    address public treasury;
-
-    // -----------------------------------------------------------------
-    // Storage — bytes accounting (ADR 036)
-    // -----------------------------------------------------------------
+    /// @inheritdoc IFeeRouter
+    uint256 public override rebateBps;
+    /// @inheritdoc IFeeRouter
+    uint256 public override buybackBps;
+    /// @inheritdoc IFeeRouter
+    address public override buybackBurner;
+    /// @inheritdoc IFeeRouter
+    address public override treasury;
+    /// @inheritdoc IFeeRouter
+    uint256 public override deliveryFloor;
 
     mapping(address operator => mapping(uint64 epoch => uint256)) internal _bytesPerEpoch;
     mapping(uint64 epoch => uint256) internal _totalBytesPerEpoch;
 
-    /// @notice Checkpointed `windowEpochs` history (ADR 036 § Governable
-    ///         parameters with safety bounds). Read by `DecdnGovernor` via
-    ///         `windowEpochsAt(snapshotTp)` so a mid-vote setter change does
-    ///         not shift quorum / vote weights for in-flight proposals
-    ///         (mirrors the I4 pattern on `DecdnGovernor.voteCapBps`).
+    /// @dev Checkpointed `windowEpochs` history. `DecdnGovernor` reads it at a
+    ///      proposal's snapshot, so a setter change never shifts an in-flight
+    ///      vote.
     Checkpoints.Trace208 internal _windowEpochsHistory;
 
     // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
 
-    event Settled(address indexed operator, uint256 bytesDelivered, uint256 amount, uint64 indexed epoch);
-    event SharesUpdated(uint256[3] newShares);
+    /// @notice One deposit landed. `credit` is the bytes added to
+    ///         `bytesPerEpoch[operator][epoch]`; `epoch` is the arrival epoch.
+    event Deposited(
+        address indexed depositor,
+        address indexed operator,
+        uint256 amount,
+        uint256 servedBytes,
+        uint256 credit,
+        uint64 indexed epoch
+    );
+    /// @notice The rebate and buyback shares changed.
+    event SplitUpdated(uint256 rebateBps, uint256 buybackBps);
+    /// @notice The weight-credit price changed.
+    event DeliveryFloorUpdated(uint256 oldValue, uint256 newValue);
+    /// @notice The buyback destination changed.
     event BuybackBurnerUpdated(address indexed oldAddr, address indexed newAddr);
+    /// @notice The treasury destination changed.
     event TreasuryUpdated(address indexed oldAddr, address indexed newAddr);
+    /// @notice The trailing-window length changed.
     event WindowEpochsUpdated(uint64 oldValue, uint64 newValue);
 
     // -----------------------------------------------------------------
     // Errors
     // -----------------------------------------------------------------
 
+    /// @notice A required address is zero.
     error ZeroAddress();
+    /// @notice A deposit moved no USDC.
     error ZeroAmount();
-    error SharesDoNotSum(uint256 sum);
-    error ShareOutOfBounds(uint256 bucket, uint256 value, uint256 floor, uint256 ceiling);
-    error NonZeroShareNeedsDestination(uint256 bucket);
+    /// @notice `rebateBps + buybackBps` exceeds 10000.
+    error SplitExceedsWhole(uint256 rebateBps, uint256 buybackBps);
+    /// @notice A non-zero `buybackBps` needs a non-zero `buybackBurner`.
+    error BuybackNeedsBurner();
+    /// @notice `deliveryFloor` is outside [1, 1000].
+    error DeliveryFloorOutOfBounds(uint256 value);
+    /// @notice `windowEpochs` is outside [4, 26].
     error WindowOutOfBounds(uint64 value, uint64 floor, uint64 ceiling);
+    /// @notice The constructor got a zero epoch length.
     error ZeroEpochLength();
+    /// @notice The bond and the router disagree on the epoch length.
     error EpochLengthMismatch(uint64 capacityBondEpoch, uint64 routerEpoch);
 
     // -----------------------------------------------------------------
     // Constructor
     // -----------------------------------------------------------------
 
-    /// @param usdc_              USDC token address.
-    /// @param capacityBond_      `CapacityBond`, read once in the constructor
-    ///                           to assert the epoch lengths agree. Not retained.
-    /// @param treasury_          Treasury / `TimelockController` address.
-    /// @param epochLength_       Constructor-immutable epoch length (1 week
-    ///                           in production). Must be non-zero.
-    /// @param windowEpochs_      Initial trailing-window length (default 13;
-    ///                           bounded `[4, 26]`).
-    /// @param admin              `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder.
-    /// @param initialShares      Initial bucket shares `[op, bb, tr]`
-    ///                           in bps. Must sum to 10_000 and satisfy the
-    ///                           cross-validation invariant against
-    ///                           `buybackBurner_`.
-    /// @param buybackBurner_     Initial `BuybackBurner` address. May be 0
-    ///                           iff `initialShares[BUCKET_BUYBACK] == 0`.
+    /// @param usdc_          USDC token address.
+    /// @param capacityBond_  `CapacityBond`, read on every deposit.
+    /// @param treasury_      Treasury (`TimelockController`).
+    /// @param epochLength_   Epoch length (1 week). Must equal the bond's.
+    /// @param windowEpochs_  Initial trailing-window length (bounded [4, 26]).
+    /// @param deliveryFloor_ Initial weight-credit price (bounded [1, 1000]).
+    /// @param admin          `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder.
+    /// @param rebateBps_     Initial rebate share.
+    /// @param buybackBps_    Initial buyback share.
+    /// @param buybackBurner_ Initial burner; zero only while `buybackBps_` is 0.
     constructor(
         IERC20 usdc_,
-        ICapacityBondEpoch capacityBond_,
+        ICapacityBondCredit capacityBond_,
         address treasury_,
         uint64 epochLength_,
         uint64 windowEpochs_,
+        uint256 deliveryFloor_,
         address admin,
-        uint256[3] memory initialShares,
+        uint256 rebateBps_,
+        uint256 buybackBps_,
         // slither-disable-next-line missing-zero-check
         address buybackBurner_
     ) {
-        if (address(usdc_) == address(0) || address(capacityBond_) == address(0) || treasury_ == address(0)) {
-            revert ZeroAddress();
-        }
-        if (admin == address(0)) revert ZeroAddress();
+        if (
+            address(usdc_) == address(0) || address(capacityBond_) == address(0) || treasury_ == address(0)
+                || admin == address(0)
+        ) revert ZeroAddress();
         if (epochLength_ == 0) revert ZeroEpochLength();
         uint64 bondEpoch = capacityBond_.epochLength();
         if (bondEpoch != epochLength_) revert EpochLengthMismatch(bondEpoch, epochLength_);
         _enforceWindowBounds(windowEpochs_);
+        _enforceFloorBounds(deliveryFloor_);
 
         usdc = usdc_;
-        treasury = treasury_;
+        capacityBond = capacityBond_;
         epochLength = epochLength_;
-        // Seed the checkpoint at clock()=now so any subsequent
-        // `windowEpochsAt(timepoint)` read at a timepoint ≥ deploy returns
-        // the constructor-set value. Trace208 stores uint208, the value is
-        // bounded to [4, 26] by `_enforceWindowBounds` above so the cast
-        // is trivially safe.
-        // slither-disable-next-line unused-return
-        _windowEpochsHistory.push(_clock(), uint208(uint256(windowEpochs_)));
-
-        // Destinations first, then shares — the cross-validation check inside
-        // `_setShares` reads the destination state and requires both to be
-        // consistent at the end of construction.
+        treasury = treasury_;
+        deliveryFloor = deliveryFloor_;
         buybackBurner = buybackBurner_;
-        _setShares(initialShares);
+        _setSplit(rebateBps_, buybackBps_);
+        // The window is bounded to [4, 26], so the uint208 cast is exact.
+        // slither-disable-next-line unused-return
+        _windowEpochsHistory.push(Time.timestamp(), uint208(uint256(windowEpochs_)));
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
-        // Deploy renounces DEFAULT_ADMIN_ROLE, freezing the role table (#2028).
+        // Deploy renounces DEFAULT_ADMIN_ROLE, freezing the role table.
         // PAUSER_ROLE stays rotatable under GOVERNANCE_ROLE so a timelocked
-        // proposal can evict a compromised emergency pauser without a redeploy.
+        // proposal can evict a compromised emergency pauser.
         _setRoleAdmin(PAUSER_ROLE, GOVERNANCE_ROLE);
     }
 
     // -----------------------------------------------------------------
-    // Settlement entrypoint
+    // Deposit
     // -----------------------------------------------------------------
 
     /// @inheritdoc IFeeRouter
-    function routeSettlement(address operator, uint256 bytesDelivered, uint256 amount)
+    function deposit(address operator, uint256 servedBytes, uint256 amount)
         external
         override
         nonReentrant
         whenNotPaused
-        onlyRole(ROUTER_CALLER_ROLE)
     {
         if (operator == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
 
-        // Pull USDC from the caller (PaymentPool) once, then push out the
-        // three legs. Pulls + pushes share the same token, so we avoid an
-        // approve race by transferring in here. PaymentPool must
-        // `approve(this, amount)` before calling.
         usdc.safeTransferFrom(msg.sender, address(this), amount);
 
         // forge-lint: disable-next-line(block-timestamp)
         uint64 epoch = uint64(block.timestamp / epochLength);
-        if (bytesDelivered != 0) {
-            _bytesPerEpoch[operator][epoch] += bytesDelivered;
-            _totalBytesPerEpoch[epoch] += bytesDelivered;
-        }
+        bool active = capacityBond.isActive(operator);
 
-        uint256[3] memory s = _shares;
+        uint256 rebate = active ? (amount * rebateBps) / BPS_DENOMINATOR : 0;
+        uint256 toBuyback = (amount * buybackBps) / BPS_DENOMINATOR;
+        uint256 toTreasury = amount - rebate - toBuyback;
 
-        uint256 buybackShare = (amount * s[BUCKET_BUYBACK]) / BPS_DENOMINATOR;
-        uint256 treasuryShare = (amount * s[BUCKET_TREASURY]) / BPS_DENOMINATOR;
-        // Operator leg absorbs the rounding remainder: operator share is
-        // bounded ≥ `OPERATOR_BPS_FLOOR` (4000 bps) and its destination is the
-        // per-call operator argument (always non-zero by the entry guard) — so
-        // the dust transfer never targets `address(0)`.
-        uint256 opShare = amount - buybackShare - treasuryShare;
+        uint256 credit = 0;
+        if (active) credit = _credit(operator, epoch, servedBytes, toBuyback + toTreasury);
 
-        if (opShare != 0) usdc.safeTransfer(operator, opShare);
-        if (buybackShare != 0) usdc.safeTransfer(buybackBurner, buybackShare);
-        if (treasuryShare != 0) usdc.safeTransfer(treasury, treasuryShare);
+        // A rebate the operator cannot receive (a blocked address) joins the
+        // treasury leg, so one bad operator address never strands a sweep.
+        if (rebate != 0 && !_tryTransfer(operator, rebate)) toTreasury += rebate;
+        if (toBuyback != 0) usdc.safeTransfer(buybackBurner, toBuyback);
+        if (toTreasury != 0) usdc.safeTransfer(treasury, toTreasury);
 
-        emit Settled(operator, bytesDelivered, amount, epoch);
+        emit Deposited(msg.sender, operator, amount, servedBytes, credit, epoch);
     }
 
     // -----------------------------------------------------------------
@@ -250,9 +254,8 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     /// @inheritdoc IFeeRouter
     function bytesInWindow(address operator, uint64 endEpoch, uint64 n) external view override returns (uint256 sum) {
         if (n == 0) return 0;
-        // Clamp the window length to the governable ceiling: no legitimate caller
-        // (the Governor passes `windowEpochs() <= WINDOW_EPOCHS_CEILING`) needs a
-        // longer span, and an unclamped `n` is an unbounded on-chain loop.
+        // No legitimate caller needs a window above the governable ceiling,
+        // and an unclamped `n` is an unbounded loop.
         if (n > WINDOW_EPOCHS_CEILING) n = WINDOW_EPOCHS_CEILING;
         uint64 startEpoch = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
         for (uint64 e = startEpoch; e <= endEpoch; e++) {
@@ -263,67 +266,11 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     /// @inheritdoc IFeeRouter
     function totalBytesInWindow(uint64 endEpoch, uint64 n) external view override returns (uint256 sum) {
         if (n == 0) return 0;
-        // Clamp to the governable ceiling — see `bytesInWindow`.
         if (n > WINDOW_EPOCHS_CEILING) n = WINDOW_EPOCHS_CEILING;
         uint64 startEpoch = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
         for (uint64 e = startEpoch; e <= endEpoch; e++) {
             sum += _totalBytesPerEpoch[e];
         }
-    }
-
-    // -----------------------------------------------------------------
-    // Views — shares + destinations
-    // -----------------------------------------------------------------
-
-    function getShares() external view returns (uint256[3] memory) {
-        return _shares;
-    }
-
-    // -----------------------------------------------------------------
-    // Governance — shares + destinations + windowEpochs
-    // -----------------------------------------------------------------
-
-    function setShares(uint256[3] calldata newShares) external onlyRole(GOVERNANCE_ROLE) {
-        _setShares(newShares);
-    }
-
-    struct ShareDestinations {
-        address buybackBurner;
-        address treasury;
-    }
-
-    /// @notice Atomic shares + destinations update for governance bucket
-    ///         activation. Sets destinations first (zero-share buckets may
-    ///         have any address), then shares (cross-validation enforces
-    ///         non-zero share ⇒ non-zero destination).
-    function setSharesAndDestinations(uint256[3] calldata newShares, ShareDestinations calldata dests)
-        external
-        onlyRole(GOVERNANCE_ROLE)
-    {
-        if (dests.treasury == address(0)) revert ZeroAddress();
-        _setBuybackBurner(dests.buybackBurner);
-        _setTreasury(dests.treasury);
-        _setShares(newShares);
-    }
-
-    function setBuybackBurner(address newAddr) external onlyRole(GOVERNANCE_ROLE) {
-        if (newAddr == address(0) && _shares[BUCKET_BUYBACK] != 0) {
-            revert NonZeroShareNeedsDestination(BUCKET_BUYBACK);
-        }
-        _setBuybackBurner(newAddr);
-    }
-
-    function setTreasury(address newAddr) external onlyRole(GOVERNANCE_ROLE) {
-        if (newAddr == address(0)) revert ZeroAddress();
-        _setTreasury(newAddr);
-    }
-
-    function setWindowEpochs(uint64 newWindow) external onlyRole(GOVERNANCE_ROLE) {
-        _enforceWindowBounds(newWindow);
-        uint64 old = windowEpochs();
-        // slither-disable-next-line unused-return
-        _windowEpochsHistory.push(_clock(), uint208(uint256(newWindow)));
-        emit WindowEpochsUpdated(old, newWindow);
     }
 
     /// @inheritdoc IFeeRouter
@@ -337,74 +284,98 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     }
 
     // -----------------------------------------------------------------
-    // Pause control
+    // Governance
     // -----------------------------------------------------------------
 
-    function pause() external onlyRole(PAUSER_ROLE) {
-        _requirePauseWindowOpen();
-        _pause();
+    /// @notice Set the rebate and buyback shares. Their sum is at most 10000;
+    ///         the treasury takes the remainder.
+    function setSplit(uint256 newRebateBps, uint256 newBuybackBps) external onlyRole(GOVERNANCE_ROLE) {
+        _setSplit(newRebateBps, newBuybackBps);
     }
 
-    function unpause() external onlyRole(PAUSER_ROLE) {
-        _unpause();
-    }
-
-    // -----------------------------------------------------------------
-    // Internal — shares + destinations
-    // -----------------------------------------------------------------
-
-    function _setShares(uint256[3] memory newShares) internal {
-        uint256 sum = newShares[0] + newShares[1] + newShares[2];
-        if (sum != BPS_DENOMINATOR) revert SharesDoNotSum(sum);
-
-        if (newShares[BUCKET_OPERATOR] < OPERATOR_BPS_FLOOR || newShares[BUCKET_OPERATOR] > OPERATOR_BPS_CEILING) {
-            revert ShareOutOfBounds({
-                bucket: BUCKET_OPERATOR,
-                value: newShares[BUCKET_OPERATOR],
-                floor: OPERATOR_BPS_FLOOR,
-                ceiling: OPERATOR_BPS_CEILING
-            });
-        }
-        // Buyback floor only enforced when the bucket is active (non-zero).
-        // Setting it to zero is permitted (launch-mode dormancy).
-        if (newShares[BUCKET_BUYBACK] != 0) {
-            if (newShares[BUCKET_BUYBACK] < BUYBACK_BPS_FLOOR || newShares[BUCKET_BUYBACK] > BUYBACK_BPS_CEILING) {
-                revert ShareOutOfBounds({
-                    bucket: BUCKET_BUYBACK,
-                    value: newShares[BUCKET_BUYBACK],
-                    floor: BUYBACK_BPS_FLOOR,
-                    ceiling: BUYBACK_BPS_CEILING
-                });
-            }
-        }
-        if (newShares[BUCKET_TREASURY] > TREASURY_BPS_CEILING) {
-            revert ShareOutOfBounds({
-                bucket: BUCKET_TREASURY, value: newShares[BUCKET_TREASURY], floor: 0, ceiling: TREASURY_BPS_CEILING
-            });
-        }
-
-        // Cross-validation invariant: non-zero share ⇒ non-zero destination.
-        if (newShares[BUCKET_BUYBACK] != 0 && buybackBurner == address(0)) {
-            revert NonZeroShareNeedsDestination(BUCKET_BUYBACK);
-        }
-        if (newShares[BUCKET_TREASURY] != 0 && treasury == address(0)) {
-            revert NonZeroShareNeedsDestination(BUCKET_TREASURY);
-        }
-
-        _shares = newShares;
-        emit SharesUpdated(newShares);
-    }
-
-    function _setBuybackBurner(address newAddr) internal {
+    /// @notice Set the buyback destination. Zero only while `buybackBps` is 0.
+    function setBuybackBurner(address newAddr) external onlyRole(GOVERNANCE_ROLE) {
+        if (newAddr == address(0) && buybackBps != 0) revert BuybackNeedsBurner();
         address old = buybackBurner;
         buybackBurner = newAddr;
         emit BuybackBurnerUpdated(old, newAddr);
     }
 
-    function _setTreasury(address newAddr) internal {
+    /// @notice Set the treasury destination.
+    function setTreasury(address newAddr) external onlyRole(GOVERNANCE_ROLE) {
+        if (newAddr == address(0)) revert ZeroAddress();
         address old = treasury;
         treasury = newAddr;
         emit TreasuryUpdated(old, newAddr);
+    }
+
+    /// @notice Set the weight-credit price (bounded [1, 1000]).
+    function setDeliveryFloor(uint256 newFloor) external onlyRole(GOVERNANCE_ROLE) {
+        _enforceFloorBounds(newFloor);
+        uint256 old = deliveryFloor;
+        deliveryFloor = newFloor;
+        emit DeliveryFloorUpdated(old, newFloor);
+    }
+
+    /// @notice Set the trailing-window length (bounded [4, 26]).
+    function setWindowEpochs(uint64 newWindow) external onlyRole(GOVERNANCE_ROLE) {
+        _enforceWindowBounds(newWindow);
+        uint64 old = windowEpochs();
+        // slither-disable-next-line unused-return
+        _windowEpochsHistory.push(Time.timestamp(), uint208(uint256(newWindow)));
+        emit WindowEpochsUpdated(old, newWindow);
+    }
+
+    // -----------------------------------------------------------------
+    // Pause control
+    // -----------------------------------------------------------------
+
+    /// @notice Block `deposit`. Bridge messages stay valid until unpause.
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _requirePauseWindowOpen();
+        _pause();
+    }
+
+    /// @notice Lift the pause.
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    // -----------------------------------------------------------------
+    // Internal
+    // -----------------------------------------------------------------
+
+    /// @dev The USDC-backed, capacity-clamped credit, written to the operator
+    ///      and network counters for `epoch`.
+    function _credit(address operator, uint64 epoch, uint256 servedBytes, uint256 net)
+        internal
+        returns (uint256 credit)
+    {
+        credit = Math.min(servedBytes, Math.mulDiv(net, BYTES_PER_MIB, deliveryFloor));
+        uint256 cap = capacityBond.declaredMbps(operator) * uint256(epochLength) * BYTES_PER_MBPS_SECOND;
+        uint256 used = _bytesPerEpoch[operator][epoch];
+        uint256 room = cap > used ? cap - used : 0;
+        if (credit > room) credit = room;
+        if (credit != 0) {
+            _bytesPerEpoch[operator][epoch] = used + credit;
+            _totalBytesPerEpoch[epoch] += credit;
+        }
+    }
+
+    /// @dev A USDC transfer that reports failure instead of reverting.
+    function _tryTransfer(address to, uint256 value) internal returns (bool) {
+        // slither-disable-next-line low-level-calls
+        (bool ok, bytes memory ret) = address(usdc).call(abi.encodeCall(IERC20.transfer, (to, value)));
+        if (!ok) return false;
+        return ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool)));
+    }
+
+    function _setSplit(uint256 newRebateBps, uint256 newBuybackBps) internal {
+        if (newRebateBps + newBuybackBps > BPS_DENOMINATOR) revert SplitExceedsWhole(newRebateBps, newBuybackBps);
+        if (newBuybackBps != 0 && buybackBurner == address(0)) revert BuybackNeedsBurner();
+        rebateBps = newRebateBps;
+        buybackBps = newBuybackBps;
+        emit SplitUpdated(newRebateBps, newBuybackBps);
     }
 
     function _enforceWindowBounds(uint64 value) internal pure {
@@ -413,11 +384,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         }
     }
 
-    /// @dev Matches `DecdnGovernor.clock()` (ERC-6372 timestamp mode) so the
-    ///      checkpoint timepoints in this contract and the governor share
-    ///      one time axis. Wrapped here to keep the constructor and setter
-    ///      readable.
-    function _clock() internal view returns (uint48) {
-        return Time.timestamp();
+    function _enforceFloorBounds(uint256 value) internal pure {
+        if (value < DELIVERY_FLOOR_MIN || value > DELIVERY_FLOOR_MAX) revert DeliveryFloorOutOfBounds(value);
     }
 }
