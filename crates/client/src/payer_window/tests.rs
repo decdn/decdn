@@ -4,21 +4,17 @@ use proptest::prelude::*;
 
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 
-use super::{
-    DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC, PayAheadPolicy, PayerWindows, WINDOW_FLOOR_BYTES, due,
-    due_after_sibling_spend, lane_room,
-};
+use super::{PayAheadPolicy, PayerWindows, WINDOW_FLOOR_BYTES, due, room};
 
 const MIB: u64 = 1 << 20;
 
 #[test]
-fn a_cold_lane_pays_one_chunk_at_the_floor_window() {
+fn a_new_stream_pays_one_chunk_at_the_floor_window() {
     assert_eq!(due(WINDOW_FLOOR_BYTES, 10 * MIB, 0, u64::MAX), (1, 0));
 }
 
 #[test]
-fn a_stream_on_a_funded_lane_pays_nothing_of_its_own() {
-    // The lane holds a full window: the node sends against it with no proof.
+fn a_stream_holding_its_window_pays_nothing_more() {
     assert_eq!(due(8 * MIB, 20 * MIB, 8 * MIB, u64::MAX), (0, 0));
     assert_eq!(due(8 * MIB, 20 * MIB, 9 * MIB, u64::MAX), (0, 0));
 }
@@ -29,7 +25,7 @@ fn the_window_is_refilled_as_credit_runs_down() {
 }
 
 #[test]
-fn a_shortfall_below_one_chunk_pays_nothing_of_its_own() {
+fn a_shortfall_below_one_chunk_pays_nothing_yet() {
     assert_eq!(
         due(
             WINDOW_FLOOR_BYTES,
@@ -37,32 +33,6 @@ fn a_shortfall_below_one_chunk_pays_nothing_of_its_own() {
             WINDOW_FLOOR_BYTES - MIB / 2,
             u64::MAX
         ),
-        (0, 0)
-    );
-}
-
-#[test]
-fn after_a_sibling_spend_a_shortfall_pays_a_chunk_or_the_rest() {
-    // Half a chunk of credit short of the window, far from the end: one whole
-    // chunk, so a frame the node cut before a sibling drew the lane down goes.
-    assert_eq!(
-        due_after_sibling_spend(
-            WINDOW_FLOOR_BYTES,
-            10 * MIB,
-            WINDOW_FLOOR_BYTES - MIB / 2,
-            u64::MAX
-        ),
-        (1, 0)
-    );
-    // Less than a chunk left unpaid: a closing residual for exactly the rest.
-    let held = WINDOW_FLOOR_BYTES - MIB / 4;
-    assert_eq!(
-        due_after_sibling_spend(WINDOW_FLOOR_BYTES, MIB + MIB / 2, held, u64::MAX),
-        (0, MIB + MIB / 2 - held)
-    );
-    // A lane holding the window pays nothing.
-    assert_eq!(
-        due_after_sibling_spend(WINDOW_FLOOR_BYTES, 10 * MIB, WINDOW_FLOOR_BYTES, u64::MAX),
         (0, 0)
     );
 }
@@ -78,76 +48,50 @@ fn the_tail_pays_a_closing_residual_and_never_past_the_end() {
 }
 
 #[test]
-fn a_full_per_node_cap_stalls_only_a_lane_whose_credit_still_feeds_a_frame() {
-    // Credit for at least one frame: the node keeps sending, so the lane waits
-    // for cap room.
-    assert_eq!(due(8 * MIB, 20 * MIB, MIB, lane_room(0, MIB)), (0, 0));
-    // A lane with no credit takes one chunk past the cap.
-    assert_eq!(due(8 * MIB, 20 * MIB, 0, lane_room(0, 0)), (1, 0));
-    // A sliver below one chunk group feeds no frame, so it takes one chunk too,
-    // after a sibling spend as well.
+fn a_full_per_node_cap_stalls_only_a_stream_whose_credit_still_feeds_a_frame() {
+    // Credit for at least one frame: the node keeps sending, so the stream
+    // waits for cap room.
+    assert_eq!(due(8 * MIB, 20 * MIB, MIB, room(0, MIB)), (0, 0));
+    // A stream with no credit takes one chunk past the cap.
+    assert_eq!(due(8 * MIB, 20 * MIB, 0, room(0, 0)), (1, 0));
+    // A sliver below one chunk group feeds no frame, so it takes one chunk too.
     let sliver = CHUNK_GROUP_BYTES / 2;
-    assert_eq!(due(8 * MIB, 20 * MIB, sliver, lane_room(0, sliver)), (1, 0));
-    assert_eq!(
-        due_after_sibling_spend(8 * MIB, 20 * MIB, sliver, lane_room(0, sliver)),
-        (1, 0)
-    );
-}
-
-#[test]
-fn a_stream_that_has_not_paid_gets_no_cap_exemption_on_a_funded_lane() {
-    // The stream counts no held credit of its own, but the exemption reads the
-    // lane's credit: a lane that still feeds a frame takes nothing past the cap,
-    // however many streams it opens.
-    assert_eq!(due(8 * MIB, 20 * MIB, 0, lane_room(0, MIB)), (0, 0));
+    assert_eq!(due(8 * MIB, 20 * MIB, sliver, room(0, sliver)), (1, 0));
 }
 
 proptest! {
-    /// A lane never pays for one byte range twice: whatever the window, the
-    /// frame sizes and the order streams draw credit in, the bytes a lane pays
-    /// for never exceed the bytes it is asked to deliver, and every delivered
-    /// byte was paid before it was sent.
+    /// A stream never pays for one byte twice: whatever the window and the
+    /// frame sizes, it pays ahead of delivery, never beyond the bytes it is
+    /// asked to deliver, and every delivered byte was paid before it was sent.
     #[test]
-    fn a_lane_never_pays_twice_for_the_same_bytes(
+    fn a_stream_never_pays_twice_for_the_same_bytes(
         total in 1u64..(40 * MIB),
         window in WINDOW_FLOOR_BYTES..(70 * MIB),
         frames in proptest::collection::vec(1u64..(2 * MIB), 1..64),
-        streams in 1usize..4,
     ) {
-        // `held` is the lane's credit, shared by every stream; `paid` and
-        // `received` are lane totals. The streams split `total` evenly.
-        let per_stream = total / streams as u64;
-        let mut need: Vec<u64> = vec![per_stream; streams];
-        if let Some(first) = need.first_mut() {
-            *first += total - per_stream * streams as u64;
-        }
+        let mut left = total;
         let mut held = 0u64;
         let mut paid = 0u64;
         let mut received = 0u64;
         let mut frame = frames.iter().cycle();
         for _ in 0..4096 {
-            if need.iter().all(|&n| n == 0) {
+            if left == 0 {
                 break;
             }
-            for left in &mut need {
-                // The stream pays before it reads on.
-                let (chunks, residual) = due(window, *left, held, u64::MAX);
-                let pay = chunks * MIB + residual;
-                paid += pay;
-                held += pay;
-                // The node sends only while the lane's credit covers the frame.
-                let len = (*frame.next().unwrap()).min(*left).min(held);
-                held -= len;
-                received += len;
-                *left -= len;
-            }
+            // The stream pays before it reads on.
+            let (chunks, residual) = due(window, left, held, u64::MAX);
+            let pay = chunks * MIB + residual;
+            paid += pay;
+            held += pay;
+            // The node sends only while the stream's credit covers the frame.
+            let len = (*frame.next().unwrap()).min(left).min(held);
+            held -= len;
+            received += len;
+            left -= len;
         }
-        prop_assert!(received <= total);
-        // Paid ahead of delivery, but never beyond the bytes still owed: the
-        // credit left over is at most what a stream was still to receive.
-        prop_assert!(paid >= received);
-        prop_assert!(paid - received <= held);
-        prop_assert!(paid <= total + MIB, "paid {paid} for a {total}-byte transfer");
+        prop_assert_eq!(received, total);
+        prop_assert_eq!(paid, total, "paid {} for a {}-byte transfer", paid, total);
+        prop_assert_eq!(held, 0);
     }
 }
 
@@ -215,33 +159,17 @@ fn the_per_node_cap_is_shared_across_every_holder_of_the_record() {
 }
 
 #[test]
-fn a_write_off_shrinks_the_next_window_and_spends_the_budget() {
+fn a_write_off_shrinks_only_that_nodes_window() {
     let windows = PayerWindows::new(PayAheadPolicy::new());
-    let node = windows.node(Address::repeat_byte(1));
-    node.note_verified(100 * MIB);
-    let before = node.window_bytes(10);
-    node.note_prepaid(8 * MIB);
-    node.write_off(8 * MIB, 0, 10);
-    assert_eq!(node.lost(), 8 * MIB);
-    assert_eq!(node.outstanding(), 0);
-    assert!(node.window_bytes(10) < before);
-    assert_eq!(windows.written_off_micro_usdc(), 80);
-}
-
-#[test]
-fn a_spent_run_budget_pins_every_node_to_the_floor() {
-    let windows = PayerWindows::new(PayAheadPolicy {
-        write_off_budget_micro_usdc: 10,
-        ..PayAheadPolicy::new()
-    });
     let liar = windows.node(Address::repeat_byte(1));
     let honest = windows.node(Address::repeat_byte(2));
-    honest.note_verified(1000 * MIB);
-    assert!(honest.window_bytes(10) > WINDOW_FLOOR_BYTES);
-    liar.note_prepaid(2 * MIB);
-    liar.write_off(2 * MIB, 0, 10);
-    assert!(honest.budget_spent());
-    assert_eq!(honest.window_bytes(10), WINDOW_FLOOR_BYTES);
+    liar.note_verified(100 * MIB);
+    honest.note_verified(100 * MIB);
+    let before = liar.window_bytes(10);
+    liar.write_off(MIB);
+    assert_eq!(liar.lost(), MIB);
+    assert!(liar.window_bytes(10) < before);
+    assert_eq!(honest.window_bytes(10), before);
 }
 
 #[test]
@@ -254,75 +182,17 @@ fn seeding_keeps_the_larger_count() {
     let node = windows.node(address);
     assert_eq!(node.verified(), 9 * MIB);
     assert_eq!(node.lost(), 3);
-    assert_eq!(windows.snapshot(), vec![(address, 9 * MIB, 3)]);
 }
 
-/// One `µUSDC` per byte: at this quoted rate a write-off's byte count converts
-/// 1:1 into the `µUSDC` the run's budget counts, so the boundary tests below
-/// can place the written-off total exactly.
-const ONE_MICRO_USDC_PER_BYTE: u64 = MIB;
-
 #[test]
-fn a_write_off_of_exactly_the_budget_spends_it() {
+fn only_this_processs_progress_is_unsaved() {
     let windows = PayerWindows::new(PayAheadPolicy::new());
-    let node = windows.node(Address::repeat_byte(8));
-    node.note_verified(1000 * MIB);
-    node.note_prepaid(DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC);
-    node.write_off(
-        DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC,
-        0,
-        ONE_MICRO_USDC_PER_BYTE,
-    );
-    assert_eq!(
-        windows.written_off_micro_usdc(),
-        DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC
-    );
-    // The `>=` boundary: writing off EXACTLY the budget spends it.
-    assert!(node.budget_spent());
-    assert_eq!(
-        node.window_bytes(10),
-        WINDOW_FLOOR_BYTES,
-        "a spent budget pins the window to the floor"
-    );
-}
-
-#[test]
-fn a_write_off_one_micro_usdc_short_leaves_the_budget_unspent() {
-    let windows = PayerWindows::new(PayAheadPolicy::new());
-    let node = windows.node(Address::repeat_byte(9));
-    node.note_verified(1000 * MIB);
-    let short = DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC - 1;
-    node.note_prepaid(short);
-    node.write_off(short, 0, ONE_MICRO_USDC_PER_BYTE);
-    assert_eq!(windows.written_off_micro_usdc(), short);
-    assert!(!node.budget_spent());
-    assert!(
-        node.window_bytes(10) > WINDOW_FLOOR_BYTES,
-        "one µUSDC under the budget still ramps past the floor"
-    );
-}
-
-#[test]
-fn a_zero_budget_pins_the_floor_from_the_start() {
-    let windows = PayerWindows::new(PayAheadPolicy {
-        write_off_budget_micro_usdc: 0,
-        ..PayAheadPolicy::new()
-    });
-    let node = windows.node(Address::repeat_byte(10));
-    node.note_verified(1000 * MIB);
-    // Nothing has been written off, yet a zero budget reads as already spent.
-    assert!(node.budget_spent());
-    assert_eq!(node.window_bytes(10), WINDOW_FLOOR_BYTES);
-}
-
-/// Pins the documented default, beside the policy pins in
-/// `config::tests::pay_ahead_defaults_are_the_documented_policy`: four caps of
-/// 640 `µUSDC` each.
-#[test]
-fn the_default_write_off_budget_is_the_documented_four_caps() {
-    assert_eq!(DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC, 2560);
-    assert_eq!(
-        PayAheadPolicy::new().write_off_budget_micro_usdc,
-        DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC
-    );
+    let address = Address::repeat_byte(4);
+    windows.seed(address, 9 * MIB, 1);
+    windows.node(address).note_verified(MIB);
+    windows.node(address).write_off(2);
+    assert_eq!(windows.take_unsaved(), vec![(address, MIB, 2)]);
+    assert!(windows.take_unsaved().is_empty(), "taken once");
+    windows.return_unsaved(address, MIB, 2);
+    assert_eq!(windows.take_unsaved(), vec![(address, MIB, 2)]);
 }

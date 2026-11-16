@@ -52,7 +52,7 @@ pub struct PullConfig {
     /// per holder instead.
     pub streamer_lane_cap: usize,
     /// The most USDC (base units) the payer holds as credit at one node across
-    /// every signer. The node sends only what a lane has paid for, so this is
+    /// every signer. The node sends only what a stream has paid for, so this is
     /// the most a node that keeps the credit can take. Converted to bytes at the
     /// rate the node quotes (ADR 003 § Credit Window).
     pub pay_ahead_cap: u64,
@@ -62,9 +62,6 @@ pub struct PullConfig {
     /// How many verified bytes one written-off byte cancels when sizing a
     /// node's window.
     pub loss_weight: u64,
-    /// The most USDC (base units) one run writes off in total. Past it every
-    /// node's window stays at its floor.
-    pub write_off_budget: u64,
 }
 
 impl PullConfig {
@@ -78,7 +75,6 @@ impl PullConfig {
             pay_ahead_cap: crate::payer_window::DEFAULT_PAY_AHEAD_CAP_MICRO_USDC,
             pay_ahead_divisor: crate::payer_window::DEFAULT_PAY_AHEAD_DIVISOR,
             loss_weight: crate::payer_window::DEFAULT_LOSS_WEIGHT,
-            write_off_budget: crate::payer_window::DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC,
         }
     }
 
@@ -102,7 +98,6 @@ impl PullConfig {
         self.pay_ahead_cap = policy.cap_micro_usdc;
         self.pay_ahead_divisor = policy.divisor;
         self.loss_weight = policy.loss_weight;
-        self.write_off_budget = policy.write_off_budget_micro_usdc;
         self
     }
 
@@ -113,7 +108,6 @@ impl PullConfig {
             cap_micro_usdc: self.pay_ahead_cap,
             divisor: self.pay_ahead_divisor,
             loss_weight: self.loss_weight,
-            write_off_budget_micro_usdc: self.write_off_budget,
         }
     }
 

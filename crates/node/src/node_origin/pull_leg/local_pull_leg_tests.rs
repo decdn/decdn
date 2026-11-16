@@ -208,7 +208,7 @@ async fn run_to_termination(
 ) -> anyhow::Result<Option<Result<(), FillError>>> {
     let hash = Hash::from(root);
     let source = BackendSource::new(engine.clone(), root, total, fresh_ledger());
-    // The downstream lane has credit for the whole blob, so the `CreditPacer`
+    // The downstream stream has credit for the whole blob, so the `CreditPacer`
     // never gates the pull (this test exercises the completion path, not the
     // credit pacing).
     let session = FillSession::starting_at(bao_tree::blake3::Hash::from(root), total, 0);

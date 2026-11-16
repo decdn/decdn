@@ -57,7 +57,7 @@ fn the_track_record_round_trips_through_the_store_by_operator_address() {
     let windows = PayerWindows::new(PayAheadPolicy::new());
     let node = windows.node(rec.eth_address);
     node.note_verified(7 << 20);
-    node.write_off(0, 3, 10);
+    node.write_off(3);
     store.save_windows(&windows).unwrap();
 
     let fresh = PayerWindows::new(PayAheadPolicy::new());
@@ -82,7 +82,7 @@ fn concurrent_runs_add_their_progress_rather_than_overwrite_it() {
     store.seed_windows(&first);
     store.seed_windows(&second);
     first.node(rec.eth_address).note_verified(5);
-    first.node(rec.eth_address).write_off(0, 2, 10);
+    first.node(rec.eth_address).write_off(2);
     second.node(rec.eth_address).note_verified(7);
     store.save_windows(&first).unwrap();
     store.save_windows(&second).unwrap();

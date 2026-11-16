@@ -34,7 +34,6 @@ fn common() -> cli::ClientFetchArgs {
         pay_ahead_cap: 640,
         pay_ahead_divisor: 2,
         loss_weight: 20,
-        write_off_budget: 2560,
         timeout_ms: 3_600_000,
         capability: None,
         capability_file: None,

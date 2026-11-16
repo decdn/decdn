@@ -1367,7 +1367,7 @@ impl ClientHandler {
         let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);
         first_byte.mark_responded();
 
-        // Stream the blob against the lane's credit.
+        // Stream the blob against the stream's credit.
         self.deliver(
             &conn,
             &mut send,

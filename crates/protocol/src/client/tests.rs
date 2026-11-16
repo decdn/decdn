@@ -58,6 +58,7 @@ fn sample_voucher() -> Voucher {
         bytes_delivered: 0x2222_2222_2222_2222u64,
         chain_root: [0x55u8; 32],
         chunk_price: 0x6666_6666_6666_6666u64,
+        stream_bytes: 0x7777_7777_7777_7777u64,
     }
 }
 
@@ -553,6 +554,7 @@ fn voucher_wire_format_is_stable() -> Result<(), postcard::Error> {
         bytes_delivered: 2u64,
         chain_root: [0xABu8; 32],
         chunk_price: 3u64,
+        stream_bytes: 4u64,
     };
     let bytes = postcard::to_allocvec(&v)?;
     let mut expected = Vec::new();
@@ -562,6 +564,7 @@ fn voucher_wire_format_is_stable() -> Result<(), postcard::Error> {
     expected.push(2u8); // bytes_delivered (varint)
     expected.extend_from_slice(&[0xABu8; 32]); // chain_root (raw, no prefix)
     expected.push(3u8); // chunk_price (varint)
+    expected.push(4u8); // stream_bytes (varint)
     assert_eq!(bytes, expected);
     Ok(())
 }
@@ -1338,6 +1341,7 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dy
         bytes_delivered: u64::MAX,
         chain_root: [0x0B; 32],
         chunk_price: u64::MAX,
+        stream_bytes: u64::MAX,
     }))?
     .len();
     let preimage_len = encode_message(&ClientMessage::ChunkPreimage(ChunkPreimage {

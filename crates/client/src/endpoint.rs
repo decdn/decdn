@@ -22,7 +22,7 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 /// QUIC flow control is receiver-advertised, and a download makes the client
 /// the receiver, so this window — not any node-side setting — bounds
 /// single-stream throughput at roughly `window / RTT`. It is sized to the
-/// payer's own pay-ahead envelope: a node sends only what the lane has paid
+/// payer's own pay-ahead envelope: a node sends only what the stream has paid
 /// for, and the payer pays ahead up to its window, whose default cap
 /// (`pay_ahead_cap`) prices 64 MiB at the default node rate (ADR 003 § Credit
 /// Window). Matching this receive window to that 64 MiB default keeps

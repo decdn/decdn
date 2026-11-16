@@ -82,8 +82,8 @@ impl ChunkFramer {
     /// the shorter final remainder once the export is exhausted), then `None`.
     ///
     /// [`FrameChunks::total`] is the frame's total byte count, which is both what the
-    /// frame header declares to the client and what the serve loop debits from the
-    /// lane's credit.
+    /// frame header declares to the client and what the serve loop takes from the
+    /// stream's credit.
     ///
     /// This is the zero-copy serve path: the frame holds reference-counted slices of
     /// the export items, so the caller can send them via a single vectored QUIC write
@@ -92,7 +92,7 @@ impl ChunkFramer {
     /// `Bytes::split_to`, which is also zero-copy.
     ///
     /// `target` is a per-call argument, not a field, because the serve loop
-    /// clamps it to the lane's credit.
+    /// clamps it to the stream's credit.
     ///
     /// # Errors
     ///
@@ -170,13 +170,12 @@ impl ChunkFramer {
 }
 
 impl ClientHandler {
-    /// Stream blob bytes to the paying client against its lane's credit (ADR 003
-    /// § Credit Window): the node sends a frame only when the lane's confirmed
-    /// payment covers it. It debits the credit before each send and reads the
-    /// payer's proofs while the credit falls short. A stream on a lane that
-    /// already holds credit sends at once, with no proof of its own. Returns how
-    /// the stream ended: `Completed`, or a mid-stream stop (a rejected voucher, a
-    /// drained pool or signer cap, a takedown, a spent proof budget).
+    /// Stream blob bytes to the paying client against the stream's credit (ADR
+    /// 003 § Credit Window): the node sends a frame only when the payment the
+    /// stream's own proofs claimed covers it, and reads the payer's proofs while
+    /// the credit falls short. Returns how the stream ended: `Completed`, or a
+    /// mid-stream stop (a rejected voucher, a drained pool or signer cap, a
+    /// takedown, a spent proof budget).
     ///
     /// # Errors
     ///
@@ -188,7 +187,7 @@ impl ClientHandler {
     /// bytes also carries [`PaidProgress`](super::wire::PaidProgress).
     ///
     /// The node's exposure to unpaid delivery is zero: every byte it sends was
-    /// debited from credit that a proof had already added to the lane.
+    /// covered by payment a proof on this stream had already claimed.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn deliver(
         &self,
@@ -205,53 +204,36 @@ impl ClientHandler {
         rate_per_mb: u64,
         first_byte: FirstByteClock,
     ) -> anyhow::Result<ServeEnd> {
-        // Bytes that accepted proofs added to the lane. Owned here so every exit of
-        // the loop, `?` included, passes through the one `PaidProgress` tag: the
-        // dispatch sink splits a peer that left into declined or abandoned by it.
+        // Bytes the proofs on this stream claimed for it. Owned here so every exit
+        // of the loop, `?` included, passes through the one `PaidProgress` tag:
+        // the dispatch sink splits a peer that left into declined or abandoned by
+        // it.
         let mut paid: u64 = 0;
-        // Wire bytes this stream wrote. A stream that ends on a fault leaves its
-        // end offset on the lane for a backfill. A clean end, `StreamEnd` or an
-        // in-band stop, leaves none: its frames arrive before the close.
-        let mut delivered: u64 = 0;
         // Refresh recency before the first byte goes out, so a blob still
         // carrying the open-time seed does not rank oldest for eviction while it
         // streams. Recency only: the frequency sighting waits for `StreamEnd`.
         self.cache.touch_recency(hash);
-        Self::log_backfill(
-            lane_key,
+        self.deliver_loop(
+            conn,
+            send,
+            recv,
             hash,
-            self.apply_backfill(lane, hash, byte_offset).await,
-        );
-        let ended = self
-            .deliver_loop(
-                conn,
-                send,
-                recv,
-                hash,
-                byte_offset,
-                byte_len,
-                total_bytes,
-                lane_key,
-                lane,
-                client_node_id,
-                rate_per_mb,
-                first_byte,
-                &mut paid,
-                &mut delivered,
-            )
-            .await;
-        if ended.is_err() && delivered > 0 {
-            let fetch_start = byte_offset - byte_offset % decdn_bao_range::CHUNK_GROUP_BYTES;
-            let end =
-                decdn_client::sink::content_paid_frontier(fetch_start, total_bytes, delivered);
-            self.note_unclean_end(lane, hash, end).await;
-        }
-        ended.map_err(|e| super::wire::tag_paid_progress(e, paid))
+            byte_offset,
+            byte_len,
+            total_bytes,
+            lane_key,
+            lane,
+            client_node_id,
+            rate_per_mb,
+            first_byte,
+            &mut paid,
+        )
+        .await
+        .map_err(|e| super::wire::tag_paid_progress(e, paid))
     }
 
-    /// The body of [`Self::deliver`]. `paid` counts the bytes accepted proofs added
-    /// to the lane, and `delivered` the wire bytes written. The caller reads both
-    /// when the loop ends.
+    /// The body of [`Self::deliver`]. `paid` counts the bytes the proofs on
+    /// this stream claimed for it; the caller reads it when the loop ends.
     // One linear, ADR-ordered serve loop (cut a frame, acquire credit, send);
     // splitting it would scatter the ordering invariants across helpers.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -270,7 +252,6 @@ impl ClientHandler {
         rate_per_mb: u64,
         first_byte: FirstByteClock,
         paid: &mut u64,
-        delivered: &mut u64,
     ) -> anyhow::Result<ServeEnd> {
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
@@ -316,6 +297,8 @@ impl ClientHandler {
 
         let chunk_bytes = CHUNK_BYTES;
         let mut first_byte = Some(first_byte);
+        // Wire bytes this stream wrote. The stream's credit is `paid − delivered`.
+        let mut delivered: u64 = 0;
         // One buffered proof reader for the whole stream: it buffers a pipelined
         // proof across waits, so every proof read MUST go through it — a second
         // reader would lose bytes it read ahead.
@@ -337,16 +320,16 @@ impl ClientHandler {
         let mut chunks = ChunkFramer::new(data, hash);
 
         loop {
-            // The next frame is cut to the lane's credit and to the payment-chunk
-            // boundary ([`ClientHandler::frame_target`]). The opening frame is
-            // small, so the first byte leaves after a few chunk groups of store
-            // read rather than a whole chunk. The cut precedes the credit wait, so
-            // the store read overlaps the payer's round trip.
-            let credit = self.lane_credit(lane).await;
-            let target = if *delivered == 0 {
+            // The next frame is cut to the stream's credit and to the
+            // payment-chunk boundary ([`ClientHandler::frame_target`]). The
+            // opening frame is small, so the first byte leaves after a few chunk
+            // groups of store read rather than a whole chunk. The cut precedes
+            // the credit wait, so the store read overlaps the payer's round trip.
+            let credit = paid.saturating_sub(delivered);
+            let target = if delivered == 0 {
                 self.first_frame_target(chunk_bytes, credit)
             } else {
-                self.frame_target(*delivered % chunk_bytes, chunk_bytes, credit)
+                self.frame_target(delivered % chunk_bytes, chunk_bytes, credit)
             };
             let Some(frame) = waits
                 .time(Wait::Store, chunks.next_frame_chunks(target))
@@ -357,8 +340,7 @@ impl ClientHandler {
             };
             let len = frame.total() as u64;
 
-            // The node sends the frame only after it has debited the lane's credit
-            // for it. A stop here leaves the credit on the lane.
+            // The node sends the frame only once the stream's credit covers it.
             match self
                 .acquire_credit(
                     conn,
@@ -374,7 +356,7 @@ impl ClientHandler {
                     client_node_id,
                     rate_per_mb,
                     len,
-                    true,
+                    delivered,
                     paid,
                 )
                 .await?
@@ -383,7 +365,7 @@ impl ClientHandler {
                 Acquired::Stopped(stop) => {
                     return Ok(ServeEnd::Stopped {
                         stop,
-                        bytes: *delivered,
+                        bytes: delivered,
                     });
                 }
             }
@@ -394,7 +376,7 @@ impl ClientHandler {
             if let Some(clock) = first_byte.take() {
                 clock.record(&self.metrics);
             }
-            *delivered = delivered.saturating_add(len);
+            delivered = delivered.saturating_add(len);
             self.shed.record_egress(len);
             self.metrics.bytes_served(len);
         }
@@ -408,23 +390,9 @@ impl ClientHandler {
             )
             .await?;
         let _ = send.finish();
-        // Credit the proofs the payer sent past the last frame, then drain its
-        // send half to its FIN before `recv` drops, so the client's finish is
-        // not stopped by the implicit `STOP_SENDING(0)` a dropped `RecvStream`
-        // issues (see `drain_recv_to_fin`).
-        self.settle_trailing_proofs(
-            conn,
-            send,
-            recv,
-            &mut reader,
-            &mut anchor,
-            hash,
-            lane_key,
-            lane,
-            client_node_id,
-            rate_per_mb,
-        )
-        .await;
+        // Drain the client's send half to its FIN before `recv` drops, so its
+        // finish is not stopped by the implicit `STOP_SENDING(0)` a dropped
+        // `RecvStream` issues (see `drain_recv_to_fin`).
         super::drain_recv_to_fin(recv).await;
         // ADR 040: emit the ONE hit sighting for this served request, only after the
         // terminal StreamEnd frame is written — so a serve that fails to finish cleanly
@@ -436,8 +404,8 @@ impl ClientHandler {
         // ADR 041: credit the realized operator margin back to the source that
         // speculatively warmed this blob (a no-op for an untagged / non-speculative
         // hash), on the same clean-completion edge as the ADR 040 hit sighting.
-        self.credit_warming_serve(hash, *delivered);
-        Ok(ServeEnd::Completed { bytes: *delivered })
+        self.credit_warming_serve(hash, delivered);
+        Ok(ServeEnd::Completed { bytes: delivered })
     }
 }
 

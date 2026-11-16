@@ -148,12 +148,36 @@ pub trait StashedFault {
     /// Take the parked typed fault, if any. Returns `None` on a source whose
     /// bytes carry the whole story (an in-memory buffer, a scripted double).
     fn take_fault(&mut self) -> Option<anyhow::Error>;
+
+    /// The decoder failed on this source's bytes: they were corrupt, or the
+    /// stream ended short of them. A paid pull books it as the node failing
+    /// its delivery (ADR 003 § Credit Window); a source with no payment behind
+    /// it has nothing to book.
+    fn note_failed_delivery(&mut self) {}
 }
 
 impl StashedFault for PullReader {
     fn take_fault(&mut self) -> Option<anyhow::Error> {
         self.fault.take()
     }
+
+    fn note_failed_delivery(&mut self) {
+        self.pull.note_node_failure();
+    }
+}
+
+/// The error a decode loop returns when the bao decoder fails on `reader`:
+/// the reader's parked typed fault when it holds one, and otherwise the
+/// decoder's own error, classified by [`classify_decode_error`]. A decoder
+/// error with no parked fault is the source's bytes failing, corrupt or short,
+/// so it tells the reader its delivery failed
+/// ([`StashedFault::note_failed_delivery`]).
+pub(crate) fn decode_failure(reader: &mut impl StashedFault, err: DecodeError) -> anyhow::Error {
+    if let Some(fault) = reader.take_fault() {
+        return fault;
+    }
+    reader.note_failed_delivery();
+    classify_decode_error(err)
 }
 
 /// A plain in-memory wire buffer has no out-of-band failure mode: whatever the

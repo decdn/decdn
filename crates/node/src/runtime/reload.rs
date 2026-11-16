@@ -1042,9 +1042,7 @@ impl RuntimeReloadState {
             // Placeholder rate — `payment.*` is restart-required.
             payment: ResolvedPayment {
                 rate_per_mb: 1,
-                backfill_window: decdn_common::config::DEFAULT_BACKFILL_WINDOW,
                 frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
-                backfill_divisor: decdn_common::config::DEFAULT_BACKFILL_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },
@@ -1308,10 +1306,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // the served price — an economic commitment on the wire — so it takes
         // effect only at startup; reprice by draining and restarting. The other
         // serve knobs are read once at handler construction.
-        warn_ignored(
-            "payment.* (rate_per_mb, backfill_window, \
-             backfill_divisor, frame_target_bytes, voucher_commit_interval_ms)",
-        );
+        warn_ignored("payment.* (rate_per_mb, frame_target_bytes, voucher_commit_interval_ms)");
     }
     if file.dht.is_some() {
         // `dht.*` (rate-limit caps) is not currently hot-reloadable — the

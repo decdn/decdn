@@ -167,7 +167,7 @@ impl PrimeLeg {
         Self { offset, len }
     }
 
-    /// The first draw [`CreditPacer`] allows once the downstream lane holds the
+    /// The first draw [`CreditPacer`] allows once the downstream stream holds the
     /// credit of a payer's first payment, one chunk: the content that one chunk of
     /// wire covers from `start`, floored to a chunk group, plus
     /// [`decdn_client::PULL_AHEAD_BYTES`]. A payer that pays more than one chunk at
@@ -1141,10 +1141,10 @@ fn handshake_verdict(
 /// Assemble `[offset, offset + len)` of `hash` into `engine`'s cache across the
 /// ranked partial holders in `target` via the ranged-drive loop (#1506, ADR 039),
 /// paying only for the missing ranges and pacing each lane with a
-/// [`CreditPacer`]: the pull draws only what the downstream lane has paid for (ADR
-/// 003 § Credit Window, ADR 037), so it never runs further ahead of the serve
-/// leg's credit frontier than [`decdn_client::PULL_AHEAD_BYTES`], and it draws
-/// nothing while the lane holds no credit.
+/// [`CreditPacer`]: the pull draws only what the downstream stream has paid for
+/// (ADR 003 § Credit Window, ADR 037), so it never runs further ahead of the
+/// serve leg's credit frontier than [`decdn_client::PULL_AHEAD_BYTES`], and it
+/// draws nothing while the stream holds no credit.
 ///
 /// # Ranged assembly across partial holders
 ///
@@ -1945,7 +1945,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// docs.
 ///
 /// The downstream [`CreditPacer`] is KEPT (bound on `served_paid`): the pull still
-/// never runs further ahead of the credit the real downstream client's lane holds
+/// never runs further ahead of the credit the real downstream client's stream holds
 /// than [`decdn_client::PULL_AHEAD_BYTES`] (#1610 — ingest only behind a waiting,
 /// paying client — and the storage/egress exposure bound).
 ///

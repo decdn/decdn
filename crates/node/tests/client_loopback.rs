@@ -51,8 +51,8 @@ use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
 use decdn_client::{
-    BlobTooLarge, Cumulative, HashMismatch, PoolContext, PoolLedger, PullDeadlines, PullStalled,
-    PullTimeout, RateAboveCeiling, UpstreamVoucherRejected, VoucherProgress, WarmConnection,
+    BlobTooLarge, Cumulative, HashMismatch, PoolContext, PoolLedger, PullDeadlines,
+    RateAboveCeiling, UpstreamVoucherRejected, VoucherProgress, WarmConnection,
     open_progressive_pull, sign_client_binding, stream_fetch, stream_fetch_on, stream_fetch_shared,
     stream_fetch_tracked, stream_fetch_tracked_with_progress,
 };
@@ -928,9 +928,9 @@ fn assert_one_completed_inbound_stream(metrics: &Metrics, vouchers: u64) -> anyh
 /// One voucher accounting interval — [`decdn_protocol::client::CHUNK_BYTES`].
 const HARNESS_INTERVAL_BYTES: u64 = decdn_protocol::client::CHUNK_BYTES;
 
-/// Spin up a serving `ClientHandler` that sends only against lane credit (ADR
-/// 003 § Credit Window): a stream receives nothing until its lane is paid, and
-/// then exactly what the payment covers.
+/// Spin up a serving `ClientHandler` that sends only against stream credit (ADR
+/// 003 § Credit Window): a stream receives nothing until its own proofs pay
+/// for it, and then exactly what the payment covers.
 async fn spawn_pipelined_server(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
@@ -1091,7 +1091,7 @@ async fn pay_cumulative(
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client_msg(
         send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
+        &ClientMessage::Voucher(claim_all(signed_to_wire_voucher(&voucher)?)),
     )
     .await
 }
@@ -1129,9 +1129,18 @@ async fn open_chain(
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client_msg(
         send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
+        &ClientMessage::Voucher(claim_all(signed_to_wire_voucher(&voucher)?)),
     )
     .await
+}
+
+/// `wire` with its stream share set to all the lane has paid and no stream has
+/// claimed (ADR 003 § Credit Window). A raw client that drives one stream at a
+/// time hands that stream every new byte its voucher pays; the node caps the
+/// share at the lane's unclaimed payment.
+const fn claim_all(mut wire: decdn_protocol::client::Voucher) -> decdn_protocol::client::Voucher {
+    wire.stream_bytes = u64::MAX;
+    wire
 }
 
 /// Release the preimage at `index` on [`CHAIN_SEED`]'s chain — the one-message,
@@ -1615,15 +1624,19 @@ async fn two_streams_on_one_lane_converge_on_the_deepest_index() -> anyhow::Resu
     Ok(())
 }
 
-/// A reveal below a sibling's frontier takes no new money and adds no credit.
+/// A reveal below a sibling's frontier takes no new money, yet still pays its
+/// own stream one chunk (ADR 003 § Credit Window).
 ///
 /// The chain index is lane-global, so cross-stream reordering routinely puts one
 /// stream's reveal at or below the frontier a faster sibling already advanced.
-/// That reveal folds nothing. Lane credit is shared by every stream on the lane,
-/// so the bytes the sibling's deeper reveal paid for are already the lane's
-/// credit, and the below-frontier reveal must not add to it a second time.
+/// That reveal folds nothing into the lane's payment. Each reveal still claims
+/// one chunk for the stream that carries it, out of what the lane has paid and
+/// no stream has claimed, so the payment reaches the streams it was meant for
+/// in whatever order the reveals arrive, and the streams together never draw
+/// more than the lane paid.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_below_frontier_reveal_adds_no_credit() -> anyhow::Result<()> {
+async fn a_below_frontier_reveal_claims_its_own_chunk_and_never_more_than_the_lane_paid()
+-> anyhow::Result<()> {
     let payload = vec![0x4Bu8; 8 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;
@@ -1642,8 +1655,8 @@ async fn a_below_frontier_reveal_adds_no_credit() -> anyhow::Result<()> {
     let (mut send_a, mut recv_a) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     let (mut send_b, mut recv_b) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     // The fast sibling anchors and pays with a DEEP index, advancing the lane
-    // frontier to 5, and reads the five chunks it paid for. The lane then holds
-    // no credit.
+    // frontier to 5: the lane is paid five chunks. The reveal pays A one chunk,
+    // and A parks for its next proof.
     open_chain(
         &mut send_a,
         &signer,
@@ -1654,12 +1667,12 @@ async fn a_below_frontier_reveal_adds_no_credit() -> anyhow::Result<()> {
     )
     .await?;
     release(&mut send_a, 5).await?;
-    read_exact_chunks(&mut recv_a, 5 * HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv_a).await?;
 
-    // B anchors and pays with BELOW-frontier reveals. Each folds nothing, so it
-    // adds no credit and B is sent nothing: the node either keeps waiting or
-    // ends B's stream on the stale proofs.
+    // B anchors and pays with BELOW-frontier reveals. Each folds nothing into the
+    // lane's payment, yet each claims one chunk of the four the lane holds
+    // unclaimed, so B is sent four chunks.
     open_chain(
         &mut send_b,
         &signer,
@@ -1669,15 +1682,22 @@ async fn a_below_frontier_reveal_adds_no_credit() -> anyhow::Result<()> {
         0,
     )
     .await?;
-    release(&mut send_b, 3).await?;
-    release(&mut send_b, 4).await?;
+    for index in 1..=4 {
+        release(&mut send_b, index).await?;
+    }
+    read_exact_chunks(&mut recv_b, 4 * HARNESS_INTERVAL_BYTES).await?;
+
+    // The lane's payment is spent: one more below-frontier reveal claims nothing,
+    // so B is sent nothing more. The node either keeps waiting or ends B's
+    // stream on the stale proofs.
+    release(&mut send_b, 2).await?;
     match tokio::time::timeout(Duration::from_secs(2), read_client_msg(&mut recv_b)).await {
         Err(_) | Ok(Err(_) | Ok(ClientMessage::StreamError(_))) => {}
-        Ok(Ok(other)) => anyhow::bail!("a below-frontier reveal must send nothing, got {other:?}"),
+        Ok(Ok(other)) => anyhow::bail!("a replayed reveal must send nothing, got {other:?}"),
     }
 
     // Billing is a MAXIMUM over the streams, never a sum: the deepest index wins,
-    // and the benign below-frontier reveal took no new money.
+    // and the below-frontier reveals took no new money.
     let lane = store
         .get(lane_key(signer.address()))?
         .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
@@ -1697,14 +1717,13 @@ async fn a_below_frontier_reveal_adds_no_credit() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A stream that has paid nothing on itself is not woken by a sibling's proof
-/// (ADR 003 § Credit Window): the serve loop arms its credit-wake channel only
-/// once the stream's own payer has paid on that stream, so a stream held open
-/// unread cannot be woken to draw the credit its siblings paid for. The payer's
-/// stream completes on its own payment while the silent sibling stays parked,
-/// served nothing.
+/// A stream that has paid nothing on itself is served nothing, whatever its
+/// siblings pay (ADR 003 § Credit Window): credit belongs to the stream whose
+/// proofs claimed it, so a stream held open unread cannot draw the credit its
+/// siblings paid for. The payer's stream completes on its own payment while the
+/// silent sibling stays parked, served nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_sibling_that_has_not_paid_is_not_woken_by_a_proof() -> anyhow::Result<()> {
+async fn a_sibling_that_has_not_paid_draws_none_of_the_lane_payment() -> anyhow::Result<()> {
     let payload = vec![0x4Cu8; 8 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;
@@ -1721,21 +1740,19 @@ async fn a_sibling_that_has_not_paid_is_not_woken_by_a_proof() -> anyhow::Result
     let ext = binding_ext(&signer, client_node_id)?;
 
     // The silent sibling opens FIRST and never pays, so it is parked in its own
-    // proof read — with no wake channel armed — before any credit exists on the
-    // lane.
+    // proof read before any payment exists on the lane.
     let (_send_b, mut recv_b) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     assert_parked_awaiting_voucher(&mut recv_b).await?;
 
     // The payer opens, pays two intervals, and reads exactly what it paid for:
-    // its proofs raise the shared lane credit, and its own stream spends all of
-    // it.
+    // its proofs claim the lane's payment for its own stream.
     let (mut send_a, mut recv_a) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     pay_cumulative(&mut send_a, &signer, 2 * HARNESS_INTERVAL_BYTES).await?;
     read_exact_chunks(&mut recv_a, 2 * HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv_a).await?;
 
-    // The never-paid sibling was not woken by those proofs: still parked,
-    // served nothing.
+    // The never-paid sibling drew none of that payment: still parked, served
+    // nothing.
     assert_parked_awaiting_voucher(&mut recv_b).await?;
 
     conn.close(0u32.into(), b"done");
@@ -2230,14 +2247,13 @@ impl StalledDelivery {
         }
         .sign(signer, &payment_domain())
         .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-        write_client_msg(
-            &mut self.send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
-        )
-        .await?;
+        // The voucher assigns exactly this delivery's bytes to its stream.
+        let mut wire = signed_to_wire_voucher(&voucher)?;
+        wire.stream_bytes = self.wire_bytes;
+        write_client_msg(&mut self.send, &ClientMessage::Voucher(wire)).await?;
 
         // Acceptance is implicit — the server sends no ack. The voucher credits
-        // the lane, so the server sends the whole delivery and then `StreamEnd`.
+        // the stream, so the server sends the whole delivery and then `StreamEnd`.
         read_exact_chunks(&mut self.recv, self.wire_bytes).await?;
         match read_client_msg(&mut self.recv).await? {
             ClientMessage::StreamEnd => {}
@@ -2250,12 +2266,26 @@ impl StalledDelivery {
     /// `(bytes_delivered, amount)`, then read and return the node's next message.
     /// Unlike [`Self::pay_and_finish`] this hands the caller an arbitrary
     /// watermark, so a test can inject a malformed or out-of-order voucher and
-    /// assert how the node rejects it.
+    /// assert how the node rejects it. The voucher claims for this stream all
+    /// the lane has paid and no stream has claimed ([`claim_all`]).
     async fn send_cumulative_voucher(
         &mut self,
         signer: &PrivateKeySigner,
         bytes_delivered: u64,
         amount: U256,
+    ) -> anyhow::Result<ClientMessage> {
+        self.send_cumulative_voucher_sharing(signer, bytes_delivered, amount, u64::MAX)
+            .await
+    }
+
+    /// [`Self::send_cumulative_voucher`], with the voucher assigning `share`
+    /// bytes of the lane's payment to this stream (`stream_bytes`).
+    async fn send_cumulative_voucher_sharing(
+        &mut self,
+        signer: &PrivateKeySigner,
+        bytes_delivered: u64,
+        amount: U256,
+        share: u64,
     ) -> anyhow::Result<ClientMessage> {
         let voucher = Voucher {
             pool_id: pool_id(),
@@ -2268,11 +2298,9 @@ impl StalledDelivery {
         }
         .sign(signer, &payment_domain())
         .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-        write_client_msg(
-            &mut self.send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
-        )
-        .await?;
+        let mut wire = signed_to_wire_voucher(&voucher)?;
+        wire.stream_bytes = share;
+        write_client_msg(&mut self.send, &ClientMessage::Voucher(wire)).await?;
         read_client_msg(&mut self.recv).await
     }
 }
@@ -3017,12 +3045,18 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
     )
     .await?;
 
-    // Settle the aggregate (A+B) on stream B first — the "higher" voucher.
+    // Settle the aggregate (A+B) on stream B first — the "higher" voucher. It
+    // assigns only B's bytes to B, so A's share stays unclaimed on the lane.
     let agg_bytes = blob_a.wire_bytes + blob_b.wire_bytes;
     let agg_amount =
         min_payment(blob_a.wire_bytes, RATE_PER_MB) + min_payment(blob_b.wire_bytes, RATE_PER_MB);
     let reply_b = stalled_b
-        .send_cumulative_voucher(&fx.client_signer, agg_bytes, agg_amount)
+        .send_cumulative_voucher_sharing(
+            &fx.client_signer,
+            agg_bytes,
+            agg_amount,
+            blob_b.wire_bytes,
+        )
         .await?;
     anyhow::ensure!(
         !matches!(reply_b, ClientMessage::StreamError(_)),
@@ -3031,12 +3065,14 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
 
     // Now the LOWER standalone voucher for just A arrives on stream A. It is
     // below the A+B watermark — already satisfied, NOT a WrongSigner/regression
-    // kill.
+    // kill — and it claims A's share of the payment the aggregate made, so A is
+    // served.
     let reply_a = stalled_a
-        .send_cumulative_voucher(
+        .send_cumulative_voucher_sharing(
             &fx.client_signer,
             blob_a.wire_bytes,
             min_payment(blob_a.wire_bytes, RATE_PER_MB),
+            blob_a.wire_bytes,
         )
         .await?;
     anyhow::ensure!(
@@ -4261,7 +4297,7 @@ fn lane_with_proved_frontier(
         chunk_price: price,
     }
     .sign(signer, &payment_domain())?;
-    let mut lane = LaneState::hydrate(
+    Ok(LaneState::hydrate(
         pool_id(),
         signer.address(),
         operator_addr(),
@@ -4271,11 +4307,7 @@ fn lane_with_proved_frontier(
         anchor_bytes,
         Some(anchor.signature.as_bytes()),
         chain,
-    );
-    // The earlier process received every byte it paid for, so the lane holds no
-    // credit: its delivered count is its whole claim.
-    lane.set_delivered_bytes(u64::try_from(lane.owed_bytes())?);
-    Ok(lane)
+    ))
 }
 
 /// Seed a lane holding a live chain ([`lane_with_proved_reveals`]), then
@@ -6928,10 +6960,11 @@ impl decdn_node::pool_view::PoolView for CachedDrainPoolView {
 
 /// A mid-stream `PoolExhausted` between the epoch's root voucher and its first
 /// reveal: the node took the root voucher, and the client has already sent the
-/// reveal. The client keeps the reveal (`VoucherRejectReason::refuses_proof`),
-/// and the node reads and credits it as a proof in flight before it closes the
-/// stream, so the client's ledger and the node's claim agree. A resumed fetch on
-/// the same ledger completes with no rebase and no rejection.
+/// reveal. The client keeps the reveal (`VoucherRejectReason::refuses_proof`).
+/// The node does not read it before it closes the stream, so its claim trails
+/// the client's ledger and never passes it. A resumed fetch on the same ledger
+/// folds the unread reveal into its first proof and completes with no rebase
+/// and no rejection.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pool_exhausted_between_root_voucher_and_reveal_resumes_without_heal()
 -> anyhow::Result<()> {
@@ -6994,9 +7027,9 @@ async fn a_pool_exhausted_between_root_voucher_and_reveal_resumes_without_heal()
         .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
     let kept = ledger.committed().amount;
     anyhow::ensure!(
-        kept == node_claim && kept > U256::ZERO,
-        "the node credits the reveal in flight, so the client's ledger matches its \
-         claim: ledger {kept} vs node claim {node_claim}"
+        node_claim <= kept && kept > U256::ZERO,
+        "the node's claim never passes the client's ledger: ledger {kept} vs node \
+         claim {node_claim}"
     );
 
     // Funded again: the resumed fetch's first reveal covers the unread one.
@@ -7021,16 +7054,13 @@ async fn a_pool_exhausted_between_root_voucher_and_reveal_resumes_without_heal()
     Ok(())
 }
 
-/// ADR 003's first write-off case, observed end to end (#2877). An unclean end
-/// loses frames the node already debited, so the payer's books count credit the
-/// node no longer holds. A resumed pull on that lane then reads nothing for a
-/// full floor window while its books say the credit covers the next bytes — the
-/// node is parked for a proof the payer, trusting its books, never sends. The
-/// payer writes the counted credit off (the operator's lost count grows and the
-/// books drop to zero) instead of wedging the lane, and the next fetch pays
-/// afresh and completes.
+/// Credit belongs to the stream (ADR 003 § Credit Window). A payer that drops a
+/// stream mid-delivery chose to leave: it books no loss, and the stream's held
+/// credit leaves the operator's outstanding total. Nothing carries to the next
+/// stream on the lane, so that stream pays its own way and completes, with no
+/// wait on credit the dropped stream left behind.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_silent_stall_against_counted_credit_writes_the_lane_credit_off() -> anyhow::Result<()> {
+async fn a_payer_that_leaves_mid_stream_books_no_loss_and_the_lane_resumes() -> anyhow::Result<()> {
     let payload = vec![0x6Du8; 4 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
@@ -7042,10 +7072,9 @@ async fn a_silent_stall_against_counted_credit_writes_the_lane_credit_off() -> a
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
 
-    // Leg 1: pay one window ahead, read ONE frame, and let the node debit the
-    // rest of the window into the transport. Dropping the pull then loses the
-    // debited frames in flight, so the books keep counting credit the node has
-    // already spent.
+    // Leg 1: pay one window ahead, read ONE frame, and let the node send more of
+    // the window into the transport. Dropping the pull then leaves frames in
+    // flight and paid credit unread.
     let generous = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)
         .map_err(|e| anyhow::anyhow!("deadlines: {e}"))?;
     let (_header, mut pull) = open_progressive_pull(
@@ -7069,62 +7098,34 @@ async fn a_silent_stall_against_counted_credit_writes_the_lane_credit_off() -> a
         .next_chunk()
         .await?
         .ok_or_else(|| anyhow::anyhow!("stream ended before its first frame"))?;
-    // Wait until the node has debited well past the one frame read, so the
-    // drop below loses paid-for frames rather than ending books-balanced.
+    // Wait until the node has sent well past the one frame read, so the drop
+    // below leaves paid-for frames in flight.
     let read = first.len() as u64;
     let deadline = Instant::now() + Duration::from_secs(10);
     while counter(&metrics, "decdn_bytes_served_total")? < read + 256 * 1024 {
         anyhow::ensure!(
             Instant::now() < deadline,
-            "the node never debited ahead of the one frame read"
+            "the node never sent ahead of the one frame read"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     anyhow::ensure!(
-        ledger.prepaid() > 0,
-        "leg 1 must leave counted credit on the books"
+        ledger.trust().outstanding() > 0,
+        "leg 1 must hold paid credit at the node before the drop"
     );
-    drop(pull); // the unclean end: the debited, unread frames are lost
-
-    // Leg 2: resume on the same lane with a short floor window. The books say
-    // the node holds more credit than it does, so once the real credit runs out
-    // the node parks for a proof the payer never sends. The floor trips on the
-    // silent window and the payer writes the counted credit off.
-    let short = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(1), 0)
-        .map_err(|e| anyhow::anyhow!("deadlines: {e}"))?;
-    let err = stream_fetch_shared(
-        &client_ep,
-        target.clone(),
-        &ctx,
-        &ledger,
-        &sd,
-        operator_addr(),
-        *hash.as_bytes(),
-        0,
-        now_us(),
-        short,
-        0,
-        0,
-    )
-    .await
-    .err()
-    .ok_or_else(|| anyhow::anyhow!("the resumed pull must stall on the phantom credit"))?;
+    drop(pull); // the payer leaves
     anyhow::ensure!(
-        err.downcast_ref::<PullStalled>().is_some() || err.downcast_ref::<PullTimeout>().is_some(),
-        "the silent stall surfaces as the floor verdict, got: {err:?}"
+        ledger.trust().lost() == 0,
+        "a payer that leaves books no loss, got {}",
+        ledger.trust().lost()
     );
     anyhow::ensure!(
-        ledger.trust().lost() > 0,
-        "a silent stall against counted credit must book the credit as lost"
-    );
-    anyhow::ensure!(
-        ledger.prepaid() == 0,
-        "the write-off must drop the books to zero, got {}",
-        ledger.prepaid()
+        ledger.trust().outstanding() == 0,
+        "the dropped stream's held credit leaves the outstanding total, got {}",
+        ledger.trust().outstanding()
     );
 
-    // The write-off unsticks the lane: with the books at or below the node's
-    // count, the next fetch pays afresh and completes.
+    // Leg 2 on the same lane pays its own way and completes.
     let got = stream_fetch_shared(
         &client_ep,
         target,
@@ -7140,20 +7141,24 @@ async fn a_silent_stall_against_counted_credit_writes_the_lane_credit_off() -> a
         0,
     )
     .await
-    .map_err(|e| anyhow::anyhow!("follow-up fetch after the write-off: {e:#}"))?;
+    .map_err(|e| anyhow::anyhow!("follow-up fetch after the drop: {e:#}"))?;
     anyhow::ensure!(
         got.as_ref() == payload.as_slice(),
         "the follow-up fetch must deliver the whole blob"
+    );
+    anyhow::ensure!(
+        ledger.trust().lost() == 0,
+        "nothing on this lane failed delivery, got {}",
+        ledger.trust().lost()
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
-/// A mere disconnect is not a write-off (ADR 003 §Write-offs, #2877): when the
-/// payer drops a stream having read every frame the node debited, the books and
-/// the node agree, so nothing is booked lost — the write-off is reserved for a
-/// node observed not delivering against counted credit. The resumed fetch on
+/// A payer that disconnects is not a write-off (ADR 003 § Credit Window): when
+/// the payer drops a stream having read every frame, nothing is booked lost —
+/// the write-off is reserved for a stream the node fails. The resumed fetch on
 /// the same lane completes, and the operator's lost count stays at zero.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mere_disconnect_is_not_a_write_off() -> anyhow::Result<()> {
@@ -7169,10 +7174,8 @@ async fn a_mere_disconnect_is_not_a_write_off() -> anyhow::Result<()> {
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
 
     // Leg 1: read the whole promised wire, then vanish — no `StreamEnd` read,
-    // no clean finish. Every byte paid for was received, so the books balance
-    // at the drop and the disconnect alone gives the payer nothing to write
-    // off. (A drop that loses debited frames is the write-off case, covered by
-    // `a_silent_stall_against_counted_credit_writes_the_lane_credit_off`.)
+    // no clean finish. The payer chose to leave, so the disconnect gives it
+    // nothing to write off.
     let deadlines = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)
         .map_err(|e| anyhow::anyhow!("deadlines: {e}"))?;
     let (_header, mut pull) = open_progressive_pull(
@@ -7322,7 +7325,7 @@ async fn setup_recheck_holder_and_driven(
 /// Pay a stream from its open to its `StreamEnd` and return the total WIRE bytes
 /// received (bao content + proof, so `>` the blob's content size).
 ///
-/// The node sends only against the lane's credit, so this pays one voucher
+/// The node sends only against the stream's credit, so this pays one voucher
 /// interval ahead of delivery and tops the credit up each time delivery reaches
 /// it. The last voucher pays exactly `total_wire`, so the stream settles to the
 /// byte.
@@ -7861,7 +7864,7 @@ async fn a_pull_stopped_at_a_split_pays_within_one_window_and_the_lane_pulls_on(
     let wire_len = support::bao_wire_len(total, 0, 4 * 1024 * 1024);
     let verified = read_groups(&mut reader, wire_len, 3 * 512 * 1024).await?;
     anyhow::ensure!(verified >= 3 * 512 * 1024, "the leg ended before the split");
-    // Let the node queue the frames the lane's credit covers that the leg has
+    // Let the node queue the frames the stream's credit covers that the leg has
     // not read yet:
     // the stop reads them, without waiting, for a rejection behind them.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -12770,7 +12773,7 @@ async fn send_signed_voucher(
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client_msg(
         send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
+        &ClientMessage::Voucher(claim_all(signed_to_wire_voucher(&voucher)?)),
     )
     .await
 }
@@ -13334,7 +13337,7 @@ async fn underpaying_voucher_after_an_accepted_voucher_returns_the_watermark() -
 const SLIVER_BYTES: u64 = 64 * 1024;
 
 /// A sliver smaller than one bao chunk group: the smallest frame the node cuts,
-/// so a proof that adds only this much leaves the lane's credit short of a frame.
+/// so a proof that adds only this much leaves the stream's credit short of a frame.
 const SUB_FRAME_SLIVER_BYTES: u64 = 1024;
 
 /// A proof that pays part of a chunk sends only that part (#2132).
@@ -14183,9 +14186,9 @@ async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> an
 }
 
 /// A node that takes payment and then cleanly `StreamEnd`s with ZERO delivery
-/// is reconciled against the credit it held (`reconcile_empty`): the payer
-/// writes the counted credit off, the operator's lost count grows, and the
-/// payer's next window toward that node shrinks.
+/// failed the stream's delivery (ADR 003 § Credit Window): the payer writes off
+/// what it paid on the stream, the operator's lost count grows, and the payer's
+/// next window toward that node shrinks.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_byte_stream_end_against_held_credit_is_written_off() -> anyhow::Result<()> {
     // Sub-chunk, so the opening payment is a single closing voucher — the one
@@ -14248,12 +14251,12 @@ async fn a_zero_byte_stream_end_against_held_credit_is_written_off() -> anyhow::
 
     anyhow::ensure!(
         ledger.trust().lost() > 0,
-        "a clean zero-byte StreamEnd against held credit must book the credit as lost"
+        "a clean zero-byte StreamEnd after payment must book the payment as lost"
     );
     anyhow::ensure!(
-        ledger.prepaid() == 0,
-        "the write-off must drop the books to zero, got {}",
-        ledger.prepaid()
+        ledger.trust().outstanding() == 0,
+        "the written-off credit leaves the outstanding total, got {}",
+        ledger.trust().outstanding()
     );
     let window_after = ledger.trust().window_bytes(RATE_PER_MB);
     anyhow::ensure!(
@@ -14265,12 +14268,13 @@ async fn a_zero_byte_stream_end_against_held_credit_is_written_off() -> anyhow::
     Ok(())
 }
 
-/// The control for `reconcile_empty`'s gate: a PARTIAL delivery before an early
-/// `StreamEnd` is NOT reconciled empty. The node delivered against the credit
-/// (just not all of it), so nothing is booked lost and the counted credit stays
-/// on the books for the next leg.
+/// A PARTIAL delivery before an early `StreamEnd` is a failed delivery too
+/// (ADR 003 § Credit Window): the payer does not take the node's word for why
+/// the stream ended. It writes off what it paid on the stream and did not
+/// receive verified, and no more: the verified prefix is not lost.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_partial_delivery_before_an_early_stream_end_is_not_written_off() -> anyhow::Result<()> {
+async fn a_partial_delivery_before_an_early_stream_end_writes_off_the_unverified_rest()
+-> anyhow::Result<()> {
     let payload = vec![0x3Fu8; 1024 * 1024 + 512 * 1024];
     let hash = support::register_payload(&payload);
     let wire = honest_bao_wire(&payload)?;
@@ -14327,10 +14331,15 @@ async fn a_partial_delivery_before_an_early_stream_end_is_not_written_off() -> a
         "the fetch must fail short of the promise, got: {msg}"
     );
 
+    let lost = ledger.trust().lost();
+    let verified = ledger.trust().verified();
     anyhow::ensure!(
-        ledger.trust().lost() == 0,
-        "a partial delivery is not a zero-byte reconciliation: nothing is lost, got {}",
-        ledger.trust().lost()
+        lost > 0,
+        "an early StreamEnd fails the delivery, so the unverified rest is lost"
+    );
+    anyhow::ensure!(
+        verified > 0,
+        "the honest prefix verified and is not part of the loss"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

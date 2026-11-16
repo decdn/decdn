@@ -359,7 +359,6 @@ pub(crate) const fn pull_config(args: &cli::ClientFetchArgs) -> PullConfig {
         cap_micro_usdc: args.pay_ahead_cap,
         divisor: args.pay_ahead_divisor,
         loss_weight: args.loss_weight,
-        write_off_budget_micro_usdc: args.write_off_budget,
     })
 }
 

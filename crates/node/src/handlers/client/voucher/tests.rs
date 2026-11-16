@@ -73,6 +73,7 @@ async fn verify_voucher_advances_candidate() {
         bytes_delivered: u64::try_from(new_bytes).expect("bytes fit u64 in this test"),
         chain_root: [0u8; 32],
         chunk_price: 0,
+        stream_bytes: 0,
     };
 
     let snapshot = lane.lock().await.state.clone();
@@ -173,6 +174,7 @@ fn stale_voucher_is_benign_and_does_not_regress_watermark() {
         bytes_delivered: one_mb,
         chain_root: [0u8; 32],
         chunk_price: 0,
+        stream_bytes: 0,
     };
 
     // verify against the high watermark; the sibling's watermark already
@@ -245,6 +247,7 @@ fn divergent_voucher_at_equal_amount_is_rejected() {
         bytes_delivered: two_mb,
         chain_root: [0u8; 32],
         chunk_price: 0,
+        stream_bytes: 0,
     };
 
     let err = super::ClientHandler::verify_voucher(
@@ -402,6 +405,7 @@ impl LiveChainLane {
             bytes_delivered: bytes,
             chain_root: chain_root.into(),
             chunk_price: u64::try_from(chunk_price).expect("price fits u64 in this test"),
+            stream_bytes: 0,
         };
         super::ClientHandler::verify_voucher(
             &self.state,

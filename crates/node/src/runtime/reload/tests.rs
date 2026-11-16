@@ -114,9 +114,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         },
         payment: ResolvedPayment {
             rate_per_mb: rate,
-            backfill_window: decdn_common::config::DEFAULT_BACKFILL_WINDOW,
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
-            backfill_divisor: decdn_common::config::DEFAULT_BACKFILL_DIVISOR,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
         },
         observability: ResolvedObservability {

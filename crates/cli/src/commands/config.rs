@@ -1049,9 +1049,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [payment]
 # rate_per_mb = 10
-# backfill_window = 4194304                # most bytes one backfill returns to a lane's credit after a dropped stream (ADR 003 § Credit Window); node-local, no wire field; default 4 MiB
-# backfill_divisor = 64                    # a lane's backfills total at most paid/backfill_divisor bytes (ADR 003 § Credit Window); 0 turns backfill off; default 64
-# frame_target_bytes = 1048576              # serve-path wire-frame target in bytes (ADR 005 §cdn/client/v1); node-local, never negotiated; clamped down to the lane's credit; must be in 1..=1048576 (one payment chunk); default 1 MiB
+# frame_target_bytes = 1048576              # serve-path wire-frame target in bytes (ADR 005 §cdn/client/v1); node-local, never negotiated; clamped down to the stream's credit; must be in 1..=1048576 (one payment chunk); default 1 MiB
 # voucher_commit_interval_ms = 5000        # background flush period (ms) for durable voucher persistence (ADR 003); must be > 0; default 5000 (5s)
 
 [observability]

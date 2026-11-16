@@ -535,12 +535,6 @@ pub enum ResolvedS3Credentials {
 pub struct ResolvedPayment {
     /// Rate per MB in USDC base units (6 decimals).
     pub rate_per_mb: u64,
-    /// Most bytes one backfill returns to a lane's credit (ADR 003 § Credit
-    /// Window). See [`crate::config::DEFAULT_BACKFILL_WINDOW`].
-    pub backfill_window: u64,
-    /// A lane's total backfill allowance is `paid / backfill_divisor` bytes; `0`
-    /// turns backfill off. See [`crate::config::DEFAULT_BACKFILL_DIVISOR`].
-    pub backfill_divisor: u64,
     /// Target wire-frame size for the serve path, in bytes (ADR 005
     /// §`cdn/client/v1`). See [`crate::config::DEFAULT_FRAME_TARGET_BYTES`] (1 MiB).
     /// Clamped down to the lane's credit per frame.

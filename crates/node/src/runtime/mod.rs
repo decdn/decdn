@@ -1506,9 +1506,6 @@ async fn build_chain_and_handlers(
         pull_through,
         local_populate,
         pull_through_origin,
-        // Backfill after a dropped stream (ADR 003 § Credit Window).
-        backfill_window: cfg.payment.backfill_window,
-        backfill_divisor: cfg.payment.backfill_divisor,
         frame_target_bytes: cfg.payment.frame_target_bytes,
         idle_timeout: None,
         pool_recheck_interval: None,

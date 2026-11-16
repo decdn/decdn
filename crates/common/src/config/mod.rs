@@ -446,15 +446,6 @@ pub const DEFAULT_NODE_PULL_STALL_WINDOW_SEC: u64 = 20;
 /// `0` disables the throughput test and leaves pure idle detection (one byte per window).
 pub const DEFAULT_NODE_PULL_MIN_THROUGHPUT_BPS: u64 = 4096;
 
-/// Default backfill window (ADR 003 § Credit Window): 4 MiB. The most bytes one
-/// backfill returns to a lane's credit when a payer resumes a stream that ended
-/// without a clean close. Node-local policy: no wire field carries it.
-pub const DEFAULT_BACKFILL_WINDOW: u64 = 4 * 1024 * 1024;
-/// Default backfill divisor (ADR 003 § Credit Window): 64. A lane's backfills
-/// total at most `paid / backfill_divisor` bytes, so a payer that claims a drop at
-/// every resume takes at most 1.6% of its paid bytes again. `0` turns backfill
-/// off.
-pub const DEFAULT_BACKFILL_DIVISOR: u64 = 64;
 /// Default serve-path wire-frame target (ADR 005 §`cdn/client/v1`): 1 MiB, matching
 /// the payment quantum so a well-funded stream sends about one frame per priced
 /// chunk. Node-local policy that travels on no message: the payer accepts any
@@ -2778,17 +2769,6 @@ pub fn resolve_payment_into(
             )
         },
     );
-    // Backfill window and divisor (ADR 003 § Credit Window). They bound what a
-    // node returns to a lane after a dropped stream, so a payer that claims a drop
-    // at every resume takes at most `1 / backfill_divisor` of its paid bytes again.
-    // A divisor of `0` turns backfill off, so it merges as a first-class value
-    // rather than falling back to the default.
-    let backfill_window = file
-        .and_then(|p| p.backfill_window.as_ref())
-        .map_or(DEFAULT_BACKFILL_WINDOW, |b| b.get());
-    let backfill_divisor = file
-        .and_then(|p| p.backfill_divisor)
-        .unwrap_or(DEFAULT_BACKFILL_DIVISOR);
     // Serve-path wire-frame target (ADR 005 §`cdn/client/v1`). Default and ceiling
     // are both one `CHUNK_BYTES` payment interval: a frame never crosses a payment
     // boundary, so the serve loop clamps every request to the interval remainder and
@@ -2830,8 +2810,6 @@ pub fn resolve_payment_into(
     );
     ResolvedPayment {
         rate_per_mb,
-        backfill_window,
-        backfill_divisor,
         frame_target_bytes,
         voucher_commit_interval_ms,
     }

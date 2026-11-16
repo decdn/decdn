@@ -240,13 +240,14 @@ async fn ranged_paid_pull(
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
-    // The node sends only against the lane's credit (ADR 003 § Credit Window),
+    // The node sends only against the stream's credit (ADR 003 § Credit Window),
     // so the client pays one interval ahead and tops the credit up each time
     // delivery reaches it. The last voucher pays exactly `expected_wire`.
     // Cumulative amounts over the lane's lifetime — vouchers are monotone in
-    // `amount` (there is no nonce). Acceptance is implicit (ADR 005): a
-    // rejection arrives as a mid-stream `StreamError`.
-    let pay = |paid: u64| -> anyhow::Result<ClientMessage> {
+    // `amount` (there is no nonce). Each voucher assigns its new bytes to this
+    // stream (`stream_bytes`). Acceptance is implicit (ADR 005): a rejection
+    // arrives as a mid-stream `StreamError`.
+    let pay = |paid: u64, share: u64| -> anyhow::Result<ClientMessage> {
         let amount = U256::from(paid)
             .saturating_mul(U256::from(rate))
             .div_ceil(U256::from(MB_BYTES));
@@ -261,11 +262,13 @@ async fn ranged_paid_pull(
         }
         .sign(client_eth.as_ref(), &voucher_dom())
         .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-        Ok(ClientMessage::Voucher(signed_to_wire_voucher(&signed)?))
+        let mut wire = signed_to_wire_voucher(&signed)?;
+        wire.stream_bytes = share;
+        Ok(ClientMessage::Voucher(wire))
     };
     let mut paid = interval_bytes.min(expected_wire);
     if paid > 0 {
-        write_client_msg(&mut send, &pay(paid)?).await?;
+        write_client_msg(&mut send, &pay(paid, paid)?).await?;
     }
     loop {
         match read_client_msg(&mut recv).await? {
@@ -274,8 +277,9 @@ async fn ranged_paid_pull(
                 let len = u64::try_from(chunk.bytes().len()).unwrap_or(u64::MAX);
                 cumulative = cumulative.saturating_add(len);
                 if cumulative >= paid && paid < expected_wire {
+                    let before = paid;
                     paid = paid.saturating_add(interval_bytes).min(expected_wire);
-                    write_client_msg(&mut send, &pay(paid)?).await?;
+                    write_client_msg(&mut send, &pay(paid, paid - before)?).await?;
                 }
             }
             ClientMessage::StreamEnd => break,
@@ -356,7 +360,7 @@ async fn throwaway_open(
 
 /// A bound `(0, 0)` open that reads the signed `StreamResponse` and then does
 /// NOTHING — neither pays nor closes. The node's fill for it parks with no
-/// lane credit and its paid frontier at 0 for as long as the connection lives: the
+/// stream credit and its paid frontier at 0 for as long as the connection lives: the
 /// stalled-owner shape. Returns the live connection (drop it to end the stream)
 /// and the advertised total.
 async fn idle_open(

@@ -1,14 +1,14 @@
-//! Lane credit on the serve path (ADR 003 § Credit Window).
+//! Stream credit on the serve path (ADR 003 § Credit Window).
 //!
-//! A node sends a frame only when its lane's confirmed payment covers it. Both
-//! serve loops call [`ClientHandler::acquire_credit`] before each send. It debits
-//! the lane's credit once, atomically, and reads the payer's proofs while the
-//! credit falls short. It also runs the checks that must hold before each send: the
-//! takedown check and the pool and signer re-checks.
+//! A node sends a frame only when the stream's confirmed payment covers it.
+//! Credit belongs to the stream: each proof on it claims a share of the lane's
+//! payment for it ([`super::LaneDeliveryState::claim`]), and nothing carries
+//! between streams. Both serve loops call [`ClientHandler::acquire_credit`]
+//! before each send. It reads the payer's proofs while the stream's credit
+//! falls short of the frame. It also runs the checks that must hold before each
+//! send: the takedown check and the pool and signer re-checks.
 
 use std::time::{Duration, Instant};
-
-use futures_util::FutureExt;
 
 use super::outcome::ServeStop;
 use super::proof_wait::ChunkProofs;
@@ -16,8 +16,8 @@ use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::StreamAnchor;
 use super::{
     Address, Arc, B256, BufferedProofReader, ClientHandler, Connection, Hash, LaneDeliveryState,
-    LaneKey, MAX_PROOFS_PER_CHUNK, Mutex, RecvStream, SendStream, U256, UnusableProofFrame,
-    VoucherRejectReason, VoucherStop,
+    LaneKey, MAX_PROOFS_PER_CHUNK, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
+    VoucherStop,
 };
 
 /// What a stream holds for the checks that run before each send: the pool funder
@@ -38,7 +38,7 @@ pub(super) struct SendGuards {
 /// How a wait for credit ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Acquired {
-    /// The lane's credit covered the frame. With `charge` the node debited it.
+    /// The stream's credit covers the frame.
     Ready,
     /// The stream ended before the frame could go out. The caller returns the stop
     /// as the stream's end.
@@ -62,8 +62,7 @@ impl ClientHandler {
     }
 
     /// The checks that run before each send (ADR 003 § Credit Window, Takedown
-    /// latency; § Pool solvency, re-checks). They run before the debit, so a stop
-    /// leaves the lane's credit on the lane.
+    /// latency; § Pool solvency, re-checks).
     ///
     /// - The takedown check runs before every frame. A takedown that lands
     ///   mid-stream stops delivery at the next frame (ADR 011 § On Blacklist
@@ -114,27 +113,22 @@ impl ClientHandler {
         Ok(None)
     }
 
-    /// Debit `len` bytes from the lane's credit before a send, reading the payer's
-    /// proofs while the credit falls short (ADR 003 § Credit Window).
+    /// Wait until the stream's credit covers a `len`-byte frame, reading the
+    /// payer's proofs while it falls short (ADR 003 § Credit Window).
     ///
-    /// A stream on a lane that holds credit debits at once and reads no proof. When
-    /// the credit falls short, the node reads one proof at a time and tries the
-    /// debit again after each. A proof that raises the lane's paid frontier raises
-    /// the credit of every stream on the lane, so a sibling's proof can cover this
-    /// frame too.
+    /// The stream's credit is `paid − delivered`: `paid` counts the bytes the
+    /// proofs on this stream claimed for it, and `delivered` the bytes it has
+    /// already sent. The caller adds the frame to `delivered` once it is on the
+    /// wire. When the
+    /// credit falls short, the node reads one proof at a time and checks again
+    /// after each. A proof the node has not read yet costs nothing: whenever it
+    /// is read, it claims its share for this stream.
     ///
     /// The wait is bounded. [`MAX_PROOFS_PER_CHUNK`] proofs that leave the credit
     /// short end the stream as [`ServeStop::ProofBudgetExhausted`], because a payer
     /// that sends proofs that credit nothing is at fault, not this node. The
     /// per-frame proof-wait ceiling and the no-progress timeout of
     /// [`super::proof_wait`] end a payer that sends nothing.
-    ///
-    /// `paid` counts the bytes that accepted proofs added to the lane, for the
-    /// stream's end tag.
-    ///
-    /// With `charge` false the call waits until the lane holds `len` bytes of credit
-    /// and debits nothing. The cache-miss loop uses it to learn that the lane has
-    /// paid for something before it asks the pull leg for bytes.
     ///
     /// # Errors
     ///
@@ -157,82 +151,22 @@ impl ClientHandler {
         client_node_id: B256,
         rate_per_mb: u64,
         len: u64,
-        charge: bool,
+        delivered: u64,
         paid: &mut u64,
     ) -> anyhow::Result<Acquired> {
         // One proof budget and one proof-wait ceiling for the whole wait.
         let mut proofs = ChunkProofs::start();
-        // Ticks when any proof on the lane raises its credit, so a sibling's
-        // payment wakes this wait once this stream has paid on itself.
-        let mut credit_rx = lane.lock().await.credit_tx.subscribe();
-        // Commit the proofs the payer already delivered on this stream before
-        // the first debit: a funded stream's proofs are credited near arrival
-        // rather than waiting unread until a sibling's higher proof supersedes
-        // them and they pay for nothing. Each drained proof spends the frame's
-        // proof budget, which only ever stops a stream on a shortfall below,
-        // so a funded stream is never stopped for its drained proofs — while a
-        // payer that slivers a frame across many proofs is cut at the same
-        // budget whether the node waited for them or found them buffered. A
-        // drain-time rejection stops the stream with nothing debited.
-        if let Some(stopped) = self
-            .credit_buffered_proofs(
-                send,
-                recv,
-                reader,
-                anchor,
-                hash,
-                lane_key,
-                lane,
-                conn.stable_id(),
-                client_node_id,
-                rate_per_mb,
-                &mut proofs,
-                paid,
-            )
-            .await?
-        {
-            return Ok(stopped);
-        }
         loop {
-            // Mark the current tick seen before the debit, so a credit rise
-            // after it wakes the proof read below.
-            credit_rx.borrow_and_update();
             if let Some(stop) = self
                 .pre_send_checks(send, recv, hash, &lane_key, rate_per_mb, guards)
                 .await?
             {
-                // A pool or signer stop is no verdict on the payer's proofs, and
-                // the payer counts the ones it sent as lane credit. Read and
-                // credit the proofs still in flight, so the credit the payer
-                // counts is the credit the lane holds. A takedown resets the
-                // stream, so nothing more arrives on it.
-                if stop != ServeStop::Takedown {
-                    Box::pin(self.settle_trailing_proofs(
-                        conn,
-                        send,
-                        recv,
-                        reader,
-                        anchor,
-                        hash,
-                        lane_key,
-                        lane,
-                        client_node_id,
-                        rate_per_mb,
-                    ))
-                    .await;
-                }
                 return Ok(Acquired::Stopped(stop));
             }
-            let covered = if charge {
-                self.debit_lane(lane, len).await
-            } else {
-                let credit = self.lane_credit(lane).await;
-                if credit >= len { Ok(()) } else { Err(credit) }
-            };
-            let credit = match covered {
-                Ok(()) => return Ok(Acquired::Ready),
-                Err(credit) => credit,
-            };
+            let credit = paid.saturating_sub(delivered);
+            if credit >= len {
+                return Ok(Acquired::Ready);
+            }
             if proofs.exhausted() {
                 self.reject_spent_budget(send, lane, proofs.attempts(), len, credit)
                     .await?;
@@ -257,16 +191,12 @@ impl ClientHandler {
                     client_node_id,
                     rate_per_mb,
                     &proofs,
-                    // A stream wakes for a sibling's proof only once its own
-                    // payer has paid on it, so a stream held open unread cannot
-                    // draw the credit its siblings paid for.
-                    (*paid > 0).then_some(&mut credit_rx),
                 )
                 .await;
             waits.end();
             let stop = committed.map_err(|e| {
                 e.context(format!(
-                    "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} while the lane's \
+                    "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} while the stream's \
                      {credit} bytes of credit fell short of a {len}-byte frame"
                 ))
             })?;
@@ -277,13 +207,12 @@ impl ClientHandler {
                 VoucherStop::Rejected => {
                     return Ok(Acquired::Stopped(ServeStop::VoucherRejected));
                 }
-                VoucherStop::Woken => proofs.refund_attempt(),
             }
         }
     }
 
-    /// End a stream whose proof budget is spent while the lane's credit does
-    /// not cover its next frame: reject it `AmountRegression` with the lane's
+    /// End a stream whose proof budget is spent while its credit does not
+    /// cover its next frame: reject it `AmountRegression` with the lane's
     /// watermark bundle, so a payer whose ledger trails the node's — a
     /// restarted payer re-proving a chain the lane already folded — reseeds
     /// from the lane's signed state and resumes, instead of retrying the stale
@@ -318,160 +247,5 @@ impl ClientHandler {
         );
         self.write_reject(send, VoucherRejectReason::AmountRegression, bundle)
             .await
-    }
-
-    /// Read, without waiting, the proofs the payer has already delivered on
-    /// this stream and credit them to the lane, spending the frame's proof
-    /// budget (`proofs`) for each one.
-    ///
-    /// The node waits on a stream's proofs only while the lane's credit falls
-    /// short, so a funded stream's proofs would otherwise sit unread until a
-    /// sibling's higher proof supersedes them — and then spend the proof
-    /// budget in [`Self::acquire_credit`] crediting nothing. Draining before
-    /// each frame commits them near arrival, so that backlog never builds.
-    /// Spending the budget here keeps the per-frame bound one number: the
-    /// budget stops a stream only on a shortfall, so a funded stream is never
-    /// stopped for its drained proofs, while a payer that slivers a frame
-    /// across many proofs is cut at [`MAX_PROOFS_PER_CHUNK`] whether the node
-    /// waited for its proofs or found them buffered.
-    ///
-    /// The drain never waits: a partial frame stays buffered for the next read
-    /// (the reader is cancellation-safe). A transport end is left for the
-    /// waiting read in [`Self::acquire_credit`]: it is sticky and re-surfaces
-    /// there when the credit falls short, so a payer that finished its send
-    /// half still draws the credit it paid. An [`UnusableProofFrame`] is
-    /// consumed and never re-surfaces, so the drain returns it as the stream's
-    /// error.
-    ///
-    /// Returns `Some` when a drained proof was rejected: the stream stops, and
-    /// the caller has debited nothing.
-    ///
-    /// # Errors
-    ///
-    /// An [`UnusableProofFrame`] read, or a proof commit that faults.
-    #[allow(clippy::too_many_arguments)]
-    async fn credit_buffered_proofs(
-        &self,
-        send: &mut SendStream,
-        recv: &mut RecvStream,
-        reader: &mut BufferedProofReader,
-        anchor: &mut StreamAnchor,
-        hash: Hash,
-        lane_key: LaneKey,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
-        conn_id: usize,
-        client_node_id: B256,
-        rate_per_mb: u64,
-        proofs: &mut ChunkProofs,
-        paid: &mut u64,
-    ) -> anyhow::Result<Option<Acquired>> {
-        while !proofs.exhausted() {
-            let Some(read) = reader.read(recv).now_or_never() else {
-                return Ok(None);
-            };
-            let proof = match read {
-                Ok(proof) => proof,
-                // The reader consumed the frame, so no later read reports it:
-                // end the stream here, as the waiting read would.
-                Err(e) if UnusableProofFrame::is(&e) => return Err(e),
-                Err(_) => return Ok(None),
-            };
-            proofs.next_attempt();
-            let committed = Box::pin(self.commit_wire_proof(
-                send,
-                conn_id,
-                anchor,
-                hash,
-                lane_key,
-                lane,
-                client_node_id,
-                rate_per_mb,
-                proof,
-            ))
-            .await?;
-            match committed {
-                VoucherStop::Continue { credited_bytes } => {
-                    *paid = paid.saturating_add(credited_bytes);
-                }
-                VoucherStop::Rejected => {
-                    return Ok(Some(Acquired::Stopped(ServeStop::VoucherRejected)));
-                }
-                // The drain passes no wake channel, so a commit cannot end as
-                // `Woken`; treat it as a no-op drain end.
-                VoucherStop::Woken => return Ok(None),
-            }
-        }
-        Ok(None)
-    }
-
-    /// After a clean `StreamEnd`, or after a pool or signer stop, read and credit
-    /// the proofs the payer sent that the node has not read, until the payer's
-    /// FIN or [`super::POST_END_DRAIN_TIMEOUT`].
-    ///
-    /// The node reads a proof only while the lane's credit falls short, so a
-    /// stream that finishes on credit a sibling paid leaves its own proofs
-    /// unread. The payer counts them as lane credit. Dropping them would leave
-    /// the lane short of what the payer believes it paid, and a sibling stream
-    /// would wait for a proof the payer never sends.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn settle_trailing_proofs(
-        &self,
-        conn: &Connection,
-        send: &mut SendStream,
-        recv: &mut RecvStream,
-        reader: &mut BufferedProofReader,
-        anchor: &mut StreamAnchor,
-        hash: Hash,
-        lane_key: LaneKey,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
-        client_node_id: B256,
-        rate_per_mb: u64,
-    ) {
-        let settle = async {
-            loop {
-                let proofs = ChunkProofs::start();
-                let committed = self
-                    .commit_one_proof(
-                        conn,
-                        send,
-                        recv,
-                        reader,
-                        anchor,
-                        hash,
-                        lane_key,
-                        Some(lane),
-                        client_node_id,
-                        rate_per_mb,
-                        &proofs,
-                        None,
-                    )
-                    .await;
-                // The payer's FIN, a fault, or a rejection ends the settle.
-                match committed {
-                    Ok(VoucherStop::Continue { .. }) => {}
-                    Ok(_) => break,
-                    // The payer's FIN lands here too, so debug, not warn — but
-                    // a lane-store fault mid-drain leaves the lane holding
-                    // less credit than the payer counts, which this drain
-                    // exists to prevent, so it must not vanish without a line.
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %format_args!("{e:#}"),
-                            "the post-end proof drain stopped on a read or \
-                             commit end"
-                        );
-                        break;
-                    }
-                }
-            }
-        };
-        if tokio::time::timeout(super::POST_END_DRAIN_TIMEOUT, Box::pin(settle))
-            .await
-            .is_err()
-        {
-            // A drain cut off with proofs unread leaves the lane short of what
-            // the payer counts; the payer heals it at its next silent stall.
-            tracing::debug!("the post-end proof drain hit its timeout with proofs possibly unread");
-        }
     }
 }

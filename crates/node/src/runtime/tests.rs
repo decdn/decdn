@@ -385,9 +385,7 @@ fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, Resolve
         },
         payment: ResolvedPayment {
             rate_per_mb: 10,
-            backfill_window: decdn_common::config::DEFAULT_BACKFILL_WINDOW,
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
-            backfill_divisor: decdn_common::config::DEFAULT_BACKFILL_DIVISOR,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
         },
         observability: ResolvedObservability {

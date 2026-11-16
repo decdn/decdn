@@ -68,7 +68,8 @@ pub fn wire_voucher_to_signed(
 
 /// Encode a [`SignedVoucher`] to its wire form (requester side). The
 /// lane-context fields (`pool_id`, `signer`, `provider`) are dropped — the
-/// receiver reconstructs them.
+/// receiver reconstructs them. The unsigned `stream_bytes` claim starts at
+/// `0`; a sender that pays new bytes for its stream sets it.
 ///
 /// # Errors
 ///
@@ -90,6 +91,7 @@ pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> Result<WireVoucher, Wir
         bytes_delivered,
         chain_root: signed.voucher.chain_root.into(),
         chunk_price,
+        stream_bytes: 0,
     })
 }
 

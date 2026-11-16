@@ -6,7 +6,7 @@
 //! hash-chain preimage per delivered
 //! `CHUNK_BYTES` chunk — with a signed `Voucher` to open a chain, to roll one,
 //! and to settle a sub-chunk residual — and pausing a stream only when the
-//! lane's credit (`paid − delivered`) cannot cover the next frame — the payer
+//! stream's credit (`paid − sent`) cannot cover the next frame — the payer
 //! pays ahead of delivery, so payment pipelines rather than stopping at each
 //! chunk — and
 //! finishing with [`ClientMessage::StreamEnd`]. A delivery fault rides in the
@@ -137,19 +137,24 @@ const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
 /// Per-lane delivery state: the validated voucher watermark, the lane-wide
 /// cumulative byte counter that feeds voucher reconstruction (ADR 003 §Voucher
-/// wire format — `bytes_delivered` is not on the wire), and the lane's credit
-/// (ADR 003 § Credit Window).
+/// wire format — `bytes_delivered` is not on the wire), and the bytes of that
+/// payment the lane's streams have claimed (ADR 003 § Credit Window).
 ///
-/// The lane's credit is its paid bytes minus the bytes the node has sent on it
-/// ([`LaneState::credit_bytes`]). Every stream on the lane debits that one
-/// balance under this entry's lock before it sends a frame, so two streams never
-/// spend the same payment.
+/// Credit belongs to a stream. Each proof claims a share of the lane's payment
+/// for the stream that carries it, and [`Self::claim`] grants it only out of
+/// the paid bytes no stream has claimed. So the sum of every stream's credit
+/// never exceeds what the lane paid, however the payer splits it and in
+/// whatever order sibling streams' proofs arrive.
 #[derive(Debug)]
 struct LaneDeliveryState {
     state: LaneState,
     /// Lane-wide cumulative bytes the lane's claim covers: the signed bytes
     /// extended by the chunks the chain has proved.
     paid_bytes: U256,
+    /// The bytes of [`Self::paid_bytes`] that streams have claimed. In memory
+    /// only: a lane this process loads starts with every paid byte claimed,
+    /// so no stream draws a payment made before the load.
+    claimed: U256,
     /// Wall-clock (Unix milliseconds) of the last accepted voucher on this lane,
     /// or `0` when this process has accepted none since it hydrated the lane
     /// (issue #1733). Stamped by [`ClientHandler::commit_one_proof`] under the
@@ -159,86 +164,40 @@ struct LaneDeliveryState {
     /// it gates nothing, and the stamp lifecycle follows the lane row (a
     /// forgotten lane drops it automatically).
     last_voucher_at: AtomicU64,
-    /// Where each stream of this lane that ended on a fault left off, by blob
-    /// hash (ADR 003 § Credit Window, backfill). In memory only: a
-    /// node restart drops it, and the payer then pays for the gap.
-    unclean_ends: HashMap<Hash, u64>,
-    /// Bytes of backfill the lane has drawn so far, against its allowance of
-    /// `paid / backfill_divisor`. In memory only.
-    backfilled_bytes: u64,
-    /// Ticks each time the lane's credit rises: a proof that credits bytes, or
-    /// a backfill. A stream waiting for credit races its own proof read against
-    /// it, so a sibling's proof wakes it (ADR 003 § Credit Window).
-    credit_tx: tokio::sync::watch::Sender<u64>,
-    /// The connection whose proof last credited the lane, by its stable id. A
-    /// payer's streams share its connection, so a stale proof on a different
-    /// connection is a payer that lost its watermark, as a restarted one has.
+    /// The connection whose proof last credited a stream of the lane, by its
+    /// stable id. A payer's streams share its connection, so a stale proof on a
+    /// different connection is a payer that lost its watermark, as a restarted
+    /// one has.
     last_credit_conn: Option<usize>,
 }
 
-/// Most unclean stream ends a lane remembers. A lane that leaves more streams
-/// unfinished than this forgets one remembered end for each further one, and
-/// its payer pays for that gap.
-const MAX_UNCLEAN_ENDS_PER_LANE: usize = 64;
-
 impl LaneDeliveryState {
-    /// The delivery state for a lane this process loads or registers. The lane's
-    /// credit is what its persisted claim and delivered count leave
-    /// ([`LaneState::credit_bytes`]), so credit survives a restart.
+    /// The delivery state for a lane this process loads or registers. Every
+    /// byte the lane has paid so far counts as claimed: credit lives with the
+    /// streams that claimed it, and those streams did not survive the load.
     fn hydrated(state: LaneState) -> Self {
         let paid_bytes = state.owed_bytes();
         Self {
             state,
             paid_bytes,
+            claimed: paid_bytes,
             last_voucher_at: AtomicU64::new(0),
-            unclean_ends: HashMap::new(),
-            backfilled_bytes: 0,
-            credit_tx: tokio::sync::watch::Sender::new(0),
             last_credit_conn: None,
         }
     }
 
-    /// Wake every stream of the lane that waits for credit.
-    fn note_credit_raised(&self) {
-        self.credit_tx
-            .send_modify(|tick| *tick = tick.wrapping_add(1));
+    /// The paid bytes no stream has claimed yet.
+    fn unclaimed(&self) -> u64 {
+        u64::try_from(self.paid_bytes.saturating_sub(self.claimed)).unwrap_or(u64::MAX)
     }
 
-    /// Remember where a stream on `hash` ended without a clean close, so a resume
-    /// of the same blob can draw a backfill.
-    fn note_unclean_end(&mut self, hash: Hash, end_offset: u64) {
-        if self.unclean_ends.len() >= MAX_UNCLEAN_ENDS_PER_LANE
-            && !self.unclean_ends.contains_key(&hash)
-        {
-            // Evict one remembered end (the map holds no order, so an
-            // arbitrary one) rather than the whole map, so one busy lane
-            // does not void every other blob's backfill at once.
-            if let Some(evicted) = self.unclean_ends.keys().next().copied() {
-                self.unclean_ends.remove(&evicted);
-            }
-        }
-        self.unclean_ends.insert(hash, end_offset);
-    }
-
-    /// Settle the backfill for a stream that starts at `byte_offset` of `hash`
-    /// (ADR 003 § Credit Window). The remembered end of the lane's last unclean
-    /// stream on the blob is consumed. A start before it returns the gap to the
-    /// lane's credit, within the lane's allowance and `window`. Returns the bytes
-    /// given back.
-    fn take_backfill(&mut self, hash: Hash, byte_offset: u64, window: u64, divisor: u64) -> u64 {
-        let Some(end_offset) = self.unclean_ends.remove(&hash) else {
-            return 0;
-        };
-        let gap = end_offset.saturating_sub(byte_offset);
-        if gap == 0 || divisor == 0 {
-            return 0;
-        }
-        let paid = u64::try_from(self.paid_bytes).unwrap_or(u64::MAX);
-        let allowance = (paid / divisor).saturating_sub(self.backfilled_bytes);
-        // `refund` clamps to the bytes the lane was sent, so credit never
-        // exceeds what the lane paid for.
-        let granted = self.state.refund(gap.min(allowance).min(window));
-        self.backfilled_bytes = self.backfilled_bytes.saturating_add(granted);
+    /// Claim up to `want` bytes of the lane's payment for one stream, and
+    /// return the bytes granted: never more than [`Self::unclaimed`]. A proof
+    /// replayed on another stream, or a share the payer overstates, can only
+    /// draw what the lane has paid and no stream has claimed.
+    fn claim(&mut self, want: u64) -> u64 {
+        let granted = want.min(self.unclaimed());
+        self.claimed = self.claimed.saturating_add(U256::from(granted));
         granted
     }
 }
@@ -323,10 +282,8 @@ impl LaneActivityClock {
                 Arc::new(Mutex::new(LaneDeliveryState {
                     state,
                     paid_bytes: U256::ZERO,
+                    claimed: U256::ZERO,
                     last_voucher_at: AtomicU64::new(now),
-                    unclean_ends: HashMap::new(),
-                    backfilled_bytes: 0,
-                    credit_tx: tokio::sync::watch::Sender::new(0),
                     last_credit_conn: None,
                 })),
             );
@@ -822,23 +779,15 @@ pub struct ClientHandlerDeps {
     /// [`Self::pull_through`]. `None` skips the local-origin tier.
     pub local_populate: Option<Duration>,
     /// Selects the credit-paced node-to-node pull leg, which draws upstream only
-    /// what the downstream lane has paid for. `None` falls back to the
+    /// what the downstream stream has paid for. `None` falls back to the
     /// buffered `populate` path when [`Self::pull_through`] is set.
     pub pull_through_origin: Option<Arc<NodeOrigin>>,
-    /// The most bytes one backfill returns to a lane's credit (ADR 003 § Credit
-    /// Window). Defaults to `DEFAULT_BACKFILL_WINDOW` (4 MiB); the runtime sets
-    /// it from `payment.backfill_window`.
-    pub backfill_window: u64,
-    /// A lane's total backfill allowance is `paid / backfill_divisor` bytes. Defaults
-    /// to `DEFAULT_BACKFILL_DIVISOR` (64); the runtime sets it from
-    /// `payment.backfill_divisor`. `0` turns backfill off.
-    pub backfill_divisor: u64,
     /// Target wire-frame size in bytes for the serve path (ADR 005
     /// §`cdn/client/v1`). Node-local policy, never negotiated: the payer accepts
     /// any non-empty frame, and neither payment nor bao verification is defined
     /// over frame boundaries. Defaults to `DEFAULT_FRAME_TARGET_BYTES` (1 MiB);
     /// the runtime sets it from `payment.frame_target_bytes`. The serve loop
-    /// clamps each request to the lane's credit, so this is a ceiling on frame
+    /// clamps each request to the stream's credit, so this is a ceiling on frame
     /// size rather than an exact size.
     pub frame_target_bytes: u64,
     /// Application-layer idle-close ceiling for a whole connection (ADR 005
@@ -939,8 +888,6 @@ impl ClientHandlerDeps {
             pull_through: None,
             local_populate: None,
             pull_through_origin: None,
-            backfill_window: decdn_common::config::DEFAULT_BACKFILL_WINDOW,
-            backfill_divisor: decdn_common::config::DEFAULT_BACKFILL_DIVISOR,
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             idle_timeout: None,
             pool_recheck_interval: None,
@@ -1166,19 +1113,13 @@ pub struct ClientHandler {
     /// miss for an offset-0 request that proves lane authority is served by
     /// fusing a progressive upstream pull with downstream delivery — forwarding
     /// each chunk to the paying client and teeing it into the cache — so
-    /// per-request upstream spend is bounded to the credit the downstream lane
+    /// per-request upstream spend is bounded to the credit the downstream stream
     /// holds instead of the whole blob. `None` keeps the buffered `populate`
     /// path (`pull_through`) or a plain `NotFound`.
     pull_through_origin: Option<Arc<NodeOrigin>>,
-    /// Most bytes one backfill returns to a lane's credit
-    /// ([`ClientHandlerDeps::backfill_window`]).
-    backfill_window: u64,
-    /// A lane's backfill allowance divisor
-    /// ([`ClientHandlerDeps::backfill_divisor`]).
-    backfill_divisor: u64,
     /// Target wire-frame size in bytes, set at construction via
     /// [`ClientHandlerDeps`]. Read through [`Self::frame_target`], which clamps it
-    /// to the lane's credit.
+    /// to the stream's credit.
     frame_target_bytes: u64,
     /// Live content deny-set (ADR 011), keyed on the pool FUNDER. Consulted at
     /// two points, both of which must gate or the check is bypassable: the
@@ -1328,8 +1269,6 @@ impl ClientHandler {
             pull_through: deps.pull_through,
             local_populate: deps.local_populate,
             pull_through_origin: deps.pull_through_origin,
-            backfill_window: deps.backfill_window,
-            backfill_divisor: deps.backfill_divisor,
             frame_target_bytes: deps.frame_target_bytes,
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
@@ -1968,9 +1907,9 @@ impl ClientHandler {
     /// no longer agree on. Cutting at the boundary keeps the preimage path exact,
     /// whatever the target.
     ///
-    /// `room` is the lane's credit, and it caps the request as well. The cap is
+    /// `room` is the stream's credit, and it caps the request as well. The cap is
     /// load-bearing on the **cache-miss** leg. The producer is fed by an upstream
-    /// pull that draws only what the lane's credit covers
+    /// pull that draws only what the stream's credit covers
     /// ([`decdn_client::PULL_AHEAD_BYTES`] past it). Asking for a frame larger than
     /// the credit would park the producer on bytes the pull may not draw.
     ///
@@ -2019,82 +1958,6 @@ impl ClientHandler {
             .min(cap)
     }
 
-    /// Debit `len` bytes from `lane`'s credit (ADR 003 § Credit Window), once and
-    /// atomically under the lane's lock, and persist the lane's new delivered
-    /// count. Returns the credit the lane holds when it cannot cover `len`, so the
-    /// caller reads a proof. Two streams on one lane never spend one payment twice,
-    /// because both debit this one balance.
-    async fn debit_lane(&self, lane: &Arc<Mutex<LaneDeliveryState>>, len: u64) -> Result<(), u64> {
-        let mut guard = lane.lock().await;
-        guard.state.debit(len)?;
-        if let Err(e) = self.pool_state_store.record(&guard.state) {
-            tracing::error!(
-                pool_id = %guard.state.pool_id,
-                error = %e,
-                "could not record a lane's delivered count; credit may repeat after a restart"
-            );
-        }
-        Ok(())
-    }
-
-    /// The credit `lane` holds now, in wire bytes.
-    async fn lane_credit(&self, lane: &Arc<Mutex<LaneDeliveryState>>) -> u64 {
-        lane.lock().await.state.credit_bytes()
-    }
-
-    /// Give a stream that resumes an unfinished one its backfill (ADR 003 § Credit
-    /// Window): the gap between the stream's `byte_offset` and the end the lane's
-    /// last unclean stream on `hash` reached, within the lane's allowance and
-    /// [`ClientHandlerDeps::backfill_window`]. Returns the bytes given back.
-    async fn apply_backfill(
-        &self,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
-        hash: Hash,
-        byte_offset: u64,
-    ) -> u64 {
-        let mut guard = lane.lock().await;
-        let granted = guard.take_backfill(
-            hash,
-            byte_offset,
-            self.backfill_window,
-            self.backfill_divisor,
-        );
-        if granted > 0 {
-            guard.note_credit_raised();
-        }
-        if granted > 0
-            && let Err(e) = self.pool_state_store.record(&guard.state)
-        {
-            tracing::error!(
-                pool_id = %guard.state.pool_id,
-                error = %e,
-                "could not record a lane's delivered count after a backfill"
-            );
-        }
-        granted
-    }
-
-    /// Log a backfill a resuming stream drew.
-    fn log_backfill(lane_key: LaneKey, hash: Hash, granted: u64) {
-        if granted > 0 {
-            tracing::debug!(
-                pool_id = %lane_key.pool_id, signer = %lane_key.signer, %hash, granted,
-                "returned the gap of an unfinished stream to the lane's credit"
-            );
-        }
-    }
-
-    /// Remember where a stream on `hash` stopped when it ended without a clean
-    /// close, so the lane's resume can draw a backfill.
-    async fn note_unclean_end(
-        &self,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
-        hash: Hash,
-        end_offset: u64,
-    ) {
-        lane.lock().await.note_unclean_end(hash, end_offset);
-    }
-
     /// The refundable floor-`M` serving guard (shared-payment-pool model): the
     /// seller keeps serving a pool only while its on-chain **remaining**
     /// (`getPool.deposit − getPool.totalRedeemed`) minus the configured
@@ -2122,7 +1985,7 @@ impl ClientHandler {
     /// Mid-stream pool-solvency stop condition: `true` while the pool's remaining
     /// deposit sits above the refundable floor `M` (ADR 003 § Pool solvency:
     /// delivery stops once `remaining ≤ M`). `M` covers every voucher in flight, so
-    /// nothing else bounds the pool: a node sends only what a lane has paid for.
+    /// nothing else bounds the pool: a node sends only what a stream has paid for.
     pub(super) fn pool_funds_committed(&self, remaining: U256) -> bool {
         remaining > self.pool_min_remaining_deposit
     }
@@ -2199,16 +2062,13 @@ impl ClientHandler {
 /// [`ClientHandler::commit_one_proof`].
 enum VoucherStop {
     /// Verified and advanced in memory; keep serving. `credited_bytes` is the
-    /// wire bytes the proof added to the lane's paid frontier, so a benign
-    /// already-satisfied proof contributes zero.
+    /// wire bytes the proof credited to the stream that carried it: the share
+    /// it claims, within what the lane has paid and no stream has claimed. A
+    /// proof that claims nothing, such as an anchor voucher, credits zero.
     Continue { credited_bytes: u64 },
     /// Rejected — the reject frame was written and the stream finishes cleanly;
     /// the loop returns `Ok(())`.
     Rejected,
-    /// The lane's credit rose while the stream waited for a proof of its own,
-    /// which it has not read: a sibling's proof paid the lane. The caller tries
-    /// its debit again.
-    Woken,
 }
 
 /// Router-facing `ProtocolHandler` for `cdn/client/v1`.
@@ -2372,9 +2232,9 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 ///
 /// The budget counts every proof that leaves the chunk unsettled. That includes
 /// a proof that credits nothing and a proof that pays only part of the chunk.
-/// A proof pays part of a chunk when the lane headroom it finds is short — for
-/// example, a sealed voucher that moves the watermark by less than the chunk. The
-/// remainder stays owed, and the next proof answers it.
+/// A proof pays part of a chunk when the lane's unclaimed payment it finds is
+/// short, or when its own share is smaller than the frame. The remainder stays
+/// owed, and the next proof answers it.
 ///
 /// A whole chunk is paid by exactly one reveal, but the payer may legitimately
 /// send metering vouchers ahead of it — the epoch's root voucher when this
@@ -2386,12 +2246,12 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// vouchers (re-anchor, roll) and then the reveal. The rest of the budget of 8
 /// is slack for a duplicate or out-of-order reveal, which is ordinary once
 /// several streams share one lane and which credits nothing when the lane holds
-/// no headroom for it.
+/// no unclaimed payment for it.
 ///
 /// The bound matters because without it a payer could hold a stream open
 /// indefinitely with a run of zero-credit vouchers, each one refreshing the
-/// no-progress timeout while the lane's credit never rises enough to cover the
-/// next frame — the
+/// no-progress timeout while the stream's credit never rises enough to cover
+/// the next frame — the
 /// same shape of stall the non-empty-`ChunkData` floor closes on the delivery
 /// side. This budget bounds the number of proofs for one owed chunk, not the
 /// time. [`proof_wait::ChunkProofs`] counts them, and it also holds the chunk's
@@ -2414,26 +2274,6 @@ const MAX_PROOFS_PER_CHUNK: u32 = 8;
 pub(super) enum Proof {
     Voucher(decdn_protocol::client::Voucher),
     Preimage(decdn_protocol::client::ChunkPreimage),
-}
-
-/// Marks a [`BufferedProofReader::read`] error for a whole frame the reader
-/// consumed and could not use: an undecodable body, or a message that is not a
-/// proof. Its bytes are gone, so a later read never reports it again, unlike a
-/// transport error or a malformed length prefix.
-#[derive(Debug)]
-pub(super) struct UnusableProofFrame;
-
-impl std::fmt::Display for UnusableProofFrame {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("unusable proof frame")
-    }
-}
-
-impl UnusableProofFrame {
-    /// Whether `e` reports a frame the reader consumed and could not use.
-    pub(super) fn is(e: &anyhow::Error) -> bool {
-        e.downcast_ref::<Self>().is_some()
-    }
 }
 
 /// Cancellation-safe, buffered reader for `cdn/client/v1` payment-proof frames. Owns
@@ -2535,14 +2375,15 @@ impl BufferedProofReader {
             .get(header_len..total)
             .ok_or_else(|| anyhow::anyhow!("proof frame bounds out of range"))?;
         let decoded = decode_message::<ClientMessage>(payload);
-        let unusable = || anyhow::Error::new(wire::PeerFault).context(UnusableProofFrame);
-        let result = match decoded {
-            Ok((ClientMessage::Voucher(v), _)) => Ok(Proof::Voucher(v)),
-            Ok((ClientMessage::ChunkPreimage(p), _)) => Ok(Proof::Preimage(p)),
-            Ok((_, _)) => Err(unusable()
-                .context("expected ClientMessage::Voucher or ClientMessage::ChunkPreimage")),
-            Err(e) => Err(unusable().context(format!("proof decode failed: {e}"))),
-        };
+        let result =
+            match decoded {
+                Ok((ClientMessage::Voucher(v), _)) => Ok(Proof::Voucher(v)),
+                Ok((ClientMessage::ChunkPreimage(p), _)) => Ok(Proof::Preimage(p)),
+                Ok((_, _)) => Err(anyhow::Error::new(wire::PeerFault)
+                    .context("expected ClientMessage::Voucher or ClientMessage::ChunkPreimage")),
+                Err(e) => Err(anyhow::Error::new(wire::PeerFault)
+                    .context(format!("proof decode failed: {e}"))),
+            };
         self.buf.drain(..total);
         Ok(Some(result))
     }

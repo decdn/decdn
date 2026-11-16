@@ -7100,9 +7100,18 @@ async fn leaf_pay(
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client(
         send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
+        &ClientMessage::Voucher(claim_all(signed_to_wire_voucher(&signed)?)),
     )
     .await
+}
+
+/// `wire` with its stream share set to all the lane has paid and no stream has
+/// claimed (ADR 003 § Credit Window). A raw leaf that drives one stream at a
+/// time hands that stream every new byte its voucher pays; the node caps the
+/// share at the lane's unclaimed payment.
+const fn claim_all(mut wire: decdn_protocol::client::Voucher) -> decdn_protocol::client::Voucher {
+    wire.stream_bytes = u64::MAX;
+    wire
 }
 
 async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMessage> {
@@ -7843,7 +7852,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         "B must promote the teed blob on a complete delivery"
     );
     // B's buyer lane to A advanced across two upstream legs: the pull leg paces
-    // on the lane credit the leaf has paid for, so the window pause at the
+    // on the stream credit the leaf has paid for, so the window pause at the
     // frontier (proven above) forces a second open. Where the first leg ends
     // depends on when the leaf's next payment lands. Each leg re-sends the bao
     // proof path to its start (ADR 038 meters WIRE: content + interleaved proof),
@@ -9235,7 +9244,7 @@ async fn window_pull_through_connected_nonpaying_leaf_bounds_upstream_spend() ->
         "leaf should have paid exactly three vouchers, got {}",
         outcome.acks
     );
-    // B sends only against the lane's credit, so the leaf receives no more than
+    // B sends only against the stream's credit, so the leaf receives no more than
     // it paid for, and its pull leg paused on a closed window.
     let paid = outcome.paid_wire;
     let group = decdn_cache::CHUNK_GROUP_BYTES;
@@ -9883,7 +9892,7 @@ struct LeafStream {
 }
 
 /// Open a paid stream from the leaf to B for `hash`, pay the first interval
-/// ahead, and read it. B sends only against the lane's credit, so it then waits
+/// ahead, and read it. B sends only against the stream's credit, so it then waits
 /// for the next proof.
 async fn leaf_reads_first_interval(
     leaf_ep: &iroh::Endpoint,
@@ -10011,7 +10020,7 @@ async fn leaf_sends_voucher(
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client(
         send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
+        &ClientMessage::Voucher(claim_all(signed_to_wire_voucher(&signed)?)),
     )
     .await
 }
@@ -14144,7 +14153,7 @@ async fn a_topup_that_adds_no_headroom_ends_the_pull() -> Result<()> {
 /// after exactly one recovery step (ADR 003 § Funding recovery).
 ///
 /// The initial deposit covers two MiB at `RATE`. The upstream sends only
-/// against the lane's credit, so it refuses the third MiB's reveal and the fill
+/// against the stream's credit, so it refuses the third MiB's reveal and the fill
 /// stops after two MiB. The step's landing covers one MiB. The next leg pays the
 /// rest in one voucher that also folds the third MiB's reveal, which the raised
 /// deposit still cannot cover, so the upstream refuses it. No byte was verified
@@ -14186,7 +14195,7 @@ async fn a_landing_short_of_the_owed_debt_ends_the_fill_after_one_step() -> Resu
         "the one step raises the deposit by exactly what landed"
     );
 
-    // The upstream sends only against the lane's credit, so the store holds
+    // The upstream sends only against the stream's credit, so the store holds
     // what the deposit paid for before the refusals, and not the whole blob.
     anyhow::ensure!(
         !fixture.engine.present_ranges(hash).await?.is_complete(),

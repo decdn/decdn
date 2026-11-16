@@ -286,16 +286,12 @@ fn default_config_template_covers_every_wired_field() {
 
     let config::types::PaymentConfig {
         rate_per_mb,
-        backfill_window,
-        backfill_divisor,
         frame_target_bytes,
         voucher_commit_interval_ms,
     } = &config::types::PaymentConfig::default();
     let payment = [
         ("rate_per_mb =", rate_per_mb.is_none()),
-        ("backfill_window =", backfill_window.is_none()),
         ("frame_target_bytes =", frame_target_bytes.is_none()),
-        ("backfill_divisor =", backfill_divisor.is_none()),
         (
             "voucher_commit_interval_ms =",
             voucher_commit_interval_ms.is_none(),

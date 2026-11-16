@@ -1,15 +1,15 @@
 use super::*;
 
-/// A lane loaded from the store keeps its credit: the claim covers the signed
-/// bytes AND the chunks its chain proved, and the persisted delivered count says
-/// how much of it the node has already sent. The difference survives the restart
-/// (ADR 003 § Credit Window), so a payer's prepayment is not lost with the process.
+/// A lane loaded from the store starts with every paid byte claimed: its paid
+/// bytes cover the signed bytes AND the chunks its chain proved, and no stream
+/// of the new process may draw a payment made before the load (ADR 003 §
+/// Credit Window). Credit lives with the streams that claimed it.
 #[tokio::test]
-async fn a_loaded_lane_keeps_its_credit_across_a_restart() {
+async fn a_loaded_lane_has_nothing_left_to_claim() {
     use decdn_incentive::chain::{CHUNK_BYTES, preimage_at, root_from_seed};
 
     let seed = B256::repeat_byte(0x5E);
-    let mut lane = LaneState::hydrate(
+    let lane = LaneState::hydrate(
         B256::repeat_byte(0x21),
         Address::repeat_byte(0x33),
         Address::repeat_byte(0x55),
@@ -27,7 +27,6 @@ async fn a_loaded_lane_keeps_its_credit_across_a_restart() {
     );
     let owed_bytes = lane.owed_bytes();
     assert_eq!(owed_bytes, U256::from(8 * CHUNK_BYTES));
-    lane.set_delivered_bytes(2 * CHUNK_BYTES);
 
     let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new());
     store.record(&lane).expect("record the seeded lane");
@@ -39,13 +38,18 @@ async fn a_loaded_lane_keeps_its_credit_across_a_restart() {
         .get(&lane.key())
         .map(|e| Arc::clone(e.value()))
         .expect("the handler loads the stored lane");
-    let guard = loaded.lock().await;
-    assert_eq!(
-        guard.state.credit_bytes(),
-        6 * CHUNK_BYTES,
-        "the paid claim minus the delivered count is the lane's credit"
-    );
+    let mut guard = loaded.lock().await;
     assert_eq!(guard.paid_bytes, owed_bytes);
+    assert_eq!(
+        guard.unclaimed(),
+        0,
+        "a loaded lane holds no unclaimed payment"
+    );
+    assert_eq!(
+        guard.claim(CHUNK_BYTES),
+        0,
+        "a proof replayed after the load claims nothing"
+    );
 }
 
 /// A client that sends garbage on the proof stream is a peer fault, not a node
@@ -73,9 +77,6 @@ async fn a_malformed_or_unexpected_proof_frame_is_attributed_to_the_peer() {
         .expect("the frame is whole")
         .expect_err("an undecodable body must fail");
     assert!(wire::is_peer_attributable(&e), "unexpected: {e:#}");
-    // The frame is consumed, so the drain must surface it rather than leave it
-    // for a later read that never sees it.
-    assert!(UnusableProofFrame::is(&e), "unexpected: {e:#}");
     assert!(
         reader.buf.is_empty(),
         "a bad frame must not wedge the buffer"
@@ -94,7 +95,6 @@ async fn a_malformed_or_unexpected_proof_frame_is_attributed_to_the_peer() {
         .expect("the frame is whole")
         .expect_err("a non-proof message must fail");
     assert!(wire::is_peer_attributable(&e), "unexpected: {e:#}");
-    assert!(UnusableProofFrame::is(&e), "unexpected: {e:#}");
 }
 
 /// A frame must never cross a payment-chunk boundary, whatever the configured
@@ -179,11 +179,11 @@ async fn frame_target_room_floor_matches_the_pull_slack() {
     );
 }
 
-/// A lane with no credit must not be asked for a full frame. On the cache-miss
-/// leg the producer is fed by an upstream pull that draws only what the lane has
-/// paid for, so a large request parks on bytes that only a payment can unblock.
-/// The room cap, the lane's credit, keeps the request satisfiable; the floor keeps
-/// it from degenerating to a single byte.
+/// A stream with no credit must not be asked for a full frame. On the cache-miss
+/// leg the producer is fed by an upstream pull that draws only what the stream
+/// has paid for, so a large request parks on bytes that only a payment can
+/// unblock. The room cap, the stream's credit, keeps the request satisfiable;
+/// the floor keeps it from degenerating to a single byte.
 #[tokio::test]
 async fn an_empty_lane_yields_a_short_frame_not_a_full_one() {
     let metrics = Arc::new(Metrics::new());
@@ -1409,7 +1409,7 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
 /// The mid-stream solvency re-check stops at the refundable floor `M`: delivery
 /// continues while the pool's remaining deposit sits above `M` and stops once it
 /// reaches `M`. `M` covers every voucher in flight, so no other bound applies: the
-/// node sends only what a lane has paid for (ADR 003 § Pool solvency).
+/// node sends only what a stream has paid for (ADR 003 § Pool solvency).
 #[tokio::test]
 async fn pool_funds_committed_stops_at_the_floor() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
@@ -1912,10 +1912,8 @@ async fn lane_activity_clock_ages_reports_stamped_and_omits_unstamped() {
                 decdn_incentive::LaneChain::NONE,
             ),
             paid_bytes: U256::ZERO,
+            claimed: U256::ZERO,
             last_voucher_at: AtomicU64::new(stamp),
-            unclean_ends: HashMap::new(),
-            backfilled_bytes: 0,
-            credit_tx: tokio::sync::watch::Sender::new(0),
             last_credit_conn: None,
         }))
     };
@@ -2026,199 +2024,63 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
 }
 
 // ---------------------------------------------------------------------------
-// Backfill accounting (ADR 003 § Credit Window): `note_unclean_end` +
-// `take_backfill` on a lone `LaneDeliveryState`, no handler or wire involved.
+// Stream claims (ADR 003 § Credit Window): `LaneDeliveryState::claim` on a lone
+// delivery state, no handler or wire involved.
 // ---------------------------------------------------------------------------
 
-/// One voucher accounting interval, the unit the backfill numbers below count in.
 const MIB: u64 = 1 << 20;
 
-/// A delivery state over a lane whose claim covers `paid` bytes, `delivered` of
-/// which the node has already sent. Built through [`LaneDeliveryState::hydrated`],
-/// so `paid_bytes` is exactly what a restart would compute from the claim.
-fn delivery_state(paid: u64, delivered: u64) -> LaneDeliveryState {
-    let signature = if paid == 0 { None } else { Some([9u8; 65]) };
-    let mut state = LaneState::hydrate(
+/// A delivery state over a fresh lane that has since been paid `paid` bytes.
+fn paid_lane(paid: u64) -> LaneDeliveryState {
+    let state = LaneState::hydrate(
         B256::repeat_byte(0x21),
         Address::repeat_byte(0x33),
         Address::repeat_byte(0x55),
         U256::MAX,
         u64::MAX,
-        U256::from(paid),
-        U256::from(paid),
-        signature,
+        U256::ZERO,
+        U256::ZERO,
+        None,
         decdn_incentive::LaneChain::NONE,
     );
-    state.set_delivered_bytes(delivered);
-    LaneDeliveryState::hydrated(state)
+    let mut lane = LaneDeliveryState::hydrated(state);
+    lane.paid_bytes = U256::from(paid);
+    lane
 }
 
-/// A distinct blob hash per index, for the multi-entry backfill tests.
-fn hash_n(n: u64) -> Hash {
-    Hash::new(n.to_le_bytes())
-}
-
-/// The happy path: a resume that starts before the remembered unclean end gets
-/// the whole gap back, when the gap sits inside both the lane's allowance
-/// (`paid / divisor`) and the per-backfill window — and the remembered end is
-/// consumed, so the same gap cannot be drawn twice.
+/// Each stream's claim is granted out of what the lane paid and no stream has
+/// claimed, so the order sibling streams' proofs arrive in moves no payment
+/// from one stream to another.
 #[test]
-fn a_backfill_returns_the_whole_gap_within_allowance_and_window() {
-    let mut lane = delivery_state(64 * MIB, 10 * MIB);
-    let credit_before = lane.state.credit_bytes();
-    lane.note_unclean_end(hash_n(1), 8 * MIB);
-
-    // Gap of 2 MiB; allowance 64/16 = 4 MiB; window 4 MiB: the gap binds.
-    let granted = lane.take_backfill(hash_n(1), 6 * MIB, 4 * MIB, 16);
-    assert_eq!(granted, 2 * MIB, "the grant is exactly the gap");
+fn claims_split_a_lane_payment_in_any_arrival_order() {
+    // Stream B's later reveal folds A's chunk into the lane's paid bytes before
+    // A's own reveal arrives. Each still claims its own one chunk.
+    let mut lane = paid_lane(2 * MIB);
+    assert_eq!(lane.claim(MIB), MIB, "B claims its chunk");
     assert_eq!(
-        lane.state.credit_bytes(),
-        credit_before + 2 * MIB,
-        "the gap returns to the lane's credit"
+        lane.claim(MIB),
+        MIB,
+        "A's late reveal still claims its chunk"
     );
-    assert_eq!(lane.backfilled_bytes, 2 * MIB);
-
-    // The remembered end was consumed with the grant.
-    assert_eq!(
-        lane.take_backfill(hash_n(1), 6 * MIB, 4 * MIB, 16),
-        0,
-        "a consumed unclean end grants nothing again"
-    );
+    assert_eq!(lane.unclaimed(), 0);
 }
 
-/// The allowance bound, at its exact boundary: a lane's backfills accumulate in
-/// `backfilled_bytes` against `paid / divisor` in total, so repeated unclean
-/// ends spend the allowance down and a lane cannot farm credit by cycling
-/// unclean streams — once the allowance is spent, further backfills grant zero.
+/// A replayed or overstated claim draws only what the lane has paid and no
+/// stream has claimed, never more than the lane's payment in total.
 #[test]
-fn repeated_backfills_spend_the_allowance_down_to_zero() {
-    // paid 64 MiB at divisor 64: the lane's whole allowance is exactly 1 MiB.
-    let mut lane = delivery_state(64 * MIB, 32 * MIB);
-    let window = 8 * MIB;
-
-    // First unclean end: half the allowance.
-    lane.note_unclean_end(hash_n(1), 4 * MIB);
-    assert_eq!(
-        lane.take_backfill(hash_n(1), 4 * MIB - MIB / 2, window, 64),
-        MIB / 2,
-        "the first backfill grants its whole half-MiB gap"
-    );
-
-    // Second: a 1 MiB gap, but only the other half of the allowance is left —
-    // the exact boundary, spending the allowance to zero.
-    lane.note_unclean_end(hash_n(2), 4 * MIB);
-    assert_eq!(
-        lane.take_backfill(hash_n(2), 3 * MIB, window, 64),
-        MIB / 2,
-        "the second backfill is capped at the remaining allowance"
-    );
-    assert_eq!(lane.backfilled_bytes, MIB, "the whole allowance is spent");
-
-    // Third: the allowance is spent, so farming further unclean ends yields 0.
-    lane.note_unclean_end(hash_n(3), 4 * MIB);
-    assert_eq!(
-        lane.take_backfill(hash_n(3), 2 * MIB, window, 64),
-        0,
-        "a spent allowance grants nothing, whatever the gap"
-    );
+fn a_claim_never_draws_past_the_lane_payment() {
+    let mut lane = paid_lane(MIB + MIB / 2);
+    assert_eq!(lane.claim(MIB), MIB);
+    assert_eq!(lane.claim(MIB), MIB / 2, "only what is left unclaimed");
+    assert_eq!(lane.claim(MIB), 0, "a replay claims nothing");
+    assert_eq!(lane.claim(u64::MAX), 0, "nor does an overstated share");
 }
 
-/// The per-backfill window caps one grant below both the gap and the allowance.
+/// A proof that assigns nothing to its stream, such as an anchor voucher,
+/// claims nothing and leaves the payment for the stream it pays.
 #[test]
-fn a_backfill_is_capped_at_the_window() {
-    let mut lane = delivery_state(64 * MIB, 32 * MIB);
-    lane.note_unclean_end(hash_n(1), 9 * MIB);
-    // Gap 8 MiB, allowance 64/4 = 16 MiB, window 1 MiB: the window binds.
-    assert_eq!(lane.take_backfill(hash_n(1), MIB, MIB, 4), MIB);
-    assert_eq!(lane.backfilled_bytes, MIB);
-}
-
-/// A fresh lane has been paid nothing, so its allowance is zero and an unclean
-/// end on it grants no backfill.
-#[test]
-fn a_fresh_lane_with_nothing_paid_grants_no_backfill() {
-    let mut lane = delivery_state(0, 0);
-    lane.note_unclean_end(hash_n(1), 2 * MIB);
-    assert_eq!(lane.take_backfill(hash_n(1), 0, 4 * MIB, 64), 0);
-    assert_eq!(lane.backfilled_bytes, 0);
-}
-
-/// A divisor of zero turns backfill off: the gap is remembered but grants
-/// nothing, and no allowance is spent.
-#[test]
-fn a_zero_divisor_turns_backfill_off() {
-    let mut lane = delivery_state(64 * MIB, 32 * MIB);
-    lane.note_unclean_end(hash_n(1), 2 * MIB);
-    assert_eq!(lane.take_backfill(hash_n(1), 0, 4 * MIB, 0), 0);
-    assert_eq!(lane.backfilled_bytes, 0);
-}
-
-/// A clean close leaves no remembered end, so a later stream on the same blob
-/// draws no backfill.
-#[test]
-fn a_clean_close_grants_no_backfill() {
-    let mut lane = delivery_state(64 * MIB, 32 * MIB);
-    assert_eq!(lane.take_backfill(hash_n(1), 0, 4 * MIB, 64), 0);
-    assert_eq!(lane.backfilled_bytes, 0);
-}
-
-/// The refund clamp: a backfill returns at most the bytes the lane was actually
-/// sent, so the lane's credit can never exceed what it paid for — and only the
-/// APPLIED amount counts against the allowance.
-#[test]
-fn a_backfill_is_clamped_to_the_bytes_the_lane_was_sent() {
-    // Only 256 KiB delivered, but a 2 MiB gap remembered.
-    let delivered = 256 * 1024;
-    let mut lane = delivery_state(64 * MIB, delivered);
-    lane.note_unclean_end(hash_n(1), 2 * MIB);
-    let granted = lane.take_backfill(hash_n(1), 0, 4 * MIB, 16);
-    assert_eq!(
-        granted, delivered,
-        "the grant is clamped to delivered bytes"
-    );
-    assert_eq!(
-        lane.state.delivered_bytes(),
-        0,
-        "the clamped refund gives back every delivered byte and no more"
-    );
-    assert_eq!(
-        lane.backfilled_bytes, delivered,
-        "only the applied amount spends the allowance"
-    );
-}
-
-/// The eviction bound: a lane remembers at most [`MAX_UNCLEAN_ENDS_PER_LANE`]
-/// unclean ends, and one more evicts exactly ONE remembered end — never the
-/// whole map — while the newest entry is kept.
-#[test]
-fn the_sixty_fifth_unclean_end_evicts_exactly_one_remembered_end() {
-    let mut lane = delivery_state(64 * MIB, 32 * MIB);
-    let max = u64::try_from(MAX_UNCLEAN_ENDS_PER_LANE).expect("64 fits u64");
-    for n in 0..max {
-        lane.note_unclean_end(hash_n(n), MIB);
-    }
-    assert_eq!(lane.unclean_ends.len(), MAX_UNCLEAN_ENDS_PER_LANE);
-
-    lane.note_unclean_end(hash_n(max), MIB);
-    assert_eq!(
-        lane.unclean_ends.len(),
-        MAX_UNCLEAN_ENDS_PER_LANE,
-        "one entry is evicted for the one inserted"
-    );
-    assert!(
-        lane.unclean_ends.contains_key(&hash_n(max)),
-        "the newest unclean end is the one kept"
-    );
-    let survivors = (0..max)
-        .filter(|&n| lane.unclean_ends.contains_key(&hash_n(n)))
-        .count();
-    assert_eq!(
-        survivors,
-        MAX_UNCLEAN_ENDS_PER_LANE - 1,
-        "exactly one earlier entry was evicted, not the whole map"
-    );
-
-    // A re-noted KNOWN hash evicts nothing: the map is already at its bound.
-    lane.note_unclean_end(hash_n(max), 2 * MIB);
-    assert_eq!(lane.unclean_ends.len(), MAX_UNCLEAN_ENDS_PER_LANE);
+fn a_zero_share_claims_nothing() {
+    let mut lane = paid_lane(MIB);
+    assert_eq!(lane.claim(0), 0);
+    assert_eq!(lane.unclaimed(), MIB);
 }

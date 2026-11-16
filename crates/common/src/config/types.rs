@@ -917,19 +917,6 @@ pub enum S3Credentials {
 pub struct PaymentConfig {
     /// Rate per MB in USDC base units.
     pub rate_per_mb: Option<u64>,
-    /// The most bytes one backfill returns to a lane's credit (ADR 003 § Credit
-    /// Window). A payer that resumes a stream that ended without a clean close gets
-    /// the gap between its resume offset and the node's remembered end offset back
-    /// as credit, up to this many bytes. Absent =>
-    /// [`crate::config::DEFAULT_BACKFILL_WINDOW`] (4 MiB). It is node-local config,
-    /// not a wire field and not a governance-owned parameter.
-    pub backfill_window: Option<decdn_config_types::Bytes>,
-    /// A lane's total backfill allowance is `paid / backfill_divisor` bytes, less
-    /// earlier backfills (ADR 003 § Credit Window). Absent =>
-    /// [`crate::config::DEFAULT_BACKFILL_DIVISOR`] (64), so a payer that claims a
-    /// drop at every resume takes at most 1.6% of its paid bytes again. `0` turns
-    /// backfill off. It is node-local config.
-    pub backfill_divisor: Option<u64>,
     /// Target wire-frame size for the serve path, in bytes (ADR 005
     /// §`cdn/client/v1`). Absent => [`crate::config::DEFAULT_FRAME_TARGET_BYTES`]
     /// (1 MiB). Must be > 0.

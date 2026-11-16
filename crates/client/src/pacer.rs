@@ -41,7 +41,7 @@ pub const VERIFY_LAG_BYTES: u64 = CHUNK_GROUP_BYTES;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DownstreamFrontier {
     /// The downstream frontier the pull may run ahead of: on the node's pull
-    /// leg, the content frontier the downstream lane has paid for
+    /// leg, the content frontier the downstream stream has paid for
     /// ([`CreditPacer`]); on the client streamer, the consumer's read cursor
     /// ([`WindowPacer`]). Paired with [`PaceState::pulled_frontier`] for the
     /// bound check.
@@ -114,7 +114,7 @@ pub enum PaceDecision {
     /// source priced out at the current deposit.
     Refuse,
     /// The pull has run its full bound ahead of the downstream `served_paid`
-    /// frontier ([`WindowPacer`]'s window, or the lane credit plus
+    /// frontier ([`WindowPacer`]'s window, or the stream's credit plus
     /// [`PULL_AHEAD_BYTES`] that [`CreditPacer`] paces) and no serve leg is
     /// parked at its frontier: pause and re-decide once either
     /// [`PaceState::downstream`] frontier advances. [`BudgetPacer`] never
@@ -295,7 +295,7 @@ impl Pacer for WindowPacer {
 
 /// The most content the node's pull leg draws past the downstream credit
 /// frontier ([`DownstreamFrontier::served_paid`]): three bao chunk groups. Two
-/// cover the roundings between what the lane has paid for and what the pull may
+/// cover the roundings between what the stream has paid for and what the pull may
 /// fetch ([`content_paid_frontier`](crate::sink::content_paid_frontier) floors
 /// the paid wire to a group, and [`CreditPacer`] floors its room to whole
 /// groups). The third covers the leaf the serve leg's encoder reads to finish
@@ -313,11 +313,10 @@ pub const PULL_AHEAD_BYTES: u64 = 3 * CHUNK_GROUP_BYTES;
 pub const MIN_CREDIT_DRAW: u64 = CHUNK_BYTES / 2;
 
 /// The node pull-leg's pacing policy on a cache miss (ADR 003 § Credit Window,
-/// ADR 037): the pull draws only what the downstream lane has paid for. The pull
-/// never runs further ahead of [`DownstreamFrontier::served_paid`] than
-/// [`PULL_AHEAD_BYTES`], and it draws nothing while the lane holds no credit for
-/// this stream. A payer that never pays therefore costs the node no upstream
-/// payment.
+/// ADR 037): the pull draws only what the downstream stream has paid for. The
+/// pull never runs further ahead of [`DownstreamFrontier::served_paid`] than
+/// [`PULL_AHEAD_BYTES`], and it draws nothing while the stream holds no credit.
+/// A payer that never pays therefore costs the node no upstream payment.
 ///
 /// The pacer reuses [`BudgetPacer`] for the money decisions, as [`WindowPacer`]
 /// does, and it only shapes a `Draw`.
@@ -325,7 +324,7 @@ pub const MIN_CREDIT_DRAW: u64 = CHUNK_BYTES / 2;
 pub struct CreditPacer {
     /// The ABSOLUTE content offset the downstream stream starts paying from, the
     /// fill session's served start. `served_paid` is an absolute frontier that
-    /// starts here, so it has moved past it only once the lane holds credit.
+    /// starts here, so it has moved past it only once the stream holds credit.
     pub paid_base: u64,
 }
 

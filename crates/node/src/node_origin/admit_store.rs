@@ -200,13 +200,15 @@ impl IngestStore for NodeAdmitStore {
                         return Err(fault);
                     }
                     // No parked fault means the bytes themselves failed to verify
-                    // (a dishonest upstream). Surface the typed corruption sentinel
-                    // `pull_verdict` / `is_bao_corruption` understand.
+                    // (a dishonest upstream). The paid pull books the upstream's
+                    // failed delivery, and the error is the typed corruption
+                    // sentinel `pull_verdict` / `is_bao_corruption` understand.
                     if matches!(
                         cache_err,
                         decdn_cache::CacheError::VerifyFailed { .. }
                             | decdn_cache::CacheError::HashMismatch { .. }
                     ) {
+                        reader.note_failed_delivery();
                         return Err(anyhow::Error::new(decdn_client::HashMismatch));
                     }
                     Err(anyhow::Error::from(cache_err))

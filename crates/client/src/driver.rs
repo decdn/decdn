@@ -977,18 +977,11 @@ where
     // opens after a fault left a voucher armed must not count that voucher as
     // its own payment once its first voucher builds on it.
     //
-    // Why the PAID frontier and not the store's DELIVERED frontier: `ingest_stream`
-    // checkpoints delivered+verified bytes payment-agnostically (ADR 003's credit
-    // window lets the node stream up to a full interval before the voucher that
-    // pays for it is due), so a leg can leave the present-range
-    // frontier AHEAD of the last PAID byte — and the whole blob can be delivered in
-    // one leg while only part is paid. Gating on delivery would `Done` before the
-    // tail is billed (under-pay). `content_paid_frontier` maps the wire an accepted
-    // voucher covered on THIS leg back to the largest chunk-group content boundary
-    // provably inside it, so completion tracks payment and the resumed open
-    // re-delivers (idempotently) and re-bills the tail. Fresh / cross-invocation
-    // resume: `paid_wire == 0`, frontier collapses to the leg start (the disk
-    // frontier), nothing already-paid is re-pulled (the `cli_fetch_resume` property).
+    // Completion and resume follow the store's verified delivered frontier: the
+    // payer pays ahead of delivery (ADR 003 § Credit Window), so every byte the
+    // store holds is paid, and a byte the store holds is never fetched or paid
+    // again. Fresh / cross-invocation resume opens at the disk frontier (the
+    // `cli_fetch_resume` property).
     counters.leg_anchor = None;
 
     // The last leg that finished cleanly, with the gap's two frontiers as the pass
@@ -1068,7 +1061,7 @@ where
             .get_or_insert((gap_start, ledger.settlement().bytes));
         let paid_wire_this_leg =
             u64::try_from(committed.bytes.saturating_sub(leg_baseline)).unwrap_or(u64::MAX);
-        // The payer pays ahead of delivery, so the lane's payment runs at or
+        // The payer pays ahead of delivery, so each stream's payment runs at or
         // past what it received. Completion and resume therefore follow the
         // verified frontier, which is the store's contiguous delivered
         // frontier: a byte the payer prepaid and has not received is not
@@ -1394,21 +1387,8 @@ where
                     //    ([`crate::classify`]). Whatever ended it, the payer
                     //    pays ahead of delivery, so a leg cut short leaves no
                     //    verified byte unpaid: the lane's next drive, if it
-                    //    runs again, opens at the verified frontier and draws
-                    //    the credit the lane still holds.
-                    // A decode that proves the node's bytes corrupt is the node
-                    // not delivering against the credit it took: write the held
-                    // credit and the corrupt bytes off at this reconciliation.
-                    // A disconnect or a cancel is not one; a silent stall wrote
-                    // itself off inside the pull.
-                    if err.downcast_ref::<crate::HashMismatch>().is_some() {
-                        let written = ledger.write_off_prepaid();
-                        tracing::warn!(
-                            written_off_bytes = written,
-                            "corrupt bytes proved; wrote the lane's counted credit \
-                             and unverified bytes off"
-                        );
-                    }
+                    //    runs again, opens at the verified frontier. The leg's
+                    //    own end booked any write-off (`UpstreamPull::settle`).
                     return Err(err);
                 }
 

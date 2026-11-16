@@ -1417,7 +1417,6 @@ const MIB: u64 = 1 << 20;
 async fn a_rebase_never_moves_below_the_price_of_verified_bytes() -> anyhow::Result<()> {
     let ledger = PoolLedger::new(Cumulative::default());
     ledger.note_rate(10);
-    ledger.note_prepaid(4 * MIB);
     // 4 MiB paid at 10 base units per MiB.
     ledger
         .issue(4 * MIB, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
@@ -1451,96 +1450,14 @@ fn node() -> Arc<crate::payer_window::NodeTrust> {
         .node(alloy::primitives::Address::repeat_byte(9))
 }
 
-/// Payment adds to the lane's credit and every received byte spends it, so a
-/// later stream on the lane reads what the earlier one left.
+/// Bytes a lane verifies feed the operator's shared track record, which every
+/// lane at that operator reads to size its window.
 #[test]
-fn received_bytes_spend_the_credit_the_lane_holds() {
-    let trust = node();
-    let ledger = lane_at(&trust);
-    ledger.note_prepaid(5 * MIB);
-    assert_eq!(trust.outstanding(), 5 * MIB);
-    ledger.note_wire(2 * MIB);
-    assert_eq!(ledger.prepaid(), 3 * MIB);
-    assert_eq!(trust.outstanding(), 3 * MIB);
-    ledger.note_wire(10 * MIB);
-    assert_eq!(ledger.prepaid(), 0, "credit never goes below zero");
-    assert_eq!(trust.outstanding(), 0);
-}
-
-/// Two lanes at one operator count against one per-node cap.
-#[test]
-fn lanes_at_one_operator_share_the_outstanding_count() {
+fn verified_bytes_feed_the_operator_record() {
     let trust = node();
     let (a, b) = (lane_at(&trust), lane_at(&trust));
-    a.note_prepaid(30 * MIB);
-    b.note_prepaid(30 * MIB);
-    assert_eq!(trust.outstanding(), 60 * MIB);
-    assert_eq!(trust.cap_room_bytes(10), 4 * MIB);
-}
-
-/// A node that is reached again and does not deliver against the credit it
-/// holds costs the payer that credit and shrinks the node's next window. The
-/// loss is bounded by the window the payer held.
-#[test]
-fn a_lying_node_costs_one_window_and_shrinks_the_next() {
-    let trust = node();
-    trust.note_verified(100 * MIB);
-    let window = trust.window_bytes(10);
-    let ledger = lane_at(&trust);
-    ledger.note_prepaid(window);
-    let written = ledger.write_off_prepaid();
-    assert_eq!(written, window, "the payer loses at most one window");
-    assert_eq!(ledger.prepaid(), 0);
-    assert_eq!(trust.lost(), window);
-    assert!(trust.window_bytes(10) < window, "the next window shrinks");
-}
-
-/// Bytes the node sent that never verified are written off with the credit it
-/// still holds, so corrupt delivery costs the window too.
-#[test]
-fn corrupt_delivery_is_written_off_with_the_held_credit() {
-    let trust = node();
-    let ledger = lane_at(&trust);
-    ledger.note_prepaid(4 * MIB);
-    ledger.note_wire(MIB);
-    ledger.note_verified(0);
-    assert_eq!(ledger.write_off_prepaid(), 4 * MIB);
-    assert_eq!(trust.lost(), 4 * MIB);
-}
-
-/// A lane that verified what it received owes nothing for it.
-#[test]
-fn verified_bytes_are_not_at_risk() {
-    let trust = node();
-    let ledger = lane_at(&trust);
-    ledger.note_prepaid(2 * MIB);
-    ledger.note_wire(2 * MIB);
-    ledger.note_verified(2 * MIB);
-    assert_eq!(ledger.write_off_prepaid(), 0);
-    assert_eq!(trust.lost(), 0);
-    assert_eq!(trust.verified(), 2 * MIB);
-}
-
-/// A disconnect, a cancel or a rejected proof is not a write-off: the credit
-/// leaves the payer's view without touching the node's lost count.
-#[test]
-fn forgetting_credit_is_not_a_write_off() {
-    let trust = node();
-    let ledger = lane_at(&trust);
-    ledger.note_prepaid(8 * MIB);
-    ledger.forget_prepaid();
-    assert_eq!(ledger.prepaid(), 0);
-    assert_eq!(trust.outstanding(), 0);
-    assert_eq!(trust.lost(), 0);
-}
-
-#[test]
-fn dropping_a_ledger_releases_its_outstanding_credit() {
-    let trust = node();
-    let ledger = lane_at(&trust);
-    ledger.note_prepaid(8 * MIB);
-    assert_eq!(trust.outstanding(), 8 * MIB);
-    drop(ledger);
-    assert_eq!(trust.outstanding(), 0);
+    a.note_verified(2 * MIB);
+    b.note_verified(3 * MIB);
+    assert_eq!(trust.verified(), 5 * MIB);
     assert_eq!(trust.lost(), 0);
 }

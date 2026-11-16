@@ -1709,8 +1709,6 @@ fn resolve_payment_rejects_zero_from_file() -> anyhow::Result<()> {
     let cli = crate::cli::run::PaymentArgs { rate_per_mb: None };
     let file = types::PaymentConfig {
         rate_per_mb: Some(0),
-        backfill_window: None,
-        backfill_divisor: None,
         frame_target_bytes: None,
         voucher_commit_interval_ms: None,
     };
@@ -1756,8 +1754,6 @@ fn resolve_payment_cli_overrides_file_and_passes_nonzero() -> anyhow::Result<()>
     };
     let file = types::PaymentConfig {
         rate_per_mb: Some(0),
-        backfill_window: None,
-        backfill_divisor: None,
         frame_target_bytes: None,
         voucher_commit_interval_ms: None,
     };
@@ -1776,16 +1772,6 @@ fn resolve_payment_defaults_when_unset() -> anyhow::Result<()> {
         resolved.rate_per_mb
     );
     anyhow::ensure!(
-        resolved.backfill_window == DEFAULT_BACKFILL_WINDOW,
-        "backfill_window default, got: {}",
-        resolved.backfill_window
-    );
-    anyhow::ensure!(
-        resolved.backfill_divisor == DEFAULT_BACKFILL_DIVISOR,
-        "backfill_divisor default, got: {}",
-        resolved.backfill_divisor
-    );
-    anyhow::ensure!(
         resolved.voucher_commit_interval_ms == DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
         "voucher_commit_interval_ms default, got: {}",
         resolved.voucher_commit_interval_ms
@@ -1800,8 +1786,6 @@ fn resolve_payment_threads_explicit_commit_interval() -> anyhow::Result<()> {
     for set in [Some(20u64), Some(1_000)] {
         let file = types::PaymentConfig {
             rate_per_mb: Some(10),
-            backfill_window: None,
-            backfill_divisor: None,
             frame_target_bytes: None,
             voucher_commit_interval_ms: set,
         };
@@ -1824,58 +1808,6 @@ fn resolve_payment_rejects_zero_commit_interval() -> anyhow::Result<()> {
     let err = resolve_payment(&empty_payment_args(), Some(&file))
         .expect_err("zero flush interval must be rejected");
     anyhow::ensure!(err.to_string().contains("voucher_commit_interval_ms"));
-    Ok(())
-}
-
-#[test]
-fn resolve_payment_defaults_backfill_window_and_divisor() -> anyhow::Result<()> {
-    let resolved = resolve_payment(&empty_payment_args(), None)?;
-    anyhow::ensure!(
-        resolved.backfill_window == 4 * 1024 * 1024,
-        "got: {}",
-        resolved.backfill_window
-    );
-    anyhow::ensure!(
-        resolved.backfill_divisor == 64,
-        "got: {}",
-        resolved.backfill_divisor
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_payment_threads_explicit_backfill_window_and_divisor() -> anyhow::Result<()> {
-    let file = types::PaymentConfig {
-        rate_per_mb: Some(10),
-        backfill_window: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
-        backfill_divisor: Some(5),
-        frame_target_bytes: None,
-        voucher_commit_interval_ms: None,
-    };
-    let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
-    anyhow::ensure!(
-        resolved.backfill_window == 32 * 1024 * 1024,
-        "backfill_window threaded, got: {}",
-        resolved.backfill_window
-    );
-    anyhow::ensure!(
-        resolved.backfill_divisor == 5,
-        "backfill_divisor threaded, got: {}",
-        resolved.backfill_divisor
-    );
-    Ok(())
-}
-
-/// A backfill divisor of `0` turns backfill off, so it threads through as a
-/// first-class value rather than falling back to the default.
-#[test]
-fn resolve_payment_threads_a_zero_backfill_divisor() -> anyhow::Result<()> {
-    let file = types::PaymentConfig {
-        backfill_divisor: Some(0),
-        ..Default::default()
-    };
-    let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
-    anyhow::ensure!(resolved.backfill_divisor == 0);
     Ok(())
 }
 
@@ -6101,16 +6033,6 @@ fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The shipped backfill defaults are 4 MiB and a divisor of 64. They are literals,
-/// not the constants: asserting a value against the constant it came from passes
-/// whatever the constant says, and the defaults are documented in several places
-/// that have to agree with it.
-#[test]
-fn backfill_defaults_are_four_mib_and_sixty_four() {
-    assert_eq!(DEFAULT_BACKFILL_WINDOW, 4 * 1024 * 1024);
-    assert_eq!(DEFAULT_BACKFILL_DIVISOR, 64);
-}
-
 #[test]
 fn buyer_working_deposit_defaults_when_absent() -> anyhow::Result<()> {
     let dir = data_dir_with_keystore()?;
@@ -6425,8 +6347,6 @@ fn resolve_payment_cli_rate_overrides_file_rate() -> anyhow::Result<()> {
     };
     let file = types::PaymentConfig {
         rate_per_mb: Some(1),
-        backfill_window: None,
-        backfill_divisor: None,
         frame_target_bytes: None,
         voucher_commit_interval_ms: None,
     };
@@ -6440,8 +6360,6 @@ fn resolve_payment_uses_file_when_cli_absent() -> anyhow::Result<()> {
     let cli = empty_payment_args();
     let file = types::PaymentConfig {
         rate_per_mb: Some(50),
-        backfill_window: None,
-        backfill_divisor: None,
         frame_target_bytes: None,
         voucher_commit_interval_ms: None,
     };

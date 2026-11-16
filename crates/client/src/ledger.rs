@@ -550,21 +550,6 @@ pub struct PoolLedger {
     /// The `ChunkData` payload bytes this lane's streams read, verified or
     /// not ([`Self::wire_bytes`]).
     wire: AtomicU64,
-    /// Bytes this lane has paid for that no stream has received yet: the credit
-    /// the node holds for the lane ([`Self::prepaid`]). Payment adds to it and
-    /// every received frame spends it, so it is the payer's view of the node's
-    /// lane credit, and a later stream on the lane draws on it with no payment
-    /// of its own. The node debits its credit when it sends, so after an
-    /// unclean stream end this count runs above the node's by the bytes lost
-    /// in flight, until a reconciliation writes them off.
-    prepaid: AtomicU64,
-    /// Ticks each time [`Self::prepaid`] falls: a stream received bytes, or the
-    /// lane dropped its credit. A stream blocked on a read pays again when it
-    /// ticks, because a sibling may have spent the credit it was counting on.
-    prepaid_fell: tokio::sync::watch::Sender<u64>,
-    /// Bytes this lane's streams received that no decoder has verified yet. A
-    /// provable corruption writes them off with the credit still held.
-    unverified: AtomicU64,
     /// Bytes this lane's streams verified since the ledger was built. A rebase
     /// never moves the ledger below their price ([`Self::verified_floor`]).
     lane_verified: AtomicU64,
@@ -615,12 +600,6 @@ pub(crate) fn merge_spans(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
         .collect()
 }
 
-impl Drop for PoolLedger {
-    fn drop(&mut self) {
-        self.release_outstanding();
-    }
-}
-
 impl PoolLedger {
     /// Build a ledger seeded from the lane's persisted cumulative state (the
     /// last voucher issued on earlier streams/invocations). Pass
@@ -653,9 +632,6 @@ impl PoolLedger {
             send_deadline: VOUCHER_SEND_DEADLINE,
             evidence: OnceLock::new(),
             wire: AtomicU64::new(0),
-            prepaid: AtomicU64::new(0),
-            prepaid_fell: tokio::sync::watch::Sender::new(0),
-            unverified: AtomicU64::new(0),
             lane_verified: AtomicU64::new(0),
             quoted_rate: AtomicU64::new(0),
             trust: OnceLock::new(),
@@ -677,58 +653,16 @@ impl PoolLedger {
         self.trust.get_or_init(NodeTrust::detached)
     }
 
-    /// Bytes this lane has paid for and no stream has received yet.
-    #[must_use]
-    pub fn prepaid(&self) -> u64 {
-        self.prepaid.load(Ordering::Relaxed)
-    }
-
-    /// Count `n` bytes this lane paid ahead of delivery.
-    pub(crate) fn note_prepaid(&self, n: u64) {
-        self.prepaid
-            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                v.saturating_add(n)
-            });
-        self.trust().note_prepaid(n);
-    }
-
-    /// Spend up to `n` bytes of held credit against received delivery.
-    fn spend_prepaid(&self, n: u64) {
-        let spent = self
-            .prepaid
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(n))
-            })
-            .map_or(0, |before| before.min(n));
-        self.trust().note_spent(spent);
-        if spent > 0 {
-            self.note_prepaid_fell();
-        }
-    }
-
-    /// A receiver that ticks each time the lane's prepaid credit falls.
-    pub(crate) fn prepaid_falls(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.prepaid_fell.subscribe()
-    }
-
-    fn note_prepaid_fell(&self) {
-        self.prepaid_fell
-            .send_modify(|tick| *tick = tick.wrapping_add(1));
-    }
-
-    /// Record the rate a stream of this lane was quoted, which prices a later
-    /// write-off against the run's budget.
+    /// Record the rate a stream of this lane was quoted, which prices the
+    /// verified bytes a rebase never moves the ledger below
+    /// ([`Self::verified_floor`]).
     pub(crate) fn note_rate(&self, rate_per_mb: u64) {
         self.quoted_rate.store(rate_per_mb, Ordering::Relaxed);
     }
 
     /// Record `n` bytes a stream of this lane verified: they feed the node's
-    /// verified count and are no longer at risk.
+    /// verified count.
     pub(crate) fn note_verified(&self, n: u64) {
-        self.unverified
-            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                v.saturating_sub(n)
-            });
         self.lane_verified
             .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 v.saturating_add(n)
@@ -751,45 +685,9 @@ impl PoolLedger {
         }
     }
 
-    /// Write off what this lane paid and the node did not deliver: the credit
-    /// it still holds, and the bytes it sent that never verified. Called at
-    /// reconciliation — the node was reached again and did not deliver against
-    /// the credit, or a live stream read nothing for a full floor window while
-    /// the books held credit — and never at a mere disconnect. The node's lost
-    /// count grows, so its next window shrinks. Returns the bytes written off.
-    pub(crate) fn write_off_prepaid(&self) -> u64 {
-        let held = self.prepaid.swap(0, Ordering::Relaxed);
-        self.note_prepaid_fell();
-        let bad = self.unverified.swap(0, Ordering::Relaxed);
-        self.trust()
-            .write_off(held, bad, self.quoted_rate.load(Ordering::Relaxed));
-        held.saturating_add(bad)
-    }
-
-    /// Forget the credit this lane believes the node holds, without a
-    /// write-off. A rejected proof leaves the payer's view of the node's credit
-    /// unknown, and the lane resumes from the node's own watermark.
-    pub(crate) fn forget_prepaid(&self) {
-        let held = self.prepaid.swap(0, Ordering::Relaxed);
-        self.note_prepaid_fell();
-        self.trust().note_spent(held);
-    }
-
     /// The lane's receipt evidence, or `None` when no collector attached one.
     pub(crate) fn evidence(&self) -> Option<&LaneEvidence> {
         self.evidence.get().map(AsRef::as_ref)
-    }
-
-    /// Release this lane's counted credit from the operator record when the
-    /// ledger retires. The record outlives the lane for the whole run; without
-    /// the release, credit stranded on retired lanes accumulates in the
-    /// operator's outstanding total until the per-node cap refuses every
-    /// payment. Not a write-off: nothing is booked lost and the run's budget
-    /// is untouched.
-    fn release_outstanding(&mut self) {
-        if let Some(trust) = self.trust.get() {
-            trust.note_spent(*self.prepaid.get_mut());
-        }
     }
 
     /// The lane's receipt evidence, attaching an empty one first if none is
@@ -920,16 +818,10 @@ impl PoolLedger {
     }
 
     /// Count `n` wire bytes that one of this lane's streams read.
-    /// Every received byte spends the lane's held credit.
     pub(crate) fn note_wire(&self, n: u64) {
         self.wire.update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             v.saturating_add(n)
         });
-        self.spend_prepaid(n);
-        self.unverified
-            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                v.saturating_add(n)
-            });
     }
 
     /// The cumulative a cancelled pull must PERSIST — the drop-path counterpart of
