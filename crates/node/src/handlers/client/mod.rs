@@ -159,8 +159,8 @@ struct LaneDeliveryState {
     /// it gates nothing, and the stamp lifecycle follows the lane row (a
     /// forgotten lane drops it automatically).
     last_voucher_at: AtomicU64,
-    /// Where each stream of this lane that ended without a clean close left
-    /// off, by blob hash (ADR 003 § Credit Window, backfill). In memory only: a
+    /// Where each stream of this lane that ended on a fault left off, by blob
+    /// hash (ADR 003 § Credit Window, backfill). In memory only: a
     /// node restart drops it, and the payer then pays for the gap.
     unclean_ends: HashMap<Hash, u64>,
     /// Bytes of backfill the lane has drawn so far, against its allowance of
@@ -2416,6 +2416,26 @@ pub(super) enum Proof {
     Preimage(decdn_protocol::client::ChunkPreimage),
 }
 
+/// Marks a [`BufferedProofReader::read`] error for a whole frame the reader
+/// consumed and could not use: an undecodable body, or a message that is not a
+/// proof. Its bytes are gone, so a later read never reports it again, unlike a
+/// transport error or a malformed length prefix.
+#[derive(Debug)]
+pub(super) struct UnusableProofFrame;
+
+impl std::fmt::Display for UnusableProofFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unusable proof frame")
+    }
+}
+
+impl UnusableProofFrame {
+    /// Whether `e` reports a frame the reader consumed and could not use.
+    pub(super) fn is(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<Self>().is_some()
+    }
+}
+
 /// Cancellation-safe, buffered reader for `cdn/client/v1` payment-proof frames. Owns
 /// a byte buffer that PERSISTS across [`Self::read`] calls, so a `read` future
 /// dropped mid-frame loses no bytes: any partial frame stays buffered for the
@@ -2515,15 +2535,14 @@ impl BufferedProofReader {
             .get(header_len..total)
             .ok_or_else(|| anyhow::anyhow!("proof frame bounds out of range"))?;
         let decoded = decode_message::<ClientMessage>(payload);
-        let result =
-            match decoded {
-                Ok((ClientMessage::Voucher(v), _)) => Ok(Proof::Voucher(v)),
-                Ok((ClientMessage::ChunkPreimage(p), _)) => Ok(Proof::Preimage(p)),
-                Ok((_, _)) => Err(anyhow::Error::new(wire::PeerFault)
-                    .context("expected ClientMessage::Voucher or ClientMessage::ChunkPreimage")),
-                Err(e) => Err(anyhow::Error::new(wire::PeerFault)
-                    .context(format!("proof decode failed: {e}"))),
-            };
+        let unusable = || anyhow::Error::new(wire::PeerFault).context(UnusableProofFrame);
+        let result = match decoded {
+            Ok((ClientMessage::Voucher(v), _)) => Ok(Proof::Voucher(v)),
+            Ok((ClientMessage::ChunkPreimage(p), _)) => Ok(Proof::Preimage(p)),
+            Ok((_, _)) => Err(unusable()
+                .context("expected ClientMessage::Voucher or ClientMessage::ChunkPreimage")),
+            Err(e) => Err(unusable().context(format!("proof decode failed: {e}"))),
+        };
         self.buf.drain(..total);
         Ok(Some(result))
     }

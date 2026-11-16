@@ -16,8 +16,8 @@ use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::StreamAnchor;
 use super::{
     Address, Arc, B256, BufferedProofReader, ClientHandler, Connection, Hash, LaneDeliveryState,
-    LaneKey, MAX_PROOFS_PER_CHUNK, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
-    VoucherStop,
+    LaneKey, MAX_PROOFS_PER_CHUNK, Mutex, RecvStream, SendStream, U256, UnusableProofFrame,
+    VoucherRejectReason, VoucherStop,
 };
 
 /// What a stream holds for the checks that run before each send: the pool funder
@@ -336,13 +336,19 @@ impl ClientHandler {
     /// waited for its proofs or found them buffered.
     ///
     /// The drain never waits: a partial frame stays buffered for the next read
-    /// (the reader is cancellation-safe), and a read error is left for the
-    /// waiting read in [`Self::acquire_credit`], which is the stream's error
-    /// surface — a transport end is sticky and re-surfaces there when the
-    /// credit falls short.
+    /// (the reader is cancellation-safe). A transport end is left for the
+    /// waiting read in [`Self::acquire_credit`]: it is sticky and re-surfaces
+    /// there when the credit falls short, so a payer that finished its send
+    /// half still draws the credit it paid. An [`UnusableProofFrame`] is
+    /// consumed and never re-surfaces, so the drain returns it as the stream's
+    /// error.
     ///
     /// Returns `Some` when a drained proof was rejected: the stream stops, and
     /// the caller has debited nothing.
+    ///
+    /// # Errors
+    ///
+    /// An [`UnusableProofFrame`] read, or a proof commit that faults.
     #[allow(clippy::too_many_arguments)]
     async fn credit_buffered_proofs(
         &self,
@@ -363,8 +369,12 @@ impl ClientHandler {
             let Some(read) = reader.read(recv).now_or_never() else {
                 return Ok(None);
             };
-            let Ok(proof) = read else {
-                return Ok(None);
+            let proof = match read {
+                Ok(proof) => proof,
+                // The reader consumed the frame, so no later read reports it:
+                // end the stream here, as the waiting read would.
+                Err(e) if UnusableProofFrame::is(&e) => return Err(e),
+                Err(_) => return Ok(None),
             };
             proofs.next_attempt();
             let committed = Box::pin(self.commit_wire_proof(

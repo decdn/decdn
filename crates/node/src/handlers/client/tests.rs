@@ -73,6 +73,9 @@ async fn a_malformed_or_unexpected_proof_frame_is_attributed_to_the_peer() {
         .expect("the frame is whole")
         .expect_err("an undecodable body must fail");
     assert!(wire::is_peer_attributable(&e), "unexpected: {e:#}");
+    // The frame is consumed, so the drain must surface it rather than leave it
+    // for a later read that never sees it.
+    assert!(UnusableProofFrame::is(&e), "unexpected: {e:#}");
     assert!(
         reader.buf.is_empty(),
         "a bad frame must not wedge the buffer"
@@ -91,6 +94,7 @@ async fn a_malformed_or_unexpected_proof_frame_is_attributed_to_the_peer() {
         .expect("the frame is whole")
         .expect_err("a non-proof message must fail");
     assert!(wire::is_peer_attributable(&e), "unexpected: {e:#}");
+    assert!(UnusableProofFrame::is(&e), "unexpected: {e:#}");
 }
 
 /// A frame must never cross a payment-chunk boundary, whatever the configured

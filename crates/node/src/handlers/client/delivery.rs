@@ -209,8 +209,9 @@ impl ClientHandler {
         // the loop, `?` included, passes through the one `PaidProgress` tag: the
         // dispatch sink splits a peer that left into declined or abandoned by it.
         let mut paid: u64 = 0;
-        // Wire bytes this stream wrote. A stream that ends without a clean close
-        // leaves its end offset on the lane for a backfill.
+        // Wire bytes this stream wrote. A stream that ends on a fault leaves its
+        // end offset on the lane for a backfill. A clean end, `StreamEnd` or an
+        // in-band stop, leaves none: its frames arrive before the close.
         let mut delivered: u64 = 0;
         // Refresh recency before the first byte goes out, so a blob still
         // carrying the open-time seed does not rank oldest for eviction while it
@@ -239,7 +240,7 @@ impl ClientHandler {
                 &mut delivered,
             )
             .await;
-        if !matches!(ended, Ok(ServeEnd::Completed { .. })) && delivered > 0 {
+        if ended.is_err() && delivered > 0 {
             let fetch_start = byte_offset - byte_offset % decdn_bao_range::CHUNK_GROUP_BYTES;
             let end =
                 decdn_client::sink::content_paid_frontier(fetch_start, total_bytes, delivered);

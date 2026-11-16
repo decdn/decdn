@@ -112,23 +112,17 @@ impl Default for PayAheadPolicy {
 ///
 /// `window` is the payer's window toward the node, `need` the wire bytes the
 /// stream has left to receive, `held` the credit the lane already holds, and
-/// `room` how much more credit the per-node cap allows. The payer keeps the
-/// lane's held credit at the window, never past the bytes the stream has left
-/// to receive, so no byte of the stream is paid for twice. Credit the lane
-/// already holds counts, so a stream on a funded lane pays nothing of its own
-/// until the credit runs down. A lane with no credit may always take on one
-/// chunk, so another signer's idle credit at the node cannot starve it.
+/// `room` how much more credit the lane may take on ([`lane_room`]). The payer
+/// keeps the lane's held credit at the window, never past the bytes the stream
+/// has left to receive, so no byte of the stream is paid for twice. Credit the
+/// lane already holds counts, so a stream on a funded lane pays nothing of its
+/// own until the credit runs down.
 ///
 /// Whole chunks go out one preimage each. A residual below one chunk goes out
 /// as a closing voucher only when it covers the end of the stream.
 #[must_use]
 pub(crate) fn due(window: u64, need: u64, held: u64, room: u64) -> (u64, u64) {
     let target = window.min(need);
-    let room = if held == 0 {
-        room.max(CHUNK_BYTES)
-    } else {
-        room
-    };
     let want = target.saturating_sub(held);
     let pay = want.min(room);
     let residual = if target == need && pay == want {
@@ -137,6 +131,24 @@ pub(crate) fn due(window: u64, need: u64, held: u64, room: u64) -> (u64, u64) {
         0
     };
     (pay / CHUNK_BYTES, residual)
+}
+
+/// How much more credit a lane holding `lane_credit` may take on, given the
+/// per-node cap leaves `cap_room`.
+///
+/// The node sends no frame smaller than one chunk group, so a lane holding
+/// less than that gets nothing from the node until it pays. Such a lane may
+/// always take on one chunk past the cap, so another lane's idle credit at the
+/// node cannot starve it. The test reads the lane's credit, not one stream's
+/// view of it, so the cap bounds the exemption to one chunk per lane however
+/// many streams the lane opens.
+#[must_use]
+pub(crate) fn lane_room(cap_room: u64, lane_credit: u64) -> u64 {
+    if lane_credit < CHUNK_GROUP_BYTES {
+        cap_room.max(CHUNK_BYTES)
+    } else {
+        cap_room
+    }
 }
 
 /// [`due`] after a sibling stream spent lane credit this stream counted on.
@@ -168,6 +180,13 @@ pub struct NodeTrust {
     verified: AtomicU64,
     lost: AtomicU64,
     outstanding: AtomicU64,
+    /// Verified bytes this process added that the peer store does not hold yet.
+    /// A save adds them to the stored count, so concurrent processes never
+    /// overwrite each other's progress ([`PayerWindows::take_unsaved`]).
+    unsaved_verified: AtomicU64,
+    /// Written-off bytes this process added that the peer store does not hold
+    /// yet, like [`Self::unsaved_verified`].
+    unsaved_lost: AtomicU64,
     shared: Arc<RunState>,
 }
 
@@ -193,6 +212,8 @@ impl NodeTrust {
             verified: AtomicU64::new(verified),
             lost: AtomicU64::new(lost),
             outstanding: AtomicU64::new(0),
+            unsaved_verified: AtomicU64::new(0),
+            unsaved_lost: AtomicU64::new(0),
             shared,
         }
     }
@@ -225,10 +246,8 @@ impl NodeTrust {
 
     /// Record `n` bytes verified from this node.
     pub fn note_verified(&self, n: u64) {
-        self.verified
-            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                v.saturating_add(n)
-            });
+        add(&self.verified, n);
+        add(&self.unsaved_verified, n);
     }
 
     /// The window toward this node now, in bytes. Once the run's write-offs
@@ -281,9 +300,8 @@ impl NodeTrust {
             return;
         }
         self.note_spent(held);
-        self.lost.update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            v.saturating_add(n)
-        });
+        add(&self.lost, n);
+        add(&self.unsaved_lost, n);
         let value = u128::from(n) * u128::from(rate_per_mb) / BYTES_PER_MIB;
         let value = u64::try_from(value).unwrap_or(u64::MAX);
         let before =
@@ -393,11 +411,47 @@ impl PayerWindows {
             .collect()
     }
 
+    /// Take every record's `(address, verified, lost)` that this process added
+    /// and has not saved, leaving each unsaved count at zero. A save adds them
+    /// to the stored counts, so two processes that share a peer store each add
+    /// their own progress and neither overwrites the other's.
+    #[must_use]
+    pub fn take_unsaved(&self) -> Vec<(Address, u64, u64)> {
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(address, node)| {
+                (
+                    *address,
+                    node.unsaved_verified.swap(0, Ordering::Relaxed),
+                    node.unsaved_lost.swap(0, Ordering::Relaxed),
+                )
+            })
+            .filter(|&(_, verified, lost)| verified > 0 || lost > 0)
+            .collect()
+    }
+
+    /// Give back counts [`Self::take_unsaved`] took that a save did not store,
+    /// so a later save stores them.
+    pub fn return_unsaved(&self, address: Address, verified: u64, lost: u64) {
+        let node = self.node(address);
+        add(&node.unsaved_verified, verified);
+        add(&node.unsaved_lost, lost);
+    }
+
     /// USDC (base units) written off so far this run.
     #[must_use]
     pub fn written_off_micro_usdc(&self) -> u64 {
         self.shared.written_off_micro_usdc.load(Ordering::Relaxed)
     }
+}
+
+/// Add `n` to `counter`, saturating.
+fn add(counter: &AtomicU64, n: u64) {
+    counter.update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        v.saturating_add(n)
+    });
 }
 
 #[cfg(test)]

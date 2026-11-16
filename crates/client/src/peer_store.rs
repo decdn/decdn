@@ -412,38 +412,72 @@ impl PeerStore {
         }
     }
 
-    /// Persist `windows`' track records onto the peer records of the operators
-    /// they name. An operator with no peer record keeps its count in memory only:
-    /// a record with no identity is never selectable.
+    /// Add the progress `windows` has not saved to the stored track records of
+    /// the operators it names. Each process adds only its own progress to what
+    /// the store holds now, so concurrent fetches never overwrite each other's
+    /// counts. An operator with no peer record keeps its progress in memory for
+    /// a later save: a record with no identity is never selectable.
+    ///
+    /// # Errors
+    ///
+    /// A record write failure. The progress not stored stays unsaved in
+    /// `windows`.
     pub fn save_windows(&self, windows: &crate::payer_window::PayerWindows) -> anyhow::Result<()> {
         let _guard = mutation_guard();
-        let snapshot = windows.snapshot();
         let records = self.load_all();
-        for (address, verified, lost) in snapshot {
-            if address.is_zero() || (verified == 0 && lost == 0) {
+        let mut unsaved = windows.take_unsaved().into_iter();
+        while let Some((address, verified, lost)) = unsaved.next() {
+            if address.is_zero() {
                 continue;
             }
-            let mut matching: Vec<&PeerRecord> = records
-                .iter()
-                .filter(|r| r.eth_address == address)
-                .collect();
-            matching.sort_by_key(|r| r.node_id.to_string());
-            let Some(first) = matching.first() else {
-                continue;
-            };
-            let mut rec = (*first).clone();
-            rec.verified_bytes = verified;
-            rec.lost_bytes = lost;
-            self.write(&rec)?;
-            // Any further record of the same operator carries nothing: the
-            // first holds the whole count.
-            for other in matching.iter().skip(1) {
-                let mut other = (*other).clone();
-                if other.holds_pay_ahead_history() {
-                    other.verified_bytes = 0;
-                    other.lost_bytes = 0;
-                    self.write(&other)?;
+            if let Err(e) = self.add_track_record(&records, address, verified, lost) {
+                windows.return_unsaved(address, verified, lost);
+                for (address, verified, lost) in unsaved {
+                    windows.return_unsaved(address, verified, lost);
                 }
+                return Err(e);
+            }
+            if !records.iter().any(|r| r.eth_address == address) {
+                windows.return_unsaved(address, verified, lost);
+            }
+        }
+        Ok(())
+    }
+
+    /// Add `verified` and `lost` to the stored track record of the operator at
+    /// `address`. The operator's first record by node id holds the whole count;
+    /// any further record of the same operator is folded into it and zeroed.
+    fn add_track_record(
+        &self,
+        records: &[PeerRecord],
+        address: Address,
+        verified: u64,
+        lost: u64,
+    ) -> anyhow::Result<()> {
+        let mut matching: Vec<&PeerRecord> = records
+            .iter()
+            .filter(|r| r.eth_address == address)
+            .collect();
+        matching.sort_by_key(|r| r.node_id.to_string());
+        let Some(first) = matching.first() else {
+            return Ok(());
+        };
+        let (stored_verified, stored_lost) = matching.iter().fold((0u64, 0u64), |(v, l), r| {
+            (
+                v.saturating_add(r.verified_bytes),
+                l.saturating_add(r.lost_bytes),
+            )
+        });
+        let mut rec = (*first).clone();
+        rec.verified_bytes = stored_verified.saturating_add(verified);
+        rec.lost_bytes = stored_lost.saturating_add(lost);
+        self.write(&rec)?;
+        for other in matching.iter().skip(1) {
+            if other.holds_pay_ahead_history() {
+                let mut other = (*other).clone();
+                other.verified_bytes = 0;
+                other.lost_bytes = 0;
+                self.write(&other)?;
             }
         }
         Ok(())

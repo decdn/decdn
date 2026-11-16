@@ -2,9 +2,11 @@ use alloy::primitives::Address;
 
 use proptest::prelude::*;
 
+use decdn_bao_range::CHUNK_GROUP_BYTES;
+
 use super::{
     DEFAULT_WRITE_OFF_BUDGET_MICRO_USDC, PayAheadPolicy, PayerWindows, WINDOW_FLOOR_BYTES, due,
-    due_after_sibling_spend,
+    due_after_sibling_spend, lane_room,
 };
 
 const MIB: u64 = 1 << 20;
@@ -76,9 +78,28 @@ fn the_tail_pays_a_closing_residual_and_never_past_the_end() {
 }
 
 #[test]
-fn a_full_per_node_cap_stalls_a_lane_that_holds_credit_but_not_one_that_holds_none() {
-    assert_eq!(due(8 * MIB, 20 * MIB, MIB, 0), (0, 0));
-    assert_eq!(due(8 * MIB, 20 * MIB, 0, 0), (1, 0));
+fn a_full_per_node_cap_stalls_only_a_lane_whose_credit_still_feeds_a_frame() {
+    // Credit for at least one frame: the node keeps sending, so the lane waits
+    // for cap room.
+    assert_eq!(due(8 * MIB, 20 * MIB, MIB, lane_room(0, MIB)), (0, 0));
+    // A lane with no credit takes one chunk past the cap.
+    assert_eq!(due(8 * MIB, 20 * MIB, 0, lane_room(0, 0)), (1, 0));
+    // A sliver below one chunk group feeds no frame, so it takes one chunk too,
+    // after a sibling spend as well.
+    let sliver = CHUNK_GROUP_BYTES / 2;
+    assert_eq!(due(8 * MIB, 20 * MIB, sliver, lane_room(0, sliver)), (1, 0));
+    assert_eq!(
+        due_after_sibling_spend(8 * MIB, 20 * MIB, sliver, lane_room(0, sliver)),
+        (1, 0)
+    );
+}
+
+#[test]
+fn a_stream_that_has_not_paid_gets_no_cap_exemption_on_a_funded_lane() {
+    // The stream counts no held credit of its own, but the exemption reads the
+    // lane's credit: a lane that still feeds a frame takes nothing past the cap,
+    // however many streams it opens.
+    assert_eq!(due(8 * MIB, 20 * MIB, 0, lane_room(0, MIB)), (0, 0));
 }
 
 proptest! {

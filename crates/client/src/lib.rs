@@ -4217,7 +4217,8 @@ fn pay_ahead_due(
         return (0, 0);
     }
     let trust = ledger.trust();
-    let held = if paid_on_stream { ledger.prepaid() } else { 0 };
+    let lane_credit = ledger.prepaid();
+    let held = if paid_on_stream { lane_credit } else { 0 };
     let due = if after_sibling_spend {
         payer_window::due_after_sibling_spend
     } else {
@@ -4227,7 +4228,7 @@ fn pay_ahead_due(
         trust.window_bytes(rate_per_mb),
         need,
         held,
-        trust.cap_room_bytes(rate_per_mb),
+        payer_window::lane_room(trust.cap_room_bytes(rate_per_mb), lane_credit),
     )
 }
 
