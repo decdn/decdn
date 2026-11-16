@@ -139,6 +139,7 @@ impl ClientHandler {
             StreamResponseExt {
                 outcome,
                 origin_attestation,
+                payment_pools: None,
             },
         ))
     }

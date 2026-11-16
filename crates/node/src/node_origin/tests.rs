@@ -1153,6 +1153,7 @@ fn an_upstream_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
     let ext = |size_proof| ProbeResponseExt {
         coverage: Coverage::full(1),
         size_proof,
+        payment_pools: None,
     };
     assert!(
         probe_size_proven(hash, &ext(Some(SizeProof::new(size, proof_bytes.clone())?))).is_ok()

@@ -1027,6 +1027,7 @@ async fn open_paid_range_stream(
     let req = StreamRequest {
         hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset,
         byte_len,
@@ -2498,6 +2499,7 @@ async fn stall_delivery_at_closing_voucher(
     let req = StreamRequest {
         hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -2636,6 +2638,7 @@ async fn open_expecting_refusal(
     let req = StreamRequest {
         hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -2674,6 +2677,7 @@ async fn race_two_same_lane_opens(
     let req_a = StreamRequest {
         hash: hash_a,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -2682,6 +2686,7 @@ async fn race_two_same_lane_opens(
     let req_b = StreamRequest {
         hash: hash_b,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5395,6 +5400,7 @@ async fn client_unknown_lane_is_rejected() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5483,6 +5489,7 @@ async fn client_underfunded_pool_is_refused_pre_serve() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5637,6 +5644,7 @@ async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Res
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5698,6 +5706,7 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5768,6 +5777,7 @@ async fn client_spent_down_pool_is_refused_pre_serve() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5845,6 +5855,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: TAIL_OFFSET,
         byte_len: 0,
@@ -5916,6 +5927,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9203,6 +9215,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9238,6 +9251,7 @@ async fn stream_request_with_skewed_timestamp_resets_without_response() -> anyho
     let request_at = |timestamp_us| StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9354,6 +9368,7 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
     let request_at = |timestamp_us| StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9394,6 +9409,7 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
     let request_at = |timestamp_us| StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9441,6 +9457,7 @@ async fn the_timestamp_gate_precedes_the_stale_chain_refusal() -> anyhow::Result
     let request_at = |timestamp_us| StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9642,6 +9659,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9746,6 +9764,7 @@ async fn client_capability_signed_by_a_non_owner_registers_no_lane() -> anyhow::
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9852,6 +9871,7 @@ async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9892,6 +9912,7 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9955,6 +9976,7 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10653,6 +10675,7 @@ async fn pull_through_gate_authorizes_only_lane_signer() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: miss_hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10754,6 +10777,7 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
     let req = StreamRequest {
         hash: [0xEDu8; 32], // never cached — a miss that would trigger the pull
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10907,6 +10931,7 @@ async fn underfunded_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: [0x19u8; 32], // never cached — a miss that would trigger the pull
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10988,6 +11013,7 @@ async fn funded_pool_still_reaches_the_paid_pull() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: [0x1Au8; 32],
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -11061,6 +11087,7 @@ async fn spent_out_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: [0x33u8; 32],
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -11110,6 +11137,7 @@ async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> 
     let req = StreamRequest {
         hash: [0xB1u8; 32], // never cached — a miss that would trigger the pull
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -11157,6 +11185,7 @@ async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> any
     let req = StreamRequest {
         hash: [0xB2u8; 32], // never cached — a miss that would trigger the pull
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -11272,6 +11301,7 @@ async fn pull_through_fills_under_deadline(
     let req = StreamRequest {
         hash: *want.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -14239,6 +14269,7 @@ async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -15452,6 +15483,7 @@ async fn a_payer_that_stops_reading_faults_at_the_no_progress_timeout() -> anyho
     let req = StreamRequest {
         hash: *blob.hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,

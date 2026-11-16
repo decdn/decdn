@@ -40,12 +40,14 @@ use serde::{Deserialize, Serialize};
 /// Maximum permitted value for [`ProbeResponseBody::rate_per_mb`] (issue #378).
 ///
 /// 1000 µUSDC/MB (USDC at 6 decimals: ~$1/GB), a realistic ceiling about 100×
-/// market price (~10 µUSDC/MB ≈ $0.01/GB). It bounds two things at once. It is
-/// the largest `rate_per_mb` the wire decodes, and it caps the governance
-/// `deliveryFloor` on-chain (ADR 003 §Rate-floor enforcement); the floor can
-/// never exceed the wire price. A cap far above market lets a governance floor
-/// near the ceiling drive credited bytes toward zero and suppress ADR-036
-/// vote-weight accrual, so the cap stays close to real prices.
+/// market price (~10 µUSDC/MB ≈ $0.01/GB). It is the largest `rate_per_mb` the
+/// wire decodes. The governance-chain `FeeRouter` bounds its `deliveryFloor`
+/// at the same value (ADR 003 §Rate-floor enforcement, ADR 009). That floor
+/// is the net-USDC price of one MB of vote weight, not a rate a node must
+/// quote: the `FeeRouter` credits `min(bytes, net × 1 MiB / deliveryFloor)`
+/// per sweep. A floor far above real prices would drive credited bytes toward
+/// zero and suppress ADR-036 vote-weight accrual, so the bound stays close to
+/// real prices.
 ///
 /// The value also participates in the client selection score
 /// `rate_per_mb × rtt_ms × scale / reputation²` (issue #322, ADR 001 §Node
@@ -62,10 +64,13 @@ pub const MAX_RATE_PER_MB: u64 = 1000;
 ///
 /// The largest legitimate
 /// message is a [`ProbeResponse`] with its [`ProbeResponseExt`] at full width:
-/// 4,807 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap
-/// and its 2-byte length) and the size proof up to 4,493 (its `Some` tag, a
+/// 6,185 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap
+/// and its 2-byte length), the size proof up to 4,493 (its `Some` tag, a
 /// 10-byte varint size, and a [`crate::MAX_SIZE_PROOF_BYTES`] proof with its
-/// 2-byte length). A [`ProbeRequest`] is at most 43 bytes. The ceiling leaves headroom
+/// 2-byte length), and the payment pools up to 1,378 (its `Some` tag, a
+/// 1-byte count, and [`crate::MAX_PAYMENT_POOLS`] ids of
+/// [`crate::MAX_POOL_ACCOUNT_LEN`] bytes with a 2-byte length each). A
+/// [`ProbeRequest`] is at most 43 bytes. The ceiling leaves headroom
 /// for Tier-1 extension fields and refuses a larger frame before the reader
 /// buffers it. The `probe_frame_ceiling_holds_the_largest_message` test pins
 /// the margin.
@@ -203,6 +208,13 @@ pub enum MessageValidationError {
     /// (ADR 024 §Off-Chain Signature Verification — EOA Recovery Only).
     #[error("WireCapability.owner_signature is empty")]
     EmptyCapabilitySignature,
+    /// A [`crate::client::StreamResponseExt`] carries `payment_pools` on a
+    /// response that is not a [`crate::client::StreamError::Declined`]
+    /// refusal. The node lists its accepted pools only when it declines a
+    /// `payment_pool` (ADR 005 § Payment pool routing). Enforced via
+    /// [`crate::client::StreamResponseExt::validate`].
+    #[error("StreamResponse carries payment_pools outside a Declined refusal")]
+    PaymentPoolsOutsideDeclined,
 }
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per
@@ -304,6 +316,15 @@ pub struct ProbeResponseExt {
     /// requester verifies the proof before it uses the size, and drops a
     /// response whose proof does not verify.
     pub size_proof: Option<crate::SizeProof>,
+    /// The `PaymentPool` contracts against which the node redeems vouchers
+    /// (ADR 005 § Accepted payment pools). A receiver keeps at most the first
+    /// [`crate::MAX_PAYMENT_POOLS`] entries. It is a hint: a requester picks a
+    /// contract in both this list and its own funded pools, and a wrong hint
+    /// costs one [`crate::StreamError::Declined`] refusal. `None` means the
+    /// node accepts only the contract the requester knows from its pinned
+    /// configuration.
+    #[serde(deserialize_with = "crate::pool_account::deserialize_payment_pools")]
+    pub payment_pools: Option<Vec<crate::PoolAccount>>,
 }
 
 /// The BLAKE3 hash of zero bytes: the root of the empty blob.

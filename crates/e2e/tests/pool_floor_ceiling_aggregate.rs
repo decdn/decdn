@@ -517,6 +517,17 @@ async fn open_and_hold(
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: [0u8; 32],
+        payment_pool: decdn_protocol::PoolAccount::eip155(
+            ctx.voucher_domain
+                .chain_id
+                .context("voucher domain names no chain id")?
+                .try_into()
+                .context("voucher domain chain id exceeds u64")?,
+            ctx.voucher_domain
+                .verifying_contract
+                .context("voucher domain names no verifying contract")?
+                .into(),
+        ),
         pool_id: ctx.pool_id.into(),
         byte_offset: 0,
         byte_len: 0,

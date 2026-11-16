@@ -730,6 +730,7 @@ impl ProbeHandler {
             ProbeResponseExt {
                 coverage: coverage.clone(),
                 size_proof: None,
+                payment_pools: None,
             }
             .consistent_with(&ProbeResponseBody {
                 hash: *hash.as_bytes(),
@@ -787,6 +788,7 @@ impl ProbeHandler {
         let ext = ProbeResponseExt {
             coverage,
             size_proof,
+            payment_pools: None,
         };
 
         let payload = encode_probe_response(&resp, Some(&ext))

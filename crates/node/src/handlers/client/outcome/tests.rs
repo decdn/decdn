@@ -47,6 +47,7 @@ fn export_one(end: ServeEnd) -> HashMap<String, String> {
     let req = StreamRequest {
         hash: [0xAB; 32],
         namespace_id: [0; 32],
+        payment_pool: decdn_protocol::PoolAccount::eip155(421_614, [0x34; 20]),
         pool_id: [0xCD; 32],
         byte_offset: 4096,
         byte_len: 8192,

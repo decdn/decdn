@@ -2586,6 +2586,7 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
     let req = decdn_protocol::client::StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: [0; 32],
+        payment_pool: decdn_protocol::PoolAccount::eip155(421_614, [0x34; 20]),
         pool_id: [0; 32],
         byte_offset: 0,
         byte_len: 0,
@@ -2615,6 +2616,7 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
     let req = |hash: [u8; 32]| decdn_protocol::client::StreamRequest {
         hash,
         namespace_id: [0; 32],
+        payment_pool: decdn_protocol::PoolAccount::eip155(421_614, [0x34; 20]),
         pool_id: [0; 32],
         byte_offset: 0,
         byte_len: 0,

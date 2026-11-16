@@ -387,6 +387,7 @@ async fn answer_probe_with_coverage(
         Some(&ProbeResponseExt {
             coverage,
             size_proof: Some(support::size_proof_for(req.hash, total_bytes)),
+            payment_pools: None,
         }),
     )
     .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
@@ -6972,6 +6973,7 @@ async fn leaf_ranged_paid_pull(
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id.into(),
         byte_offset,
         byte_len,
@@ -7239,6 +7241,7 @@ async fn leaf_paced_pull_mode(
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len,
@@ -8742,6 +8745,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: leaf_pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10192,6 +10196,7 @@ async fn leaf_opens_paid_stream(
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len: 0,

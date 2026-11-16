@@ -391,7 +391,8 @@ use decdn_protocol::client::{
     StreamResponseExt, VoucherRejectReason, WatermarkBundle, WireCapability,
 };
 use decdn_protocol::{
-    CHUNK_BYTES, ChunkPreimage, decode_message, encode_message, read_frame, write_frame,
+    CHUNK_BYTES, ChunkPreimage, PoolAccount, decode_message, encode_message, read_frame,
+    write_frame,
 };
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
@@ -2027,6 +2028,25 @@ enum ConnSource<'a> {
     Reuse(&'a iroh::endpoint::Connection),
 }
 
+/// The CAIP-10 account of the `PaymentPool` contract a voucher domain binds:
+/// the contract that holds the pool the vouchers draw from.
+///
+/// # Errors
+///
+/// When the domain names no chain id, one past `u64`, or no verifying
+/// contract.
+fn payment_pool(voucher_domain: &Eip712Domain) -> anyhow::Result<PoolAccount> {
+    let chain_id = voucher_domain
+        .chain_id
+        .ok_or_else(|| anyhow::anyhow!("voucher domain names no chain id"))?;
+    let chain_id = u64::try_from(chain_id)
+        .map_err(|_| anyhow::anyhow!("voucher domain chain id {chain_id} exceeds u64"))?;
+    let contract = voucher_domain
+        .verifying_contract
+        .ok_or_else(|| anyhow::anyhow!("voucher domain names no verifying contract"))?;
+    Ok(PoolAccount::eip155(chain_id, contract.into()))
+}
+
 /// The OPEN stage of a `cdn/client/v1` pull, the single request site behind
 /// [`open_progressive_pull`]: get the connection from `source` (dial a fresh one,
 /// or reuse a warm one), open the bi-stream, send the [`StreamRequest`], then read
@@ -2101,6 +2121,10 @@ async fn open_stream(
             // to a directory-discovered cold origin passes the served namespace so
             // that origin's gate resolves and it can fill from its own backend.
             namespace_id,
+            // The pool lives in the contract its voucher domain binds (ADR 005
+            // § Payment pool routing), so the node routes on that contract.
+            payment_pool: payment_pool(&ctx.voucher_domain)
+                .map_err(|e| e.context(LocalPullFault))?,
             pool_id: ctx.pool_id.into(),
             byte_offset,
             // `0` = whole-tail fetch; a caller requesting a bounded middle gap

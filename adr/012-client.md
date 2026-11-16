@@ -232,11 +232,11 @@ in current schema terms:
   is an RPC endpoint, the chain id, and `payment_pool`. A client reads the registry from the
   governance chain and pays on the payment chain ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
   A client with pools on several payment chains lists one payment-chain set for each. For each
-  candidate node it picks a chain that is in its own list and in the node's `payment_chains` probe
-  hint, and it sets that chain as `chain_id` in the `StreamRequest`
-  ([ADR 005 § Payment chain routing](005-protocol.md#payment-chain-routing)). A node that refuses
-  the chain lists its accepted chains in the refusal, and the client retries that node once on a
-  listed chain where it holds a funded pool.
+  candidate node it picks a `PaymentPool` contract that is in its own list and in the node's
+  `payment_pools` probe hint, and it sets that contract as `payment_pool` in the `StreamRequest`
+  ([ADR 005 § Payment pool routing](005-protocol.md#payment-pool-routing)). A node that refuses
+  the contract lists its accepted contracts in the refusal, and the client retries that node once
+  on a listed contract where it holds a funded pool.
   The RPC URLs and keystore live here, **not** under `[network]`/`[keys]`.
 - `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
   probing to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull

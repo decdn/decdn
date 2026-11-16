@@ -69,9 +69,10 @@ pub const MAX_CHAIN_LENGTH: u8 = 255;
 /// bytes (ADR 013 § Wire Framing).
 ///
 /// The node reads a [`StreamRequest`] and every later payment proof against it.
-/// The largest legitimate message is a [`StreamRequest`] with a client binding
-/// and a capability: 301 bytes, since every signature on the wire is a 65-byte
-/// EOA signature. The ceiling leaves headroom for Tier-1 extension fields and
+/// The largest legitimate message is a [`StreamRequest`] with a
+/// [`crate::MAX_POOL_ACCOUNT_LEN`]-byte pool account, a client binding and a
+/// capability: 473 bytes, since every signature on the wire is a 65-byte EOA
+/// signature. The ceiling leaves headroom for Tier-1 extension fields and
 /// refuses a larger frame before the reader buffers it. It is also the wire
 /// bound on `owner_signature`, which decode checks only for being non-empty.
 /// The `client_control_frame_ceiling_holds_the_largest_message` test pins the
@@ -82,7 +83,9 @@ pub const MAX_CLIENT_CONTROL_FRAME: u32 = 4 * 1024;
 /// (ADR 013 § Wire Framing).
 ///
 /// The largest legitimate response carries a full [`crate::MAX_SIZE_PROOF_BYTES`]
-/// size proof, an origin attestation and a refusal code: under 5 KiB. The
+/// size proof and an origin attestation: 4,693 bytes. A `Declined` refusal
+/// that carries [`crate::MAX_PAYMENT_POOLS`] full-width payment pools is
+/// 1,493 bytes. The
 /// ceiling leaves headroom for Tier-1 extension fields and refuses a larger
 /// frame before the reader buffers it. The node reads no response, so this
 /// ceiling adds nothing to the node's reader buffers. The
@@ -242,6 +245,13 @@ pub struct StreamRequest {
     /// the frozen base — every node reads it for origin routing (a node with no
     /// chain origin directory configured resolves nothing from it).
     pub namespace_id: [u8; 32],
+    /// The `PaymentPool` contract that holds `pool_id` (ADR 005 § Payment pool
+    /// routing). A pool id is unique only inside one contract, so the node
+    /// routes the request, the pool reads and the voucher domain on this
+    /// account. A node that does not accept the contract answers
+    /// [`StreamError::Declined`] with its accepted pools in
+    /// [`StreamResponseExt::payment_pools`].
+    pub payment_pool: crate::PoolAccount,
     /// `poolId = keccak256(owner, poolNonce)` (ADR 005).
     pub pool_id: [u8; 32],
     /// Resume position in bytes; `0` for a full-blob fetch.
@@ -474,6 +484,15 @@ pub struct StreamResponseExt {
     /// because its own `StreamResponse` is the attestation. A client ignores
     /// it; a relay verifies it before keeping it.
     pub origin_attestation: Option<crate::dht::OriginAttestation>,
+    /// The `PaymentPool` contracts the node accepts (ADR 005 § Payment pool
+    /// routing). The node sets it only on the [`StreamError::Declined`]
+    /// refusal of a `payment_pool` it does not accept, and
+    /// [`StreamResponseExt::validate`] refuses it on any other response. A
+    /// receiver keeps at most the first [`crate::MAX_PAYMENT_POOLS`]
+    /// entries. It is a hint: a requester retries this node once on a
+    /// listed contract where it holds a funded pool.
+    #[serde(deserialize_with = "crate::pool_account::deserialize_payment_pools")]
+    pub payment_pools: Option<Vec<crate::PoolAccount>>,
 }
 
 /// The unsigned answer of a [`StreamResponse`]: a served blob's size, or the
@@ -510,6 +529,7 @@ impl StreamResponseExt {
         Self {
             outcome: StreamOutcome::Served(size_proof),
             origin_attestation,
+            payment_pools: None,
         }
     }
 
@@ -519,6 +539,20 @@ impl StreamResponseExt {
         Self {
             outcome: StreamOutcome::Refused(error),
             origin_attestation: None,
+            payment_pools: None,
+        }
+    }
+
+    /// The [`StreamError::Declined`] refusal of a `payment_pool` the node does
+    /// not accept, carrying the pools it does accept (ADR 005 § Payment pool
+    /// routing). Keeps the first [`crate::MAX_PAYMENT_POOLS`] entries.
+    #[must_use]
+    pub fn pool_declined(mut payment_pools: Vec<crate::PoolAccount>) -> Self {
+        payment_pools.truncate(crate::MAX_PAYMENT_POOLS);
+        Self {
+            outcome: StreamOutcome::Refused(StreamError::Declined),
+            origin_attestation: None,
+            payment_pools: Some(payment_pools),
         }
     }
 
@@ -543,7 +577,9 @@ impl StreamResponseExt {
     /// Check the unsigned half against the signed `ok` flag (ADR 005
     /// §`cdn/client/v1`): `ok == true` ⇒ a served outcome with its size
     /// proof; `ok == false` ⇒ a delivery-side refusal, never the
-    /// mid-stream-only [`StreamError::VoucherRejected`].
+    /// mid-stream-only [`StreamError::VoucherRejected`]. `payment_pools`
+    /// rides only on a [`StreamError::Declined`] refusal (ADR 005 § Payment
+    /// pool routing).
     ///
     /// Separate from parsing so forward-compatible trailing bytes do not couple
     /// to value checks, and separate from [`StreamResponse::validate`] because
@@ -553,14 +589,19 @@ impl StreamResponseExt {
     /// # Errors
     ///
     /// [`MessageValidationError::StreamErrorWithOk`],
-    /// [`MessageValidationError::MissingStreamError`], or
-    /// [`MessageValidationError::VoucherRejectedInResponse`].
+    /// [`MessageValidationError::MissingStreamError`],
+    /// [`MessageValidationError::VoucherRejectedInResponse`], or
+    /// [`MessageValidationError::PaymentPoolsOutsideDeclined`].
     pub const fn validate(&self, ok: bool) -> Result<(), MessageValidationError> {
         match (ok, &self.outcome) {
             (true, StreamOutcome::Refused(_)) => Err(MessageValidationError::StreamErrorWithOk),
             (false, StreamOutcome::Served(_)) => Err(MessageValidationError::MissingStreamError),
             (false, StreamOutcome::Refused(code)) if !code.is_delivery_side() => {
                 Err(MessageValidationError::VoucherRejectedInResponse)
+            }
+            (_, StreamOutcome::Refused(StreamError::Declined)) => Ok(()),
+            _ if self.payment_pools.is_some() => {
+                Err(MessageValidationError::PaymentPoolsOutsideDeclined)
             }
             _ => Ok(()),
         }

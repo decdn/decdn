@@ -1024,6 +1024,7 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
             ProbeResponseExt {
                 coverage: Coverage::empty(),
                 size_proof: Some(decdn_protocol::SizeProof::default()),
+                payment_pools: None,
             },
             crate::probe::ProbeRtt {
                 ms: 5.0,
@@ -1111,6 +1112,7 @@ fn a_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
             ProbeResponseExt {
                 coverage: Coverage::full(1),
                 size_proof,
+                payment_pools: None,
             },
             crate::probe::ProbeRtt {
                 ms: 5.0,
