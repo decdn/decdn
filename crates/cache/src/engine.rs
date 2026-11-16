@@ -427,6 +427,11 @@ struct Inner {
     /// which already
     /// honors the evicted set.
     probe_holds: Mutex<HashMap<Hash, tokio::time::Instant>>,
+    /// Hashes a reader or a fill is using, with how many [`InUse`] guards
+    /// hold each. Eviction skips them: a release under a live reader or fill
+    /// lets GC sweep the entry it is using, and a write into a swept entry
+    /// is lost.
+    in_use: Mutex<HashMap<Hash, usize>>,
     /// Hold-budget cap (ADR 005 §Hold budget). `0` disables `has_blob: true`
     /// entirely. Set once from `cache.max_probe_holds` via
     /// [`CacheEngine::set_max_probe_holds`] at runtime bring-up — `cache.*`
@@ -904,6 +909,39 @@ type ProofPairs = Vec<(
     bao_tree::TreeNode,
     (bao_tree::blake3::Hash, bao_tree::blake3::Hash),
 )>;
+
+/// A hold on one hash against capacity eviction
+/// ([`CacheEngine::hold_in_use`]), freed when the guard drops.
+#[must_use = "the hold ends when the guard drops"]
+pub struct InUse {
+    engine: CacheEngine,
+    hash: Hash,
+}
+
+impl std::fmt::Debug for InUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InUse")
+            .field("hash", &self.hash)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for InUse {
+    fn drop(&mut self) {
+        let mut in_use = self
+            .engine
+            .inner
+            .in_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = in_use.get_mut(&self.hash) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                in_use.remove(&self.hash);
+            }
+        }
+    }
+}
 
 /// Live control over one [`CacheEngine::admit_bao_stream_until`] call.
 #[derive(Clone, Copy, Default)]
@@ -1687,6 +1725,7 @@ impl CacheEngine {
                 evicted: MonotoneHashSet::new(evicted),
                 quarantined: DashMap::new(),
                 probe_holds: Mutex::new(HashMap::new()),
+                in_use: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
                 frequency: ArcSwap::from_pointee(None),
                 admission: ArcSwap::from_pointee(
@@ -5133,7 +5172,16 @@ impl CacheEngine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             g.retain(|_, exp| *exp > now);
-            g.keys().copied().collect()
+            let mut held: HashSet<Hash> = g.keys().copied().collect();
+            held.extend(
+                self.inner
+                    .in_use
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .keys()
+                    .copied(),
+            );
+            held
         };
         let map = self
             .inner
@@ -5263,10 +5311,14 @@ impl CacheEngine {
     /// held on disk (unservable) until the takedown `evict()` runs. This only
     /// drops GC protection — the durable takedown record stays `evict`'s job.
     ///
+    /// A hash in use ([`Self::hold_in_use`]) is refused the same way, deny
+    /// list or not: GC sweeping an entry a reader or a fill is using loses
+    /// the fill's later writes, and a takedown goes through `evict` anyway.
+    ///
     /// Best-effort against the GC cadence: like `evict`, actual disk reclaim
     /// only happens when periodic GC is enabled (`cache.gc_interval_sec > 0`).
     pub async fn release_for_eviction(&self, hash: Hash) -> CacheResult<u64> {
-        if self.is_pinned(hash) && !self.refuses(hash) {
+        if (self.is_pinned(hash) && !self.refuses(hash)) || self.is_in_use(hash) {
             return Ok(0);
         }
         // Drop the protecting tag(s) FIRST, and only forget the access-time
@@ -5295,6 +5347,35 @@ impl CacheEngine {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&hash);
         Ok(deleted)
+    }
+
+    /// Hold `hash` against capacity eviction while the returned guard lives:
+    /// [`Self::eviction_candidates`] skips it and
+    /// [`Self::release_for_eviction`] refuses it. A reader or a fill takes
+    /// one for as long as it uses the entry; holds on one hash nest, and the
+    /// last guard to drop frees it.
+    pub fn hold_in_use(&self, hash: Hash) -> InUse {
+        *self
+            .inner
+            .in_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(hash)
+            .or_insert(0) += 1;
+        InUse {
+            engine: self.clone(),
+            hash,
+        }
+    }
+
+    /// Whether some [`InUse`] guard holds `hash`.
+    #[must_use]
+    pub fn is_in_use(&self, hash: Hash) -> bool {
+        self.inner
+            .in_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&hash)
     }
 
     async fn read_local(&self, hash: Hash) -> CacheResult<Bytes> {

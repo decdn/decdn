@@ -3019,6 +3019,21 @@ async fn a_raw_blob_past_the_blob_cap_answers_413_with_no_pull() {
     assert_eq!(*logs.ranges.lock().unwrap(), [Some((0, 4))]);
 }
 
+/// A bundle entry whose declared size passes `--max-blob-mb` answers 413 as a
+/// raw blob does: the manifest pulls, the entry does not.
+#[tokio::test]
+async fn an_entry_past_the_blob_cap_answers_413_with_no_entry_pull() {
+    let manifest = serde_json::json!({"version": 1, "entries": [
+        {"path": "huge.bin", "hash": alloy::hex::encode(ENTRY), "size": 3 << 20},
+    ]})
+    .to_string()
+    .into_bytes();
+    let (gateway, caps) = recording_gateway(Reply::Bytes(manifest), &["--max-blob-mb", "2"]).await;
+    let (status, body) = get(&gateway, &format!("/{}/huge.bin", alloy::hex::encode(BLOB))).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(caps.lock().unwrap().len(), 1, "only the manifest pulls");
+}
+
 /// A raw blob of verified size takes one `Range`, as a sized entry does: 206
 /// over the window, and 416 with the size for a window past the end, with
 /// no pull.

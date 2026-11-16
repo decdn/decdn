@@ -280,3 +280,28 @@ async fn capture_reconstructs_the_true_outboard() {
         "a multi-group blob has interior nodes to capture"
     );
 }
+
+/// A live store keeps its entry out of capacity eviction: no candidate, and a
+/// release refused. Holds nest, and the entry is free once the last drops.
+#[tokio::test]
+async fn a_live_store_holds_its_entry_against_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(&dir).await;
+    let total = 2 * CHUNK_GROUP_BYTES;
+    let (root, _, range, wire) = wire(total, 0, total);
+    let hash = Hash::from_bytes(root);
+    let store = CacheStore::new(engine.clone(), hash, total);
+    IngestStore::ingest_stream(&store, &range, MemReader::new(wire), None, total, None)
+        .await
+        .unwrap();
+
+    let reader = engine.hold_in_use(hash);
+    drop(store);
+    assert!(!engine.eviction_candidates().contains_key(&hash));
+    assert_eq!(engine.release_for_eviction(hash).await.unwrap(), 0);
+
+    drop(reader);
+    assert!(!engine.is_in_use(hash));
+    assert!(engine.eviction_candidates().contains_key(&hash));
+    assert!(engine.release_for_eviction(hash).await.unwrap() > 0);
+}

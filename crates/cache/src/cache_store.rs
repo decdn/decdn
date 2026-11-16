@@ -18,7 +18,9 @@ use decdn_bao_range::{
 };
 use tokio::sync::Notify;
 
-use crate::{AdmitControl, AdmitEnd, CacheEngine, CacheError, FillSession, Hash, NodeRangedStore};
+use crate::{
+    AdmitControl, AdmitEnd, CacheEngine, CacheError, FillSession, Hash, InUse, NodeRangedStore,
+};
 
 /// A callback that sees the content bytes each leg admitted.
 pub type OnAdmitted = Arc<dyn Fn(u64) + Send + Sync>;
@@ -30,8 +32,14 @@ pub type OnAdmitted = Arc<dyn Fn(u64) + Send + Sync>;
 /// Two stores over one entry may fill it at the same time: each admit
 /// verifies its bytes against the root before the store keeps them, and
 /// writing a chunk group twice leaves it as it was.
+///
+/// The store holds its entry against capacity eviction for as long as it
+/// lives ([`CacheEngine::hold_in_use`]), so GC never sweeps an entry a pull
+/// is writing.
 pub struct CacheStore {
     inner: NodeRangedStore,
+    /// Keeps the entry out of eviction while this store lives.
+    _in_use: InUse,
     /// The serving leg's fill session, when a serve reads beside this pull:
     /// the admit captures each range's proof nodes into it as they verify.
     session: Option<Arc<FillSession>>,
@@ -45,8 +53,9 @@ pub struct CacheStore {
 impl CacheStore {
     /// `engine`'s view of `hash`, a `total_bytes`-byte blob.
     #[must_use]
-    pub const fn new(engine: CacheEngine, hash: Hash, total_bytes: u64) -> Self {
+    pub fn new(engine: CacheEngine, hash: Hash, total_bytes: u64) -> Self {
         Self {
+            _in_use: engine.hold_in_use(hash),
             inner: NodeRangedStore::new(engine, hash, total_bytes),
             session: None,
             on_admitted: None,

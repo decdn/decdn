@@ -146,7 +146,8 @@
 //! read from it with no pull. A blob the cache holds whole answers `HEAD` and gives
 //! its length with no size lookup. A request the cache holds only part of
 //! streams as a pull, which fetches only what the cache lacks, and is charged
-//! as a pull is. The eviction loop holds the cache under `--cache-mb`, and
+//! as a pull is. A hit counts as a use for eviction, and no entry a pull is
+//! filling or a hit is reading is released. The eviction loop holds the cache under `--cache-mb`, and
 //! under what keeps the node's default free-disk margin on the volume;
 //! `--cache-mb 0` turns the cache off and each pull fills a scratch directory
 //! that ends with it.
@@ -2403,7 +2404,9 @@ impl Gateway {
     /// One bundle entry, by its literal manifest path. A path the manifest
     /// lacks answers 404, and so does a blob that is not a manifest or a
     /// malformed one ([`Self::manifest`]). On a site, a path that names a
-    /// directory with an `index.html` redirects to the directory.
+    /// directory with an `index.html` redirects to the directory. An entry
+    /// whose pull, by its declared size, passes `--max-blob-mb` answers 413
+    /// before any pull, as a raw blob does ([`Self::over_blob_cap`]).
     async fn entry(
         self: &Arc<Self>,
         manifest_hash: [u8; 32],
@@ -2428,6 +2431,9 @@ impl Gateway {
                 && let Some(engine) = self.cache_hit(entry.hash, &extent).await
             {
                 return self.from_cache(engine, entry.hash, Some(path), &extent, present);
+            }
+            if let Some(refused) = self.over_blob_cap(extent.billable()) {
+                return Ok(refused);
             }
             if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
@@ -2475,6 +2481,9 @@ impl Gateway {
                 && let Some(engine) = self.cache_hit(entry.hash, &extent).await
             {
                 return self.from_cache(engine, entry.hash, Some(&entry.path), &extent, present);
+            }
+            if let Some(refused) = self.over_blob_cap(extent.billable()) {
+                return Ok(refused);
             }
             if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
@@ -3231,7 +3240,8 @@ where
 /// Read `[offset, end)` of `hash` out of `engine` on a task of its own, one
 /// [`CHUNK_BYTES`] read at a time, into the channel it returns. A failed or
 /// short read sends its error and ends the channel; a dropped receiver stops
-/// the reads.
+/// the reads. The hit counts as a use of the entry for eviction, and the
+/// task holds the entry against eviction until its reads end.
 fn read_cached(
     engine: CacheEngine,
     hash: decdn_cache::Hash,
@@ -3239,7 +3249,10 @@ fn read_cached(
     end: u64,
 ) -> mpsc::Receiver<std::io::Result<Bytes>> {
     let (tx, rx) = mpsc::channel(2);
+    engine.observe_hit(hash);
+    let held = engine.hold_in_use(hash);
     tokio::spawn(async move {
+        let _held = held;
         let chunk = u64::try_from(CHUNK_BYTES).unwrap_or(u64::MAX);
         let mut next = offset;
         while next < end {

@@ -66,7 +66,8 @@ write, so it spends the shared bucket. The gateway counts:
   response does not end whole.
 
 An entry's pull is capped at the size its manifest declares. A manifest
-cannot make the gateway pay for more than it says.
+cannot make the gateway pay for more than it says. An entry whose pull, by
+that size, passes `--max-blob-mb` answers 413 before any pull of the entry.
 
 A raw blob has no manifest. The gateway uses the verified size of the blob.
 Every node that states a size sends its size proof, and the fetch verifies
@@ -252,7 +253,10 @@ chunk groups that the cache does not hold.
 
 The eviction loop of the node runs on the cache. It keeps the cache under
 `--cache-mb` (10240 by default). It also keeps the free-disk margin of the
-node on the volume. It releases the least recently used blobs first.
+node on the volume. It releases the least recently used blobs first. A hit
+counts as a use. The loop releases no blob that a pull is filling or a hit is
+reading: a release lets GC remove the blob, and GC that removes a blob under a
+fill loses the writes that follow.
 `--cache-mb 0` turns the cache off. Each pull then fills a scratch directory,
 and the gateway removes the directory when the pull ends.
 
