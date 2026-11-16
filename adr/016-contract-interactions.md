@@ -154,14 +154,15 @@ interface IFeeRouter {
     // Receives one CCTP sweep. Permissionless. FeeRouter is the
     // `destinationCaller`: it calls `MessageTransmitterV2.receiveMessage`
     // and reads `sourceDomain`, `messageSender` (the sweeping pool), the
-    // minted USDC amount `U` (after the CCTP fee), and
-    // `hookData = abi.encode(operator, bytes)`. Any pool on any chain may
-    // sweep; there is no pool allowlist. FeeRouter accepts a message only
-    // if the outer `recipient` is the local `TokenMessengerV2`, the outer
-    // `sender` equals that messenger's `remoteTokenMessengers(sourceDomain)`,
-    // and the burn body's `mintRecipient` is FeeRouter. These checks reject
-    // a generic CCTP message that only names FeeRouter as `destinationCaller`.
-    // `U = amount - feeExecuted`, both read from the signed burn body.
+    // minted USDC amount `U`, and `hookData = abi.encode(operator, bytes)`.
+    // Any pool on any chain may sweep; there is no pool allowlist.
+    // FeeRouter accepts a message only if the outer `recipient` is the
+    // local `TokenMessengerV2` and the burn body's `mintRecipient` is
+    // FeeRouter. These checks reject a generic CCTP message that only
+    // names FeeRouter as `destinationCaller`. The messenger itself accepts
+    // a burn message only from its `remoteTokenMessengers(sourceDomain)`.
+    // `U` is the rise in FeeRouter's USDC balance across `receiveMessage`.
+    // A burn of any other token mints no USDC, so it credits nothing.
     //   1. Active at arrival: the rebate and the weight credit go to the
     //      operator only if `CapacityBond.isActive(operator)`. Otherwise
     //      the rebate goes to the treasury and the credit is 0.
@@ -274,12 +275,14 @@ interface IPaymentPool {
     // `(bytes, usdc)`. The pool does not clamp bytes.
     function redeemMany(Batch[] calldata batches) external;
 
-    // Permissionless. Needs `pending[operator].usdc >= minSweep`. Calls
-    // CCTP V2 `depositForBurnWithHook` (`minFinalityThreshold` 2000) with
-    // `mintRecipient` and `destinationCaller` set to the governance-chain
-    // FeeRouter and `hookData = abi.encode(operator, bytes)`, then resets
-    // `pending[operator]`. The operator has its own reason to sweep: the
-    // sweep carries its rebate and its vote weight.
+    // Permissionless. Needs `pending[operator].usdc >= minSweep`. Resets
+    // `pending[operator]`, then calls CCTP V2 `depositForBurnWithHook`
+    // (`minFinalityThreshold` 2000) with `mintRecipient` and
+    // `destinationCaller` set to the governance-chain FeeRouter,
+    // `maxFee = getMinFeeAmount(amount)` (0 when the messenger has no such
+    // function), and `hookData = abi.encode(operator, bytes)`. The operator
+    // has its own reason to sweep: the sweep carries its rebate and its
+    // vote weight.
     function sweep(address operator) external;
 
     function pending(address operator) external view returns (uint256 bytes_, uint256 usdc);
