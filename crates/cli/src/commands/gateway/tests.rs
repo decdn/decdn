@@ -4539,10 +4539,11 @@ async fn a_spent_allowance_still_serves_a_cached_site() {
     assert_eq!(gateway.metrics.snapshot().cache_hits, 2);
 }
 
-/// A loopback page no capability covers still gets a blob the cache holds
-/// whole: the hit spends no capability.
+/// A loopback page no capability covers gets the 402 even for a blob the
+/// cache holds whole: the refusal is how the page learns to register a
+/// capability, and the SDK contract pins it.
 #[tokio::test]
-async fn a_page_with_no_capability_still_gets_a_cached_blob() {
+async fn a_page_with_no_capability_gets_402_even_for_a_cached_blob() {
     let dir = tempfile::tempdir().unwrap();
     let text = cached_text();
     let len = u64::try_from(text.len()).unwrap();
@@ -4553,9 +4554,7 @@ async fn a_page_with_no_capability_still_gets_a_cached_blob() {
     let gateway = test_gateway_cached(NoPulls, flags(&[]), sites, None, 1, Some(cache)).await;
 
     let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(hash))).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, text);
-    let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(OTHER))).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
     assert!(body.contains("no capability covers"), "{body}");
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 0);
 }

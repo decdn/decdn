@@ -239,8 +239,9 @@ the whole blob, or the chunk groups of its one `Range`. The cache must also
 hold the blob under the size that the response states. The gateway serves a
 hit from the cache. A hit starts no pull, spends no capability and charges
 the allowance nothing. The allowance meters what the gateway pays for, and a
-hit pays for nothing. Thus a hit is served when the allowance is spent, and
-on a loopback gateway when no capability covers the page. A blob that the
+hit pays for nothing. Thus a hit is served when the allowance is spent. On a
+loopback gateway, a page that no capability covers gets 402 for a hit too.
+The 402 tells the page to register a capability. A blob that the
 cache holds whole answers `HEAD` with its length, and needs no size lookup.
 
 A bundle manifest that the cache holds whole is read from the cache, with no

@@ -141,8 +141,10 @@
 //! verified against the blob's hash. A request whose bytes the cache holds,
 //! the whole blob or its one `Range`, at the size a holder proved, is served
 //! out of the cache (`Gateway::cache_hit`): no pull, no capability spent, and
-//! no allowance charged, so a spent allowance or a page no capability covers
-//! still gets it (`Gateway::cached_only`). A manifest the cache holds whole is
+//! no allowance charged, so a spent allowance still gets it
+//! (`Gateway::cached_only`). A loopback page no capability covers gets its
+//! 402 all the same, as that refusal is how a page learns to register a
+//! capability. A manifest the cache holds whole is
 //! read from it with no pull. A blob the cache holds whole answers `HEAD` and gives
 //! its length with no size lookup. A request the cache holds only part of
 //! streams as a pull, which fetches only what the cache lacks, and is charged
@@ -2131,9 +2133,8 @@ impl Gateway {
         present: Present,
         ask: Ask<'_>,
     ) -> Response<Body> {
-        // Neither gate below meters a response the cache holds whole: it
-        // costs no pull, so a spent allowance or a page no capability covers
-        // still gets it.
+        // The allowance meters what the gateway pays for, and a response the
+        // cache holds whole costs no pull, so a spent allowance still gets it.
         if let Some(refused) = self.allowance_refusal(pointer, uri) {
             return match self.cached_only(uri, present, ask).await {
                 Some(response) => response,
@@ -2142,12 +2143,11 @@ impl Gateway {
         }
         // A funding stop retires the capability and the next covering one
         // takes the request, so a capability that cannot pay costs a retry,
-        // never a failed load. Each pass retires one, so the loop ends.
+        // never a failed load. Each pass retires one, so the loop ends. A page
+        // no capability covers gets the 402 even for a cached blob: the
+        // refusal is how the page learns to register a capability.
         loop {
             let Some(paying) = self.paying_for(page_host, pointer).await else {
-                if let Some(response) = self.cached_only(uri, present, ask).await {
-                    return response;
-                }
                 return text(
                     StatusCode::PAYMENT_REQUIRED,
                     &format!("no capability covers {page_host}\n"),
