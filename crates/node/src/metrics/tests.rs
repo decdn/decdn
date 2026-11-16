@@ -1711,3 +1711,28 @@ fn inbound_failure_reasons_hold_no_duplicate() {
         INBOUND_FAILURE_REASONS.iter().copied().collect();
     assert_eq!(unique.len(), INBOUND_FAILURE_REASONS.len());
 }
+
+/// A peer that connects and sends no request loses its connection, and so
+/// its permit, once the header read timeout passes.
+#[tokio::test(start_paused = true)]
+async fn a_silent_metrics_connection_is_closed() {
+    use tokio::io::AsyncReadExt as _;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, shutdown) = oneshot::channel();
+    let server = tokio::spawn(serve(listener, Arc::new(Metrics::new()), shutdown));
+
+    let started = tokio::time::Instant::now();
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 64];
+    // The server closes without a response, or answers the timeout with a
+    // 408 and then closes; either way the read reaches EOF.
+    while client.read(&mut buf).await.unwrap_or(0) > 0 {}
+    let held = started.elapsed();
+    assert!(
+        held >= METRICS_HEADER_READ_TIMEOUT && held < METRICS_CONNECTION_LIFETIME,
+        "a silent connection closes at the header timeout, held {held:?}"
+    );
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}

@@ -4636,6 +4636,31 @@ async fn origin_range_wire_hard_faults_on_wrong_length_outboard() -> anyhow::Res
     Ok(())
 }
 
+/// An origin size claim past the engine's blob cap reads no outboard: the
+/// claim would otherwise size the outboard read itself.
+#[tokio::test]
+async fn an_origin_size_past_the_blob_cap_reads_no_outboard() -> anyhow::Result<()> {
+    let (_data, hash, origin, _aligned) = multi_window_stub();
+    let origin = Arc::new(origin);
+    let tmp = tempfile::tempdir()?;
+    let engine =
+        CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 1).await?;
+    let claim = (1u64 << 20) + 1;
+    anyhow::ensure!(
+        engine
+            .origin_fetch_outboard_bytes(hash, claim)
+            .await?
+            .is_none(),
+        "a size claim past the cap must read no outboard"
+    );
+    anyhow::ensure!(
+        origin.outboard_fetches.load(Ordering::SeqCst) == 0,
+        "the origin must not be asked for the outboard, asked {}",
+        origin.outboard_fetches.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
+
 /// Every draw of one hash reuses the outboard the first draw read: the origin
 /// serves `{H}.obao4` once, however many draws follow.
 #[tokio::test]
