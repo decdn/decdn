@@ -12,7 +12,9 @@ import { PaymentPool } from "../src/PaymentPool.sol";
 contract DeployPaymentPoolTest is Test, DeployPaymentPool {
     using stdJson for string;
 
-    address internal constant TEST_USDC = address(0x75FA);
+    // `vm.setEnv` is process-wide and suites run in parallel, so every env var
+    // this suite shares with `DeployProtocolScriptTest` carries the same value.
+    address internal constant TEST_USDC = address(0xa55D);
     address internal constant TEST_MESSENGER = address(0x8FE6);
     address internal constant TEST_RECEIVER = address(0xCAFE);
     address internal constant TEST_PAUSER = address(0xDEAD);
