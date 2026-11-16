@@ -885,6 +885,57 @@ fn present_byte_count(ranges: &ChunkRanges, size: u64) -> u64 {
     })
 }
 
+/// The byte offset the last span of `ranges` ends at in a `size`-byte blob:
+/// `size` for a span open to the end, and `0` for no span.
+fn ranges_end_bytes(ranges: &ChunkRanges, size: u64) -> u64 {
+    const CHUNK_BYTES: u64 = 1024;
+    let boundaries = ranges.boundaries();
+    if boundaries.len() % 2 == 1 {
+        return size;
+    }
+    boundaries
+        .last()
+        .map_or(0, |chunk| chunk.0.saturating_mul(CHUNK_BYTES).min(size))
+}
+
+/// The verified proof nodes one streamed admit decoded, for a serve leg's
+/// shared outboard.
+type ProofPairs = Vec<(
+    bao_tree::TreeNode,
+    (bao_tree::blake3::Hash, bao_tree::blake3::Hash),
+)>;
+
+/// Live control over one [`CacheEngine::admit_bao_stream_until`] call.
+#[derive(Clone, Copy, Default)]
+pub struct AdmitControl<'a> {
+    /// Called after each verified chunk group with the end of the verified
+    /// prefix, as a byte offset into the blob. It runs in the decode loop, so
+    /// it must not block.
+    pub on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+    /// An end the caller can lower while the admit streams, as a byte offset
+    /// into the blob. Once the verified prefix reaches it, the admit stops.
+    pub stop_at: Option<&'a AtomicU64>,
+}
+
+impl std::fmt::Debug for AdmitControl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmitControl")
+            .field("on_progress", &self.on_progress.is_some())
+            .field("stop_at", &self.stop_at)
+            .finish()
+    }
+}
+
+/// How a [`CacheEngine::admit_bao_stream_until`] call ended without a fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmitEnd {
+    /// The decoder read the admitted ranges to their end.
+    Drained,
+    /// The verified prefix reached [`AdmitControl::stop_at`] before the end
+    /// of the admitted ranges, and the admit stopped there.
+    Stopped,
+}
+
 /// The chunk span of discovery block `index` of a `size`-byte blob.
 ///
 /// One bao leaf chunk is 1024 bytes ([`bao_tree::ChunkNum`]'s unit), so one
@@ -4595,6 +4646,53 @@ impl CacheEngine {
     where
         R: AsyncStreamReader + Send,
     {
+        self.admit_bao_stream_until(
+            hash,
+            chunk_ranges,
+            total_bytes,
+            reader,
+            session,
+            AdmitControl::default(),
+        )
+        .await
+        .map(|(reader, _)| reader)
+    }
+
+    /// [`Self::admit_bao_stream`] under `control`: it reports the verified
+    /// prefix as each chunk group lands, and stops early once that prefix
+    /// reaches an end the caller lowers while the admit runs.
+    ///
+    /// After each verified chunk group it calls
+    /// [`AdmitControl::on_progress`] with the end of the verified prefix, as a
+    /// byte offset into the blob, and then reads [`AdmitControl::stop_at`]
+    /// with `SeqCst`. Once the prefix reaches that end, and the admitted
+    /// ranges continue past it, the admit keeps what it verified, protects the
+    /// partial as a whole admit does, and returns [`AdmitEnd::Stopped`]
+    /// without reading further. A chunk group ends at a boundary of the
+    /// pre-order bao encoding, so the stopped prefix verifies on its own.
+    /// `chunk_ranges` is one contiguous range when `stop_at` is set: the
+    /// prefix is the end of the furthest chunk group verified.
+    ///
+    /// The progress call follows the hand-off of the chunk group to the
+    /// store's import, so a read of the present ranges right after it can
+    /// still miss that group. The call returns only once the store has
+    /// written every group it verified.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_bao_stream`].
+    pub async fn admit_bao_stream_until<R>(
+        &self,
+        hash: Hash,
+        chunk_ranges: ChunkRanges,
+        total_bytes: u64,
+        reader: R,
+        session: Option<&Arc<crate::FillSession>>,
+        control: AdmitControl<'_>,
+    ) -> Result<(R, AdmitEnd), (R, CacheError)>
+    where
+        R: AsyncStreamReader + Send,
+    {
         let Some(size) = NonZeroU64::new(total_bytes) else {
             // An empty blob has no bao to decode. Mirror iroh-blobs' own
             // `import_bao_reader`: the canonical empty hash is a no-op success
@@ -4602,7 +4700,7 @@ impl CacheEngine {
             // other hash is an upstream inconsistency (the signed `total_bytes`
             // disagrees with a non-empty content hash) — the sender's fault.
             if hash == Hash::EMPTY {
-                return Ok(reader);
+                return Ok((reader, AdmitEnd::Drained));
             }
             return Err((
                 reader,
@@ -4614,6 +4712,7 @@ impl CacheEngine {
         let tree = bao_tree::BaoTree::new(total_bytes, crate::range_pull::IROH_BLOCK_SIZE);
         let capture_into = session.cloned();
         let admitted = chunk_ranges.clone();
+        let ranges_end = ranges_end_bytes(&chunk_ranges, total_bytes);
 
         let handle = match self
             .inner
@@ -4642,6 +4741,8 @@ impl CacheEngine {
         let driver = async move {
             let mut decoder = ResponseDecoder::new(hash.into(), chunk_ranges, tree, reader);
             let mut pairs = Vec::new();
+            // The end of the furthest chunk group verified so far.
+            let mut verified_end = 0u64;
             loop {
                 match decoder.next().await {
                     ResponseDecoderNext::More((rest, item)) => {
@@ -4650,7 +4751,15 @@ impl CacheEngine {
                             // A decode/verify fault (corrupt bytes) or a truncated
                             // feed. Recover the reader and surface the decoder's
                             // `io::Error` for classification.
-                            Err(e) => break (rest.finish(), Err(std::io::Error::from(e))),
+                            Err(e) => {
+                                break (rest.finish(), Err(std::io::Error::from(e)), false);
+                            }
+                        };
+                        let leaf_end = match &item {
+                            BaoContentItem::Leaf(leaf) => Some(leaf.offset.saturating_add(
+                                u64::try_from(leaf.data.len()).unwrap_or(u64::MAX),
+                            )),
+                            BaoContentItem::Parent(_) => None,
                         };
                         // The `Parent` items ARE the outboard proof nodes; capture
                         // them for the serve leg here, in the one decode pass, rather
@@ -4668,75 +4777,108 @@ impl CacheEngine {
                         if tx.send(item).await.is_err() {
                             // The store import ended before this item landed — its
                             // result (awaited below) explains why. Recover the reader.
-                            break (rest.finish(), Ok(pairs));
+                            break (rest.finish(), Ok(pairs), false);
+                        }
+                        if let Some(end) = leaf_end {
+                            verified_end = verified_end.max(end);
+                            if let Some(cb) = control.on_progress {
+                                cb(verified_end);
+                            }
+                            // A lowered end this prefix reached stops the admit
+                            // here. The progress call above published the prefix
+                            // before the end is read, the order a caller that
+                            // lowers it relies on.
+                            if verified_end < ranges_end
+                                && control
+                                    .stop_at
+                                    .is_some_and(|stop| verified_end >= stop.load(Ordering::SeqCst))
+                            {
+                                break (rest.finish(), Ok(pairs), true);
+                            }
                         }
                         decoder = rest;
                     }
-                    ResponseDecoderNext::Done(reader) => break (reader, Ok(pairs)),
+                    ResponseDecoderNext::Done(reader) => break (reader, Ok(pairs), false),
                 }
             }
             // `tx` drops here, ending the fed item stream so the store finalizes.
         };
         // Await the store's result concurrently with the decode: the item channel is
         // bounded, so the store must drain it while the driver fills it.
-        let ((reader, decode_res), store_res) = tokio::join!(driver, rx);
+        let ((reader, decode_res, stopped), store_res) = tokio::join!(driver, rx);
 
-        let finished: CacheResult<()> = 'finish: {
-            // A decode/verify fault names the real cause (corrupt upstream vs
-            // truncated feed) and wins over the store side.
-            let pairs = match decode_res {
-                Ok(pairs) => pairs,
-                Err(io_err) => break 'finish Err(classify_admit_decode_error(hash, io_err)),
-            };
-            // Then the store's own result, or a dropped receiver (the store task died).
-            match store_res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    break 'finish Err(CacheError::Store(
-                        anyhow::Error::from(e).context("admit_bao_stream: store import"),
-                    ));
-                }
-                Err(_recv) => {
-                    break 'finish Err(CacheError::Store(anyhow::anyhow!(
-                        "admit_bao_stream: import result channel dropped"
-                    )));
-                }
-            }
-
-            // ADR 040: consult the admission policy, then label the segment only
-            // after `protect_partial` succeeds, so a failed protect leaves no stale
-            // membership entry for an unprotected blob. Under the default
-            // `AlwaysAdmit` the segment is `Main`, so `set_segment` is a no-op —
-            // membership is pure in-memory metadata, no tag I/O.
-            let admission_ctx = crate::policy::AdmissionContext {
-                hash,
-                known_size: Some(total_bytes),
-            };
-            let segment = self.admission_segment(&admission_ctx);
-            if let Err(e) = self.protect_partial(hash).await {
-                break 'finish Err(e);
-            }
-            self.set_segment(hash, segment);
-            // Recency only, like every fill path: the partial becomes an eviction
-            // candidate even when no serve follows (an aborted or unpaid serve leg
-            // never reaches `observe_hit`), so the bytes `size_snapshot` counts can
-            // be released.
-            self.record_partial_fill(hash).await;
-            // Capture any proof nodes left after the last leaf. `pairs` is empty
-            // when no serve leg shares this fill.
-            if let Some(session) = session {
-                session.capture_many(pairs);
-            }
-            Ok(())
-        };
+        let finished = self
+            .settle_admit(hash, total_bytes, decode_res, store_res, session)
+            .await;
         // On success and failure alike: the store keeps every item it verified
         // before a fault, and a gap-fill retry admits only the missing ranges, so
         // a block this admit completed is announced here or not at all.
         self.announce_completed_blocks(hash, &admitted).await;
         match finished {
-            Ok(()) => Ok(reader),
+            Ok(()) if stopped => Ok((reader, AdmitEnd::Stopped)),
+            Ok(()) => Ok((reader, AdmitEnd::Drained)),
             Err(e) => Err((reader, e)),
         }
+    }
+
+    /// Settle one streamed admit once its decode and the store import have
+    /// both ended: classify a fault, else protect the partial, label its
+    /// segment, record the fill, and hand the last proof nodes to `session`.
+    async fn settle_admit<E, D>(
+        &self,
+        hash: Hash,
+        total_bytes: u64,
+        decode_res: Result<ProofPairs, std::io::Error>,
+        store_res: Result<Result<(), E>, D>,
+        session: Option<&Arc<crate::FillSession>>,
+    ) -> CacheResult<()>
+    where
+        anyhow::Error: From<E>,
+    {
+        // A decode/verify fault names the real cause (corrupt upstream vs
+        // truncated feed) and wins over the store side.
+        let pairs = match decode_res {
+            Ok(pairs) => pairs,
+            Err(io_err) => return Err(classify_admit_decode_error(hash, io_err)),
+        };
+        // Then the store's own result, or a dropped receiver (the store task died).
+        match store_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(CacheError::Store(
+                    anyhow::Error::from(e).context("admit_bao_stream: store import"),
+                ));
+            }
+            Err(_recv) => {
+                return Err(CacheError::Store(anyhow::anyhow!(
+                    "admit_bao_stream: import result channel dropped"
+                )));
+            }
+        }
+
+        // ADR 040: consult the admission policy, then label the segment only
+        // after `protect_partial` succeeds, so a failed protect leaves no stale
+        // membership entry for an unprotected blob. Under the default
+        // `AlwaysAdmit` the segment is `Main`, so `set_segment` is a no-op —
+        // membership is pure in-memory metadata, no tag I/O.
+        let admission_ctx = crate::policy::AdmissionContext {
+            hash,
+            known_size: Some(total_bytes),
+        };
+        let segment = self.admission_segment(&admission_ctx);
+        self.protect_partial(hash).await?;
+        self.set_segment(hash, segment);
+        // Recency only, like every fill path: the partial becomes an eviction
+        // candidate even when no serve follows (an aborted or unpaid serve leg
+        // never reaches `observe_hit`), so the bytes `size_snapshot` counts can
+        // be released.
+        self.record_partial_fill(hash).await;
+        // Capture any proof nodes left after the last leaf. `pairs` is empty
+        // when no serve leg shares this fill.
+        if let Some(session) = session {
+            session.capture_many(pairs);
+        }
+        Ok(())
     }
 
     /// Best-effort total byte size of `hash` from the configured origins, for
