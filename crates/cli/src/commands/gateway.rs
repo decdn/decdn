@@ -415,14 +415,28 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     // The worker's queued lane writes land before the store dir is removed.
     gateway.pulls.stop().await;
     drop(temp_store);
-    drop(eviction);
-    // The cache's last writes reach its database before the process exits.
-    if let Some(engine) = &cache
+    close_cache(eviction, cache.as_ref()).await;
+    served
+}
+
+/// Stop the eviction loop, wait for its sweep to end, then shut `cache` down,
+/// so no release races the cache's last writes and those writes reach its
+/// database before the process exits.
+async fn close_cache(
+    eviction: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
+    cache: Option<&CacheEngine>,
+) {
+    if let Some((stop, sweeping)) = eviction {
+        let _ = stop.send(());
+        if let Err(e) = sweeping.await {
+            tracing::warn!(error = %e, "the gateway cache's eviction loop did not end cleanly");
+        }
+    }
+    if let Some(engine) = cache
         && let Err(e) = engine.shutdown().await
     {
         tracing::warn!(error = %e, "the gateway cache did not shut down cleanly");
     }
-    served
 }
 
 /// The cache directory under the gateway's data dir.
@@ -463,13 +477,14 @@ async fn open_cache(
 
 /// Run the cache's eviction loop (#1173, ADR 040) under `cache_mb`, with the
 /// node's default marks, sweep budget, tick and free-disk margin. The loop
-/// stops when the returned sender drops.
+/// stops at its next tick once the returned sender fires or drops; the
+/// returned task ends with it.
 fn start_eviction(
     engine: &CacheEngine,
     metrics: &Arc<CacheMetrics>,
     cache_mb: u64,
     root: &Path,
-) -> oneshot::Sender<()> {
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     use decdn_common::config as defaults;
     let (stop, stopped) = oneshot::channel();
     let params = decdn_cache::EvictionParams {
@@ -481,7 +496,7 @@ fn start_eviction(
         tick: Duration::from_secs(defaults::DEFAULT_EVICTION_TICK_SECS),
     };
     let dir = root.join(CACHE_DIR);
-    tokio::spawn(decdn_cache::eviction_driver::run(
+    let sweeping = tokio::spawn(decdn_cache::eviction_driver::run(
         engine.clone(),
         Arc::clone(metrics),
         params,
@@ -490,7 +505,7 @@ fn start_eviction(
         |_| {},
         stopped,
     ));
-    stop
+    (stop, sweeping)
 }
 
 /// Print where the gateway serves, and on loopback its token and the

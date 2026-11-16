@@ -181,6 +181,10 @@ async fn run() -> anyhow::Result<()> {
                         &registry,
                         "--allowance",
                         &format!("{namespace}={NAMESPACE_ALLOWANCE}"),
+                        // A repeat request pulls, so it spends the allowance;
+                        // with the cache on it would be a free hit.
+                        "--cache-mb",
+                        "0",
                     ]),
                     chain_flags(&chain),
                     node_flags(&chain, &node),
