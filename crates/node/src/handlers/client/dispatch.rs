@@ -3,11 +3,11 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, MissPath,
-    MissRefusal, OwnedSemaphorePermit, PublicKey, RecvStream, Semaphore, SendStream,
-    ServeRejectReason, StreamReadError, StreamRequest, U256, VarInt, read_first_message,
-    reset_stream, verify_binding,
+    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, Deployment,
+    FillOutcome, FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneId,
+    LaneKey, MissPath, MissRefusal, OwnedSemaphorePermit, PublicKey, RecvStream, Semaphore,
+    SendStream, ServeRejectReason, StreamReadError, StreamRequest, U256, VarInt,
+    read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
@@ -397,6 +397,27 @@ impl ClientHandler {
             return Ok(ServeEnd::Reset(ResetCause::TimestampSkew));
         }
 
+        // Payment pool routing (ADR 005 § Payment pool routing). The request
+        // names the pool it pays from; every pool read, voucher domain and lane
+        // below belongs to that pool's route. A pool this node does not accept
+        // is refused `Declined` with the accepted pools listed, before any pool
+        // read or chain call, so the requester can retry on one it holds.
+        let Some(deployment) = Deployment::from_pool_account(&req.payment_pool)
+            .filter(|deployment| self.pool_route(*deployment).is_some())
+        else {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::UnacceptedPool,
+                    self.rate_per_mb,
+                )
+                .await;
+        };
+        let pool_view = self
+            .pool_route(deployment)
+            .and_then(|route| route.pool_view.clone());
+
         // Verify an ephemeral client binding if present (ADR 005 §Client
         // identity binding) and remember the recovered address for the
         // connection's lifetime (a binding may be sent once and omitted on
@@ -450,8 +471,8 @@ impl ClientHandler {
         // The request's price: the node's configured `rate_per_mb`, quoted
         // verbatim and threaded to every refusal and to the window tier. The
         // delivery floor never rewrites it — a sub-floor rate still sells, and
-        // settlement clamps only the vote-weight byte credit (ADR 003
-        // § Rate-floor enforcement).
+        // the floor prices only the vote-weight credit the governance chain's
+        // `FeeRouter` grants on a sweep (ADR 003 § Rate-floor enforcement).
         let rate_per_mb = self.rate_per_mb;
 
         // Chain-staleness gate (ADR 011 §Serving while chain-stale). Every gate
@@ -519,11 +540,15 @@ impl ClientHandler {
         // as "not my business" (it cannot make this node spend, because
         // `pull_authorized` refuses it before every fill tier).
         let self_operator = self.eth_signer.address();
-        let lane_key = verified_client.map(|signer| LaneKey {
-            pool_id: B256::from(req.pool_id),
-            signer,
-            provider: self_operator,
+        let lane_key = verified_client.map(|signer| LaneId {
+            deployment,
+            key: LaneKey {
+                pool_id: B256::from(req.pool_id),
+                signer,
+                provider: self_operator,
+            },
         });
+        let pool = (deployment, B256::from(req.pool_id));
 
         // Backend and chain work only for a request that names a lane. A
         // request with no verified binding can name none, so it can never be
@@ -536,7 +561,7 @@ impl ClientHandler {
         // read; the per-request limiter and the admit-read cap bound what bound
         // requests can spend. With no pool-view wired (dev/test) the lane gate
         // below refuses it.
-        if self.pool_view.is_some() && lane_key.is_none() {
+        if pool_view.is_some() && lane_key.is_none() {
             self.warn_unbound_request(&peer);
             return self
                 .respond_error(
@@ -608,7 +633,7 @@ impl ClientHandler {
         // rejection rather than a fail-open serve. With NO pool-view wired
         // (dev/test, no chain) the read is `None` and the downstream gates keep
         // their prior fail-open behavior.
-        let pool_status = match self.pool_view.as_ref() {
+        let pool_status = match pool_view.as_ref() {
             Some(view) => view.status(B256::from(req.pool_id)).await,
             None => None,
         };
@@ -622,7 +647,7 @@ impl ClientHandler {
         // wired, which lets the capability-owner and floor gates below rely on it.
         // With NO pool-view (dev/test, no chain wired) `pool_status` stays `None` and
         // the pre-#-gates keep their prior fail-open behavior.
-        if self.pool_view.is_some() && pool_status.is_none() {
+        if pool_view.is_some() && pool_status.is_none() {
             return self
                 .respond_error(
                     &mut send,
@@ -645,7 +670,7 @@ impl ClientHandler {
         // read of the signer -> None -> refuse as unconfirmed, never as an
         // exhausted cap.
         let mut registered_terms: Option<(u64, u64)> = None;
-        if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
+        if let (Some(view), Some(signer)) = (pool_view.as_ref(), verified_client) {
             let floor_micro =
                 decdn_incentive::min_payment(self.credit_window(CHUNK_BYTES, 0), rate_per_mb);
             let auth = view
@@ -697,7 +722,13 @@ impl ClientHandler {
         if let (Some(signer), Some(capability), Some(status)) =
             (verified_client, ext.capability.as_ref(), pool_status)
         {
-            self.intake_capability(B256::from(req.pool_id), signer, status.owner, capability);
+            self.intake_capability(
+                deployment,
+                B256::from(req.pool_id),
+                signer,
+                status.owner,
+                capability,
+            );
         }
 
         // Resolve the live lane AFTER intake, so a lane just registered from this
@@ -719,7 +750,8 @@ impl ClientHandler {
         // registered from a wider capability, or from one presented before the
         // signer's registration landed elsewhere, narrows here on its next stream.
         if let (Some(lane), Some((cap, expiry))) = (known_lane.as_ref(), registered_terms) {
-            self.clamp_lane_to_registration(lane, cap, expiry).await;
+            self.clamp_lane_to_registration(deployment, lane, cap, expiry)
+                .await;
         }
 
         // Funding gates that need the lane (ADR 003 §Pool solvency, ADR 005
@@ -1074,9 +1106,8 @@ impl ClientHandler {
                         window
                     };
                     let reserved = decdn_incentive::min_payment(reserved_bytes, rate_per_mb);
-                    let pool_id = B256::from(req.pool_id);
                     match self.try_reserve_floor(
-                        pool_id,
+                        pool,
                         key.signer,
                         status.remaining,
                         rate_per_mb,
@@ -1086,7 +1117,7 @@ impl ClientHandler {
                             self.log_floor_refusal(
                                 refusal,
                                 FloorRefusalSite {
-                                    pool_id,
+                                    pool,
                                     signer: key.signer,
                                     hash,
                                     remaining: status.remaining,
@@ -1480,7 +1511,7 @@ impl ClientHandler {
             let refused = if floor_reservation.is_none() {
                 let reserved = decdn_incentive::min_payment(guard_bytes, rate_per_mb);
                 match self.try_reserve_floor(
-                    B256::from(req.pool_id),
+                    lane_key.pool(),
                     lane_key.signer,
                     status.remaining,
                     rate_per_mb,
@@ -1503,18 +1534,14 @@ impl ClientHandler {
                 // worse than serving: the fill already fronted upstream USDC, so
                 // refusing loses that spend for nothing. The per-signer cap did its
                 // job pre-fill; this gate only asks whether the pool can still pay.
-                (!self.pool_budget_covers_reserve(
-                    B256::from(req.pool_id),
-                    status.remaining,
-                    U256::ZERO,
-                ))
-                .then_some(FloorRefusal::PoolExhausted)
+                (!self.pool_budget_covers_reserve(lane_key.pool(), status.remaining, U256::ZERO))
+                    .then_some(FloorRefusal::PoolExhausted)
             };
             if let Some(refusal) = refused {
                 self.log_floor_refusal(
                     refusal,
                     FloorRefusalSite {
-                        pool_id: B256::from(req.pool_id),
+                        pool: lane_key.pool(),
                         signer: lane_key.signer,
                         hash,
                         remaining: status.remaining,

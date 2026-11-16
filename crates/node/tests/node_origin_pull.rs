@@ -7596,7 +7596,7 @@ async fn build_node_b_with_store(
             // discover→probe→pull, paced by the ramped credit window (#1669).
             deps.pull_through = Some(Duration::from_secs(20));
             deps.pull_through_origin = Some(Arc::new(origin));
-            deps.pool_view = Some(pool_view);
+            support::set_pool_view(deps, pool_view);
             if let Some(deny) = content_deny {
                 deps.content_deny = deny;
             }
@@ -15026,7 +15026,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
             deps.warming_credit = Arc::new(
                 decdn_node::warming_allowance::DirectWarmingCreditSink::new(Arc::clone(&warming)),
             );
-            deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(OP_BPS);
+            support::set_operator_shares(deps, decdn_node::fee_shares::OperatorShares::new(OP_BPS));
         },
     )?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -15279,7 +15279,10 @@ async fn attack_b_attempt(
                     Arc::new(decdn_node::warming_allowance::DirectWarmingCreditSink::new(
                         Arc::clone(warming),
                     ));
-                deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(op_bps);
+                support::set_operator_shares(
+                    deps,
+                    decdn_node::fee_shares::OperatorShares::new(op_bps),
+                );
             },
         )?;
         let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -15860,7 +15863,7 @@ async fn build_serving_node(
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
             deps.pull_through_origin = Some(Arc::clone(&origin_s));
-            deps.pool_view = Some(pool_view);
+            support::set_pool_view(deps, pool_view);
         },
     )?;
     let target = EndpointAddr::new(s_id).with_ip_addr(addr_s);

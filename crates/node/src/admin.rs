@@ -177,11 +177,11 @@ pub struct EarningsHandles {
     /// The settlement ledger: one row per landed `redeemMany`, the source of
     /// every settled figure.
     pub ledger: Arc<dyn SettlementLedger>,
-    /// Persistent per-lane voucher state, read for the pending total
-    /// (`owed − paid_cumulative` per lane).
-    pub pool_store: Arc<dyn PoolStateStore>,
-    /// The redeemer's published sweep schedule, for "next sweep in".
-    pub schedule: RedeemSchedule,
+    /// Persistent per-lane voucher state of every accepted pool, read for the
+    /// pending total (`owed − paid_cumulative` per lane).
+    pub pool_stores: Vec<Arc<dyn PoolStateStore>>,
+    /// Each pool redeemer's published sweep schedule, for "next sweep in".
+    pub schedules: Vec<RedeemSchedule>,
     /// When the settlement ledger started recording, Unix seconds
     /// (`PersistentPoolStateStore::ledger_started_at_unix`): the ledger records
     /// every settlement landed from this time on.
@@ -193,7 +193,7 @@ pub struct EarningsHandles {
 impl std::fmt::Debug for EarningsHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EarningsHandles")
-            .field("schedule", &self.schedule)
+            .field("schedules", &self.schedules)
             .field("ledger_started_at_unix", &self.ledger_started_at_unix)
             .finish_non_exhaustive()
     }
@@ -222,10 +222,9 @@ impl std::fmt::Debug for BuyerPoolHandle {
 /// argument.
 #[derive(Clone)]
 pub struct LaneStatusHandles {
-    /// Persistent per-lane voucher state (same handle the client handler
-    /// commits accepted vouchers to). Read via `load_all` to build the
-    /// snapshot — each lane's committed claim, reported at [`LaneState::owed`].
-    pub pool_store: Arc<dyn PoolStateStore>,
+    /// Every accepted pool's lane store and owner lookup, in configuration
+    /// order.
+    pub pools: Vec<AdminPool>,
     /// Read handle over the client handler's live lane registry (issue #1733).
     /// Read for `seconds_since_last_voucher`; a lane reads back `None` until
     /// this process accepts a voucher or preimage for it.
@@ -234,10 +233,30 @@ pub struct LaneStatusHandles {
     /// (`blockchain.redeem_threshold_micro_usdc`). A lane whose accrued
     /// claim has reached this is reported `settlement_eligible`.
     pub redeem_threshold_micro_usdc: u64,
+}
+
+/// One accepted pool's lane handles for `admin_v1_lanes`.
+#[derive(Clone)]
+pub struct AdminPool {
+    /// The pool.
+    pub deployment: decdn_incentive::Deployment,
+    /// Persistent per-lane voucher state of the pool (same handle the client
+    /// handler commits accepted vouchers to). Read via `load_all` to build the
+    /// snapshot — each lane's committed claim, reported at [`LaneState::owed`].
+    pub store: Arc<dyn PoolStateStore>,
     /// Names each lane's pool owner, the reported `counterparty`: the serve
     /// gates' pool view first, then an owner cache, then one `getPool` per
     /// pool in neither. A pool it cannot name reports `None`.
-    pub pool_owners: PoolOwners,
+    pub owners: PoolOwners,
+}
+
+// The trait-object store carries no `Debug` bound; name the pool only.
+impl std::fmt::Debug for AdminPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminPool")
+            .field("deployment", &self.deployment)
+            .finish_non_exhaustive()
+    }
 }
 
 // `AdminState` derives `Debug`, so the bundled handles must too. The
@@ -870,48 +889,65 @@ impl AdminRpcServer for AdminRpcImpl {
         // build the wire DTOs off the loaded `Vec` — the cheap part. A
         // store failure surfaces as a specific RPC error so the operator
         // sees "lane snapshot unavailable" rather than a transport fault.
-        let store = Arc::clone(&ch.pool_store);
-        let states = tokio::task::spawn_blocking(move || store.load_all())
-            .await
-            .map_err(|join_err| {
-                // `JoinError` is returned on panic OR cancellation (e.g.
-                // runtime shutdown); name the actual cause so a cancelled
-                // task at teardown isn't misread as a panic.
-                let cause = if join_err.is_cancelled() {
-                    "cancelled"
-                } else {
-                    "panicked"
-                };
-                tracing::error!(
-                    error = %join_err,
-                    cause,
-                    "pool-store load task did not complete"
-                );
-                ErrorObjectOwned::owned(
-                    POOL_STORE_ERROR_CODE,
-                    "pool state store load task failed",
-                    None::<()>,
-                )
-            })?
-            .map_err(|store_err| {
-                tracing::error!(error = %store_err, "admin_v1_lanes could not load pool store");
-                ErrorObjectOwned::owned(
-                    POOL_STORE_ERROR_CODE,
-                    format!("pool state store load failed: {store_err}"),
-                    None::<()>,
-                )
-            })?;
+        let stores: Vec<Arc<dyn PoolStateStore>> = ch
+            .pools
+            .iter()
+            .map(|pool| Arc::clone(&pool.store))
+            .collect();
+        let per_pool = tokio::task::spawn_blocking(move || {
+            stores
+                .iter()
+                .map(|store| store.load_all())
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|join_err| {
+            // `JoinError` is returned on panic OR cancellation (e.g.
+            // runtime shutdown); name the actual cause so a cancelled
+            // task at teardown isn't misread as a panic.
+            let cause = if join_err.is_cancelled() {
+                "cancelled"
+            } else {
+                "panicked"
+            };
+            tracing::error!(
+                error = %join_err,
+                cause,
+                "pool-store load task did not complete"
+            );
+            ErrorObjectOwned::owned(
+                POOL_STORE_ERROR_CODE,
+                "pool state store load task failed",
+                None::<()>,
+            )
+        })?
+        .map_err(|store_err| {
+            tracing::error!(error = %store_err, "admin_v1_lanes could not load pool store");
+            ErrorObjectOwned::owned(
+                POOL_STORE_ERROR_CODE,
+                format!("pool state store load failed: {store_err}"),
+                None::<()>,
+            )
+        })?;
 
         let threshold = U256::from(ch.redeem_threshold_micro_usdc);
         // Read each live lane's last-voucher age off the handler's registry
         // (issue #1733); lanes with no voucher since restart are absent from the
         // map and read back as `None`.
         let ages = ch.lane_activity.ages().await;
-        let owners = ch
-            .pool_owners
-            .resolve(states.iter().map(|s| s.pool_id))
-            .await;
-        let lanes = build_lane_snapshots(&states, threshold, &ages, &owners);
+        let mut lanes = Vec::new();
+        for (pool, states) in ch.pools.iter().zip(per_pool) {
+            let pool_ages: HashMap<LaneKey, u64> = ages
+                .iter()
+                .filter(|(lane, _)| lane.deployment == pool.deployment)
+                .map(|(lane, age)| (lane.key, *age))
+                .collect();
+            let owners = pool.owners.resolve(states.iter().map(|s| s.pool_id)).await;
+            lanes.extend(build_lane_snapshots(
+                &states, threshold, &pool_ages, &owners,
+            ));
+        }
+        sort_lane_snapshots(&mut lanes);
         Ok(LanesResponse {
             lanes,
             redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
@@ -1017,14 +1053,19 @@ impl AdminRpcServer for AdminRpcImpl {
         // the returned `Vec`s. Each read names itself in its error, so a lane
         // store fault is never reported as a ledger fault.
         let ledger = Arc::clone(&h.ledger);
-        let store = Arc::clone(&h.pool_store);
+        let stores = h.pool_stores.clone();
         let (rows, lanes) = tokio::task::spawn_blocking(move || {
             let rows = ledger
                 .load_settlements()
                 .map_err(|err| format!("settlement ledger load failed: {err}"))?;
-            let lanes = store
-                .load_all()
-                .map_err(|err| format!("lane store load failed: {err}"))?;
+            let mut lanes = Vec::new();
+            for store in &stores {
+                lanes.extend(
+                    store
+                        .load_all()
+                        .map_err(|err| format!("lane store load failed: {err}"))?,
+                );
+            }
             Ok::<_, String>((rows, lanes))
         })
         .await
@@ -1051,7 +1092,7 @@ impl AdminRpcServer for AdminRpcImpl {
             self.state.operator_address,
             unix_now(),
             req.since_unix,
-            &h.schedule,
+            &h.schedules,
             h.ledger_started_at_unix,
         ))
     }
@@ -1080,7 +1121,7 @@ pub(crate) fn build_earnings_response(
     operator: Option<Address>,
     now_unix: u64,
     since_unix: Option<u64>,
-    schedule: &RedeemSchedule,
+    schedules: &[RedeemSchedule],
     ledger_started_at_unix: u64,
 ) -> EarningsResponse {
     // Only this operator's rows: the ledger outlives an Ethereum key rotation
@@ -1109,7 +1150,7 @@ pub(crate) fn build_earnings_response(
         since_ledger_start: sum_period(covered_from_unix, rows.iter().copied()),
         since: since_unix.map(|since| sum_period(since, landed_since(since))),
         last_settlement: last_settlement(rows.iter().copied()),
-        pending: Some(pending_redeem(lanes, operator, now_unix, schedule)),
+        pending: Some(pending_redeem(lanes, operator, now_unix, schedules)),
     }
 }
 
@@ -1120,19 +1161,26 @@ pub(crate) fn build_earnings_response(
 /// stranded. The planner also skips a lane whose pool cannot pay, which needs
 /// the pool view, and sweeps nothing while the total is under the redeem
 /// threshold, so the pending figure is an upper bound on the next sweep.
+///
+/// Each pool runs its own redeemer, so the sweep times span `schedules`: the
+/// last sweep is the latest any redeemer ran, and the next sweep the earliest
+/// any is due.
 fn pending_redeem(
     lanes: &[LaneState],
     operator: Option<Address>,
     now_unix: u64,
-    schedule: &RedeemSchedule,
+    schedules: &[RedeemSchedule],
 ) -> PendingRedeem {
     let mut pending = PendingRedeem {
         micro_usdc: 0,
         lanes: 0,
         stranded_micro_usdc: 0,
         stranded_lanes: 0,
-        last_sweep_at_unix: schedule.swept_at(),
-        next_sweep_at_unix: schedule.next_sweep_at(),
+        last_sweep_at_unix: schedules.iter().filter_map(RedeemSchedule::swept_at).max(),
+        next_sweep_at_unix: schedules
+            .iter()
+            .filter_map(RedeemSchedule::next_sweep_at)
+            .min(),
     };
     for lane in lanes {
         let unredeemed = lane.unredeemed();
@@ -1209,12 +1257,17 @@ fn build_lane_snapshots(
             }
         })
         .collect();
-    // Most recently active first: `Some(age)` sorts ahead of `None`, and
-    // within each group smaller age (more recent) first; ties broken by
-    // descending outstanding. `Reverse` on the outstanding term puts the
-    // largest claim first. The key tuple is a total order so `sort_unstable`
-    // (no allocation) is safe — equal keys mean identical sort-relevant
-    // fields, with no insertion-order tiebreak promised.
+    sort_lane_snapshots(&mut snapshots);
+    snapshots
+}
+
+/// Order lane snapshots most recently active first: `Some(age)` sorts ahead of
+/// `None`, and within each group smaller age (more recent) first; ties broken
+/// by descending outstanding. `Reverse` on the outstanding term puts the
+/// largest claim first. The key tuple is a total order so `sort_unstable` (no
+/// allocation) is safe — equal keys mean identical sort-relevant fields, with
+/// no insertion-order tiebreak promised.
+fn sort_lane_snapshots(snapshots: &mut [LaneSnapshot]) {
     snapshots.sort_unstable_by_key(|s| {
         (
             s.seconds_since_last_voucher.is_none(),
@@ -1222,7 +1275,6 @@ fn build_lane_snapshots(
             std::cmp::Reverse(s.outstanding_micro_usdc),
         )
     });
-    snapshots
 }
 
 /// Bind the admin listener. Kept synchronous-at-startup so port

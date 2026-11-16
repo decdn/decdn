@@ -2774,9 +2774,13 @@ fn test_recorder() -> SettlementRecorder {
     SettlementRecorder::new(
         Arc::new(decdn_incentive::MemorySettlementLedger::default()),
         Address::from([20u8; 20]),
-        decdn_incentive::Deployment {
-            chain_id: 31_337,
-            payment_pool: Address::ZERO,
+        crate::settlement_ledger::LedgerSource {
+            deployment: decdn_incentive::Deployment {
+                chain_id: 31_337,
+                payment_pool: Address::ZERO,
+            },
+            usdc: Address::ZERO,
+            operator_bps: 6_000,
         },
         Arc::new(Metrics::new()),
     )
@@ -5351,9 +5355,13 @@ mod settlement_ledger_rows {
         let recorder = SettlementRecorder::new(
             Arc::clone(&ledger) as Arc<dyn SettlementLedger>,
             SELLER,
-            decdn_incentive::Deployment {
-                chain_id: 31_337,
-                payment_pool: Address::ZERO,
+            crate::settlement_ledger::LedgerSource {
+                deployment: decdn_incentive::Deployment {
+                    chain_id: 31_337,
+                    payment_pool: Address::ZERO,
+                },
+                usdc: Address::ZERO,
+                operator_bps: 6_000,
             },
             Arc::clone(&metrics),
         );

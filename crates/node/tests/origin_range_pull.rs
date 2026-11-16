@@ -2841,7 +2841,7 @@ async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow:
         RATE_PER_MB,
         &domains(),
         16,
-        |deps| deps.pool_view = Some(pool_view),
+        |deps| support::set_pool_view(deps, pool_view),
     )?;
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;

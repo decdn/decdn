@@ -172,6 +172,10 @@ pub struct ProbeHandler {
     /// fire either cause at will. Each event also counts into
     /// `decdn_probe_timestamp_skew_refusals_total`.
     timestamp_skew_warn: WarnThrottle,
+    /// The payment pools this node accepts, advertised in
+    /// `ProbeResponseExt.payment_pools` (ADR 005 § Payment pool routing). At
+    /// most `decdn_protocol::MAX_PAYMENT_POOLS`; empty advertises none.
+    payment_pools: Vec<decdn_protocol::PoolAccount>,
 }
 
 impl std::fmt::Debug for ProbeHandler {
@@ -220,7 +224,23 @@ impl ProbeHandler {
             chain_freshness,
             read_fault_warn: WarnThrottle::new(PROBE_READ_FAULT_WARN_INTERVAL),
             timestamp_skew_warn: WarnThrottle::new(PROBE_READ_FAULT_WARN_INTERVAL),
+            payment_pools: Vec::new(),
         }
+    }
+
+    /// Advertise `pools` as the payment pools this node accepts, in every
+    /// response's extension. Keeps the first `decdn_protocol::MAX_PAYMENT_POOLS`.
+    #[must_use]
+    pub fn with_payment_pools(mut self, mut pools: Vec<decdn_protocol::PoolAccount>) -> Self {
+        pools.truncate(decdn_protocol::MAX_PAYMENT_POOLS);
+        self.payment_pools = pools;
+        self
+    }
+
+    /// The `payment_pools` hint of a response: the accepted pools, or `None`
+    /// when the node advertises none.
+    fn payment_pools_hint(&self) -> Option<Vec<decdn_protocol::PoolAccount>> {
+        (!self.payment_pools.is_empty()).then(|| self.payment_pools.clone())
     }
 
     /// The advertised `total_bytes` for a blob already established as present.
@@ -743,8 +763,9 @@ impl ProbeHandler {
 
         // The node advertises its configured rate verbatim. The delivery floor
         // is not a quote gate: a rate below the floor still sells and settles,
-        // and `PaymentPool.redeem` clamps only the vote-weight byte credit for
-        // sub-floor bytes (ADR 003 § Rate-floor enforcement).
+        // and only the vote-weight credit the governance chain's `FeeRouter`
+        // grants on a sweep is priced against it (ADR 003 § Rate-floor
+        // enforcement).
         let rate_per_mb = self.rate_per_mb;
         let body = ProbeResponseBody {
             hash: req.hash,
@@ -788,7 +809,7 @@ impl ProbeHandler {
         let ext = ProbeResponseExt {
             coverage,
             size_proof,
-            payment_pools: None,
+            payment_pools: self.payment_pools_hint(),
         };
 
         let payload = encode_probe_response(&resp, Some(&ext))

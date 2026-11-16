@@ -98,8 +98,8 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// **Every** chain read on a watcher's path routes through here: the loop's own
 /// `get_logs`, `shared_head`'s `get_block_number`, and each follow-up RPC a
 /// [`resumable_watcher::LogSink`] issues from `apply` / `on_tick_complete`
-/// (for example the registry's `nodeIdOf`, the fee-shares `getShares`, and the
-/// slash and blacklist re-enumeration reads). This is not automatic — the loop
+/// (for example the registry's `nodeIdOf`, the settlement re-anchor `getPool`,
+/// and the slash and blacklist re-enumeration reads). This is not automatic — the loop
 /// cannot see a sink's own reads, so a *new* sink read that does not wrap itself
 /// here reintroduces the wedge this exists
 /// to prevent: the alloy HTTP provider has no request timeout, so a provider

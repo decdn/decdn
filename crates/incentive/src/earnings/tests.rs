@@ -19,7 +19,6 @@ fn row(
         log_index,
         tx_hash: B256::repeat_byte(u8::try_from(block % 256).unwrap_or(0)),
         landed_at_unix: landed_at,
-        epoch: 1,
         gross_micro_usdc: gross,
         net_micro_usdc: net,
         bytes_delivered: bytes,

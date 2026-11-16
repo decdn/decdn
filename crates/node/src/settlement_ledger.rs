@@ -1,12 +1,18 @@
 //! Writes the settlement ledger (#2598): one [`SettlementRecord`] per landed
-//! `redeemMany`, decoded from the transaction receipt by
-//! [`settlement_from_receipt`]. That decoder yields no row in this build, so
-//! the recorder writes none; the plumbing around it (timestamps, backfills,
-//! failure counting) stands ready for a decoder that does. Decoding the
-//! receipt costs no extra RPC; the redeemer's one read is the block header,
-//! for the row's timestamp, only when the receipt's logs do not carry it and
-//! only once the receipt has decoded to a row. The watcher's backfill adds the
-//! receipt read itself.
+//! `redeemMany`, decoded from the node's own transaction receipt by
+//! [`settlement_from_receipt`].
+//!
+//! A `redeemMany` that paid anything pays the operator share in the same
+//! transaction: one USDC `Transfer` from the pool to the operator, the exact
+//! net income. The pool keeps the rest as the pending protocol share, which
+//! `PaymentPool.pending(operator)` reports until a sweep. Each pool group that
+//! paid emits one `PoolRedeemed` naming the provider and the bytes each lane
+//! paid for. A `redeemMany` that paid nothing (every voucher at or below its
+//! lane's watermark, as after a re-send of a batch that had already landed)
+//! carries no transfer and gets no row. Decoding the receipt costs no extra
+//! RPC; the redeemer's one read is the block header, for the row's timestamp,
+//! only when the receipt's logs do not carry it and only once the receipt has
+//! decoded to a row. The watcher's backfill adds the receipt read itself.
 //!
 //! Two writers share [`SettlementRecorder`]: the redeemer, which has the
 //! receipt in hand when its `redeemMany` lands, and the `PoolRedeemed` watcher,
@@ -31,7 +37,10 @@ use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
+use alloy::sol_types::SolEvent;
 use decdn_common::redact::sanitize_err_chain;
+use decdn_incentive::erc20::Erc20;
+use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{Deployment, SettlementLedger, SettlementRecord, StoreError};
 use tracing::{debug, warn};
 
@@ -39,39 +48,144 @@ use crate::chain_events::timed;
 use crate::metrics::Metrics;
 use crate::payment_settlement::unix_now;
 
-/// Why a landed receipt that routed a payout yields no ledger row. This build
-/// decodes no row from a receipt ([`settlement_from_receipt`]), so no value of
-/// this type exists.
+/// Basis-point denominator of `PaymentPool.operatorBps()`.
+const BPS_DENOMINATOR: u128 = 10_000;
+
+/// The pool a recorder decodes receipts of: its deployment, the USDC token it
+/// pays in (`PaymentPool.usdc()`), and its operator share
+/// (`PaymentPool.operatorBps()`), which turns the net income back into the
+/// gross payout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerSource {
+    /// The pool.
+    pub deployment: Deployment,
+    /// The token the pool pays in.
+    pub usdc: Address,
+    /// The pool's operator share, in basis points.
+    pub operator_bps: u16,
+}
+
+/// Why a landed receipt yields no ledger row.
 #[derive(Debug)]
-pub enum DecodeError {}
+pub enum DecodeError {
+    /// A `Transfer`-shaped log of the pool's token does not decode, so the net
+    /// cannot be read.
+    UndecodableTransfer(alloy::sol_types::Error),
+    /// A `PoolRedeemed`-shaped log of the pool does not decode as this
+    /// binary's ABI, so the bytes cannot be read.
+    UndecodablePoolRedeemed(alloy::sol_types::Error),
+    /// The operator transfer carries no log index, so the row has no identity.
+    MissingLogIndex,
+}
 
 impl std::fmt::Display for DecodeError {
-    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UndecodableTransfer(err) => {
+                write!(
+                    f,
+                    "an ERC-20 Transfer log in the receipt does not decode: {err}"
+                )
+            }
+            Self::UndecodablePoolRedeemed(err) => write!(
+                f,
+                "a PaymentPool.PoolRedeemed log does not decode as this binary's ABI: {err}"
+            ),
+            Self::MissingLogIndex => {
+                f.write_str("the operator's USDC transfer carries no log index")
+            }
+        }
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UndecodableTransfer(err) | Self::UndecodablePoolRedeemed(err) => Some(err),
+            Self::MissingLogIndex => None,
+        }
+    }
+}
 
-/// The ledger row for a landed `redeemMany` receipt of `operator` on
-/// `deployment`, in `block_number`.
+/// The ledger row for `operator`'s landed `redeemMany` receipt on
+/// `source.deployment`, in `block_number`.
 ///
-/// This build decodes no row: every receipt answers `Ok(None)`, so the ledger
-/// gains no rows from redemptions and `admin_v1_earnings` reports the rows
-/// already present.
+/// - **Net:** the sum of every `Transfer` the pool's token (`source.usdc`)
+///   emitted from the pool to `operator`. The row's log index is the first
+///   such transfer's.
+/// - **Gross:** the pool pays `floor(gross × operatorBps / 10000)` to the
+///   operator, so the gross is the smallest payout that floors to the net:
+///   `ceil(net × 10000 / operatorBps)`. It understates the true payout by less
+///   than `10000 / operatorBps` micro-USDC (under 2 at a 60% share). The share
+///   is the one the node seeded at startup; when that read fell back to the
+///   floor share, the gross is approximate.
+/// - **Bytes:** the sum of `bytesPaid` over every lane of every
+///   `PoolRedeemed` the pool emitted for `operator` as provider.
+///
+/// `Ok(None)` is a receipt with no operator transfer: a `redeemMany` that paid
+/// nothing, or one whose operator share floored to zero. A pool with a zero
+/// `operatorBps` never pays one, so it yields no rows. Amounts narrow from
+/// `uint256` to `u64` micro-USDC with saturation; the on-chain counters are
+/// `uint64`, so a real value never saturates.
 ///
 /// # Errors
 ///
-/// None in this build; see [`DecodeError`].
-pub const fn settlement_from_receipt(
+/// An undecodable transfer or `PoolRedeemed`, or an operator transfer with no
+/// log index: see [`DecodeError`].
+pub fn settlement_from_receipt(
     receipt: &TransactionReceipt,
     operator: Address,
-    deployment: Deployment,
+    source: LedgerSource,
     block_number: u64,
     landed_at_unix: u64,
 ) -> Result<Option<SettlementRecord>, DecodeError> {
-    let _ = (receipt, operator, deployment, block_number, landed_at_unix);
-    Ok(None)
+    let pool = source.deployment.payment_pool;
+    let logs = receipt.inner.logs();
+    let mut net = 0u64;
+    let mut first_transfer: Option<&alloy::rpc::types::Log> = None;
+    for log in logs.iter().filter(|log| {
+        log.address() == source.usdc && log.topic0() == Some(&Erc20::Transfer::SIGNATURE_HASH)
+    }) {
+        let transfer = Erc20::Transfer::decode_log_data(&log.inner.data)
+            .map_err(DecodeError::UndecodableTransfer)?;
+        if transfer.from == pool && transfer.to == operator {
+            net = net.saturating_add(u64::try_from(transfer.value).unwrap_or(u64::MAX));
+            first_transfer.get_or_insert(log);
+        }
+    }
+    let Some(paid) = first_transfer else {
+        return Ok(None);
+    };
+    if source.operator_bps == 0 {
+        return Ok(None);
+    }
+    let log_index = paid.log_index.ok_or(DecodeError::MissingLogIndex)?;
+    let mut bytes = 0u64;
+    for log in logs.iter().filter(|log| {
+        log.address() == pool && log.topic0() == Some(&PaymentPool::PoolRedeemed::SIGNATURE_HASH)
+    }) {
+        let redeemed = PaymentPool::PoolRedeemed::decode_log_data(&log.inner.data)
+            .map_err(DecodeError::UndecodablePoolRedeemed)?;
+        if redeemed.provider == operator {
+            for lane in &redeemed.lanes {
+                bytes = bytes.saturating_add(lane.bytesPaid);
+            }
+        }
+    }
+    let gross = u128::from(net)
+        .saturating_mul(BPS_DENOMINATOR)
+        .div_ceil(u128::from(source.operator_bps));
+    Ok(Some(SettlementRecord {
+        deployment: source.deployment,
+        block_number,
+        log_index,
+        tx_hash: receipt.transaction_hash,
+        landed_at_unix,
+        gross_micro_usdc: u64::try_from(gross).unwrap_or(u64::MAX),
+        net_micro_usdc: net,
+        bytes_delivered: bytes,
+        operator,
+    }))
 }
 
 /// How many times a backfill retries a failed header read before it gives up,
@@ -146,7 +260,7 @@ enum TimeFallback {
 pub struct SettlementRecorder {
     ledger: Arc<dyn SettlementLedger>,
     operator: Address,
-    deployment: Deployment,
+    source: LedgerSource,
     metrics: Arc<Metrics>,
 }
 
@@ -159,19 +273,19 @@ impl std::fmt::Debug for SettlementRecorder {
 }
 
 impl SettlementRecorder {
-    /// A recorder that writes rows for `operator`'s redemptions on
-    /// `deployment` into `ledger` and counts its failures into `metrics`.
+    /// A recorder that writes rows for `operator`'s redemptions on `source`'s
+    /// pool into `ledger` and counts its failures into `metrics`.
     #[must_use]
     pub fn new(
         ledger: Arc<dyn SettlementLedger>,
         operator: Address,
-        deployment: Deployment,
+        source: LedgerSource,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             ledger,
             operator,
-            deployment,
+            source,
             metrics,
         }
     }
@@ -204,7 +318,7 @@ impl SettlementRecorder {
     /// Whether the ledger already holds `tx_hash` in `block_number`; `None`
     /// after a failed read, which is counted and ends the backfill.
     async fn is_known(&self, block_number: u64, tx_hash: B256) -> Option<bool> {
-        let deployment = self.deployment;
+        let deployment = self.source.deployment;
         let known = self
             .on_ledger(move |ledger| ledger.has_settlement_tx(deployment, block_number, tx_hash))
             .await;
@@ -293,15 +407,6 @@ impl SettlementRecorder {
             return;
         };
         row.landed_at_unix = landed_at_unix;
-        if row.net_micro_usdc > row.gross_micro_usdc {
-            warn!(
-                %tx,
-                block,
-                net_micro_usdc = row.net_micro_usdc,
-                gross_micro_usdc = row.gross_micro_usdc,
-                "receipt carries more router-to-operator USDC than the Settled amount"
-            );
-        }
         self.write(row).await;
     }
 
@@ -349,14 +454,14 @@ impl SettlementRecorder {
     /// row.
     fn decode_or_skip(&self, receipt: &TransactionReceipt, block: u64) -> Option<SettlementRecord> {
         let tx = receipt.transaction_hash;
-        match settlement_from_receipt(receipt, self.operator, self.deployment, block, 0) {
+        match settlement_from_receipt(receipt, self.operator, self.source, block, 0) {
             Ok(Some(row)) => Some(row),
             Ok(None) => {
                 debug!(
                     %tx,
                     block,
-                    "redeemMany landed but paid nothing (every voucher at or below its \
-                     watermark); nothing routed, no ledger row"
+                    "redeemMany landed but paid the operator nothing (every voucher at or \
+                     below its watermark, or a zero operator share); no ledger row"
                 );
                 None
             }

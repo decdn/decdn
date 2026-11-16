@@ -18,7 +18,7 @@
 use super::proof_wait::ChunkProofs;
 use super::{
     Arc, B256, BufferedProofReader, ClientHandler, Connection, DEFAULT_TOLERANCE_BPS, Hash,
-    LaneDeliveryState, LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream,
+    LaneDeliveryState, LaneId, LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream,
     RetrySignal, SendStream, SignedVoucher, U256, VoucherRejectReason, VoucherStop,
     WatermarkBundle, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
@@ -359,7 +359,7 @@ impl ClientHandler {
         reader: &mut BufferedProofReader,
         anchor: &mut StreamAnchor,
         hash: Hash,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
@@ -442,7 +442,14 @@ impl ClientHandler {
                 )
                 .await;
         };
-        if let Err(e) = signed.verify_signer(lane_key.signer, &self.voucher_domain) {
+        // The voucher domain is that of the lane's pool. A lane exists only on
+        // a routed pool, so a missing route verifies against no domain and
+        // rejects as a bad signature.
+        let verified_signer = match self.pool_route(lane_key.deployment) {
+            Some(route) => signed.verify_signer(lane_key.signer, route.voucher_domain()),
+            None => Err(VoucherError::InvalidSignature),
+        };
+        if let Err(e) = verified_signer {
             let reason = match e {
                 VoucherError::InvalidSignature => VoucherRejectReason::BadSignature,
                 VoucherError::WrongSigner { .. } => VoucherRejectReason::WrongSigner,
@@ -568,7 +575,7 @@ impl ClientHandler {
         // clears the anchor instead — it opens no chain to reveal against.
         anchor.adopt(B256::from(wire.chain_root));
         guard.paid_credited = new_credited;
-        if let Err(e) = self.pool_state_store.record(&guard.state) {
+        if let Err(e) = self.record_lane(lane_key.deployment, &guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
         }
@@ -594,13 +601,7 @@ impl ClientHandler {
         if credited_bytes > 0 {
             self.record_receipt(hash, credited_bytes, client_node_id, verified.amount);
         }
-        // Hint the settlement service that this lane's accrued claim advanced
-        // (#749/#327). Best-effort: an absent sender or a full channel just skips.
-        if let Some(tx) = self.redeem_hint.as_ref()
-            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(lane_key)
-        {
-            self.metrics.redeem_hint_dropped();
-        }
+        self.hint_redeem(lane_key);
         Ok(VoucherStop::Continue { credited_bytes })
     }
 
@@ -648,7 +649,7 @@ impl ClientHandler {
         send: &mut SendStream,
         anchor: &mut StreamAnchor,
         hash: Hash,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         client_node_id: B256,
         preimage: decdn_protocol::client::ChunkPreimage,
@@ -843,7 +844,7 @@ impl ClientHandler {
         let (new_credited, credited_bytes) =
             credit_advance(guard.paid_credited, owed.remaining(), owed_bytes)?;
         guard.paid_credited = new_credited;
-        if let Err(e) = self.pool_state_store.record(&guard.state) {
+        if let Err(e) = self.record_lane(lane_key.deployment, &guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
         }
@@ -871,11 +872,7 @@ impl ClientHandler {
         if credited_bytes > 0 {
             self.record_receipt(hash, credited_bytes, client_node_id, amount);
         }
-        if let Some(tx) = self.redeem_hint.as_ref()
-            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(lane_key)
-        {
-            self.metrics.redeem_hint_dropped();
-        }
+        self.hint_redeem(lane_key);
         Ok(VoucherStop::Continue { credited_bytes })
     }
 
@@ -893,9 +890,9 @@ impl ClientHandler {
     /// [`VoucherRejectReason::Underpaid`] carrying the lane's last-accepted
     /// watermark, so a payer whose local watermark diverged can rebase to it.
     /// Delivery stops either way. There is no cumulative rate-floor check: the
-    /// delivery floor is a soft floor that `PaymentPool.redeem` enforces by
-    /// clamping credited bytes, not by rejecting, so a sub-floor cumulative never
-    /// stops the stream here.
+    /// delivery floor prices only the vote-weight credit the governance chain's
+    /// `FeeRouter` grants on a sweep, so a sub-floor cumulative never stops the
+    /// stream here.
     fn verify_voucher(
         state: &LaneState,
         cumulative_bytes: U256,
@@ -961,11 +958,10 @@ impl ClientHandler {
                 }
 
                 // No cumulative-rate floor check here. The delivery floor is a
-                // soft floor: `PaymentPool.redeem` settles a sub-floor voucher's
-                // `cumulative` and clamps only the byte count it credits toward
-                // vote weight (ADR 003 § Rate-floor enforcement). The node never
-                // gates a voucher on the floor — it is redemption-time contract
-                // state, not a wire check. The advertised-rate check above still
+                // governance-chain `FeeRouter` parameter that prices only the
+                // vote-weight credit a sweep earns; the pool settles a sub-floor
+                // voucher in full (ADR 003 § Rate-floor enforcement). The node
+                // never gates a voucher on the floor — it is not a wire check. The advertised-rate check above still
                 // protects this node's per-delta revenue at its own quote.
                 // The byte watermark this voucher settles is the CHAIN-EXTENDED
                 // one: a rollover voucher's own `bytes_delivered` already folds

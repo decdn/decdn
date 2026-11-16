@@ -88,6 +88,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_signer_floor_at_cap_total",
     "decdn_serve_stream_rejected_stream_cap_full_total",
     "decdn_serve_stream_rejected_timestamp_skew_total",
+    "decdn_serve_stream_rejected_unaccepted_pool_total",
     "decdn_serve_stream_rejected_unknown_lane_total",
     "decdn_serve_stream_request_unreadable_total",
     "decdn_serve_stream_midstream_pool_exhausted_total",
@@ -1856,6 +1857,11 @@ pub struct DecdnMetrics {
     /// pull-through was unavailable or failed to fill it. Visible name:
     /// `decdn_serve_stream_rejected_cache_miss_total`.
     pub serve_stream_rejected_cache_miss: Counter,
+    /// `serve_stream` requests refused because their `payment_pool` names a
+    /// pool this node does not accept (ADR 005 § Payment pool routing). Signed
+    /// `Declined` with the accepted pools listed. Visible name:
+    /// `decdn_serve_stream_rejected_unaccepted_pool_total`.
+    pub serve_stream_rejected_unaccepted_pool: Counter,
     /// `serve_stream` requests refused by a local store fault (`has`/`inspect`
     /// error, or a present blob reporting no size) — signed to the client as
     /// `Declined`, not a signed absence. Visible name:
@@ -2253,14 +2259,6 @@ pub struct DecdnMetrics {
     /// `decdn_settlement_watcher_last_tick_timestamp_seconds` (#1316): Unix time
     /// of the payment-settlement watcher's last successful poll tick.
     pub settlement_watcher_last_tick_timestamp_seconds: Gauge,
-    /// `decdn_fee_shares_watcher_last_tick_timestamp_seconds`: Unix time of the
-    /// fee-shares watcher's last successful poll tick. Load-bearing: the
-    /// watcher's `getShares()` poll failure and undecodable-log paths both
-    /// return `Ok` by design, so a watcher stuck in RPC backoff — or dead — is
-    /// otherwise indistinguishable from a healthy one while the node keeps
-    /// signing quotes against a stale operator fee share. Alert on this gauge
-    /// going stale.
-    pub fee_shares_watcher_last_tick_timestamp_seconds: Gauge,
     /// `decdn_slash_watcher_task_panicked_total` (#1316): the slash watcher task
     /// unwound on a panic. Bumped from a `Drop` guard in `multiplexed_poller::run`
     /// — the only thing that still runs on the unwind, since nothing awaits the
@@ -2272,9 +2270,6 @@ pub struct DecdnMetrics {
     /// `decdn_blacklist_watcher_task_panicked_total` (#1316, #1283): the
     /// blacklist watcher task unwound on a panic.
     pub blacklist_watcher_task_panicked: Counter,
-    /// `decdn_fee_shares_watcher_task_panicked_total`: the fee-shares watcher
-    /// task unwound on a panic. Any non-zero value is a bug in this node.
-    pub fee_shares_watcher_task_panicked: Counter,
     /// `decdn_settlement_watcher_task_panicked_total` (#1316): the
     /// payment-settlement watcher task unwound on a panic.
     pub settlement_watcher_task_panicked: Counter,
@@ -2480,26 +2475,6 @@ pub struct DecdnMetrics {
     /// RPCs against a seed that failed.
     pub dht_bootstrap_find_node_failures: Counter,
 
-    // ---- Fee-shares watcher parity ----
-    /// `decdn_fee_shares_watcher_unregistered`: `1` when the startup
-    /// `PaymentPool.feeRouter()` read failed, so the fee-shares watcher is not
-    /// running and the operator share stays at the floor for the life of the
-    /// process; `0` otherwise. The watcher's own down gauges read healthy in
-    /// that state, since it never started.
-    pub fee_shares_watcher_unregistered: Gauge,
-    /// `decdn_fee_shares_watcher_poll_failures_total`: authoritative
-    /// `getShares()` re-reads that failed. The watcher keeps the current share and
-    /// its tick still succeeds, so this is the only signal that the safety-net
-    /// re-read is not landing.
-    pub fee_shares_watcher_poll_failures: Counter,
-    /// `decdn_fee_shares_watcher_restarts_total`: distinct drift windows the
-    /// fee-shares watcher entered. Mirrors `slash_watcher_restarts`.
-    pub fee_shares_watcher_restarts: Counter,
-    /// `decdn_fee_shares_watcher_down_seconds`: seconds the fee-shares watcher
-    /// has been failing its chain read, recomputed at scrape from
-    /// `fee_shares_watcher_down_since`.
-    pub fee_shares_watcher_down_seconds: Gauge,
-
     // ---- Operator-path failures ----
     /// `decdn_config_reload_failures_total`: SIGHUP or admin config reloads that
     /// failed. Sections committed before the failure stay applied; the rest keep
@@ -2613,11 +2588,6 @@ pub struct Metrics {
     /// `settlement_watcher_down_seconds` gauge. Mirrors
     /// `staker_set_watcher_down_since`.
     settlement_watcher_down_since: Mutex<Option<Instant>>,
-    /// `Instant` the fee-shares watcher entered its current error/backoff
-    /// window. `None` whenever a cycle is established. Backs the
-    /// `fee_shares_watcher_down_seconds` gauge. Mirrors
-    /// `staker_set_watcher_down_since`.
-    fee_shares_watcher_down_since: Mutex<Option<Instant>>,
     /// Cache engine whose live probe-hold count backs the
     /// `probe_hold_slots_used` gauge, sampled once per scrape in
     /// [`Self::encode`]. Unset until runtime bring-up attaches the cache
@@ -2748,7 +2718,6 @@ impl Metrics {
             slash_watcher_down_since: Mutex::new(None),
             blacklist_watcher_down_since: Mutex::new(None),
             settlement_watcher_down_since: Mutex::new(None),
-            fee_shares_watcher_down_since: Mutex::new(None),
             probe_holds: OnceLock::new(),
         }
     }
@@ -3493,6 +3462,10 @@ recorders! {
     /// pull-through could not fill (#876).
     serve_stream_rejected_cache_miss => serve_stream_rejected_cache_miss.inc();
 
+    /// Record a `serve_stream` request refused for naming a payment pool this
+    /// node does not accept.
+    serve_stream_rejected_unaccepted_pool => serve_stream_rejected_unaccepted_pool.inc();
+
     /// Record a `serve_stream` request refused by a local store fault,
     /// signed as `Declined` (#876).
     serve_stream_rejected_internal_error => serve_stream_rejected_internal_error.inc();
@@ -3954,11 +3927,6 @@ recorders! {
     blacklist_watcher_tick => blacklist_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the payment-settlement watcher's liveness gauge (#1316).
     settlement_watcher_tick => settlement_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
-    /// Stamp the fee-shares watcher's liveness gauge. See `slash_watcher_tick`;
-    /// this one matters because the fee-shares watcher's failure paths
-    /// deliberately return `Ok`, so this gauge is the only signal that it is
-    /// still polling.
-    fee_shares_watcher_tick => fee_shares_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
 
     /// Record that the slash watcher task unwound on a panic (#1316). Bumped from
     /// the `Drop` guard in `multiplexed_poller::run` via the `on_task_panic` hook.
@@ -3967,8 +3935,6 @@ recorders! {
     staker_set_watcher_task_panicked => staker_set_watcher_task_panicked.inc();
     /// Record that the blacklist watcher task unwound on a panic (#1316, #1283).
     blacklist_watcher_task_panicked => blacklist_watcher_task_panicked.inc();
-    /// Record that the fee-shares watcher task unwound on a panic.
-    fee_shares_watcher_task_panicked => fee_shares_watcher_task_panicked.inc();
     /// Record that the payment-settlement watcher task unwound on a panic (#1316).
     settlement_watcher_task_panicked => settlement_watcher_task_panicked.inc();
 
@@ -4025,12 +3991,6 @@ recorders! {
     dht_bucket_refresh_failure => dht_bucket_refresh_failures.inc();
     /// `count` bootstrap `FIND_NODE` RPCs against seeds failed.
     dht_bootstrap_find_node_failures(count: u64) => dht_bootstrap_find_node_failures.inc_by(count);
-
-    /// The fee-shares watcher's authoritative `getShares()` re-read failed.
-    fee_shares_watcher_poll_failure => fee_shares_watcher_poll_failures.inc();
-    /// Record whether the fee-shares watcher is unregistered because the startup
-    /// `feeRouter()` read failed.
-    fee_shares_watcher_unregistered(unregistered: bool) => fee_shares_watcher_unregistered.set(i64::from(unregistered));
 
     /// A config reload failed and kept the previous values.
     config_reload_failure => config_reload_failures.inc();
@@ -4113,17 +4073,6 @@ watcher_downtime_recorders! {
     down_since: settlement_watcher_down_since,
     restarts: settlement_watcher_restarts,
     down_seconds: settlement_watcher_down_seconds;
-
-    /// The fee-shares watcher's poll tick errored and the loop is about to back
-    /// off. Stamps `fee_shares_watcher_down_since` once per drift window.
-    /// Mirrors [`Self::slash_watcher_backoff_started`].
-    fee_shares_watcher_backoff_started,
-    /// Mark the fee-shares watcher cycle established: clear
-    /// `fee_shares_watcher_down_since`. Mirrors [`Self::slash_watcher_cycle_established`].
-    fee_shares_watcher_cycle_established,
-    down_since: fee_shares_watcher_down_since,
-    restarts: fee_shares_watcher_restarts,
-    down_seconds: fee_shares_watcher_down_seconds;
 }
 
 /// Bind the `/metrics` HTTP listener synchronously so startup can fail fast

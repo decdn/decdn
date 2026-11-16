@@ -148,7 +148,6 @@ mod settlement_ledger {
             log_index,
             tx_hash: B256::repeat_byte(tx_byte),
             landed_at_unix: 1_700_000_000 + block,
-            epoch: 3,
             gross_micro_usdc: 1_000,
             net_micro_usdc: 600,
             bytes_delivered: 2_048,

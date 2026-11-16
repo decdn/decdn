@@ -745,13 +745,19 @@ async fn run_e2e() -> anyhow::Result<()> {
             &domains,
             16,
             move |deps| {
-                deps.redeem_hint = Some(hint);
-                deps.pool_view =
-                    Some(Arc::new(pool_view) as Arc<dyn decdn_node::pool_view::PoolView>);
+                for pool in &mut deps.pools {
+                    pool.redeem_hint = Some(hint.clone());
+                    pool.pool_view = Some(
+                        Arc::new(pool_view.clone()) as Arc<dyn decdn_node::pool_view::PoolView>
+                    );
+                }
             },
         )?
     };
 
+    // The pool's immutable operator share: the ledger scales each net income
+    // back to the gross payout by it.
+    let operator_bps = u16::try_from(pool_read.operatorBps().call().await?)?;
     let (service, settlement_route) = PoolSettlementService::bootstrap(
         node_provider.clone(),
         decdn_incentive::Deployment {
@@ -771,6 +777,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         pool_view.clone(),
         redeem_tx,
         redeem_rx,
+        operator_bps,
     )
     .await?;
     // The paid-watermark watcher is now a route on the shared multiplexed poller,
@@ -1199,6 +1206,73 @@ async fn run_e2e() -> anyhow::Result<()> {
         "second sweep must attach NO CapabilityReg — registration is already known from the \
          persisted registered_until watermark, so the batched-read skip must fire: \
          cap_count={cap_count_second}"
+    );
+
+    // The settlement ledger (#2598): one row per landed `redeemMany`, in chain
+    // order, decoded from each receipt. The redeemer writes the row after the
+    // receipt lands (one header read in between), so poll for the second one.
+    let rows = poll_until(Duration::from_secs(10), || {
+        let store = Arc::clone(&concrete_store);
+        async move {
+            let rows = decdn_incentive::SettlementLedger::load_settlements(store.as_ref()).ok()?;
+            (rows.len() >= 2).then_some(rows)
+        }
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("the settlement ledger did not record both redeems"))?;
+    anyhow::ensure!(rows.len() == 2, "one ledger row per redeemMany: {rows:?}");
+    let (first, second) = (&rows[0], &rows[1]);
+    anyhow::ensure!(
+        first.tx_hash == tx_first && first.block_number == block_first,
+        "the first row is the first redeem ({tx_first} at {block_first}): {first:?}"
+    );
+    anyhow::ensure!(
+        second.tx_hash == tx_second,
+        "the second row is the second redeem ({tx_second}): {second:?}"
+    );
+    for row in &rows {
+        anyhow::ensure!(
+            row.net_micro_usdc > 0 && row.bytes_delivered > 0 && row.landed_at_unix > 0,
+            "a ledger row carries the net, the bytes paid and the block time: {row:?}"
+        );
+        // The pool pays floor(gross × bps / 10000) to the operator, and the row
+        // records the smallest gross that floors to the net.
+        let floored = row.gross_micro_usdc * u64::from(operator_bps) / 10_000;
+        anyhow::ensure!(
+            floored == row.net_micro_usdc,
+            "a ledger row's gross scales back to its net at {operator_bps} bps: {row:?}"
+        );
+    }
+    // The watcher's backfill decodes the same receipt into the same row, and a
+    // second backfill of a known transaction fetches nothing.
+    let backfill_ledger = Arc::new(decdn_incentive::MemorySettlementLedger::default());
+    let recorder = decdn_node::settlement_ledger::SettlementRecorder::new(
+        backfill_ledger.clone(),
+        node_addr,
+        decdn_node::settlement_ledger::LedgerSource {
+            deployment: Deployment {
+                chain_id: CHAIN_ID,
+                payment_pool,
+            },
+            usdc: usdc_addr,
+            operator_bps,
+        },
+        Arc::clone(&metrics),
+    );
+    recorder
+        .backfill(&node_provider, block_first, tx_first)
+        .await;
+    let backfilled = decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?;
+    anyhow::ensure!(
+        backfilled.as_slice() == &rows[..1],
+        "a backfilled row equals the redeemer's row: {backfilled:?} vs {first:?}"
+    );
+    recorder
+        .backfill(&node_provider, block_first, tx_first)
+        .await;
+    anyhow::ensure!(
+        decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?.len() == 1,
+        "a known transaction is not written twice"
     );
 
     // ============================================================

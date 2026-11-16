@@ -210,15 +210,24 @@ type HttpUrl = alloy::transports::http::reqwest::Url;
 /// Every provider sends through [`crate::rpc_metrics::metered_http_client`],
 /// so each JSON-RPC request the node makes counts on
 /// `decdn_rpc_requests_total`.
+///
+/// One factory serves one chain: the governance chain, or one payment chain.
+/// Its wallet providers bind the signer to that chain's id, so a transaction
+/// built for one chain cannot be signed for another.
 #[derive(Clone)]
 struct ProviderFactory {
     url: HttpUrl,
+    chain_id: u64,
     metrics: Arc<metrics::Metrics>,
 }
 
 impl ProviderFactory {
-    const fn new(url: HttpUrl, metrics: Arc<metrics::Metrics>) -> Self {
-        Self { url, metrics }
+    const fn new(url: HttpUrl, chain_id: u64, metrics: Arc<metrics::Metrics>) -> Self {
+        Self {
+            url,
+            chain_id,
+            metrics,
+        }
     }
 
     fn client(&self) -> alloy::rpc::client::RpcClient {
@@ -257,6 +266,8 @@ impl ProviderFactory {
         signer: PrivateKeySigner,
         interval: Duration,
     ) -> impl Provider + Clone + use<> {
+        use alloy::signers::Signer as _;
+        let signer = signer.with_chain_id(Some(self.chain_id));
         // The send-leg marker lets the buyer's `openPool` / `topUp` / `approve`,
         // the reclaim sweep and the seller's `redeemMany` tell a send request
         // that failed in transport from a chain read that failed before it. The
@@ -404,15 +415,16 @@ struct Infra {
     node_metrics: Arc<metrics::Metrics>,
     secret_key: SecretKey,
     eth_signer: Arc<PrivateKeySigner>,
-    /// The `PaymentPool` deployment the lane store is stamped with. The voucher
-    /// EIP-712 domain is derived from this same value, so the stamp and the
-    /// signature domain can never disagree.
-    payment_pool_deployment: crate::pool_store::Deployment,
-    concrete_pool_store: Arc<PersistentPoolStateStore>,
-    pool_state_store: Arc<dyn PoolStateStore>,
-    watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
-    /// The settlement ledger (#2598): the same redb store as the lane state,
-    /// through the ledger trait. Written by the settlement service, read by
+    /// The node's one set of store files: every pool's seller view, the
+    /// settlement ledger and the buyer tables share it.
+    store_files: Arc<crate::pool_store::PoolStoreFiles>,
+    /// Every accepted pool, in configuration order: its deployment, its
+    /// payment chain's providers and its seller store view. The voucher EIP-712
+    /// domain derives from the same deployment the store keys rows by, so the
+    /// two can never disagree.
+    pools: Vec<PoolInfra>,
+    /// The settlement ledger (#2598): the store files, through the ledger
+    /// trait. Written by every pool's settlement service, read by
     /// `admin_v1_earnings`.
     settlement_ledger: Arc<dyn decdn_incentive::SettlementLedger>,
     receipt_sink: Arc<dyn crate::receipt_log::ReceiptSink>,
@@ -442,6 +454,24 @@ struct Infra {
     /// and connection driver runs on the main runtime.
     dht_conns: Connections,
     limiter: Arc<ConnectionLimiter>,
+}
+
+/// One accepted payment pool's bring-up state.
+struct PoolInfra {
+    /// The pool: payment chain id and contract address.
+    deployment: crate::pool_store::Deployment,
+    /// Providers on the pool's payment chain. Every pool read and every pool
+    /// transaction goes through them, never through the governance chain's.
+    providers: ProviderFactory,
+    /// The pool's seller view over the shared store files.
+    store: Arc<PersistentPoolStateStore>,
+}
+
+impl PoolInfra {
+    /// The seller lane store, through the trait the handler and settlement use.
+    fn lane_store(&self) -> Arc<dyn PoolStateStore> {
+        Arc::clone(&self.store) as Arc<dyn PoolStateStore>
+    }
 }
 
 /// Front bring-up phase: RPC preflight, eth keystore load, voucher-state
@@ -484,79 +514,60 @@ async fn build_infra(
     let eth_signer = Arc::new(load_eth_signer(cfg).await?);
     tracing::info!(address = %eth_signer.address(), "loaded eth keystore");
 
+    // Every accepted pool, with its payment chain's providers. Each pool's
+    // identity probe runs against its own chain BEFORE the store opens, so a
+    // typo'd chain id or contract address aborts bring-up before any row is
+    // written under a deployment that does not exist.
+    let pool_chains = accepted_pools(cfg, &node_metrics)?;
+    for (deployment, providers) in &pool_chains {
+        check_rpc_reachability(providers.url.as_str())
+            .await
+            .with_context(|| format!("payment chain of pool {}", deployment.pool_account()))?;
+        check_deployment_preflight(
+            providers.shared_head(),
+            *deployment,
+            &BootRetry::new(DEPLOYMENT_PREFLIGHT_BUDGET, Arc::clone(&node_metrics)),
+        )
+        .await?;
+    }
+
     // Open the off-chain voucher-state store (issue #527, ADR 003
     // §Off-chain voucher state persistence) before any handler that could
-    // accept a voucher comes online. `PersistentPoolStateStore::open`
-    // performs disk I/O (file create + mode tighten + redb header read), so
-    // run it on a blocking thread to avoid stalling the tokio runtime.
-    // Failure here MUST abort startup: continuing with a fresh in-memory
-    // map silently reopens the replay window the store exists to close.
+    // accept a voucher comes online, and take one seller view per pool over
+    // it. The open performs disk I/O (file create + mode tighten + redb header
+    // read) and each view hydrates its pool's lanes, so run both on a blocking
+    // thread to avoid stalling the tokio runtime. Failure here MUST abort
+    // startup: continuing with a fresh in-memory map silently reopens the
+    // replay window the store exists to close. redb forbids a second
+    // `Database` handle to one file, so the files open once and back every
+    // view, the settlement ledger and the buyer tables.
     let pool_store_data_dir = cfg.identity.data_dir.clone();
-    // The node serves the first pool of the first configured payment chain.
-    // The store keys every row by this deployment, so rows of any other
-    // deployment stay on disk untouched.
-    let (payment_chain, payment_pool) = cfg
-        .blockchain
-        .first_payment_pool()
-        .ok_or_else(|| anyhow::anyhow!("blockchain.payment_chains names no payment pool"))?;
-    anyhow::ensure!(
-        !payment_pool.is_zero(),
-        "blockchain.payment_chains names the zero address as a payment pool"
-    );
-    let pool_store_deployment = crate::pool_store::Deployment {
-        chain_id: payment_chain.chain_id,
-        payment_pool,
-    };
-    // Verify the configured deployment against the live chain BEFORE the store
-    // opens, so a typo'd chain id or contract address aborts bring-up before
-    // any row is written under a deployment that does not exist.
-    // The URL is not echoed on a parse failure: it can embed a provider API
-    // key.
-    let preflight_rpc_url: HttpUrl = payment_chain.rpc_url.parse().context(
-        "blockchain.payment_chains rpc_url is not a valid URL (value redacted; check the config)",
-    )?;
-    check_deployment_preflight(
-        ProviderFactory::new(preflight_rpc_url, Arc::clone(&node_metrics)).shared_head(),
-        pool_store_deployment,
-        &BootRetry::new(DEPLOYMENT_PREFLIGHT_BUDGET, Arc::clone(&node_metrics)),
-    )
-    .await?;
-    // Keep the concrete store `Arc` so it can back the seller
-    // `PoolStateStore` (lane_state_v2 table), the pending-settle store
-    // (pending_settle_v2 table, PR #743 review), and the buyer
-    // `BuyerPoolStore` (buyer_pool_state_v2 table, #744) — redb forbids a
-    // second `Database` handle to the same file, so one shared store owns all.
-    let concrete_pool_store: Arc<PersistentPoolStateStore> = Arc::new(
-        tokio::task::spawn_blocking(move || {
-            PersistentPoolStateStore::open(&pool_store_data_dir, pool_store_deployment)
+    let deployments: Vec<crate::pool_store::Deployment> = pool_chains
+        .iter()
+        .map(|(deployment, _)| *deployment)
+        .collect();
+    let (store_files, views) = tokio::task::spawn_blocking(move || {
+        let files = crate::pool_store::PoolStoreFiles::open(&pool_store_data_dir)?;
+        let views = deployments
+            .into_iter()
+            .map(|deployment| files.seller_view(deployment).map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, decdn_incentive::StoreError>((files, views))
+    })
+    .await
+    .context("pool state store open task panicked")?
+    .context("failed to open pool state store (issue #527 voucher replay guard)")?;
+    let settlement_ledger: Arc<dyn decdn_incentive::SettlementLedger> =
+        Arc::clone(&store_files) as Arc<dyn decdn_incentive::SettlementLedger>;
+    let pools: Vec<PoolInfra> = pool_chains
+        .into_iter()
+        .zip(views)
+        .map(|((deployment, providers), store)| PoolInfra {
+            deployment,
+            providers,
+            store,
         })
-        .await
-        .context("pool state store open task panicked")?
-        .context("failed to open pool state store (issue #527 voucher replay guard)")?,
-    );
-    // The one redb-backed store implements the voucher-state trait (for the
-    // handler + #527 replay guard), the pending-settle trait (for the on-chain
-    // settlement sweep, PR #743 review), and the buyer-pool trait (#744).
-    // Derive trait-object handles from the single concrete store so every write
-    // family shares one open store and one fsync discipline (each family commits
-    // on its own per-family redb file); `concrete_pool_store` stays bound for
-    // the buyer handle built further below.
-    let pool_state_store: Arc<dyn PoolStateStore> = concrete_pool_store.clone();
-    let settlement_ledger: Arc<dyn decdn_incentive::SettlementLedger> = concrete_pool_store.clone();
-    // Debounce the scan-checkpoint writes (#784, keyed in #1092): the settlement
-    // watcher, the only watcher that persists a cursor (`CheckpointKey::PoolOpened`),
-    // advances it once per completed `eth_getLogs` window — on the live tail, once
-    // per poll tick with new confirmed blocks — and the directly-durable store
-    // fsyncs on each. The persisted value is only a *floor* for the resume backfill
-    // (`resolve_persisted_start` rewinds it by the reorg margin; the sinks are
-    // idempotent), so coarsening the write cadence is safe — and the settlement
-    // service force-flushes its key on graceful shutdown, so steady-state progress
-    // is not lost.
-    // Wrapping here (the wiring layer) keeps the domain trait and the disk store
-    // free of the debounce policy.
-    let watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore> = Arc::new(
-        crate::payment_settlement::DebouncedCheckpointStore::new(concrete_pool_store.clone()),
-    );
+        .collect();
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema, well before the
     // `cdn/client/v1` handler is constructed further down the bring-up.
@@ -565,18 +576,21 @@ async fn build_infra(
     // the *store*, not a snapshot: a pre-built map threaded through
     // `ClientHandlerDeps` would couple this stage to the handler's internal
     // lane representation. Cost: one extra `load_all` on startup.
-    let persisted_count = tokio::task::spawn_blocking({
-        let store = Arc::clone(&pool_state_store);
-        move || store.load_all()
-    })
-    .await
-    .context("pool state store load task panicked")?
-    .context("failed to hydrate persisted lane state")?
-    .len();
-    tracing::info!(
-        lanes = persisted_count,
-        "pool state store ready (issue #527 replay guard active)",
-    );
+    for pool in &pools {
+        let persisted_count = tokio::task::spawn_blocking({
+            let store = pool.lane_store();
+            move || store.load_all()
+        })
+        .await
+        .context("pool state store load task panicked")?
+        .context("failed to hydrate persisted lane state")?
+        .len();
+        tracing::info!(
+            pool = %pool.deployment.pool_account(),
+            lanes = persisted_count,
+            "pool state store ready (issue #527 replay guard active)",
+        );
+    }
 
     // Open the append-only download-receipt audit log (issue #248). Unlike the
     // pool state store, a failure here is NON-fatal: the receipt log is an audit
@@ -621,7 +635,8 @@ async fn build_infra(
     // mirror the in-memory voucher watermark to disk every
     // `payment.voucher_commit_interval_ms`. A failed flush retains the dirty set
     // for the next tick; it never blocks delivery.
-    let flush_store = Arc::clone(&pool_state_store);
+    let flush_stores: Vec<Arc<dyn PoolStateStore>> =
+        pools.iter().map(PoolInfra::lane_store).collect();
     let flush_metrics = Arc::clone(&node_metrics);
     let flush_interval =
         std::time::Duration::from_millis(cfg.payment.voucher_commit_interval_ms.max(1));
@@ -630,8 +645,8 @@ async fn build_infra(
         ticker.tick().await; // skip the immediate first tick
         loop {
             ticker.tick().await;
-            let store = Arc::clone(&flush_store);
-            let res = tokio::task::spawn_blocking(move || store.flush()).await;
+            let stores = flush_stores.clone();
+            let res = tokio::task::spawn_blocking(move || flush_all(&stores)).await;
             match res {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
@@ -732,10 +747,8 @@ async fn build_infra(
         node_metrics,
         secret_key,
         eth_signer,
-        payment_pool_deployment: pool_store_deployment,
-        concrete_pool_store,
-        pool_state_store,
-        watcher_checkpoint_store,
+        store_files,
+        pools,
         settlement_ledger,
         receipt_sink,
         receipt_writer,
@@ -844,14 +857,12 @@ async fn serve_until_shutdown(
 /// threaded through [`PoolSettlementService`]); [`run`] infers `P` at the call
 /// site and hands it to [`ShutdownHandles`].
 struct ChainHandlers<P: Provider + Clone + 'static> {
-    providers: ProviderFactory,
     event_poll_interval: Duration,
     slash_domain: alloy::dyn_abi::Eip712Domain,
     bind_domain: alloy::dyn_abi::Eip712Domain,
     staker_set: Arc<dyn StakerSet>,
-    /// The single multiplexed chain-event poller driving every registered
-    /// watcher route — six with the fee-shares route, which registers only
-    /// when the startup `feeRouter()` read succeeds.
+    /// The governance chain's multiplexed chain-event poller, driving the
+    /// registry, slash, origin-seat and blacklist routes.
     /// Stopped once, late in shutdown (after `router.shutdown`), because the
     /// capacity-bond route's staker set gates DHT admission through drain.
     poller: crate::chain_events::resumable_watcher::WatcherHandle,
@@ -877,11 +888,16 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// sampling tick spawned in [`spawn_background_tasks`], so all three see
     /// the same live policy.
     shed_controller: Arc<crate::load_shed::LoadShedController>,
-    payment_service: PoolSettlementService<P>,
-    /// Names each lane's pool owner for `admin_v1_lanes`: the event-fed pool
-    /// view the settlement watcher writes, then an owner cache, then its own
-    /// `getPool` reads (never the serve path's negative-caching resolver).
-    pool_owners: admin::pool_owners::PoolOwners,
+    /// One settlement service per accepted pool, in configuration order.
+    payment_services: Vec<PoolSettlementService<P>>,
+    /// One multiplexed poller per payment chain, carrying that chain's pools'
+    /// settlement routes. Stopped with the governance poller.
+    payment_pollers: Vec<crate::chain_events::resumable_watcher::WatcherHandle>,
+    /// Per pool, its lane store and the lookup that names each lane's pool
+    /// owner for `admin_v1_lanes`: the event-fed pool view the settlement
+    /// watcher writes, then an owner cache, then its own `getPool` reads
+    /// (never the serve path's negative-caching resolver).
+    admin_pools: Vec<admin::AdminPool>,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     /// Bring-up node-id binding self-check (#1034), carried through to
     /// `AdminState` so `admin_v1_health` can report it. A plain value, not a
@@ -891,8 +907,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// ADR 041 buy-side profitability gate policy, selected from
     /// `cache.serve_economics.policy`.
     serve_economics: Arc<dyn crate::serve_economics::ServeEconomicsPolicy>,
-    /// Live operator fee-share (basis points) cell, seeded from chain at
-    /// startup and kept current by the fee-shares watcher.
+    /// The operator share (basis points) the buy-side serve-economics gate
+    /// prices future serve revenue at: the lowest `operatorBps()` of the
+    /// accepted pools, the conservative choice when a serve may be paid on any
+    /// of them.
     operator_shares: crate::fee_shares::OperatorShares,
     /// ADR 041 per-source warming allowance. The SAME `Arc` the eviction path
     /// holds (to forget a dropped hash's tag) and the warming-credit aggregator
@@ -907,6 +925,21 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// detached so a task that died shows up as a join error instead of as
     /// credits that quietly stop landing.
     warming_creditor: StopHandle,
+}
+
+/// One accepted pool's settlement inputs, built beside its serve route and
+/// consumed by its [`PoolSettlementService::bootstrap`].
+struct SettlementWiring<P> {
+    /// Wallet-filled provider on the pool's payment chain.
+    wallet_provider: P,
+    /// The pool view the settlement watcher writes and the serve path reads.
+    projection: crate::pool_view::PoolProjection,
+    /// Redeem-hint sender; a clone rides the pool's serve route.
+    redeem_tx: tokio::sync::mpsc::Sender<decdn_incentive::LaneKey>,
+    /// Redeem-hint receiver the redeemer loop drains.
+    redeem_rx: tokio::sync::mpsc::Receiver<decdn_incentive::LaneKey>,
+    /// The pool's `operatorBps()`, for the ledger's gross figure.
+    operator_bps: u16,
 }
 
 /// The chain-event poller builder with its config-driven settings: the
@@ -990,7 +1023,14 @@ async fn build_chain_and_handlers(
             .context("missing mandatory blockchain.content_blacklist_address")?,
         "blockchain.content_blacklist_address",
     )?;
-    let providers = ProviderFactory::new(rpc_url, Arc::clone(&infra.node_metrics));
+    // Governance-chain providers: the bond, slash, blacklist, registry and
+    // origin-seat reads. Every pool read and transaction uses its own payment
+    // chain's providers ([`PoolInfra::providers`]).
+    let providers = ProviderFactory::new(
+        rpc_url,
+        cfg.blockchain.chain_id,
+        Arc::clone(&infra.node_metrics),
+    );
     // One value, two consumers (#1011/#1106): the multiplexed poller's merged
     // `eth_getLogs` tick cadence, and — through `with_poll_interval` below — the
     // pending-tx receipt heartbeat, overriding alloy's 250 ms localhost default
@@ -1158,19 +1198,30 @@ async fn build_chain_and_handlers(
         cfg.blockchain.chain_staleness_grace_sec,
     ));
 
-    let probe_handler = Arc::new(ProbeHandler::new(
-        infra.secret_key.public(),
-        cfg.payment.rate_per_mb,
-        Arc::clone(&infra.node_metrics),
-        Arc::clone(&infra.limiter),
-        Arc::clone(&probe_rate_limiter),
-        infra.cache.clone(),
-        Arc::clone(&infra.eth_signer),
-        slash_domain.clone(),
-        stake_lane_policy,
-        cfg.cache.relay_foreign_namespaces,
-        Some(chain_freshness.clone()),
-    ));
+    let probe_handler = Arc::new(
+        ProbeHandler::new(
+            infra.secret_key.public(),
+            cfg.payment.rate_per_mb,
+            Arc::clone(&infra.node_metrics),
+            Arc::clone(&infra.limiter),
+            Arc::clone(&probe_rate_limiter),
+            infra.cache.clone(),
+            Arc::clone(&infra.eth_signer),
+            slash_domain.clone(),
+            stake_lane_policy,
+            cfg.cache.relay_foreign_namespaces,
+            Some(chain_freshness.clone()),
+        )
+        // The probe hint names the pools a client can pay this node from (ADR 005
+        // § Payment pool routing).
+        .with_payment_pools(
+            infra
+                .pools
+                .iter()
+                .map(|pool| pool.deployment.pool_account())
+                .collect(),
+        ),
+    );
 
     // `cdn/dht/v1` handler (ADR 022 / #320): serves FindNode, FindValue, and
     // Store. Bootstrap, bucket refresh, and the republish scheduler run as
@@ -1271,32 +1322,36 @@ async fn build_chain_and_handlers(
     // tasks can all operate on the same instance.
     let dht_routing = dht_handler.routing_table();
 
-    // `cdn/client/v1` paid-delivery handler (#317). The voucher EIP-712 domain
-    // binds to the `PaymentPool` deployment the lane store is stamped with
-    // (`infra.payment_pool_deployment` — one parse, one source of truth); the
-    // ephemeral-binding domain to the `CapacityBond` deployment
-    // (== `capacity_bond_addr`, which holds the NodeId↔address mappings). The
-    // handler hydrates per-lane voucher state from `pool_state_store` so
-    // a restart cannot replay an already-accepted voucher (#527).
-    let payment_pool_addr = infra.payment_pool_deployment.payment_pool;
-
-    // Operator fee-share seed (ADR 041): the immutable
-    // `PaymentPool.operatorBps()`. Unlike the fail-closed reads, it is not fatal
-    // to boot: a failure falls back to `OPERATOR_BPS_FLOOR` and the node still
-    // comes up. The read retries on a `FEE_SHARE_BOOT_BUDGET` sub-budget of the
-    // boot deadline, so a flapping provider cannot spend the time the later
-    // `usdc()` and blacklist reads need.
-    let seed_operator_bps = crate::fee_shares::seed_from_chain(
-        providers.read_only(event_poll_interval),
-        payment_pool_addr,
-        OPERATOR_BPS_FLOOR,
-        &boot.capped(FEE_SHARE_BOOT_BUDGET),
-    )
-    .await;
-    let operator_shares = crate::fee_shares::OperatorShares::new(seed_operator_bps);
-    tracing::info!(
-        bps = seed_operator_bps,
-        "seeded live operator fee share for serve-economics"
+    // Operator fee-share seed per pool (ADR 041): the immutable
+    // `PaymentPool.operatorBps()`, read on the pool's own payment chain. Unlike
+    // the fail-closed reads, it is not fatal to boot: a failure falls back to
+    // `OPERATOR_BPS_FLOOR` and the node still comes up. The reads retry on a
+    // `FEE_SHARE_BOOT_BUDGET` sub-budget of the boot deadline, so a flapping
+    // provider cannot spend the time the later `usdc()` and blacklist reads
+    // need.
+    let fee_share_boot = boot.capped(FEE_SHARE_BOOT_BUDGET);
+    let mut pool_shares = Vec::with_capacity(infra.pools.len());
+    for pool in &infra.pools {
+        let bps = crate::fee_shares::seed_from_chain(
+            pool.providers.read_only(event_poll_interval),
+            pool.deployment.payment_pool,
+            OPERATOR_BPS_FLOOR,
+            &fee_share_boot,
+        )
+        .await;
+        tracing::info!(
+            pool = %pool.deployment.pool_account(),
+            bps,
+            "seeded the pool's operator fee share for serve-economics"
+        );
+        pool_shares.push(crate::fee_shares::OperatorShares::new(bps));
+    }
+    let operator_shares = crate::fee_shares::OperatorShares::new(
+        pool_shares
+            .iter()
+            .map(crate::fee_shares::OperatorShares::bps)
+            .min()
+            .unwrap_or(OPERATOR_BPS_FLOOR),
     );
 
     // ADR 041 buy-side profitability gate for cache-miss relay legs. Node-local,
@@ -1327,7 +1382,6 @@ async fn build_chain_and_handlers(
     )
     .await;
 
-    let voucher_domain = infra.payment_pool_deployment.voucher_domain();
     let bind_domain =
         decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
 
@@ -1389,13 +1443,6 @@ async fn build_chain_and_handlers(
     // below names it like every other field: a wiring site that drops it fails
     // to compile rather than silently degrading to "deny nothing".
     let content_denylist = reload_state.content_denylist();
-    // Redeem-hint channel (#327), created outside `PoolSettlementService::bootstrap`
-    // so the sender can be cloned into the handler deps below while the service
-    // takes the receiver. `redeem_tx` is cloned into the handler deps and also
-    // handed to the service (so `redeem_hint_sender()` keeps working); `redeem_rx`
-    // drives the service's redeemer loop.
-    let (redeem_tx, redeem_rx) =
-        tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
     // Overload-protection gate (load-shed): sheds new serves under resource
     // pressure so in-flight streams stay fast. Bound to a named local, not
     // inlined into the deps literal, so the reload section (`[load_shed]`,
@@ -1416,39 +1463,79 @@ async fn build_chain_and_handlers(
         &coarse_clock,
         std::time::Duration::from_millis(500),
     );
-    // Event-fed pool view (owner + remaining) for the floor-`M` solvency gate and
-    // the ADR 011 funder gate. The settlement watcher below folds every
-    // `PaymentPool` event into this projection, so a serve request reads
-    // `{owner, remaining}` in-memory — no per-serve `getPool` `eth_call`. The same
-    // instance is handed to the settlement service (its watcher is the writer).
-    let pool_view = crate::pool_view::PoolProjection::new();
-    // Wallet-filled provider + `PaymentPool` binding, created here so the handler's
-    // pool-view (below) can confirm a projection-miss pool with a `getPool` at
-    // admission. The same provider is moved into the settlement service, which
-    // builds its own binding from the same address; the buyer path builds its own
-    // provider separately.
-    let wallet_provider = providers.seller_wallet((*infra.eth_signer).clone(), event_poll_interval);
-    // Admit-path pool-view: reads the event-fed projection first and, on a miss
-    // (a pool opened before the watcher's `ColdStart::Head` anchor), does ONE
-    // `getPool` to confirm the pool is live and solvent before a serve is admitted
-    // — folding a servable pool into the projection and refusing an absent/closed/
-    // errored one. The mid-stream pool re-check reads the projection only.
-    let resolving_pool_view = crate::payment_settlement::ResolvingPoolView::new(
-        decdn_incentive::payment_pool::PaymentPool::new(payment_pool_addr, wallet_provider.clone()),
-        pool_view.clone(),
-        Arc::clone(&infra.node_metrics),
-    );
-    // Lane owner lookup for `admin_v1_lanes`. Its own binding and reads, so an
-    // operator's `node lanes` never negative-caches a pool the serve path reads.
-    let pool_owners = admin::pool_owners::PoolOwners::new(
-        pool_view.clone(),
-        Some(Arc::new(admin::pool_owners::ChainPoolOwners::new(
+    // Per accepted pool: the serve path's route, the settlement wiring and the
+    // admin owner lookup. Every pool read and transaction goes through the
+    // pool's own payment chain providers.
+    let mut routes = Vec::with_capacity(infra.pools.len());
+    let mut settlement_wiring = Vec::with_capacity(infra.pools.len());
+    let mut admin_pools = Vec::with_capacity(infra.pools.len());
+    for (pool, shares) in infra.pools.iter().zip(pool_shares) {
+        // Redeem-hint channel (#327), created outside
+        // `PoolSettlementService::bootstrap` so the sender rides the pool's
+        // route while the service takes the receiver.
+        let (redeem_tx, redeem_rx) =
+            tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
+        // Event-fed pool view (owner + remaining) for the floor-`M` solvency
+        // gate and the ADR 011 funder gate. The pool's settlement watcher folds
+        // every `PaymentPool` event into this projection, so a serve request
+        // reads `{owner, remaining}` in-memory — no per-serve `getPool`
+        // `eth_call`. The same instance is handed to the settlement service
+        // (its watcher is the writer).
+        let projection = crate::pool_view::PoolProjection::new();
+        // Wallet-filled provider on the pool's payment chain, its signer bound
+        // to that chain's id. The handler's pool view confirms a
+        // projection-miss pool with a `getPool` at admission through it, and
+        // the settlement service signs its `redeemMany` with it.
+        let wallet_provider = pool
+            .providers
+            .seller_wallet((*infra.eth_signer).clone(), event_poll_interval);
+        // Admit-path pool-view: reads the event-fed projection first and, on a
+        // miss (a pool opened before the watcher's `ColdStart::Head` anchor),
+        // does ONE `getPool` to confirm the pool is live and solvent before a
+        // serve is admitted — folding a servable pool into the projection and
+        // refusing an absent/closed/errored one. The mid-stream pool re-check
+        // reads the projection only.
+        let resolving_pool_view = crate::payment_settlement::ResolvingPoolView::new(
             decdn_incentive::payment_pool::PaymentPool::new(
-                payment_pool_addr,
+                pool.deployment.payment_pool,
                 wallet_provider.clone(),
             ),
-        ))),
-    );
+            projection.clone(),
+            Arc::clone(&infra.node_metrics),
+        );
+        // Lane owner lookup for `admin_v1_lanes`. Its own binding and reads,
+        // so an operator's `node lanes` never negative-caches a pool the serve
+        // path reads.
+        admin_pools.push(admin::AdminPool {
+            deployment: pool.deployment,
+            store: pool.lane_store(),
+            owners: admin::pool_owners::PoolOwners::new(
+                projection.clone(),
+                Some(Arc::new(admin::pool_owners::ChainPoolOwners::new(
+                    decdn_incentive::payment_pool::PaymentPool::new(
+                        pool.deployment.payment_pool,
+                        wallet_provider.clone(),
+                    ),
+                ))),
+            ),
+        });
+        let mut route = crate::handlers::client::PoolRoute::new(pool.deployment, pool.lane_store());
+        route.pool_view =
+            Some(Arc::new(resolving_pool_view) as Arc<dyn crate::pool_view::PoolView>);
+        // Hint the settlement service on each accepted voucher so a lane's
+        // accrued claim is planned into a chunk promptly rather than waiting
+        // the self-tick.
+        route.redeem_hint = Some(redeem_tx.clone());
+        route.operator_shares = shares.clone();
+        routes.push(route);
+        settlement_wiring.push(SettlementWiring {
+            wallet_provider,
+            projection,
+            redeem_tx,
+            redeem_rx,
+            operator_bps: shares.bps(),
+        });
+    }
     // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
     // allowance the buy loop debits and the eviction path forgets, plus the live
     // operator fee-share cell. The background aggregator behind the sink is what
@@ -1473,11 +1560,9 @@ async fn build_chain_and_handlers(
         cache: infra.cache.clone(),
         eth_signer: Arc::clone(&infra.eth_signer),
         slash_domain: slash_domain.clone(),
-        voucher_domain: voucher_domain.clone(),
         bind_domain: bind_domain.clone(),
-        pool_state_store: Arc::clone(&infra.pool_state_store),
+        pools: routes,
         receipt_sink: Arc::clone(&infra.receipt_sink),
-        pool_view: Some(Arc::new(resolving_pool_view) as Arc<dyn crate::pool_view::PoolView>),
         request_limiter: Some(Arc::clone(&serve_rate_limiter)),
         pool_min_remaining_deposit: U256::from(
             cfg.blockchain.pool_min_remaining_deposit_micro_usdc,
@@ -1487,10 +1572,6 @@ async fn build_chain_and_handlers(
         content_deny: Arc::clone(&content_denylist),
         chain_freshness: Some(chain_freshness.clone()),
         attestations: Some(Arc::clone(&attestations)),
-        // Hint the settlement service on each accepted voucher so a lane's
-        // accrued claim is planned into a chunk promptly rather than waiting the
-        // self-tick.
-        redeem_hint: Some(redeem_tx.clone()),
         pull_through,
         local_populate,
         pull_through_origin,
@@ -1505,7 +1586,6 @@ async fn build_chain_and_handlers(
         // live un-vouchered floor one capability signer may hold at once.
         pool_floor_signer_live_windows: cfg.blockchain.pool_floor_signer_live_windows,
         warming_credit,
-        operator_shares: operator_shares.clone(),
         // Origin-only policy (#1759): backend-authoritative own/foreign decision.
         relay_foreign_namespaces: cfg.cache.relay_foreign_namespaces,
         coarse_clock: Some(coarse_clock),
@@ -1530,28 +1610,93 @@ async fn build_chain_and_handlers(
     // until restart. `SimpleNonceManager` stores nothing — each send re-reads
     // the pending nonce — so a failed send can't gap the lane. The buyer
     // provider below relies on this same property for the retried `reclaim`.
-    // `wallet_provider` was built above (the handler's admit-path pool-view shares
-    // it); it moves into the service here.
-    let (payment_service, settlement_route) = PoolSettlementService::bootstrap(
-        wallet_provider,
-        infra.payment_pool_deployment,
-        infra.eth_signer.address(),
-        Arc::clone(&infra.pool_state_store),
-        Arc::clone(&infra.watcher_checkpoint_store),
-        Arc::clone(&infra.settlement_ledger),
-        Arc::clone(&client_handler),
-        U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
-        usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
-        Duration::from_secs(cfg.blockchain.redeem_interval_secs),
-        Arc::clone(&infra.node_metrics),
-        &boot,
-        pool_view,
-        redeem_tx,
-        redeem_rx,
-    )
-    .await
-    .context("PaymentPool settlement service bootstrap")?;
-    poller_routes.push(settlement_route);
+    // Each pool's `wallet_provider` was built above (the handler's admit-path
+    // pool-view shares it); it moves into the pool's service here.
+    //
+    // A pool's settlement route reads its own payment chain, so it rides that
+    // chain's poller, never the governance poller. Pools of one chain share
+    // one poller and one shared head.
+    let mut payment_services = Vec::with_capacity(infra.pools.len());
+    let mut chain_routes: Vec<(
+        ProviderFactory,
+        Vec<crate::chain_events::multiplexed_poller::Route>,
+    )> = Vec::new();
+    for (pool, wiring) in infra.pools.iter().zip(settlement_wiring) {
+        // Debounce the scan-checkpoint writes (#784, keyed in #1092): the
+        // settlement watcher, the only watcher that persists a cursor
+        // (`CheckpointKey::PoolOpened`), advances it once per completed
+        // `eth_getLogs` window, and the directly-durable store fsyncs on each.
+        // The persisted value is only a *floor* for the resume backfill
+        // (`resolve_persisted_start` rewinds it by the reorg margin; the sinks
+        // are idempotent), so coarsening the write cadence is safe — and the
+        // settlement service force-flushes its key on graceful shutdown.
+        // Wrapping here (the wiring layer) keeps the domain trait and the disk
+        // store free of the debounce policy. The pool's store view keys the
+        // checkpoint by its deployment.
+        let checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore> =
+            Arc::new(crate::payment_settlement::DebouncedCheckpointStore::new(
+                Arc::clone(&pool.store) as Arc<dyn decdn_incentive::KeyedCheckpointStore>,
+            ));
+        let (payment_service, settlement_route) = PoolSettlementService::bootstrap(
+            wiring.wallet_provider,
+            pool.deployment,
+            infra.eth_signer.address(),
+            pool.lane_store(),
+            checkpoint_store,
+            Arc::clone(&infra.settlement_ledger),
+            Arc::clone(&client_handler),
+            U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+            usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
+            Duration::from_secs(cfg.blockchain.redeem_interval_secs),
+            Arc::clone(&infra.node_metrics),
+            &boot,
+            wiring.projection,
+            wiring.redeem_tx,
+            wiring.redeem_rx,
+            wiring.operator_bps,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "PaymentPool settlement service bootstrap for pool {}",
+                pool.deployment.pool_account()
+            )
+        })?;
+        payment_services.push(payment_service);
+        match chain_routes
+            .iter_mut()
+            .find(|(providers, _)| providers.chain_id == pool.deployment.chain_id)
+        {
+            Some((_, routes)) => routes.push(settlement_route),
+            None => chain_routes.push((pool.providers.clone(), vec![settlement_route])),
+        }
+    }
+    let mut payment_pollers = Vec::with_capacity(chain_routes.len());
+    for (chain_providers, routes) in chain_routes {
+        let chain_head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(
+            chain_providers.shared_head(),
+            event_poll_interval,
+        ));
+        let builder = routes.into_iter().fold(
+            chain_poller_builder(
+                chain_head,
+                event_poll_interval,
+                &cfg.blockchain,
+                &infra.node_metrics,
+            ),
+            crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::route,
+        );
+        let poller = builder.build().with_context(|| {
+            format!(
+                "assemble the chain-event poller of payment chain {}",
+                chain_providers.chain_id
+            )
+        })?;
+        payment_pollers.push(crate::chain_events::multiplexed_poller::spawn(
+            chain_providers.read_only(event_poll_interval),
+            poller,
+        ));
+    }
 
     // Blacklist compliance watcher (ADR 011/031, issue #1031). Its boot pass
     // ENUMERATES the current on-chain deny-set at one pinned block
@@ -1634,7 +1779,6 @@ async fn build_chain_and_handlers(
         ));
 
     Ok(ChainHandlers {
-        providers,
         event_poll_interval,
         slash_domain,
         bind_domain,
@@ -1654,8 +1798,9 @@ async fn build_chain_and_handlers(
         registry_regions,
         client_handler,
         shed_controller,
-        payment_service,
-        pool_owners,
+        payment_services,
+        payment_pollers,
+        admin_pools,
         blacklist_ready_rx,
         binding_report,
         serve_economics,
@@ -1699,7 +1844,8 @@ struct Background {
 /// mark boot ready on `decdn_node_boot_ready`, and emit the startup banner.
 /// `tasks` already holds the metrics server that [`run`] started before
 /// bring-up. Borrows [`Infra`] and [`ChainHandlers`]; the buyer provider is
-/// built from `ch.providers`, and the three EIP-712 domains are cloned out of
+/// built from the first accepted pool's payment chain providers, and the
+/// EIP-712 domains are cloned out of
 /// the shared `ch` reference, and each clone is consumed exactly once. Returns
 /// the [`Background`] handles [`run`] threads into the serve call and
 /// [`ShutdownHandles`].
@@ -1743,11 +1889,18 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // the next sweep; an `openPool` or `topUp` that loses one is held at its
     // nonce and settled against the chain (`OpenUnconfirmed` /
     // `TopUpUnconfirmed`).
-    let buyer_wallet_provider = ch
+    //
+    // The node buys on the first accepted pool, through its payment chain's
+    // providers.
+    let buyer_pool = infra
+        .pools
+        .first()
+        .context("no accepted payment pool for the buyer leg")?;
+    let buyer_wallet_provider = buyer_pool
         .providers
         .buyer_wallet((*infra.eth_signer).clone(), ch.event_poll_interval);
     let buyer_pool_store: Arc<dyn decdn_incentive::BuyerPoolStore> = Arc::new(
-        crate::pool_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.concrete_pool_store)),
+        crate::pool_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.store_files)),
     );
     // `admin_v1_pools` reads the SAME store the bootstrap below writes adoptions
     // and top-ups into. It has to be the same handle, not a second open of
@@ -2192,7 +2345,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
     let node_origin_engine = infra.cache.clone();
     let mut buyer_bootstrap_stop_rx = buyer_bootstrap_stop_rx;
-    let buyer_deployment = infra.payment_pool_deployment;
+    let buyer_deployment = buyer_pool.deployment;
     let payment_pool_addr_for_buyer = buyer_deployment.payment_pool;
     tasks.spawn(async move {
         let service = tokio::select! {
@@ -2218,7 +2371,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                         "buyer-side PaymentPool bootstrap failed; node→node paid cache-miss \
                          pulls are DISABLED for this process (seller settlement is unaffected). \
                          This condition is sticky — restart the node to retry. Check: (1) \
-                         blockchain.payment_pool_address is correct, (2) the RPC endpoint is \
+                         the first blockchain.payment_chains pool is correct, (2) its RPC endpoint is \
                          reachable, (3) the wallet holds gas for the one-time USDC approve."
                     );
                     if pull_through_enabled {
@@ -2350,19 +2503,22 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // registry for the last-voucher clock (issue #1733) and the resolver
         // that names each lane's pool owner — read-only here.
         .with_lanes(admin::LaneStatusHandles {
-            pool_store: Arc::clone(&infra.pool_state_store),
+            pools: ch.admin_pools.clone(),
             lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
-            pool_owners: ch.pool_owners.clone(),
         })
-        // Earnings for `admin_v1_earnings` (#2598): the settlement ledger the
-        // settlement service writes, the lane store for the pending total, and
-        // the redeemer's published schedule — read-only here.
+        // Earnings for `admin_v1_earnings` (#2598): the settlement ledger every
+        // pool's settlement service writes, the lane stores for the pending
+        // total, and each redeemer's published schedule — read-only here.
         .with_earnings(admin::EarningsHandles {
             ledger: Arc::clone(&infra.settlement_ledger),
-            pool_store: Arc::clone(&infra.pool_state_store),
-            schedule: ch.payment_service.redeem_schedule(),
-            ledger_started_at_unix: infra.concrete_pool_store.ledger_started_at_unix(),
+            pool_stores: infra.pools.iter().map(PoolInfra::lane_store).collect(),
+            schedules: ch
+                .payment_services
+                .iter()
+                .map(PoolSettlementService::redeem_schedule)
+                .collect(),
+            ledger_started_at_unix: infra.store_files.ledger_started_at_unix(),
         })
         // Buyer-pool introspection for `admin_v1_pools` (#2078). The SAME store
         // handle `BuyerPoolService` records into, so the admin surface reports
@@ -2577,11 +2733,12 @@ pub async fn run(
         admin_stop_tx: bg.admin_stop_tx,
         rpc_watchdog: bg.rpc_watchdog,
         poller: ch.poller,
-        payment_service: ch.payment_service,
+        payment_pollers: ch.payment_pollers,
+        payment_services: ch.payment_services,
         receipt_writer: infra.receipt_writer,
         warming_creditor: ch.warming_creditor,
         lane_flush_task: infra.lane_flush_task,
-        pool_state_store: infra.pool_state_store,
+        pool_state_stores: infra.pools.iter().map(PoolInfra::lane_store).collect(),
         node_metrics: infra.node_metrics,
         tasks: bg.tasks,
     };
@@ -2615,7 +2772,11 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// `router.shutdown`), because its capacity-bond route gates DHT admission
     /// through drain — see the cancel site in [`shutdown`].
     poller: crate::chain_events::resumable_watcher::WatcherHandle,
-    payment_service: PoolSettlementService<P>,
+    /// One poller per payment chain, carrying its pools' settlement routes.
+    /// Stopped beside [`Self::poller`].
+    payment_pollers: Vec<crate::chain_events::resumable_watcher::WatcherHandle>,
+    /// One settlement service per accepted pool.
+    payment_services: Vec<PoolSettlementService<P>>,
     /// The background receipt writer, cancelled once the router has drained
     /// and awaited in the drain phase so the audit tail survives shutdown
     /// (#803).
@@ -2625,9 +2786,9 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// queued land in the ledger before the runtime returns.
     warming_creditor: StopHandle,
     /// Periodic lane-store flush timer, aborted below after one final durable
-    /// flush of `pool_state_store`.
+    /// flush of every pool's lane store.
     lane_flush_task: tokio::task::JoinHandle<()>,
-    pool_state_store: Arc<dyn PoolStateStore>,
+    pool_state_stores: Vec<Arc<dyn PoolStateStore>>,
     node_metrics: Arc<metrics::Metrics>,
     tasks: JoinSet<()>,
 }
@@ -2700,11 +2861,12 @@ async fn shutdown<P: Provider + Clone + 'static>(
         mut admin_stop_tx,
         rpc_watchdog,
         poller,
-        payment_service,
+        payment_pollers,
+        payment_services,
         receipt_writer,
         warming_creditor,
         lane_flush_task,
-        pool_state_store,
+        pool_state_stores,
         node_metrics,
         mut tasks,
     } = handles;
@@ -2825,6 +2987,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // best-effort and the checkpoint is independent of, and idempotent with
     // respect to, the redeem sweep.
     poller.shutdown();
+    for payment_poller in &payment_pollers {
+        payment_poller.shutdown();
+    }
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
     // is already enqueued and exit; it is awaited in the drain phase below so
@@ -2847,19 +3012,26 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // not left un-redeemed. The redeem sweep does not depend on the checkpoint
     // flush having completed — the scan checkpoint is independent lane state and
     // idempotent to re-scan. Bounded by the deadline
-    // so a slow RPC cannot hang shutdown.
-    payment_service.shutdown(SHUTDOWN_DEADLINE).await;
+    // so a slow RPC cannot hang shutdown. The pools redeem concurrently, each
+    // on its own chain, under the one deadline.
+    futures_util::future::join_all(
+        payment_services
+            .iter()
+            .map(|service| service.shutdown(SHUTDOWN_DEADLINE)),
+    )
+    .await;
 
     // Final durable flush before stop, so the last interval of frontier lands.
     // The router has drained and the redeem sweep above already ran, so the
     // in-memory lane state is final; this is the last write before the
     // background flush task is aborted below.
-    let flush_result = match tokio::task::spawn_blocking(move || pool_state_store.flush()).await {
-        Ok(result) => result,
-        Err(join_err) => Err(decdn_incentive::StoreError::Backend(format!(
-            "flush join: {join_err}"
-        ))),
-    };
+    let flush_result =
+        match tokio::task::spawn_blocking(move || flush_all(&pool_state_stores)).await {
+            Ok(result) => result,
+            Err(join_err) => Err(decdn_incentive::StoreError::Backend(format!(
+                "flush join: {join_err}"
+            ))),
+        };
     if let Err(err) = flush_result {
         node_metrics.lane_flush_failure();
         tracing::warn!(error = %err, "final lane store flush on shutdown failed");
@@ -3279,12 +3451,9 @@ fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<RelayUrl>> {
 /// the startup fails. The list comes from
 /// [`eth_identity::standard_sources`], the single builder every binary shares.
 ///
-/// The Arbitrum Sepolia
-/// chain id is bound on the signer so EIP-712 signers and any
-/// `eth_sendTransaction` paths inherit a deterministic value. To target a
-/// different chain, thread the value through `ResolvedBlockchain` next to
-/// `rpc_url` (chain-id-keyed config is already a seam pattern; see
-/// `appendix-poc-production-seams.md` §Seam 8).
+/// The governance chain id (`blockchain.chain_id`) is bound on the returned
+/// signer; each payment chain's wallet provider binds its clone to that
+/// chain's id.
 async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigner> {
     use alloy::signers::Signer;
 
@@ -3308,14 +3477,12 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
     let signer = tokio::task::spawn_blocking(move || eth_identity::load_signer(&path, &password))
         .await
         .map_err(|e| anyhow::anyhow!("keystore decrypt task panicked: {e}"))??;
-    // Bind the signer to the *configured* chain id, not a hardcoded
-    // constant, so the signer's chain id and the `slash_sig` EIP-712 domain
-    // chain id (also `cfg.blockchain.chain_id`, see the slash domain build)
-    // can never silently diverge — e.g. when the chain target changes via
-    // the seam in `appendix-poc-production-seams.md` §Seam 8. Note: raw
-    // EIP-712 `sign_hash_sync` does not consult the signer's bound chain
-    // id, so this binding only matters for any future `eth_sendTransaction`
-    // path; keeping it single-sourced is defensive against that future code.
+    // Bind the signer to the governance chain id, the chain id of the
+    // `slash_sig` EIP-712 domain (see the slash domain build). Raw EIP-712
+    // `sign_hash_sync` does not consult the bound chain id. Every wallet
+    // provider rebinds its clone to its own chain's id
+    // (`ProviderFactory::wallet`), so a payment-chain transaction is signed
+    // for the payment chain.
     Ok(signer.with_chain_id(Some(cfg.blockchain.chain_id)))
 }
 
@@ -3771,6 +3938,62 @@ enum RpcProbe {
     Fatal(String),
 }
 
+/// Every accepted payment pool, in configuration order, with providers on its
+/// payment chain. One [`ProviderFactory`] serves every pool of one chain.
+///
+/// # Errors
+///
+/// No pool is configured, a pool is the zero address, or a payment chain's
+/// `rpc_url` does not parse. The URL is not echoed on a parse failure: it can
+/// embed a provider API key.
+fn accepted_pools(
+    cfg: &ResolvedConfig,
+    node_metrics: &Arc<metrics::Metrics>,
+) -> anyhow::Result<Vec<(crate::pool_store::Deployment, ProviderFactory)>> {
+    let mut pools = Vec::new();
+    for chain in &cfg.blockchain.payment_chains {
+        let url: HttpUrl = chain.rpc_url.parse().with_context(|| {
+            format!(
+                "blockchain.payment_chains rpc_url of chain {} is not a valid URL (value \
+                 redacted; check the config)",
+                chain.chain_id
+            )
+        })?;
+        let providers = ProviderFactory::new(url, chain.chain_id, Arc::clone(node_metrics));
+        for &payment_pool in &chain.payment_pools {
+            anyhow::ensure!(
+                !payment_pool.is_zero(),
+                "blockchain.payment_chains names the zero address as a payment pool on chain {}",
+                chain.chain_id
+            );
+            pools.push((
+                crate::pool_store::Deployment {
+                    chain_id: chain.chain_id,
+                    payment_pool,
+                },
+                providers.clone(),
+            ));
+        }
+    }
+    anyhow::ensure!(
+        !pools.is_empty(),
+        "blockchain.payment_chains names no payment pool"
+    );
+    Ok(pools)
+}
+
+/// Flush every pool's lane store, each attempted even after one fails; the
+/// first error is returned.
+fn flush_all(stores: &[Arc<dyn PoolStateStore>]) -> Result<(), decdn_incentive::StoreError> {
+    let mut first_err = None;
+    for store in stores {
+        if let Err(err) = store.flush() {
+            first_err.get_or_insert(err);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
 /// Retry budget for [`check_deployment_preflight`]'s chain reads. Its own
 /// [`BootRetry`] budget, independent of the shared boot deadline the chain
 /// bootstraps below share: the RPC endpoint has just passed
@@ -3817,8 +4040,9 @@ async fn check_deployment_preflight<P: Provider + Clone>(
         .await?;
     anyhow::ensure!(
         rpc_chain_id == deployment.chain_id,
-        "blockchain.payment_chains entry chain_id is {} but its rpc_url serves chain \
-         {rpc_chain_id} — fix the payment chain's chain_id or rpc_url",
+        "payment pool {}: blockchain.payment_chains entry chain_id is {} but its rpc_url \
+         serves chain {rpc_chain_id} — fix the payment chain's chain_id or rpc_url",
+        deployment.pool_account(),
         deployment.chain_id,
     );
     anyhow::ensure!(

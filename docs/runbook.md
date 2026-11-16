@@ -75,9 +75,9 @@ retrying after backoff` at `WARN` and retries. The daemon exits when the next
 retry could not start before a shared 10-minute boot deadline (`gave up after
 N attempts`), or at once on a deterministic fault (`deterministic failure, not
 retried`: a wrong contract address, an ABI mismatch, a revert, a disk error
-that decides a blacklist enforcement attempt). A best-effort fee-share read
-that gives up logs the same text but falls back to the floor share instead of
-exiting; `decdn_fee_shares_watcher_unregistered` then reads `1`. The node
+that decides a blacklist enforcement attempt). A best-effort
+`PaymentPool.operatorBps()` read that gives up logs the same text but falls
+back to the floor share instead of exiting. The node
 serves nothing until the blacklist enumeration and enforcement complete. The
 metrics listener serves during boot: `decdn_node_boot_ready` reads `0` until
 bring-up finishes, and `decdn_chain_boot_read_retries_total` rises while the
@@ -87,10 +87,10 @@ boot chain reads retry. The RPC preflight's own retries show only in its
 **Detect:**
 
 - Existing alerts in `prometheus-alerts.yml`: a dead endpoint stalls
-  every chain-event watcher at once, so expect up to five stalled alerts to
-  fire together — `DecdnBlacklistWatcherStalled`, `DecdnSlashWatcherStalled`,
-  `DecdnStakerSetWatcherStalled`, `DecdnFeeSharesWatcherStalled` (only where
-  the fee-shares watcher is registered), and `DecdnSettlementWatcherStalled`.
+  every chain-event watcher on its chain at once, so expect up to four stalled
+  alerts to fire together — `DecdnBlacklistWatcherStalled`,
+  `DecdnSlashWatcherStalled` and `DecdnStakerSetWatcherStalled` for the
+  governance chain, and `DecdnSettlementWatcherStalled` for a payment chain.
   Several firing together points at the RPC endpoint
   rather than at any one watcher. Each fires on the *age* of that watcher's last
   successful tick (guarded against the pre-first-tick sentinel) **or** on

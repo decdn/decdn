@@ -29,7 +29,7 @@ fn provider_factory_preserves_role_polling_policy() {
     let url: HttpUrl = "http://localhost:8545".parse().expect("valid URL");
     let interval = Duration::from_secs(7);
 
-    let providers = ProviderFactory::new(url, Arc::new(metrics::Metrics::new()));
+    let providers = ProviderFactory::new(url, 31_337, Arc::new(metrics::Metrics::new()));
 
     let read = providers.read_only(interval);
     let head = providers.shared_head();
@@ -51,7 +51,7 @@ fn provider_factory_preserves_role_polling_policy() {
 async fn wallet_providers_mark_a_failed_send_request() {
     decdn_common::tls::install_crypto_provider();
     let url: HttpUrl = "http://127.0.0.1:1".parse().expect("valid URL");
-    let providers = ProviderFactory::new(url, Arc::new(metrics::Metrics::new()));
+    let providers = ProviderFactory::new(url, 1, Arc::new(metrics::Metrics::new()));
     let signer = PrivateKeySigner::random();
     let request = alloy::rpc::types::TransactionRequest {
         from: Some(signer.address()),
@@ -96,7 +96,7 @@ async fn wallet_providers_send_an_estimate_with_headroom() {
         .await
         .expect("bind a loopback port");
     let url: HttpUrl = stub.url().parse().expect("valid URL");
-    let providers = ProviderFactory::new(url, Arc::new(metrics::Metrics::new()));
+    let providers = ProviderFactory::new(url, 1, Arc::new(metrics::Metrics::new()));
     let signer = PrivateKeySigner::random();
     let request = alloy::rpc::types::TransactionRequest {
         from: Some(signer.address()),
@@ -1614,6 +1614,10 @@ async fn a_chain_id_mismatch_aborts_the_preflight() {
     assert!(
         msg.contains("chain_id") && msg.contains("serves chain 1"),
         "the error must name the key and the served chain: {msg}"
+    );
+    assert!(
+        msg.contains(&PREFLIGHT_DEPLOYMENT.pool_account().to_string()),
+        "the error must name the pool whose chain mismatches: {msg}"
     );
 }
 

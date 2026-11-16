@@ -514,16 +514,26 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         pool_view: PoolProjection,
         redeem_tx: mpsc::Sender<LaneKey>,
         redeem_rx: mpsc::Receiver<LaneKey>,
+        operator_bps: u16,
     ) -> Result<(Self, Route)> {
         let payment_pool_addr = deployment.payment_pool;
         let contract = PaymentPool::new(payment_pool_addr, provider);
-        // One recorder for both ledger writers: the redeemer (receipt in hand)
-        // and the `PoolRedeemed` sink (backfill of a landing it never saw).
-        let recorder =
-            SettlementRecorder::new(ledger, self_address, deployment, Arc::clone(&metrics));
         let schedule = RedeemSchedule::default();
 
         let usdc_token = usdc_self_check(&contract, boot).await?;
+        // One recorder for both ledger writers: the redeemer (receipt in hand)
+        // and the `PoolRedeemed` sink (backfill of a landing it never saw). It
+        // reads the operator's income as the pool's `usdc()` transfer to it.
+        let recorder = SettlementRecorder::new(
+            ledger,
+            self_address,
+            crate::settlement_ledger::LedgerSource {
+                deployment,
+                usdc: usdc_token,
+                operator_bps,
+            },
+            Arc::clone(&metrics),
+        );
         info!(
             %payment_pool_addr,
             %usdc_token,
@@ -544,6 +554,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         // recorded exactly — the node never assumes its voucher cleared.
         let backfills = LedgerBackfills::new(recorder.clone());
         let sink = PoolSettlementSink {
+            deployment,
             self_address,
             store: Arc::clone(&store),
             handler,
@@ -816,6 +827,8 @@ fn settlement_route_topic0s() -> Vec<B256> {
 /// owes nothing and the forget is idempotent. An undecodable log is log-and-skip
 /// so a permanently undecodable log never hot-loops the deterministic re-scan.
 struct PoolSettlementSink<P: Provider + Clone> {
+    /// The pool this sink settles; the handler keys its lanes by it.
+    deployment: Deployment,
     self_address: Address,
     store: Arc<dyn PoolStateStore>,
     handler: Arc<ClientHandler>,
@@ -1295,7 +1308,11 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
                 continue;
             }
             let key = st.key();
-            if let Err(err) = self.handler.forget_lane(key).await {
+            let lane = crate::handlers::client::LaneId {
+                deployment: self.deployment,
+                key,
+            };
+            if let Err(err) = self.handler.forget_lane(lane).await {
                 self.metrics.watcher_persist_failure();
                 warn!(error = %err, pool_id = %pool_id, signer = %key.signer, "failed to forget reclaimed lane");
             } else {
@@ -1303,7 +1320,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
                 info!(pool_id = %pool_id, signer = %key.signer, "pool reclaimed; dropped tracked lane");
             }
         }
-        self.handler.forget_pool_floor(pool_id);
+        self.handler.forget_pool_floor((self.deployment, pool_id));
     }
 }
 

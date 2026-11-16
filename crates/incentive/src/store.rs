@@ -496,14 +496,16 @@ pub struct SettlementRecord {
     /// read, which the node logs. `0` on a row the producer has not stamped:
     /// `decdn node earnings --address` stamps only the rows it prints.
     pub landed_at_unix: u64,
-    /// The settlement epoch the row counts toward.
-    pub epoch: u64,
-    /// The gross payout the redemption paid.
+    /// The gross payout the redemption paid, before the pool kept the
+    /// protocol share: the net scaled by `10000 / operatorBps`, rounded up, so
+    /// it understates the true payout by less than `10000 / operatorBps`
+    /// micro-USDC.
     pub gross_micro_usdc: u64,
-    /// The USDC the operator received in the same transaction. `0` when the
-    /// operator share is `0`.
+    /// The USDC the operator received in the same transaction: the pool's
+    /// `Transfer` to the operator.
     pub net_micro_usdc: u64,
-    /// The bytes this settlement paid for.
+    /// The bytes this settlement paid for: the `bytesPaid` of every lane the
+    /// pool's `PoolRedeemed` events in the transaction name for the operator.
     pub bytes_delivered: u64,
     /// The address the payout went to. The ledger outlives an Ethereum key
     /// rotation (`decdn node rotate-key eth` keeps the data directory), so the

@@ -1225,6 +1225,21 @@ async fn lanes_without_handles_returns_empty() {
 /// computed against it. Pool 1's owner comes from the pool view; pool 2 is
 /// not in it, as a lane carried across a restart is not, so its owner comes
 /// from the chain read.
+/// The one pool the admin lane tests read.
+const ADMIN_DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
+    chain_id: 31_337,
+    payment_pool: Address::repeat_byte(0x34),
+};
+
+/// `store` and `owners` as the admin handles of [`ADMIN_DEPLOYMENT`].
+fn admin_pool(store: Arc<dyn PoolStateStore>, owners: PoolOwners) -> AdminPool {
+    AdminPool {
+        deployment: ADMIN_DEPLOYMENT,
+        store,
+        owners,
+    }
+}
+
 #[tokio::test]
 async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -1237,10 +1252,12 @@ async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
     projection.record_opened(lane_pool_id(1), owner, U256::from(10_000_000u64));
     let (state, _tmp) = state_with().await;
     let handles = LaneStatusHandles {
-        pool_store: store as Arc<dyn PoolStateStore>,
+        pools: vec![admin_pool(
+            store,
+            PoolOwners::new(projection, Some(Arc::new(OneOwner(chain_owner)))),
+        )],
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
-        pool_owners: PoolOwners::new(projection, Some(Arc::new(OneOwner(chain_owner)))),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let resp = rpc.lanes().await.expect("lanes ok");
@@ -1373,10 +1390,15 @@ async fn lanes_rpc_reflects_stamped_lane_through_activity_clock() -> anyhow::Res
 
     let (state, _tmp) = state_with().await;
     let handles = LaneStatusHandles {
-        pool_store: store as Arc<dyn PoolStateStore>,
-        lane_activity: LaneActivityClock::with_stamped_lanes(&[active_id]),
+        pools: vec![admin_pool(
+            store,
+            PoolOwners::new(PoolProjection::new(), None),
+        )],
+        lane_activity: LaneActivityClock::with_stamped_lanes(&[crate::handlers::client::LaneId {
+            deployment: ADMIN_DEPLOYMENT,
+            key: active_id,
+        }]),
         redeem_threshold_micro_usdc: 1_000_000,
-        pool_owners: PoolOwners::new(PoolProjection::new(), None),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let resp = rpc.lanes().await.expect("lanes ok");
@@ -1422,10 +1444,12 @@ async fn lanes_rpc_surfaces_store_load_failure() {
 
     let (state, _tmp) = state_with().await;
     let handles = LaneStatusHandles {
-        pool_store: Arc::new(FailingStore) as Arc<dyn PoolStateStore>,
+        pools: vec![admin_pool(
+            Arc::new(FailingStore),
+            PoolOwners::new(PoolProjection::new(), None),
+        )],
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
-        pool_owners: PoolOwners::new(PoolProjection::new(), None),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let err = rpc.lanes().await.expect_err("expected store-load error");
@@ -1523,7 +1547,6 @@ mod earnings {
             log_index: 0,
             tx_hash: B256::repeat_byte(u8::try_from(block).unwrap_or(0)),
             landed_at_unix: landed_at,
-            epoch: 1,
             gross_micro_usdc: gross,
             net_micro_usdc: net,
             bytes_delivered: bytes,
@@ -1562,7 +1585,7 @@ mod earnings {
             operator,
             NOW,
             since,
-            &RedeemSchedule::default(),
+            &[RedeemSchedule::default()],
             started,
         )
     }

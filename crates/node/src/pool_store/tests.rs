@@ -357,6 +357,11 @@ fn pre_existing_file_chmod_failure_preserves_file() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The buyer pending-settle store of `store`'s deployment over its files.
+fn buyer_pending(store: &Arc<PersistentPoolStateStore>) -> BuyerPendingSettleStoreHandle {
+    BuyerPendingSettleStoreHandle::new(Arc::clone(store.files()), store.deployment())
+}
+
 /// Fill every seller-side family a deployment change must clear — a lane,
 /// a seller and a buyer pending settle, a watcher checkpoint — and flush.
 fn seed_seller_state(dir: &Path, deployment: Deployment) -> anyhow::Result<LaneState> {
@@ -369,14 +374,14 @@ fn seed_seller_state(dir: &Path, deployment: Deployment) -> anyhow::Result<LaneS
         settle_after: 1_700_000_000,
     };
     store.record_pending(&pending)?;
-    BuyerPendingSettleStoreHandle::new(Arc::clone(&store)).record_pending(&pending)?;
+    buyer_pending(&store).record_pending(&pending)?;
     store.record_checkpoint(CheckpointKey::PoolOpened, 4_242)?;
     Ok(lane)
 }
 
 /// Whether every seller-side family `seed_seller_state` fills is empty.
 fn seller_state_is_empty(store: &Arc<PersistentPoolStateStore>) -> anyhow::Result<bool> {
-    let buyer = BuyerPendingSettleStoreHandle::new(Arc::clone(store));
+    let buyer = buyer_pending(store);
     Ok(store.load_all()?.is_empty()
         && store.load_pending()?.is_empty()
         && buyer.load_pending()?.is_empty()
@@ -393,10 +398,7 @@ fn reopen_on_the_same_deployment_keeps_seller_state() -> anyhow::Result<()> {
     anyhow::ensure!(store.load_all()? == vec![lane], "lane kept");
     anyhow::ensure!(store.load_pending()?.len() == 1, "seller pending kept");
     anyhow::ensure!(
-        BuyerPendingSettleStoreHandle::new(Arc::clone(&store))
-            .load_pending()?
-            .len()
-            == 1,
+        buyer_pending(&store).load_pending()?.len() == 1,
         "buyer pending kept"
     );
     anyhow::ensure!(
@@ -463,10 +465,7 @@ fn another_deployment_keeps_its_own_seller_rows_beside_the_first() -> anyhow::Re
             "first pending settle kept"
         );
         anyhow::ensure!(
-            BuyerPendingSettleStoreHandle::new(Arc::clone(&store))
-                .load_pending()?
-                .len()
-                == 1,
+            buyer_pending(&store).load_pending()?.len() == 1,
             "first buyer pending kept"
         );
         anyhow::ensure!(
@@ -479,6 +478,66 @@ fn another_deployment_keeps_its_own_seller_rows_beside_the_first() -> anyhow::Re
         anyhow::ensure!(store.load_all()? == vec![second], "second lane kept");
         anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(1));
     }
+    Ok(())
+}
+
+/// Two live seller views over one file set — one per pool the node accepts —
+/// keep apart the same lane identity, pending settle and checkpoint, through
+/// a flush and a reopen. A second live view of one deployment is refused, and
+/// dropping a view frees its deployment.
+#[test]
+fn live_views_of_two_deployments_share_the_files_and_stay_apart() -> anyhow::Result<()> {
+    let other = Deployment {
+        chain_id: 31_337,
+        payment_pool: address!("00000000000000000000000000000000000000cf"),
+    };
+    let dir = data_dir()?;
+    let lane_a = sample(0x31);
+    let lane_b = LaneState::hydrate(
+        lane_a.pool_id,
+        lane_a.signer,
+        lane_a.provider,
+        U256::from(7_777u64),
+        2_000_000_000,
+        U256::from(55u64),
+        U256::from(66u64),
+        None,
+        LaneChain::NONE,
+    );
+    {
+        let files = PoolStoreFiles::open(dir.path())?;
+        let a = files.seller_view(DEPLOYMENT)?;
+        let b = files.seller_view(other)?;
+        anyhow::ensure!(
+            files.seller_view(DEPLOYMENT).is_err(),
+            "a second live view of one deployment must be refused"
+        );
+        a.record(&lane_a)?;
+        b.record(&lane_b)?;
+        a.flush()?;
+        b.flush()?;
+        a.record_checkpoint(CheckpointKey::PoolOpened, 10)?;
+        b.record_checkpoint(CheckpointKey::PoolOpened, 20)?;
+        b.record_pending(&PendingSettle {
+            pool_id: lane_b.pool_id,
+            settle_after: 7,
+        })?;
+        anyhow::ensure!(a.load_all()? == vec![lane_a.clone()]);
+        anyhow::ensure!(b.load_all()? == vec![lane_b.clone()]);
+        anyhow::ensure!(a.load_pending()?.is_empty(), "b's pending stays b's");
+        drop(a);
+        // The deployment is free again once its view drops.
+        let again = files.seller_view(DEPLOYMENT)?;
+        anyhow::ensure!(again.load_all()? == vec![lane_a.clone()], "rehydrated");
+    }
+    let files = PoolStoreFiles::open(dir.path())?;
+    let a = files.seller_view(DEPLOYMENT)?;
+    let b = files.seller_view(other)?;
+    anyhow::ensure!(a.load_all()? == vec![lane_a], "a's lane after reopen");
+    anyhow::ensure!(b.load_all()? == vec![lane_b], "b's lane after reopen");
+    anyhow::ensure!(a.load_checkpoint(CheckpointKey::PoolOpened)? == Some(10));
+    anyhow::ensure!(b.load_checkpoint(CheckpointKey::PoolOpened)? == Some(20));
+    anyhow::ensure!(b.load_pending()?.len() == 1 && a.load_pending()?.is_empty());
     Ok(())
 }
 
@@ -498,7 +557,6 @@ fn ledger_rows_of_two_deployments_do_not_collide() -> anyhow::Result<()> {
         log_index: 2,
         tx_hash: B256::repeat_byte(tx),
         landed_at_unix: 1,
-        epoch: 0,
         gross_micro_usdc: 10,
         net_micro_usdc: 6,
         bytes_delivered: 100,
@@ -575,7 +633,7 @@ fn a_buyer_pool_row_survives_an_open_for_another_deployment() -> anyhow::Result<
     let pool_id = sample(0x31).pool_id;
     {
         let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-        let buyer = BuyerPoolStoreHandle::new(Arc::clone(&store));
+        let buyer = BuyerPoolStoreHandle::new(Arc::clone(store.files()));
         buyer.record(&BuyerPoolState::new(
             pool_id,
             DEPLOYMENT,
@@ -590,7 +648,7 @@ fn a_buyer_pool_row_survives_an_open_for_another_deployment() -> anyhow::Result<
         ..DEPLOYMENT
     };
     let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
-    let row = BuyerPoolStoreHandle::new(Arc::clone(&store))
+    let row = BuyerPoolStoreHandle::new(Arc::clone(store.files()))
         .get_by_pool_id(DEPLOYMENT, pool_id)?
         .ok_or_else(|| anyhow::anyhow!("buyer row gone after an open for another deployment"))?;
     anyhow::ensure!(
@@ -616,7 +674,7 @@ fn future_schema_version_refuses_to_load() -> anyhow::Result<()> {
     let encoded = postcard::to_allocvec(&forward)?;
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        let mut wtx = store.lanes_db.begin_write()?;
+        let mut wtx = store.files.lanes_db.begin_write()?;
         wtx.set_durability(Durability::Immediate)?;
         {
             let mut table = wtx.open_table(LANE_TABLE)?;
@@ -648,7 +706,7 @@ fn extra_trailing_bytes_are_tolerated() -> anyhow::Result<()> {
     encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        let mut tx = store.lanes_db.begin_write()?;
+        let mut tx = store.files.lanes_db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
             let mut t = tx.open_table(LANE_TABLE)?;
@@ -679,7 +737,7 @@ fn wrong_length_signature_is_corrupt() -> anyhow::Result<()> {
     let encoded = postcard::to_allocvec(&stored)?;
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        let mut tx = store.lanes_db.begin_write()?;
+        let mut tx = store.files.lanes_db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
             let mut t = tx.open_table(LANE_TABLE)?;
@@ -716,7 +774,7 @@ fn corrupt_owner_sig_on_a_lane_refuses_the_open() -> anyhow::Result<()> {
         let mut stored = StoredLaneState::from(&lane);
         stored.owner_sig = vec![0xFFu8; 3];
         let encoded = postcard::to_allocvec(&stored)?;
-        let mut tx = store.lanes_db.begin_write()?;
+        let mut tx = store.files.lanes_db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
             let mut table = tx.open_table(LANE_TABLE)?;
@@ -799,7 +857,10 @@ fn pending_settle_round_trip_and_persist() -> anyhow::Result<()> {
 fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let store = std::sync::Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-    let buyer = BuyerPendingSettleStoreHandle::new(std::sync::Arc::clone(&store));
+    let buyer = BuyerPendingSettleStoreHandle::new(
+        std::sync::Arc::clone(store.files()),
+        store.deployment(),
+    );
     let seller_pool = b256!("aa00000000000000000000000000000000000000000000000000000000000000");
     let buyer_pool = b256!("bb00000000000000000000000000000000000000000000000000000000000000");
     PendingSettleStore::record_pending(
@@ -955,7 +1016,7 @@ fn flush_of_a_large_batch_lands_packed_and_round_trips() -> anyhow::Result<()> {
         anyhow::ensure!(got == *lane, "each lane round-trips to its own record");
     }
 
-    let read_txn = store.lanes_db.begin_read()?;
+    let read_txn = store.files.lanes_db.begin_read()?;
     let leaf_pages = read_txn.open_table(LANE_TABLE)?.stats()?.leaf_pages();
     anyhow::ensure!(
         leaf_pages <= 55,
@@ -1131,7 +1192,6 @@ mod settlement_ledger {
             log_index,
             tx_hash: B256::repeat_byte(tx_byte),
             landed_at_unix: 1_700_000_000 + block,
-            epoch: 9,
             gross_micro_usdc: 1_000 + block,
             net_micro_usdc: 600 + block,
             bytes_delivered: 4_096 * block,
@@ -1217,8 +1277,8 @@ mod settlement_ledger {
     fn bind_ledger_start_persists_the_first_stamp() -> anyhow::Result<()> {
         let dir = data_dir()?;
         let db = Database::create(dir.path().join(SETTLE_DB_FILE))?;
-        assert_eq!(PersistentPoolStateStore::bind_ledger_start(&db, 100)?, 100);
-        assert_eq!(PersistentPoolStateStore::bind_ledger_start(&db, 200)?, 100);
+        assert_eq!(PoolStoreFiles::bind_ledger_start(&db, 100)?, 100);
+        assert_eq!(PoolStoreFiles::bind_ledger_start(&db, 200)?, 100);
         let txn = db.begin_read()?;
         let stored = txn
             .open_table(SETTLEMENT_LEDGER_START_TABLE)?
@@ -1294,7 +1354,7 @@ mod settlement_ledger {
     /// Write raw `value` bytes under the ledger key `(block, 0)`, bypassing the
     /// encoder, to seed a row this binary cannot read.
     fn write_raw(store: &PersistentPoolStateStore, block: u64, value: &[u8]) -> anyhow::Result<()> {
-        let txn = store.settle_db.begin_write()?;
+        let txn = store.files.settle_db.begin_write()?;
         {
             let mut table = txn.open_table(SETTLEMENT_LEDGER_TABLE)?;
             table.insert(&settlement_key(DEPLOYMENT, block, 0), value)?;

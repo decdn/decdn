@@ -16,7 +16,7 @@ const BPS_DENOMINATOR: u64 = 10_000;
 pub struct ServeEconomicsCtx {
     /// The node's own sell rate, per MB, already raised to the on-chain floor.
     pub sell_rate_per_mb: u64,
-    /// Operator basis points from `FeeRouter.getShares()[0]`; `(1 - f)` numerator.
+    /// Operator basis points (`PaymentPool.operatorBps()`); `(1 - f)` numerator.
     pub operator_bps: u16,
     /// ADR-040 frequency estimate for the hash; 0 = cold.
     pub heat_estimate: u32,

@@ -64,7 +64,7 @@ use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked, pop_p
 use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
-    Connection, FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream,
+    Connection, FloorReservation, Hash, LaneDeliveryState, LaneId, Mutex, RecvStream, SendStream,
     ServeRejectReason, U256, VecDeque, VoucherRejectReason, VoucherStop,
 };
 
@@ -116,7 +116,7 @@ impl ClientHandler {
         lane: &Arc<Mutex<LaneDeliveryState>>,
         carry: RampCarry,
         hash: Hash,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         client_node_id: B256,
         rate_per_mb: u64,
         offset: u64,
@@ -251,7 +251,7 @@ impl ClientHandler {
         lane: &Arc<Mutex<LaneDeliveryState>>,
         mut carry: RampCarry,
         hash: Hash,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         client_node_id: B256,
         rate_per_mb: u64,
         offset: u64,
@@ -293,7 +293,7 @@ impl ClientHandler {
         // Records the loop's waits and the path's state at every exit
         // (#2348), from the loop's first await on.
         let mut waits = ServeWaits::start(conn);
-        let funder: Option<super::Address> = self.pool_funder(lane_key.pool_id).await;
+        let funder: Option<super::Address> = self.pool_funder(lane_key.pool()).await;
 
         // Bytes written to the wire, and bytes an accepted voucher covered — both
         // WIRE quantities (bao content + proof, ADR 038). Their gap
@@ -695,7 +695,7 @@ impl ClientHandler {
                 // the on-chain `min(desired, cap − spent)` redeem is the backstop.
                 if self
                     .signer_cap_drained_midstream(
-                        lane_key.pool_id,
+                        lane_key.pool(),
                         lane_key.signer,
                         held_signer_cap,
                         rate_per_mb,
@@ -780,7 +780,7 @@ impl ClientHandler {
         // ADR 041: credit the realized operator margin back to the source that
         // speculatively warmed this blob (a no-op for an untagged / non-speculative
         // hash), on the same clean-completion edge as the ADR 040 hit sighting.
-        self.credit_warming_serve(hash, delivered);
+        self.credit_warming_serve(lane_key.deployment, hash, delivered);
         Ok(ServeEnd::Completed { bytes: delivered })
     }
 }

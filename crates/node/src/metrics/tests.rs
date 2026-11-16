@@ -938,10 +938,6 @@ fn observability_counters_export_at_zero() {
         "decdn_dht_routing_table_size",
         "decdn_dht_bucket_refresh_failures_total",
         "decdn_dht_bootstrap_find_node_failures_total",
-        "decdn_fee_shares_watcher_poll_failures_total",
-        "decdn_fee_shares_watcher_restarts_total",
-        "decdn_fee_shares_watcher_down_seconds",
-        "decdn_fee_shares_watcher_unregistered",
         "decdn_config_reload_failures_total",
         "decdn_receipt_write_failures_total",
         "decdn_serve_stream_midstream_pool_exhausted_total",
@@ -1312,7 +1308,7 @@ fn new_watchers_down_seconds_track_true_downtime() {
     // the `watcher_downtime_recorders!` template, so one compact pass per
     // watcher confirms the wiring: healthy reads 0, backoff climbs, one
     // restart per drift window, re-establish clears.
-    let cases: [(fn(&Metrics), fn(&Metrics), &str, &str); 3] = [
+    let cases: [(fn(&Metrics), fn(&Metrics), &str, &str); 2] = [
         (
             Metrics::blacklist_watcher_cycle_established,
             Metrics::blacklist_watcher_backoff_started,
@@ -1324,12 +1320,6 @@ fn new_watchers_down_seconds_track_true_downtime() {
             Metrics::settlement_watcher_backoff_started,
             "decdn_settlement_watcher_down_seconds",
             "decdn_settlement_watcher_restarts_total",
-        ),
-        (
-            Metrics::fee_shares_watcher_cycle_established,
-            Metrics::fee_shares_watcher_backoff_started,
-            "decdn_fee_shares_watcher_down_seconds",
-            "decdn_fee_shares_watcher_restarts_total",
         ),
     ];
     for (established, backoff, down_seconds, restarts) in cases {

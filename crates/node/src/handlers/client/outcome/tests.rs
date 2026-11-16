@@ -161,6 +161,7 @@ const fn refusal_is_listed(reason: ServeRejectReason) {
     match reason {
         ServeRejectReason::EvictedSinceProbe
         | ServeRejectReason::CacheMiss
+        | ServeRejectReason::UnacceptedPool
         | ServeRejectReason::InternalError
         | ServeRejectReason::UnknownLane
         | ServeRejectReason::OwnerMismatch
@@ -192,6 +193,7 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
     let refusals = [
         ServeRejectReason::EvictedSinceProbe,
         ServeRejectReason::CacheMiss,
+        ServeRejectReason::UnacceptedPool,
         ServeRejectReason::InternalError,
         ServeRejectReason::UnknownLane,
         ServeRejectReason::OwnerMismatch,

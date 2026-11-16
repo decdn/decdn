@@ -221,7 +221,7 @@ fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
         Address::repeat_byte(0xcd),
         U256::from(7_000_000u64),
     );
-    BuyerPoolStoreHandle::new(std::sync::Arc::clone(&store))
+    BuyerPoolStoreHandle::new(std::sync::Arc::clone(store.files()))
         .record(&state)
         .unwrap();
     // Dropping the last handle releases redb's process-exclusive lock — the

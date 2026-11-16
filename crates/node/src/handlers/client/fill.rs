@@ -1,7 +1,7 @@
 //! Cache-fill tiers for the serve-miss path.
 
 use super::{
-    Arc, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneDeliveryState, LaneKey, Mutex,
+    Arc, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneDeliveryState, LaneId, Mutex,
 };
 use tracing::Instrument as _;
 
@@ -40,9 +40,9 @@ impl ClientHandler {
     /// refused there before this authority is consulted, so no fill fronts USDC
     /// or origin egress on a blacklisted funder's behalf.
     pub(super) fn pull_authorized(
-        lane_key: Option<LaneKey>,
+        lane_key: Option<LaneId>,
         known_lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
-    ) -> Option<(LaneKey, &Arc<Mutex<LaneDeliveryState>>)> {
+    ) -> Option<(LaneId, &Arc<Mutex<LaneDeliveryState>>)> {
         lane_key.zip(known_lane)
     }
 

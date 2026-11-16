@@ -554,15 +554,15 @@ pub struct EarningsPeriod {
     /// shorter span than it names; the CLI says so in the row label.
     pub from_unix: u64,
     /// Micro-USDC the operator actually received: the sum of the USDC
-    /// transfers from the `FeeRouter` to the operator, one per settlement.
+    /// transfers from a `PaymentPool` to the operator, one per settlement.
     pub net_micro_usdc: u64,
-    /// Micro-USDC routed before the fee split: the sum of
-    /// `FeeRouter.Settled.amount`. `net` is `gross` minus the buyback and
-    /// treasury buckets.
+    /// Micro-USDC the settlements paid before the pool kept the protocol
+    /// share: each settlement's net scaled by `10000 / operatorBps`, rounded
+    /// up. `gross − net` is the protocol share the pool holds until a sweep.
     pub gross_micro_usdc: u64,
-    /// Bytes the settlements paid for: the sum of
-    /// `FeeRouter.Settled.bytesDelivered`. Bytes served but not yet redeemed
-    /// are not in this figure.
+    /// Bytes the settlements paid for: the sum of the `bytesPaid` of the
+    /// operator's `PoolRedeemed` lanes. Bytes served but not yet redeemed are
+    /// not in this figure.
     pub bytes_settled: u64,
     /// How many `redeemMany` transactions landed in the period.
     pub settlements: u64,

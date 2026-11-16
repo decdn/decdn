@@ -105,11 +105,11 @@
 //! early successes. A deferred tick fails through [`fail_whole_tick`] once no
 //! tick has reached head for [`GET_LOGS_STALL_BUDGET`].
 //!
-//! The runtime registers each `eth_getLogs` watcher's [`Route`] on one
-//! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
-//! place of five independent per-watcher loops (four when the fee-shares
-//! route is absent: it registers only when the startup `feeRouter()` read
-//! succeeds).
+//! The runtime registers each `eth_getLogs` watcher's [`Route`] on one poller
+//! per chain in `build_chain_and_handlers` and spawns each once: the
+//! governance chain's poller carries the registry, slash, origin-seat and
+//! blacklist routes, and each payment chain's poller carries the settlement
+//! routes of that chain's pools.
 //!
 //! This module is `pub` only so `Route` can appear in the `pub` watcher
 //! `bootstrap` signatures and the external settlement e2e can drive `spawn`; its

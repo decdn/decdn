@@ -55,7 +55,13 @@ async fn verify_voucher_advances_candidate() {
         last_voucher_at: AtomicU64::new(0),
         ramp_pool: Arc::default(),
     }));
-    handler.lanes.insert(lane_key, Arc::clone(&lane));
+    handler.lanes.insert(
+        crate::handlers::client::LaneId {
+            deployment: crate::handlers::client::TEST_DEPLOYMENT,
+            key: lane_key,
+        },
+        Arc::clone(&lane),
+    );
 
     // A cumulative voucher paying exactly one MB from zero, signed by the
     // lane's pinned signer over the lane context.

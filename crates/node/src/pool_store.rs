@@ -28,11 +28,14 @@
 //! Pool ids repeat across `PaymentPool` deployments, so every key in every
 //! table starts with the [`Deployment`] (payment chain id and contract address)
 //! the row belongs to. Rows of several deployments share the files without
-//! colliding. A store value serves the seller side of one deployment, the one
-//! passed to `open()`: it hydrates, reads and writes only that deployment's
-//! lane, pending-settle and checkpoint rows, and leaves every other
-//! deployment's rows in place. The settlement ledger and the buyer tables name
-//! the deployment per row and per call.
+//! colliding. [`PoolStoreFiles`] owns the one file set. A
+//! [`PersistentPoolStateStore`] is the seller view of one deployment over those
+//! files ([`PoolStoreFiles::seller_view`]): it hydrates, reads and writes only
+//! that deployment's lane, pending-settle and checkpoint rows. A node that
+//! accepts several pools holds one view per pool over the same files, and at
+//! most one view per deployment exists at a time, so no two working sets
+//! buffer the same rows. The settlement ledger and the buyer tables name the
+//! deployment per row and per call, so they live on the files.
 //!
 //! The lane table is buffered in memory: `open()`
 //! hydrates the working set from disk, `record`/`forget` mutate that working
@@ -84,6 +87,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
@@ -277,7 +281,6 @@ struct StoredSettlement {
     schema_version: u32,
     tx_hash: [u8; 32],
     landed_at_unix: u64,
-    epoch: u64,
     gross_micro_usdc: u64,
     net_micro_usdc: u64,
     bytes_delivered: u64,
@@ -290,7 +293,6 @@ impl StoredSettlement {
             schema_version: SETTLEMENT_SCHEMA_VERSION,
             tx_hash: row.tx_hash.into(),
             landed_at_unix: row.landed_at_unix,
-            epoch: row.epoch,
             gross_micro_usdc: row.gross_micro_usdc,
             net_micro_usdc: row.net_micro_usdc,
             bytes_delivered: row.bytes_delivered,
@@ -316,7 +318,6 @@ impl StoredSettlement {
             log_index,
             tx_hash: B256::from(self.tx_hash),
             landed_at_unix: self.landed_at_unix,
-            epoch: self.epoch,
             gross_micro_usdc: self.gross_micro_usdc,
             net_micro_usdc: self.net_micro_usdc,
             bytes_delivered: self.bytes_delivered,
@@ -582,23 +583,15 @@ enum LaneSlot {
     Tombstoned,
 }
 
-/// `redb`-backed persistent implementation of [`PoolStateStore`].
+/// The node's one set of `redb` store files, shared by every seller view
+/// ([`PersistentPoolStateStore`]), the settlement ledger and the buyer tables.
 ///
-/// Construct via [`PersistentPoolStateStore::open`]. One `redb::Database` per
-/// write family is owned for the lifetime of this value; drop closes every
-/// handle. The lane table is buffered in memory: `record`/`forget` mutate the
-/// working set only, and a caller must call [`PoolStateStore::flush`] to commit
-/// it to disk. The store is thread-safe — each redb file serialises its own
-/// writes via single-writer transactions, families commit on independent writer
-/// slots, and reads are MVCC.
-///
-/// The working set is a [`DashMap`] rather than one mutex-guarded map, so a
-/// `record` on the paid-delivery path locks only its own lane's shard — no lane
-/// serialises on another, and settlement's `load_all`/`get` do not contend
-/// with `record` (issue #1792 item 1). Each entry's shard lock is the per-lane
-/// critical section that keeps a `record`/`forget` race decidable.
+/// Construct via [`PoolStoreFiles::open`]. One `redb::Database` per write
+/// family is owned for the lifetime of this value; drop closes every handle.
+/// `redb` forbids a second `Database` handle to one file, so a process opens
+/// the files once and derives every view from them.
 #[derive(Debug)]
-pub struct PersistentPoolStateStore {
+pub struct PoolStoreFiles {
     /// Seller lane frontier (`lanes.redb`). The owner-signed capability material
     /// each lane's redeemer needs rides the lane record itself (`owner_sig`), so
     /// the periodic flush commits it in the same transaction as the frontier.
@@ -609,15 +602,42 @@ pub struct PersistentPoolStateStore {
     checkpoint_db: Database,
     /// Buyer pool state + owner index (`buyer.redb`).
     buyer_db: Database,
-    /// The `PaymentPool` deployment whose lane, pending-settle and checkpoint
-    /// rows this store value serves. Every key it writes starts with it.
-    deployment: Deployment,
     /// Path of the lane store file (`lanes.redb`); returned by [`Self::path`].
     path: PathBuf,
     /// When the settlement ledger started recording; returned by
     /// [`Self::ledger_started_at_unix`].
     ledger_started_at_unix: u64,
-    /// The per-lane working set, hydrated from disk at `open()`.
+    /// The deployments a live seller view serves. A second view of one
+    /// deployment would buffer the same rows in a second working set, and the
+    /// two flushes would overwrite each other.
+    bound: std::sync::Mutex<HashSet<Deployment>>,
+}
+
+/// `redb`-backed persistent implementation of [`PoolStateStore`]: the seller
+/// view of one `PaymentPool` deployment over the shared [`PoolStoreFiles`].
+///
+/// Construct via [`PoolStoreFiles::seller_view`], or
+/// [`PersistentPoolStateStore::open`] for a process that serves one
+/// deployment. The lane table is buffered in memory: `record`/`forget` mutate
+/// the working set only, and a caller must call [`PoolStateStore::flush`] to
+/// commit it to disk. The store is thread-safe — each redb file serialises its
+/// own writes via single-writer transactions, families commit on independent
+/// writer slots, and reads are MVCC. Dropping the view releases its
+/// deployment, so a later view of it hydrates afresh.
+///
+/// The working set is a [`DashMap`] rather than one mutex-guarded map, so a
+/// `record` on the paid-delivery path locks only its own lane's shard — no lane
+/// serialises on another, and settlement's `load_all`/`get` do not contend
+/// with `record` (issue #1792 item 1). Each entry's shard lock is the per-lane
+/// critical section that keeps a `record`/`forget` race decidable.
+#[derive(Debug)]
+pub struct PersistentPoolStateStore {
+    /// The shared store files.
+    files: Arc<PoolStoreFiles>,
+    /// The `PaymentPool` deployment whose lane, pending-settle and checkpoint
+    /// rows this store value serves. Every key it writes starts with it.
+    deployment: Deployment,
+    /// The per-lane working set, hydrated from disk when the view opens.
     lanes: DashMap<LaneKey, LaneSlot>,
     /// Lock-free work-list of lanes changed since the last flush.
     /// `record`/`forget`/`set_registered_until` push their key; `flush` drains
@@ -630,8 +650,69 @@ pub struct PersistentPoolStateStore {
     dirty: SegQueue<LaneKey>,
 }
 
+impl Drop for PersistentPoolStateStore {
+    fn drop(&mut self) {
+        self.files.release(self.deployment);
+    }
+}
+
 impl PersistentPoolStateStore {
-    /// Open (or create) the lane-state store under `data_dir`.
+    /// Open the store files under `data_dir` and return the seller view of
+    /// `deployment` over them: [`PoolStoreFiles::open`] then
+    /// [`PoolStoreFiles::seller_view`]. A process that serves several
+    /// deployments opens the files once and takes one view per deployment.
+    ///
+    /// # Errors
+    ///
+    /// Every error of [`PoolStoreFiles::open`] and
+    /// [`PoolStoreFiles::seller_view`].
+    pub fn open(data_dir: &Path, deployment: Deployment) -> Result<Self, StoreError> {
+        PoolStoreFiles::open(data_dir)?.seller_view(deployment)
+    }
+
+    /// Testable form of [`Self::open`] that takes an injectable chmod
+    /// function; see [`PoolStoreFiles::open_with`].
+    #[cfg(test)]
+    pub(crate) fn open_with<F>(
+        data_dir: &Path,
+        deployment: Deployment,
+        chmod_fn: F,
+    ) -> Result<Self, StoreError>
+    where
+        F: Fn(&Path) -> Result<(), StoreError>,
+    {
+        PoolStoreFiles::open_with(data_dir, chmod_fn)?.seller_view(deployment)
+    }
+
+    /// The deployment this view serves.
+    #[must_use]
+    pub const fn deployment(&self) -> Deployment {
+        self.deployment
+    }
+
+    /// The shared store files this view reads and writes.
+    #[must_use]
+    pub const fn files(&self) -> &Arc<PoolStoreFiles> {
+        &self.files
+    }
+
+    /// Filesystem path of the lane store file. Useful for log messages and
+    /// operator runbooks.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.files.path()
+    }
+
+    /// When the settlement ledger started recording, Unix seconds; see
+    /// [`PoolStoreFiles::ledger_started_at_unix`].
+    #[must_use]
+    pub fn ledger_started_at_unix(&self) -> u64 {
+        self.files.ledger_started_at_unix()
+    }
+}
+
+impl PoolStoreFiles {
+    /// Open (or create) the store files under `data_dir`.
     ///
     /// `data_dir` is validated through
     /// [`decdn_common::identity::ensure_data_dir`] before any redb operation,
@@ -651,12 +732,8 @@ impl PersistentPoolStateStore {
     ///
     /// When this returns `Err`, the caller MUST abort node bring-up —
     /// starting with a clean store silently forfeits the issue #527 guarantee.
-    ///
-    /// `deployment` is the `PaymentPool` whose seller rows this value serves:
-    /// it hydrates that deployment's lanes only, and every other deployment's
-    /// rows stay on disk untouched.
-    pub fn open(data_dir: &Path, deployment: Deployment) -> Result<Self, StoreError> {
-        Self::open_with(data_dir, deployment, Self::tighten_permissions)
+    pub fn open(data_dir: &Path) -> Result<Arc<Self>, StoreError> {
+        Self::open_with(data_dir, Self::tighten_permissions)
     }
 
     /// Testable form of [`Self::open`] that takes an injectable chmod
@@ -667,11 +744,7 @@ impl PersistentPoolStateStore {
     /// `pub(crate)` deliberately — exposing this beyond the crate would let an
     /// external caller pass a no-op `chmod_fn` and silently weaken the
     /// file-mode hardening.
-    pub(crate) fn open_with<F>(
-        data_dir: &Path,
-        deployment: Deployment,
-        chmod_fn: F,
-    ) -> Result<Self, StoreError>
+    pub(crate) fn open_with<F>(data_dir: &Path, chmod_fn: F) -> Result<Arc<Self>, StoreError>
     where
         F: Fn(&Path) -> Result<(), StoreError>,
     {
@@ -694,18 +767,77 @@ impl PersistentPoolStateStore {
 
         let ledger_started_at_unix =
             Self::bind_ledger_start(&settle_db, crate::payment_settlement::unix_now())?;
-        let lanes = Self::hydrate_lanes(&lanes_db, deployment)?;
-        Ok(Self {
+        Ok(Arc::new(Self {
             lanes_db,
             settle_db,
             checkpoint_db,
             buyer_db,
-            deployment,
             path,
             ledger_started_at_unix,
+            bound: std::sync::Mutex::new(HashSet::new()),
+        }))
+    }
+
+    /// The seller view of `deployment` over these files: hydrates that
+    /// deployment's lanes into a fresh working set. Every other deployment's
+    /// rows stay on disk untouched.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::Backend`] when a live view of `deployment` already
+    ///   exists: two working sets over the same rows would overwrite each
+    ///   other's flushes.
+    /// - [`StoreError::Corrupt`] or [`StoreError::Backend`] when a lane row of
+    ///   `deployment` does not decode or the table cannot be read. Running past
+    ///   it would reopen the issue #527 voucher-replay window.
+    pub fn seller_view(
+        self: &Arc<Self>,
+        deployment: Deployment,
+    ) -> Result<PersistentPoolStateStore, StoreError> {
+        if !self.lock_bound().insert(deployment) {
+            return Err(StoreError::Backend(format!(
+                "a seller view of {} is already open",
+                deployment.pool_account()
+            )));
+        }
+        let lanes = match Self::hydrate_lanes(&self.lanes_db, deployment) {
+            Ok(lanes) => lanes,
+            Err(err) => {
+                self.release(deployment);
+                return Err(err);
+            }
+        };
+        Ok(PersistentPoolStateStore {
+            files: Arc::clone(self),
+            deployment,
             lanes,
             dirty: SegQueue::new(),
         })
+    }
+
+    /// Filesystem path of the lane store file (`lanes.redb`).
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// When the settlement ledger started recording, Unix seconds: the open of
+    /// `settle.redb` that found no stamp (`Self::bind_ledger_start`). The
+    /// ledger records every settlement landed from this time on.
+    #[must_use]
+    pub const fn ledger_started_at_unix(&self) -> u64 {
+        self.ledger_started_at_unix
+    }
+
+    fn lock_bound(&self) -> std::sync::MutexGuard<'_, HashSet<Deployment>> {
+        self.bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Release `deployment` when its view drops.
+    fn release(&self, deployment: Deployment) {
+        self.lock_bound().remove(&deployment);
     }
 
     /// Open (or create) one hardened redb file at `path`, applying the empty-file
@@ -960,21 +1092,6 @@ impl PersistentPoolStateStore {
             "lane state store: file-mode tightening skipped on non-unix; relying on data_dir ACL",
         );
         Ok(())
-    }
-
-    /// Filesystem path of the underlying database file. Useful for log messages
-    /// and operator runbooks.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// When the settlement ledger started recording, Unix seconds: the open of
-    /// `settle.redb` that found no stamp (`Self::bind_ledger_start`). The
-    /// ledger records every settlement landed from this time on.
-    #[must_use]
-    pub const fn ledger_started_at_unix(&self) -> u64 {
-        self.ledger_started_at_unix
     }
 }
 
@@ -1260,6 +1377,7 @@ impl PersistentPoolStateStore {
     /// rightward through the B-trees.
     fn commit_snapshot(&self, snapshot: &FlushSnapshot) -> Result<(), StoreError> {
         let mut write_txn = self
+            .files
             .lanes_db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
@@ -1301,11 +1419,10 @@ impl PersistentPoolStateStore {
 // writer slot) and which `TableDefinition` names it.
 // ---------------------------------------------------------------------------
 
-/// Test/e2e-only seam on the concrete store. Kept here rather than on the
-/// handle because the buyer reconciliation + mixed-reclaim e2e (#763) holds a
-/// `PersistentPoolStateStore`.
+/// Test/e2e-only seam on the store files. Kept here rather than on the handle
+/// because the buyer reconciliation + mixed-reclaim e2e (#763) holds the files.
 #[cfg(any(test, feature = "anvil-e2e"))]
-impl PersistentPoolStateStore {
+impl PoolStoreFiles {
     /// Test/e2e-only: write raw value bytes under a buyer pool key, bypassing
     /// the postcard encoder, to simulate a row left undecodable by a binary
     /// downgrade.
@@ -1323,22 +1440,22 @@ impl PersistentPoolStateStore {
     }
 }
 
-/// [`BuyerPoolStore`] adapter over the shared [`PersistentPoolStateStore`].
+/// [`BuyerPoolStore`] adapter over the shared [`PoolStoreFiles`].
 ///
-/// Holds an `Arc` to the same store the seller path uses. The seller's
+/// Holds an `Arc` to the same files the seller views use. The seller's
 /// `lane_state_v2` table and the buyer pool table sit in separate redb files
-/// (`lanes.redb` and `buyer.redb`) behind that one handle, so neither family's
-/// commit waits on the other's writer slot. Hand this to the buyer service as
+/// (`lanes.redb` and `buyer.redb`), so neither family's commit waits on the
+/// other's writer slot. Hand this to the buyer service as
 /// `Arc<dyn BuyerPoolStore>`.
 #[derive(Debug, Clone)]
 pub struct BuyerPoolStoreHandle {
-    inner: std::sync::Arc<PersistentPoolStateStore>,
+    inner: Arc<PoolStoreFiles>,
 }
 
 impl BuyerPoolStoreHandle {
-    /// Wrap a shared persistent store as a buyer-pool store.
+    /// Wrap the shared store files as a buyer-pool store.
     #[must_use]
-    pub const fn new(inner: std::sync::Arc<PersistentPoolStateStore>) -> Self {
+    pub const fn new(inner: Arc<PoolStoreFiles>) -> Self {
         Self { inner }
     }
 
@@ -1475,16 +1592,18 @@ impl BuyerPoolStore for BuyerPoolStoreHandle {
     }
 }
 
-impl PersistentPoolStateStore {
-    /// Insert/overwrite a pending-settle entry in `table` (fsync-on-commit). The
-    /// `PENDING_SETTLE_TABLE` and `BUYER_PENDING_SETTLE_TABLE` share this body so
-    /// the seller and buyer pending sets stay byte-for-byte consistent.
+impl PoolStoreFiles {
+    /// Insert/overwrite `deployment`'s pending-settle entry in `table`
+    /// (fsync-on-commit). The `PENDING_SETTLE_TABLE` and
+    /// `BUYER_PENDING_SETTLE_TABLE` share this body so the seller and buyer
+    /// pending sets stay byte-for-byte consistent.
     fn pending_record_in(
         &self,
         table_def: TableDefinition<'_, &[u8; PENDING_KEY_LEN], u64>,
+        deployment: Deployment,
         entry: &PendingSettle,
     ) -> Result<(), StoreError> {
-        let key = pending_key(self.deployment, entry.pool_id);
+        let key = pending_key(deployment, entry.pool_id);
         let mut write_txn = self
             .settle_db
             .begin_write()
@@ -1510,11 +1629,12 @@ impl PersistentPoolStateStore {
         Ok(())
     }
 
-    /// Load this store's deployment's pending-settle entries from `table` (an
-    /// absent table is the empty set, not an error — first-boot tolerance).
+    /// Load `deployment`'s pending-settle entries from `table` (an absent
+    /// table is the empty set, not an error — first-boot tolerance).
     fn pending_load_from(
         &self,
         table_def: TableDefinition<'_, &[u8; PENDING_KEY_LEN], u64>,
+        deployment: Deployment,
     ) -> Result<Vec<PendingSettle>, StoreError> {
         let read_txn = self
             .settle_db
@@ -1526,8 +1646,8 @@ impl PersistentPoolStateStore {
             Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
         };
         let mut out = Vec::new();
-        let lo = pending_key(self.deployment, B256::ZERO);
-        let hi = pending_key(self.deployment, B256::repeat_byte(0xff));
+        let lo = pending_key(deployment, B256::ZERO);
+        let hi = pending_key(deployment, B256::repeat_byte(0xff));
         let iter = table
             .range::<&[u8; PENDING_KEY_LEN]>(&lo..=&hi)
             .map_err(|err| StoreError::Backend(format!("table range: {err}")))?;
@@ -1549,9 +1669,10 @@ impl PersistentPoolStateStore {
     fn pending_forget_in(
         &self,
         table_def: TableDefinition<'_, &[u8; PENDING_KEY_LEN], u64>,
+        deployment: Deployment,
         pool_id: B256,
     ) -> Result<(), StoreError> {
-        let key = pending_key(self.deployment, pool_id);
+        let key = pending_key(deployment, pool_id);
         {
             let read_txn = self
                 .settle_db
@@ -1588,55 +1709,61 @@ impl PersistentPoolStateStore {
 
 impl PendingSettleStore for PersistentPoolStateStore {
     fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError> {
-        self.pending_record_in(PENDING_SETTLE_TABLE, entry)
+        self.files
+            .pending_record_in(PENDING_SETTLE_TABLE, self.deployment, entry)
     }
 
     fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
-        self.pending_load_from(PENDING_SETTLE_TABLE)
+        self.files
+            .pending_load_from(PENDING_SETTLE_TABLE, self.deployment)
     }
 
     fn forget_pending(&self, pool_id: B256) -> Result<(), StoreError> {
-        self.pending_forget_in(PENDING_SETTLE_TABLE, pool_id)
+        self.files
+            .pending_forget_in(PENDING_SETTLE_TABLE, self.deployment, pool_id)
     }
 }
 
-/// [`PendingSettleStore`] over the buyer's `buyer_pending_settle_v2` table,
-/// isolated from the seller's `pending_settle_v2` table so the two settle
-/// sweeps never finalize each other's closes (#988). Wraps the same shared
-/// [`PersistentPoolStateStore`] (one redb file, one handle); hand this to the
-/// buyer service as `Arc<dyn PendingSettleStore>`.
+/// [`PendingSettleStore`] over the buyer's `buyer_pending_settle_v2` table for
+/// one deployment, isolated from the seller's `pending_settle_v2` table so the
+/// two settle sweeps never finalize each other's closes (#988). Wraps the
+/// shared [`PoolStoreFiles`]; hand this to the buyer service as
+/// `Arc<dyn PendingSettleStore>`.
 #[derive(Debug, Clone)]
 pub struct BuyerPendingSettleStoreHandle {
-    inner: std::sync::Arc<PersistentPoolStateStore>,
+    inner: Arc<PoolStoreFiles>,
+    deployment: Deployment,
 }
 
 impl BuyerPendingSettleStoreHandle {
-    /// Wrap a shared persistent store as the buyer pending-settle store.
+    /// The buyer pending-settle store of `deployment` over the shared files.
     #[must_use]
-    pub const fn new(inner: std::sync::Arc<PersistentPoolStateStore>) -> Self {
-        Self { inner }
+    pub const fn new(inner: Arc<PoolStoreFiles>, deployment: Deployment) -> Self {
+        Self { inner, deployment }
     }
 }
 
 impl PendingSettleStore for BuyerPendingSettleStoreHandle {
     fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError> {
         self.inner
-            .pending_record_in(BUYER_PENDING_SETTLE_TABLE, entry)
+            .pending_record_in(BUYER_PENDING_SETTLE_TABLE, self.deployment, entry)
     }
 
     fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
-        self.inner.pending_load_from(BUYER_PENDING_SETTLE_TABLE)
+        self.inner
+            .pending_load_from(BUYER_PENDING_SETTLE_TABLE, self.deployment)
     }
 
     fn forget_pending(&self, pool_id: B256) -> Result<(), StoreError> {
         self.inner
-            .pending_forget_in(BUYER_PENDING_SETTLE_TABLE, pool_id)
+            .pending_forget_in(BUYER_PENDING_SETTLE_TABLE, self.deployment, pool_id)
     }
 }
 
 impl KeyedCheckpointStore for PersistentPoolStateStore {
     fn load_checkpoint(&self, key: CheckpointKey) -> Result<Option<u64>, StoreError> {
         let read_txn = self
+            .files
             .checkpoint_db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
@@ -1654,6 +1781,7 @@ impl KeyedCheckpointStore for PersistentPoolStateStore {
 
     fn record_checkpoint(&self, key: CheckpointKey, block: u64) -> Result<(), StoreError> {
         let mut write_txn = self
+            .files
             .checkpoint_db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
@@ -1676,7 +1804,29 @@ impl KeyedCheckpointStore for PersistentPoolStateStore {
     }
 }
 
+/// The ledger names the deployment per row, so a seller view reads and writes
+/// the whole ledger of its files.
 impl SettlementLedger for PersistentPoolStateStore {
+    fn record_settlement(&self, row: &SettlementRecord) -> Result<(), StoreError> {
+        self.files.record_settlement(row)
+    }
+
+    fn load_settlements(&self) -> Result<Vec<SettlementRecord>, StoreError> {
+        self.files.load_settlements()
+    }
+
+    fn has_settlement_tx(
+        &self,
+        deployment: Deployment,
+        block_number: u64,
+        tx_hash: B256,
+    ) -> Result<bool, StoreError> {
+        self.files
+            .has_settlement_tx(deployment, block_number, tx_hash)
+    }
+}
+
+impl SettlementLedger for PoolStoreFiles {
     fn record_settlement(&self, row: &SettlementRecord) -> Result<(), StoreError> {
         let key = settlement_key(row.deployment, row.block_number, row.log_index);
         let value = postcard::to_allocvec(&StoredSettlement::from_record(row))
@@ -1754,7 +1904,7 @@ impl SettlementLedger for PersistentPoolStateStore {
     }
 }
 
-impl PersistentPoolStateStore {
+impl PoolStoreFiles {
     /// Open [`SETTLEMENT_LEDGER_TABLE`] for reading; `None` when no row was
     /// ever written.
     fn open_settlement_ledger(&self) -> Result<Option<SettlementLedgerTable>, StoreError> {

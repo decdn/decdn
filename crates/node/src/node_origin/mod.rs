@@ -542,10 +542,9 @@ pub struct NodeOriginConfig {
     /// per MB, on a cache-miss relay leg. `select_policy(&cfg.cache.serve_economics)`
     /// picks `OffPolicy` (no ceiling) or `MarginPolicy` at construction.
     pub serve_economics: Arc<dyn crate::serve_economics::ServeEconomicsPolicy>,
-    /// Live operator fee-share (basis points) from `FeeRouter.getShares()[0]`,
-    /// the `(1 - f)` numerator the `margin` serve-economics policy amortizes
-    /// over. Seeded from chain at startup and kept current by the fee-shares
-    /// watcher (`crate::fee_shares_watcher::route`).
+    /// Operator fee-share (basis points), the `(1 - f)` numerator the `margin`
+    /// serve-economics policy amortizes over: the lowest immutable
+    /// `PaymentPool.operatorBps()` of the accepted pools, read at startup.
     pub operator_shares: crate::fee_shares::OperatorShares,
     /// ADR 040 shared frequency estimator, when built (`cache.eviction_policy`
     /// / `cache.admission_policy` == `"tinylfu"`, or `cache.serve_economics.policy`
