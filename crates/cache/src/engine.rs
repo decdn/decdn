@@ -917,6 +917,22 @@ pub struct AdmitControl<'a> {
     pub stop_at: Option<&'a AtomicU64>,
 }
 
+impl AdmitControl<'_> {
+    /// Refuse more than one span under a set control: the verified prefix is
+    /// only a prefix over one contiguous span, and across a gap the furthest
+    /// group verified says nothing about the gap.
+    fn check_span(&self, ranges: &ChunkRanges) -> CacheResult<()> {
+        let controlled = self.on_progress.is_some() || self.stop_at.is_some();
+        if controlled && ranges.boundaries().len() > 2 {
+            return Err(CacheError::Internal(anyhow::anyhow!(
+                "admit_bao_stream_until: a controlled admit takes one contiguous range, \
+                 got {ranges:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for AdmitControl<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdmitControl")
@@ -4670,8 +4686,8 @@ impl CacheEngine {
     /// partial as a whole admit does, and returns [`AdmitEnd::Stopped`]
     /// without reading further. A chunk group ends at a boundary of the
     /// pre-order bao encoding, so the stopped prefix verifies on its own.
-    /// `chunk_ranges` is one contiguous range when `stop_at` is set: the
-    /// prefix is the end of the furthest chunk group verified.
+    /// With either control set, `chunk_ranges` must be one contiguous range,
+    /// so the furthest chunk group verified ends the verified prefix.
     ///
     /// The progress call follows the hand-off of the chunk group to the
     /// store's import, so a read of the present ranges right after it can
@@ -4680,7 +4696,8 @@ impl CacheEngine {
     ///
     /// # Errors
     ///
-    /// As [`Self::admit_bao_stream`].
+    /// As [`Self::admit_bao_stream`], plus [`CacheError::Internal`] for a
+    /// controlled admit over more than one span, before any byte is read.
     pub async fn admit_bao_stream_until<R>(
         &self,
         hash: Hash,
@@ -4693,6 +4710,9 @@ impl CacheEngine {
     where
         R: AsyncStreamReader + Send,
     {
+        if let Err(e) = control.check_span(&chunk_ranges) {
+            return Err((reader, e));
+        }
         let Some(size) = NonZeroU64::new(total_bytes) else {
             // An empty blob has no bao to decode. Mirror iroh-blobs' own
             // `import_bao_reader`: the canonical empty hash is a no-op success

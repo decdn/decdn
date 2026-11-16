@@ -5188,6 +5188,43 @@ async fn admit_bao_stream_until_reports_each_chunk_group_and_drains() {
 }
 
 #[tokio::test]
+async fn admit_bao_stream_until_refuses_a_controlled_multi_span_admit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 4 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let (hash, _, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+    let chunks = |groups: u64| bao_tree::ChunkNum(groups * group / 1024);
+    let two_spans = bao_tree::ChunkRanges::from(chunks(0)..chunks(1))
+        | bao_tree::ChunkRanges::from(chunks(2)..chunks(3));
+
+    let stop_at = AtomicU64::new(u64::MAX);
+    let result = engine
+        .admit_bao_stream_until(
+            hash,
+            two_spans,
+            total,
+            bao.slice(8..),
+            None,
+            crate::AdmitControl {
+                on_progress: None,
+                stop_at: Some(&stop_at),
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err((_, CacheError::Internal(_)))),
+        "a controlled admit over two spans is refused"
+    );
+    assert!(
+        engine.present_ranges(hash).await.unwrap().is_empty(),
+        "nothing is admitted"
+    );
+}
+
+#[tokio::test]
 async fn admit_bao_stream_until_stops_at_a_lowered_end_and_keeps_the_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
