@@ -5,7 +5,7 @@
 //! receiver checks each chunk group against the blob's BLAKE3 root as it lands
 //! ([ADR 038 § Wire format]). This crate holds the range arithmetic both sides
 //! share. It depends on `bao-tree` and not on `iroh-blobs`, so the client SDK
-//! and the `decdn` CLI link no blob store.
+//! links no blob store.
 //!
 //! # Entry points
 //!

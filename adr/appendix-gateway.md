@@ -7,7 +7,8 @@
 
 **Date:** 2026-10-24 — **Status:** Accepted (`decdn gateway --public-url`
 ships). **Touches:** `decdn` CLI (`gateway`, `publish point`), `decdn-client`
-(byte windows), `decdn-incentive` (the buyer-pool snapshot).
+(byte windows), `decdn-incentive` (the buyer-pool snapshot), `decdn-cache`
+(the gateway cache).
 
 ## Context
 
@@ -223,6 +224,37 @@ read a site. A site page cannot read another origin. A loopback gateway sends
 CORS headers on its API only. A page on another origin cannot send the token
 header to content, and it cannot read content.
 
+## Cache
+
+The gateway keeps what its pulls deliver. Each pull streams into a cache
+under `<data-dir>/cache`. The cache is the node's cache engine with no origin
+([ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies)).
+It verifies each chunk group against the
+hash of the blob before it keeps the group. It keeps the blob under the size
+that a holder proved.
+
+A request is a cache hit when the cache holds every byte of the response:
+the whole blob, or the chunk groups of its one `Range`. The cache must also
+hold the blob under the size that the response states. The gateway serves a
+hit from the cache. A hit starts no pull, spends no capability and charges
+the allowance nothing. The allowance meters what the gateway pays for, and a
+hit pays for nothing. A blob that the cache holds whole answers `HEAD` with
+its length, and needs no size lookup.
+
+A request that the cache holds only in part is not a hit. It streams as a
+pull, and the allowance charges it as a pull. The pull fetches only the
+chunk groups that the cache does not hold.
+
+The eviction loop of the node runs on the cache. It keeps the cache under
+`--cache-mb` (10240 by default). It also keeps the free-disk margin of the
+node on the volume. It releases the least recently used blobs first.
+`--cache-mb 0` turns the cache off. Each pull then fills a scratch directory,
+and the gateway removes the directory when the pull ends.
+
+Concurrent pulls of one blob fill one cache entry. Each pull fetches the
+chunk groups that are missing when it plans a range. Thus two concurrent
+pulls can pay for the same chunk group once each.
+
 ## Metrics
 
 Every gateway counts what it serves, the loopback gateway too.
@@ -254,6 +286,7 @@ start.
 | `decdn_gateway_pull_failures_other_total` | counter | Answers 502. |
 | `decdn_gateway_pulls_active` | gauge | Pulls handed to the worker and not yet ended. |
 | `decdn_gateway_pointer_updates_total` | counter | Namespace pointers stored through `PUT /_pointer`. |
+| `decdn_gateway_cache_hits_total` | counter | Responses served from the cache, with no pull and no allowance charge (see [Cache](#cache)). |
 
 The exposition is for the operator's scraper. The listener takes a loopback
 address only.

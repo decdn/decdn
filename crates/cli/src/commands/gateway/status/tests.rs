@@ -55,6 +55,7 @@ fn counters() -> Counters {
         pull_failures_other: 3,
         pulls_active: 2,
         pointer_updates: 5,
+        cache_hits: 9,
     }
 }
 

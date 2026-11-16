@@ -80,10 +80,10 @@ pub trait StreamStores {
 
     /// Open the store for `hash`, sized to the stream's proven size
     /// `total_bytes`. A store that already holds verified bytes of `hash`
-    /// keeps them, and the stream fetches only what is missing. Two streams
-    /// must not fill one store at the same time: an implementation either
-    /// returns a distinct store per call, or documents which calls share one
-    /// so its caller keeps those streams apart.
+    /// keeps them, and the stream fetches only what is missing. An
+    /// implementation documents which calls share one store and whether two
+    /// streams may fill it at the same time; where they may not, its caller
+    /// keeps those streams apart.
     fn open(
         &self,
         hash: [u8; 32],

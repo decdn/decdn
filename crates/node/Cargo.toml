@@ -70,7 +70,8 @@ test-support = ["decdn-protocol/test-support"]
 
 [dependencies]
 decdn-protocol = { workspace = true }
-decdn-cache = { workspace = true }
+# The node serves S3/R2/B2 origins.
+decdn-cache = { workspace = true, features = ["s3"] }
 decdn-client = { workspace = true }
 # `NodeAdmitStore` (`src/node_origin/admit_store.rs`, #1621) implements
 # `decdn_bao_range::RangedStore` directly (delegating to `NodeRangedStore`), so

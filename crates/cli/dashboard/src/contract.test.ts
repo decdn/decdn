@@ -113,6 +113,7 @@ const COUNTERS: Keys<Counters> = {
   pull_failures_other: true,
   pulls_active: true,
   pointer_updates: true,
+  cache_hits: true,
 };
 const PULL: Keys<ActivePull> = {
   hash: true,

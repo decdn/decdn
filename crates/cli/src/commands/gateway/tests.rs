@@ -420,6 +420,18 @@ async fn test_gateway_in(
     public: Option<Public>,
     worker_slots: usize,
 ) -> Arc<Gateway> {
+    test_gateway_cached(backend, common, sites, public, worker_slots, None).await
+}
+
+/// [`test_gateway_in`] serving repeat requests out of `cache`.
+async fn test_gateway_cached(
+    backend: impl worker::Backend,
+    common: cli::ClientFetchArgs,
+    sites: SiteDomain,
+    public: Option<Public>,
+    worker_slots: usize,
+    cache: Option<CacheEngine>,
+) -> Arc<Gateway> {
     let token = matches!(sites, SiteDomain::Loopback { .. }).then(|| TEST_TOKEN.to_owned());
     assert_eq!(matches!(sites, SiteDomain::Public { .. }), public.is_some());
     let chain = ChainConfig {
@@ -437,6 +449,7 @@ async fn test_gateway_in(
         chain,
         delegates: Mutex::new(HashMap::new()),
         pulls: PullWorker::start(backend, worker_slots).await.unwrap(),
+        cache,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
         manifest_fills: std::sync::Mutex::default(),
@@ -4317,4 +4330,124 @@ async fn another_namespace_does_not_wait_on_a_fill() {
     pulls_reach(&caps, 2).await;
     abort_held(first).await;
     abort_held(second).await;
+}
+
+/// The bytes the cache tests serve: text, so a response body reads as a
+/// string, and longer than one chunk group.
+fn cached_text() -> String {
+    "cached bytes ".repeat(3_000)
+}
+
+/// A cache under `dir` holding `range` of `data` (`(0, len)` for all of it),
+/// and the blob's hash.
+async fn cache_holding(dir: &Path, data: &[u8], range: (u64, u64)) -> (CacheEngine, [u8; 32]) {
+    let engine = CacheEngine::open(dir, Vec::new(), 0).await.unwrap();
+    let outboard =
+        bao_tree::io::outboard::PreOrderMemOutboard::create(data, decdn_bao_range::IROH_BLOCK_SIZE);
+    let root = *outboard.root.as_bytes();
+    let total = u64::try_from(data.len()).unwrap();
+    let aligned = decdn_bao_range::align_range(range.0, range.1, total).unwrap();
+    let start = usize::try_from(aligned.fetch_start()).unwrap();
+    let end = usize::try_from(aligned.fetch_end()).unwrap();
+    let wire = decdn_bao_range::encode_verified_range(
+        root,
+        &aligned,
+        &data[start..end],
+        Bytes::from(outboard.data),
+    )
+    .unwrap();
+    engine
+        .admit_bao_stream(
+            decdn_cache::Hash::from_bytes(root),
+            aligned.chunk_ranges().clone(),
+            total,
+            wire.slice(8..),
+            None,
+        )
+        .await
+        .map_err(|(_, e)| e)
+        .unwrap();
+    (engine, root)
+}
+
+/// A public gateway that can start no pull, with `allowance` bytes a day and
+/// `cache`.
+async fn cached_public_gateway(
+    allowance: u64,
+    cache: CacheEngine,
+    pointers_dir: &Path,
+) -> Arc<Gateway> {
+    let sites = SiteDomain::Public {
+        origin: "https://decdn.test".parse().unwrap(),
+    };
+    let public = public_with(Allowance::with_namespaces(allowance, []), pointers_dir);
+    test_gateway_cached(NoPulls, flags(&[]), sites, Some(public), 1, Some(cache)).await
+}
+
+/// A blob the cache holds whole is served from it with its length: no pull,
+/// and nothing charged against an allowance far smaller than the blob.
+#[tokio::test]
+async fn a_cached_blob_is_served_with_no_pull_and_no_allowance() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cached_text();
+    let len = u64::try_from(text.len()).unwrap();
+    let (cache, hash) = cache_holding(&dir.path().join("cache"), text.as_bytes(), (0, len)).await;
+    let gateway = cached_public_gateway(10, cache, dir.path()).await;
+
+    let path = format!("/{}", alloy::hex::encode(hash));
+    let answer = request(&gateway, "decdn.test", &path, &[]).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body, text);
+    assert_eq!(
+        answer.header(header::CONTENT_LENGTH),
+        Some(len.to_string().as_str())
+    );
+    let allowance = &gateway.public.as_ref().unwrap().allowance;
+    assert_eq!(allowance.remaining(None, now_secs()), Ok(10));
+    let counters = gateway.metrics.snapshot();
+    assert_eq!(counters.cache_hits, 1);
+    assert_eq!(counters.bytes_served, len);
+}
+
+/// A `Range` the cache holds is served from it as a 206, with its
+/// `Content-Range`.
+#[tokio::test]
+async fn a_cached_range_is_served_from_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cached_text();
+    let len = u64::try_from(text.len()).unwrap();
+    let (cache, hash) = cache_holding(&dir.path().join("cache"), text.as_bytes(), (0, len)).await;
+    let gateway = cached_public_gateway(10, cache, dir.path()).await;
+
+    let path = format!("/{}", alloy::hex::encode(hash));
+    let range = [(header::RANGE.as_str(), "bytes=100-199")];
+    let answer = request(&gateway, "decdn.test", &path, &range).await;
+    assert_eq!(
+        answer.status,
+        StatusCode::PARTIAL_CONTENT,
+        "{}",
+        answer.body
+    );
+    assert_eq!(answer.body, text[100..200]);
+    assert_eq!(
+        answer.header(header::CONTENT_RANGE),
+        Some(format!("bytes 100-199/{len}").as_str())
+    );
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 1);
+}
+
+/// A cache entry that does not hold the bytes a request asks for is no hit:
+/// the request goes to a pull.
+#[tokio::test]
+async fn a_partial_entry_that_misses_the_request_is_no_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cached_text();
+    let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+    let (cache, hash) = cache_holding(&dir.path().join("cache"), text.as_bytes(), (0, group)).await;
+    let gateway = cached_public_gateway(u64::MAX, cache, dir.path()).await;
+
+    let path = format!("/{}", alloy::hex::encode(hash));
+    let answer = request(&gateway, "decdn.test", &path, &[]).await;
+    assert_ne!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 0);
 }

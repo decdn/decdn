@@ -22,11 +22,15 @@
 //!   6. The metrics listener on loopback counts what the gateway served, and
 //!      the node wrote the wire bytes of those pulls and no more: no pull of
 //!      a.bin or b opens a stream it drops unread (#2619). Every pull reaches
-//!      the node, since the gateway keeps no blob bodies. Its `/_status`
+//!      the node, since this gateway runs with its cache off. Its `/_status`
 //!      agrees with the exposition and shows the pool's lane and the spent
 //!      allowance; its `/` is no page.
 //!   7. `decdn dashboard`, pointed at that listener and at the node, shows the
 //!      gateway's state and the node's health and lanes.
+//!
+//! A second gateway runs with its cache on: a repeat request, whole or a
+//! `Range`, is served from the cache, with no byte from the node and no
+//! allowance charged.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and built `decdn` and `decdn-node` binaries:
@@ -172,6 +176,10 @@ async fn run() -> anyhow::Result<()> {
                         &DEPOSIT_MICRO_USDC.to_string(),
                         "--allowance-bytes-per-day",
                         ALLOWANCE,
+                        // Every repeat pulls, so the allowance and the node's
+                        // bytes count each request.
+                        "--cache-mb",
+                        "0",
                         "--metrics-listen",
                         &metrics,
                         // A public gateway verifies namespace pointers, and
@@ -609,6 +617,153 @@ async fn run() -> anyhow::Result<()> {
     );
     dashboard.start_kill().context("stop the dashboard")?;
     let _ = dashboard.wait().await;
+
+    gateway.start_kill().context("stop the gateway")?;
+    let _ = gateway.wait().await;
+    drop(node);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_public_gateway_serves_a_repeat_from_its_cache() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_cached()))
+        .await
+        .context("gateway cache e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+/// A public gateway with its cache on pulls a blob once. A repeat `GET` and a
+/// `Range` are served from the cache: the node writes no byte for them, the
+/// gateway counts two hits, and the allowance stays where the pull left it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential journey: node, operator, gateway, the pull, then the hits"
+)]
+async fn run_cached() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+    let data = blob(4 * MIB, 0xCAC4_E003);
+    let (node, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[data.as_slice()]).await?;
+    let path = format!("/{}", hashes[0].to_hex());
+
+    let gateway_dir = private_tempdir("gateway")?;
+    eth_identity::generate_and_persist(gateway_dir.path(), KEYSTORE_PASSWORD, false)
+        .context("generate the gateway keystore")?;
+    let keystore = eth_identity::keystore_path(gateway_dir.path());
+    let operator = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD)?.address();
+    chain.fund_eth(operator, 100).await?;
+    chain
+        .mint_usdc(operator, U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64))
+        .await?;
+
+    let gateway_port = PortReservation::tcp()?;
+    let listen = gateway_port.addr().to_string();
+    let metrics_port = PortReservation::tcp()?;
+    let metrics = metrics_port.addr().to_string();
+    let mut gateway =
+        tokio::process::Command::from(decdn_command(gateway_dir.path(), KEYSTORE_PASSWORD)?)
+            .args(
+                [
+                    strs(&[
+                        "gateway",
+                        "--public-url",
+                        &format!("http://{DOMAIN}"),
+                        "--listen",
+                        &listen,
+                        "--data-dir",
+                        &gateway_dir.path().display().to_string(),
+                        "--working-deposit-micro-usdc",
+                        &DEPOSIT_MICRO_USDC.to_string(),
+                        "--metrics-listen",
+                        &metrics,
+                        "--publisher-registry-address",
+                        &format!("{}", chain.addrs().publisher_registry),
+                    ]),
+                    chain_flags(&chain),
+                    node_flags(&chain, &node),
+                ]
+                .concat(),
+            )
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn decdn gateway")?;
+    let base = format!("http://{listen}");
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    wait_for_gateway(&http, &base).await?;
+    let get = |range: Option<&str>| {
+        let mut request = http.get(format!("{base}{path}")).header("host", DOMAIN);
+        if let Some(range) = range {
+            request = request.header("range", range.to_owned());
+        }
+        async move {
+            let response = request.send().await?;
+            let status = response.status();
+            let body = response.bytes().await?.to_vec();
+            anyhow::Ok((status, body))
+        }
+    };
+    let status = || async {
+        let text = http
+            .get(format!("http://{metrics}/_status"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        anyhow::Ok(serde_json::from_str::<serde_json::Value>(&text)?)
+    };
+
+    // The first pull opens the pool, which the node serves once its chain
+    // watcher has seen it, so the first request is retried.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let (status, body) = get(None).await?;
+        if status.is_success() {
+            anyhow::ensure!(body == data, "the pull: {} bytes", body.len());
+            break;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the gateway never served the blob: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+    let served = node.scrape_metric(SERVED).await?;
+    let used = status().await?["allowance"][0]["used"].clone();
+
+    let (repeat_status, repeat) = get(None).await?;
+    anyhow::ensure!(
+        repeat_status == StatusCode::OK && repeat == data,
+        "the repeat"
+    );
+    let (ranged_status, ranged) = get(Some("bytes=100-199")).await?;
+    anyhow::ensure!(
+        ranged_status == StatusCode::PARTIAL_CONTENT && ranged == data[100..200],
+        "the range: {ranged_status}"
+    );
+
+    anyhow::ensure!(
+        node.scrape_metric(SERVED).await? == served,
+        "the node wrote no byte for the hits"
+    );
+    let after = status().await?;
+    anyhow::ensure!(
+        after["counters"]["cache_hits"] == 2,
+        "two hits: {}",
+        after["counters"]
+    );
+    anyhow::ensure!(
+        after["allowance"][0]["used"] == used,
+        "the hits charged nothing: {} then {}",
+        used,
+        after["allowance"][0]["used"]
+    );
 
     gateway.start_kill().context("stop the gateway")?;
     let _ = gateway.wait().await;
