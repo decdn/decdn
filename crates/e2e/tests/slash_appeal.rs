@@ -10,7 +10,8 @@
 //!    sized from the other operators' bytes, so B needs A's in the window.
 //! 2. Slash A through a **real** `SlashJudge` rate-manipulation commit-reveal
 //!    challenge.
-//! 3. Assert A's daemon surfaces the slash over `admin_v1_slashes`.
+//! 3. Restart A's daemon and assert it surfaces the slash over
+//!    `admin_v1_slashes`.
 //! 4. File the appeal through the **`decdn appeal slash` CLI** (posts the bond),
 //!    the emergency multisig fast-tracks, and a **real Governor proposal**
 //!    (propose → vote → queue → timelock → execute) grants it.
@@ -175,23 +176,12 @@ async fn run() -> anyhow::Result<()> {
         .slash_operator_via_judge(&challenger, node_a.operator(), a_node_id, blob_hash)
         .await?;
 
-    // ---- Layer 1 (daemon): A surfaces the slash over admin RPC.
+    // ---- Layer 1 (daemon): A surfaces the slash over admin RPC. The live
+    // refresh reads `operatorSlashCount` every 15 minutes, past this test's
+    // budget, so a restart drives the read: bootstrap rebuilds the in-memory
+    // store from the chain (#1032). From the new process's view, the slash was
+    // mined while it was down.
     let admin_a = node_a.admin_client()?;
-    let surfaced = poll(Duration::from_secs(30), || async {
-        let resp = admin_a.slashes().await.context("admin slashes")?;
-        Ok(resp
-            .slashes
-            .iter()
-            .any(|s| s.slash_id == slash_id.to_string())
-            .then_some(()))
-    })
-    .await?;
-    assert!(surfaced.is_some(), "A's daemon never surfaced the slash");
-
-    // ---- Restart regression (#1032): a fresh process must re-surface the slash
-    // by rebuilding its in-memory store from the SlashJudge floor scan, not
-    // silently drop it. From the new process's view, the slash was mined while
-    // it was down — the exact gap this guards against.
     node_a.restart().await?;
     let after_restart = poll(Duration::from_secs(30), || async {
         let resp = admin_a

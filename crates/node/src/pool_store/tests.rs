@@ -219,12 +219,7 @@ fn file_mode_is_owner_only() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let _store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     // Every family file is hardened to 0o600, not just the lane store.
-    for file in [
-        LANES_DB_FILE,
-        SETTLE_DB_FILE,
-        CHECKPOINT_DB_FILE,
-        BUYER_DB_FILE,
-    ] {
+    for file in [LANES_DB_FILE, SETTLE_DB_FILE, BUYER_DB_FILE] {
         let path = dir.path().join(file);
         anyhow::ensure!(path.exists(), "{file} must be created at open()");
         let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
@@ -363,7 +358,7 @@ fn buyer_pending(store: &Arc<PersistentPoolStateStore>) -> BuyerPendingSettleSto
 }
 
 /// Fill every seller-side family a deployment change must clear — a lane,
-/// a seller and a buyer pending settle, a watcher checkpoint — and flush.
+/// a seller and a buyer pending settle, a sent `redeemMany` hash — and flush.
 fn seed_seller_state(dir: &Path, deployment: Deployment) -> anyhow::Result<LaneState> {
     let store = Arc::new(PersistentPoolStateStore::open(dir, deployment)?);
     let lane = sample(0x31);
@@ -375,7 +370,7 @@ fn seed_seller_state(dir: &Path, deployment: Deployment) -> anyhow::Result<LaneS
     };
     store.record_pending(&pending)?;
     buyer_pending(&store).record_pending(&pending)?;
-    store.record_checkpoint(CheckpointKey::PoolOpened, 4_242)?;
+    store.record_sent_redeem(deployment, SENT_TX)?;
     Ok(lane)
 }
 
@@ -385,8 +380,11 @@ fn seller_state_is_empty(store: &Arc<PersistentPoolStateStore>) -> anyhow::Resul
     Ok(store.load_all()?.is_empty()
         && store.load_pending()?.is_empty()
         && buyer.load_pending()?.is_empty()
-        && store.load_checkpoint(CheckpointKey::PoolOpened)?.is_none())
+        && store.sent_redeems(store.deployment())?.is_empty())
 }
+
+/// A `redeemMany` hash `seed_seller_state` records.
+const SENT_TX: B256 = B256::repeat_byte(0x5e);
 
 /// A reopen against the same deployment keeps every seller-side row.
 #[test]
@@ -402,8 +400,8 @@ fn reopen_on_the_same_deployment_keeps_seller_state() -> anyhow::Result<()> {
         "buyer pending kept"
     );
     anyhow::ensure!(
-        store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(4_242),
-        "checkpoint kept"
+        store.sent_redeems(DEPLOYMENT)? == vec![SENT_TX],
+        "sent hash kept"
     );
     Ok(())
 }
@@ -451,7 +449,7 @@ fn another_deployment_keeps_its_own_seller_rows_beside_the_first() -> anyhow::Re
             pool_id: first.pool_id,
             settle_after: 1,
         })?;
-        store.record_checkpoint(CheckpointKey::PoolOpened, 1)?;
+        store.record_sent_redeem(other, B256::repeat_byte(1))?;
         drop(store);
 
         let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
@@ -469,20 +467,20 @@ fn another_deployment_keeps_its_own_seller_rows_beside_the_first() -> anyhow::Re
             "first buyer pending kept"
         );
         anyhow::ensure!(
-            store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(4_242),
-            "first checkpoint kept"
+            store.sent_redeems(DEPLOYMENT)? == vec![SENT_TX],
+            "first sent hash kept"
         );
         drop(store);
 
         let store = PersistentPoolStateStore::open(dir.path(), other)?;
         anyhow::ensure!(store.load_all()? == vec![second], "second lane kept");
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(1));
+        anyhow::ensure!(store.sent_redeems(other)? == vec![B256::repeat_byte(1)]);
     }
     Ok(())
 }
 
 /// Two live seller views over one file set — one per pool the node accepts —
-/// keep apart the same lane identity, pending settle and checkpoint, through
+/// keep apart the same lane identity and pending settle, through
 /// a flush and a reopen. A second live view of one deployment is refused, and
 /// dropping a view frees its deployment.
 #[test]
@@ -516,8 +514,6 @@ fn live_views_of_two_deployments_share_the_files_and_stay_apart() -> anyhow::Res
         b.record(&lane_b)?;
         a.flush()?;
         b.flush()?;
-        a.record_checkpoint(CheckpointKey::PoolOpened, 10)?;
-        b.record_checkpoint(CheckpointKey::PoolOpened, 20)?;
         b.record_pending(&PendingSettle {
             pool_id: lane_b.pool_id,
             settle_after: 7,
@@ -535,8 +531,6 @@ fn live_views_of_two_deployments_share_the_files_and_stay_apart() -> anyhow::Res
     let b = files.seller_view(other)?;
     anyhow::ensure!(a.load_all()? == vec![lane_a], "a's lane after reopen");
     anyhow::ensure!(b.load_all()? == vec![lane_b], "b's lane after reopen");
-    anyhow::ensure!(a.load_checkpoint(CheckpointKey::PoolOpened)? == Some(10));
-    anyhow::ensure!(b.load_checkpoint(CheckpointKey::PoolOpened)? == Some(20));
     anyhow::ensure!(b.load_pending()?.len() == 1 && a.load_pending()?.is_empty());
     Ok(())
 }
@@ -794,25 +788,29 @@ fn corrupt_owner_sig_on_a_lane_refuses_the_open() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The watcher scan checkpoint round-trips, overwrites in place, and
-/// survives a reopen — so the next boot resumes the `PoolOpened` backfill
-/// from the persisted block. An empty table reads as `None` (first boot).
+/// A sent `redeemMany` hash round-trips, survives a reopen (so the next boot
+/// fetches a receipt a crash missed), and forgets cleanly. An empty table
+/// reads as no hash.
 #[test]
-fn watcher_checkpoint_round_trip_and_persist() -> anyhow::Result<()> {
+fn sent_redeem_round_trip_and_persist() -> anyhow::Result<()> {
     let dir = data_dir()?;
+    let (a, b) = (B256::repeat_byte(0xa1), B256::repeat_byte(0xb2));
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)?.is_none());
-        store.record_checkpoint(CheckpointKey::PoolOpened, 1_000)?;
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(1_000));
-        store.record_checkpoint(CheckpointKey::PoolOpened, 2_500)?;
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(2_500));
+        anyhow::ensure!(store.sent_redeems(DEPLOYMENT)?.is_empty());
+        store.record_sent_redeem(DEPLOYMENT, a)?;
+        store.record_sent_redeem(DEPLOYMENT, b)?;
+        store.record_sent_redeem(DEPLOYMENT, a)?;
+        anyhow::ensure!(store.sent_redeems(DEPLOYMENT)? == vec![a, b]);
     }
     let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     anyhow::ensure!(
-        store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(2_500),
-        "checkpoint must survive a restart"
+        store.sent_redeems(DEPLOYMENT)? == vec![a, b],
+        "sent hashes must survive a restart"
     );
+    store.forget_sent_redeem(DEPLOYMENT, a)?;
+    store.forget_sent_redeem(DEPLOYMENT, a)?;
+    anyhow::ensure!(store.sent_redeems(DEPLOYMENT)? == vec![b]);
     Ok(())
 }
 

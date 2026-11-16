@@ -79,29 +79,19 @@ const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 /// the watchdog probing the RPC endpoint frequently enough to risk
 /// tripping provider rate limits or exhausting paid quotas.
 const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
-/// Default chain-event poll interval (milliseconds). One knob, two unrelated
-/// consumers (see `ResolvedBlockchain::event_poll_interval_ms`): the
-/// `eth_getLogs` watcher tick cadence, and alloy's pending-transaction receipt
-/// heartbeat. 7000 ms matches alloy's non-local default, so live-RPC load is
-/// unchanged from before #1011; it also overrides alloy's 250 ms localhost
-/// default, which the receipt heartbeat would otherwise use against a dev anvil.
-const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
-/// Minimum chain-event poll interval. The node polls chain events with
-/// `eth_getLogs` and issues no `eth_getFilterChanges` anywhere. At 250 ms the node's
-/// ~6 watcher loops would each scan `[cursor, head]` four times a second against
-/// one endpoint, tripping provider rate limits and burning paid quota just as the
-/// original flood did. The same floor bounds the receipt-heartbeat consumer.
-/// 250 ms is kept as the floor because it is alloy's own localhost cadence: a dev
-/// anvil can still be driven at the fastest interval alloy itself considers sane.
-const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
-/// Default ceiling on the block span of one chain-watcher `eth_getLogs`
-/// request. A node that resumes far behind head scans the gap in windows of at
-/// most this many blocks, because one unbounded request would exceed the range
-/// and result caps that RPC providers enforce. 10 000 clears the common
-/// paid-tier range caps. It bounds the block span, not the result count, so a
-/// dense window can still trip a result cap. A provider with a lower cap (free
-/// tiers go down to 10 blocks) or a result cap rejects the request, and the
-/// poller then halves its window until the provider accepts it.
+/// Default pending-transaction receipt poll interval (milliseconds): alloy's
+/// receipt heartbeat while the node awaits a mined transaction (see
+/// `ResolvedBlockchain::receipt_poll_interval_ms`). 7000 ms matches alloy's
+/// non-local default; it also overrides alloy's 250 ms localhost default, which
+/// the heartbeat would otherwise use against a dev anvil.
+const DEFAULT_RECEIPT_POLL_INTERVAL_MS: u64 = 7000;
+/// Minimum receipt poll interval: alloy's own localhost cadence, so a dev anvil
+/// can still be driven at the fastest interval alloy itself considers sane.
+const MIN_RECEIPT_POLL_INTERVAL_MS: u64 = 250;
+/// Default ceiling on the block span of one `eth_getLogs` request of the CLI's
+/// chain scans (`decdn receipt settle`, `decdn node earnings --address`). 10 000
+/// clears the common paid-tier range caps; a scan halves its window when the
+/// provider rejects a range.
 pub const DEFAULT_GET_LOGS_MAX_BLOCK_SPAN: u64 = 10_000;
 
 /// Default accrued-claim redemption threshold: 0.05 USDC (`50_000` `µUSDC`).
@@ -277,7 +267,7 @@ pub const DEFAULT_RELAY_FOREIGN_NAMESPACES: bool = true;
 
 /// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
 /// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
-/// origin-set staleness (there is no event tail); 5 min matches the negative
+/// origin-set staleness; 5 min matches the negative
 /// probe cache order of magnitude.
 pub const DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC: u64 = 300;
 /// Negative-hit TTL: how long "this namespace has no origins / does not
@@ -381,9 +371,9 @@ pub const DEFAULT_SERVE_ECONOMICS_WARMING_REFILL: u64 = 58;
 /// `appendix-poc-production-seams.md` §Seam 8).
 pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 
-/// Default seconds between the blacklist watcher's periodic re-enumeration +
-/// re-scope pass (ADR 011 § Node Behavior's 10-minute cadence).
-pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
+/// Default and largest seconds between two blacklist ledger polls (ADR 011
+/// § Following the mutation ledger: at most 5 minutes).
+pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 300;
 
 /// Default seconds the node may go without a successful chain read before the
 /// serve and probe paths refuse (ADR 011 § Serving while chain-stale). Thirty
@@ -1509,15 +1499,16 @@ fn resolve_blockchain_into(
     let content_blacklist_poll_interval_sec = file
         .and_then(|b| b.content_blacklist_poll_interval_sec)
         .unwrap_or(DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC);
-    // `0` is not a "disable" sentinel — disabling the periodic re-scope would
-    // break the retain/re-scope compliance guarantee — and it panics
-    // `tokio::time::interval_at` ("period must be non-zero"), which would kill
-    // the watcher task and silently stop enforcement. Reject it up front.
+    // `0` is not a "disable" sentinel — the ledger poll is the compliance path.
+    // ADR 011 bounds the interval at 5 minutes, inside the 1-hour
+    // compliance-window floor and the chain-staleness grace.
     bag.check(
-        content_blacklist_poll_interval_sec != 0,
+        (1..=DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC)
+            .contains(&content_blacklist_poll_interval_sec),
         "blockchain.content_blacklist_poll_interval_sec",
-        "blockchain.content_blacklist_poll_interval_sec must not be 0 — the \
-         reconcile interval must be non-zero; omit it for the default (600s)",
+        "blockchain.content_blacklist_poll_interval_sec must be between 1 and 300 \
+         seconds — the ledger poll follows every takedown; omit it for the default \
+         (300s)",
     );
 
     let chain_staleness_grace_sec = file
@@ -1580,32 +1571,18 @@ fn resolve_blockchain_into(
         },
     );
 
-    let event_poll_interval_ms = file
-        .and_then(|b| b.event_poll_interval_ms)
-        .unwrap_or(DEFAULT_EVENT_POLL_INTERVAL_MS);
+    let receipt_poll_interval_ms = file
+        .and_then(|b| b.receipt_poll_interval_ms)
+        .unwrap_or(DEFAULT_RECEIPT_POLL_INTERVAL_MS);
     bag.check_with(
-        event_poll_interval_ms >= MIN_EVENT_POLL_INTERVAL_MS,
-        "blockchain.event_poll_interval_ms",
+        receipt_poll_interval_ms >= MIN_RECEIPT_POLL_INTERVAL_MS,
+        "blockchain.receipt_poll_interval_ms",
         || {
             format!(
-                "blockchain.event_poll_interval_ms={event_poll_interval_ms} would poll the \
-                 RPC endpoint too frequently — it drives both the eth_getLogs watcher \
-                 tick and pending-tx receipt polling \
-                 (minimum {MIN_EVENT_POLL_INTERVAL_MS}ms)"
+                "blockchain.receipt_poll_interval_ms={receipt_poll_interval_ms} would poll the \
+                 RPC endpoint for receipts too frequently \
+                 (minimum {MIN_RECEIPT_POLL_INTERVAL_MS}ms)"
             )
-        },
-    );
-
-    let get_logs_max_block_span = file
-        .and_then(|b| b.get_logs_max_block_span)
-        .unwrap_or(DEFAULT_GET_LOGS_MAX_BLOCK_SPAN);
-    bag.check_with(
-        get_logs_max_block_span > 0,
-        "blockchain.get_logs_max_block_span",
-        || {
-            "blockchain.get_logs_max_block_span=0 would scan no blocks; use at least 1 \
-             (the provider's eth_getLogs range limit)"
-                .to_owned()
         },
     );
 
@@ -1733,8 +1710,7 @@ fn resolve_blockchain_into(
         chain_staleness_grace_sec,
         chain_id,
         rpc_watchdog_interval_sec,
-        event_poll_interval_ms,
-        get_logs_max_block_span,
+        receipt_poll_interval_ms,
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
         redeem_interval_secs,

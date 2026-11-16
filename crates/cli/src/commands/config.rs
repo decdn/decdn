@@ -209,13 +209,8 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  event_poll_interval_ms: {}",
-        resolved.blockchain.event_poll_interval_ms
-    )?;
-    writeln!(
-        w,
-        "  get_logs_max_block_span: {}",
-        resolved.blockchain.get_logs_max_block_span
+        "  receipt_poll_interval_ms: {}",
+        resolved.blockchain.receipt_poll_interval_ms
     )?;
     writeln!(
         w,
@@ -999,12 +994,12 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` target (#1029).
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # content_blacklist_address = ""     # REQUIRED: 0x-prefixed hex; deployed ContentBlacklist (ADR 011/031). Absent => startup fails before any ALPN accepts; the zero address is rejected (it is a fail-open compliance trap).
-# content_blacklist_poll_interval_sec = 600  # blacklist watcher periodic replay + re-scope cadence (ADR 011); must be > 0; default 600s
+# content_blacklist_poll_interval_sec = 300  # blacklist mutation-ledger poll cadence (ADR 011); 1 to 300; default 300s
 # chain_staleness_grace_sec = 1800   # stop serving after this long without a successful chain read (ADR 011); guards deny-set/pool/signer-cap staleness; must be > 0; set large to opt out; default 1800s
 # chain_id = 421614                  # governance-chain EIP-712 chain id (slash, attestation, bind-node and pointer signatures); default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
-# event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
-# get_logs_max_block_span = 10000    # max blocks per chain-watcher eth_getLogs request; set to your RPC provider's range limit (the poller also shrinks the window when the provider rejects a range; set it to the lowest span the poller reaches while rejections keep coming); default 10000, must be > 0
+# receipt_poll_interval_ms = 7000    # pending-tx receipt polling cadence (#1011); default 7000ms, min 250ms (lower for a local anvil)
+# get_logs_max_block_span = 10000    # max blocks per eth_getLogs request of the CLI's chain scans (`decdn receipt settle`, `decdn node earnings --address`); set to your RPC provider's range limit; default 10000, must be > 0
 # redeem_threshold_micro_usdc = 50000            # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 0.05 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0

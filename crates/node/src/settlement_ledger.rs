@@ -12,18 +12,18 @@
 //! carries no transfer and gets no row. Decoding the receipt costs no extra
 //! RPC; the redeemer's one read is the block header, for the row's timestamp,
 //! only when the receipt's logs do not carry it and only once the receipt has
-//! decoded to a row. The watcher's backfill adds the receipt read itself.
+//! decoded to a row.
 //!
-//! Two writers share [`SettlementRecorder`]: the redeemer, which has the
-//! receipt in hand when its `redeemMany` lands, and the `PoolRedeemed` watcher,
-//! which backfills a row for a transaction the redeemer never saw land (a
-//! receipt wait that timed out, or a landing across a restart). Rows key on
-//! `(deployment, block_number, log_index)`, so the two writers never duplicate a row. The
-//! backfills run on their own tasks ([`LedgerBackfills`]); the settlement
-//! service drains them at shutdown, because the watcher's checkpoint moves
-//! past a `PoolRedeemed` as soon as its backfill starts. Only a crash during a
-//! catch-up can lose a backfilled row; `decdn node earnings --address` still
-//! has the chain's record.
+//! Every `redeemMany` hash the redeemer gets back from its send is recorded
+//! ([`SettlementRecorder::record_sent`]) before the redeemer waits for the
+//! receipt, and dropped once the receipt is decoded. A receipt the redeemer
+//! never saw (a wait that timed out, or a crash before the receipt) is fetched
+//! by that hash on the next boot and at each periodic sweep
+//! ([`SettlementRecorder::recover_sent`]). Rows key on `(deployment,
+//! block_number, log_index)`, so a receipt decoded twice writes one row. The
+//! hash reaches the store only after the RPC accepts the send, so a crash in
+//! that one gap loses the row; `decdn node earnings --address` still has the
+//! chain's record.
 //!
 //! The ledger is observability, not a claim: every failure here is logged,
 //! counted (`decdn_settlement_ledger_write_failures_total`,
@@ -298,70 +298,102 @@ impl SettlementRecorder {
             .await;
     }
 
-    /// Record the row for a `redeemMany` the `PoolRedeemed` watcher saw in
-    /// `block_number`, when the ledger has no row for `tx_hash` yet: one
-    /// `eth_getTransactionReceipt`, then the same decoding as
-    /// [`Self::record_landed`]. Covers a receipt wait that timed out and a
-    /// landing across a restart. A transaction already in the ledger costs one
-    /// ledger read of that block and no RPC. A block time the RPC cannot
-    /// supply skips the row: this path can run long after the landing.
-    pub async fn backfill<P: Provider>(&self, provider: &P, block_number: u64, tx_hash: B256) {
-        if self.is_known(block_number, tx_hash).await != Some(false) {
-            return;
-        }
-        if let Some(receipt) = self.fetch_receipt(provider, tx_hash).await {
-            debug!(tx = %tx_hash, "backfilling a settlement ledger row from PoolRedeemed");
-            self.record(provider, &receipt, TimeFallback::Skip).await;
-        }
-    }
-
-    /// Whether the ledger already holds `tx_hash` in `block_number`; `None`
-    /// after a failed read, which is counted and ends the backfill.
-    async fn is_known(&self, block_number: u64, tx_hash: B256) -> Option<bool> {
+    /// Record the hash of a `redeemMany` the RPC accepted, before the
+    /// redeemer waits for its receipt. A failed write is logged and counted:
+    /// the redemption itself stands, and a receipt the wait does see still
+    /// writes its row.
+    pub async fn record_sent(&self, tx_hash: B256) {
         let deployment = self.source.deployment;
-        let known = self
-            .on_ledger(move |ledger| ledger.has_settlement_tx(deployment, block_number, tx_hash))
-            .await;
-        match known {
-            Ok(known) => Some(known),
-            Err(error) => {
-                warn!(error, tx = %tx_hash, block = block_number, "settlement ledger read failed; skipping backfill");
-                self.metrics.settlement_ledger_skipped_row();
-                None
-            }
+        if let Err(error) = self
+            .on_ledger(move |ledger| ledger.record_sent_redeem(deployment, tx_hash))
+            .await
+        {
+            warn!(error, tx = %tx_hash, "could not record a sent redeemMany hash");
+            self.metrics.settlement_ledger_write_failure();
         }
     }
 
-    /// The receipt of `tx_hash`, retried like the header read (a load-balanced
-    /// provider whose backend lags head answers `null` for a moment), or
-    /// `None` (counted) when every attempt fails.
-    async fn fetch_receipt<P: Provider>(
-        &self,
-        provider: &P,
-        tx_hash: B256,
-    ) -> Option<TransactionReceipt> {
-        let mut why = String::new();
-        for attempt in 0..=HEADER_READ_RETRIES {
-            if attempt > 0 {
-                tokio::time::sleep(HEADER_READ_RETRY_DELAY).await;
-            }
-            let fetched = timed(
-                None,
-                "ledger backfill getTransactionReceipt",
-                provider.get_transaction_receipt(tx_hash),
-            )
-            .await;
-            why = match fetched {
-                Ok(Some(receipt)) => return Some(receipt),
-                Ok(None) => {
-                    "PoolRedeemed names a transaction the RPC has no receipt for".to_owned()
-                }
-                Err(err) => format!("receipt read failed: {}", sanitize_err_chain(&err)),
-            };
-            debug!(tx = %tx_hash, attempt, why, "settlement ledger backfill receipt read missed");
+    /// Drop a recorded hash whose receipt is decoded.
+    pub async fn forget_sent(&self, tx_hash: B256) {
+        let deployment = self.source.deployment;
+        if let Err(error) = self
+            .on_ledger(move |ledger| ledger.forget_sent_redeem(deployment, tx_hash))
+            .await
+        {
+            warn!(error, tx = %tx_hash, "could not drop a sent redeemMany hash");
         }
-        self.skip(tx_hash, None, &why);
-        None
+    }
+
+    /// Fetch the receipt of every recorded `redeemMany` hash: a receipt the
+    /// redeemer never decoded (a wait that timed out, or a crash before the
+    /// receipt). A mined receipt writes its row and drops the hash; a hash the
+    /// chain does not know (a dropped or replaced transaction) is dropped; a
+    /// transaction still pending, or a failed read, keeps the hash for the next
+    /// call. A block time the RPC cannot supply skips the row: this path can
+    /// run long after the landing.
+    pub async fn recover_sent<P: Provider>(&self, provider: &P) {
+        let deployment = self.source.deployment;
+        let sent = match self
+            .on_ledger(move |ledger| ledger.sent_redeems(deployment))
+            .await
+        {
+            Ok(sent) => sent,
+            Err(error) => {
+                warn!(error, "could not read the sent redeemMany hashes");
+                return;
+            }
+        };
+        for tx_hash in sent {
+            self.recover_one(provider, tx_hash).await;
+        }
+    }
+
+    /// Recover one sent hash: see [`Self::recover_sent`].
+    async fn recover_one<P: Provider>(&self, provider: &P, tx_hash: B256) {
+        let receipt = timed(
+            None,
+            "sent redeemMany getTransactionReceipt",
+            provider.get_transaction_receipt(tx_hash),
+        )
+        .await;
+        match receipt {
+            Ok(Some(receipt)) => {
+                debug!(tx = %tx_hash, "recovering a settlement ledger row by its sent hash");
+                if receipt.status() {
+                    self.record(provider, &receipt, TimeFallback::Skip).await;
+                }
+                self.forget_sent(tx_hash).await;
+            }
+            Ok(None) => self.drop_if_unknown(provider, tx_hash).await,
+            Err(err) => debug!(
+                tx = %tx_hash,
+                error = %sanitize_err_chain(&err),
+                "sent redeemMany receipt read failed; retrying later"
+            ),
+        }
+    }
+
+    /// Drop a sent hash with no receipt when the chain does not know the
+    /// transaction at all; keep a pending one.
+    async fn drop_if_unknown<P: Provider>(&self, provider: &P, tx_hash: B256) {
+        let known = timed(
+            None,
+            "sent redeemMany getTransactionByHash",
+            provider.get_transaction_by_hash(tx_hash),
+        )
+        .await;
+        match known {
+            Ok(None) => {
+                debug!(tx = %tx_hash, "sent redeemMany is unknown to the chain; dropping its hash");
+                self.forget_sent(tx_hash).await;
+            }
+            Ok(Some(_)) => {}
+            Err(err) => debug!(
+                tx = %tx_hash,
+                error = %sanitize_err_chain(&err),
+                "sent redeemMany lookup failed; retrying later"
+            ),
+        }
     }
 
     /// Run one blocking ledger call on the blocking pool. A task that did not
@@ -495,176 +527,6 @@ impl SettlementRecorder {
                 );
                 self.metrics.settlement_ledger_write_failure();
             }
-        }
-    }
-}
-
-/// How many settlement ledger backfills may run at once. A resume after a long
-/// outage replays every own-provider `PoolRedeemed` of the gap; this keeps
-/// that from fanning out into as many concurrent receipt reads.
-pub const LEDGER_BACKFILL_CONCURRENCY: usize = 4;
-
-/// The ledger backfills in flight: one task per own-provider `PoolRedeemed`
-/// the watcher applies, each a [`SettlementRecorder::backfill`]. The watcher
-/// starts them and the settlement service drains them at shutdown, so a stop
-/// during a catch-up does not drop the rows the poller's checkpoint has
-/// already moved past. A clone shares the set.
-///
-/// A backfill runs off the poller's task: the poller applies every route's
-/// logs in turn, and a receipt or header read can wait out three attempts at
-/// the call timeout, so one slow read must not hold up the paid watermarks,
-/// the blacklist or the slash watcher. [`LEDGER_BACKFILL_CONCURRENCY`] bounds
-/// how many read at once; the rest wait on the permit. Each spawn reaps the
-/// tasks that have finished, so a panic inside one is logged and counted as a
-/// skipped row rather than lost with the handle. Once the drain has started,
-/// a spawn is refused, logged and counted: the poller can still be applying a
-/// window while the service shuts down, and a task started after the drain
-/// took the set would end with the process and no trace.
-#[derive(Clone)]
-pub struct LedgerBackfills {
-    recorder: SettlementRecorder,
-    permits: Arc<tokio::sync::Semaphore>,
-    /// A `std::sync::Mutex`: the guard is held to spawn, to reap and to take
-    /// the set for the drain, never across an `.await`.
-    state: Arc<std::sync::Mutex<BackfillSet>>,
-}
-
-/// The tasks in flight and whether the drain has begun, under one lock so a
-/// spawn cannot slip between the drain's flag and its take.
-#[derive(Default)]
-struct BackfillSet {
-    tasks: tokio::task::JoinSet<()>,
-    draining: bool,
-}
-
-impl std::fmt::Debug for LedgerBackfills {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LedgerBackfills")
-            .field("in_flight", &self.in_flight())
-            .finish_non_exhaustive()
-    }
-}
-
-impl LedgerBackfills {
-    /// Backfills that write through `recorder`.
-    #[must_use]
-    pub fn new(recorder: SettlementRecorder) -> Self {
-        Self {
-            recorder,
-            permits: Arc::new(tokio::sync::Semaphore::new(LEDGER_BACKFILL_CONCURRENCY)),
-            state: Arc::default(),
-        }
-    }
-
-    /// Start a backfill of `tx_hash`, seen in `block_number`, on its own task.
-    /// Returns at once. The recorder's own-block guard makes a repeat of a
-    /// transaction already in the ledger cost one ledger read. After
-    /// [`Self::drain`] has started, no task starts: the miss is logged and
-    /// counted as a skipped row.
-    pub fn spawn<P: Provider + Clone + 'static>(
-        &self,
-        provider: P,
-        block_number: u64,
-        tx_hash: B256,
-    ) {
-        let recorder = self.recorder.clone();
-        let permits = Arc::clone(&self.permits);
-        let mut state = self.lock();
-        if state.draining {
-            drop(state);
-            warn!(
-                tx = %tx_hash,
-                block = block_number,
-                "settlement ledger backfills are draining for shutdown; no row for this \
-                 PoolRedeemed (`decdn node earnings --address` has the chain's record)"
-            );
-            self.recorder.metrics.settlement_ledger_skipped_row();
-            return;
-        }
-        Self::reap(&mut state.tasks, &self.recorder.metrics);
-        state.tasks.spawn(async move {
-            match permits.acquire_owned().await {
-                Ok(_permit) => recorder.backfill(&provider, block_number, tx_hash).await,
-                Err(_closed) => {
-                    warn!(
-                        tx = %tx_hash,
-                        block = block_number,
-                        "settlement ledger backfill permit unavailable; no row"
-                    );
-                    recorder.metrics.settlement_ledger_skipped_row();
-                }
-            }
-        });
-    }
-
-    /// Wait for every backfill in flight, up to `deadline`, and refuse every
-    /// spawn from here on. One still running at the deadline is aborted and
-    /// logged: its row, if the transaction has one, is left to `decdn node
-    /// earnings --address`.
-    pub async fn drain(&self, deadline: Duration) {
-        let mut tasks = {
-            let mut state = self.lock();
-            state.draining = true;
-            std::mem::take(&mut state.tasks)
-        };
-        let pending = tasks.len();
-        if pending == 0 {
-            return;
-        }
-        debug!(pending, "draining settlement ledger backfills");
-        let drained = tokio::time::timeout(deadline, async {
-            while let Some(joined) = tasks.join_next().await {
-                Self::observe(joined, &self.recorder.metrics);
-            }
-        })
-        .await;
-        if drained.is_err() {
-            let aborted = tasks.len();
-            tasks.abort_all();
-            warn!(
-                aborted,
-                deadline_secs = deadline.as_secs(),
-                "shutdown deadline elapsed with settlement ledger backfills still running; \
-                 their rows are missing from `decdn node earnings` (`--address` has the chain's record)"
-            );
-        }
-    }
-
-    /// How many backfills are in flight, finished tasks not yet reaped
-    /// included.
-    #[must_use]
-    pub fn in_flight(&self) -> usize {
-        self.lock().tasks.len()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BackfillSet> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Take every finished task off the set, so it holds only the ones in
-    /// flight, and account for any that panicked.
-    fn reap(tasks: &mut tokio::task::JoinSet<()>, metrics: &Metrics) {
-        while let Some(joined) = tasks.try_join_next() {
-            Self::observe(joined, metrics);
-        }
-    }
-
-    /// A finished backfill task: a panic is a lost row, logged and counted;
-    /// an abort is the drain's own doing.
-    fn observe(joined: Result<(), tokio::task::JoinError>, metrics: &Metrics) {
-        match joined {
-            Ok(()) => {}
-            Err(err) if err.is_panic() => {
-                tracing::error!(
-                    error = %err,
-                    "settlement ledger backfill task panicked; its row is missing from \
-                     `decdn node earnings`"
-                );
-                metrics.settlement_ledger_skipped_row();
-            }
-            Err(err) => debug!(error = %err, "settlement ledger backfill task cancelled"),
         }
     }
 }

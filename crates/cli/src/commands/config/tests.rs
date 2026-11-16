@@ -94,7 +94,7 @@ fn default_config_template_covers_every_wired_field() {
         chain_staleness_grace_sec,
         chain_id,
         rpc_watchdog_interval_sec,
-        event_poll_interval_ms,
+        receipt_poll_interval_ms,
         get_logs_max_block_span,
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
@@ -161,7 +161,10 @@ fn default_config_template_covers_every_wired_field() {
             "rpc_watchdog_interval_sec =",
             rpc_watchdog_interval_sec.is_none(),
         ),
-        ("event_poll_interval_ms =", event_poll_interval_ms.is_none()),
+        (
+            "receipt_poll_interval_ms =",
+            receipt_poll_interval_ms.is_none(),
+        ),
         (
             "get_logs_max_block_span =",
             get_logs_max_block_span.is_none(),

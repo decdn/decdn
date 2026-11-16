@@ -197,7 +197,7 @@ running-low signal counts the recorded amount as earlier spend of the signer
 signal](039-multi-source-parallel-fetch.md#client-sdk-funding-signal)). `decdn pool`
 reads and writes `buyer-pools.redb`. A `decdn pool` command whose data dir holds any
 of the daemon's stores (`decdn_common::data_dir::DAEMON_STORE_FILES` — `buyer.redb`,
-`lanes.redb`, `settle.redb`, `checkpoint.redb`) is pointed at a node: it reports the
+`lanes.redb`, `settle.redb`) is pointed at a node: it reports the
 node's pools through the admin RPC (`decdn node pools`) and refuses to escrow into a
 store the node never reads. The daemon holds its lock only while it runs, so with the
 daemon stopped `decdn pool list` reads `buyer.redb` directly and marks the listing as

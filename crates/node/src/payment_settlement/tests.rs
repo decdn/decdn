@@ -1,4 +1,5 @@
 use super::*;
+use decdn_incentive::StoreError;
 
 fn boot_retries(metrics: &Metrics) -> u64 {
     let text = metrics.encode().unwrap_or_default();
@@ -337,16 +338,15 @@ async fn resolving_status_counts_onchain_redemptions() -> Result<()> {
         .await
         .ok_or_else(|| anyhow::anyhow!("a live pool resolves"))?;
     assert_eq!(status.remaining, U256::ZERO);
-    assert_eq!(projection.pending_rereads(), vec![pool_id]);
+    assert!(projection.fresh(pool_id).is_some());
     Ok(())
 }
 
-/// An admit-path seed read of an `Open` pool.
-fn seed(pool_id: B256, deposit: u64, total_redeemed: u64) -> PoolRead {
-    PoolRead {
-        pool_id,
-        deposit,
-        total_redeemed,
+/// A held `getPool` read of an `Open` pool.
+fn seed(deposit: u64, total_redeemed: u64) -> PoolStatus {
+    PoolStatus {
+        owner: Address::from([1u8; 20]),
+        remaining: U256::from(deposit.saturating_sub(total_redeemed)),
         lifecycle: Lifecycle::Open,
     }
 }
@@ -364,374 +364,134 @@ fn mocked_contract() -> (
     (PaymentPool::new(Address::ZERO, provider), asserter)
 }
 
-/// The value `decdn_settlement_reanchor_<suffix>` exports, if it is exported.
-fn reanchor_metric(metrics: &Metrics, suffix: &str) -> Option<i64> {
-    let prefix = format!("decdn_settlement_reanchor_{suffix} ");
-    metrics
-        .encode()
-        .unwrap_or_default()
-        .lines()
-        .find_map(|line| line.strip_prefix(&prefix)?.parse().ok())
-}
+/// `read_pools` holds a servable pool's read, drops and queues a `Closed` one
+/// for lane cleanup, and drops an absent one.
+#[tokio::test]
+async fn read_pools_records_each_answer() {
+    use alloy::sol_types::SolValue;
 
-/// Each reason a stale re-anchor read is skipped has its own counter.
-#[test]
-fn count_reanchor_skip_counts_each_reason_apart() {
-    let read = seed(B256::repeat_byte(0x64), 1_000, 0);
-    let metrics = Metrics::new();
-    for (reason, count) in [
-        (ReanchorStale::BelowFolded { folded_through: 9 }, 1),
-        (ReanchorStale::LowerRedeemed { held: 5 }, 2),
-        (ReanchorStale::LowerDeposit { held: 2_000 }, 3),
+    let owner = Address::from([7u8; 20]);
+    let (open, closed, absent) = (
+        B256::repeat_byte(0x46),
+        B256::repeat_byte(0x49),
+        B256::repeat_byte(0x4b),
+    );
+    let projection = PoolProjection::new();
+    projection.record_read(absent, seed(1_000, 0));
+    for (pool_id, answer) in [
+        (
+            open,
+            PaymentPool::Pool {
+                totalRedeemed: 700,
+                ..pool(owner, PaymentPool::Status::Open, 0)
+            },
+        ),
+        (closed, pool(owner, PaymentPool::Status::Closed, 0)),
+        (absent, pool(Address::ZERO, PaymentPool::Status::Open, 0)),
     ] {
-        for _ in 0..count {
-            count_reanchor_skip(&ReanchorSkip { read, reason }, 8, &metrics);
-        }
+        let (contract, asserter) = mocked_contract();
+        asserter.push_success(&Bytes::from(answer.abi_encode()));
+        assert!(!read_pools(&contract, &[pool_id], &projection).await);
     }
     assert_eq!(
-        reanchor_metric(&metrics, "skipped_below_folded_total"),
-        Some(1)
+        projection.snapshot(open).map(|s| s.remaining),
+        Some(U256::from(300u64))
     );
-    assert_eq!(
-        reanchor_metric(&metrics, "skipped_lower_redeemed_total"),
-        Some(2)
-    );
-    assert_eq!(
-        reanchor_metric(&metrics, "skipped_lower_deposit_total"),
-        Some(3)
-    );
+    assert!(projection.snapshot(closed).is_none());
+    assert!(projection.snapshot(absent).is_none());
+    assert_eq!(projection.take_closed(), vec![closed]);
 }
 
-/// A read whose `totalRedeemed` is below the seed's (a reorg that lowered it,
-/// or a backend behind the admit read) is skipped and counted, and the pool
-/// stays pending and in the gauge.
+/// A faulted read reports the fault and keeps the held read.
 #[tokio::test]
-async fn reanchor_pools_counts_a_stale_read_and_keeps_the_pool_pending() {
-    use alloy::sol_types::SolValue;
-
-    let owner = Address::from([7u8; 20]);
-    let pool_id = B256::repeat_byte(0x65);
-    let projection = PoolProjection::new();
-    projection.record_resolved(owner, seed(pool_id, 1_000, 500));
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-    asserter.push_success(&Bytes::from(
-        PaymentPool::Pool {
-            totalRedeemed: 300,
-            ..pool(owner, PaymentPool::Status::Open, 0)
-        }
-        .abi_encode(),
-    ));
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
-
-    assert_eq!(projection.pending_rereads(), vec![pool_id]);
-    assert_eq!(
-        reanchor_metric(&metrics, "skipped_lower_redeemed_total"),
-        Some(1)
-    );
-    assert_eq!(reanchor_metric(&metrics, "anchored_total"), Some(0));
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
-}
-
-/// The end-of-tick re-anchor reads the block number, then `getPool` at it, and
-/// anchors the seed there.
-#[tokio::test]
-async fn reanchor_pools_anchors_an_admit_seed() -> Result<()> {
-    use alloy::sol_types::SolValue;
-
-    let owner = Address::from([7u8; 20]);
-    let pool_id = B256::repeat_byte(0x46);
-    let projection = PoolProjection::new();
-    projection.record_resolved(owner, seed(pool_id, 1_000, 0));
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-    asserter.push_success(&Bytes::from(
-        PaymentPool::Pool {
-            totalRedeemed: 700,
-            ..pool(owner, PaymentPool::Status::Open, 0)
-        }
-        .abi_encode(),
-    ));
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
-
-    assert_eq!(reanchor_metric(&metrics, "anchored_total"), Some(1));
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(0));
-
-    assert!(projection.pending_rereads().is_empty());
-    let status = projection
-        .snapshot(pool_id)
-        .ok_or_else(|| anyhow::anyhow!("the pool stays known"))?;
-    assert_eq!(status.remaining, U256::from(300u64));
-    assert!(asserter.read_q().is_empty(), "both reads were consumed");
-    Ok(())
-}
-
-/// A faulted re-anchor read leaves the pool pending for the next tick.
-#[tokio::test]
-async fn reanchor_pools_retries_a_faulted_read() {
+async fn read_pools_keeps_the_held_read_on_a_fault() {
     let pool_id = B256::repeat_byte(0x47);
     let projection = PoolProjection::new();
-    projection.record_resolved(Address::from([7u8; 20]), seed(pool_id, 1_000, 0));
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-    asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
-
-    assert_eq!(
-        reanchor_metric(&metrics, "pool_read_failures_total"),
-        Some(1)
-    );
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
-
-    assert_eq!(projection.pending_rereads(), vec![pool_id]);
-}
-
-/// A failed block-number read reads no pool and leaves it pending.
-#[tokio::test]
-async fn reanchor_pools_retries_a_faulted_block_number() {
-    let pool_id = B256::repeat_byte(0x48);
-    let projection = PoolProjection::new();
-    projection.record_resolved(Address::from([7u8; 20]), seed(pool_id, 1_000, 0));
+    projection.record_read(pool_id, seed(1_000, 0));
     let (contract, asserter) = mocked_contract();
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
-
-    assert_eq!(
-        reanchor_metric(&metrics, "block_read_failures_total"),
-        Some(1)
-    );
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
-
-    assert_eq!(projection.pending_rereads(), vec![pool_id]);
-}
-
-/// A pool the re-anchor read finds `Closed` leaves the projection.
-#[tokio::test]
-async fn reanchor_pools_forgets_a_closed_pool() {
-    use alloy::sol_types::SolValue;
-
-    let owner = Address::from([7u8; 20]);
-    let pool_id = B256::repeat_byte(0x49);
-    let projection = PoolProjection::new();
-    projection.record_resolved(owner, seed(pool_id, 1_000, 0));
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-    asserter.push_success(&Bytes::from(
-        pool(owner, PaymentPool::Status::Closed, 0).abi_encode(),
-    ));
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
-
-    assert_eq!(reanchor_metric(&metrics, "anchored_total"), Some(0));
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(0));
-
-    assert!(projection.snapshot(pool_id).is_none());
-}
-
-/// A pool absent at the pinned block (a backend behind the admit read) stays
-/// pending rather than being forgotten.
-#[tokio::test]
-async fn reanchor_pools_keeps_a_pool_absent_at_the_pinned_block() {
-    use alloy::sol_types::SolValue;
-
-    let pool_id = B256::repeat_byte(0x4b);
-    let projection = PoolProjection::new();
-    projection.record_resolved(Address::from([7u8; 20]), seed(pool_id, 1_000, 0));
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-    asserter.push_success(&Bytes::from(
-        pool(Address::ZERO, PaymentPool::Status::Open, 0).abi_encode(),
-    ));
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
-
-    assert_eq!(reanchor_metric(&metrics, "absent_total"), Some(1));
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
-
+    assert!(read_pools(&contract, &[pool_id], &projection).await);
     assert!(projection.snapshot(pool_id).is_some());
-    assert_eq!(projection.pending_rereads(), vec![pool_id]);
 }
 
-/// The first faulted read stops the batch: later pools wait for the next tick
-/// instead of each paying a timeout against a failing endpoint. The faulted
-/// pool moves the cursor, so one whose read keeps failing cannot hold back the
-/// pools behind it.
+/// The live refresh reads `getPool` and `getAuthorizations` for the live pools
+/// and signers only, and drops the old reads of pools with no live lane.
+#[tokio::test(start_paused = true)]
+async fn refresh_live_reads_only_live_pools_and_drops_idle_reads() {
+    use alloy::sol_types::{SolCall, SolValue};
+
+    let (live, idle) = (B256::repeat_byte(0x70), B256::repeat_byte(0x71));
+    let signer = Address::from([0xa1; 20]);
+    let (view, projection, asserter) = mocked_getpool_view(None);
+    projection.record_read(idle, seed(1_000, 0));
+    tokio::time::advance(POOL_REFRESH_INTERVAL).await;
+    asserter.push_success(&Bytes::from(
+        pool(Address::from([7u8; 20]), PaymentPool::Status::Open, 0).abi_encode(),
+    ));
+    asserter.push_success(&Bytes::from(
+        PaymentPool::getAuthorizationsCall::abi_encode_returns(&vec![PaymentPool::Authorization {
+            cap: 10,
+            expiry: u64::MAX,
+            spent: 4,
+        }]),
+    ));
+    view.refresh_live(&HashMap::from([(live, HashSet::from([signer]))]))
+        .await;
+    assert!(
+        asserter.read_q().is_empty(),
+        "one getPool, one getAuthorizations"
+    );
+    assert!(projection.fresh(live).is_some());
+    assert!(
+        projection.snapshot(idle).is_none(),
+        "an idle old read is dropped"
+    );
+    assert_eq!(
+        crate::pool_view::PoolView::signer_spent_cached(&view, live, signer).await,
+        Some(4)
+    );
+}
+
+/// With no live lane the refresh makes no RPC.
 #[tokio::test]
-async fn reanchor_pools_stops_at_the_first_fault() {
-    let projection = PoolProjection::new();
-    for n in 0x50..0x54u8 {
-        projection.record_resolved(
-            Address::from([7u8; 20]),
-            seed(B256::repeat_byte(n), 1_000, 0),
-        );
-    }
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-    asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-    // A good answer behind the fault: the batch has stopped, so it anchors nothing.
-    asserter.push_success(&Bytes::from({
-        use alloy::sol_types::SolValue;
-        pool(Address::from([7u8; 20]), PaymentPool::Status::Open, 0).abi_encode()
-    }));
-    let mut cursor = None;
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut cursor, 0, &metrics).await;
-
-    assert_eq!(
-        reanchor_metric(&metrics, "pool_read_failures_total"),
-        Some(1)
-    );
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(4));
-
-    assert_eq!(projection.pending_rereads().len(), 4);
-    assert_eq!(
-        cursor,
-        Some(B256::repeat_byte(0x50)),
-        "the faulted pool moves the cursor, so the next tick starts after it"
-    );
+async fn refresh_live_with_nothing_live_reads_nothing() {
+    let (view, _projection, _asserter) = mocked_getpool_view(None);
+    // Nothing queued: a read would fail the test loudly.
+    view.refresh_live(&HashMap::new()).await;
 }
 
-/// Each tick's batch starts after the last pool read, so pools past the cap
-/// take their turn instead of waiting behind the same first pools forever.
-#[test]
-fn reanchor_batch_rotates_after_the_cursor() {
-    let pending: Vec<B256> = (0..(REANCHOR_POOLS_PER_TICK + 2))
-        .map(|n| B256::left_padding_from(&n.to_be_bytes()))
-        .collect();
-    let first = reanchor_batch(&pending, None);
-    assert_eq!(first.len(), REANCHOR_POOLS_PER_TICK);
-    assert_eq!(first.first(), pending.first());
-    let second = reanchor_batch(&pending, first.last().copied());
-    assert_eq!(second.first(), pending.get(REANCHOR_POOLS_PER_TICK));
-    assert_eq!(second.get(2), pending.first(), "the batch wraps around");
-    // A cursor past every pending id starts again at the front.
-    assert_eq!(
-        reanchor_batch(&pending, Some(B256::repeat_byte(0xff))).first(),
-        pending.first()
-    );
-}
-
-/// A fault after a good read keeps the good read: the first pool anchors, the
-/// faulted one stays pending, and the cursor lands on it.
-#[tokio::test]
-async fn reanchor_pools_keeps_reads_before_a_fault() {
+/// Admission answers from a held read only while it is younger than the
+/// refresh interval; an older one is read again.
+#[tokio::test(start_paused = true)]
+async fn admission_rereads_a_read_older_than_the_refresh_interval() -> Result<()> {
+    use crate::pool_view::PoolView;
     use alloy::sol_types::SolValue;
 
     let owner = Address::from([7u8; 20]);
-    let (first, second) = (B256::repeat_byte(0x60), B256::repeat_byte(0x61));
-    let projection = PoolProjection::new();
-    projection.record_resolved(owner, seed(first, 1_000, 0));
-    projection.record_resolved(owner, seed(second, 1_000, 0));
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
+    let (view, _projection, asserter) =
+        mocked_getpool_view(Some(pool(owner, PaymentPool::Status::Open, 0)));
+    let pool_id = B256::repeat_byte(0x72);
+    view.status(pool_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("first read admits"))?;
+    view.status(pool_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("a fresh read answers"))?;
+    tokio::time::advance(POOL_REFRESH_INTERVAL).await;
     asserter.push_success(&Bytes::from(
         PaymentPool::Pool {
-            totalRedeemed: 100,
+            totalRedeemed: 1_000,
             ..pool(owner, PaymentPool::Status::Open, 0)
         }
         .abi_encode(),
     ));
-    asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-    let mut cursor = None;
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut cursor, 0, &metrics).await;
-
-    assert_eq!(reanchor_metric(&metrics, "anchored_total"), Some(1));
-    assert_eq!(
-        reanchor_metric(&metrics, "pool_read_failures_total"),
-        Some(1)
-    );
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
-
-    assert_eq!(projection.pending_rereads(), vec![second]);
-    assert_eq!(
-        projection.snapshot(first).map(|s| s.remaining),
-        Some(U256::from(900u64))
-    );
-    assert_eq!(cursor, Some(second));
-}
-
-/// A `Closing` read carries its dispute deadline into the projection.
-#[tokio::test]
-async fn reanchor_pools_reads_a_closing_pool() {
-    use alloy::sol_types::SolValue;
-
-    let owner = Address::from([7u8; 20]);
-    let pool_id = B256::repeat_byte(0x62);
-    let projection = PoolProjection::new();
-    projection.record_resolved(owner, seed(pool_id, 1_000, 0));
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-    asserter.push_success(&Bytes::from(
-        pool(owner, PaymentPool::Status::Closing, 1_900_000_000).abi_encode(),
-    ));
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
-
-    assert_eq!(
-        projection.snapshot(pool_id).map(|s| s.lifecycle),
-        Some(Lifecycle::Closing {
-            deadline: 1_900_000_000
-        })
-    );
-}
-
-/// A block number below the highest log the sink applied comes from a backend
-/// behind the watcher: the tick reads no pool, and every pool stays pending.
-#[tokio::test]
-async fn reanchor_pools_skips_a_block_behind_the_watcher() {
-    use alloy::sol_types::SolValue;
-
-    let owner = Address::from([7u8; 20]);
-    let pool_id = B256::repeat_byte(0x63);
-    let projection = PoolProjection::new();
-    projection.record_resolved(owner, seed(pool_id, 1_000, 0));
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-    asserter.push_success(&Bytes::from(
-        pool(owner, PaymentPool::Status::Open, 0).abi_encode(),
-    ));
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 50, &metrics).await;
-
-    assert_eq!(reanchor_metric(&metrics, "behind_watcher_total"), Some(1));
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
-
-    assert_eq!(projection.pending_rereads(), vec![pool_id]);
-    assert_eq!(asserter.read_q().len(), 1, "no getPool was sent");
-}
-
-/// With nothing to re-anchor the tick costs no RPC.
-#[tokio::test]
-async fn reanchor_pools_without_seeds_reads_nothing() {
-    let projection = PoolProjection::new();
-    projection.record_opened(
-        B256::repeat_byte(0x4a),
-        Address::from([7u8; 20]),
-        U256::from(1u64),
-    );
-    let (contract, asserter) = mocked_contract();
-    asserter.push_success(&alloy::primitives::U64::from(42u64));
-
-    let metrics = Metrics::new();
-    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
-
-    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(0));
-
-    assert_eq!(asserter.read_q().len(), 1, "no read was sent");
+    let status = view
+        .status(pool_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("re-read admits"))?;
+    assert_eq!(status.remaining, U256::ZERO, "the re-read sees the drain");
+    assert!(asserter.read_q().is_empty());
+    Ok(())
 }
 
 /// Admit path (ii, verdict): an absent (`owner == 0`) or `Closed` pool the
@@ -1053,26 +813,32 @@ async fn getauthorization_fault_refuses_signer() -> Result<()> {
     Ok(())
 }
 
-/// A `Registered` read answers however old it is: the second call finds an
-/// empty response queue, so a chain read would fault and refuse.
+/// A `Registered` read answers for one refresh interval; past it, admission
+/// reads the signer again and sees the spend since.
 #[tokio::test]
-async fn a_registered_read_never_ages_out() -> Result<()> {
+async fn a_registered_read_ages_out_after_the_refresh_interval() -> Result<()> {
     use crate::pool_view::PoolView;
 
     let pool_id = B256::repeat_byte(0x45);
     let signer = Address::from([6u8; 20]);
-    let (view, _asserter) = mocked_getauth_view(&[authz(1_000_000, 200_000)]);
+    let (view, _asserter) =
+        mocked_getauth_view(&[authz(1_000_000, 200_000), authz(1_000_000, 900_000)]);
     assert_eq!(
         view.signer_authorization(pool_id, signer).await,
         Some(registered(1_000_000, 200_000))
     );
-    age_auth_read(&view, pool_id, signer)?;
     assert_eq!(
         view.signer_authorization(pool_id, signer).await,
         Some(registered(1_000_000, 200_000)),
-        "the old registered read answers with no chain read"
+        "a fresh read answers with no chain read"
     );
-    assert_eq!(signer_auth_counts(&view.metrics), (1, 1, 0));
+    age_auth_read(&view, pool_id, signer)?;
+    assert_eq!(
+        view.signer_authorization(pool_id, signer).await,
+        Some(registered(1_000_000, 900_000)),
+        "an old read is read again"
+    );
+    assert_eq!(signer_auth_counts(&view.metrics), (1, 1, 1));
     Ok(())
 }
 
@@ -1093,7 +859,7 @@ fn signer_auth_counts(metrics: &Metrics) -> (u64, u64, u64) {
 }
 
 /// Backdate the held read of `(pool_id, signer)` past
-/// [`UNREGISTERED_AUTH_TTL`].
+/// [`POOL_REFRESH_INTERVAL`].
 fn age_auth_read(
     view: &ResolvingPoolView<impl Provider + Clone>,
     pool_id: B256,
@@ -1107,7 +873,7 @@ fn age_auth_read(
         .get_mut(&(pool_id, signer))
         .ok_or_else(|| anyhow::anyhow!("the first read is cached"))?;
     entry.at = Instant::now()
-        .checked_sub(UNREGISTERED_AUTH_TTL * 2)
+        .checked_sub(POOL_REFRESH_INTERVAL * 2)
         .ok_or_else(|| anyhow::anyhow!("clock too close to its epoch"))?;
     Ok(())
 }
@@ -1544,9 +1310,6 @@ async fn a_registered_read_answers_without_reaching_a_hung_rpc() -> Result<()> {
     let (view, calls) = counting_hanging_view();
     let pool_id = B256::repeat_byte(0x52);
     let signer = Address::from([7u8; 20]);
-    let aged = Instant::now()
-        .checked_sub(UNREGISTERED_AUTH_TTL * 2)
-        .ok_or_else(|| anyhow::anyhow!("clock too close to its epoch"))?;
     view.auth_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1554,8 +1317,7 @@ async fn a_registered_read_answers_without_reaching_a_hung_rpc() -> Result<()> {
             (pool_id, signer),
             AuthRead {
                 auth: registered(1_000_000, 200_000),
-                folded_at_read: 0,
-                at: aged,
+                at: Instant::now(),
             },
         );
     let started = tokio::time::Instant::now();
@@ -1653,76 +1415,28 @@ async fn admit_getauthorization_hang_with_no_cached_read_refuses() -> Result<()>
     Ok(())
 }
 
-/// A held `Registered` read adds what the projection folds for the signer
-/// after the read, from any provider, so a signer that drains its shared cap
-/// at other nodes is not admitted on the old headroom.
+/// The mid-stream read answers from the held read, whatever its age: the
+/// admit-path `getAuthorization` carries the spend before admission, and no
+/// read held reads as nothing spent.
 #[tokio::test]
-async fn a_registered_read_adds_the_spent_folded_since() {
-    use crate::pool_view::PoolView;
-
-    let pool_id = B256::repeat_byte(0x47);
-    let signer = Address::from([8u8; 20]);
-    let (view, _asserter) = mocked_getauth_view(&[authz(1_000_000, 200_000)]);
-    let lane = |paid: u64| PaymentPool::LaneSettled {
-        signer,
-        newPaidCumulative: paid,
-        bytesPaid: 0,
-    };
-    view.projection
-        .record_opened(pool_id, Address::from([1u8; 20]), U256::from(5_000_000u64));
-    // Folded before the read: the read's `spent` already holds it.
-    view.projection
-        .record_redeemed(pool_id, Address::from([9u8; 20]), &[lane(200_000)], None);
-    assert_eq!(
-        view.signer_authorization(pool_id, signer).await,
-        Some(registered(1_000_000, 200_000))
-    );
-    view.projection
-        .record_redeemed(pool_id, Address::from([10u8; 20]), &[lane(650_000)], None);
-    assert_eq!(
-        view.signer_authorization(pool_id, signer).await,
-        Some(registered(1_000_000, 850_000)),
-        "a drain folded since the read adds to spent"
-    );
-}
-
-/// #2711: on a pool seeded from one `getPool`, the projection counts only what
-/// the signer redeems after the seed. The mid-stream read adds the spend the
-/// admit-path `getAuthorization` saw, so a signer that spent most of its cap
-/// before a restart shows its whole spend once other nodes drain the rest.
-#[tokio::test]
-async fn the_midstream_read_counts_a_resolved_pools_pre_seed_spend() {
+async fn the_midstream_read_answers_from_the_held_read() -> Result<()> {
     use crate::pool_view::PoolView;
 
     let pool_id = B256::repeat_byte(0x48);
     let signer = Address::from([6u8; 20]);
     let (view, _asserter) = mocked_getauth_view(&[authz(1_000, 900)]);
-    view.projection
-        .record_resolved(Address::from([1u8; 20]), seed(pool_id, 5_000, 900));
-    assert_eq!(
-        view.signer_spent_cached(pool_id, signer).await,
-        Some(0),
-        "with no read held, the seeded projection alone answers"
-    );
+    assert_eq!(view.signer_spent_cached(pool_id, signer).await, Some(0));
     assert_eq!(
         view.signer_authorization(pool_id, signer).await,
         Some(registered(1_000, 900))
     );
-    view.projection.record_redeemed(
-        pool_id,
-        Address::from([9u8; 20]),
-        &[PaymentPool::LaneSettled {
-            signer,
-            newPaidCumulative: 100,
-            bytesPaid: 0,
-        }],
-        None,
-    );
+    age_auth_read(&view, pool_id, signer)?;
     assert_eq!(
         view.signer_spent_cached(pool_id, signer).await,
-        Some(1_000),
-        "the pre-seed spend plus the drain since the read"
+        Some(900),
+        "an old held read still answers the non-blocking re-check"
     );
+    Ok(())
 }
 
 /// A fault after a cached `Unregistered` read has aged past the TTL refuses
@@ -1748,82 +1462,26 @@ async fn an_expired_unregistered_read_does_not_answer_a_fault() -> Result<()> {
     Ok(())
 }
 
-/// An `Unregistered` read lapses inside its window once the projection folds
-/// a redemption by the signer: that redemption registered it.
-#[tokio::test]
-async fn a_folded_redemption_lapses_an_unregistered_read() {
-    use crate::pool_view::PoolView;
-
-    let pool_id = B256::repeat_byte(0x48);
-    let signer = Address::from([11u8; 20]);
-    let (view, asserter) = mocked_getauth_view(&[authz(0, 0), authz(1_000_000, 50_000)]);
-    assert_eq!(
-        view.signer_authorization(pool_id, signer).await,
-        Some(SignerAuthorization::Unregistered)
-    );
-    view.projection
-        .record_opened(pool_id, Address::from([1u8; 20]), U256::from(5_000_000u64));
-    view.projection.record_redeemed(
-        pool_id,
-        Address::from([9u8; 20]),
-        &[PaymentPool::LaneSettled {
-            signer,
-            newPaidCumulative: 50_000,
-            bytesPaid: 0,
-        }],
-        None,
-    );
-    assert_eq!(
-        view.signer_authorization(pool_id, signer).await,
-        Some(registered(1_000_000, 50_000)),
-        "the fold sends a re-read, which finds the registration"
-    );
-    assert_eq!(asserter.read_q().len(), 0, "both reads were sent");
-    assert_eq!(
-        view.signer_authorization(pool_id, signer).await,
-        Some(registered(1_000_000, 50_000)),
-    );
-    assert_eq!(signer_auth_counts(&view.metrics), (1, 1, 1));
-}
-
-fn auth_read(auth: SignerAuthorization, folded_at_read: u64, age: Duration) -> AuthRead {
+fn auth_read(auth: SignerAuthorization, age: Duration) -> AuthRead {
     AuthRead {
         auth,
-        folded_at_read,
         at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
     }
 }
 
 #[test]
-fn cached_auth_classifies_each_read() {
-    let fresh_unreg = auth_read(SignerAuthorization::Unregistered, 10, Duration::ZERO);
-    assert_eq!(cached_auth(None, 0), CachedAuth::Absent);
-    assert_eq!(
-        cached_auth(Some(&fresh_unreg), 10),
-        CachedAuth::Fresh(SignerAuthorization::Unregistered)
-    );
-    assert_eq!(
-        cached_auth(Some(&fresh_unreg), 11),
-        CachedAuth::Lapsed,
-        "a fold since the read lapses an Unregistered read"
-    );
-    let old_unreg = auth_read(
-        SignerAuthorization::Unregistered,
-        10,
-        UNREGISTERED_AUTH_TTL * 2,
-    );
-    assert_eq!(cached_auth(Some(&old_unreg), 10), CachedAuth::Lapsed);
-    let old_reg = auth_read(registered(1_000, 100), 40, UNREGISTERED_AUTH_TTL * 2);
-    assert_eq!(
-        cached_auth(Some(&old_reg), 65),
-        CachedAuth::Fresh(registered(1_000, 125)),
-        "a registered read adds the fold since the read"
-    );
-    assert_eq!(
-        cached_auth(Some(&old_reg), 0),
-        CachedAuth::Fresh(registered(1_000, 100)),
-        "a fold below the baseline adds nothing"
-    );
+fn cached_auth_classifies_each_read_by_age() {
+    assert_eq!(cached_auth(None), CachedAuth::Absent);
+    for auth in [SignerAuthorization::Unregistered, registered(1_000, 100)] {
+        assert_eq!(
+            cached_auth(Some(&auth_read(auth, Duration::ZERO))),
+            CachedAuth::Fresh(auth)
+        );
+        assert_eq!(
+            cached_auth(Some(&auth_read(auth, POOL_REFRESH_INTERVAL * 2))),
+            CachedAuth::Lapsed
+        );
+    }
 }
 
 #[test]
@@ -1834,18 +1492,14 @@ fn remember_auth_prunes_lapsed_then_evicts_the_oldest() {
         (B256::ZERO, Address::from(bytes))
     };
     let mut cache = HashMap::new();
-    let oldest = auth_read(registered(1, 0), 0, Duration::from_secs(10));
+    let oldest = auth_read(registered(1, 0), Duration::from_secs(10));
     cache.insert(key(0), oldest);
     for i in 1..AUTH_CACHE_MAX {
-        cache.insert(key(i), auth_read(registered(1, 0), 0, Duration::ZERO));
+        cache.insert(key(i), auth_read(registered(1, 0), Duration::ZERO));
     }
-    let lapsed = auth_read(
-        SignerAuthorization::Unregistered,
-        0,
-        UNREGISTERED_AUTH_TTL * 2,
-    );
+    let lapsed = auth_read(SignerAuthorization::Unregistered, POOL_REFRESH_INTERVAL * 2);
     cache.insert(key(1), lapsed);
-    let fresh = auth_read(registered(1, 0), 0, Duration::ZERO);
+    let fresh = auth_read(registered(1, 0), Duration::ZERO);
 
     remember_auth(&mut cache, key(AUTH_CACHE_MAX), fresh);
     assert_eq!(cache.len(), AUTH_CACHE_MAX, "the lapsed read made room");
@@ -1986,10 +1640,13 @@ fn partition_keeps_redeemable_and_counts_skips() {
 fn open_pools() -> PoolProjection {
     let projection = PoolProjection::new();
     for pool in 1..=4u8 {
-        projection.record_opened(
+        projection.record_read(
             PoolId::from([pool; 32]),
-            Address::from([1u8; 20]),
-            U256::MAX,
+            PoolStatus {
+                owner: Address::from([1u8; 20]),
+                remaining: U256::MAX,
+                lifecycle: Lifecycle::Open,
+            },
         );
     }
     projection
@@ -2762,9 +2419,9 @@ fn shutdown_service<P: Provider + Clone + 'static>(
         metrics,
         pool_view: open_pools(),
         recorder: test_recorder(),
-        backfills: LedgerBackfills::new(test_recorder()),
         schedule: RedeemSchedule::default(),
         redeemer: std::sync::Mutex::new(None),
+        refresher: tokio::spawn(async {}),
     }
 }
 
@@ -3544,13 +3201,10 @@ async fn a_clean_sweep_releases_a_parked_lane() -> Result<()> {
     let (hinted, total) = record_lanes(store.as_ref(), 1..=1, u64::MAX)?;
     let settled = u64::try_from(total)?;
     // A read and a failed send for the first hint, then a read that shows
-    // the lane settled for the sweep and for the hint after it.
-    let (contract, asserter) = mocked_redeem_pool(&[
-        Some(vec![lane(0)]),
-        None,
-        Some(vec![lane(settled)]),
-        Some(vec![lane(settled)]),
-    ]);
+    // the lane settled for the sweep. The sweep records that watermark, so
+    // the hint after it plans nothing and reads nothing.
+    let (contract, asserter) =
+        mocked_redeem_pool(&[Some(vec![lane(0)]), None, Some(vec![lane(settled)])]);
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
@@ -3568,22 +3222,22 @@ async fn a_clean_sweep_releases_a_parked_lane() -> Result<()> {
     await_metric_line(&metrics, "decdn_redemption_reconcile_ok_total 2").await?;
     ensure_metric_lines(&metrics, &["decdn_redemption_reconciled_skip_total 1"])?;
 
-    // The clean sweep cleared the parked set, so this hint reads again.
+    // The clean sweep cleared the parked set, so this hint is not parked
+    // again. The recorded watermark covers the lane, so it reads nothing.
     tx.send(hinted).await?;
-    await_metric_line(&metrics, "decdn_redemption_reconcile_ok_total 3").await?;
+    drop(tx);
+    handle.await?;
     ensure_metric_lines(
         &metrics,
         &[
-            "decdn_redemption_reconciled_skip_total 2",
+            "decdn_redemption_reconcile_ok_total 2",
+            "decdn_redemption_reconciled_skip_total 1",
             "decdn_redemption_reconcile_failures_total 0",
             "decdn_onchain_tx_send_failed_total 1",
             "decdn_redeem_hints_parked_total 1",
         ],
     )?;
     assert_eq!(asserter.read_q().len(), 0, "every queued answer was read");
-
-    drop(tx);
-    handle.await?;
     Ok(())
 }
 
@@ -3826,7 +3480,7 @@ async fn a_faulted_pool_read_leaves_known_pools_to_redeem() -> Result<()> {
         decdn_incentive::MemoryPoolStateStore::new(),
     ));
     let projection = PoolProjection::new();
-    projection.record_opened(PoolId::from([1u8; 32]), Address::from([1u8; 20]), U256::MAX);
+    projection.record_read(PoolId::from([1u8; 32]), seed(u64::MAX, 0));
     let (contract, asserter) = mocked_contract();
     asserter.push_failure_msg("getPool refused");
     asserter.push_success(&Bytes::from(
@@ -4665,52 +4319,6 @@ fn compaction_rejects_high_s_whose_top_bit_is_clear() {
     );
 }
 
-/// The debounce decorator forwards through to the inner store on the first
-/// record, coalesces sub-threshold advances, and forces a buffered block out
-/// on flush. Driven by an in-test [`KeyedCheckpointStore`] double, since the
-/// incentive crate ships no memory checkpoint store.
-#[test]
-fn debounced_checkpoint_coalesces_then_flushes() {
-    #[derive(Default)]
-    struct MemCk(std::sync::Mutex<HashMap<CheckpointKey, u64>>);
-    impl KeyedCheckpointStore for MemCk {
-        fn load_checkpoint(&self, key: CheckpointKey) -> Result<Option<u64>, StoreError> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&key)
-                .copied())
-        }
-        fn record_checkpoint(&self, key: CheckpointKey, block: u64) -> Result<(), StoreError> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, block);
-            Ok(())
-        }
-    }
-    let inner: Arc<dyn KeyedCheckpointStore> = Arc::new(MemCk::default());
-    let deb = DebouncedCheckpointStore::with_params(
-        Arc::clone(&inner),
-        10,
-        Duration::from_hours(1),
-        Box::new(Instant::now),
-    );
-    let key = CheckpointKey::PoolOpened;
-    let load = |s: &Arc<dyn KeyedCheckpointStore>| s.load_checkpoint(key).ok().flatten();
-    // First advancing record forwards durably (re-anchor the floor promptly).
-    let _ = deb.record_checkpoint(key, 5);
-    assert_eq!(load(&inner), Some(5));
-    // A sub-`flush_blocks` advance buffers only; the durable floor holds.
-    let _ = deb.record_checkpoint(key, 8);
-    assert_eq!(load(&inner), Some(5));
-    assert_eq!(deb.load_checkpoint(key).ok().flatten(), Some(8));
-    // A flush forces the buffered block out durably (the shutdown path).
-    let _ = deb.flush_checkpoint(key);
-    assert_eq!(load(&inner), Some(8));
-}
-
 #[test]
 fn is_oversize_send_err_matches_known_markers() {
     for m in [
@@ -4759,62 +4367,6 @@ fn is_oversize_send_reads_the_status_and_the_text() {
 fn is_oversize_send_err_ignores_unrelated_errors() {
     for m in ["nonce too low", "connection refused", "execution reverted"] {
         assert!(!is_oversize_send_err(m), "should not flag: {m}");
-    }
-}
-
-/// The settlement route watches exactly the five `PaymentPool` lifecycle
-/// events the paid-watermark cache and pool projection need — no more, no
-/// fewer. `PoolOpened` in particular must never be dropped: it is the
-/// projection's only signal that a pool exists. `PoolCloseInitiated` folds a
-/// pool's `Closing` deadline into the projection so the redeemer's solvency
-/// gate drops a drained or past-deadline lane instead of submitting a
-/// `redeemMany` that reverts `PoolClosed`; the node still runs no force-redeem
-/// on close.
-#[test]
-fn route_topic0s_covers_every_pool_lifecycle_event() {
-    assert_eq!(
-        settlement_route_topic0s(),
-        vec![
-            PaymentPool::PoolOpened::SIGNATURE_HASH,
-            PaymentPool::PoolRedeemed::SIGNATURE_HASH,
-            PaymentPool::PoolToppedUp::SIGNATURE_HASH,
-            PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
-            PaymentPool::PoolReclaimed::SIGNATURE_HASH,
-        ]
-    );
-}
-
-/// The settlement route resumes from the durable `PoolOpened` checkpoint,
-/// rewound by the reorg margin, and anchors a cold (first-ever) boot at
-/// head rather than replaying all of history.
-#[test]
-fn cursor_start_resumes_from_pool_opened_checkpoint() {
-    #[derive(Default)]
-    struct NoopCk;
-    impl KeyedCheckpointStore for NoopCk {
-        fn load_checkpoint(&self, _key: CheckpointKey) -> Result<Option<u64>, StoreError> {
-            Ok(None)
-        }
-        fn record_checkpoint(&self, _key: CheckpointKey, _block: u64) -> Result<(), StoreError> {
-            Ok(())
-        }
-    }
-    let store: Arc<dyn KeyedCheckpointStore> = Arc::new(NoopCk);
-    let start = cursor_start(store);
-    match start {
-        CursorStart::FromCheckpoint {
-            checkpoint,
-            reorg_margin,
-            cold_start,
-        } => {
-            assert_eq!(checkpoint.key, CheckpointKey::PoolOpened);
-            assert_eq!(reorg_margin, REORG_MARGIN_BLOCKS);
-            assert_eq!(cold_start, ColdStart::Head);
-        }
-        CursorStart::Seeded { .. } => unreachable!("expected FromCheckpoint, got Seeded"),
-        CursorStart::HeadMinusWindow { .. } => {
-            unreachable!("expected FromCheckpoint, got HeadMinusWindow")
-        }
     }
 }
 
@@ -4953,26 +4505,6 @@ fn signed_lane_state(pool: u8, signer: u8, provider: u8, owner_sig: Option<[u8; 
     );
     st.owner_sig = owner_sig;
     st
-}
-
-/// A grace close counts only for this provider's lane on the closing pool
-/// that the chain has not fully paid.
-#[test]
-fn holds_unredeemed_matches_only_an_unpaid_lane_of_this_pool_and_provider() {
-    let pool = PoolId::from([1; 32]);
-    let me = Address::from([20; 20]);
-    let owed = signed_lane_state(1, 10, 20, None);
-    assert!(holds_unredeemed(std::slice::from_ref(&owed), pool, me));
-
-    let mut paid = owed.clone();
-    paid.paid_cumulative = paid.owed();
-    assert!(!holds_unredeemed(&[paid], pool, me));
-
-    let other_provider = signed_lane_state(1, 10, 21, None);
-    assert!(!holds_unredeemed(&[other_provider], pool, me));
-
-    let other_pool = signed_lane_state(2, 10, 20, None);
-    assert!(!holds_unredeemed(&[other_pool], pool, me));
 }
 
 #[test]
@@ -5338,6 +4870,7 @@ mod redeem_schedule {
 }
 
 mod settlement_ledger_rows {
+    use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
     use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
     use decdn_incentive::{MemorySettlementLedger, SettlementLedger};

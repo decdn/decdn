@@ -27,8 +27,8 @@ fn pool_redeemed_signature_matches_contract() {
 /// carrying `signer` per entry rather than as a topic. The
 /// signature-string pin above is blind to this split, so a future edit
 /// that moved `indexed` onto the wrong param would pass that test while
-/// silently breaking a node's `provider`-topic filter for its settlement
-/// watcher. This test builds the event with distinct sentinel values and
+/// silently breaking the `provider`-topic filter of `decdn node earnings
+/// --address` and the node's receipt decode. This test builds the event with distinct sentinel values and
 /// checks each one landed where the ABI encoding puts it.
 #[test]
 fn pool_redeemed_indexed_layout_matches_contract() {
@@ -72,7 +72,7 @@ fn pool_redeemed_indexed_layout_matches_contract() {
     assert_eq!(log.data.len(), 32 * (2 + 3 * 2));
 
     // Round-trip through the decoder recovers the same lanes, proving the
-    // topic/data split above is exactly what a real watcher decodes.
+    // topic/data split above is exactly what a receipt decoder reads.
     let decoded = PaymentPool::PoolRedeemed::decode_log_data(&log).unwrap();
     assert_eq!(decoded.poolId, pool_id);
     assert_eq!(decoded.provider, provider);
@@ -295,8 +295,8 @@ fn redeem_call_struct_layouts_match_contract() {
     );
 }
 
-/// Same pin for the other four ABI-tuple-carrying events consumed by
-/// the node's watchers.
+/// Same pin for the other four ABI-tuple-carrying events that receipt
+/// decoders and indexers consume.
 #[test]
 fn lifecycle_event_signatures_match_contract() {
     assert_eq!(

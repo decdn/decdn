@@ -37,7 +37,7 @@ use decdn_incentive::{
     bind_node_id_domain, binding_signing_hash, node_register, register_node_signing_hash,
     slash_judge_domain,
 };
-use decdn_node::chain_events::shared_head::SNAPSHOT_LAG_MARGIN_BLOCKS;
+use decdn_node::chain_events::snapshot::SNAPSHOT_LAG_MARGIN_BLOCKS;
 
 use crate::bindings::{
     AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, DecdnGovernor, Erc20,
@@ -269,7 +269,16 @@ struct AnvilProcess {
 /// `None` for a per-journey anvil that loads a snapshot and writes none.
 async fn spawn_anvil(manifest: Option<PathBuf>) -> anyhow::Result<AnvilProcess> {
     let admin_signer: PrivateKeySigner = ADMIN_KEY.parse().context("parse admin key")?;
-    let (child, port) = spawn_anvil_child(&["--chain-id", &E2E_CHAIN_ID.to_string()]).await?;
+    // Zero slots per epoch makes anvil's `safe` block the head, so a node's
+    // `ContentBlacklist` ledger read (pinned to `safe`) sees a mutation as soon
+    // as it mines.
+    let (child, port) = spawn_anvil_child(&[
+        "--chain-id",
+        &E2E_CHAIN_ID.to_string(),
+        "--slots-in-an-epoch",
+        "0",
+    ])
+    .await?;
     let mut guard = AnvilGuard { child, manifest };
     let rpc_url = format!("http://127.0.0.1:{port}");
 

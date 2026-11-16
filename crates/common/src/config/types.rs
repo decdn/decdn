@@ -222,16 +222,14 @@ pub struct BlockchainConfig {
     /// startup completes the initial global + operator-scope replay before any
     /// ALPN accepts connections (ADR 011/019/031).
     pub content_blacklist_address: Option<String>,
-    /// Seconds between the blacklist watcher's periodic replay + re-scope pass
-    /// (ADR 011 §Polling cadence). This backstop is what catches scope changes
-    /// with no `ContentBlacklist` event — an operator region/ripening
-    /// transition. Absent =>
-    /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (600s). Only
+    /// Seconds between two blacklist mutation-ledger polls (ADR 011 § Following
+    /// the mutation ledger), 1 to 300. Absent =>
+    /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (300s). Only
     /// consulted when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: Option<u64>,
     /// Seconds the node may go without a successful chain read before it stops
     /// serving (ADR 011 § Serving while chain-stale). While the blacklist
-    /// watcher cannot reach the RPC, every chain-derived serve guard — the
+    /// sync cannot reach the RPC, every chain-derived serve guard — the
     /// deny-set, pool solvency, per-signer caps — answers from stale state, so a
     /// takedown that lands during the outage would go unenforced and serving it
     /// past the compliance window is slashable. Past this window the serve and
@@ -250,26 +248,20 @@ pub struct BlockchainConfig {
     /// watchdog entirely; absent => default (30s). Non-zero values below
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC` are rejected at config resolution.
     pub rpc_watchdog_interval_sec: Option<u64>,
-    /// Milliseconds between chain-event poll ticks (#1011, #1106). Drives two
-    /// unrelated consumers: the `eth_getLogs` tick cadence of every chain
-    /// watcher, and alloy's pending-transaction receipt heartbeat (see
-    /// `ResolvedBlockchain::event_poll_interval_ms`). The heartbeat is why this
-    /// overrides alloy's own default, which is 250 ms for a localhost RPC (it
-    /// auto-detects `127.0.0.1`/`localhost`) and 7000 ms otherwise — the 250 ms
-    /// local default hammers a dev anvil. Absent => default
-    /// (`DEFAULT_EVENT_POLL_INTERVAL_MS`, 7000 ms, matching alloy's non-local
-    /// cadence so live-RPC load is unchanged). Values below
-    /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
-    pub event_poll_interval_ms: Option<u64>,
-    /// Maximum block span of one chain-watcher `eth_getLogs` request. Set it to
-    /// the RPC provider's actual `eth_getLogs` range limit: the lowest `span`
-    /// the poller reaches while rejections keep coming (the shrink `warn!` and
-    /// the `decdn_chain_get_logs_span` gauge show it). A provider's documented
-    /// or quoted limit can be wrong. The poller also shrinks its window on its own when the provider
-    /// rejects a range, and grows it back toward this ceiling, so this is a
-    /// ceiling, not a hard requirement. Absent =>
-    /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`;
-    /// rejected at config resolution.
+    /// Milliseconds between alloy's pending-transaction receipt polls (#1011;
+    /// see `ResolvedBlockchain::receipt_poll_interval_ms`). This overrides
+    /// alloy's own default, which is 250 ms for a localhost RPC (it auto-detects
+    /// `127.0.0.1`/`localhost`) and 7000 ms otherwise — the 250 ms local
+    /// default hammers a dev anvil. Absent => default
+    /// (`DEFAULT_RECEIPT_POLL_INTERVAL_MS`, 7000 ms). Values below
+    /// `MIN_RECEIPT_POLL_INTERVAL_MS` are rejected at config resolution.
+    pub receipt_poll_interval_ms: Option<u64>,
+    /// Maximum block span of one `eth_getLogs` request of the CLI's chain scans
+    /// (`decdn receipt settle`, `decdn node earnings --address`). Set it to the
+    /// RPC provider's `eth_getLogs` range limit; a scan also halves its window
+    /// when the provider rejects a range. Absent =>
+    /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`.
+    /// The node reads no event log and ignores it.
     pub get_logs_max_block_span: Option<u64>,
     /// Per-chunk redemption floor (base units, `µUSDC`, ADR 003 § Operator
     /// early withdrawal). The node submits an on-chain redemption

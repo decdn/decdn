@@ -977,7 +977,6 @@ impl AdminRpcServer for AdminRpcImpl {
                 offense_type: s.offense_type,
                 amount: s.amount.to_string(),
                 evidence_hash: format!("{:#x}", s.evidence_hash),
-                block_number: s.block_number,
                 appeal_window_close: s.appeal_window_close,
             })
             .collect();
@@ -1109,12 +1108,10 @@ const WEEK_SECS: u64 = 7 * DAY_SECS;
 /// A row falls in a period when its `landed_at_unix` is at or after the
 /// period's start. The figures cover settlements from `ledger_started_at_unix`
 /// on, or from this operator's earliest row when that row is earlier. A row
-/// predates the start when the `PoolRedeemed` watcher, resuming from its
-/// checkpoint, backfills a landing from before this ledger's first open, when
-/// the rows were written before the store kept a start, or by clock skew (the
-/// start is wall-clock time, a row's is block time). The watcher scans every
-/// block from its resume point, so the ledger covers the time from such a row
-/// on. The pending section is [`pending_redeem`].
+/// predates the start when boot recovery decodes a sent `redeemMany` that
+/// landed before this ledger's first open, or by clock skew (the start is
+/// wall-clock time, a row's is block time). The pending section is
+/// [`pending_redeem`].
 pub(crate) fn build_earnings_response(
     rows: &[SettlementRecord],
     lanes: &[LaneState],
@@ -1245,7 +1242,7 @@ fn build_lane_snapshots(
                 last_nonce: 0,
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
                 // What a landed redemption has not paid yet (#2598): the claim
-                // minus the paid watermark the `PoolRedeemed` watcher recorded.
+                // minus the paid watermark the redeemer recorded.
                 unredeemed_micro_usdc: u64::try_from(state.unredeemed()).unwrap_or(u64::MAX),
                 deposit_micro_usdc: 0,
                 seconds_since_last_voucher: ages.get(&state.key()).copied(),

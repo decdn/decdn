@@ -32,12 +32,10 @@ fn provider_factory_preserves_role_polling_policy() {
     let providers = ProviderFactory::new(url, 31_337, Arc::new(metrics::Metrics::new()));
 
     let read = providers.read_only(interval);
-    let head = providers.shared_head();
     let seller = providers.seller_wallet(PrivateKeySigner::random(), interval);
     let buyer = providers.buyer_wallet(PrivateKeySigner::random(), interval);
 
     assert_eq!(read.client().poll_interval(), interval);
-    assert_eq!(head.client().poll_interval(), Duration::from_millis(250));
     assert_eq!(seller.client().poll_interval(), interval);
     assert_eq!(buyer.client().poll_interval(), interval);
 }
@@ -223,7 +221,7 @@ async fn listener_stays_closed_when_initial_blacklist_sync_fails() {
     let (ready_tx, ready_rx) = oneshot::channel();
     let started = Arc::new(AtomicBool::new(false));
     ready_tx
-        .send(Err("ContentBlacklist getLogs unavailable".to_string()))
+        .send(Err("ContentBlacklist mutationCount unavailable".to_string()))
         .expect("readiness receiver is live");
 
     let err = gate_listener_on_blacklist_sync(ready_rx, {
@@ -234,7 +232,7 @@ async fn listener_stays_closed_when_initial_blacklist_sync_fails() {
     .expect_err("failed initial sync must fail startup");
 
     assert!(
-        format!("{err:#}").contains("ContentBlacklist getLogs unavailable"),
+        format!("{err:#}").contains("ContentBlacklist mutationCount unavailable"),
         "startup error should preserve the sync failure: {err:#}"
     );
     assert!(
@@ -262,8 +260,8 @@ async fn listener_fails_closed_when_watcher_drops_readiness() {
     .expect_err("a dropped readiness channel must fail startup closed");
 
     assert!(
-        format!("{err:#}").contains("blacklist watcher exited before initial sync completed"),
-        "startup error should explain the watcher exited early: {err:#}"
+        format!("{err:#}").contains("blacklist sync exited before initial sync completed"),
+        "startup error should explain the sync exited early: {err:#}"
     );
     assert!(
         !started.load(Ordering::SeqCst),
@@ -325,8 +323,7 @@ fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, Resolve
             cctp_sweep_receiver_address: None,
             capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,
-            event_poll_interval_ms: 7000,
-            get_logs_max_block_span: decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
+            receipt_poll_interval_ms: 7000,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
@@ -1342,66 +1339,6 @@ async fn build_endpoint_binds_with_discovery_and_custom_relay() {
         .await
         .expect("discovery + custom relay endpoint binds");
     ep.close().await;
-}
-
-/// The runtime hands `blockchain.get_logs_max_block_span` to the poller:
-/// dropping the setter would silently ignore the knob.
-#[tokio::test]
-async fn chain_poller_builder_uses_the_configured_get_logs_span() {
-    struct NoHead;
-    #[async_trait::async_trait]
-    impl HeadSource for NoHead {
-        async fn head(&self) -> anyhow::Result<u64> {
-            Ok(0)
-        }
-    }
-    let (_tmp, mut cfg) = cfg_with_origin(None);
-    cfg.blockchain.get_logs_max_block_span = 150;
-    let node_metrics = Arc::new(metrics::Metrics::new());
-    let builder = chain_poller_builder(
-        Arc::new(NoHead),
-        Duration::from_secs(7),
-        &cfg.blockchain,
-        &node_metrics,
-    );
-    assert_eq!(builder.span_ceiling(), 150);
-
-    // The hooks land in the exported series: `run` reports the starting
-    // span, and a range rejection and a window retry bump their counters.
-    let built = builder.build();
-    assert!(built.is_ok(), "an empty poller builds");
-    let Ok(poller) = built else { return };
-    poller.fire_range_rejection_for_test();
-    poller.fire_window_retry_for_test();
-    poller.fire_window_deferred_for_test();
-    let provider = alloy::providers::ProviderBuilder::new()
-        .connect_mocked_client(alloy::providers::mock::Asserter::new());
-    let shutdown = CancellationToken::new();
-    shutdown.cancel();
-    crate::chain_events::multiplexed_poller::run(provider, poller, shutdown).await;
-    let scrape = node_metrics.encode().unwrap_or_default();
-    assert!(
-        scrape.lines().any(|l| l == "decdn_chain_get_logs_span 150"),
-        "span gauge not wired: {scrape}"
-    );
-    assert!(
-        scrape
-            .lines()
-            .any(|l| l == "decdn_chain_get_logs_range_rejections_total 1"),
-        "rejection counter not wired"
-    );
-    assert!(
-        scrape
-            .lines()
-            .any(|l| l == "decdn_chain_get_logs_retries_total 1"),
-        "window-retry counter not wired"
-    );
-    assert!(
-        scrape
-            .lines()
-            .any(|l| l == "decdn_chain_get_logs_deferred_total 1"),
-        "window-deferred counter not wired"
-    );
 }
 
 /// Bind a loopback endpoint with relays off, returning it and a dialable

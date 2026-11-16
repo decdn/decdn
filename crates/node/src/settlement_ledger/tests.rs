@@ -292,21 +292,69 @@ mod recorder {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn backfill_of_a_receipt_the_rpc_lacks_writes_nothing() {
+    /// A sent hash whose receipt a crash or a timed-out wait missed: the
+    /// recovery fetches the receipt, writes its row and drops the hash.
+    #[tokio::test]
+    async fn a_missed_receipt_is_recovered_by_its_sent_hash() {
+        let tx = B256::repeat_byte(0x55);
+        let mut paid = transfer(USDC, POOL, OPERATOR, 600, 2);
+        paid.block_timestamp = Some(1_700_000_123);
+        let mined = receipt(
+            Some(900),
+            vec![pool_redeemed(POOL, OPERATOR, &[4_096], 0), paid],
+        );
         let asserter = Asserter::new();
-        for _ in 0..=HEADER_READ_RETRIES {
-            asserter.push_success(&Option::<TransactionReceipt>::None);
-        }
+        asserter.push_success(&Some(mined));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let ledger = Arc::new(MemorySettlementLedger::default());
+        let rec = recorder(ledger.clone());
+        rec.record_sent(tx).await;
+        rec.recover_sent(&provider).await;
+        let rows = ledger.load_settlements().expect("ledger");
+        assert_eq!(rows.len(), 1);
+        assert!(ledger.sent_redeems(DEPLOYMENT).expect("sent").is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    /// A sent hash the chain does not know (a dropped or replaced
+    /// transaction) is dropped with no row.
+    #[tokio::test]
+    async fn a_dropped_send_is_forgotten() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<TransactionReceipt>::None);
+        asserter.push_success(&Option::<alloy::rpc::types::Transaction>::None);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let ledger = Arc::new(MemorySettlementLedger::default());
         let rec = recorder(ledger.clone());
-        rec.backfill(&provider, 900, B256::repeat_byte(0x55)).await;
+        rec.record_sent(B256::repeat_byte(0x66)).await;
+        rec.recover_sent(&provider).await;
         assert!(ledger.load_settlements().expect("ledger").is_empty());
+        assert!(ledger.sent_redeems(DEPLOYMENT).expect("sent").is_empty());
+    }
+
+    /// A failed receipt read keeps the hash for the next attempt.
+    #[tokio::test]
+    async fn a_failed_receipt_read_keeps_the_hash() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("upstream down");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let ledger = Arc::new(MemorySettlementLedger::default());
+        let rec = recorder(ledger.clone());
+        rec.record_sent(B256::repeat_byte(0x77)).await;
+        rec.recover_sent(&provider).await;
         assert_eq!(
-            counter(&rec.metrics, "decdn_settlement_ledger_skipped_rows"),
-            1
+            ledger.sent_redeems(DEPLOYMENT).expect("sent"),
+            vec![B256::repeat_byte(0x77)]
         );
+    }
+
+    /// With nothing recorded, the recovery makes no RPC.
+    #[tokio::test]
+    async fn nothing_sent_reads_nothing() {
+        // Nothing queued: a receipt read would fail the test loudly.
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let rec = recorder(Arc::new(MemorySettlementLedger::default()));
+        rec.recover_sent(&provider).await;
     }
 
     struct FailingLedger;
@@ -323,94 +371,32 @@ mod recorder {
         fn has_settlement_tx(&self, _: Deployment, _: u64, _: B256) -> Result<bool, StoreError> {
             Err(StoreError::Backend("locked".into()))
         }
+
+        fn record_sent_redeem(&self, _: Deployment, _: B256) -> Result<(), StoreError> {
+            Err(StoreError::Backend("disk full".into()))
+        }
+
+        fn sent_redeems(&self, _: Deployment) -> Result<Vec<B256>, StoreError> {
+            Err(StoreError::Backend("locked".into()))
+        }
+
+        fn forget_sent_redeem(&self, _: Deployment, _: B256) -> Result<(), StoreError> {
+            Err(StoreError::Backend("locked".into()))
+        }
     }
 
+    /// A sent hash the store refuses is counted as a ledger write failure, and
+    /// an unreadable sent set makes no RPC.
     #[tokio::test]
-    async fn a_failing_guard_read_makes_no_rpc_and_is_counted() {
+    async fn a_failing_store_is_counted_and_reads_nothing() {
         // Nothing queued: a receipt fetch would fail the test loudly.
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let rec = recorder(Arc::new(FailingLedger));
-        rec.backfill(&provider, 900, B256::repeat_byte(0x55)).await;
+        rec.record_sent(B256::repeat_byte(0x55)).await;
+        rec.recover_sent(&provider).await;
         assert_eq!(
-            counter(&rec.metrics, "decdn_settlement_ledger_skipped_rows"),
+            counter(&rec.metrics, "decdn_settlement_ledger_write_failures"),
             1
         );
-    }
-
-    mod backfills {
-        use decdn_incentive::test_rpc::ScriptedRpc;
-
-        use super::*;
-
-        /// A receipt read that never answers does not hold the caller: the
-        /// spawn returns at once, and the backfill runs out its three
-        /// attempts at the call timeout on its own task, where the miss is
-        /// counted.
-        #[tokio::test(start_paused = true)]
-        async fn a_backfill_runs_off_the_caller_and_its_miss_is_counted() {
-            let ledger = Arc::new(MemorySettlementLedger::default());
-            let rec = recorder(ledger.clone());
-            let backfills = LedgerBackfills::new(rec.clone());
-            // Every unscripted read on this transport parks forever.
-            let provider = ScriptedRpc::parked_receipt().provider();
-            let started = tokio::time::Instant::now();
-            backfills.spawn(provider, 900, B256::repeat_byte(0x55));
-            assert_eq!(backfills.in_flight(), 1);
-            // Three attempts at the call timeout plus the pauses between them;
-            // the paused clock skips ahead whenever every task is parked, and
-            // the drain returns the moment the task gives up.
-            backfills.drain(Duration::from_secs(60)).await;
-            assert_eq!(
-                started.elapsed(),
-                3 * crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT + 2 * HEADER_READ_RETRY_DELAY,
-                "three receipt attempts at the call timeout, two pauses between them"
-            );
-            assert_eq!(
-                counter(&rec.metrics, "decdn_settlement_ledger_skipped_rows"),
-                1,
-                "the backfill ran to its miss on its own task"
-            );
-            assert!(ledger.load_settlements().expect("ledger").is_empty());
-        }
-
-        /// A backfill still parked at the deadline is aborted, not waited on
-        /// past it, and the set is empty afterwards.
-        #[tokio::test(start_paused = true)]
-        async fn drain_aborts_what_outlives_the_deadline() {
-            let ledger = Arc::new(MemorySettlementLedger::default());
-            let backfills = LedgerBackfills::new(recorder(ledger.clone()));
-            backfills.spawn(
-                ScriptedRpc::parked_receipt().provider(),
-                900,
-                B256::repeat_byte(0x55),
-            );
-            let started = tokio::time::Instant::now();
-            backfills.drain(Duration::from_secs(1)).await;
-            assert_eq!(started.elapsed(), Duration::from_secs(1));
-            assert_eq!(backfills.in_flight(), 0);
-            // A drain after the abort has nothing to wait for.
-            backfills.drain(Duration::from_secs(1)).await;
-            assert_eq!(started.elapsed(), Duration::from_secs(1));
-        }
-
-        /// A spawn after the drain has begun starts no task: the poller can
-        /// still be applying a window while the service shuts down, and a
-        /// task started then would end with the process. The miss is counted.
-        #[tokio::test]
-        async fn a_spawn_after_the_drain_is_refused_and_counted() {
-            // Nothing queued: a receipt read would fail loudly.
-            let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
-            let ledger = Arc::new(MemorySettlementLedger::default());
-            let rec = recorder(ledger.clone());
-            let backfills = LedgerBackfills::new(rec.clone());
-            backfills.drain(Duration::from_secs(1)).await;
-            backfills.spawn(provider, 900, B256::repeat_byte(0x55));
-            assert_eq!(backfills.in_flight(), 0, "no task started");
-            tokio::task::yield_now().await;
-            assert_eq!(
-                counter(&rec.metrics, "decdn_settlement_ledger_skipped_rows"),
-                1
-            );
-        }
     }
 }

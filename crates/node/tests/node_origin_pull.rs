@@ -943,7 +943,7 @@ async fn build_origin_with_discovery(
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -1106,7 +1106,7 @@ async fn build_origin_multi_hash(
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -1705,7 +1705,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -8144,7 +8144,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     // Only the FUNDER is blacklisted; the delegate signer stays clean.
-    deny.apply_chain_origin(leaf_funder.address(), true);
+    deny.set_chain_origins(std::collections::HashSet::from([leaf_funder.address()]));
 
     let outcome = tokio::time::timeout(Duration::from_secs(45), leaf)
         .await
@@ -11543,7 +11543,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -13208,7 +13208,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -14800,7 +14800,7 @@ async fn build_origin_economics(
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics,

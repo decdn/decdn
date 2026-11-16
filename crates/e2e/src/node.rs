@@ -1048,8 +1048,8 @@ struct RenderConfig<'a> {
 }
 
 /// Render the daemon TOML config. Emits only the keys the fixture sets; the
-/// daemon fills the rest from defaults. `event_poll_interval_ms` is dropped to
-/// 500ms so chain watchers react quickly against the local anvil.
+/// daemon fills the rest from defaults. `receipt_poll_interval_ms` is dropped
+/// to 500ms so redemptions land quickly against the local anvil.
 fn render_config(c: &RenderConfig<'_>) -> String {
     let a = &c.addrs;
     // Path fields use single-quoted TOML *literal* strings so backslashes in a
@@ -1073,12 +1073,12 @@ capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
 slash_appeal_address = "{slash_appeal}"
 content_blacklist_address = "{content_blacklist}"
-# Small so a scope transition with no on-chain event (region/ripening, appeal
-# reversal) is re-scoped within the test budget rather than the 10-min default.
+# Small so a ledger mutation, or a scope transition with no ledger record
+# (region ripening), is enforced within the test budget.
 content_blacklist_poll_interval_sec = 2
 publisher_registry_address = "{publisher_registry}"
 origin_assignment_address = "{origin_assignment}"
-event_poll_interval_ms = 500
+receipt_poll_interval_ms = 500
 redeem_threshold_micro_usdc = 10
 
 [cache]

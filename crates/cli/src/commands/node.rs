@@ -1038,23 +1038,19 @@ fn write_slashes_table(w: &mut impl io::Write, resp: &SlashesResponse) -> io::Re
     }
     writeln!(
         w,
-        "{:<20} {:>6} {:>14} {:>10} {:>10} APPEAL_CLOSE",
-        "SLASH_ID", "TYPE", "AMOUNT", "BLOCK", "EVIDENCE",
+        "{:<20} {:>6} {:>14} {:>10} APPEAL_CLOSE",
+        "SLASH_ID", "TYPE", "AMOUNT", "EVIDENCE",
     )?;
     for s in &resp.slashes {
-        let block = s
-            .block_number
-            .map_or_else(|| "?".to_string(), |b| b.to_string());
         let close = s
             .appeal_window_close
             .map_or_else(|| "?".to_string(), |c| c.to_string());
         writeln!(
             w,
-            "{:<20} {:>6} {:>14} {:>10} {:>10} {close}",
+            "{:<20} {:>6} {:>14} {:>10} {close}",
             s.slash_id,
             s.offense_type,
             s.amount,
-            block,
             short_node_id(&s.evidence_hash),
         )?;
     }

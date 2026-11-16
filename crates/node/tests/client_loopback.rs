@@ -10344,7 +10344,7 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     // Only the FUNDER goes on the deny-set; the delegate signer stays clean.
-    deny.apply_chain_origin(funder.address(), true);
+    deny.set_chain_origins(std::collections::HashSet::from([funder.address()]));
 
     let err = fetch.await?.err().ok_or_else(|| {
         anyhow::anyhow!(

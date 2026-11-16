@@ -519,8 +519,8 @@ pub struct EarningsResponse {
     /// The time the figures cover from, Unix seconds: no settlement landed
     /// before it is counted. On the daemon this is when the node's settlement
     /// ledger started recording, or the earliest ledger row for this operator
-    /// when that row is earlier (a landing the watcher backfilled, or a skewed
-    /// clock). The ledger records every settlement from then on, apart from
+    /// when that row is earlier (a landing recovered from a sent hash after a
+    /// restart, or a skewed clock). The ledger records every settlement from then on, apart from
     /// the rows it drops on a failure, which the node logs and counts. Built
     /// from the chain (`decdn node earnings --address`) it is the block time of
     /// the scan's first block, and every settlement from that block on is
@@ -720,18 +720,12 @@ pub struct SlashRecordDto {
     pub offense_type: u8,
     /// Bond amount slashed, in TOKEN base units, as a decimal string (`uint256`).
     pub amount: String,
-    /// `keccak256` evidence digest from the `Slashed` event (ADR 014),
-    /// `0x`-prefixed 32-byte hex.
+    /// `keccak256` evidence digest from the `CapacityBond` slash record (ADR
+    /// 014), `0x`-prefixed 32-byte hex.
     pub evidence_hash: String,
-    /// Block number the `Slashed` log was mined in, or `None` if the log was
-    /// still pending when observed (rare; live logs carry a block number).
-    pub block_number: Option<u64>,
-    /// **Nominal** appeal-window close (Unix seconds): the `Slashed` block
-    /// timestamp + 30 days, or `None` if the block read failed. This is a cheap
-    /// client-side hint, NOT read from the `CapacityBond` slash record, and it
-    /// ignores protocol-pause extensions — which only ever move the real
-    /// deadline *later* (`markAppealOpen` adds `pausedTotal`). Safe to file
-    /// before this; a keeper must not treat a just-past value as final.
+    /// Appeal-window close (Unix seconds) the contract enforces: the slash
+    /// record's base `appealWindowClose` plus the global `pausedTotal` at the
+    /// last read. A later protocol pause only moves it later.
     pub appeal_window_close: Option<u64>,
 }
 

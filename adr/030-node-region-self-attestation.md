@@ -6,7 +6,7 @@
 
 ## Context
 
-Each node declares a region — an ISO 3166-1 alpha-2 country code — at registration as `regionHint` on `CapacityBond` (see [ADR 001 § Node Region Metadata](001-network.md#node-region-metadata)). The `CapacityBond` registry watcher resolves the active set into a `NodeId → region` map. The declared region is load-bearing in two places:
+Each node declares a region — an ISO 3166-1 alpha-2 country code — at registration as `regionHint` on `CapacityBond` (see [ADR 001 § Node Region Metadata](001-network.md#node-region-metadata)). The `CapacityBond` registry refresh resolves the active set into a `NodeId → region` map. The declared region is load-bearing in two places:
 
 - **Regional blacklist enforcement.** A node applies only blacklist entries that are global or match its declared region ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)), and is slashable only for serving a hash blacklisted in its declared scope ([ADR 011 § Slashing](011-content-takedown.md#slashing)).
 - **Peer-selection penalty.** A pulling node applies the RTT-vs-claim reputation penalty against a node whose measured latency contradicts its declared region ([ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm), implemented in `crates/node/src/node_origin/mod.rs`).

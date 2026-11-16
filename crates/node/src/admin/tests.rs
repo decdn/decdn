@@ -54,7 +54,6 @@ async fn slashes_reports_detected_records_newest_first() {
             offense_type: 0,
             amount: U256::from(100u64),
             evidence_hash: B256::repeat_byte(0x11),
-            block_number: Some(10),
             appeal_window_close: Some(999),
         },
         crate::slash_watcher::DetectedSlash {
@@ -62,7 +61,6 @@ async fn slashes_reports_detected_records_newest_first() {
             offense_type: 1,
             amount: U256::from(200u64),
             evidence_hash: B256::repeat_byte(0x22),
-            block_number: Some(20),
             appeal_window_close: None,
         },
     ]));
@@ -1249,7 +1247,14 @@ async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
     let owner = Address::repeat_byte(0x0F);
     let chain_owner = Address::repeat_byte(0x0E);
     let projection = PoolProjection::new();
-    projection.record_opened(lane_pool_id(1), owner, U256::from(10_000_000u64));
+    projection.record_read(
+        lane_pool_id(1),
+        crate::pool_view::PoolStatus {
+            owner,
+            remaining: U256::from(10_000_000u64),
+            lifecycle: crate::pool_view::Lifecycle::Open,
+        },
+    );
     let (state, _tmp) = state_with().await;
     let handles = LaneStatusHandles {
         pools: vec![admin_pool(

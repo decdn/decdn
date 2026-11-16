@@ -122,7 +122,7 @@ pub struct ResolvedBlockchain {
     /// Required `ContentBlacklist` contract address (ADR 011/019/031). Successful
     /// node config resolution always produces `Some`; the runtime rejects `None`.
     pub content_blacklist_address: Option<String>,
-    /// Seconds between the blacklist watcher's periodic replay + re-scope pass.
+    /// Seconds between two blacklist mutation-ledger polls, 1 to 300.
     /// Defaults to [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`]. Only
     /// used when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: u64,
@@ -139,26 +139,16 @@ pub struct ResolvedBlockchain {
     /// watchdog entirely; otherwise the resolver enforces a minimum (see
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC`).
     pub rpc_watchdog_interval_sec: u64,
-    /// Milliseconds between chain-event poll ticks (#1011, #1106). Two unrelated
-    /// consumers read this one value:
-    /// - the `MultiplexedPoller`'s `poll_interval` — the `eth_getLogs` tick
-    ///   cadence shared by every chain watcher's `Route`.
-    /// - alloy's pending-transaction receipt heartbeat, applied to every provider
-    ///   via the node's `with_poll_interval` (`client().set_poll_interval`) and
-    ///   consumed by `PendingTransactionBuilder::get_receipt` when the node awaits
-    ///   a mined settlement / pool tx. This is also what overrides alloy's
-    ///   localhost-detected 250 ms default.
+    /// Milliseconds between alloy's pending-transaction receipt polls (#1011),
+    /// applied to every provider via the node's `with_poll_interval`
+    /// (`client().set_poll_interval`) and consumed by
+    /// `PendingTransactionBuilder::get_receipt` when the node awaits a mined
+    /// settlement / pool tx. This also overrides alloy's localhost-detected
+    /// 250 ms default.
     ///
-    /// Defaults to 7000 ms (`DEFAULT_EVENT_POLL_INTERVAL_MS`); the resolver
-    /// enforces a minimum (see `MIN_EVENT_POLL_INTERVAL_MS`).
-    pub event_poll_interval_ms: u64,
-    /// Ceiling on the block span of one chain-watcher `eth_getLogs` request
-    /// (the `MultiplexedPoller`'s window). The poller starts here. When the
-    /// provider rejects a range, it sets its span to half the rejected window's
-    /// length, and it doubles back toward this ceiling after a streak of
-    /// accepted windows. Defaults to [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`];
-    /// always `>= 1`.
-    pub get_logs_max_block_span: u64,
+    /// Defaults to 7000 ms (`DEFAULT_RECEIPT_POLL_INTERVAL_MS`); the resolver
+    /// enforces a minimum (see `MIN_RECEIPT_POLL_INTERVAL_MS`).
+    pub receipt_poll_interval_ms: u64,
     /// Per-chunk redemption floor (base units, `µUSDC`). The seller
     /// settlement path submits an on-chain redemption transaction for a
     /// chunk of lanes only once the aggregate un-redeemed value across that

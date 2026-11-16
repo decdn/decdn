@@ -43,10 +43,10 @@
 //!   into one tx), and `sweep(operator)` (anyone may send an operator's
 //!   pending protocol share over CCTP to the governance chain's
 //!   `CctpSweepReceiver` once it reaches `minSweep`);
-//! - events: `PoolOpened`, `PoolToppedUp` (→ raise the tracked deposit so
-//!   post-top-up vouchers are not wrongly rejected), `PoolRedeemed` (one per
-//!   pool group of a `redeemMany`, filtered on the redeemer's `provider`
-//!   topic), `PoolCloseInitiated` (the owner started the grace-window
+//! - events: `PoolOpened` (the buyer decodes its pool id from the open
+//!   receipt), `PoolToppedUp`, `PoolRedeemed` (one per pool group of a
+//!   `redeemMany`; the seller decodes its paid watermarks from its own
+//!   receipts), `PoolCloseInitiated` (the owner started the grace-window
 //!   close), `PoolReclaimed` (the residual was refunded and the pool is now
 //!   closed), and `Swept` (an operator's pending share left for the
 //!   governance chain).

@@ -1979,18 +1979,6 @@ async fn signer_cap_is_a_window_count_not_a_slice_of_the_deposit() -> anyhow::Re
     Ok(())
 }
 
-/// A `PoolRedeemed` lane entry for the projection, at `cumulative` `µUSDC`.
-fn lane_settled(
-    signer: Address,
-    cumulative: u64,
-) -> decdn_incentive::payment_pool::PaymentPool::LaneSettled {
-    decdn_incentive::payment_pool::PaymentPool::LaneSettled {
-        signer,
-        newPaidCumulative: cumulative,
-        bytesPaid: 0,
-    }
-}
-
 /// A live lane registered from a wider capability narrows to the signer's
 /// on-chain registration, and the store persists the clamped terms (#2265).
 #[tokio::test]
@@ -2271,64 +2259,14 @@ async fn pool_recheck_stale_with_no_view_wired_counts_nothing() -> anyhow::Resul
 /// The mid-stream signer cap-headroom re-check stops a live stream once the
 /// signer drains its shared `cap` at OTHER providers since admission — the drain
 /// the pool-solvency re-check cannot see, because the pool's `remaining` stays
-/// healthy on other signers' budgets.
+/// healthy on other signers' budgets. The admit-path `getAuthorization` read
+/// carries the spend before admission; the settlement service's live refresh
+/// (`getPool` + `getAuthorizations`) carries the drain since.
 #[tokio::test]
-async fn midstream_signer_recheck_trips_when_signer_drains_at_other_nodes() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, projection, _dir) = handler_with_projection_view(&metrics).await;
-    let pool = tpool_byte(0x51);
-    let signer = Address::new([0xa1; 20]);
-    let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
-    let ow = u64::try_from(one_window).expect("one window fits u64");
-    // The signer holds a cap of ten windows on this lane; the pool is richly
-    // funded, so only per-signer cap headroom can bind here.
-    let held_cap = U256::from(ow.saturating_mul(10));
-    projection.record_opened(pool.1, Address::new([0x07; 20]), U256::MAX);
-
-    // At admit the signer has spent one window across providers — nine windows of
-    // headroom remain, above the one-window floor, so the stream keeps serving.
-    projection.record_redeemed(
-        pool.1,
-        Address::new([0xc0; 20]),
-        &[lane_settled(signer, ow)],
-        None,
-    );
-    anyhow::ensure!(
-        !handler
-            .signer_cap_drained_midstream(pool, signer, held_cap, TEST_RATE)
-            .await,
-        "nine windows of headroom must keep the stream serving"
-    );
-
-    // Mid-stream the signer drains the rest of its cap at a DIFFERENT provider,
-    // taking the cross-provider total to the full cap — headroom falls below one
-    // floor, so the re-check stops the stream.
-    projection.record_redeemed(
-        pool.1,
-        Address::new([0xc1; 20]),
-        &[lane_settled(signer, ow.saturating_mul(9))],
-        None,
-    );
-    anyhow::ensure!(
-        handler
-            .signer_cap_drained_midstream(pool, signer, held_cap, TEST_RATE)
-            .await,
-        "a signer drained to its full cap across providers must stop the stream"
-    );
-    Ok(())
-}
-
-/// #2711: after a restart the projection seeds a pool from one `getPool` and
-/// counts only what the signer redeems after the seed. The mid-stream re-check
-/// still sees the spend the admit-path `getAuthorization` read held, so a signer
-/// that spent most of its cap before the restart stops the stream once other
-/// nodes drain the rest.
-#[tokio::test]
-async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() -> anyhow::Result<()>
-{
+async fn midstream_signer_recheck_trips_when_the_refresh_reads_a_drain() -> anyhow::Result<()> {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
-    use alloy::sol_types::SolValue;
+    use alloy::sol_types::{SolCall, SolValue};
     use decdn_incentive::payment_pool::PaymentPool;
 
     use crate::pool_view::PoolView;
@@ -2350,27 +2288,16 @@ async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() ->
     let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
     let ow = u64::try_from(one_window).expect("one window fits u64");
     let cap = ow.saturating_mul(10);
+    let authorization = |spent: u64| PaymentPool::Authorization {
+        cap,
+        expiry: u64::MAX,
+        spent,
+    };
 
-    // Before the restart the signer spent eight windows at other nodes. The
-    // seed carries that spend in the pool's `totalRedeemed` only.
-    projection.record_resolved(
-        Address::new([0x07; 20]),
-        crate::pool_view::PoolRead {
-            pool_id: pool.1,
-            deposit: u64::MAX,
-            total_redeemed: ow.saturating_mul(8),
-            lifecycle: crate::pool_view::Lifecycle::Open,
-        },
-    );
+    // At admission the signer has spent eight windows at other nodes.
     asserter.push_success(&alloy::primitives::Bytes::from(
-        PaymentPool::Authorization {
-            cap,
-            expiry: u64::MAX,
-            spent: ow.saturating_mul(8),
-        }
-        .abi_encode(),
+        authorization(ow.saturating_mul(8)).abi_encode(),
     ));
-    // Admission reads the authorization: two windows of headroom remain.
     anyhow::ensure!(view.signer_authorization(pool.1, signer).await.is_some());
     anyhow::ensure!(
         !handler
@@ -2379,18 +2306,32 @@ async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() ->
         "two windows of headroom keep the stream serving"
     );
 
-    // Another node redeems the signer's last two windows.
-    projection.record_redeemed(
+    // Another node redeems the signer's last two windows; the next live refresh
+    // reads the pool and the signer again.
+    asserter.push_success(&alloy::primitives::Bytes::from(
+        PaymentPool::Pool {
+            owner: Address::new([0x07; 20]),
+            status: PaymentPool::Status::Open,
+            disputeDeadline: 0,
+            deposit: u64::MAX,
+            totalRedeemed: ow.saturating_mul(10),
+        }
+        .abi_encode(),
+    ));
+    asserter.push_success(&alloy::primitives::Bytes::from(
+        PaymentPool::getAuthorizationsCall::abi_encode_returns(&vec![authorization(cap)]),
+    ));
+    view.refresh_live(&std::collections::HashMap::from([(
         pool.1,
-        Address::new([0xc2; 20]),
-        &[lane_settled(signer, ow.saturating_mul(2))],
-        None,
-    );
+        std::collections::HashSet::from([signer]),
+    )]))
+    .await;
+    anyhow::ensure!(asserter.read_q().is_empty(), "the refresh read both");
     anyhow::ensure!(
         handler
             .signer_cap_drained_midstream(pool, signer, U256::from(cap), TEST_RATE)
             .await,
-        "the pre-restart spend plus the drain since admission stops the stream"
+        "the drain the refresh read stops the stream"
     );
     Ok(())
 }

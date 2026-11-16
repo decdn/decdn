@@ -695,7 +695,6 @@ fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
                 offense_type: 0,
                 amount: "1_000_000".to_string(),
                 evidence_hash: format!("0x{}", "a".repeat(64)),
-                block_number: Some(1_234_567),
                 appeal_window_close: Some(1_700_000_000),
             },
             SlashRecordDto {
@@ -703,7 +702,6 @@ fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
                 offense_type: 1,
                 amount: "2_500_000".to_string(),
                 evidence_hash: format!("0x{}", "c".repeat(64)),
-                block_number: None,
                 appeal_window_close: None,
             },
         ],
@@ -714,12 +712,12 @@ fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
     assert!(s.contains("slashes=2"), "{s}");
     assert!(s.contains("SLASH_ID"), "header missing: {s}");
     assert!(s.contains("APPEAL_CLOSE"), "header missing: {s}");
-    // First row: slash id, offense type, amount, block, evidence preview.
+    // First row: slash id, offense type, amount, evidence preview.
     assert!(s.contains("42"), "slash id missing: {s}");
     assert!(s.contains("1_000_000"), "amount missing: {s}");
-    assert!(s.contains("1234567"), "block number missing: {s}");
+    assert!(s.contains("1700000000"), "appeal close missing: {s}");
     assert!(s.contains("0xaaaaaaaaaa"), "evidence preview missing: {s}");
-    // Second row: missing block / appeal close render as "?".
+    // Second row: a missing appeal close renders as "?".
     assert!(s.contains('?'), "missing-value sentinel missing: {s}");
     Ok(())
 }

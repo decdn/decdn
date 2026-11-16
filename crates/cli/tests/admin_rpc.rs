@@ -44,7 +44,7 @@ use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
 };
 use decdn_node::metrics::Metrics;
-use decdn_node::pool_view::PoolProjection;
+use decdn_node::pool_view::{Lifecycle, PoolProjection, PoolStatus};
 use decdn_protocol::{ContentHash, Coverage};
 use jsonrpsee::RpcModule;
 use jsonrpsee::core::ClientError;
@@ -237,11 +237,19 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     store.record(&mk(1, 0xAA, 2_000_000))?;
     store.record(&mk(2, 0xBB, 100_000))?;
 
-    // The node has seen pool 1 open. Pool 2 is not in its pool view, and this
-    // state wires no chain source to read it from, so its owner is unknown.
+    // The node holds a read of pool 1. Pool 2 is not in its pool view, and
+    // this state wires no chain source to read it from, so its owner is
+    // unknown.
     let owner = Address::repeat_byte(0x0F);
     let pool_view = PoolProjection::new();
-    pool_view.record_opened(pool_id(1), owner, U256::from(10_000_000u64));
+    pool_view.record_read(
+        pool_id(1),
+        PoolStatus {
+            owner,
+            remaining: U256::from(10_000_000u64),
+            lifecycle: Lifecycle::Open,
+        },
+    );
 
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(

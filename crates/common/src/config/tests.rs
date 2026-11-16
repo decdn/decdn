@@ -5362,7 +5362,7 @@ fn resolve_blockchain_cli_rpc_url_overrides_file() -> anyhow::Result<()> {
         eth_keystore: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: None,
-        event_poll_interval_ms: None,
+        receipt_poll_interval_ms: None,
         redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
@@ -5397,7 +5397,7 @@ fn resolve_blockchain_uses_file_rpc_url_when_cli_absent() -> anyhow::Result<()> 
         eth_keystore: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         rpc_watchdog_interval_sec: None,
-        event_poll_interval_ms: None,
+        receipt_poll_interval_ms: None,
         redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
@@ -5674,7 +5674,7 @@ fn resolve_blockchain_rejects_zero_content_blacklist_poll_interval() -> anyhow::
     };
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("content_blacklist_poll_interval_sec") && msg.contains("must not be 0"),
+        msg.contains("content_blacklist_poll_interval_sec") && msg.contains("between 1 and 300"),
         "error should reject the zero poll interval: {msg}"
     );
     Ok(())
@@ -5755,7 +5755,7 @@ fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Resul
         eth_keystore: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(1),
-        event_poll_interval_ms: None,
+        receipt_poll_interval_ms: None,
         redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
@@ -5800,7 +5800,7 @@ fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
         eth_keystore: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: None,
-        event_poll_interval_ms: None,
+        receipt_poll_interval_ms: None,
         redeem_threshold_micro_usdc: Some(0),
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
@@ -6048,7 +6048,7 @@ fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
         eth_keystore: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(0),
-        event_poll_interval_ms: None,
+        receipt_poll_interval_ms: None,
         redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
@@ -6086,7 +6086,7 @@ fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
         eth_keystore: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
-        event_poll_interval_ms: None,
+        receipt_poll_interval_ms: None,
         redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
@@ -6152,7 +6152,7 @@ fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
         eth_keystore: None,
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: None,
-        event_poll_interval_ms: None,
+        receipt_poll_interval_ms: None,
         redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: Some(0),
@@ -6229,10 +6229,9 @@ fn buyer_working_deposit_defaults_when_absent() -> anyhow::Result<()> {
 }
 
 #[test]
-fn resolve_blockchain_rejects_event_poll_interval_below_minimum() -> anyhow::Result<()> {
-    // #1011/#1106: a sub-minimum interval would drive every eth_getLogs
-    // watcher tick — and the pending-tx receipt heartbeat — too frequently,
-    // so resolution must reject it.
+fn resolve_blockchain_rejects_receipt_poll_interval_below_minimum() -> anyhow::Result<()> {
+    // #1011: a sub-minimum interval would drive the pending-tx receipt
+    // heartbeat too frequently, so resolution must reject it.
     let dir = data_dir_with_keystore()?;
     let cli = BlockchainArgs {
         origin_assignment_address: None,
@@ -6246,7 +6245,7 @@ fn resolve_blockchain_rejects_event_poll_interval_below_minimum() -> anyhow::Res
         chain_id: None,
     };
     let file = types::BlockchainConfig {
-        event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS - 1),
+        receipt_poll_interval_ms: Some(MIN_RECEIPT_POLL_INTERVAL_MS - 1),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         slash_appeal_address: None,
         content_blacklist_address: None,
@@ -6256,16 +6255,16 @@ fn resolve_blockchain_rejects_event_poll_interval_below_minimum() -> anyhow::Res
         anyhow::bail!("expected error when event poll interval is below the minimum");
     };
     let msg = format!("{err:#}");
-    let expected_min = format!("minimum {MIN_EVENT_POLL_INTERVAL_MS}ms");
+    let expected_min = format!("minimum {MIN_RECEIPT_POLL_INTERVAL_MS}ms");
     assert!(
-        msg.contains("event_poll_interval_ms") && msg.contains(&expected_min),
+        msg.contains("receipt_poll_interval_ms") && msg.contains(&expected_min),
         "error should mention the field and the {expected_min} floor: {msg}"
     );
     Ok(())
 }
 
 #[test]
-fn resolve_blockchain_applies_default_event_poll_interval_when_absent() -> anyhow::Result<()> {
+fn resolve_blockchain_applies_default_receipt_poll_interval_when_absent() -> anyhow::Result<()> {
     // Pins the no-config bootstrap path: the default must stay at or above
     // MIN so an operator without an explicit setting never floods the RPC.
     let dir = data_dir_with_keystore()?;
@@ -6282,15 +6281,15 @@ fn resolve_blockchain_applies_default_event_poll_interval_when_absent() -> anyho
     };
     let resolved = resolve_blockchain(&cli, None, dir.path())?;
     assert_eq!(
-        resolved.event_poll_interval_ms,
-        DEFAULT_EVENT_POLL_INTERVAL_MS
+        resolved.receipt_poll_interval_ms,
+        DEFAULT_RECEIPT_POLL_INTERVAL_MS
     );
-    assert!(resolved.event_poll_interval_ms >= MIN_EVENT_POLL_INTERVAL_MS);
+    assert!(resolved.receipt_poll_interval_ms >= MIN_RECEIPT_POLL_INTERVAL_MS);
     Ok(())
 }
 
 #[test]
-fn resolve_blockchain_accepts_min_and_in_range_event_poll_interval() -> anyhow::Result<()> {
+fn resolve_blockchain_accepts_min_and_in_range_receipt_poll_interval() -> anyhow::Result<()> {
     // Pins the inclusive floor (exactly MIN is accepted, guarding an
     // off-by-one regression to `>`) and that an in-range value is preserved
     // through resolution rather than clamped. Mirrors the
@@ -6308,28 +6307,31 @@ fn resolve_blockchain_accepts_min_and_in_range_event_poll_interval() -> anyhow::
         chain_id: None,
     };
     let at_min = types::BlockchainConfig {
-        event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS),
+        receipt_poll_interval_ms: Some(MIN_RECEIPT_POLL_INTERVAL_MS),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         slash_appeal_address: None,
         content_blacklist_address: None,
         ..Default::default()
     };
     let resolved = resolve_blockchain(&cli, Some(&at_min), dir.path())?;
-    assert_eq!(resolved.event_poll_interval_ms, MIN_EVENT_POLL_INTERVAL_MS);
+    assert_eq!(
+        resolved.receipt_poll_interval_ms,
+        MIN_RECEIPT_POLL_INTERVAL_MS
+    );
 
     let in_range = types::BlockchainConfig {
-        event_poll_interval_ms: Some(1000),
+        receipt_poll_interval_ms: Some(1000),
         slash_judge_address: Some(GOOD_ADDR.to_string()),
         slash_appeal_address: None,
         content_blacklist_address: None,
         ..Default::default()
     };
     let resolved = resolve_blockchain(&cli, Some(&in_range), dir.path())?;
-    assert_eq!(resolved.event_poll_interval_ms, 1000);
+    assert_eq!(resolved.receipt_poll_interval_ms, 1000);
     Ok(())
 }
 
-fn get_logs_span_cli() -> BlockchainArgs {
+fn blacklist_poll_cli() -> BlockchainArgs {
     BlockchainArgs {
         origin_assignment_address: None,
         publisher_registry_address: None,
@@ -6343,49 +6345,32 @@ fn get_logs_span_cli() -> BlockchainArgs {
     }
 }
 
+/// ADR 011 bounds the ledger poll at five minutes: `0` and anything above 300
+/// seconds are rejected, and 300 is the default.
 #[test]
-fn resolve_blockchain_rejects_zero_get_logs_max_block_span() -> anyhow::Result<()> {
-    // A zero span would scan no blocks: every chain watcher would go blind.
+fn resolve_blockchain_bounds_the_blacklist_poll_at_five_minutes() -> anyhow::Result<()> {
     let dir = data_dir_with_keystore()?;
-    let file = types::BlockchainConfig {
-        get_logs_max_block_span: Some(0),
-        ..Default::default()
-    };
-    let Err(err) = resolve_blockchain(&get_logs_span_cli(), Some(&file), dir.path()) else {
-        anyhow::bail!("expected an error for get_logs_max_block_span = 0");
-    };
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("get_logs_max_block_span"),
-        "error should name the field: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_blockchain_applies_default_get_logs_max_block_span_when_absent() -> anyhow::Result<()> {
-    let dir = data_dir_with_keystore()?;
-    let resolved = resolve_blockchain(&get_logs_span_cli(), None, dir.path())?;
-    assert_eq!(
-        resolved.get_logs_max_block_span,
-        DEFAULT_GET_LOGS_MAX_BLOCK_SPAN
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_blockchain_accepts_a_provider_sized_get_logs_max_block_span() -> anyhow::Result<()> {
-    // One block is the smallest span that still scans; 10 is Alchemy's
-    // free-tier cap.
-    let dir = data_dir_with_keystore()?;
-    for span in [1, 10] {
+    let resolved = resolve_blockchain(&blacklist_poll_cli(), None, dir.path())?;
+    assert_eq!(resolved.content_blacklist_poll_interval_sec, 300);
+    for bad in [0, 301] {
         let file = types::BlockchainConfig {
-            get_logs_max_block_span: Some(span),
+            content_blacklist_poll_interval_sec: Some(bad),
             ..Default::default()
         };
-        let resolved = resolve_blockchain(&get_logs_span_cli(), Some(&file), dir.path())?;
-        assert_eq!(resolved.get_logs_max_block_span, span);
+        let Err(err) = resolve_blockchain(&blacklist_poll_cli(), Some(&file), dir.path()) else {
+            anyhow::bail!("expected an error for content_blacklist_poll_interval_sec = {bad}");
+        };
+        assert!(
+            format!("{err:#}").contains("content_blacklist_poll_interval_sec"),
+            "{err:#}"
+        );
     }
+    let file = types::BlockchainConfig {
+        content_blacklist_poll_interval_sec: Some(60),
+        ..Default::default()
+    };
+    let resolved = resolve_blockchain(&blacklist_poll_cli(), Some(&file), dir.path())?;
+    assert_eq!(resolved.content_blacklist_poll_interval_sec, 60);
     Ok(())
 }
 

@@ -16,9 +16,9 @@
 //!      genuine client-signed voucher. The seller redeemer then submits `redeem`;
 //!      the contract's `ECDSA.recover` accepts the normalized voucher signature,
 //!      `getWatermark` advances, and `FeeRouter.bytesPerEpoch` increments.
-//!   2. **Live event decode.** The [`PoolSettlementService`] watcher's
-//!      subscribe+decode path runs against a live RPC (`PoolRedeemed` drives the
-//!      paid watermark cache that gates redemption).
+//!   2. **Live receipt decode.** The [`PoolSettlementService`] redeemer decodes
+//!      its own `redeemMany` receipt against a live RPC (`PoolRedeemed` drives
+//!      the paid watermark that gates redemption).
 //!   3. **Buyer lifecycle.** A [`BuyerPoolService`] opens a pool, delivers a paid
 //!      stream signed via the service-produced [`PoolContext`], tops the pool up,
 //!      and — after an owner `closePool` and a grace-window warp — reclaims the
@@ -81,12 +81,11 @@ use decdn_client::sign_client_binding;
 use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolStore, KeyedCheckpointStore, MemoryBuyerPoolStore, PoolStateStore,
-    bind_node_id_domain, register_node_signing_hash, slash_judge_domain, voucher_domain,
+    BuyerPoolStore, MemoryBuyerPoolStore, PoolStateStore, bind_node_id_domain,
+    register_node_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_pool::BuyerPoolService;
 use decdn_node::chain_events::boot_retry::BootRetry;
-use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
 use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::PoolSettlementService;
@@ -287,19 +286,6 @@ impl Drop for AnvilGuard {
         // Manifest is gitignored, but remove it so re-runs start clean.
         let _ = std::fs::remove_file(&self.manifest);
     }
-}
-
-/// A real [`SharedHead`] over the anvil provider, matching the poll interval the
-/// settlement service is bootstrapped with (so the TTL is 125 ms here, not the
-/// 3.5 s a production 7 s interval yields).
-fn e2e_head<P>(provider: &P) -> Arc<dyn HeadSource>
-where
-    P: Provider + Clone + 'static,
-{
-    Arc::new(SharedHead::new(
-        provider.clone(),
-        Duration::from_millis(250),
-    ))
 }
 
 /// Current Unix time in seconds — the base for a generous capability expiry.
@@ -701,7 +687,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     )?;
     // One concrete redb-backed store backs the lane-state trait (the handler +
     // #527 replay guard), the capability sink/source (first-redemption
-    // registration), and the watcher checkpoint — mirrors the runtime wiring.
+    // registration), and the settlement ledger — mirrors the runtime wiring.
     let concrete_store = Arc::new(PersistentPoolStateStore::open(
         store_tmp.path(),
         Deployment {
@@ -710,7 +696,6 @@ async fn run_e2e() -> anyhow::Result<()> {
         },
     )?);
     let store: Arc<dyn PoolStateStore> = concrete_store.clone();
-    let checkpoint_store: Arc<dyn KeyedCheckpointStore> = concrete_store.clone();
     let ledger: Arc<dyn decdn_incentive::SettlementLedger> = concrete_store.clone();
 
     let node_eth = Arc::new(node_signer.clone());
@@ -726,14 +711,17 @@ async fn run_e2e() -> anyhow::Result<()> {
     // receiver drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
-    // Event-fed pool view, shared with the settlement service below (its watcher
-    // is the writer). The capability-intake gate reads the on-chain pool owner
-    // from it; without an owner the capability is dropped and no lane registers,
-    // so the test waits for the projection to catch `PoolOpened` before serving.
-    let pool_view = decdn_node::pool_view::PoolProjection::new();
+    // The `getPool`-backed pool view, shared with the settlement service below
+    // (its refresh loop re-reads the pools with a live lane). The
+    // capability-intake gate reads the on-chain pool owner from it.
+    let pool_view = Arc::new(decdn_node::payment_settlement::ResolvingPoolView::new(
+        PaymentPool::new(payment_pool, node_provider.clone()),
+        decdn_node::pool_view::PoolProjection::new(),
+        Arc::clone(&metrics),
+    ));
     let handler = {
         let hint = redeem_tx.clone();
-        let pool_view = pool_view.clone();
+        let pool_view = Arc::clone(&pool_view);
         build_handler_full_configured(
             node_pub,
             &node_eth,
@@ -747,9 +735,8 @@ async fn run_e2e() -> anyhow::Result<()> {
             move |deps| {
                 for pool in &mut deps.pools {
                     pool.redeem_hint = Some(hint.clone());
-                    pool.pool_view = Some(
-                        Arc::new(pool_view.clone()) as Arc<dyn decdn_node::pool_view::PoolView>
-                    );
+                    pool.pool_view =
+                        Some(Arc::clone(&pool_view) as Arc<dyn decdn_node::pool_view::PoolView>);
                 }
             },
         )?
@@ -758,7 +745,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // The pool's immutable operator share: the ledger scales each net income
     // back to the gross payout by it.
     let operator_bps = u16::try_from(pool_read.operatorBps().call().await?)?;
-    let (service, settlement_route) = PoolSettlementService::bootstrap(
+    let service = PoolSettlementService::bootstrap(
         node_provider.clone(),
         decdn_incentive::Deployment {
             chain_id: CHAIN_ID,
@@ -766,7 +753,6 @@ async fn run_e2e() -> anyhow::Result<()> {
         },
         node_addr,
         Arc::clone(&store),
-        Arc::clone(&checkpoint_store),
         Arc::clone(&ledger),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
@@ -774,25 +760,12 @@ async fn run_e2e() -> anyhow::Result<()> {
         Duration::from_secs(300),
         Arc::clone(&metrics),
         &BootRetry::single_attempt(Arc::clone(&metrics)),
-        pool_view.clone(),
+        Arc::clone(&pool_view),
         redeem_tx,
         redeem_rx,
         operator_bps,
     )
     .await?;
-    // The paid-watermark watcher is now a route on the shared multiplexed poller,
-    // not a service-owned task. Spawn a single-route poller so the settlement
-    // watcher actually runs (folds `PoolOpened` / `PoolRedeemed` events, drives
-    // the pool projection) as it does in the runtime. The handle is held for the
-    // test's duration; dropping it aborts the poller.
-    let settlement_poller = {
-        use decdn_node::chain_events::multiplexed_poller::{MultiplexedPollerBuilder, spawn};
-        let poller =
-            MultiplexedPollerBuilder::new(e2e_head(&node_provider), Duration::from_millis(250))
-                .route(settlement_route)
-                .build()?;
-        spawn(node_provider.clone(), poller)
-    };
 
     let (server_ep, server_addr) = local_endpoint(node_iroh_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), Arc::clone(&handler));
@@ -845,22 +818,20 @@ async fn run_e2e() -> anyhow::Result<()> {
     // batched-read proof): no redeem on this lane can land before this block.
     let redeem_scan_from = node_provider.get_block_number().await?;
 
-    // Wait for the settlement watcher to fold `PoolOpened` into the shared pool
-    // projection: the capability-intake gate reads the owner from it, and drops
-    // the capability if the owner is not yet known. In production a serve request
-    // against a just-opened pool would fail open (serve, defer registration); the
-    // test pins the owner first so the single lane deterministically registers.
+    // The pool view reads `getPool` on its first sight of the pool: the
+    // capability-intake gate reads the owner from it. Pin the owner first so
+    // the single lane deterministically registers.
     {
         use decdn_node::pool_view::PoolView;
-        let view = pool_view.clone();
+        let view = Arc::clone(&pool_view);
         let owner = poll_until(Duration::from_secs(30), || {
-            let view = view.clone();
+            let view = Arc::clone(&view);
             async move { view.status(pool_id).await.map(|s| s.owner) }
         })
         .await;
         anyhow::ensure!(
             owner == Some(client_addr),
-            "pool projection did not observe PoolOpened owner in time"
+            "pool view did not read the pool owner in time"
         );
     }
 
@@ -1130,7 +1101,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         "Authorization must not change across the second, already-registered sweep"
     );
     // Poll for the same reason as `lane_after_first`: the second redeem's
-    // `store.set_registered_until` (if any) and the watcher `paid` update race
+    // `store.set_registered_until` (if any) and the receipt `paid` update race
     // the `getWatermark` poll above.
     let _lane_after_second = poll_until(Duration::from_secs(10), || {
         let store = Arc::clone(&store);
@@ -1243,8 +1214,8 @@ async fn run_e2e() -> anyhow::Result<()> {
             "a ledger row's gross scales back to its net at {operator_bps} bps: {row:?}"
         );
     }
-    // The watcher's backfill decodes the same receipt into the same row, and a
-    // second backfill of a known transaction fetches nothing.
+    // Boot recovery decodes a recorded sent hash into the same row, and drops
+    // the hash, so a second recovery fetches nothing.
     let backfill_ledger = Arc::new(decdn_incentive::MemorySettlementLedger::default());
     let recorder = decdn_node::settlement_ledger::SettlementRecorder::new(
         backfill_ledger.clone(),
@@ -1259,20 +1230,28 @@ async fn run_e2e() -> anyhow::Result<()> {
         },
         Arc::clone(&metrics),
     );
-    recorder
-        .backfill(&node_provider, block_first, tx_first)
-        .await;
+    recorder.record_sent(tx_first).await;
+    recorder.recover_sent(&node_provider).await;
     let backfilled = decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?;
     anyhow::ensure!(
         backfilled.as_slice() == &rows[..1],
-        "a backfilled row equals the redeemer's row: {backfilled:?} vs {first:?}"
+        "a recovered row equals the redeemer's row: {backfilled:?} vs {first:?}"
     );
-    recorder
-        .backfill(&node_provider, block_first, tx_first)
-        .await;
+    anyhow::ensure!(
+        decdn_incentive::SettlementLedger::sent_redeems(
+            backfill_ledger.as_ref(),
+            Deployment {
+                chain_id: CHAIN_ID,
+                payment_pool,
+            },
+        )?
+        .is_empty(),
+        "a recovered hash is dropped"
+    );
+    recorder.recover_sent(&node_provider).await;
     anyhow::ensure!(
         decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?.len() == 1,
-        "a known transaction is not written twice"
+        "a recovered transaction is not written twice"
     );
 
     // ============================================================
@@ -1352,20 +1331,19 @@ async fn run_e2e() -> anyhow::Result<()> {
     // requester endpoint (`client_ep` here) to the serve gate.
     let buyer_binding = sign_client_binding(buyer_signer.as_ref(), client_node_id, &bind_domain)?;
     let buyer_ctx = buyer_ctx.with_client_binding(buyer_binding);
-    // As with the seller pool: wait for the settlement watcher to fold this
-    // freshly-opened pool's `PoolOpened` into the shared projection, so the
-    // capability-intake gate can confirm the owner and register the lane.
+    // As with the seller pool: read this freshly-opened pool's owner first, so
+    // the capability-intake gate can confirm it and register the lane.
     {
         use decdn_node::pool_view::PoolView;
-        let view = pool_view.clone();
+        let view = Arc::clone(&pool_view);
         let owner = poll_until(Duration::from_secs(30), || {
-            let view = view.clone();
+            let view = Arc::clone(&view);
             async move { view.status(buyer_pool_id).await.map(|s| s.owner) }
         })
         .await;
         anyhow::ensure!(
             owner == Some(buyer_addr),
-            "pool projection did not observe the buyer pool's PoolOpened owner in time"
+            "pool view did not read the buyer pool's owner in time"
         );
     }
     let suffix = stream_fetch(
@@ -1464,10 +1442,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         "reclaimed pool must be Closed on-chain"
     );
 
-    // Retire the seller service: stop the shared poller (flushes the settlement
-    // route's scan checkpoint), then the service's graceful-shutdown path
-    // (quiesce the redeemer, run a final redeem sweep).
-    settlement_poller.shutdown();
+    // Retire the seller service through its graceful-shutdown path (quiesce
+    // the redeemer, run a final redeem sweep).
     service.shutdown(Duration::from_secs(30)).await;
 
     // PRE-REDEEM RECONCILIATION GATE (#2076). Asserted here, after the forced

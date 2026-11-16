@@ -8,7 +8,6 @@ pub(crate) use reload::emit_config_notices;
 pub use reload::{LogLevelApply, LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
 use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
-use crate::chain_events::shared_head::{HeadSource, SharedHead};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroUsize;
@@ -162,27 +161,24 @@ const FEE_SHARE_BOOT_BUDGET: Duration = Duration::from_mins(1);
 /// Apply an explicit client poll interval to a freshly built provider,
 /// overriding alloy's localhost-detected 250 ms default (#1011).
 ///
-/// Despite the config knob's name, this does not touch event watching: the
-/// multiplexed poller ticks on its own `poll_interval` and never reads the
-/// client interval. The one consumer still reachable from this node is
-/// `PendingTransactionBuilder::get_receipt`'s heartbeat (alloy-provider
-/// `heart.rs`), which the node awaits in `payment_settlement` and
-/// `buyer_pool` — so this bounds how fast a node awaiting a mined settlement /
-/// pool tx re-polls for its receipt, and alloy's 250 ms localhost default
-/// would otherwise hammer a dev anvil for the life of every pending tx.
+/// The one consumer is `PendingTransactionBuilder::get_receipt`'s heartbeat
+/// (alloy-provider `heart.rs`), which the node awaits in `payment_settlement`
+/// and `buyer_pool` — so this bounds how fast a node awaiting a mined
+/// settlement / pool tx re-polls for its receipt, and alloy's 250 ms localhost
+/// default would otherwise hammer a dev anvil for the life of every pending tx.
 ///
 /// `set_poll_interval` uses interior mutability, so this applies to the
 /// already-constructed provider and returns it unchanged in type —
 /// wallet/nonce-filler providers route through it too, because `client()` is a
 /// default `Provider` trait method available on every provider. The interval
-/// comes from `blockchain.event_poll_interval_ms`.
+/// comes from `blockchain.receipt_poll_interval_ms`.
 fn with_poll_interval<P: Provider>(provider: P, interval: Duration) -> P {
     provider.client().set_poll_interval(interval);
     provider
 }
 
-/// Keep every iroh ALPN listener closed until the blacklist watcher reports one
-/// clean boot enumeration + operator-scope enforcement pass. The closure is the explicit seam
+/// Keep every iroh ALPN listener closed until the blacklist sync reports one
+/// clean boot snapshot + operator-scope enforcement pass. The closure is the explicit seam
 /// that makes it impossible to construct the `Router` on either pending or
 /// failed readiness.
 async fn gate_listener_on_blacklist_sync<T>(
@@ -191,7 +187,7 @@ async fn gate_listener_on_blacklist_sync<T>(
 ) -> anyhow::Result<T> {
     readiness
         .await
-        .context("blacklist watcher exited before initial sync completed")?
+        .context("blacklist sync exited before initial sync completed")?
         .map_err(anyhow::Error::msg)
         .context("initial ContentBlacklist sync unavailable")?;
     Ok(start_listener())
@@ -199,13 +195,11 @@ async fn gate_listener_on_blacklist_sync<T>(
 
 type HttpUrl = alloy::transports::http::reqwest::Url;
 
-/// Construct the four HTTP-provider roles owned by the node runtime (#1252).
+/// Construct the HTTP-provider roles owned by the node runtime (#1252).
 ///
 /// Keeping these constructors together makes the pending-transaction poll
 /// interval and wallet nonce policy single-sourced while preserving separate
-/// provider instances for every consumer. The shared-head provider is the one
-/// deliberate exception to the poll override: it never creates pending
-/// transactions and therefore keeps Alloy's transport default.
+/// provider instances for every consumer.
 ///
 /// Every provider sends through [`crate::rpc_metrics::metered_http_client`],
 /// so each JSON-RPC request the node makes counts on
@@ -239,10 +233,6 @@ impl ProviderFactory {
             ProviderBuilder::new().connect_client(self.client()),
             interval,
         )
-    }
-
-    fn shared_head(&self) -> impl Provider + Clone + use<> {
-        ProviderBuilder::new().connect_client(self.client())
     }
 
     fn seller_wallet(
@@ -524,7 +514,9 @@ async fn build_infra(
             .await
             .with_context(|| format!("payment chain of pool {}", deployment.pool_account()))?;
         check_deployment_preflight(
-            providers.shared_head(),
+            providers.read_only(Duration::from_millis(
+                cfg.blockchain.receipt_poll_interval_ms,
+            )),
             *deployment,
             &BootRetry::new(DEPLOYMENT_PREFLIGHT_BUDGET, Arc::clone(&node_metrics)),
         )
@@ -850,22 +842,24 @@ async fn serve_until_shutdown(
     Ok((router, signal))
 }
 
-/// Chain providers, event watchers, and paid-delivery handlers built during the
-/// middle phase of [`run`] (#1253). A by-value bundle of the long-lived handles
-/// the background-task, serve, and shutdown phases consume, mirroring [`Infra`].
-/// Generic over the seller-wallet provider `P` (an opaque `impl Provider`
-/// threaded through [`PoolSettlementService`]); [`run`] infers `P` at the call
-/// site and hands it to [`ShutdownHandles`].
+/// Chain providers, chain-state refresh loops, and paid-delivery handlers built
+/// during the middle phase of [`run`] (#1253). A by-value bundle of the
+/// long-lived handles the background-task, serve, and shutdown phases consume,
+/// mirroring [`Infra`]. Generic over the seller-wallet provider `P` (an opaque
+/// `impl Provider` threaded through [`PoolSettlementService`]); [`run`] infers
+/// `P` at the call site and hands it to [`ShutdownHandles`].
 struct ChainHandlers<P: Provider + Clone + 'static> {
-    event_poll_interval: Duration,
+    receipt_poll_interval: Duration,
     slash_domain: alloy::dyn_abi::Eip712Domain,
     bind_domain: alloy::dyn_abi::Eip712Domain,
     staker_set: Arc<dyn StakerSet>,
-    /// The governance chain's multiplexed chain-event poller, driving the
-    /// registry, slash, origin-seat and blacklist routes.
-    /// Stopped once, late in shutdown (after `router.shutdown`), because the
-    /// capacity-bond route's staker set gates DHT admission through drain.
-    poller: crate::chain_events::resumable_watcher::WatcherHandle,
+    /// Stops the governance chain's refresh loops: registry, slash, origin
+    /// seats and blacklist. Cancelled once, late in shutdown (after
+    /// `router.shutdown`), because the registry's staker set gates DHT
+    /// admission through drain.
+    chain_sync_stop: CancellationToken,
+    /// The refresh loop tasks.
+    chain_sync_tasks: Vec<tokio::task::JoinHandle<()>>,
     slash_store: crate::slash_watcher::SlashStore,
     node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>>,
     probe_rate_limiter: Arc<ProbeRateLimiter>,
@@ -890,13 +884,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     shed_controller: Arc<crate::load_shed::LoadShedController>,
     /// One settlement service per accepted pool, in configuration order.
     payment_services: Vec<PoolSettlementService<P>>,
-    /// One multiplexed poller per payment chain, carrying that chain's pools'
-    /// settlement routes. Stopped with the governance poller.
-    payment_pollers: Vec<crate::chain_events::resumable_watcher::WatcherHandle>,
     /// Per pool, its lane store and the lookup that names each lane's pool
-    /// owner for `admin_v1_lanes`: the event-fed pool view the settlement
-    /// watcher writes, then an owner cache, then its own `getPool` reads
-    /// (never the serve path's negative-caching resolver).
+    /// owner for `admin_v1_lanes`: the held `getPool` reads, then an owner
+    /// cache, then its own `getPool` reads (never the serve path's
+    /// negative-caching resolver).
     admin_pools: Vec<admin::AdminPool>,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     /// Bring-up node-id binding self-check (#1034), carried through to
@@ -929,11 +920,12 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
 
 /// One accepted pool's settlement inputs, built beside its serve route and
 /// consumed by its [`PoolSettlementService::bootstrap`].
-struct SettlementWiring<P> {
+struct SettlementWiring<P: Provider + Clone> {
     /// Wallet-filled provider on the pool's payment chain.
     wallet_provider: P,
-    /// The pool view the settlement watcher writes and the serve path reads.
-    projection: crate::pool_view::PoolProjection,
+    /// The admit-path pool view the serve path reads; the settlement service
+    /// refreshes its live pools.
+    view: Arc<crate::payment_settlement::ResolvingPoolView<P>>,
     /// Redeem-hint sender; a clone rides the pool's serve route.
     redeem_tx: tokio::sync::mpsc::Sender<decdn_incentive::LaneKey>,
     /// Redeem-hint receiver the redeemer loop drains.
@@ -942,37 +934,9 @@ struct SettlementWiring<P> {
     operator_bps: u16,
 }
 
-/// The chain-event poller builder with its config-driven settings: the
-/// `eth_getLogs` block-span ceiling (`blockchain.get_logs_max_block_span`) and
-/// the span, range-rejection and window-retry metrics. Routes are added by the
-/// caller.
-fn chain_poller_builder(
-    head: Arc<dyn HeadSource>,
-    poll_interval: Duration,
-    blockchain: &decdn_common::config::ResolvedBlockchain,
-    node_metrics: &Arc<metrics::Metrics>,
-) -> crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder {
-    let span_metrics = Arc::clone(node_metrics);
-    crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::new(head, poll_interval)
-        .max_backfill_span(blockchain.get_logs_max_block_span)
-        .on_span_change(Box::new(move |span| span_metrics.chain_get_logs_span(span)))
-        .on_range_rejection(metrics::metric_hook(
-            node_metrics,
-            metrics::Metrics::chain_get_logs_range_rejected,
-        ))
-        .on_window_retry(metrics::metric_hook(
-            node_metrics,
-            metrics::Metrics::chain_get_logs_retried,
-        ))
-        .on_window_deferred(metrics::metric_hook(
-            node_metrics,
-            metrics::Metrics::chain_get_logs_deferred,
-        ))
-}
-
 /// Middle phase of [`run`] (#1253): parse the chain contract addresses and
-/// EIP-712 domains, bootstrap the `CapacityBond` registry / slash / origin
-/// watchers, and construct the probe, client, and DHT handlers plus the
+/// EIP-712 domains, take the `CapacityBond` registry / slash / origin-seat /
+/// blacklist boot snapshots with their refresh loops, and construct the probe, client, and DHT handlers plus the
 /// seller-side [`PoolSettlementService`]. Borrows [`Infra`]; the buyer-side
 /// provider/store construction and the background tasks belong to
 /// `spawn_background_tasks`. Returns [`ChainHandlers`], whose seller-wallet provider `P` [`run`]
@@ -1031,33 +995,13 @@ async fn build_chain_and_handlers(
         cfg.blockchain.chain_id,
         Arc::clone(&infra.node_metrics),
     );
-    // One value, two consumers (#1011/#1106): the multiplexed poller's merged
-    // `eth_getLogs` tick cadence, and — through `with_poll_interval` below — the
-    // pending-tx receipt heartbeat, overriding alloy's 250 ms localhost default
-    // that would hammer a dev anvil.
-    let event_poll_interval = Duration::from_millis(cfg.blockchain.event_poll_interval_ms);
-    let chain_provider = providers.read_only(event_poll_interval);
-    // One `eth_blockNumber` per TTL window for ALL watchers, instead of one per
-    // watcher per tick. Plain read-only provider: a head read needs no wallet or
-    // nonce filler, and coupling it to the signer stack would give every watcher's
-    // head read a dependency on it. Deliberately NOT wrapped in
-    // `with_poll_interval` — that only sets the pending-tx receipt heartbeat, and
-    // this provider never builds a `PendingTransactionBuilder`.
-    let head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(
-        providers.shared_head(),
-        event_poll_interval,
-    ));
-    // Every on-chain watcher registers a `Route` on ONE shared multiplexed
-    // poller instead of running its own `eth_getLogs` loop: six watchers scan
-    // disjoint `(address, topic0)` slices of the same four contracts, so one
-    // merged `get_logs` per tick — demuxed after the fact — replaces six. The
-    // routes are collected as each watcher bootstraps below and spawned once (see
-    // `build`/`spawn` near the end of this function). The poller mints one
-    // shutdown token; the runtime drives graceful stop through the single handle.
-    let mut poller_routes: Vec<crate::chain_events::multiplexed_poller::Route> = Vec::new();
-    // One read-only provider for the poller's merged `get_logs` (each sink still
-    // holds its own contract instance for its follow-up reads/writes).
-    let poller_provider = providers.read_only(event_poll_interval);
+    // The pending-tx receipt heartbeat (`with_poll_interval`), overriding
+    // alloy's 250 ms localhost default that would hammer a dev anvil.
+    let receipt_poll_interval = Duration::from_millis(cfg.blockchain.receipt_poll_interval_ms);
+    // Every governance-chain snapshot reads by `eth_call` on its own refresh
+    // loop; one token stops them all late in shutdown.
+    let chain_sync_stop = CancellationToken::new();
+    let mut chain_sync_tasks: Vec<crate::dht::capacity_bond_registry::RefreshTask> = Vec::new();
 
     // One boot deadline for the four fail-closed chain bootstraps below — the
     // registry, slash, `usdc()` self-check and blacklist reads (#2159). Each
@@ -1069,30 +1013,30 @@ async fn build_chain_and_handlers(
     // waits on the blacklist enumeration and enforcement.
     let boot = BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&infra.node_metrics));
 
-    // One CapacityBond enumeration + one route feeding both registry projections
-    // (#1110). The bindings half is built only when pull-through is on; it derives
-    // from page data already read here, so it has no RPC that can fail on its own.
+    // One CapacityBond snapshot feeding every registry projection (#1110). The
+    // bindings half is built only when pull-through is on; it derives from page
+    // data already read here, so it has no RPC that can fail on its own.
     let registry = crate::dht::capacity_bond_registry::bootstrap(
-        chain_provider,
+        providers.read_only(receipt_poll_interval),
         capacity_bond_addr,
-        Arc::clone(&head),
         cfg.cache.node_to_node_pull_through_enabled,
         Arc::clone(&infra.node_metrics),
         &boot,
+        chain_sync_stop.clone(),
     )
     .await
     .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
     let staker_set: Arc<dyn StakerSet> = registry.staker_set;
     let registry_regions = Arc::clone(&registry.regions);
     // The shared `operator address → NodeId` reverse projection (#1110), kept
-    // current by the same registry route. The lazy `ChainOriginDirectory`
+    // current by the same registry snapshot. The lazy `ChainOriginDirectory`
     // resolves against it directly rather than maintaining its own binding cache.
     let operator_to_node = Arc::clone(&registry.operator_to_node);
     // Registry multiaddrs as an endpoint address lookup (ADR 001 § Node
     // Discovery): every bare-`NodeId` dial resolves the node's registry
     // addresses alongside its pkarr record, so a peer stays directly dialable
     // when the pkarr server is unreachable or its record is not yet published.
-    // The same registry route keeps the lookup current.
+    // The same registry snapshot keeps the lookup current.
     infra
         .ep
         .address_lookup()
@@ -1104,30 +1048,28 @@ async fn build_chain_and_handlers(
         cfg.network.bind_port,
         &registry.dial_addrs.get(&own_id).unwrap_or_default(),
     );
-    // The registry route MUST stay live through drain (its staker set gates DHT
-    // admission), which forces the single poller stop to the LATE point below.
-    poller_routes.push(registry.route);
+    // The registry refresh MUST stay live through drain (its staker set gates
+    // DHT admission), which forces the shared stop to the LATE point in
+    // shutdown.
+    chain_sync_tasks.push(registry.refresh);
 
-    // Slash-detection watcher (#1032, G-NODE-05): enumerate this operator's
-    // still-appealable slashes from `CapacityBond` and follow `SlashRecorded`, so
-    // a slash surfaces over `admin_v1_slashes` (+ the `decdn_slashes_detected_total`
-    // metric) and the operator can file `decdn appeal slash` in time. Read-only;
-    // held to `run()`'s end so its background task lives as long as the daemon.
-    // The boot enumeration retries on the shared boot budget, like the
-    // CapacityBond registry bootstrap above; thereafter a tail blip retries and
-    // the periodic resync heals drift, so detection is never disabled for the
-    // daemon's lifetime.
-    let (slash_store, slash_route) = crate::slash_watcher::bootstrap(
-        providers.read_only(event_poll_interval),
+    // Slash detection (#1032, G-NODE-05): enumerate this operator's
+    // still-appealable slashes from `CapacityBond` and re-read them on a
+    // cadence, so a slash surfaces over `admin_v1_slashes` (+ the
+    // `decdn_slashes_detected_total` metric) and the operator can file `decdn
+    // appeal slash` in time. The boot enumeration retries on the shared boot
+    // budget, like the CapacityBond registry bootstrap above.
+    let (slash_store, slash_refresh) = crate::slash_watcher::bootstrap(
+        providers.read_only(receipt_poll_interval),
         capacity_bond_addr,
         infra.eth_signer.address(),
-        Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
         &boot,
+        chain_sync_stop.clone(),
     )
     .await
-    .context("bootstrap the slash-detection watcher")?;
-    poller_routes.push(slash_route);
+    .context("bootstrap slash detection")?;
+    chain_sync_tasks.push(slash_refresh);
 
     // NodeId → bonded operator address resolver for node-to-node pulls (#831),
     // produced by the same CapacityBond bootstrap as the staker set above and
@@ -1187,10 +1129,10 @@ async fn build_chain_and_handlers(
     );
 
     // Chain-read liveness (ADR 011 §Serving while chain-stale). One handle,
-    // stamped by the blacklist watcher (boot enumeration + every successful poll
-    // tick) and read by the probe and serve paths, which refuse once the node
+    // stamped by the blacklist sync (boot snapshot + every successful ledger
+    // poll) and read by the probe and serve paths, which refuse once the node
     // has been unable to reach the chain for longer than the grace window. This
-    // runtime path always wires the blacklist watcher — `content_blacklist_address`
+    // runtime path always wires the blacklist sync — `content_blacklist_address`
     // is mandatory at node config resolution — so the gate is always live here;
     // the `Option` the handlers hold exists for the test paths that build a
     // handler with no chain.
@@ -1256,7 +1198,7 @@ async fn build_chain_and_handlers(
             let origin_assignment_addr =
                 parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
             Arc::new(crate::dht::ChainOriginDirectory::new(
-                providers.read_only(event_poll_interval),
+                providers.read_only(receipt_poll_interval),
                 origin_assignment_addr,
                 Arc::clone(&operator_to_node),
                 Arc::clone(&staker_set),
@@ -1270,24 +1212,24 @@ async fn build_chain_and_handlers(
             Arc::new(crate::dht::origin::EmptyOriginDirectory)
         };
     // The seated-origin set every DHT record's attestation is checked against
-    // (ADR 022 § Origin Attestation). The `OriginAssignment` watcher fills it at
-    // boot and keeps it current. Without that address it stays empty, and no
+    // (ADR 022 § Origin Attestation). The `OriginAssignment` snapshot fills it
+    // at boot and keeps it current. Without that address it stays empty, and no
     // record is valid here: the check fails closed.
     let seated_origins = Arc::new(crate::dht::SeatedOriginSet::new());
     if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
         let origin_assignment_addr =
             parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
-        let seat_route = crate::origin_seat_watcher::bootstrap(
-            providers.read_only(event_poll_interval),
+        let seat_refresh = crate::origin_seat_watcher::bootstrap(
+            providers.read_only(receipt_poll_interval),
             origin_assignment_addr,
-            Arc::clone(&head),
             Arc::clone(&seated_origins),
             Arc::clone(&infra.node_metrics),
             &boot,
+            chain_sync_stop.clone(),
         )
         .await
-        .context("bootstrap the origin seat watcher")?;
-        poller_routes.push(seat_route);
+        .context("bootstrap the origin seat snapshot")?;
+        chain_sync_tasks.push(seat_refresh);
     } else {
         tracing::warn!(
             "blockchain.origin_assignment_address is not set: no origin seat is known, \
@@ -1333,7 +1275,7 @@ async fn build_chain_and_handlers(
     let mut pool_shares = Vec::with_capacity(infra.pools.len());
     for pool in &infra.pools {
         let bps = crate::fee_shares::seed_from_chain(
-            pool.providers.read_only(event_poll_interval),
+            pool.providers.read_only(receipt_poll_interval),
             pool.deployment.payment_pool,
             OPERATOR_BPS_FLOOR,
             &fee_share_boot,
@@ -1375,7 +1317,7 @@ async fn build_chain_and_handlers(
     // that refused to boot on a transient RPC failure could not be used to run
     // the rotation that repairs the binding. See `crate::binding_check`.
     let binding_report = crate::binding_check::check(
-        providers.read_only(event_poll_interval),
+        providers.read_only(receipt_poll_interval),
         capacity_bond_addr,
         infra.eth_signer.address(),
         *infra.secret_key.public().as_bytes(),
@@ -1475,34 +1417,31 @@ async fn build_chain_and_handlers(
         // route while the service takes the receiver.
         let (redeem_tx, redeem_rx) =
             tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
-        // Event-fed pool view (owner + remaining) for the floor-`M` solvency
-        // gate and the ADR 011 funder gate. The pool's settlement watcher folds
-        // every `PaymentPool` event into this projection, so a serve request
-        // reads `{owner, remaining}` in-memory — no per-serve `getPool`
-        // `eth_call`. The same instance is handed to the settlement service
-        // (its watcher is the writer).
+        // Held `getPool` reads (owner + remaining) for the floor-`M` solvency
+        // gate and the ADR 011 funder gate, so a serve request reads
+        // `{owner, remaining}` in-memory. The settlement service refreshes the
+        // pools with live lanes.
         let projection = crate::pool_view::PoolProjection::new();
         // Wallet-filled provider on the pool's payment chain, its signer bound
-        // to that chain's id. The handler's pool view confirms a
-        // projection-miss pool with a `getPool` at admission through it, and
-        // the settlement service signs its `redeemMany` with it.
+        // to that chain's id. The handler's pool view reads `getPool` at
+        // admission through it, and the settlement service signs its
+        // `redeemMany` with it.
         let wallet_provider = pool
             .providers
-            .seller_wallet((*infra.eth_signer).clone(), event_poll_interval);
-        // Admit-path pool-view: reads the event-fed projection first and, on a
-        // miss (a pool opened before the watcher's `ColdStart::Head` anchor),
-        // does ONE `getPool` to confirm the pool is live and solvent before a
-        // serve is admitted — folding a servable pool into the projection and
-        // refusing an absent/closed/errored one. The mid-stream pool re-check
-        // reads the projection only.
-        let resolving_pool_view = crate::payment_settlement::ResolvingPoolView::new(
+            .seller_wallet((*infra.eth_signer).clone(), receipt_poll_interval);
+        // Admit-path pool-view: answers from a read younger than the refresh
+        // interval and otherwise does ONE `getPool` to confirm the pool is live
+        // and solvent before a serve is admitted, refusing an
+        // absent/closed/errored one. The mid-stream pool re-check reads the held
+        // read only.
+        let resolving_pool_view = Arc::new(crate::payment_settlement::ResolvingPoolView::new(
             decdn_incentive::payment_pool::PaymentPool::new(
                 pool.deployment.payment_pool,
                 wallet_provider.clone(),
             ),
             projection.clone(),
             Arc::clone(&infra.node_metrics),
-        );
+        ));
         // Lane owner lookup for `admin_v1_lanes`. Its own binding and reads,
         // so an operator's `node lanes` never negative-caches a pool the serve
         // path reads.
@@ -1521,7 +1460,7 @@ async fn build_chain_and_handlers(
         });
         let mut route = crate::handlers::client::PoolRoute::new(pool.deployment, pool.lane_store());
         route.pool_view =
-            Some(Arc::new(resolving_pool_view) as Arc<dyn crate::pool_view::PoolView>);
+            Some(Arc::clone(&resolving_pool_view) as Arc<dyn crate::pool_view::PoolView>);
         // Hint the settlement service on each accepted voucher so a lane's
         // accrued claim is planned into a chunk promptly rather than waiting
         // the self-tick.
@@ -1530,7 +1469,7 @@ async fn build_chain_and_handlers(
         routes.push(route);
         settlement_wiring.push(SettlementWiring {
             wallet_provider,
-            projection,
+            view: resolving_pool_view,
             redeem_tx,
             redeem_rx,
             operator_bps: shares.bps(),
@@ -1597,9 +1536,9 @@ async fn build_chain_and_handlers(
     // On-chain seller-settlement service (#327). A wallet-filled provider
     // (the staker-set provider above is read-only) signs the `redeemMany`
     // transactions with the same eth keystore signer. The bootstrap
-    // self-checks the contract via `usdc()`; the watcher folds `PaymentPool`
-    // events so the serve path reads pool solvency in-memory, and forgets a
-    // reclaimed pool's lanes. Redemption is purely periodic: a self-tick
+    // self-checks the contract via `usdc()`; the service re-reads every pool
+    // with a live lane so the serve path reads pool solvency in-memory, and
+    // forgets a closed pool's lanes. Redemption is purely periodic: a self-tick
     // flushes the lane store then sweeps every above-threshold lane.
     // Simple (re-fetch-each-send) nonce management, not alloy's default cached
     // manager (#904). The cached manager advances its in-memory nonce when it
@@ -1611,38 +1550,15 @@ async fn build_chain_and_handlers(
     // the pending nonce — so a failed send can't gap the lane. The buyer
     // provider below relies on this same property for the retried `reclaim`.
     // Each pool's `wallet_provider` was built above (the handler's admit-path
-    // pool-view shares it); it moves into the pool's service here.
-    //
-    // A pool's settlement route reads its own payment chain, so it rides that
-    // chain's poller, never the governance poller. Pools of one chain share
-    // one poller and one shared head.
+    // pool-view shares it); it moves into the pool's service here. Every pool
+    // read and transaction rides the pool's own payment chain.
     let mut payment_services = Vec::with_capacity(infra.pools.len());
-    let mut chain_routes: Vec<(
-        ProviderFactory,
-        Vec<crate::chain_events::multiplexed_poller::Route>,
-    )> = Vec::new();
     for (pool, wiring) in infra.pools.iter().zip(settlement_wiring) {
-        // Debounce the scan-checkpoint writes (#784, keyed in #1092): the
-        // settlement watcher, the only watcher that persists a cursor
-        // (`CheckpointKey::PoolOpened`), advances it once per completed
-        // `eth_getLogs` window, and the directly-durable store fsyncs on each.
-        // The persisted value is only a *floor* for the resume backfill
-        // (`resolve_persisted_start` rewinds it by the reorg margin; the sinks
-        // are idempotent), so coarsening the write cadence is safe — and the
-        // settlement service force-flushes its key on graceful shutdown.
-        // Wrapping here (the wiring layer) keeps the domain trait and the disk
-        // store free of the debounce policy. The pool's store view keys the
-        // checkpoint by its deployment.
-        let checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore> =
-            Arc::new(crate::payment_settlement::DebouncedCheckpointStore::new(
-                Arc::clone(&pool.store) as Arc<dyn decdn_incentive::KeyedCheckpointStore>,
-            ));
-        let (payment_service, settlement_route) = PoolSettlementService::bootstrap(
+        let payment_service = PoolSettlementService::bootstrap(
             wiring.wallet_provider,
             pool.deployment,
             infra.eth_signer.address(),
             pool.lane_store(),
-            checkpoint_store,
             Arc::clone(&infra.settlement_ledger),
             Arc::clone(&client_handler),
             U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
@@ -1650,7 +1566,7 @@ async fn build_chain_and_handlers(
             Duration::from_secs(cfg.blockchain.redeem_interval_secs),
             Arc::clone(&infra.node_metrics),
             &boot,
-            wiring.projection,
+            wiring.view,
             wiring.redeem_tx,
             wiring.redeem_rx,
             wiring.operator_bps,
@@ -1663,62 +1579,23 @@ async fn build_chain_and_handlers(
             )
         })?;
         payment_services.push(payment_service);
-        match chain_routes
-            .iter_mut()
-            .find(|(providers, _)| providers.chain_id == pool.deployment.chain_id)
-        {
-            Some((_, routes)) => routes.push(settlement_route),
-            None => chain_routes.push((pool.providers.clone(), vec![settlement_route])),
-        }
-    }
-    let mut payment_pollers = Vec::with_capacity(chain_routes.len());
-    for (chain_providers, routes) in chain_routes {
-        let chain_head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(
-            chain_providers.shared_head(),
-            event_poll_interval,
-        ));
-        let builder = routes.into_iter().fold(
-            chain_poller_builder(
-                chain_head,
-                event_poll_interval,
-                &cfg.blockchain,
-                &infra.node_metrics,
-            ),
-            crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::route,
-        );
-        let poller = builder.build().with_context(|| {
-            format!(
-                "assemble the chain-event poller of payment chain {}",
-                chain_providers.chain_id
-            )
-        })?;
-        payment_pollers.push(crate::chain_events::multiplexed_poller::spawn(
-            chain_providers.read_only(event_poll_interval),
-            poller,
-        ));
     }
 
-    // Blacklist compliance watcher (ADR 011/031, issue #1031). Its boot pass
-    // ENUMERATES the current on-chain deny-set at one pinned block
-    // (`blacklistedAddresses` ∪ per-region `blacklistedHashes`) rather than
-    // replaying logs, then follows the live tail seeded at that block. It evicts
-    // held blobs whose hash is blacklisted in scope for this operator, which
-    // cascades to DHT-announce suppression (the republisher's `is_evicted` gate),
-    // probe `has_blob:false`, and delivery refusal — the node's only local
+    // Blacklist sync (ADR 011 § Node Behavior). Its boot pass reads the
+    // deny-set from the enumeration views at the `safe` block, then follows the
+    // `ContentBlacklist` mutation ledger by `eth_call`. It evicts held blobs
+    // whose hash is blacklisted in scope for this operator, which cascades to
+    // DHT-announce suppression (the republisher's `is_evicted` gate), probe
+    // `has_blob:false`, and delivery refusal — the node's only local
     // protection against the slash for serving blacklisted content.
-    // `blacklist_ready_rx` gates the ALPN router below on that first enumeration.
-    // The route carries a shutdown-token-observing sink factory (its re-scope
-    // polls the poller's token, #1236); the tail carries no durable cursor, so
-    // teardown has no scan checkpoint to flush.
+    // `blacklist_ready_rx` gates the ALPN router below on that first snapshot.
     let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
-    let blacklist_route = crate::blacklist_watcher::bootstrap(
-        providers.read_only(event_poll_interval),
+    let blacklist_sync = crate::blacklist_watcher::bootstrap(
+        providers.read_only(receipt_poll_interval),
         content_blacklist_addr,
         infra.eth_signer.address(),
         infra.cache.clone(),
         Arc::clone(&warming),
-        Arc::clone(&head),
-        Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
         blacklist_ready_tx,
         &infra.node_metrics,
         Arc::clone(&content_denylist),
@@ -1726,27 +1603,16 @@ async fn build_chain_and_handlers(
         &boot,
     )
     .await
-    .context("blacklist compliance watcher boot enumeration")?;
-    poller_routes.push(blacklist_route);
-
-    // Assemble and spawn the ONE poller for all routes. `build` fails fast if
-    // two routes claim the same `(address, topic0)` — a wiring bug, not a
-    // runtime condition — surfacing it at boot.
-    let poller = chain_poller_builder(
-        Arc::clone(&head),
-        event_poll_interval,
-        &cfg.blockchain,
-        &infra.node_metrics,
-    );
-    let poller = poller_routes
-        .into_iter()
-        .fold(
-            poller,
-            crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::route,
-        )
-        .build()
-        .context("assemble the multiplexed chain-event poller")?;
-    let poller = crate::chain_events::multiplexed_poller::spawn(poller_provider, poller);
+    .context("blacklist sync boot snapshot")?;
+    let blacklist_poll = Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec);
+    let blacklist_stop = chain_sync_stop.clone();
+    chain_sync_tasks.push(Box::pin(crate::blacklist_watcher::run(
+        blacklist_sync,
+        blacklist_poll,
+        blacklist_stop,
+    )));
+    let chain_sync_tasks: Vec<tokio::task::JoinHandle<()>> =
+        chain_sync_tasks.into_iter().map(tokio::spawn).collect();
 
     // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
     // active-staker set + parallel `FindNode(self.node_id)` against a
@@ -1779,11 +1645,12 @@ async fn build_chain_and_handlers(
         ));
 
     Ok(ChainHandlers {
-        event_poll_interval,
+        receipt_poll_interval,
         slash_domain,
         bind_domain,
         staker_set,
-        poller,
+        chain_sync_stop,
+        chain_sync_tasks,
         slash_store,
         node_address_resolver,
         probe_rate_limiter,
@@ -1799,7 +1666,6 @@ async fn build_chain_and_handlers(
         client_handler,
         shed_controller,
         payment_services,
-        payment_pollers,
         admin_pools,
         blacklist_ready_rx,
         binding_report,
@@ -1898,7 +1764,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         .context("no accepted payment pool for the buyer leg")?;
     let buyer_wallet_provider = buyer_pool
         .providers
-        .buyer_wallet((*infra.eth_signer).clone(), ch.event_poll_interval);
+        .buyer_wallet((*infra.eth_signer).clone(), ch.receipt_poll_interval);
     let buyer_pool_store: Arc<dyn decdn_incentive::BuyerPoolStore> = Arc::new(
         crate::pool_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.store_files)),
     );
@@ -2312,9 +2178,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         max_rate_per_mb: cfg.cache.max_rate_per_mb,
-        event_poll_interval: std::time::Duration::from_millis(
-            cfg.blockchain.event_poll_interval_ms,
-        ),
+        // An upstream re-reads a live pool at this cadence, so a top-up shows
+        // there within it.
+        upstream_pool_refresh: crate::pool_view::POOL_REFRESH_INTERVAL,
         lookup: crate::dht::LookupConfig::default(),
         // Own self-attested region for the ADR 030 latency-vs-claim penalty
         // (#1177); `None` disables it (nothing to compare a peer's claim against).
@@ -2732,8 +2598,8 @@ pub async fn run(
         bucket_refresh_stop_tx: bg.bucket_refresh_stop_tx,
         admin_stop_tx: bg.admin_stop_tx,
         rpc_watchdog: bg.rpc_watchdog,
-        poller: ch.poller,
-        payment_pollers: ch.payment_pollers,
+        chain_sync_stop: ch.chain_sync_stop,
+        chain_sync_tasks: ch.chain_sync_tasks,
         payment_services: ch.payment_services,
         receipt_writer: infra.receipt_writer,
         warming_creditor: ch.warming_creditor,
@@ -2768,13 +2634,13 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
-    /// The single multiplexed chain-event poller. Stopped once, late (after
-    /// `router.shutdown`), because its capacity-bond route gates DHT admission
-    /// through drain — see the cancel site in [`shutdown`].
-    poller: crate::chain_events::resumable_watcher::WatcherHandle,
-    /// One poller per payment chain, carrying its pools' settlement routes.
-    /// Stopped beside [`Self::poller`].
-    payment_pollers: Vec<crate::chain_events::resumable_watcher::WatcherHandle>,
+    /// Stops the governance-chain refresh loops (registry, slash, origin seats,
+    /// blacklist). Cancelled once, late (after `router.shutdown`), because the
+    /// registry's staker set gates DHT admission through drain — see the cancel
+    /// site in [`shutdown`].
+    chain_sync_stop: CancellationToken,
+    /// The refresh loop tasks, awaited after [`Self::chain_sync_stop`] fires.
+    chain_sync_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// One settlement service per accepted pool.
     payment_services: Vec<PoolSettlementService<P>>,
     /// The background receipt writer, cancelled once the router has drained
@@ -2835,8 +2701,8 @@ async fn close_router(router: &Router, deadline: Duration) -> bool {
 /// Graceful teardown of [`run`] (#1253). Consumes every field of
 /// [`ShutdownHandles`] via an exhaustive destructure — see that type's docs for
 /// why the `..`-free binding is load-bearing. The teardown ordering here is
-/// itself load-bearing (metrics accept-loop stop first; the multiplexed `poller`
-/// stops after `router.shutdown`) and must not be reordered.
+/// itself load-bearing (metrics accept-loop stop first; the chain refresh loops
+/// stop after `router.shutdown`) and must not be reordered.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn shutdown<P: Provider + Clone + 'static>(
     handles: ShutdownHandles<P>,
@@ -2860,8 +2726,8 @@ async fn shutdown<P: Provider + Clone + 'static>(
         bucket_refresh_stop_tx,
         mut admin_stop_tx,
         rpc_watchdog,
-        poller,
-        payment_pollers,
+        chain_sync_stop,
+        chain_sync_tasks,
         payment_services,
         receipt_writer,
         warming_creditor,
@@ -2919,13 +2785,8 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // flush by a poll — it just cannot report anything once cancelled.
     republish_stop.cancel();
     let _ = bucket_refresh_stop_tx.send(());
-    // The chain watchers are one multiplexed poller with one shutdown token, so
-    // they stop together in a SINGLE `poller.shutdown()` at the LATE point below
-    // (after `router.shutdown`). For the blacklist and rate-bounds routes the
-    // late stop is harmless — neither carries a durable cursor to flush, and
-    // neither is consulted for a drain-time decision (unlike the capacity-bond
-    // route's staker set), so they only keep applying compliance/rate updates a
-    // little longer.
+    // The governance-chain refresh loops share one shutdown token and stop
+    // together at the LATE point below (after `router.shutdown`).
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain
@@ -2967,28 +2828,19 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
     // then closes the endpoint. Bounded, so every step below still runs.
     close_router(&router, SHUTDOWN_DEADLINE).await;
-    // The ONE multiplexed poller driving all registered watcher routes stops here,
-    // once. It exits cooperatively — cancelling its loop at the next await
-    // boundary and flushing every persisting route's checkpoint (settlement's
-    // `PoolOpened`) before returning — with its `WatcherHandle`'s `AbortOnDropHandle`
-    // as the backstop.
-    //
-    // *After* `router.shutdown` deliberately, and the capacity-bond route is why:
-    // its projection is the cached active-staker set, which gates DHT `Store`
-    // admission and decides which probes the stake-lane reservation sheds.
-    // Cancelling it before the drain would freeze that set while the router is
-    // still serving, so a membership change landing mid-drain would be missed by
-    // exactly the requests still in flight. This binding constraint forces the
-    // single stop late; the other four routes (slash, settlement, blacklist,
-    // rate-bounds) are not drain-consulted and could stop earlier, but one shared
-    // token means they stop here too. `shutdown` only cancels the token — it is
-    // not awaited — so settlement's checkpoint flush races the redeem sweep just
-    // below rather than completing before it; that is fine because the flush is
-    // best-effort and the checkpoint is independent of, and idempotent with
-    // respect to, the redeem sweep.
-    poller.shutdown();
-    for payment_poller in &payment_pollers {
-        payment_poller.shutdown();
+    // The governance-chain refresh loops stop here, once, after
+    // `router.shutdown` deliberately: the registry's cached active-staker set
+    // gates DHT `Store` admission and decides which probes the stake-lane
+    // reservation sheds, so freezing it before the drain would miss a
+    // membership change for exactly the requests still in flight. The loops
+    // end at their next await once cancelled.
+    chain_sync_stop.cancel();
+    for task in chain_sync_tasks {
+        if let Err(err) = task.await
+            && err.is_panic()
+        {
+            tracing::error!(error = %err, "a chain refresh loop panicked");
+        }
     }
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
@@ -3005,13 +2857,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
 
     // Redeem on shutdown (#327): now that the router has drained, no further
     // vouchers arrive and the persisted lane state is final. A pool is
-    // owner-closed only, so there is nothing to close here. The poller cancel
-    // above triggers settlement's tail stop and checkpoint flush asynchronously
-    // (best-effort, not awaited before this point), so this quiesces the redeemer
-    // and runs one final best-effort redeem sweep so an above-threshold lane is
-    // not left un-redeemed. The redeem sweep does not depend on the checkpoint
-    // flush having completed — the scan checkpoint is independent lane state and
-    // idempotent to re-scan. Bounded by the deadline
+    // owner-closed only, so there is nothing to close here. Each service stops
+    // its pool refresh, quiesces the redeemer and runs one final best-effort
+    // redeem sweep so an above-threshold lane is not left un-redeemed. Bounded by
+    // the deadline
     // so a slow RPC cannot hang shutdown. The pools redeem concurrently, each
     // on its own chain, under the one deadline.
     futures_util::future::join_all(

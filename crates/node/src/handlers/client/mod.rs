@@ -391,6 +391,50 @@ impl ClientHandler {
             lanes: Arc::clone(&self.lanes),
         }
     }
+
+    /// The live lanes of `deployment`, as pool → signers: every lane that
+    /// accepted a voucher within `window`, and every signer that holds a floor
+    /// reservation (a stream admitted and not yet paid up). The settlement
+    /// service re-reads these pools and signers on its refresh cadence, so a
+    /// live stream's solvency and signer-cap re-checks read recent chain state.
+    pub async fn live_lanes(
+        &self,
+        deployment: Deployment,
+        window: std::time::Duration,
+    ) -> HashMap<B256, std::collections::HashSet<Address>> {
+        let mut live: HashMap<B256, std::collections::HashSet<Address>> = HashMap::new();
+        let since =
+            unix_millis().saturating_sub(u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
+        let handles: Vec<(LaneId, Arc<Mutex<LaneDeliveryState>>)> = self
+            .lanes
+            .iter()
+            .filter(|e| e.key().deployment == deployment)
+            .map(|e| (*e.key(), Arc::clone(e.value())))
+            .collect();
+        for (lane, state) in handles {
+            let stamped = state.lock().await.last_voucher_at.load(Ordering::Relaxed);
+            if stamped != 0 && stamped >= since {
+                live.entry(lane.key.pool_id)
+                    .or_default()
+                    .insert(lane.key.signer);
+            }
+        }
+        let floors = self
+            .pool_floor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for ((pool_deployment, pool_id), floor) in floors.iter() {
+            if *pool_deployment != deployment {
+                continue;
+            }
+            for (signer, state) in &floor.signers {
+                if !state.is_empty() {
+                    live.entry(*pool_id).or_default().insert(*signer);
+                }
+            }
+        }
+        live
+    }
 }
 
 /// One capability signer's slice of a pool's floor accounting (ADR 003 §Pool
@@ -1834,9 +1878,9 @@ impl ClientHandler {
     /// - No pool view wired (dev/test, no chain): `None`. There is nothing to
     ///   check, so the stream fails open.
     /// - The view holds no status for the pool: [`ServeStop::PoolClosed`].
-    ///   Admission puts every admitted stream's pool in the view, and the view
-    ///   drops a pool only once it is reclaimed or a re-anchor read finds it
-    ///   closed, so the pool closed under this stream. `redeemMany` reverts on a
+    ///   Admission puts every admitted stream's pool in the view, and the
+    ///   view drops a live lane's pool only once a refresh read finds it
+    ///   closed or absent, so the pool closed under this stream. `redeemMany` reverts on a
     ///   closed pool.
     /// - The pool is `Closing` and its dispute deadline falls inside the
     ///   capability expiry margin ([`Self::inside_expiry_margin`]):
@@ -2474,7 +2518,7 @@ impl ClientHandler {
                 interval = ?self.deposit_refusal_warn.interval(),
                 "refusing paying clients: pool's refundable remaining deposit below the reserved cost. \
                  A sustained rate here is either a client running dry (no action) or this \
-                 node's chain watcher lagging behind an on-chain top-up (check RPC health) \
+                 node's pool read older than an on-chain top-up (check RPC health) \
                  — see docs/runbook.md"
             );
         }
@@ -2613,7 +2657,7 @@ impl ClientHandler {
     ///
     /// `remaining` is a chain quantity read from `getPool`; the handler does not
     /// hold an RPC client, so **E4 threads `remaining` to every call site** (from
-    /// the redemption/pool watcher's cached `getPool` view, cached like
+    /// the pool view's held `getPool` read, cached like
     /// `withdrawn_cache`). This method owns only the policy arithmetic.
     pub(super) fn pool_remaining_covers_window(
         &self,

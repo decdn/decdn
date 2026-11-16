@@ -7,15 +7,19 @@
 //! operator unseated from one namespace stays in the set while it holds a seat
 //! in another.
 //!
-//! [`SeatedOriginSet`] is the in-memory projection. The chain watcher in
+//! [`SeatedOriginSet`] is the in-memory projection. The snapshot in
 //! [`crate::origin_seat_watcher`] fills it from `OriginAssignment` and keeps it
 //! current. Before the first successful read the set is empty, so no record is
-//! valid: the set fails closed.
+//! valid: the set fails closed. A lookup for an operator the set does not hold
+//! asks that snapshot for an early re-read, so a newly seated origin's records
+//! become valid without waiting out the refresh interval.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 
 use alloy::primitives::{Address, U256};
+
+use crate::chain_events::refresh::RefreshTrigger;
 
 /// Read-only view of the seated-origin set.
 pub trait SeatedOrigins: Send + Sync + std::fmt::Debug {
@@ -36,9 +40,18 @@ pub trait SeatedOrigins: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct SeatedOriginSet {
     seats: RwLock<HashMap<Address, HashSet<U256>>>,
+    /// Asks the seat snapshot for an early re-read when a lookup misses.
+    on_miss: RefreshTrigger,
 }
 
 impl SeatedOriginSet {
+    /// The trigger a lookup miss pulls; the seat snapshot's refresh loop
+    /// listens to it.
+    #[must_use]
+    pub fn refresh_trigger(&self) -> RefreshTrigger {
+        self.on_miss.clone()
+    }
+
     /// An empty set: no attestation is valid until seats are added.
     #[must_use]
     pub fn new() -> Self {
@@ -83,10 +96,15 @@ impl SeatedOriginSet {
 
 impl SeatedOrigins for SeatedOriginSet {
     fn is_seated(&self, operator: &Address) -> bool {
-        self.seats
+        let seated = self
+            .seats
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(operator)
+            .contains_key(operator);
+        if !seated {
+            self.on_miss.request();
+        }
+        seated
     }
 
     fn len(&self) -> usize {

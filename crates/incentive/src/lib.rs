@@ -49,10 +49,10 @@
 //! # Who drives settlement
 //!
 //! This crate holds the primitives. The `decdn-node` daemon drives both sides
-//! of settlement with them. As a seller, it records each lane's watermark from
-//! the `PoolOpened` and `Redeemed` events, redeems every lane worth the gas on a
-//! sweep that runs well inside a closing pool's grace window, and forgets a
-//! reclaimed pool. As a buyer on a cache miss,
+//! of settlement with them. As a seller, it reads each pool by `eth_call`,
+//! records each lane's paid watermark from its own `redeemMany` receipts,
+//! redeems every lane worth the gas on a sweep that runs well inside a closing
+//! pool's grace window, and forgets a closed pool. As a buyer on a cache miss,
 //! it approves USDC once, opens or tops up a pool, signs the vouchers, and
 //! closes and reclaims a pool it no longer uses.
 //!
@@ -137,9 +137,8 @@ pub use rate::{
     BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, pool_budget_covers, verify_rate,
 };
 pub use store::{
-    CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, MemorySettlementLedger,
-    PendingSettle, PendingSettleStore, PoolStateStore, SettlementKey, SettlementLedger,
-    SettlementRecord, StoreError,
+    MemoryPoolStateStore, MemorySettlementLedger, PendingSettle, PendingSettleStore,
+    PoolStateStore, SettlementKey, SettlementLedger, SettlementRecord, StoreError,
 };
 pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSlashData, StreamSlashError};
 pub use voucher::{

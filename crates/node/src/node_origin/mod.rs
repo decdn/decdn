@@ -522,14 +522,11 @@ pub struct NodeOriginConfig {
     /// refuses a stream quote that exceeds the lower of the two before paying — and
     /// retains the signed over-quote as rate-manipulation evidence.
     pub max_rate_per_mb: u64,
-    /// How often this node's chain watcher polls for events
-    /// (`blockchain.event_poll_interval_ms`), used to size the settle window
-    /// after a funding recovery step's top-up (#1530).
-    ///
-    /// The wait is for the UPSTREAM's watcher, not ours, but every node in the
-    /// network runs the same default cadence and this is the only local reading of
-    /// it we have. See `funder::settle_wait_budget`.
-    pub event_poll_interval: Duration,
+    /// How often an upstream re-reads a live pool's `getPool`
+    /// (`pool_view::POOL_REFRESH_INTERVAL`), used to size the settle window
+    /// after a funding recovery step's top-up (#1530). See
+    /// `funder::settle_wait_budget`.
+    pub upstream_pool_refresh: Duration,
     /// DHT lookup tuning.
     pub lookup: LookupConfig,
     /// This node's self-attested region (`identity.region`), or `None` when
@@ -972,7 +969,7 @@ impl Origin for NodeOrigin {
                 // and the candidates of both walks that refused this node's
                 // funding: the ones the step asks again.
                 let gate = Arc::new(RecoveryGate::with_settle(settle_window(
-                    deps.config.event_poll_interval,
+                    deps.config.upstream_pool_refresh,
                 )));
                 // The deposit this fill starts at. A sibling fill's step that
                 // lands above it serves this fill too.
@@ -2219,8 +2216,8 @@ async fn try_pull(
 ///
 /// The first step of a fill is always allowed; a further step only after a
 /// byte verified since the last one. A step that tops the pool up opens the
-/// gate's settle window: a candidate that still refuses inside it is the
-/// upstream's chain watcher lagging the new deposit, so the fill waits a
+/// gate's settle window: a candidate that still refuses inside it holds a
+/// pool read older than the new deposit, so the fill waits a
 /// [`SETTLE_POLL_STEP`] and asks again instead of taking another step. A fill
 /// that can take no step ends "funding needed" ([`PullMiss::FundingNeeded`]),
 /// which still answers the client `NotFound`.
