@@ -53,6 +53,7 @@ GRAPH: dict[str, list[str]] = {
     ],
     "decdn-cli": [
         "decdn-bao-range",
+        "decdn-cache",
         "decdn-client",
         "decdn-common",
         "decdn-config-types",
@@ -77,7 +78,7 @@ GRAPH: dict[str, list[str]] = {
 }
 
 DEV: dict[str, list[str]] = {
-    "decdn-cli": ["decdn-cache", "decdn-incentive", "decdn-node"],
+    "decdn-cli": ["decdn-incentive", "decdn-node"],
     "decdn-node": ["decdn-client", "decdn-incentive"],
     "sponsord": ["decdn-client", "decdn-e2e", "sponsord-core"],
     "sponsord-core": ["decdn-e2e"],
@@ -90,9 +91,11 @@ EXTERNAL: dict[str, list[str]] = {
     "iroh-blobs": ["iroh"],
     "aws-sdk-s3": [],
 }
+# The cache links the S3 SDK only under its `s3` feature, which the node turns
+# on and the CLI does not.
 EXTERNAL_EDGES: dict[str, list[str]] = {
-    "decdn-cache": ["iroh-blobs", "aws-sdk-s3"],
-    "decdn-node": ["iroh-blobs", "iroh"],
+    "decdn-cache": ["iroh-blobs"],
+    "decdn-node": ["iroh-blobs", "iroh", "aws-sdk-s3"],
     "decdn-cli": ["iroh"],
     "decdn-common": ["iroh"],
 }
@@ -253,16 +256,17 @@ def test_dev_dependencies_are_not_edges():
 
 
 def test_closure_must_not_reach_the_blob_store():
-    """A leak below the SDK reaches every guarded crate built on it; each gets its own error.
+    """A leak below the SDK reaches every guarded crate built on it but the CLI.
 
-    The onramp sits on the wire types alone, so it is the one guarded crate
-    the leak misses.
+    The CLI may link the blob store for its gateway cache, and the onramp sits
+    on the wire types alone, so those two are the guarded crates the leak
+    misses.
     """
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-common"].append("iroh-blobs")
     errors = run(external_edges=ext)
-    assert len(errors) == 3, errors
-    assert [e.split()[0] for e in errors] == ["decdn-cli", "decdn-client", "sponsord"], errors
+    assert len(errors) == 2, errors
+    assert [e.split()[0] for e in errors] == ["decdn-client", "sponsord"], errors
     for e in errors:
         assert "iroh-blobs" in e
         assert "decdn-common" in e, "the path should name the crate that introduced it"
@@ -293,22 +297,27 @@ def test_client_sdk_is_guarded_without_the_cli():
 
 def test_cli_only_leak_does_not_blame_the_sdk():
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
-    ext["decdn-cli"].append("iroh-blobs")
+    ext["decdn-cli"].append("aws-sdk-s3")
     errors = run(external_edges=ext)
     assert len(errors) == 1, errors
-    assert errors[0].startswith("decdn-cli links iroh-blobs"), errors[0]
+    assert errors[0].startswith("decdn-cli links aws-sdk-s3"), errors[0]
+
+
+def test_cli_may_link_the_blob_store_through_the_cache():
+    """The gateway cache puts iroh-blobs in the CLI's closure, and only there."""
+    assert "iroh-blobs" in cce.MAY_LINK["decdn-cli"]
+    assert run() == []
 
 
 def test_cli_closure_ignores_dev_only_routes():
-    """`cli` dev-depends on `cache`, which links iroh-blobs; that is not a leak."""
-    dev = {"decdn-cli": ["decdn-cache"]}
+    """`cli` dev-depends on `node`, which links the S3 SDK; that is not a leak."""
+    dev = {"decdn-cli": ["decdn-node"]}
     assert run(dev=dev) == []
 
 
 @pytest.mark.parametrize(
     "forbidden",
     [
-        "iroh-blobs",
         "aws-sdk-s3",
         "aws-config",
         "aws-smithy-types",

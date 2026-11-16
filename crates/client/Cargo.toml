@@ -17,8 +17,10 @@ categories.workspace = true
 # store — and the single-deadline `PullDeadlines::whole_transfer` shape they pass,
 # which deliberately builds the zero-stall / uncapped state the production
 # constructors reject. Gated so a production caller cannot even name them (#1145
-# review); enabled by downstream test suites via `dev-dependencies`.
-test-util = []
+# review); enabled by downstream test suites via `dev-dependencies`. Also turns
+# on `decdn-bao-range/test-util`, where `ProvenSize::assume_for_tests` and the
+# in-memory reader's `StashedFault` live.
+test-util = ["decdn-bao-range/test-util"]
 # Gates the slow `public_api` snapshot test out of the default
 # `cargo nextest --workspace` (coverage) run. CI's dedicated `public-api` job
 # opts in with `--features public-api-test`.

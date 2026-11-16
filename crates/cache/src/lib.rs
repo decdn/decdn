@@ -16,6 +16,7 @@
 //! | Stream a verified sub-range from the origin, one window per draw | [`CacheEngine::origin_range_wire`] |
 //! | Export a stored range as the bao wire encoding | [`CacheEngine::export_bao_range_stream`] |
 //! | Admit a verified bao stream into the store | [`CacheEngine::admit_bao_stream`] |
+//! | Let a paid pull fill the store, or read it back as it fills | [`CacheStore`] |
 //! | Share one in-progress fill between several readers | [`FillRegistry`], [`FillSession`] |
 //! | Pick an origin backend | [`FilesystemOrigin`], [`HttpOrigin`], `S3Origin` (feature `s3`), or your own [`Origin`] |
 //! | Choose what to admit and what to evict | [`AdmissionPolicy`], [`EvictionPolicy`] ([ADR 040]) |
@@ -42,6 +43,7 @@
 //! [ADR 040]: https://github.com/decdn/decdn/blob/main/adr/040-cache-policy.md
 //! [PoC/production seams]: https://github.com/decdn/decdn/blob/main/adr/appendix-poc-production-seams.md
 
+pub mod cache_store;
 pub mod circuit_breaker;
 pub mod engine;
 pub mod error;
@@ -60,6 +62,7 @@ pub mod retry;
 pub mod serve_store;
 mod size_proofs;
 
+pub use cache_store::{CacheStore, OnAdmitted};
 pub use circuit_breaker::{
     Admission, BreakerState, Clock, ManualClock, OriginBreaker, OriginOutcome, SystemClock,
 };
@@ -71,8 +74,8 @@ pub use circuit_breaker::{
 /// under-reserves by up to two groups.
 pub use decdn_bao_range::CHUNK_GROUP_BYTES;
 pub use engine::{
-    AdmitControl, AdmitEnd, CacheEngine, EvictionCandidates, EvictionPreview, OriginHeldReport,
-    OriginPresence, PresentRanges, ServeAudit,
+    AdmitControl, AdmitEnd, CacheEngine, EvictionCandidates, EvictionPreview, InUse,
+    OriginHeldReport, OriginPresence, PresentRanges, ServeAudit,
 };
 pub use error::{
     CacheError, CacheResult, ErrorChain, OriginError, OriginPullError, SupportedEncoding,

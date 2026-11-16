@@ -43,8 +43,8 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   `OriginKind`, `PinnedHashes`, `Hash`) and the `Hash` returned by
   `parse_hash_arg` live in the `decdn-config-types` leaf crate
   (serde + `url` only — no iroh-blobs, no AWS SDK). `decdn-common`
-  therefore does **not** depend on `decdn-cache`, so `decdn` links
-  none of the blob-store/AWS weight. The daemon's `evict`
+  therefore does **not** depend on `decdn-cache`; `decdn` links the
+  blob store for its gateway cache alone, and no AWS SDK. The daemon's `evict`
   handler converts the leaf `Hash` to the blob-store hash via
   `decdn_cache::to_store_hash` at its boundary.
 
@@ -70,7 +70,7 @@ noun the command operates on.
 both binaries, so fragmenting it has no payoff. The cache-typed
 `config` value types were instead split into the `decdn-config-types`
 leaf crate — extract the shared value types, not the crate — so the
-CLI links no blob store.
+CLI's config never pulls in the blob store.
 
 ### Why the metric prefix and OTLP `service.name` stay `decdn`
 
@@ -221,12 +221,13 @@ first and refuses a `decdn` binary that holds it.
   `cargo bloat --release --bin decdn -n 20` and
   `ls -lh target/release/decdn target/release/decdn-node` after each
   significant CLI change. Soft target ≤ 50 MB stripped (the dockerd
-  CLI is ≈ 50 MB). The single largest contributor — `iroh-blobs` and
-  the AWS SDK reaching `decdn` via `cli → common → cache` — was
-  removed by extracting `decdn-config-types`; `decdn` no
-  longer links the blob store or AWS SDK at all (`reqwest`/`iroh`
-  remain, via `alloy` and the direct `iroh` dep — not the cache).
+  CLI is ≈ 50 MB). `decdn` links the AWS SDK nowhere: the config
+  vocabulary lives in `decdn-config-types`, and `decdn gateway` links
+  `decdn-cache` store-only, without its `s3` feature. The gateway cache
+  is the one blob store in `decdn` (`iroh-blobs`, about 1.3 MiB
+  stripped); the `decdn-client` SDK links none.
   Regression guard: `.github/scripts/check_crate_edges.py` fails CI when
-  the normal or build closure of `decdn-cli` or of the `decdn-client` SDK
-  contains `iroh-blobs` or an AWS SDK crate. Dev-dependencies still pull
-  them for the integration tests. That does not affect the release binary.
+  the normal or build closure of `decdn-cli` contains an AWS SDK crate, or
+  that of the `decdn-client` SDK contains `iroh-blobs` or an AWS SDK
+  crate. Dev-dependencies still pull them for the integration tests. That
+  does not affect the release binary.

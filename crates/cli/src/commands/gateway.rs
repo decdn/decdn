@@ -135,6 +135,24 @@
 //! the buyer-pool store and the connections to nodes are built once per
 //! gateway run, and up to 16 pulls stream at once, so a response whose reader
 //! stops holds only its own pull.
+//!
+//! **Cache.** Every pull streams into a [`CacheEngine`] under
+//! `<data-dir>/cache` (`fetch::CacheStores`), which keeps each chunk group
+//! verified against the blob's hash. A request whose bytes the cache holds,
+//! the whole blob or its one `Range`, at the size a holder proved, is served
+//! out of the cache (`Gateway::cache_hit`): no pull, no capability spent, and
+//! no allowance charged, so a spent allowance still gets it
+//! (`Gateway::cached_only`). A loopback page no capability covers gets its
+//! 402 all the same, as that refusal is how a page learns to register a
+//! capability. A manifest the cache holds whole is
+//! read from it with no pull. A blob the cache holds whole answers `HEAD` and gives
+//! its length with no size lookup. A request the cache holds only part of
+//! streams as a pull, which fetches only what the cache lacks, and is charged
+//! as a pull is. A hit counts as a use for eviction, and no entry a pull is
+//! filling or a hit is reading is released. The eviction loop holds the cache under `--cache-mb`, and
+//! under what keeps the node's default free-disk margin on the volume;
+//! `--cache-mb 0` turns the cache off and each pull fills a scratch directory
+//! that ends with it.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -167,10 +185,13 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Semaphore, SemaphorePermit, oneshot};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc, oneshot};
+
+use decdn_cache::{CacheEngine, CacheMetrics};
 
 use super::fetch::{
-    BlobFetch, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb, resolve_chain,
+    BlobFetch, CacheStores, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb,
+    resolve_chain,
 };
 use super::local_http::{
     Body, allowed_hosts, carries_token, full, host_header, json, load_or_create_token, private_dir,
@@ -349,11 +370,17 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("listen on {}", args.listen))?;
+    let cache = open_cache(&root, args.cache_mb, common.max_blob_mb).await?;
+    let eviction = cache
+        .as_ref()
+        .map(|(engine, metrics)| start_eviction(engine, metrics, args.cache_mb, &root));
+    let cache = cache.map(|(engine, _)| engine);
     let pulls = PullWorker::start(
         FetchBackend {
             common: common.clone(),
             config_path: config_path.map(Path::to_path_buf),
             pool: public_url.is_some(),
+            cache: cache.clone().map(CacheStores::new),
         },
         MAX_PULLS,
     )
@@ -366,6 +393,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         chain,
         delegates: Mutex::new(HashMap::new()),
         pulls,
+        cache: cache.clone(),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
         manifest_fills: std::sync::Mutex::default(),
@@ -392,7 +420,97 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     // The worker's queued lane writes land before the store dir is removed.
     gateway.pulls.stop().await;
     drop(temp_store);
+    close_cache(eviction, cache.as_ref()).await;
     served
+}
+
+/// Stop the eviction loop, wait for its sweep to end, then shut `cache` down,
+/// so no release races the cache's last writes and those writes reach its
+/// database before the process exits.
+async fn close_cache(
+    eviction: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
+    cache: Option<&CacheEngine>,
+) {
+    if let Some((stop, sweeping)) = eviction {
+        let _ = stop.send(());
+        if let Err(e) = sweeping.await {
+            tracing::warn!(error = %e, "the gateway cache's eviction loop did not end cleanly");
+        }
+    }
+    if let Some(engine) = cache
+        && let Err(e) = engine.shutdown().await
+    {
+        tracing::warn!(error = %e, "the gateway cache did not shut down cleanly");
+    }
+}
+
+/// The cache directory under the gateway's data dir.
+const CACHE_DIR: &str = "cache";
+
+/// Open the gateway's cache under `root`, or `None` when `cache_mb` is `0`.
+/// It has no origin: only the gateway's own pulls fill it.
+///
+/// # Errors
+///
+/// The directory cannot be created, or the store cannot open: another
+/// gateway on the same data dir holds it.
+async fn open_cache(
+    root: &Path,
+    cache_mb: u64,
+    max_blob_mb: u64,
+) -> anyhow::Result<Option<(CacheEngine, Arc<CacheMetrics>)>> {
+    if cache_mb == 0 {
+        return Ok(None);
+    }
+    let dir = root.join(CACHE_DIR);
+    private_dir(&dir)?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let engine = CacheEngine::open_full(
+        &dir,
+        Vec::new(),
+        max_blob_mb,
+        decdn_cache::PinnedHashes::empty(),
+        decdn_cache::RetryPolicy::default(),
+        decdn_cache::CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&metrics)),
+        Duration::from_secs(decdn_common::config::DEFAULT_GC_INTERVAL_SEC),
+    )
+    .await
+    .with_context(|| format!("open the gateway cache at {}", dir.display()))?;
+    Ok(Some((engine, metrics)))
+}
+
+/// Run the cache's eviction loop (#1173, ADR 040) under `cache_mb`, with the
+/// node's default marks, sweep budget, tick and free-disk margin. The loop
+/// stops at its next tick once the returned sender fires or drops; the
+/// returned task ends with it.
+fn start_eviction(
+    engine: &CacheEngine,
+    metrics: &Arc<CacheMetrics>,
+    cache_mb: u64,
+    root: &Path,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    use decdn_common::config as defaults;
+    let (stop, stopped) = oneshot::channel();
+    let params = decdn_cache::EvictionParams {
+        cache_size_mb: cache_mb,
+        disk_headroom_mb: defaults::DEFAULT_DISK_HEADROOM_MB,
+        high_water_pct: defaults::DEFAULT_EVICTION_HIGH_WATER_PCT,
+        target_pct: defaults::DEFAULT_EVICTION_TARGET_PCT,
+        per_sweep_budget: defaults::DEFAULT_EVICTION_PER_SWEEP_BUDGET,
+        tick: Duration::from_secs(defaults::DEFAULT_EVICTION_TICK_SECS),
+    };
+    let dir = root.join(CACHE_DIR);
+    let sweeping = tokio::spawn(decdn_cache::eviction_driver::run(
+        engine.clone(),
+        Arc::clone(metrics),
+        params,
+        Arc::new(decdn_cache::LruEviction),
+        move || decdn_common::disk::statvfs_target(&dir).map(|space| space.avail),
+        |_| {},
+        stopped,
+    ));
+    (stop, sweeping)
 }
 
 /// Print where the gateway serves, and on loopback its token and the
@@ -924,6 +1042,9 @@ struct Gateway {
     delegates: Mutex<HashMap<Address, Delegate>>,
     /// Runs every pull, on one endpoint and one buyer-pool store.
     pulls: PullWorker,
+    /// What the pulls filled, for a later request to read with no pull and
+    /// no allowance; `None` with `--cache-mb 0`.
+    cache: Option<CacheEngine>,
     manifests: std::sync::Mutex<ManifestCache>,
     /// Hashes a pull found to be no manifest, so a repeat request pays for
     /// no second pull.
@@ -2012,12 +2133,19 @@ impl Gateway {
         present: Present,
         ask: Ask<'_>,
     ) -> Response<Body> {
+        // The allowance meters what the gateway pays for, and a response the
+        // cache holds whole costs no pull, so a spent allowance still gets it.
         if let Some(refused) = self.allowance_refusal(pointer, uri) {
-            return refused;
+            return match self.cached_only(uri, present, ask).await {
+                Some(response) => response,
+                None => refused,
+            };
         }
         // A funding stop retires the capability and the next covering one
         // takes the request, so a capability that cannot pay costs a retry,
-        // never a failed load. Each pass retires one, so the loop ends.
+        // never a failed load. Each pass retires one, so the loop ends. A page
+        // no capability covers gets the 402 even for a cached blob: the
+        // refusal is how the page learns to register a capability.
         loop {
             let Some(paying) = self.paying_for(page_host, pointer).await else {
                 return text(
@@ -2040,6 +2168,48 @@ impl Gateway {
                 Err(e) => return pull_failed(e, uri, page_host, self.public()),
             }
         }
+    }
+
+    /// `uri` answered out of the cache alone, at no pull: a blob, a bundle
+    /// entry, or a site's `index.html`, whose response bytes the cache holds
+    /// ([`Self::cache_hit`]), at a size the gateway knows with no pull. The
+    /// manifest comes from what the gateway already holds
+    /// ([`Self::known_manifest`]). An empty blob and an unsatisfiable range
+    /// are answered too, as they cost nothing. `None` for anything else: a
+    /// `HEAD`, a listing, a manifest or a byte the cache lacks.
+    async fn cached_only(
+        self: &Arc<Self>,
+        uri: &DecdnUri,
+        present: Present,
+        ask: Ask<'_>,
+    ) -> Option<Response<Body>> {
+        let Ask::Get(range) = ask else {
+            return None;
+        };
+        let manifest;
+        let (hash, path, size) = if matches!(uri.target, UriTarget::Blob) {
+            (uri.hash, None, Some(self.blob_size(uri.hash).await?))
+        } else {
+            let wanted = match &uri.target {
+                UriTarget::BundleEntry(path) => path.as_str(),
+                UriTarget::Bundle if present == Present::Site => "index.html",
+                _ => return None,
+            };
+            let cap_mb = manifest_cap_mb(self.common.max_blob_mb);
+            manifest = self.known_manifest(uri.hash, cap_mb).await?.ok()?;
+            let entry = manifest.entries.iter().find(|e| e.path == wanted)?;
+            (entry.hash, Some(entry.path.as_str()), entry.size)
+        };
+        let name = served_name(hash, path);
+        let extent = match Extent::of(size, range, rewrites(present, path.unwrap_or(&name))) {
+            Ok(extent) => extent,
+            Err(size) => return Some(not_satisfiable(size)),
+        };
+        if size == Some(0) {
+            return Some(empty_entry(&name, hash, present));
+        }
+        let engine = self.cache_hit(hash, &extent).await?;
+        self.from_cache(engine, hash, path, &extent, present).ok()
     }
 
     /// The 402 for `uri` once the public allowance `bucket` ran out under a
@@ -2133,6 +2303,11 @@ impl Gateway {
             Ok(extent) => extent,
             Err(size) => return Ok(not_satisfiable(size)),
         };
+        if size != Some(0)
+            && let Some(engine) = self.cache_hit(uri.hash, &extent).await
+        {
+            return self.from_cache(engine, uri.hash, None, &extent, present);
+        }
         if let Some(refused) = self.over_blob_cap(extent.billable()) {
             return Ok(refused);
         }
@@ -2147,7 +2322,8 @@ impl Gateway {
     }
 
     /// The verified size of the blob `hash` that a fetch here learned
-    /// ([`PullWorker::size`]); the empty root's is zero. Every size a node
+    /// ([`PullWorker::size`]), or that of a blob the cache holds whole
+    /// ([`Self::cached_size`]); the empty root's is zero. Every size a node
     /// states arrives with its size proof, which the fetch verified (ADR 005 §
     /// Bounded byte ranges), so the server can stop reading a body at
     /// its length.
@@ -2155,7 +2331,22 @@ impl Gateway {
         if hash == decdn_protocol::EMPTY_ROOT {
             return Some(0);
         }
-        self.pulls.size(hash).await
+        if let Some(size) = self.pulls.size(hash).await {
+            return Some(size);
+        }
+        self.cached_size(hash).await
+    }
+
+    /// The size of `hash` when the cache holds the whole blob: its last chunk
+    /// verified, so the size is the blob's own.
+    async fn cached_size(&self, hash: [u8; 32]) -> Option<u64> {
+        let present = self
+            .cache
+            .as_ref()?
+            .present_ranges(decdn_cache::Hash::from_bytes(hash))
+            .await
+            .ok()?;
+        present.is_complete().then(|| present.size())
     }
 
     /// Learn the verified size of the blob `uri` names before its response,
@@ -2213,7 +2404,9 @@ impl Gateway {
     /// One bundle entry, by its literal manifest path. A path the manifest
     /// lacks answers 404, and so does a blob that is not a manifest or a
     /// malformed one ([`Self::manifest`]). On a site, a path that names a
-    /// directory with an `index.html` redirects to the directory.
+    /// directory with an `index.html` redirects to the directory. An entry
+    /// whose pull, by its declared size, passes `--max-blob-mb` answers 413
+    /// before any pull, as a raw blob does ([`Self::over_blob_cap`]).
     async fn entry(
         self: &Arc<Self>,
         manifest_hash: [u8; 32],
@@ -2234,6 +2427,14 @@ impl Gateway {
                 Ok(extent) => extent,
                 Err(size) => return Ok(not_satisfiable(size)),
             };
+            if entry.size != Some(0)
+                && let Some(engine) = self.cache_hit(entry.hash, &extent).await
+            {
+                return self.from_cache(engine, entry.hash, Some(path), &extent, present);
+            }
+            if let Some(refused) = self.over_blob_cap(extent.billable()) {
+                return Ok(refused);
+            }
             if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
             }
@@ -2276,6 +2477,14 @@ impl Gateway {
                 Ok(extent) => extent,
                 Err(size) => return Ok(not_satisfiable(size)),
             };
+            if entry.size != Some(0)
+                && let Some(engine) = self.cache_hit(entry.hash, &extent).await
+            {
+                return self.from_cache(engine, entry.hash, Some(&entry.path), &extent, present);
+            }
+            if let Some(refused) = self.over_blob_cap(extent.billable()) {
+                return Ok(refused);
+            }
             if let Some(refused) = self.too_large(paying.bucket(), &uri, extent.billable(), false) {
                 return Ok(refused);
             }
@@ -2348,6 +2557,56 @@ impl Gateway {
 
     /// What the gateway knows of `hash` as a manifest: the parsed manifest,
     /// or why it is none.
+    /// What the gateway knows of `hash` as a manifest with no pull: a parsed
+    /// manifest or a verdict it kept ([`Self::cached_manifest`]), else the
+    /// blob the cache holds whole ([`Self::manifest_from_cache`]).
+    async fn known_manifest(
+        &self,
+        hash: [u8; 32],
+        cap_mb: u64,
+    ) -> Option<Result<Arc<BundleManifest>, NotManifest>> {
+        match self.cached_manifest(&hash) {
+            Some(known) => Some(known),
+            None => self.manifest_from_cache(hash, cap_mb).await,
+        }
+    }
+
+    /// The manifest `hash` read out of the cache, when the cache holds the
+    /// blob whole and it fits the manifest cap `cap_mb`: parsed with no pull,
+    /// and kept as a pulled manifest or verdict is. A blob past the cap is
+    /// left to a pull, whose cap stop names the raw blob.
+    async fn manifest_from_cache(
+        &self,
+        hash: [u8; 32],
+        cap_mb: u64,
+    ) -> Option<Result<Arc<BundleManifest>, NotManifest>> {
+        let engine = self.cache.as_ref()?;
+        let size = self.cached_size(hash).await?;
+        if size == 0 || size > cap_mb.saturating_mul(1024 * 1024) {
+            return None;
+        }
+        let bytes = engine
+            .export_range(decdn_cache::Hash::from_bytes(hash), 0, size)
+            .await
+            .ok()?;
+        let verdict = BundleManifest::parse(&bytes)
+            .map(Arc::new)
+            .map_err(NotManifest::unparsed);
+        match &verdict {
+            Ok(manifest) => self
+                .manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(hash, Arc::clone(manifest), bytes.len()),
+            Err(not) => self
+                .not_manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(hash, not.clone()),
+        }
+        Some(verdict)
+    }
+
     fn cached_manifest(&self, hash: &[u8; 32]) -> Option<Result<Arc<BundleManifest>, NotManifest>> {
         let manifest = self
             .manifests
@@ -2385,7 +2644,7 @@ impl Gateway {
         let not_manifest = |verdict: &NotManifest| {
             PullError::NotManifest(verdict.error(cap_mb, &raw, raw_past_cap))
         };
-        if let Some(known) = self.cached_manifest(&hash) {
+        if let Some(known) = self.known_manifest(hash, cap_mb).await {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
         let flight = self.manifest_flight((hash, namespace));
@@ -2393,7 +2652,7 @@ impl Gateway {
         let mut failed = flight.failed.lock().await;
         // A request that waited on the fill lock finds what the one before it
         // pulled.
-        if let Some(known) = self.cached_manifest(&hash) {
+        if let Some(known) = self.known_manifest(hash, cap_mb).await {
             return known.map_err(|verdict| not_manifest(&verdict));
         }
         if flight.ended.load(Ordering::Relaxed) > seen
@@ -2548,18 +2807,8 @@ impl Gateway {
         extent: Extent,
         present: Present,
     ) -> Result<Response<Body>, PullError> {
-        let name = path
-            .and_then(|p| p.rsplit('/').next())
-            .map_or_else(|| alloy::hex::encode(hash), str::to_owned);
-        let (content_type, rewrite) = match present {
-            Present::Bare | Present::Download => (content_type(&name), None),
-            Present::Site => {
-                let content_type = site::content_type(&name);
-                let essence = content_type.split(';').next().unwrap_or_default();
-                let rewrite = Rewrite::for_type(essence);
-                (content_type, rewrite)
-            }
-        };
+        let name = served_name(hash, path);
+        let (content_type, rewrite) = presentation(present, &name);
         // The pull holds no more than the size the manifest declares or a
         // pull verified, and takes only the window a range asked for.
         let (first, reader, done, guard) = self
@@ -2592,48 +2841,64 @@ impl Gateway {
             Payment::Pool { .. } => None,
         };
         let body = futures_util::stream::unfold(state, move |s| next_frame(s, signer));
-        let disposition = if present == Present::Download {
-            "attachment"
-        } else {
-            "inline"
+        streamed_response(&name, &content_type, present, &extent, body)
+    }
+
+    /// The cache entry of `hash` when it holds every byte `extent` streams,
+    /// at the size `extent` names; `None` with no cache, or an extent of
+    /// unknown size. The entry's size is the size its fill opened with, which
+    /// a holder proved, so a declared size that differs is no hit.
+    async fn cache_hit(&self, hash: [u8; 32], extent: &Extent) -> Option<CacheEngine> {
+        let engine = self.cache.as_ref()?;
+        let size = extent.size?;
+        let present = engine
+            .present_ranges(decdn_cache::Hash::from_bytes(hash))
+            .await
+            .ok()?;
+        if present.size() != size {
+            return None;
+        }
+        let (offset, len) = extent.window.unwrap_or((0, size));
+        let end = offset.saturating_add(len);
+        let needed = bao_tree::ChunkRanges::from(
+            bao_tree::ChunkNum(offset / BAO_CHUNK_BYTES)
+                ..bao_tree::ChunkNum(end.div_ceil(BAO_CHUNK_BYTES)),
+        );
+        needed
+            .is_subset(present.chunk_ranges())
+            .then(|| engine.clone())
+    }
+
+    /// A response streaming `hash`'s bytes straight out of `engine`, which
+    /// holds every one of them ([`Self::cache_hit`]): no pull, and no charge
+    /// against the allowance. A read that fails mid-body (the entry evicted
+    /// under it) ends the body with an error.
+    fn from_cache(
+        self: &Arc<Self>,
+        engine: CacheEngine,
+        hash: [u8; 32],
+        path: Option<&str>,
+        extent: &Extent,
+        present: Present,
+    ) -> Result<Response<Body>, PullError> {
+        let name = served_name(hash, path);
+        let (content_type, rewrite) = presentation(present, &name);
+        let size = extent.size.unwrap_or_default();
+        let (offset, len) = extent.window.unwrap_or((0, size));
+        self.metrics.cache_hit();
+        let state = CachedBody {
+            chunks: read_cached(
+                engine,
+                decdn_cache::Hash::from_bytes(hash),
+                offset,
+                offset.saturating_add(len),
+            ),
+            rewrite,
+            gateway: Arc::clone(self),
+            ended: false,
         };
-        let status = if extent.window.is_some() {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::OK
-        };
-        let mut response = Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(
-                header::CONTENT_DISPOSITION,
-                format!(
-                    "{disposition}; filename=\"{}\"",
-                    name.replace(['"', '\\'], "_")
-                ),
-            )
-            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
-        if present == Present::Bare {
-            response = response.header(header::CONTENT_SECURITY_POLICY, "sandbox");
-        }
-        if let Some(size) = size {
-            response = response.header(header::CONTENT_LENGTH, size);
-        }
-        if extent.fixed {
-            response = response.header(header::ACCEPT_RANGES, "bytes");
-        }
-        if let (Some((offset, len)), Some(total)) = (extent.window, extent.size) {
-            response = response.header(
-                header::CONTENT_RANGE,
-                format!(
-                    "bytes {offset}-{}/{total}",
-                    offset.saturating_add(len).saturating_sub(1)
-                ),
-            );
-        }
-        response
-            .body(StreamBody::new(body).boxed())
-            .map_err(|e| PullError::Other(e.into()))
+        let body = futures_util::stream::unfold(state, next_cached_frame);
+        streamed_response(&name, &content_type, present, extent, body)
     }
 
     /// `HEAD` on the public bare host, or under a site's `/_decdn/`: a blob's
@@ -2889,6 +3154,167 @@ async fn next_frame(
     if out.is_err() {
         s.done = None;
     }
+    Some((out.map(Frame::data), s))
+}
+
+/// One bao chunk, the unit the cache records presence in.
+const BAO_CHUNK_BYTES: u64 = 1024;
+
+/// The name a response for `hash` carries: the last segment of its bundle
+/// `path`, or the hash in hex.
+fn served_name(hash: [u8; 32], path: Option<&str>) -> String {
+    path.and_then(|p| p.rsplit('/').next())
+        .map_or_else(|| alloy::hex::encode(hash), str::to_owned)
+}
+
+/// The content type a response named `name` carries, presented as
+/// `present` says, and the rewrite its bytes pass through on a site.
+fn presentation(present: Present, name: &str) -> (String, Option<Rewrite>) {
+    match present {
+        Present::Bare | Present::Download => (content_type(name), None),
+        Present::Site => {
+            let content_type = site::content_type(name);
+            let essence = content_type.split(';').next().unwrap_or_default();
+            let rewrite = Rewrite::for_type(essence);
+            (content_type, rewrite)
+        }
+    }
+}
+
+/// The response that streams `body`, a blob named `name` presented as
+/// `present` says, over `extent`.
+fn streamed_response<S>(
+    name: &str,
+    content_type: &str,
+    present: Present,
+    extent: &Extent,
+    body: S,
+) -> Result<Response<Body>, PullError>
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync + 'static,
+{
+    let disposition = if present == Present::Download {
+        "attachment"
+    } else {
+        "inline"
+    };
+    let status = if extent.window.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!(
+                "{disposition}; filename=\"{}\"",
+                name.replace(['"', '\\'], "_")
+            ),
+        )
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if present == Present::Bare {
+        response = response.header(header::CONTENT_SECURITY_POLICY, "sandbox");
+    }
+    if let Some(size) = extent.length() {
+        response = response.header(header::CONTENT_LENGTH, size);
+    }
+    if extent.fixed {
+        response = response.header(header::ACCEPT_RANGES, "bytes");
+    }
+    if let (Some((offset, len)), Some(total)) = (extent.window, extent.size) {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!(
+                "bytes {offset}-{}/{total}",
+                offset.saturating_add(len).saturating_sub(1)
+            ),
+        );
+    }
+    response
+        .body(StreamBody::new(body).boxed())
+        .map_err(|e| PullError::Other(e.into()))
+}
+
+/// Read `[offset, end)` of `hash` out of `engine` on a task of its own, one
+/// [`CHUNK_BYTES`] read at a time, into the channel it returns. A failed or
+/// short read sends its error and ends the channel; a dropped receiver stops
+/// the reads. The hit counts as a use of the entry for eviction, and the
+/// task holds the entry against eviction until its reads end.
+fn read_cached(
+    engine: CacheEngine,
+    hash: decdn_cache::Hash,
+    offset: u64,
+    end: u64,
+) -> mpsc::Receiver<std::io::Result<Bytes>> {
+    let (tx, rx) = mpsc::channel(2);
+    engine.observe_hit(hash);
+    let held = engine.hold_in_use(hash);
+    tokio::spawn(async move {
+        let _held = held;
+        let chunk = u64::try_from(CHUNK_BYTES).unwrap_or(u64::MAX);
+        let mut next = offset;
+        while next < end {
+            let len = (end - next).min(chunk);
+            let read = match engine.export_range(hash, next, len).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let e = std::io::Error::other(format!("read the gateway cache: {e}"));
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            if read.is_empty() {
+                let e = std::io::Error::other("the cache entry ended short");
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+            next = next.saturating_add(u64::try_from(read.len()).unwrap_or(u64::MAX));
+            if tx.send(Ok(read)).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// A response body read out of the cache: the chunks [`read_cached`] sends,
+/// passed through the rewrite.
+struct CachedBody {
+    chunks: mpsc::Receiver<std::io::Result<Bytes>>,
+    rewrite: Option<Rewrite>,
+    gateway: Arc<Gateway>,
+    /// Set once the body sent its last frame.
+    ended: bool,
+}
+
+/// The next frame of a body read out of the cache, or `None` at its end.
+async fn next_cached_frame(
+    mut s: CachedBody,
+) -> Option<(Result<Frame<Bytes>, std::io::Error>, CachedBody)> {
+    if s.ended {
+        return None;
+    }
+    let out = match s.chunks.recv().await {
+        Some(Ok(chunk)) => {
+            s.gateway.metrics.bytes(chunk.len());
+            match s.rewrite.as_mut() {
+                Some(rewrite) => rewrite.feed(&chunk),
+                None => Ok(chunk),
+            }
+        }
+        Some(Err(e)) => Err(e),
+        // Every byte is out: the rewrite lets out its tail.
+        None => {
+            s.ended = true;
+            return s
+                .rewrite
+                .take()
+                .map(|rewrite| (rewrite.finish().map(Frame::data), s));
+        }
+    };
+    s.ended = out.is_err();
     Some((out.map(Frame::data), s))
 }
 

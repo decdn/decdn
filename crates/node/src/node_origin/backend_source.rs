@@ -8,7 +8,7 @@
 //! there is no counterparty, no lane, and no payment — but the driver, sink,
 //! and serve leg are reused verbatim. This source is what lets that happen: it
 //! streams the header-less interleaved bao wire for one [`AlignedRange`] straight
-//! out of [`CacheEngine::origin_range_wire`], so the existing `NodeAdmitStore`
+//! out of [`CacheEngine::origin_range_wire`], so the existing `CacheStore`
 //! sink verifies-and-stores it against the root `H` exactly as it does a peer
 //! pull's wire. The wire is produced window by window, so a leg holds
 //! `O(window + outboard)` bytes whatever its range (#2065).

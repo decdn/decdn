@@ -12,6 +12,7 @@ const counters: Counters = {
   pull_failures_other: 0,
   pulls_active: 0,
   pointer_updates: 2,
+  cache_hits: 3,
 };
 
 describe("tiles", () => {
@@ -22,6 +23,15 @@ describe("tiles", () => {
     ).toBe("4");
     expect(shown.some((t) => t.label === "Allowance spent")).toBe(false);
     expect(shown.some((t) => t.label === "Pointer updates")).toBe(false);
+  });
+
+  it("show the cache hits in both modes", () => {
+    for (const publicMode of [false, true]) {
+      expect(
+        tiles(counters, publicMode).find((t) => t.label === "Cache hits")
+          ?.value,
+      ).toBe("3");
+    }
   });
 
   it("show the 402s of a public gateway as the spent allowance, beside its pointer updates", () => {

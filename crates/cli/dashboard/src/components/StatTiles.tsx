@@ -30,6 +30,11 @@ export function tiles(c: Counters, publicMode: boolean): Tile[] {
       hint: "Pulls handed to the worker and not yet ended",
     },
     {
+      label: "Cache hits",
+      value: formatCount(c.cache_hits),
+      hint: "Read whole out of the cache, with no pull and no allowance",
+    },
+    {
       label: "Not found",
       value: formatCount(c.requests_not_found),
       hint: "A path, entry or manifest that does not exist",
