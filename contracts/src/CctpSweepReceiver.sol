@@ -95,11 +95,15 @@ contract CctpSweepReceiver is ReentrancyGuard {
         }
         (address operator, uint256 servedBytes) = abi.decode(body[HOOK_DATA_INDEX:], (address, uint256));
 
+        // The balance read across `receiveMessage` is the measurement itself:
+        // `minted` is what this message minted, under `nonReentrant`.
+        // slither-disable-start reentrancy-balance
         uint256 balanceBefore = usdc.balanceOf(address(this));
         if (!messageTransmitter.receiveMessage(message, attestation)) revert ReceiveFailed();
         uint256 minted = usdc.balanceOf(address(this)) - balanceBefore;
         // slither-disable-next-line incorrect-equality
         if (minted == 0) revert NothingMinted();
+        // slither-disable-end reentrancy-balance
 
         usdc.forceApprove(address(feeRouter), minted);
         feeRouter.deposit(operator, servedBytes, minted);

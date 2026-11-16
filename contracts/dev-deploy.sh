@@ -27,6 +27,7 @@ RPC_PORT="${RPC_PORT:-8545}"
 RPC_URL="http://127.0.0.1:${RPC_PORT}"
 CHAIN_ID=31337
 MANIFEST="deployments/${CHAIN_ID}.json"
+POOL_MANIFEST="deployments/${CHAIN_ID}-payment.json"
 
 # Funded TOKEN balance for the faucet (1M TOKEN, 18 decimals).
 FUNDING_AMOUNT="${FUNDING_AMOUNT:-1000000000000000000000000}"
@@ -43,7 +44,7 @@ ACC1_ADDR="0x70997970C51812dc3A010C7d01b50e0d17dc79C8" # EMERGENCY_MULTISIG
 # --- Clean stale manifest ----------------------------------------------------
 # Anvil starts fresh each run, so a manifest from a prior run is meaningless
 # and would trip DeployProtocol's ManifestAlreadyExists guard.
-rm -f "$MANIFEST"
+rm -f "$MANIFEST" "$POOL_MANIFEST"
 
 # --- Start Anvil -------------------------------------------------------------
 # Refuse if something already answers on the port. Otherwise our own anvil
@@ -84,14 +85,28 @@ USDC=$(forge create test/mocks/MintableUSDC.sol:MintableUSDC \
 [[ "$USDC" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "failed to deploy MintableUSDC"
 log "USDC = $USDC"
 
+# --- Deploy loopback CCTP ----------------------------------------------------
+# The local chain is both the governance chain and the payment chain, so one
+# LoopbackCctp plays CCTP V2 on both sides (domain 0). Testnet-only: it checks
+# no attestation.
+log "deploying LoopbackCctp"
+CCTP=$(forge create testnet/LoopbackCctp.sol:LoopbackCctp \
+  --rpc-url "$RPC_URL" --private-key "$ACC0_KEY" --broadcast --json \
+  --constructor-args 0 \
+  | jq -r .deployedTo)
+[[ "$CCTP" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "failed to deploy LoopbackCctp"
+log "CCTP = $CCTP"
+
 # --- Deploy protocol ---------------------------------------------------------
-log "deploying protocol suite (DeployProtocol)"
+log "deploying governance-chain suite (DeployProtocol)"
 # ADR 019 § Terms Acceptance — DeployProtocol requires a non-zero genesis
 # operator-terms hash (CapacityBond rejects the zero sentinel). For local dev
 # any non-zero placeholder is fine; production supplies keccak256(TERMS.md).
 # DeployProtocol also requires INITIAL_VETTER (a deploy with no genesis
 # VETTER_ROLE holder is a governance deadlock); the local deployer plays it.
 USDC_ADDRESS="$USDC" \
+CCTP_MESSAGE_TRANSMITTER="$CCTP" \
+CCTP_TOKEN_MESSENGER="$CCTP" \
 EMERGENCY_MULTISIG="$ACC1_ADDR" \
 INITIAL_TOKEN_HOLDER="$ACC0_ADDR" \
 INITIAL_VETTER="$ACC0_ADDR" \
@@ -103,6 +118,19 @@ forge script script/DeployProtocol.s.sol:DeployProtocol \
 TOKEN=$(jq -r '.contracts.Token // empty' "$MANIFEST")
 [[ "$TOKEN" =~ ^0x[0-9a-fA-F]{40}$ ]] \
   || die "manifest $MANIFEST missing/invalid .contracts.Token (got: '${TOKEN:-<empty>}')"
+RECEIVER=$(jq -r '.contracts.CctpSweepReceiver // empty' "$MANIFEST")
+[[ "$RECEIVER" =~ ^0x[0-9a-fA-F]{40}$ ]] \
+  || die "manifest $MANIFEST missing/invalid .contracts.CctpSweepReceiver"
+
+# --- Deploy the payment pool -------------------------------------------------
+log "deploying PaymentPool (DeployPaymentPool)"
+USDC_ADDRESS="$USDC" \
+CCTP_TOKEN_MESSENGER="$CCTP" \
+SWEEP_RECIPIENT="$RECEIVER" \
+PAUSER="$ACC1_ADDR" \
+forge script script/DeployPaymentPool.s.sol:DeployPaymentPool \
+  --rpc-url "$RPC_URL" --sender "$ACC0_ADDR" --private-key "$ACC0_KEY" --broadcast
+[[ -f "$POOL_MANIFEST" ]] || die "pool deploy did not write $POOL_MANIFEST"
 
 # --- Deploy faucet -----------------------------------------------------------
 log "deploying TestnetFaucet (funding ${FUNDING_AMOUNT} TOKEN from account #0)"
@@ -121,9 +149,10 @@ echo "Local deCDN dev environment is up:"
 echo "  RPC URL : ${RPC_URL}  (chain id ${CHAIN_ID})"
 echo "  Deployer: ${ACC0_ADDR}  (holds 1B TOKEN)"
 echo "  USDC    : ${USDC}"
-jq -r '.contracts | to_entries[] | "  \(.key): \(.value)"' "$MANIFEST"
+echo "  CCTP    : ${CCTP}  (LoopbackCctp)"
+jq -r '.contracts | to_entries[] | "  \(.key): \(.value)"' "$MANIFEST" "$POOL_MANIFEST"
 echo
-echo "Manifest: contracts/${MANIFEST}"
+echo "Manifests: contracts/${MANIFEST}, contracts/${POOL_MANIFEST}"
 echo "Press Ctrl-C to stop Anvil and tear down."
 
 wait "$ANVIL_PID"

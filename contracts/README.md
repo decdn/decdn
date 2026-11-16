@@ -6,20 +6,21 @@ This is a standalone Foundry project at the repo root, **excluded from the Cargo
 
 ## Contracts
 
-Deployable contracts in [`src/`](src/):
+Deployable contracts in [`src/`](src/). `PaymentPool` runs on each payment chain; every other contract runs on the governance chain, Ethereum ([ADR 016 § Deployment Tiers](../adr/016-contract-interactions.md#deployment-tiers)):
 
 | Contract | Purpose | ADR |
 |----------|---------|-----|
 | `Token` | Fixed-supply (1B) ERC20 with permit + burn; no mint post-genesis | [026](../adr/026-tokenomics.md) |
-| `CapacityBond` | Operator registry; custodies the TOKEN bond, executes escrow-on-slash, reports settlements to `FeeRouter` | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
-| `FeeRouter` | 60/30/10 settlement split (operator / buyback / treasury) and the canonical served-bytes accountant for vote weight | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
-| `PaymentPool` | Shared USDC payment pool with off-chain vouchers and on-chain redemption; forwards fees to `FeeRouter` rather than skimming inline | [003](../adr/003-payments.md) |
+| `CapacityBond` | Operator registry; custodies the TOKEN bond, executes escrow-on-slash, supplies the active flag and declared capacity `FeeRouter` credits against | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
+| `FeeRouter` | Permissionless `deposit` of each sweep: rebate / buyback / treasury split and the canonical served-bytes accountant for vote weight | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
+| `CctpSweepReceiver` | Stateless CCTP V2 bridge adapter: receives a sweep and deposits it into `FeeRouter` | [016](../adr/016-contract-interactions.md#bridge-adapters) |
+| `PaymentPool` | Payment-chain USDC pool with off-chain vouchers and on-chain redemption; pays `operatorBps` at redemption and sweeps the rest over CCTP. Built on the bridge-neutral `PaymentPoolBase` | [003](../adr/003-payments.md) |
 | `SlashJudge` | On-chain adjudicator for signature-dependent slashable offenses; verifies the EIP-712 slash signature through a commit–reveal challenge | [014](../adr/014-on-chain-verification.md) |
 | `SlashAppeal` | Slash-appeal state machine (open → ratify/reverse) holding a per-appeal TOKEN bond | [028](../adr/028-slashing-appeals.md) |
 | `OriginAssignment` | Namespace origin sets: a vetted publisher seats and unseats bonded operators as origins for its namespaces | [011](../adr/011-content-takedown.md) |
 | `ManualVettingPolicy` | Genesis vetting policy: a `VETTER_ROLE` holder approves which publishers may seat origins | [011](../adr/011-content-takedown.md#vetting-policies) |
 | `OpenVettingPolicy` | Vetting policy that vets every publisher; for local and test deployments only | [011](../adr/011-content-takedown.md#vetting-policies) |
-| `BuybackBurner` | Swaps the 30% USDC buyback bucket for TOKEN and burns the proceeds; venue-neutral abstract base with a concrete Uniswap V3 subclass | [018](../adr/018-liquidity-strategy.md), [026](../adr/026-tokenomics.md) |
+| `BuybackBurner` | Swaps the `buybackBps` share of each sweep for TOKEN and burns the proceeds; venue-neutral abstract base with a concrete Uniswap V3 subclass | [018](../adr/018-liquidity-strategy.md), [026](../adr/026-tokenomics.md) |
 | `ContentBlacklist` | Global + regional content-hash blacklist, operator- and origin-level blacklists | [011](../adr/011-content-takedown.md) |
 | `PublisherRegistry` | Permissionless namespace creation and timelocked namespace ownership transfer | [002](../adr/002-content-addressing.md) |
 | `DecdnGovernor` | Served-bytes-weighted on-chain governor with a Timelock executor | [036](../adr/036-served-bytes-voting-weight.md) |
@@ -38,10 +39,12 @@ Libraries:
 
 ```
 contracts/
-  src/            — 17 contracts (3 abstract) + 4 libraries
-    interfaces/   — 19 frozen external surfaces (I*.sol)
-  test/           — Foundry suite (29 *.t.sol + mocks/ + ed25519-vectors/)
-  script/         — DeployProtocol, BaseProtocolDeploy, ActivateBuyback,
+  src/            — contracts (PaymentPoolBase and the buyback bases abstract) + 4 libraries
+    interfaces/   — frozen external surfaces (I*.sol), including the CCTP V2 calls
+  test/           — Foundry suite (*.t.sol + mocks/ + ed25519-vectors/)
+  testnet/        — TestnetFaucet and LoopbackCctp (same-chain CCTP for local deploys)
+  script/         — DeployProtocol (governance chain), DeployPaymentPool (each
+                    payment chain), BaseProtocolDeploy, ActivateBuyback,
                     TransitionToGovernor, TestnetFaucet
     interfaces/   — pool-creation surfaces used only by the deploy scripts
     lib/          — BuybackVenueLib (shared burner construction + steady-state split)

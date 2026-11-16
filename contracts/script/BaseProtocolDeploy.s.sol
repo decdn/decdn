@@ -16,7 +16,10 @@ import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
-import { PaymentPool } from "../src/PaymentPool.sol";
+import { CctpSweepReceiver } from "../src/CctpSweepReceiver.sol";
+import { IMessageTransmitterV2 } from "../src/interfaces/ICctpV2.sol";
+import { IFeeRouter } from "../src/interfaces/IFeeRouter.sol";
+import { ICapacityBondCredit } from "../src/interfaces/ICapacityBondCredit.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
@@ -29,7 +32,6 @@ import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceVi
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 import { IUniswapV3Pool } from "../src/interfaces/IUniswapV3Pool.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
-import { ICapacityBondEpoch } from "../src/interfaces/ICapacityBondEpoch.sol";
 import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
 import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
 import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
@@ -58,13 +60,16 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                         ADR 016) and the eventual
 ///                                         DEFAULT_ADMIN_ROLE holder of every target.
 ///           2. `_deployTargets`         — Token, CapacityBond, SlashAppeal,
-///                                         FeeRouter (treasury bucket = the
-///                                         TimelockController; buyback bucket
-///                                         dormant — see BuybackBurner note below),
-///                                         ContentBlacklist, PublisherRegistry,
-///                                         PaymentPool, SlashJudge,
+///                                         FeeRouter (treasury = the
+///                                         TimelockController; buyback dormant —
+///                                         see BuybackBurner note below),
+///                                         CctpSweepReceiver, ContentBlacklist,
+///                                         PublisherRegistry, SlashJudge,
 ///                                         OriginAssignment. Deployer is admin of
 ///                                         every AccessControl-bearing target.
+///                                         This is the governance-chain set; each
+///                                         payment chain deploys its PaymentPool
+///                                         with `DeployPaymentPool.s.sol`.
 ///           3. `_deployGovernor`        — DecdnGovernor; grant Timelock's
 ///                                         PROPOSER + CANCELLER roles to
 ///                                         `_initialProposer` — the Governor, or
@@ -74,7 +79,6 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          blacklist ejector,
 ///                                          emergency multisig, PAUSER_ROLE on every
 ///                                          Pausable target,
-///                                          router-caller → PaymentPool,
 ///                                          SLASH_ROLE → SlashJudge) plus the
 ///                                          `GOVERNANCE_ROLE`-gated
 ///                                          `CapacityBond.setSlashJudge`
@@ -109,8 +113,8 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          the Governor does not.
 ///           7. `_assertPeerRolesWired`   — reverts if any phase-4 peer-role grant
 ///                                          or address binding (slash trigger,
-///                                          router-caller, pausers, emergency
-///                                          multisig, blacklist binding) did not
+///                                          pausers, emergency multisig, blacklist
+///                                          binding, receiver → router) did not
 ///                                          land.
 ///                                          `grantRole` to a wrong address does not
 ///                                          revert, so without this a half-wired
@@ -122,9 +126,9 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///         `SLASH_APPEAL_ROLE` on CapacityBond so it can open/settle appeals.
 ///
 ///         BuybackBurner is dormant by default: the FeeRouter is constructed with
-///         `buybackBurner_=address(0)` and `feeRouterShares[1]=0`, which
-///         `FeeRouter._setShares` permits as launch-mode dormancy, and governance
-///         activates the bucket later via `FeeRouter.setSharesAndDestinations`.
+///         `buybackBurner_=address(0)` and `buybackBps_=0`, and governance
+///         activates the buyback later with `FeeRouter.setBuybackBurner` and
+///         `FeeRouter.setSplit`.
 ///         The OPTIONAL genesis path (`BuybackActivation.activate`, OFF by default)
 ///         instead seeds the venue pool, deploys the concrete burner, and flips the
 ///         split in-script before the handoff — see `_activateBuyback` and the
@@ -146,7 +150,7 @@ abstract contract BaseProtocolDeploy is Script {
     // deploy. When ON, `_activateBuyback` runs the same coherent bundle a
     // post-deploy governance activation would (ADR 018 § Activation Criteria) —
     // seed the venue pool, deploy the concrete burner, flip the FeeRouter split
-    // to the steady-state `[6000, 3000, 1000]`, wire the keeper — but in-script,
+    // to the steady-state `BuybackVenueLib.steadySplit()`, wire the keeper — but in-script,
     // while the deployer still holds `GOVERNANCE_ROLE`, because at genesis the
     // served-bytes voting weight that gates that governance call is zero (ADR
     // 036) and no privileged role survives the handoff to bootstrap it.
@@ -169,8 +173,9 @@ abstract contract BaseProtocolDeploy is Script {
     ///      full-range mint at the seed price consumes both legs up to rounding,
     ///      so only a price moved before the mint lands can trip it.
     uint256 internal constant SEED_MIN_BPS = 9900;
-    /// @dev Arbitrum One, the mainnet chain the emergency-multisig checks apply to.
-    uint256 internal constant ARBITRUM_ONE_CHAIN_ID = 42_161;
+    /// @dev Ethereum mainnet, the governance chain the emergency-multisig checks
+    ///      apply to.
+    uint256 internal constant ETHEREUM_MAINNET_CHAIN_ID = 1;
 
     /// @notice Pool seed amounts (raw). The script creates + seeds the 50/50
     ///         Uniswap V3 pool in-script, so `_deriveTokenSeed` pairs `usdcSeed`
@@ -205,16 +210,6 @@ abstract contract BaseProtocolDeploy is Script {
         PoolSeed seed;
         UniswapVenueParams uni;
     }
-
-    // PaymentPool launch params (ADR 003 § Initial deployment values). All
-    // governance-tunable post-deploy within the contract's safety bounds.
-    uint256 internal constant PAYMENT_DISPUTE_WINDOW = 48 hours;
-    uint256 internal constant PAYMENT_DELIVERY_FLOOR = 1;
-    // Minimum `openPool` deposit (contract bounds [0, $100]) — the
-    // Sybil-economics floor on minting fresh pool identities (ADR 003).
-    // Ships dormant at 0 (any non-zero deposit opens a pool); governance
-    // arms it post-deploy via `setMinDeposit`.
-    uint64 internal constant PAYMENT_MIN_DEPOSIT = 0;
 
     // SlashJudge launch params (ADR 014 § Governable Parameters). `maxEvidenceAge`
     // (5 days) must stay `< unbondingPeriod` (14 days default) — the SlashJudge
@@ -259,15 +254,18 @@ abstract contract BaseProtocolDeploy is Script {
         // (keccak256 of the shipped TERMS.md). Governance-swappable post-deploy
         // via CapacityBond.setCurrentTermsHash.
         bytes32 currentTermsHash;
-        // FeeRouter params (ADR 016 / ADR 026). `buybackBurner` may be
-        // `address(0)` iff `feeRouterShares[1] == 0` (launch-mode dormancy
-        // per ADR 016 § Tunable Economics). The cross-validation is enforced
-        // by `FeeRouter._setShares`, not re-asserted here. Buckets are
-        // operator / buyback / treasury (3-bucket split, ADR 026 § FeeRouter).
+        // FeeRouter params (ADR 016 § Tunable Economics). `buybackBurner` may
+        // be `address(0)` iff `feeRouterBuybackBps == 0`; the FeeRouter
+        // constructor enforces it.
         uint64 feeRouterEpochLength;
         uint64 feeRouterWindowEpochs;
-        uint256[3] feeRouterShares;
+        uint256 feeRouterRebateBps;
+        uint256 feeRouterBuybackBps;
+        uint256 feeRouterDeliveryFloor;
         address buybackBurner;
+        // Governance-chain CCTP V2 contracts the `CctpSweepReceiver` binds.
+        IMessageTransmitterV2 cctpMessageTransmitter;
+        address cctpTokenMessenger;
         // Appeal-bond param (ADR 028)
         uint256 slashAppealBond;
     }
@@ -281,7 +279,7 @@ abstract contract BaseProtocolDeploy is Script {
         PublisherRegistry registry;
         TimelockController timelock;
         DecdnGovernor governor;
-        PaymentPool paymentPool;
+        CctpSweepReceiver sweepReceiver;
         SlashJudge slashJudge;
         OriginAssignment originAssignment;
         ManualVettingPolicy vettingPolicy;
@@ -345,18 +343,17 @@ abstract contract BaseProtocolDeploy is Script {
     ///         deployer renounced — permanently ungovernable, with no on-chain
     ///         recovery and a green deploy.
     error BootstrapMultisigNotAContract(address account);
-    /// @notice On Arbitrum One, `DeployConfig.emergencyMultisig` is the deployer
+    /// @notice On Ethereum mainnet, `DeployConfig.emergencyMultisig` is the deployer
     ///         EOA, so one key would hold every pause and emergency role.
     error EmergencyMultisigIsDeployer(address account);
-    /// @notice On Arbitrum One, `DeployConfig.emergencyMultisig` holds no code, so
+    /// @notice On Ethereum mainnet, `DeployConfig.emergencyMultisig` holds no code, so
     ///         it cannot be the multisig ADR 009 § Emergency Multisig specifies.
     error EmergencyMultisigNotAContract(address account);
     /// @notice Post-deploy invariant — a phase-4 peer role (e.g. `SLASH_ROLE`,
-    ///         `ROUTER_CALLER_ROLE`, `PAUSER_ROLE`) was not actually granted to
-    ///         `grantee` on `target`. OZ `grantRole` does not revert when the
-    ///         target address is wrong, so a dropped or mis-targeted peer grant is
-    ///         otherwise silent — shipping a dead slash trigger, an unroutable
-    ///         payment path, or no live pauser.
+    ///         `PAUSER_ROLE`) was not actually granted to `grantee` on `target`.
+    ///         OZ `grantRole` does not revert when the target address is wrong, so
+    ///         a dropped or mis-targeted peer grant is otherwise silent — shipping
+    ///         a dead slash trigger or no live pauser.
     error PeerRoleNotWired(address target, bytes32 role, address grantee);
     /// @notice Post-deploy invariant — an address binding (such as
     ///         `CapacityBond.slashJudge` or `OriginAssignment.vettingPolicy`)
@@ -372,8 +369,8 @@ abstract contract BaseProtocolDeploy is Script {
     error MissingBuybackKeeper();
     /// @notice Genesis activation left a required Uniswap field zero. A missing
     ///         swap router, position manager, or fee tier ships a burner that can
-    ///         never swap while already receiving the buyback bucket's 30% of
-    ///         revenue, or fails the seed with an opaque `extcodesize` revert.
+    ///         never swap while already receiving the buyback share of every
+    ///         sweep, or fails the seed with an opaque `extcodesize` revert.
     error UniswapFieldsUnwired();
     /// @notice `PoolSeed.tokenSeed` is not what `usdcSeed` + `targetPrice` derive.
     ///         The seed sizes the genesis pool, so a wrong value anchors
@@ -403,9 +400,9 @@ abstract contract BaseProtocolDeploy is Script {
     /// @notice The genesis-activation target price was zero — the TOKEN seed is
     ///         derived as `usdcSeed / targetPrice`, so a zero divides by zero.
     error TargetPriceZero();
-    /// @notice Post-activation invariant — the FeeRouter split is not the expected
-    ///         steady-state `[6000, 3000, 1000]` after `setSharesAndDestinations`.
-    error BuybackSharesNotActivated(uint256 operator, uint256 buyback, uint256 treasury);
+    /// @notice Post-activation invariant — the FeeRouter split is not the
+    ///         steady-state `BuybackVenueLib.steadySplit()` after activation.
+    error BuybackSplitNotActivated(uint256 rebateBps, uint256 buybackBps);
 
     function _runFullDeploy(DeployConfig memory cfg) internal returns (Deployment memory d) {
         return _runFullDeploy(cfg, _noBuybackActivation());
@@ -475,7 +472,7 @@ abstract contract BaseProtocolDeploy is Script {
         // On mainnet the emergency multisig holds every PAUSER_ROLE and the
         // blacklist/appeal emergency roles, so it must be a real multisig, never
         // the deployer key. Testnet and e2e deploys seat the deployer on purpose.
-        if (block.chainid == ARBITRUM_ONE_CHAIN_ID) {
+        if (block.chainid == ETHEREUM_MAINNET_CHAIN_ID) {
             if (cfg.emergencyMultisig == cfg.deployer) revert EmergencyMultisigIsDeployer(cfg.deployer);
             if (cfg.emergencyMultisig.code.length == 0) revert EmergencyMultisigNotAContract(cfg.emergencyMultisig);
         }
@@ -505,13 +502,26 @@ abstract contract BaseProtocolDeploy is Script {
 
         d.router = new FeeRouter({
             usdc_: cfg.usdc,
-            capacityBond_: ICapacityBondEpoch(address(d.bond)),
+            capacityBond_: ICapacityBondCredit(address(d.bond)),
             treasury_: address(timelock),
             epochLength_: cfg.feeRouterEpochLength,
             windowEpochs_: cfg.feeRouterWindowEpochs,
+            deliveryFloor_: cfg.feeRouterDeliveryFloor,
             admin: cfg.deployer,
-            initialShares: cfg.feeRouterShares,
+            rebateBps_: cfg.feeRouterRebateBps,
+            buybackBps_: cfg.feeRouterBuybackBps,
             buybackBurner_: cfg.buybackBurner
+        });
+
+        // CctpSweepReceiver (ADR 016 § Bridge adapters): the CCTP V2 adapter
+        // every payment-chain PaymentPool sweeps to. Stateless, no roles.
+        if (address(cfg.cctpMessageTransmitter) == address(0)) revert ZeroAddress("cctpMessageTransmitter");
+        if (cfg.cctpTokenMessenger == address(0)) revert ZeroAddress("cctpTokenMessenger");
+        d.sweepReceiver = new CctpSweepReceiver({
+            usdc_: cfg.usdc,
+            messageTransmitter_: cfg.cctpMessageTransmitter,
+            tokenMessenger_: cfg.cctpTokenMessenger,
+            feeRouter_: IFeeRouter(address(d.router))
         });
 
         // PublisherRegistry — consumed by `OriginAssignment` below, which binds
@@ -522,18 +532,6 @@ abstract contract BaseProtocolDeploy is Script {
         // § Contract Inventory) now that the appeal-bond escrow is gone.
         d.blacklist =
             new ContentBlacklist({ capacityBond_: ICapacityBondEjector(address(d.bond)), admin: cfg.deployer });
-
-        // PaymentPool (ADR 003): USDC settlement gateway. `feeRouter` must be
-        // a deployed contract (constructor checks code size) — `d.router` above.
-        d.paymentPool = new PaymentPool({
-            usdc_: cfg.usdc,
-            capacityBond_: ICapacityBondActivity(address(d.bond)),
-            feeRouter_: address(d.router),
-            disputeWindow_: PAYMENT_DISPUTE_WINDOW,
-            deliveryFloor_: PAYMENT_DELIVERY_FLOOR,
-            minDeposit_: PAYMENT_MIN_DEPOSIT,
-            admin: cfg.deployer
-        });
 
         // SlashJudge (ADR 014): evidence verification + challenge bonds. The
         // constructor enforces `maxEvidenceAge < CapacityBond.unbondingPeriod`.
@@ -684,12 +682,8 @@ abstract contract BaseProtocolDeploy is Script {
         d.bond.grantRole(d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.router.grantRole(d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.slashAppeal.grantRole(d.slashAppeal.PAUSER_ROLE(), cfg.emergencyMultisig);
-        d.paymentPool.grantRole(d.paymentPool.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.slashJudge.grantRole(d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
 
-        // PaymentPool.redeem calls FeeRouter.routeSettlement (ADR 016 § Post-
-        // Deployment Init step 4) — without this the settlement path reverts.
-        d.router.grantRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentPool));
         // SlashJudge is the sole holder of SLASH_ROLE on CapacityBond (step 3) —
         // the only on-chain slash trigger.
         d.bond.grantRole(d.bond.SLASH_ROLE(), address(d.slashJudge));
@@ -704,9 +698,9 @@ abstract contract BaseProtocolDeploy is Script {
         _postWiringHook(cfg, d);
     }
 
-    /// @dev Subclasses (e.g. GovernanceLifecycleTest) override this to grant
-    ///      test-only roles like ROUTER_CALLER_ROLE before the handoff puts
-    ///      the role-grant surface behind the Timelock. No-op in production.
+    /// @dev Subclasses (e.g. GovernanceLifecycleTest) override this to wire
+    ///      test-only state before the handoff puts the role-grant surface
+    ///      behind the Timelock. No-op in production.
     function _postWiringHook(DeployConfig memory cfg, Deployment memory d) internal virtual { }
 
     // Phase 5 — role handoff to Timelock, then DEFAULT_ADMIN_ROLE renounced (#2028).
@@ -757,7 +751,7 @@ abstract contract BaseProtocolDeploy is Script {
     ///      single source of truth for `_handOffGovernance` and `_assertNoBackDoors`
     ///      so a target cannot be handed off by one and missed by the other.
     function _allGovernedTargets(Deployment memory d) internal pure returns (address[] memory) {
-        IAccessControl[9] memory fixedTargets = _governedTargets(d);
+        IAccessControl[8] memory fixedTargets = _governedTargets(d);
         bool hasBurner = address(d.buybackBurner) != address(0);
         // Sized and indexed off `fixedTargets.length`, never a literal: widening
         // `_governedTargets` — which its own docstring instructs a future target to do
@@ -842,8 +836,8 @@ abstract contract BaseProtocolDeploy is Script {
     //
     // `_assertNoBackDoors` covers only the GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE
     // handoff. The peer grants and address bindings wired in `_wireCrossContractRoles`
-    // are security-critical (the only slash trigger, the only settlement-routing
-    // grant, the live pausers, the blacklist read binding) yet none are reverting:
+    // are security-critical (the only slash trigger, the live pausers, the
+    // blacklist read binding, the receiver's router binding) yet none are reverting:
     // OZ `grantRole` to the wrong address is a silent no-op of the intended
     // property. This phase re-reads each one so a dropped or mis-targeted grant
     // fails the deploy loudly instead of shipping a half-wired protocol.
@@ -852,8 +846,6 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRole(d.bond, d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
         _requireRole(d.bond, d.bond.BLACKLIST_ROLE(), address(d.blacklist));
         _requireRole(d.bond, d.bond.SLASH_ROLE(), address(d.slashJudge));
-        // FeeRouter settlement-routing grant.
-        _requireRole(d.router, d.router.ROUTER_CALLER_ROLE(), address(d.paymentPool));
         // EMERGENCY_MULTISIG_ROLE on both appeal surfaces.
         _requireRole(d.slashAppeal, d.slashAppeal.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.blacklist, d.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
@@ -861,7 +853,6 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRole(d.bond, d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.router, d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.slashAppeal, d.slashAppeal.PAUSER_ROLE(), cfg.emergencyMultisig);
-        _requireRole(d.paymentPool, d.paymentPool.PAUSER_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.slashJudge, d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
 
         // #2028 — the rotatable off-chain-key roles must be GOVERNANCE_ROLE-administered
@@ -873,7 +864,6 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRoleAdmin(d.bond, d.bond.PAUSER_ROLE(), GOVERNANCE_ROLE);
         _requireRoleAdmin(d.router, d.router.PAUSER_ROLE(), GOVERNANCE_ROLE);
         _requireRoleAdmin(d.slashJudge, d.slashJudge.PAUSER_ROLE(), GOVERNANCE_ROLE);
-        _requireRoleAdmin(d.paymentPool, d.paymentPool.PAUSER_ROLE(), GOVERNANCE_ROLE);
         _requireRoleAdmin(d.slashAppeal, d.slashAppeal.PAUSER_ROLE(), GOVERNANCE_ROLE);
         _requireRoleAdmin(d.slashAppeal, d.slashAppeal.EMERGENCY_MULTISIG_ROLE(), GOVERNANCE_ROLE);
         _requireRoleAdmin(d.blacklist, d.blacklist.EMERGENCY_MULTISIG_ROLE(), GOVERNANCE_ROLE);
@@ -892,6 +882,12 @@ abstract contract BaseProtocolDeploy is Script {
         if (boundVettingPolicy != address(d.vettingPolicy)) {
             revert BindingNotWired(address(d.originAssignment), address(d.vettingPolicy), boundVettingPolicy);
         }
+        // Every CCTP sweep lands through the receiver, so it must deposit into
+        // this deployment's router.
+        address boundRouter = address(d.sweepReceiver.feeRouter());
+        if (boundRouter != address(d.router)) {
+            revert BindingNotWired(address(d.sweepReceiver), address(d.router), boundRouter);
+        }
     }
 
     function _requireRole(IAccessControl target, bytes32 role, address grantee) private view {
@@ -907,24 +903,23 @@ abstract contract BaseProtocolDeploy is Script {
         if (got != wantAdmin) revert RoleAdminNotScoped(address(target), role, wantAdmin, got);
     }
 
-    /// @dev The nine role-bearing targets whose handoff grants GOVERNANCE_ROLE to
+    /// @dev The eight role-bearing targets whose handoff grants GOVERNANCE_ROLE to
     ///      the Timelock and renounces DEFAULT_ADMIN_ROLE to no one (router, bond,
-    ///      blacklist, slashAppeal, registry, paymentPool, slashJudge,
-    ///      originAssignment, vettingPolicy) — single
+    ///      blacklist, slashAppeal, registry, slashJudge, originAssignment,
+    ///      vettingPolicy) — single
     ///      source of truth for `_handOffGovernance` and `_assertNoBackDoors` so
     ///      the governed set can't drift between them. The array width MUST equal
     ///      the number of role-bearing `Deployment` members; adding a target
     ///      requires widening it. `ManualVettingPolicy`'s VETTER_ROLE is admin'd
     ///      by its GOVERNANCE_ROLE, so handing off GOVERNANCE_ROLE gives the
     ///      Timelock control of the vetter set too.
-    function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[9] memory) {
+    function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[8] memory) {
         return [
             IAccessControl(address(d.router)),
             d.bond,
             d.blacklist,
             d.slashAppeal,
             d.registry,
-            d.paymentPool,
             d.slashJudge,
             d.originAssignment,
             d.vettingPolicy
@@ -938,7 +933,7 @@ abstract contract BaseProtocolDeploy is Script {
     /// @dev Runs the full activation bundle between `_wireCrossContractRoles` and
     ///      `_handOffGovernance`: create + seed the Uniswap V3 pool + concrete burner
     ///      (deployer as admin), grant the burner's pauser + keeper, then flip the
-    ///      FeeRouter to the steady-state `[6000, 3000, 1000]` split. Stores the
+    ///      FeeRouter to the steady-state `BuybackVenueLib.steadySplit()`. Stores the
     ///      burner on `d` so the handoff and the post-deploy asserts treat it as a
     ///      governed target.
     function _activateBuyback(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d) internal {
@@ -957,15 +952,12 @@ abstract contract BaseProtocolDeploy is Script {
         // burner; `setKeeper` is governance-gated, so post-handoff it needs a proposal.
         burner.setKeeper(act.keeper);
 
-        // Flip the FeeRouter split + destinations atomically. The deployer still
-        // holds GOVERNANCE_ROLE on the router here (pre-handoff);
-        // `setSharesAndDestinations` sets the buyback destination before the non-zero
-        // buyback share, satisfying the cross-validation invariant.
-        d.router
-            .setSharesAndDestinations(
-                BuybackVenueLib.steadyShares(),
-                FeeRouter.ShareDestinations({ buybackBurner: address(burner), treasury: address(d.timelock) })
-            );
+        // Flip the FeeRouter split. The deployer still holds GOVERNANCE_ROLE on
+        // the router here (pre-handoff). The burner lands before the non-zero
+        // buyback share, as `setSplit` requires.
+        d.router.setBuybackBurner(address(burner));
+        (uint256 rebateBps, uint256 buybackBps) = BuybackVenueLib.steadySplit();
+        d.router.setSplit(rebateBps, buybackBps);
 
         d.buybackBurner = burner;
     }
@@ -1171,10 +1163,9 @@ abstract contract BaseProtocolDeploy is Script {
         if (d.router.buybackBurner() != address(burner)) {
             revert BindingNotWired(address(d.router), address(burner), d.router.buybackBurner());
         }
-        uint256[3] memory shares = d.router.getShares();
-        uint256[3] memory expected = BuybackVenueLib.steadyShares();
-        if (shares[0] != expected[0] || shares[1] != expected[1] || shares[2] != expected[2]) {
-            revert BuybackSharesNotActivated(shares[0], shares[1], shares[2]);
+        (uint256 wantRebate, uint256 wantBuyback) = BuybackVenueLib.steadySplit();
+        if (d.router.rebateBps() != wantRebate || d.router.buybackBps() != wantBuyback) {
+            revert BuybackSplitNotActivated(d.router.rebateBps(), d.router.buybackBps());
         }
         _requireRole(burner, burner.KEEPER_ROLE(), act.keeper);
         _requireRole(burner, burner.PAUSER_ROLE(), cfg.emergencyMultisig);

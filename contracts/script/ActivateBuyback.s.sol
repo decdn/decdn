@@ -18,18 +18,19 @@ import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
 /// @title ActivateBuyback — deploy the Uniswap V3 BuybackBurner and print the
 ///        governance calldata that activates the buyback bucket.
 /// @notice `DeployProtocol` intentionally leaves the buyback bucket dormant
-///         (`FeeRouter.buybackBurner == address(0)`, shares `[9000, 0, 1000]`)
+///         (`FeeRouter.buybackBurner == address(0)`, `buybackBps == 0`)
 ///         because activation is a deliberate, audited, post-deploy event gated
 ///         on a seeded live pool + private-RPC keeper + a calibrated per-epoch
 ///         cap (ADR 018 § Activation Criteria 1–7). This script performs the one
 ///         broadcast step that is safe to run ahead of time — deploying the
 ///         concrete `GuardedBuybackBurner` with `GOVERNANCE_ROLE`/`DEFAULT_ADMIN_ROLE`
-///         held by the Timelock — then PRINTS (does not execute) the three
-///         calldata blobs governance schedules through the 48h Timelock:
-///           1. `FeeRouter.setSharesAndDestinations([6000, 3000, 1000], …)`
-///              (steady-state split, ADR 016 § Deployment Order).
-///           2. `GuardedBuybackBurner.setKeeper(keeper)`.
-///           3. `GuardedBuybackBurner.renounceRole(DEFAULT_ADMIN_ROLE, timelock)`
+///         held by the Timelock — then PRINTS (does not execute) the calldata
+///         blobs governance schedules, in order, as one Timelock batch:
+///           1. `FeeRouter.setBuybackBurner(burner)`.
+///           2. `FeeRouter.setSplit(0, 7500)` (steady-state split, ADR 016 §
+///              Tunable Economics).
+///           3. `GuardedBuybackBurner.setKeeper(keeper)`.
+///           4. `GuardedBuybackBurner.renounceRole(DEFAULT_ADMIN_ROLE, timelock)`
 ///              (#2028 — freeze the burner's role table to match every other
 ///              contract; without it the Timelock keeps a master key on the burner
 ///              that a captured governance could use to mint a fresh GOVERNANCE_ROLE).
@@ -86,23 +87,23 @@ contract ActivateBuyback is Script {
 
         console2.log("BuybackBurner deployed at:", address(burner));
         console2.log("Roles (DEFAULT_ADMIN, GOVERNANCE) held by Timelock:", timelock);
-        console2.log("DEFAULT_ADMIN is renounced by step 3 below (#2028).");
+        console2.log("DEFAULT_ADMIN is renounced by step 4 below (#2028).");
         console2.log("");
-        console2.log("== Schedule the following through the 48h Timelock ==");
+        console2.log("== Schedule the following through the 48h Timelock, in order ==");
 
-        bytes memory activateCalldata = abi.encodeCall(
-            FeeRouter.setSharesAndDestinations,
-            (
-                BuybackVenueLib.steadyShares(),
-                FeeRouter.ShareDestinations({ buybackBurner: address(burner), treasury: timelock })
-            )
-        );
+        bytes memory burnerCalldata = abi.encodeCall(FeeRouter.setBuybackBurner, (address(burner)));
         console2.log("1) target:", feeRouter);
-        console2.log("   FeeRouter.setSharesAndDestinations([6000,3000,1000], {burner, timelock})");
-        console2.logBytes(activateCalldata);
+        console2.log("   FeeRouter.setBuybackBurner(burner)");
+        console2.logBytes(burnerCalldata);
+
+        (uint256 rebateBps, uint256 buybackBps) = BuybackVenueLib.steadySplit();
+        bytes memory splitCalldata = abi.encodeCall(FeeRouter.setSplit, (rebateBps, buybackBps));
+        console2.log("2) target:", feeRouter);
+        console2.log("   FeeRouter.setSplit(0, 7500)");
+        console2.logBytes(splitCalldata);
 
         bytes memory keeperCalldata = abi.encodeCall(GuardedBuybackBurner.setKeeper, (keeper));
-        console2.log("2) target:", address(burner));
+        console2.log("3) target:", address(burner));
         console2.log("   GuardedBuybackBurner.setKeeper(keeper)");
         console2.logBytes(keeperCalldata);
 
@@ -113,7 +114,7 @@ contract ActivateBuyback is Script {
         // so the argument is the Timelock's own address — it renounces its own role.
         bytes memory renounceCalldata =
             abi.encodeCall(IAccessControl.renounceRole, (burner.DEFAULT_ADMIN_ROLE(), timelock));
-        console2.log("3) target:", address(burner));
+        console2.log("4) target:", address(burner));
         console2.log("   GuardedBuybackBurner.renounceRole(DEFAULT_ADMIN_ROLE, timelock)  [#2028, schedule last]");
         console2.logBytes(renounceCalldata);
     }

@@ -361,9 +361,9 @@ CI (`.github/workflows/ci.yml`) runs Solidity jobs that fail on warnings local `
 
 ### Local deployment (Anvil)
 
-`script/DeployProtocol.s.sol` deploys the full contract suite, hands all governance roles to the `TimelockController`, and writes a `deployments/<chainId>.json` manifest. The script does **not** deploy USDC — it wraps an existing token — so a local deploy first stands up the `MintableUSDC` mock from `test/mocks/`.
+`script/DeployProtocol.s.sol` deploys the governance-chain suite (including `FeeRouter` and the `CctpSweepReceiver`), hands all governance roles to the `TimelockController`, and writes a `deployments/<chainId>.json` manifest. `script/DeployPaymentPool.s.sol` deploys one `PaymentPool` on a payment chain and writes `deployments/<chainId>-payment.json`. Neither script deploys USDC or CCTP — they wrap existing contracts — so a local deploy first stands up the `MintableUSDC` mock from `test/mocks/` and the testnet-only `LoopbackCctp` from `testnet/`, which plays CCTP V2 on both sides of one chain.
 
-**One-command setup:** from `contracts/`, run [`./dev-deploy.sh`](contracts/dev-deploy.sh). It boots Anvil, deploys the USDC mock + full protocol + a funded TOKEN faucet, prints the deployed addresses, and stays in the foreground (Ctrl-C tears it all down). The manual steps below show what it does end to end.
+**One-command setup:** from `contracts/`, run [`./dev-deploy.sh`](contracts/dev-deploy.sh). It boots Anvil, deploys the USDC mock, the loopback CCTP, the governance suite, a payment pool and a funded TOKEN faucet, prints the deployed addresses, and stays in the foreground (Ctrl-C tears it all down). The manual steps below show what it does end to end.
 
 Run everything from `contracts/`. The addresses/keys below are Anvil's deterministic defaults (accounts #0–#2); never use them anywhere but a local chain.
 
@@ -377,7 +377,13 @@ USDC=$(forge create test/mocks/MintableUSDC.sol:MintableUSDC \
   --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
   --broadcast --json | jq -r .deployedTo)
 
-# 3. Deploy the protocol. The addresses are required; for local testing any EOA
+# 3. Deploy the loopback CCTP (domain 0). Testnet-only: it checks no attestation.
+CCTP=$(forge create testnet/LoopbackCctp.sol:LoopbackCctp \
+  --rpc-url http://127.0.0.1:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --broadcast --json --constructor-args 0 | jq -r .deployedTo)
+
+# 4. Deploy the governance suite. The addresses are required; for local testing any EOA
 #    works. EMERGENCY_MULTISIG is account #1; INITIAL_TOKEN_HOLDER is the
 #    deployer (account #0, the `--sender`) so it holds the genesis TOKEN and can
 #    later fund the faucet. INITIAL_VETTER is the genesis VETTER_ROLE holder on
@@ -388,6 +394,8 @@ USDC=$(forge create test/mocks/MintableUSDC.sol:MintableUSDC \
 #    CapacityBond rejects the zero sentinel, so an accidental terms-disabled
 #    deployment is forbidden.
 USDC_ADDRESS=$USDC \
+CCTP_MESSAGE_TRANSMITTER=$CCTP \
+CCTP_TOKEN_MESSENGER=$CCTP \
 EMERGENCY_MULTISIG=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
 INITIAL_TOKEN_HOLDER=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
 INITIAL_VETTER=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
@@ -398,17 +406,28 @@ forge script script/DeployProtocol.s.sol:DeployProtocol \
   --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
   --broadcast
 
-# 4. Read back the deployed addresses.
-jq . deployments/31337.json
+# 5. Deploy the payment pool, sweeping to the receiver step 4 deployed.
+USDC_ADDRESS=$USDC \
+CCTP_TOKEN_MESSENGER=$CCTP \
+SWEEP_RECIPIENT=$(jq -r .contracts.CctpSweepReceiver deployments/31337.json) \
+PAUSER=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
+forge script script/DeployPaymentPool.s.sol:DeployPaymentPool \
+  --rpc-url http://127.0.0.1:8545 \
+  --sender 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --broadcast
+
+# 6. Read back the deployed addresses.
+jq . deployments/31337.json deployments/31337-payment.json
 ```
 
 Notes and common snags:
 
 - **Drop `--broadcast` for a dry run** — the script simulates against the fork and prints addresses without sending transactions.
-- **Required env vars:** `USDC_ADDRESS`, `EMERGENCY_MULTISIG`, `INITIAL_TOKEN_HOLDER`, `INITIAL_VETTER`, `CURRENT_TERMS_HASH`. Every economic parameter (`MIN_BOND`, `TIMELOCK_DELAY`, `FEE_ROUTER_WINDOW_EPOCHS`, the slash/blacklist bonds, …) has a production-shaped default and is overridable via env var — see `_readConfig` in `DeployProtocol.s.sol` for the full list and defaults.
+- **Required env vars:** `DeployProtocol` needs `USDC_ADDRESS`, `CCTP_MESSAGE_TRANSMITTER`, `CCTP_TOKEN_MESSENGER`, `EMERGENCY_MULTISIG`, `INITIAL_TOKEN_HOLDER`, `INITIAL_VETTER`, `CURRENT_TERMS_HASH`; `DeployPaymentPool` needs `USDC_ADDRESS`, `CCTP_TOKEN_MESSENGER`, `SWEEP_RECIPIENT`, `PAUSER`, and takes `OPERATOR_BPS`, `MIN_SWEEP`, `DISPUTE_WINDOW`, `MIN_DEPOSIT`, `SWEEP_DOMAIN` with reference defaults. Every governance-chain economic parameter (`MIN_BOND`, `TIMELOCK_DELAY`, `FEE_ROUTER_WINDOW_EPOCHS`, the slash/blacklist bonds, …) has a production-shaped default and is overridable via env var — see `_readConfig` in `DeployProtocol.s.sol` for the full list and defaults.
 - **`--sender` becomes the deployer.** The script reverts (`DeployerIsForgeDefaultSender`) if you let forge use its default sender, so always pass `--sender`. The deployer's roles are granted to the Timelock and then revoked as the final step; the script reverts if any privileged role is left on the deployer.
 - **Re-running on the same chain reverts** with `ManifestAlreadyExists` (the guard fires before any gas is spent). Either `rm deployments/31337.json`, restart Anvil for a clean slate, or set `FORCE_OVERWRITE_MANIFEST=true`.
-- **`BuybackBurner` is recorded as the zero address** — it ships unwired at launch (operators take 90%, treasury 10%); its 30% buyback share activates by governance once the concrete Uniswap V3 burner is deployed.
+- **`BuybackBurner` is recorded as the zero address** — it ships unwired at launch (a 7500-bps rebate on the 40% protocol share, so operators take 90% and the treasury 10%); governance activates the 30% buyback with `setBuybackBurner` and `setSplit(0, 7500)` once the concrete Uniswap V3 burner is deployed.
 - **A real-network redeploy must be mirrored into the CLI.** `decdn config init --chain <name>` bakes contract addresses read from the manifest, embedded at compile time from `crates/cli/deployments/<chainId>.json` — a copy, because `include_str!` cannot reach outside the crate and the published `decdn-cli` would otherwise not build. `contracts/deployments/` stays canonical; after a redeploy of a chain the CLI knows about, `cp` the manifest across. Update `l2_start_block` in `crates/cli/src/known_chains.rs` too: the manifest's `deployBlock` is an L1 number, and `decdn node earnings --address` scans `eth_getLogs` (L2 numbers) from this field. Take the earliest contract creation block from the explorer. The `packaging` CI job and the `deployment-manifest-mirror` pre-commit hook fail on drift, so this cannot be forgotten silently. Local chain ids (31337) are not mirrored.
 - **Testnet TOKEN faucet (optional):** `script/TestnetFaucet.s.sol:DeployTestnetFaucet` funds and deploys a cooldown-gated dispenser. It reads `TOKEN_ADDRESS` (from the manifest), `TREASURY_ADDRESS` (must equal `--sender`), `FUNDING_AMOUNT`, and the `ADMIN_ADDRESS`/`GOVERNANCE_ADDRESS`/`PAUSER_ADDRESS` role holders; `CLAIM_AMOUNT` and `COOLDOWN_SECONDS` are optional.
 

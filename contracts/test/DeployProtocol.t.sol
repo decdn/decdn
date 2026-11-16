@@ -11,6 +11,8 @@ import { TimelockController } from "@openzeppelin/contracts/governance/TimelockC
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { TransitionToGovernor } from "../script/TransitionToGovernor.s.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
+import { IMessageTransmitterV2 } from "../src/interfaces/ICctpV2.sol";
+import { LoopbackCctp } from "../testnet/LoopbackCctp.sol";
 import { Token } from "../src/Token.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
@@ -61,6 +63,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     function _testConfig() internal returns (DeployConfig memory) {
         DeployUSDC usdc = new DeployUSDC();
         MockEd25519Verifier ed = new MockEd25519Verifier();
+        LoopbackCctp cctp = new LoopbackCctp(0);
         return DeployConfig({
             usdc: usdc,
             ed25519Verifier: ed,
@@ -79,8 +82,12 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             currentTermsHash: keccak256("decdn operator terms v1"),
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
-            feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
+            feeRouterRebateBps: 7500,
+            feeRouterBuybackBps: 0,
+            feeRouterDeliveryFloor: 1,
             buybackBurner: address(0),
+            cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
+            cctpTokenMessenger: address(cctp),
             slashAppealBond: 1000e18
         });
     }
@@ -111,7 +118,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertFalse(d.blacklist.hasRole(DEFAULT_ADMIN_ROLE, tl), "blacklist admin master key");
         assertFalse(d.slashAppeal.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashAppeal admin master key");
         assertFalse(d.registry.hasRole(DEFAULT_ADMIN_ROLE, tl), "registry admin master key");
-        assertFalse(d.paymentPool.hasRole(DEFAULT_ADMIN_ROLE, tl), "paymentPool admin master key");
         assertFalse(d.slashJudge.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashJudge admin master key");
         assertFalse(d.originAssignment.hasRole(DEFAULT_ADMIN_ROLE, tl), "originAssignment admin master key");
         assertFalse(d.vettingPolicy.hasRole(DEFAULT_ADMIN_ROLE, tl), "vettingPolicy admin master key");
@@ -124,7 +130,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     function test_roleMatrix_rotatableRolesAdminedByGovernance() public view {
         assertEq(d.bond.getRoleAdmin(d.bond.PAUSER_ROLE()), GOVERNANCE_ROLE, "bond pauser admin");
         assertEq(d.router.getRoleAdmin(d.router.PAUSER_ROLE()), GOVERNANCE_ROLE, "router pauser admin");
-        assertEq(d.paymentPool.getRoleAdmin(d.paymentPool.PAUSER_ROLE()), GOVERNANCE_ROLE, "pool pauser admin");
         assertEq(d.slashJudge.getRoleAdmin(d.slashJudge.PAUSER_ROLE()), GOVERNANCE_ROLE, "judge pauser admin");
         assertEq(d.slashAppeal.getRoleAdmin(d.slashAppeal.PAUSER_ROLE()), GOVERNANCE_ROLE, "appeal pauser admin");
         assertEq(
@@ -164,13 +169,13 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // (freeze everything) was rejected: it would strand a rogue pauser in place.
     function test_2028_pauserRotatableByGovernance() public {
         address newPauser = address(0xBEEF);
-        bytes32 pauser = d.paymentPool.PAUSER_ROLE();
+        bytes32 pauser = d.router.PAUSER_ROLE();
         vm.startPrank(address(d.timelock));
-        d.paymentPool.grantRole(pauser, newPauser);
-        d.paymentPool.revokeRole(pauser, emergencyMultisig);
+        d.router.grantRole(pauser, newPauser);
+        d.router.revokeRole(pauser, emergencyMultisig);
         vm.stopPrank();
-        assertTrue(d.paymentPool.hasRole(pauser, newPauser), "new pauser seated");
-        assertFalse(d.paymentPool.hasRole(pauser, emergencyMultisig), "old pauser evicted");
+        assertTrue(d.router.hasRole(pauser, newPauser), "new pauser seated");
+        assertFalse(d.router.hasRole(pauser, emergencyMultisig), "old pauser evicted");
     }
 
     function test_roleMatrix_deployerHoldsNoRoleAnywhere() public view {
@@ -205,7 +210,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.bond.hasRole(d.bond.PAUSER_ROLE(), emergencyMultisig), "bond pauser");
         assertTrue(d.router.hasRole(d.router.PAUSER_ROLE(), emergencyMultisig), "router pauser");
         assertTrue(d.slashAppeal.hasRole(d.slashAppeal.PAUSER_ROLE(), emergencyMultisig), "slashAppeal pauser");
-        assertTrue(d.paymentPool.hasRole(d.paymentPool.PAUSER_ROLE(), emergencyMultisig), "paymentPool pauser");
         assertTrue(d.slashJudge.hasRole(d.slashJudge.PAUSER_ROLE(), emergencyMultisig), "slashJudge pauser");
     }
 
@@ -240,10 +244,13 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // role-matrix test (not only the E2E lifecycle test) so a wiring regression
     // fails here independently of the heavier E2E flow.
     function test_crossContractWiring_newContractPeerRoles() public view {
-        assertTrue(
-            d.router.hasRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentPool)),
-            "paymentPool holds ROUTER_CALLER_ROLE on router"
+        assertEq(address(d.sweepReceiver.feeRouter()), address(d.router), "sweepReceiver deposits into router");
+        assertEq(
+            address(d.sweepReceiver.messageTransmitter()),
+            address(cfg.cctpMessageTransmitter),
+            "sweepReceiver messageTransmitter binding"
         );
+        assertEq(d.sweepReceiver.tokenMessenger(), cfg.cctpTokenMessenger, "sweepReceiver tokenMessenger binding");
         assertTrue(d.bond.hasRole(d.bond.SLASH_ROLE(), address(d.slashJudge)), "slashJudge holds SLASH_ROLE on bond");
         assertEq(address(d.bond.slashJudge()), address(d.slashJudge), "bond slashJudge binding");
         assertEq(
@@ -285,10 +292,10 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // FeeRouter launch state — buyback bucket dormant pending a concrete
     // BuybackBurner subclass (see BaseProtocolDeploy header).
 
-    function test_feeRouter_launchSharesDormantBuyback() public view {
-        uint256[3] memory shares = d.router.getShares();
-        assertEq(shares[0] + shares[1] + shares[2], 10_000, "shares sum to 10_000");
-        assertEq(shares[1], 0, "buyback share is 0 at launch (dormant)");
+    function test_feeRouter_launchSplitDormantBuyback() public view {
+        assertEq(d.router.rebateBps(), cfg.feeRouterRebateBps, "rebate share at launch");
+        assertEq(d.router.buybackBps(), 0, "buyback share is 0 at launch (dormant)");
+        assertEq(d.router.deliveryFloor(), cfg.feeRouterDeliveryFloor, "delivery floor at launch");
         assertEq(d.router.buybackBurner(), address(0), "buybackBurner unwired at launch");
     }
 
@@ -357,9 +364,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         d2.bond.grantRole(d2.bond.PAUSER_ROLE(), cfg2.emergencyMultisig);
         d2.router.grantRole(d2.router.PAUSER_ROLE(), cfg2.emergencyMultisig);
         d2.slashAppeal.grantRole(d2.slashAppeal.PAUSER_ROLE(), cfg2.emergencyMultisig);
-        d2.paymentPool.grantRole(d2.paymentPool.PAUSER_ROLE(), cfg2.emergencyMultisig);
         d2.slashJudge.grantRole(d2.slashJudge.PAUSER_ROLE(), cfg2.emergencyMultisig);
-        d2.router.grantRole(d2.router.ROUTER_CALLER_ROLE(), address(d2.paymentPool));
         d2.bond.grantRole(d2.bond.SLASH_ROLE(), address(d2.slashJudge));
         vm.stopPrank();
         vm.expectRevert(
@@ -745,19 +750,19 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(bad);
     }
 
-    /// @notice On Arbitrum One the deployer key cannot be the emergency
+    /// @notice On Ethereum mainnet the deployer key cannot be the emergency
     ///         multisig, which holds every pause and emergency role.
     function test_mainnet_revertsWhenEmergencyMultisigIsDeployer() public {
-        vm.chainId(42_161);
+        vm.chainId(1);
         DeployConfig memory bad = _testConfig();
         bad.emergencyMultisig = bad.deployer;
         vm.expectRevert(abi.encodeWithSelector(BaseProtocolDeploy.EmergencyMultisigIsDeployer.selector, bad.deployer));
         this.externalRunFullDeploy(bad);
     }
 
-    /// @notice On Arbitrum One the emergency multisig must hold code.
+    /// @notice On Ethereum mainnet the emergency multisig must hold code.
     function test_mainnet_revertsWhenEmergencyMultisigIsNotAContract() public {
-        vm.chainId(42_161);
+        vm.chainId(1);
         DeployConfig memory bad = _testConfig();
         bad.emergencyMultisig = address(0xDEAD);
         vm.expectRevert(
@@ -883,5 +888,17 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         DeployConfig memory bad = _testConfig();
         bad.initialTokenHolder = address(0);
         _expectZeroAddressRevert(bad, "initialTokenHolder");
+    }
+
+    function test_deployTargets_revertsOnZeroCctpMessageTransmitter() public {
+        DeployConfig memory bad = _testConfig();
+        bad.cctpMessageTransmitter = IMessageTransmitterV2(address(0));
+        _expectZeroAddressRevert(bad, "cctpMessageTransmitter");
+    }
+
+    function test_deployTargets_revertsOnZeroCctpTokenMessenger() public {
+        DeployConfig memory bad = _testConfig();
+        bad.cctpTokenMessenger = address(0);
+        _expectZeroAddressRevert(bad, "cctpTokenMessenger");
     }
 }
