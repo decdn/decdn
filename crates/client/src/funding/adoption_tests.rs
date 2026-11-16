@@ -2012,10 +2012,9 @@ async fn delegated_ctx(
         .layer(SendLegLayer)
         .connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc);
-    let chain = ChainConfig {
+    let governance = crate::session::GovernanceChain {
         rpc_url: "http://config:8545".to_string(),
         chain_id: DEPLOYMENT.chain_id,
-        payment_pool: PP,
         slash_judge: Address::repeat_byte(0x44),
         capacity_bond: None,
     };
@@ -2029,7 +2028,7 @@ async fn delegated_ctx(
         delegate,
         &DEPLOYMENT.voucher_domain(),
         PROVIDER,
-        &chain,
+        (&governance, DEPLOYMENT),
         &endpoint,
         grant,
     )

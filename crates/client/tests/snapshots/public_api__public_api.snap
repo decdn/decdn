@@ -315,6 +315,7 @@ pub fn decdn_client::discovery::NodeCandidate::dial_addrs(&self) -> alloc::vec::
 pub struct decdn_client::discovery::Probed
 pub decdn_client::discovery::Probed::candidate: decdn_client::discovery::NodeCandidate
 pub decdn_client::discovery::Probed::coverage: decdn_protocol::coverage::Coverage
+pub decdn_client::discovery::Probed::payment_pools: core::option::Option<alloc::vec::Vec<decdn_protocol::pool_account::PoolAccount>>
 pub decdn_client::discovery::Probed::rtt_ms: f64
 pub decdn_client::discovery::Probed::total_bytes: core::option::Option<decdn_client::ProvenSize>
 pub const decdn_client::discovery::BOOTSTRAP_UNREACHABLE: &str
@@ -354,6 +355,24 @@ pub mod decdn_client::endpoint
 pub fn decdn_client::endpoint::client_discovery(core::option::Option<&std::path::Path>) -> anyhow::Result<decdn_common::config::resolved::ResolvedDiscovery>
 pub async fn decdn_client::endpoint::client_endpoint(&[iroh_base::relay_url::RelayUrl], &decdn_common::config::resolved::ResolvedDiscovery) -> anyhow::Result<iroh::endpoint::Endpoint>
 pub fn decdn_client::endpoint::resolve_relays(core::option::Option<&str>, core::option::Option<&std::path::Path>) -> anyhow::Result<alloc::vec::Vec<iroh_base::relay_url::RelayUrl>>
+pub mod decdn_client::pool_route
+pub struct decdn_client::pool_route::PoolPasses
+impl decdn_client::pool_route::PoolPasses
+pub fn decdn_client::pool_route::PoolPasses::admits(&self, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, core::option::Option<&[decdn_protocol::pool_account::PoolAccount]>) -> bool
+pub fn decdn_client::pool_route::PoolPasses::declined(&self, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, &[decdn_protocol::pool_account::PoolAccount])
+pub fn decdn_client::pool_route::PoolPasses::first<'h>(&self, impl core::iter::traits::collect::IntoIterator<Item = core::option::Option<&'h [decdn_protocol::pool_account::PoolAccount]>>) -> decdn_incentive::deployment::Deployment
+pub fn decdn_client::pool_route::PoolPasses::new(decdn_client::pool_route::PoolRoute) -> Self
+pub fn decdn_client::pool_route::PoolPasses::next(&self) -> core::option::Option<decdn_incentive::deployment::Deployment>
+pub const fn decdn_client::pool_route::PoolPasses::route(&self) -> &decdn_client::pool_route::PoolRoute
+pub fn decdn_client::pool_route::PoolPasses::start(&self, decdn_incentive::deployment::Deployment)
+pub struct decdn_client::pool_route::PoolRoute
+impl decdn_client::pool_route::PoolRoute
+pub fn decdn_client::pool_route::PoolRoute::choose(&self, core::option::Option<&[decdn_protocol::pool_account::PoolAccount]>) -> core::option::Option<decdn_incentive::deployment::Deployment>
+pub fn decdn_client::pool_route::PoolRoute::for_buyer(&decdn_client::session::ChainConfig, &dyn decdn_incentive::buyer_pool::BuyerPoolStore, core::option::Option<alloy_primitives::bits::address::Address>) -> anyhow::Result<Self>
+pub fn decdn_client::pool_route::PoolRoute::new(&[decdn_incentive::deployment::Deployment], impl core::ops::function::Fn(decdn_incentive::deployment::Deployment) -> bool) -> core::option::Option<Self>
+pub fn decdn_client::pool_route::PoolRoute::order(&self) -> &[decdn_incentive::deployment::Deployment]
+pub fn decdn_client::pool_route::PoolRoute::retry(&self, decdn_incentive::deployment::Deployment, &[decdn_protocol::pool_account::PoolAccount]) -> core::option::Option<decdn_incentive::deployment::Deployment>
+pub fn decdn_client::pool_route::PoolRoute::single(decdn_incentive::deployment::Deployment) -> Self
 pub mod decdn_client::probe
 pub struct decdn_client::probe::ProbeRtt
 pub decdn_client::probe::ProbeRtt::direct: bool
@@ -453,6 +472,7 @@ pub type decdn_client::receipt::ReceiptAmount::Error = ruint::from::FromUintErro
 pub fn decdn_client::receipt::ReceiptAmount::try_from(decdn_client::Cumulative) -> core::result::Result<Self, Self::Error>
 pub struct decdn_client::receipt::ReceiptChain
 pub decdn_client::receipt::ReceiptChain::chain_id: u64
+pub decdn_client::receipt::ReceiptChain::payment_chain_id: u64
 pub decdn_client::receipt::ReceiptChain::payment_pool: alloy_primitives::bits::address::Address
 pub decdn_client::receipt::ReceiptChain::slash_judge: alloy_primitives::bits::address::Address
 pub struct decdn_client::receipt::ReceiptContent
@@ -542,13 +562,13 @@ pub enum decdn_client::session::PoolOpen
 pub decdn_client::session::PoolOpen::Allowed
 pub decdn_client::session::PoolOpen::Refused
 pub struct decdn_client::session::ChainConfig
-pub decdn_client::session::ChainConfig::capacity_bond: core::option::Option<alloy_primitives::bits::address::Address>
-pub decdn_client::session::ChainConfig::chain_id: u64
-pub decdn_client::session::ChainConfig::payment_pool: alloy_primitives::bits::address::Address
-pub decdn_client::session::ChainConfig::rpc_url: alloc::string::String
-pub decdn_client::session::ChainConfig::slash_judge: alloy_primitives::bits::address::Address
+pub decdn_client::session::ChainConfig::governance: decdn_client::session::GovernanceChain
+pub decdn_client::session::ChainConfig::payment_pools: alloc::vec::Vec<decdn_client::session::PaymentPoolChain>
 impl decdn_client::session::ChainConfig
-pub const fn decdn_client::session::ChainConfig::deployment(&self) -> decdn_incentive::deployment::Deployment
+pub fn decdn_client::session::ChainConfig::deployments(&self) -> alloc::vec::Vec<decdn_incentive::deployment::Deployment>
+pub fn decdn_client::session::ChainConfig::first_pool(&self) -> anyhow::Result<&decdn_client::session::PaymentPoolChain>
+pub fn decdn_client::session::ChainConfig::new(decdn_client::session::GovernanceChain, alloc::vec::Vec<decdn_client::session::PaymentPoolChain>) -> anyhow::Result<Self>
+pub fn decdn_client::session::ChainConfig::pool(&self, decdn_incentive::deployment::Deployment) -> core::option::Option<&decdn_client::session::PaymentPoolChain>
 pub struct decdn_client::session::DepositPolicy
 pub decdn_client::session::DepositPolicy::adoption: decdn_client::session::ChainAdoption
 pub decdn_client::session::DepositPolicy::max_approve: bool
@@ -562,6 +582,14 @@ pub decdn_client::session::DiscoveryOptions::rediscover: bool
 pub decdn_client::session::DiscoveryOptions::registry_timeout: core::time::Duration
 impl core::default::Default for decdn_client::session::DiscoveryOptions
 pub fn decdn_client::session::DiscoveryOptions::default() -> Self
+pub struct decdn_client::session::GovernanceChain
+pub decdn_client::session::GovernanceChain::capacity_bond: core::option::Option<alloy_primitives::bits::address::Address>
+pub decdn_client::session::GovernanceChain::chain_id: u64
+pub decdn_client::session::GovernanceChain::rpc_url: alloc::string::String
+pub decdn_client::session::GovernanceChain::slash_judge: alloy_primitives::bits::address::Address
+pub struct decdn_client::session::PaymentPoolChain
+pub decdn_client::session::PaymentPoolChain::deployment: decdn_incentive::deployment::Deployment
+pub decdn_client::session::PaymentPoolChain::rpc_url: alloc::string::String
 pub struct decdn_client::session::PinnedNode
 pub decdn_client::session::PinnedNode::addr: core::option::Option<core::net::socket_addr::SocketAddr>
 pub decdn_client::session::PinnedNode::node_id: iroh_base::key::PublicKey
@@ -1039,6 +1067,7 @@ impl core::fmt::Display for decdn_client::UnprovenSize
 pub fn decdn_client::UnprovenSize::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::UpstreamRefused
 impl decdn_client::UpstreamRefused
+pub fn decdn_client::UpstreamRefused::accepted_pools(&self) -> core::option::Option<&[decdn_protocol::pool_account::PoolAccount]>
 pub const fn decdn_client::UpstreamRefused::error(&self) -> &decdn_protocol::client::StreamError
 pub fn decdn_client::UpstreamRefused::evidence(&self) -> core::option::Option<&decdn_protocol::client::StreamResponse>
 pub const fn decdn_client::UpstreamRefused::mid_stream(decdn_protocol::client::StreamError) -> Self

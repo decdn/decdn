@@ -98,14 +98,15 @@ async fn an_owned_lane_binds_its_endpoint_with_the_lane_key() -> anyhow::Result<
         U256::ZERO,
     )?;
     let capacity_bond = Address::repeat_byte(0x55);
-    let chain = ChainConfig {
+    // The binding domain is the governance chain's, never the payment
+    // chain's.
+    let governance = crate::session::GovernanceChain {
         rpc_url: "http://config:8545".to_string(),
-        chain_id: deployment.chain_id,
-        payment_pool: deployment.payment_pool,
+        chain_id: deployment.chain_id.wrapping_add(1),
         slash_judge: Address::repeat_byte(0x44),
         capacity_bond: Some(capacity_bond),
     };
-    let ctx = attach_client_binding(ctx, &chain, &endpoint)?;
+    let ctx = attach_client_binding(ctx, &governance, &endpoint)?;
 
     let lane = payer.lane().address();
     anyhow::ensure!(
@@ -120,8 +121,19 @@ async fn an_owned_lane_binds_its_endpoint_with_the_lane_key() -> anyhow::Result<
         B256::from(*endpoint.id().as_bytes()),
         decdn_incentive::EPHEMERAL_BINDING_NONCE,
         &binding.binding_signature,
-        &bind_node_id_domain(chain.chain_id, capacity_bond),
+        &bind_node_id_domain(governance.chain_id, capacity_bond),
     )?;
+    anyhow::ensure!(
+        decdn_incentive::verify_binding(
+            B256::from(*endpoint.id().as_bytes()),
+            decdn_incentive::EPHEMERAL_BINDING_NONCE,
+            &binding.binding_signature,
+            &bind_node_id_domain(deployment.chain_id, capacity_bond),
+        )
+        .ok()
+            != Some(lane),
+        "the binding must not verify under the payment chain id"
+    );
     anyhow::ensure!(
         recovered == lane,
         "the binding recovers to {recovered}, not the lane key"

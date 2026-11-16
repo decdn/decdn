@@ -159,7 +159,7 @@ use decdn_common::config::{FileConfig, load_file_config};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::publisher_registry::PublisherRegistry;
-use decdn_incentive::{CapabilityGrant, PoolId, voucher_domain};
+use decdn_incentive::{CapabilityGrant, PoolId};
 use http_body_util::{BodyExt as _, Limited, StreamBody};
 use hyper::body::{Body as HttpBody, Frame};
 use hyper::service::service_fn;
@@ -344,7 +344,9 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     };
     let (store_dir, temp_store) = store_dir(&root, public_url.is_some())?;
     common.data_dir = Some(store_dir);
-    let (sites, public) = mode(args, &root, chain.chain_id, &file)?;
+    let (sites, public) = mode(args, &root, chain.governance.chain_id, &file)?;
+    // A capability names a pool on the first configured payment pool.
+    let capability_pool = chain.first_pool()?.deployment;
 
     let listener = TcpListener::bind(args.listen)
         .await
@@ -362,7 +364,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     let gateway = Arc::new(Gateway {
         common,
         token,
-        domain: voucher_domain(chain.chain_id, chain.payment_pool),
+        domain: capability_pool.voucher_domain(),
         chain,
         delegates: Mutex::new(HashMap::new()),
         pulls,
@@ -1657,7 +1659,7 @@ impl Gateway {
             }
         };
         let ns = pointer.namespace;
-        let domain = pointer_domain(self.chain.chain_id, public.registry);
+        let domain = pointer_domain(self.chain.governance.chain_id, public.registry);
         let signer = match pointer.signer(&domain) {
             Ok(signer) => signer,
             Err(e) => return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n")),
@@ -1863,9 +1865,13 @@ impl Gateway {
                 format!("could not read the capability's pool on-chain: {e}\n"),
             )
         };
-        let rpc = decdn_client::provider::build_read_provider(&self.chain.rpc_url)
+        let capability_pool = self
+            .chain
+            .first_pool()
             .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
-        let pool = PaymentPool::new(self.chain.payment_pool, rpc)
+        let rpc = decdn_client::provider::build_read_provider(&capability_pool.rpc_url)
+            .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
+        let pool = PaymentPool::new(capability_pool.deployment.payment_pool, rpc)
             .getPool(grant.pool_id)
             .call()
             .await
@@ -1914,7 +1920,7 @@ impl Gateway {
                 &format!("could not read the namespace's owner on-chain: {e}\n"),
             ))
         };
-        let rpc = decdn_client::provider::build_read_provider(&self.chain.rpc_url)
+        let rpc = decdn_client::provider::build_read_provider(&self.chain.governance.rpc_url)
             .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
         let registry = PublisherRegistry::new(public.registry, rpc);
         let lookup = registry.ownerOf(U256::from(ns));

@@ -317,7 +317,7 @@ impl Backend for FetchBackend {
         delegates: &[(PoolId, Address)],
     ) -> anyhow::Result<PoolSnapshot> {
         let store = host.store();
-        let deployment = host.deployment();
+        let deployment = host.deployment()?;
         let queries = lane_queries(grant.as_ref(), delegates);
         tokio::task::spawn_blocking(move || read_pools(store.as_ref(), deployment, &queries))
             .await?

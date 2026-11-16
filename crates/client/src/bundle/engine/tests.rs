@@ -147,13 +147,13 @@ fn chain_against(
     data_dir: &Path,
     rediscover: bool,
 ) -> anyhow::Result<(ChainConfig, PullSite, DiscoveryOptions)> {
-    let chain = ChainConfig {
-        rpc_url: format!("http://{}", rpc.local_addr()?),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: Some(Address::repeat_byte(0x55)),
-    };
+    let chain = crate::session::test_support::one_chain(
+        format!("http://{}", rpc.local_addr()?),
+        1,
+        Address::repeat_byte(0x33),
+        Address::repeat_byte(0x44),
+        Some(Address::repeat_byte(0x55)),
+    );
     let site = PullSite {
         data_dir: data_dir.to_path_buf(),
         region: None,

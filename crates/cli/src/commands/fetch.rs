@@ -45,10 +45,11 @@ use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
+use decdn_client::pool_route::{PoolPasses, PoolRoute};
 use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::session::{
-    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PoolOpen,
-    ProxyWarmingParams, PullSite,
+    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, GovernanceChain, PaymentPoolChain,
+    PinnedNode, PoolOpen, ProxyWarmingParams, PullSite,
 };
 use decdn_client::targets::{
     ProbeOpts, ProbeRound, ResolveConfigFault, holders_or_none, resolve_target_node,
@@ -65,7 +66,7 @@ use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::rate::min_payment;
-use decdn_incentive::{CapabilityGrant, PoolId, slash_judge_domain, voucher_domain};
+use decdn_incentive::{CapabilityGrant, PoolId, slash_judge_domain};
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, PublicKey, RelayUrl};
 
@@ -118,9 +119,10 @@ fn new_progress_bar() -> indicatif::ProgressBar {
 /// default. Pure (parse-only) so the precedence is unit-testable.
 #[derive(Debug)]
 pub(crate) struct ResolvedChain {
-    /// The chain the command pays on. Its `capacity_bond` is `None` when
-    /// neither the flag nor `blockchain.capacity_bond_address` is set — only
-    /// an error on the discovery path, never on the explicit-node path.
+    /// The governance chain and the payment pools the command can pay
+    /// through. The governance `capacity_bond` is `None` when neither the flag
+    /// nor `blockchain.capacity_bond_address` is set — only an error on the
+    /// discovery path, never on the explicit-node path.
     pub(crate) config: ChainConfig,
     /// Where the command keeps its state, and the client's region. The data
     /// dir holds the buyer-pool redb store and (by default) the keystore. It
@@ -202,25 +204,86 @@ fn parse_region_allowlist(file: &FileConfig) -> Vec<decdn_protocol::Region> {
         .collect()
 }
 
+/// The payment pools a command can pay through: every pool of every
+/// `[[blockchain.payment_chains]]` entry, in the order the config lists them.
+/// `--rpc-url` and `--payment-pool-address` override the first pool's RPC
+/// endpoint and contract. With no entry, the flags name the one pool, on the
+/// governance chain id `governance_chain_id`; an entry with no chain id is on
+/// it too.
+///
+/// # Errors
+///
+/// No pool and no RPC endpoint is named, or an address is malformed or zero.
+fn resolve_payment_pools(
+    args: &cli::ClientFetchArgs,
+    bc: Option<&decdn_common::config::types::BlockchainConfig>,
+    governance_chain_id: u64,
+) -> anyhow::Result<Vec<PaymentPoolChain>> {
+    let mut pools = Vec::new();
+    for entry in bc.map(|b| b.payment_chains.as_slice()).unwrap_or_default() {
+        let chain_id = entry.chain_id.unwrap_or(governance_chain_id);
+        for raw in &entry.payment_pools {
+            // `--rpc-url` stands in for the first pool's endpoint only.
+            let rpc_url = entry
+                .rpc_url
+                .clone()
+                .or_else(|| pools.is_empty().then(|| args.rpc_url.clone()).flatten())
+                .context("rpc_url not set (a [[blockchain.payment_chains]] rpc_url)")?;
+            pools.push(PaymentPoolChain {
+                rpc_url,
+                deployment: decdn_incentive::Deployment {
+                    chain_id,
+                    payment_pool: super::chain_ctx::parse_nonzero_address(raw, "payment_pools")?,
+                },
+            });
+        }
+    }
+    let flag_pool = args
+        .payment_pool_address
+        .as_deref()
+        .map(|raw| super::chain_ctx::parse_nonzero_address(raw, "payment_pool_address"))
+        .transpose()?;
+    match pools.first_mut() {
+        Some(first) => {
+            if let Some(rpc_url) = &args.rpc_url {
+                first.rpc_url.clone_from(rpc_url);
+            }
+            if let Some(payment_pool) = flag_pool {
+                first.deployment.payment_pool = payment_pool;
+            }
+        }
+        None => pools.push(PaymentPoolChain {
+            rpc_url: args.rpc_url.clone().context(
+                "rpc_url not set (--rpc-url or a [[blockchain.payment_chains]] rpc_url)",
+            )?,
+            deployment: decdn_incentive::Deployment {
+                chain_id: governance_chain_id,
+                payment_pool: flag_pool.context(
+                    "payment pool not set (--payment-pool-address or a payment_pools entry)",
+                )?,
+            },
+        }),
+    }
+    Ok(pools)
+}
+
 pub(crate) fn resolve_chain(
     args: &cli::ClientFetchArgs,
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedChain> {
     let bc = file.blockchain.as_ref();
-    // The pull pays on the first configured payment chain's first pool; the
-    // flags override each part.
-    let payment = bc.and_then(|b| b.payment_chains.first());
-    let rpc_url = args
-        .rpc_url
-        .clone()
-        .or_else(|| payment.and_then(|p| p.rpc_url.clone()))
-        .context("rpc_url not set (--rpc-url or a [[blockchain.payment_chains]] rpc_url)")?;
-    let pp_raw = args
-        .payment_pool_address
-        .clone()
-        .or_else(|| payment.and_then(|p| p.payment_pools.first().cloned()))
-        .context("payment pool not set (--payment-pool-address or a payment_pools entry)")?;
-    let payment_pool = super::chain_ctx::parse_nonzero_address(&pp_raw, "payment_pool_address")?;
+    let governance_chain_id = args
+        .chain_id
+        .or_else(|| bc.and_then(|b| b.chain_id))
+        .unwrap_or(DEFAULT_CHAIN_ID);
+    let payment_pools = resolve_payment_pools(args, bc, governance_chain_id)?;
+    // The registry and every non-payment domain live on the governance chain.
+    // A command that names no governance RPC runs on one chain: its first
+    // payment pool's.
+    let governance_rpc_url = bc
+        .and_then(|b| b.rpc_url.clone())
+        .or_else(|| payment_pools.first().map(|pool| pool.rpc_url.clone()))
+        .context("rpc_url not set (blockchain.rpc_url)")?;
 
     let sj_raw = args
         .slash_judge_address
@@ -250,11 +313,6 @@ pub(crate) fn resolve_chain(
 
     // The `[client] region_allowlist` pre-filters discovery/probing.
     let region_allowlist = parse_region_allowlist(file);
-
-    let chain_id = args
-        .chain_id
-        .or_else(|| payment.and_then(|p| p.chain_id))
-        .unwrap_or(DEFAULT_CHAIN_ID);
 
     // Client data dir: an explicit `--data-dir`/`identity.data_dir` wins,
     // otherwise the client-scoped `~/.decdn/client` (not the node-shaped
@@ -313,13 +371,15 @@ pub(crate) fn resolve_chain(
     let max_approve = bc.and_then(|b| b.buyer_max_approve).unwrap_or(false);
 
     Ok(ResolvedChain {
-        config: ChainConfig {
-            rpc_url,
-            chain_id,
-            payment_pool,
-            slash_judge,
-            capacity_bond,
-        },
+        config: ChainConfig::new(
+            GovernanceChain {
+                rpc_url: governance_rpc_url,
+                chain_id: governance_chain_id,
+                slash_judge,
+                capacity_bond,
+            },
+            payment_pools,
+        )?,
         site: PullSite {
             data_dir,
             region,
@@ -559,7 +619,7 @@ pub(crate) async fn fetch(
     };
     // On every exit, a Ctrl-C's included: the gate lists a replacement whose
     // fetch was dropped too.
-    print_reclaim_notes(&payer.recovery.replacements());
+    print_reclaim_notes(&payer.replacements());
     let result = name_held_escrows(result, &host.escrows);
     let output = if wants_stdout(output) {
         "stdout"
@@ -808,8 +868,8 @@ pub(crate) struct FetchHost {
     /// Each `openPool` and `topUp` no local record credits yet, and each that
     /// escrowed with no local record crediting it, across every fetch.
     pub(crate) escrows: UnconfirmedEscrows,
-    /// The pool's settlement token, `PaymentPool.usdc()`, read once.
-    token: tokio::sync::OnceCell<alloy::primitives::Address>,
+    /// Each payment pool's settlement token, `PaymentPool.usdc()`, read once.
+    tokens: PerPool<tokio::sync::OnceCell<alloy::primitives::Address>>,
     /// The proven sizes of blobs fetches on this host learned, up to
     /// [`MAX_SIZE_HINTS`].
     sizes: Mutex<SizeHints>,
@@ -817,6 +877,35 @@ pub(crate) struct FetchHost {
 
 /// The most blob sizes a [`FetchHost`] remembers.
 const MAX_SIZE_HINTS: usize = 4096;
+
+/// One `T` per payment pool, made on first use. A pool id is unique only
+/// inside one `PaymentPool` contract, so funding facts, recovery gates and
+/// lane ledgers never cross pools.
+pub(crate) struct PerPool<T>(Mutex<std::collections::HashMap<decdn_incentive::Deployment, Arc<T>>>);
+
+impl<T> Default for PerPool<T> {
+    fn default() -> Self {
+        Self(Mutex::new(std::collections::HashMap::new()))
+    }
+}
+
+impl<T> PerPool<T> {
+    /// The `T` of `deployment`, made by `make` on first use.
+    fn get(&self, deployment: decdn_incentive::Deployment, make: impl FnOnce() -> T) -> Arc<T> {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(map.entry(deployment).or_insert_with(|| Arc::new(make())))
+    }
+
+    /// Every `T` made so far.
+    fn all(&self) -> Vec<Arc<T>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+}
 
 /// Blob sizes by hash, each one a size a holder proved or a whole fetch
 /// verified ([`BlobFetch::size_only`]), oldest first out
@@ -925,7 +1014,7 @@ impl FetchHost {
             health: Arc::new(PeerHealth::default()),
             writes: OrderedWrites::default(),
             escrows: UnconfirmedEscrows::default(),
-            token: tokio::sync::OnceCell::new(),
+            tokens: PerPool::default(),
             sizes: Mutex::new(SizeHints::default()),
         };
         Ok((host, grant))
@@ -936,9 +1025,14 @@ impl FetchHost {
         Arc::clone(&self.store)
     }
 
-    /// The chain and `PaymentPool` this host pays on.
-    pub(crate) const fn deployment(&self) -> decdn_incentive::Deployment {
-        self.chain.config.deployment()
+    /// The first configured payment pool: the one a delegated capability
+    /// draws from.
+    ///
+    /// # Errors
+    ///
+    /// No payment pool is configured.
+    pub(crate) fn deployment(&self) -> anyhow::Result<decdn_incentive::Deployment> {
+        Ok(self.chain.config.first_pool()?.deployment)
     }
 
     /// The size of `hash` a whole fetch on this host verified, or a size
@@ -962,16 +1056,17 @@ impl FetchHost {
 /// advance each lane's cumulative voucher through one issuer.
 pub(crate) struct Payer {
     key: PayerKey,
-    /// The lane ledgers concurrent fetches share; `None` for a keystore payer,
-    /// whose fetches run one at a time, each lane starting from its persisted
-    /// watermark.
-    ledgers: Option<LaneLedgers>,
-    /// The funding facts concurrent fetches share, so their `topUp`s run one
-    /// at a time (a `RunFunding` serializes only its own): a gateway's pool
-    /// payer. `None` for a payer whose fetches run one at a time, each pass
-    /// with its own.
-    funding: Option<Arc<RunFunding>>,
-    recovery: Arc<RecoveryGate>,
+    /// The lane ledgers concurrent fetches share, one registry per payment
+    /// pool; `None` for a keystore payer, whose fetches run one at a time,
+    /// each lane starting from its persisted watermark.
+    ledgers: Option<PerPool<LaneLedgers>>,
+    /// The funding facts concurrent fetches share, one per payment pool, so
+    /// their `topUp`s run one at a time (a `RunFunding` serializes only its
+    /// own): a gateway's pool payer, reporting to `escrows`. `None` for a
+    /// payer whose fetches run one at a time, each pass with its own.
+    funding: Option<(PerPool<RunFunding>, UnconfirmedEscrows)>,
+    /// The funding recovery gate of each payment pool.
+    recovery: PerPool<RecoveryGate>,
     open_lock: tokio::sync::Mutex<()>,
     /// Where every lane keeps the signed messages a pull receipt holds, and
     /// every fetch records the blob it landed; `None` keeps nothing.
@@ -1023,7 +1118,7 @@ impl Payer {
             },
             ledgers: None,
             funding: None,
-            recovery: Arc::new(RecoveryGate::new()),
+            recovery: PerPool::default(),
             open_lock: tokio::sync::Mutex::new(()),
             evidence: None,
         }
@@ -1042,8 +1137,8 @@ impl Payer {
     /// pull's entries do, so no two of them send a `topUp` at once.
     pub(crate) fn pool(grant: Option<CapabilityGrant>, escrows: UnconfirmedEscrows) -> Self {
         Self {
-            ledgers: Some(LaneLedgers::new()),
-            funding: Some(Arc::new(RunFunding::reporting_escrows_to(escrows))),
+            ledgers: Some(PerPool::default()),
+            funding: Some((PerPool::default(), escrows)),
             ..Self::keystore(grant)
         }
     }
@@ -1112,12 +1207,22 @@ impl Payer {
                 signer: credential.signer,
                 slot,
             },
-            ledgers: Some(LaneLedgers::new()),
+            ledgers: Some(PerPool::default()),
             funding: None,
-            recovery: Arc::new(RecoveryGate::new()),
+            recovery: PerPool::default(),
             open_lock: tokio::sync::Mutex::new(()),
             evidence: None,
         })
+    }
+
+    /// Every pool replacement a funding recovery step of this payer made, on
+    /// any payment pool ([`RecoveryGate::replacements`]).
+    pub(crate) fn replacements(&self) -> Vec<PoolReplaced> {
+        self.recovery
+            .all()
+            .iter()
+            .flat_map(|gate| gate.replacements())
+            .collect()
     }
 
     /// Each lane the payer's fetches share a ledger on, with what it has
@@ -1126,9 +1231,13 @@ impl Payer {
     pub(crate) fn committed_lanes(
         &self,
     ) -> Vec<(decdn_incentive::LaneKey, decdn_client::Cumulative)> {
-        self.ledgers
-            .as_ref()
-            .map_or_else(Vec::new, LaneLedgers::committed_lanes)
+        self.ledgers.as_ref().map_or_else(Vec::new, |ledgers| {
+            ledgers
+                .all()
+                .iter()
+                .flat_map(|ledgers| ledgers.committed_lanes())
+                .collect()
+        })
     }
 
     /// Whether the fetch pays from a pool another owner funds.
@@ -1171,7 +1280,7 @@ pub(crate) async fn fetch_on(
         health,
         writes,
         escrows,
-        token,
+        tokens,
         sizes,
     } = host;
     let hash = args.hash;
@@ -1224,28 +1333,8 @@ pub(crate) async fn fetch_on(
     let self_address = signer.address();
 
     let config = &chain.config;
-    let rpc = provider::build_provider(&config.rpc_url, &signer)?;
-    let contract = PaymentPool::new(config.payment_pool, rpc.clone());
-    let voucher_dom = voucher_domain(config.chain_id, config.payment_pool);
-    let slash_dom = slash_judge_domain(config.chain_id, config.slash_judge);
-    // The pool's token is `PaymentPool.usdc()`, immutable per contract, so the
-    // host reads it once. A repeat fetch already holds it in the persisted pool
-    // row, so read it there and skip the eth_call; only a first-ever pool (no
-    // row) pays the `usdc()` round-trip. The reuse branch of
-    // `open_or_reuse_pool` already trusts this same `state.token`, so this only
-    // makes the top-level value consistent with it.
-    let token = *token
-        .get_or_try_init(|| async {
-            match cached_pool_token(store.as_ref(), self_address, config.deployment())? {
-                Some(token) => anyhow::Ok(token),
-                None => contract
-                    .usdc()
-                    .call()
-                    .await
-                    .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()")),
-            }
-        })
-        .await?;
+    // Every probe answer and stream response verifies on the governance chain.
+    let slash_dom = slash_judge_domain(config.governance.chain_id, config.governance.slash_judge);
 
     let max_blob_bytes = held_cap(common.max_blob_mb, args.size_cap);
     // The namespace routing hint (ADR 005 § Namespace routing): the URI's
@@ -1271,31 +1360,77 @@ pub(crate) async fn fetch_on(
         clock,
     );
     let deposit = chain.deposit_policy(payer.delegated())?;
-    // One funding recovery state for everything the payer pays for, both passes
-    // included.
-    let recovery = &payer.recovery;
-    // A replacement the gate carries from an earlier fetch under this payer (an
-    // entry URI's manifest fetch) names the pool this fetch's lanes reuse; the
-    // gate still lists it for the command to name. A keystore payer runs its
-    // fetches one after another, so no fetch is still on the closed pool. A
-    // held payer funds nothing, so its gate never holds one.
-    // Only a payer whose fetches run one after another clears a carried
-    // replacement: a fetch of a shared payer may still be in its pass on the
-    // closed pool, and would open yet another one.
-    if payer.ledgers.is_none() {
-        recovery.leave_carried();
-    }
+    // Which payment pool pays each node (ADR 005 § Payment pool routing): a
+    // pass pays through one pool, and pays only the nodes routed to it. The
+    // first pass is the first pool of the buyer's route that a holder is
+    // routed to.
+    let owner = match &keys {
+        PayerKeys::Owned(payer) => Some(payer.owner().address()),
+        PayerKeys::Delegated(_) => None,
+    };
+    let passes = PoolPasses::new(PoolRoute::for_buyer(config, store.as_ref(), owner)?);
+    let mut pass_pool = resolved.first_pass(&passes);
     // Set once a funding recovery step's replacement ended the first pass of a
-    // file fetch: the second pass then runs the remaining work against the new
-    // pool, and resumes the `.partial`.
+    // file fetch on a pool: the next pass then runs the remaining work against
+    // the new pool, and resumes the `.partial`.
     let mut replaced: Option<PoolReplaced> = None;
+    let mut first = true;
     loop {
+        let pool = config.pool(pass_pool).with_context(|| {
+            format!(
+                "payment pool {} is not configured",
+                pass_pool.pool_account()
+            )
+        })?;
+        let rpc = provider::build_provider(&pool.rpc_url, &signer)?;
+        let contract = PaymentPool::new(pass_pool.payment_pool, rpc.clone());
+        let voucher_dom = pass_pool.voucher_domain();
+        // The pool's token is `PaymentPool.usdc()`, immutable per contract, so
+        // the host reads it once per pool. A repeat fetch already holds it in
+        // the persisted pool row, so read it there and skip the eth_call; only
+        // a first-ever pool (no row) pays the `usdc()` round-trip. The reuse
+        // branch of `open_or_reuse_pool` already trusts this same
+        // `state.token`, so this only makes the top-level value consistent
+        // with it.
+        let token = *tokens
+            .get(pass_pool, tokio::sync::OnceCell::new)
+            .get_or_try_init(|| async {
+                match cached_pool_token(store.as_ref(), self_address, pass_pool)? {
+                    Some(token) => anyhow::Ok(token),
+                    None => contract
+                        .usdc()
+                        .call()
+                        .await
+                        .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()")),
+                }
+            })
+            .await?;
+        // One funding recovery state per pool for everything the payer pays
+        // for, every pass on the pool included.
+        let recovery = payer.recovery.get(pass_pool, RecoveryGate::new);
+        // A replacement the gate carries from an earlier fetch under this
+        // payer (an entry URI's manifest fetch) names the pool this pass's
+        // lanes reuse; the gate still lists it for the command to name. A
+        // keystore payer runs its fetches one after another, so no fetch is
+        // still on the closed pool. A held payer funds nothing, so its gate
+        // never holds one. Only a payer whose fetches run one after another
+        // clears a carried replacement: a fetch of a shared payer may still
+        // be in its pass on the closed pool, and would open yet another one.
+        if payer.ledgers.is_none() && replaced.is_none() {
+            recovery.leave_carried();
+        }
         // Per pass: the funding facts, the lanes and their handles all name the
         // pool the pass pays from.
-        let funding = payer
-            .funding
-            .clone()
-            .unwrap_or_else(|| Arc::new(RunFunding::reporting_escrows_to(escrows.clone())));
+        let funding = match &payer.funding {
+            Some((per_pool, shared)) => per_pool.get(pass_pool, || {
+                RunFunding::reporting_escrows_to(shared.clone())
+            }),
+            None => Arc::new(RunFunding::reporting_escrows_to(escrows.clone())),
+        };
+        let ledgers = payer
+            .ledgers
+            .as_ref()
+            .map(|ledgers| ledgers.get(pass_pool, LaneLedgers::new));
         // The shared pull/funding deps every lane borrows for the whole pass.
         let deps = LaneDeps {
             endpoint,
@@ -1306,6 +1441,8 @@ pub(crate) async fn fetch_on(
             self_address,
             token,
             chain: config,
+            pool,
+            passes: &passes,
             site: &chain.site,
             deposit,
             namespace_id,
@@ -1329,14 +1466,18 @@ pub(crate) async fn fetch_on(
             keys.lane_payer(),
             &voucher_dom,
             Some(&payer.open_lock),
-            payer.ledgers.as_ref(),
+            ledgers.as_deref(),
             None,
-            recovery,
+            &recovery,
         );
+        passes.start(pass_pool);
         let holders = sources.holders_from(&resolved);
-        if replaced.is_none() {
+        if first {
             timings.set_holders_start(holders.len());
         }
+        // Set once the pass writes to a stream: a stream cannot run again
+        // on another pool, because the bytes it wrote cannot be taken back.
+        let streamed = std::cell::Cell::new(false);
         // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
@@ -1360,7 +1501,8 @@ pub(crate) async fn fetch_on(
             let claim = sources
                 .first_claim(hash, holders, first_leg, health, &stop)
                 .await?;
-            if replaced.is_none()
+            if first
+                && replaced.is_none()
                 && let Some(hints) = &rate_hints
             {
                 // A whole blob is one range, so its wire bytes follow from
@@ -1382,6 +1524,7 @@ pub(crate) async fn fetch_on(
                 return Ok(());
             }
             let landed = if streams {
+                streamed.set(true);
                 stream_out(
                     &deps,
                     &sources,
@@ -1431,9 +1574,27 @@ pub(crate) async fn fetch_on(
         }
         let result = result.map_err(|err| annotate(err, &sources.fault_context()));
         match next_pass(result, &mut replaced, streams) {
+            Some(Err(err)) if !streamed.get() => match passes.next() {
+                // The nodes routed to another pool, and those that refused
+                // this one and named another, are paid in that pool's pass.
+                // A file pass resumes the `.partial`.
+                Some(next) => {
+                    tracing::info!(
+                        failed_pool = %pass_pool.pool_account(),
+                        next_pool = %next.pool_account(),
+                        error = %decdn_common::redact::sanitize_err_chain(&err),
+                        "the pass on this payment pool ended; the fetch goes on with the \
+                         nodes that take payment through the next pool"
+                    );
+                    pass_pool = next;
+                    replaced = None;
+                }
+                None => return Err(err),
+            },
             Some(pass_result) => return pass_result,
             None => recovery.start_next_pass(),
         }
+        first = false;
     }
 }
 

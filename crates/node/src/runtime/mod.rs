@@ -1756,18 +1756,31 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // nonce and settled against the chain (`OpenUnconfirmed` /
     // `TopUpUnconfirmed`).
     //
-    // The node buys on the first accepted pool, through its payment chain's
-    // providers.
+    // The node buys through one of its accepted pools, through that pool's
+    // payment chain's providers: the first of the route over the accepted
+    // pools that prefers a pool the buyer store already holds the node's pool
+    // in (ADR 005 § Payment pool routing). An upstream is paid only when the
+    // same route sends it to this pool.
+    let buyer_pool_store: Arc<dyn decdn_incentive::BuyerPoolStore> = Arc::new(
+        crate::pool_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.store_files)),
+    );
+    let buyer_owner = infra.eth_signer.address();
+    let accepted: Vec<_> = infra.pools.iter().map(|pool| pool.deployment).collect();
+    let buyer_route = crate::node_origin::BuyerPool::choose(&accepted, |deployment| {
+        matches!(
+            buyer_pool_store.get_by_owner(deployment, buyer_owner),
+            Ok(Some(_))
+        )
+    })
+    .context("no accepted payment pool for the buyer leg")?;
     let buyer_pool = infra
         .pools
-        .first()
+        .iter()
+        .find(|pool| pool.deployment == buyer_route.deployment())
         .context("no accepted payment pool for the buyer leg")?;
     let buyer_wallet_provider = buyer_pool
         .providers
         .buyer_wallet((*infra.eth_signer).clone(), ch.receipt_poll_interval);
-    let buyer_pool_store: Arc<dyn decdn_incentive::BuyerPoolStore> = Arc::new(
-        crate::pool_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.store_files)),
-    );
     // `admin_v1_pools` reads the SAME store the bootstrap below writes adoptions
     // and top-ups into. It has to be the same handle, not a second open of
     // `buyer.redb`: redb holds a process-exclusive lock on that file for the
@@ -2237,7 +2250,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                         "buyer-side PaymentPool bootstrap failed; node→node paid cache-miss \
                          pulls are DISABLED for this process (seller settlement is unaffected). \
                          This condition is sticky — restart the node to retry. Check: (1) \
-                         the first blockchain.payment_chains pool is correct, (2) its RPC endpoint is \
+                         the buyer pool (payment_pool_addr) is correct, (2) its RPC endpoint is \
                          reachable, (3) the wallet holds gas for the one-time USDC approve."
                     );
                     if pull_through_enabled {
@@ -2281,6 +2294,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     origin_directory: origin_directory_c,
                     addr_resolver: Arc::clone(resolver),
                     buyer: Arc::clone(&service) as Arc<dyn crate::buyer_pool::PoolOpener>,
+                    buyer_pool: buyer_route,
                     self_id: node_origin_self_id,
                     slash_domain: node_origin_slash_domain,
                     bind_domain: node_origin_bind_domain,

@@ -128,6 +128,7 @@ fn one_operator_yields_one_holder_the_nearer_by_rank() {
         pinned: false,
         size_hint: None,
         late: crate::targets::LateSlot::default(),
+        pool_hints: std::collections::HashMap::new(),
     };
     let mut nodes = std::collections::HashMap::new();
     let holders = holders_from(&targets, &mut nodes, &mut std::collections::HashMap::new());
@@ -193,6 +194,7 @@ fn late_non_holder(seed: u8, rtt_ms: f64) -> crate::targets::ProbeOutcome {
             eth_address: Address::repeat_byte(seed),
             rtt_ms,
             multiaddrs: alloy::primitives::Bytes::new(),
+            payment_pools: None,
         },
         (node_id, rtt_ms, 1),
     )
@@ -211,6 +213,7 @@ fn late_holder(seed: u8, rtt_ms: f64) -> crate::targets::ProbeOutcome {
             rtt_ms,
             total_bytes: None,
             coverage: decdn_protocol::Coverage::full(4),
+            payment_pools: None,
         },
         (node_id, rtt_ms, 1),
     )
@@ -332,6 +335,7 @@ fn a_rediscovery_refreshes_an_operators_node() {
         pinned: false,
         size_hint: None,
         late: crate::targets::LateSlot::default(),
+        pool_hints: std::collections::HashMap::new(),
     };
     let mut nodes = std::collections::HashMap::new();
     let mut rates = std::collections::HashMap::new();
@@ -467,14 +471,15 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         crate::CredentialSlot::new(c.signer, c.capability)?
     };
 
-    let chain = ChainConfig {
-        rpc_url: "http://config:8545".to_string(),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: None,
-    };
-    let deployment = chain.deployment();
+    let chain: ChainConfig = crate::session::test_support::one_chain(
+        "http://config:8545".to_string(),
+        1,
+        Address::repeat_byte(0x33),
+        Address::repeat_byte(0x44),
+        None,
+    );
+    let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
+    let deployment = pool.deployment;
     let dir = tempfile::tempdir()?;
     let store: Arc<dyn BuyerPoolStore> =
         Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
@@ -514,13 +519,13 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         .await?;
     let rpc = alloy::providers::ProviderBuilder::new()
         .connect_mocked_client(alloy::providers::mock::Asserter::new());
-    let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
+    let contract = PaymentPool::new(pool.deployment.payment_pool, rpc.clone());
     let site = PullSite {
         data_dir: dir.path().to_path_buf(),
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.slash_judge);
+    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.governance.slash_judge);
     let connections = crate::Connections::new(ep.clone());
     let writes = crate::ordered_writes::OrderedWrites::default();
     let funding = crate::funding::RunFunding::default();
@@ -535,6 +540,8 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         self_address: first.address(),
         token: Address::repeat_byte(0x22),
         chain: &chain,
+        pool: &pool,
+        passes: &passes,
         site: &site,
         deposit: DepositPolicy {
             working_deposit: U256::ZERO,
@@ -658,7 +665,7 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         &recovery,
     );
     let row = WatermarkRow::Owned {
-        deployment: deps.chain.deployment(),
+        deployment: deps.pool.deployment,
         owner: owner.owner().address(),
     };
     anyhow::ensure!(owner.lane().address() != owner.owner().address());
@@ -735,6 +742,173 @@ fn the_primed_first_leg_carries_the_streamers_store_size() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Each pass pays only the holders routed to its pool, and a holder that
+/// refuses a pool and names another is paid in that pool's pass.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fixture: the lane deps a real LaneSources needs"
+)]
+#[tokio::test]
+async fn each_pass_pays_the_holders_routed_to_its_pool() -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use decdn_incentive::Deployment;
+    use decdn_incentive::buyer_pool::BuyerPoolStore;
+    use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
+    use decdn_incentive::payment_pool::PaymentPool;
+
+    use crate::SourceProvider as _;
+    use crate::lanes::{LaneDeps, LanePayer};
+    use crate::pool_route::{PoolPasses, PoolRoute};
+    use crate::session::{
+        ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, GovernanceChain,
+        PaymentPoolChain, PoolOpen, PullSite,
+    };
+
+    let pool_on = |chain_id: u64, byte: u8| PaymentPoolChain {
+        rpc_url: format!("http://pay-{chain_id}:8545"),
+        deployment: Deployment {
+            chain_id,
+            payment_pool: Address::repeat_byte(byte),
+        },
+    };
+    let (pool_a, pool_b) = (pool_on(42_161, 0xa1), pool_on(8_453, 0xb1));
+    let chain = ChainConfig::new(
+        GovernanceChain {
+            rpc_url: "http://gov:8545".to_string(),
+            chain_id: 1,
+            slash_judge: Address::repeat_byte(0x44),
+            capacity_bond: None,
+        },
+        vec![pool_a.clone(), pool_b.clone()],
+    )?;
+    let passes = PoolPasses::new(
+        PoolRoute::new(&chain.deployments(), |_| false)
+            .ok_or_else(|| anyhow::anyhow!("a route"))?,
+    );
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn BuyerPoolStore> =
+        Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
+    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await?;
+    let rpc = alloy::providers::ProviderBuilder::new()
+        .connect_mocked_client(alloy::providers::mock::Asserter::new());
+    let site = PullSite {
+        data_dir: dir.path().to_path_buf(),
+        region: None,
+        region_allowlist: Vec::new(),
+    };
+    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.governance.slash_judge);
+    let connections = crate::Connections::new(ep.clone());
+    let writes = crate::ordered_writes::OrderedWrites::default();
+    let funding = crate::funding::RunFunding::default();
+    let payer = crate::buyer_pool::OwnedPayer::for_store(
+        Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+        store.as_ref(),
+    )?;
+    let discovery = DiscoveryOptions::default();
+    let recovery = Arc::new(crate::RecoveryGate::new());
+
+    let node = |seed: u8| crate::discovery::NodeCandidate {
+        node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+        eth_address: Address::repeat_byte(seed),
+        region_hint: None,
+        multiaddrs: alloy::primitives::Bytes::new(),
+    };
+    let (on_a, on_b, no_hint) = (node(1), node(2), node(3));
+    let targets = crate::targets::ResolvedTargets {
+        candidates: vec![on_a.clone(), on_b.clone(), no_hint.clone()],
+        coverage_by_node: HashMap::new(),
+        probed_samples: Vec::new(),
+        pinned: false,
+        size_hint: None,
+        late: crate::targets::LateSlot::default(),
+        pool_hints: HashMap::from([
+            (on_a.node_id, vec![pool_a.deployment.pool_account()]),
+            (on_b.node_id, vec![pool_b.deployment.pool_account()]),
+        ]),
+    };
+    assert_eq!(targets.first_pass(&passes), pool_a.deployment);
+
+    let providers_in_pass = |pool: &PaymentPoolChain| -> anyhow::Result<Vec<Address>> {
+        let contract = PaymentPool::new(pool.deployment.payment_pool, rpc.clone());
+        let deps = LaneDeps {
+            marks: None,
+            evidence: None,
+            endpoint: &ep,
+            store: &store,
+            contract: &contract,
+            rpc: &rpc,
+            slash_dom: &slash_dom,
+            self_address: payer.owner().address(),
+            token: Address::repeat_byte(0x22),
+            chain: &chain,
+            pool,
+            passes: &passes,
+            site: &site,
+            deposit: DepositPolicy {
+                working_deposit: alloy::primitives::U256::ZERO,
+                max_approve: false,
+                adoption: ChainAdoption::Refused,
+                open: PoolOpen::Allowed,
+            },
+            namespace_id: decdn_protocol::client::NO_NAMESPACE,
+            max_rate_per_mb: 0,
+            max_blob_bytes: 0,
+            deadlines: crate::PullDeadlines::new(
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                0,
+            )?,
+            connections: &connections,
+            writes: &writes,
+            funding: &funding,
+        };
+        let voucher_dom = pool.deployment.voucher_domain();
+        let sources = super::LaneSources::new(
+            &deps,
+            &discovery,
+            &[],
+            LanePayer::Owned(&payer),
+            &voucher_dom,
+            None,
+            None,
+            None,
+            &recovery,
+        );
+        passes.start(pool.deployment);
+        let holders = sources.holders_from(&targets);
+        // The holder on pool A refuses it and names pool B.
+        if pool.deployment == pool_a.deployment
+            && let Some(refused) = holders.iter().find(|h| h.provider == on_a.eth_address)
+        {
+            sources.on_pool_declined(refused, &[pool_b.deployment.pool_account()]);
+        }
+        Ok(holders.iter().map(|h| h.provider).collect())
+    };
+
+    // Pass A: the holder routed to A, and the one with no hint, which takes
+    // the first configured pool.
+    assert_eq!(
+        providers_in_pass(&pool_a)?,
+        vec![on_a.eth_address, no_hint.eth_address]
+    );
+    // Pass B: the holder routed to B, and the retry of the one that refused
+    // A.
+    assert_eq!(passes.next(), Some(pool_b.deployment));
+    assert_eq!(
+        providers_in_pass(&pool_b)?,
+        vec![on_a.eth_address, on_b.eth_address]
+    );
+    assert_eq!(passes.next(), None);
+    ep.close().await;
+    Ok(())
+}
+
 /// A late-joining holder's probed rate is captured for its lane's
 /// stream-rate ceiling, exactly as a first-round holder's is.
 #[expect(
@@ -759,13 +933,14 @@ async fn a_late_holders_probed_rate_is_captured_for_its_lane_ceiling() -> anyhow
         ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PoolOpen, PullSite,
     };
 
-    let chain = ChainConfig {
-        rpc_url: "http://config:8545".to_string(),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: None,
-    };
+    let chain: ChainConfig = crate::session::test_support::one_chain(
+        "http://config:8545".to_string(),
+        1,
+        Address::repeat_byte(0x33),
+        Address::repeat_byte(0x44),
+        None,
+    );
+    let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
     let dir = tempfile::tempdir()?;
     let store: Arc<dyn BuyerPoolStore> =
         Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
@@ -775,13 +950,13 @@ async fn a_late_holders_probed_rate_is_captured_for_its_lane_ceiling() -> anyhow
         .await?;
     let rpc = alloy::providers::ProviderBuilder::new()
         .connect_mocked_client(alloy::providers::mock::Asserter::new());
-    let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
+    let contract = PaymentPool::new(pool.deployment.payment_pool, rpc.clone());
     let site = PullSite {
         data_dir: dir.path().to_path_buf(),
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.slash_judge);
+    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.governance.slash_judge);
     let connections = crate::Connections::new(ep.clone());
     let writes = crate::ordered_writes::OrderedWrites::default();
     let funding = crate::funding::RunFunding::default();
@@ -800,6 +975,8 @@ async fn a_late_holders_probed_rate_is_captured_for_its_lane_ceiling() -> anyhow
         self_address: payer.owner().address(),
         token: Address::repeat_byte(0x22),
         chain: &chain,
+        pool: &pool,
+        passes: &passes,
         site: &site,
         deposit: DepositPolicy {
             working_deposit: alloy::primitives::U256::ZERO,
@@ -816,7 +993,7 @@ async fn a_late_holders_probed_rate_is_captured_for_its_lane_ceiling() -> anyhow
         funding: &funding,
     };
     let discovery = DiscoveryOptions::default();
-    let voucher_dom = chain.deployment().voucher_domain();
+    let voucher_dom = pool.deployment.voucher_domain();
     let recovery = Arc::new(crate::RecoveryGate::new());
     let sources = super::LaneSources::new(
         &deps,
@@ -843,6 +1020,7 @@ async fn a_late_holders_probed_rate_is_captured_for_its_lane_ceiling() -> anyhow
             rtt_ms: 100.0,
             total_bytes: None,
             coverage: decdn_protocol::Coverage::full(4),
+            payment_pools: None,
         },
         (node_id, 100.0, late_rate),
     );
@@ -911,13 +1089,14 @@ async fn a_built_lane_carries_the_probed_rate_as_its_ceiling() -> anyhow::Result
     )?;
     let slot = crate::CredentialSlot::new(Arc::new(delegate), capability)?;
 
-    let chain = ChainConfig {
-        rpc_url: "http://config:8545".to_string(),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: None,
-    };
+    let chain: ChainConfig = crate::session::test_support::one_chain(
+        "http://config:8545".to_string(),
+        1,
+        Address::repeat_byte(0x33),
+        Address::repeat_byte(0x44),
+        None,
+    );
+    let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
     let dir = tempfile::tempdir()?;
     let store: Arc<dyn BuyerPoolStore> =
         Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
@@ -942,13 +1121,13 @@ async fn a_built_lane_carries_the_probed_rate_as_its_ceiling() -> anyhow::Result
     asserter
         .push_success::<alloy::primitives::Bytes>(&Address::repeat_byte(0x22).abi_encode().into());
     let rpc = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-    let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
+    let contract = PaymentPool::new(pool.deployment.payment_pool, rpc.clone());
     let site = PullSite {
         data_dir: dir.path().to_path_buf(),
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.slash_judge);
+    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.governance.slash_judge);
     let connections = crate::Connections::new(ep.clone());
     let writes = crate::ordered_writes::OrderedWrites::default();
     let funding = crate::funding::RunFunding::default();
@@ -963,6 +1142,8 @@ async fn a_built_lane_carries_the_probed_rate_as_its_ceiling() -> anyhow::Result
         self_address: Address::repeat_byte(0x0A),
         token: Address::repeat_byte(0x22),
         chain: &chain,
+        pool: &pool,
+        passes: &passes,
         site: &site,
         deposit: DepositPolicy {
             working_deposit: alloy::primitives::U256::ZERO,
@@ -979,7 +1160,7 @@ async fn a_built_lane_carries_the_probed_rate_as_its_ceiling() -> anyhow::Result
         funding: &funding,
     };
     let discovery = DiscoveryOptions::default();
-    let voucher_dom = chain.deployment().voucher_domain();
+    let voucher_dom = pool.deployment.voucher_domain();
     let recovery = Arc::new(crate::RecoveryGate::new());
     let sources = super::LaneSources::new(
         &deps,
@@ -1007,6 +1188,7 @@ async fn a_built_lane_carries_the_probed_rate_as_its_ceiling() -> anyhow::Result
         pinned: false,
         size_hint: None,
         late: crate::targets::LateSlot::default(),
+        pool_hints: std::collections::HashMap::new(),
     };
     let holders = sources.holders_from(&targets);
     let holder = holders

@@ -176,6 +176,12 @@ pub trait SourceProvider: Send + Sync {
 
     /// Called once for each delivery fault `holder` raises.
     fn on_source_fault(&self, _holder: &Holder) {}
+
+    /// Called for each `Declined` refusal from `holder` that lists the
+    /// payment pools the node accepts (ADR 005 § Payment pool routing). The
+    /// set drops the holder as for any `Declined`; the provider may pay it
+    /// through a listed pool in a later pass.
+    fn on_pool_declined(&self, _holder: &Holder, _accepted: &[decdn_protocol::PoolAccount]) {}
 }
 
 impl<P: SourceProvider> SourceProvider for &P {
@@ -203,6 +209,10 @@ impl<P: SourceProvider> SourceProvider for &P {
 
     fn on_source_fault(&self, holder: &Holder) {
         (**self).on_source_fault(holder);
+    }
+
+    fn on_pool_declined(&self, holder: &Holder, accepted: &[decdn_protocol::PoolAccount]) {
+        (**self).on_pool_declined(holder, accepted);
     }
 }
 
@@ -929,10 +939,18 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         reason: DeclineReason,
         refused: Option<&UpstreamRefused>,
     ) -> bool {
+        // A refusal of the request's payment pool covers every block, so
+        // the node leaves the blob even as a partial holder.
+        let pool_refused = refused.and_then(UpstreamRefused::accepted_pools);
+        if let Some(accepted) = pool_refused
+            && let Some(holder) = self.holder(provider)
+        {
+            self.provider.on_pool_declined(holder, accepted);
+        }
         let partial = self
             .holder(provider)
             .is_some_and(|holder| holder.coverage.is_some());
-        let left = !(partial && reason == DeclineReason::Refused);
+        let left = pool_refused.is_some() || !(partial && reason == DeclineReason::Refused);
         let newly = if left {
             self.declined.insert(provider)
         } else {

@@ -51,8 +51,9 @@ fn bundle_receipt(chain_id: u64) -> PullReceipt {
     PullReceipt::new(
         ReceiptChain {
             chain_id,
-            payment_pool: Address::repeat_byte(0x11),
             slash_judge: Address::repeat_byte(0x22),
+            payment_chain_id: chain_id,
+            payment_pool: Address::repeat_byte(0x11),
         },
         ReceiptContent {
             hash,

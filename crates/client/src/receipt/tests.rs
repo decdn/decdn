@@ -12,25 +12,34 @@ use decdn_protocol::client::{StreamResponse, StreamResponseBody, Voucher as Wire
 use super::*;
 use crate::ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, StreamProof};
 
-const CHAIN_ID: u64 = 421_614;
+const CHAIN_ID: u64 = 11_155_111;
+const PAYMENT_CHAIN_ID: u64 = 421_614;
 const RATE: u64 = 500;
 
 fn chain() -> ReceiptChain {
     ReceiptChain {
         chain_id: CHAIN_ID,
-        payment_pool: Address::repeat_byte(0x11),
         slash_judge: Address::repeat_byte(0x22),
+        payment_chain_id: PAYMENT_CHAIN_ID,
+        payment_pool: Address::repeat_byte(0x11),
     }
 }
 
-fn chain_config() -> crate::session::ChainConfig {
+fn governance() -> crate::session::GovernanceChain {
     let c = chain();
-    crate::session::ChainConfig {
+    crate::session::GovernanceChain {
         rpc_url: "http://127.0.0.1:1".to_owned(),
         chain_id: c.chain_id,
-        payment_pool: c.payment_pool,
         slash_judge: c.slash_judge,
         capacity_bond: None,
+    }
+}
+
+fn deployment() -> Deployment {
+    let c = chain();
+    Deployment {
+        chain_id: c.payment_chain_id,
+        payment_pool: c.payment_pool,
     }
 }
 
@@ -89,7 +98,10 @@ impl Keys {
             chain_root: commit.chain_root,
             chunk_price: commit.chunk_price,
         }
-        .sign(&self.payer, &voucher_domain(c.chain_id, c.payment_pool))
+        .sign(
+            &self.payer,
+            &voucher_domain(c.payment_chain_id, c.payment_pool),
+        )
         .unwrap();
         signed_to_wire_voucher(&signed).unwrap()
     }
@@ -158,7 +170,7 @@ fn window() -> ReceiptWindow {
 fn collected(keys: &Keys, seed: Cumulative) -> (ReceiptEvidence, Arc<PoolLedger>) {
     let ledger = Arc::new(PoolLedger::new(seed));
     let collector = ReceiptEvidence::new();
-    collector.attach(&chain_config(), keys.key(), &ledger);
+    collector.attach((&governance(), deployment()), keys.key(), &ledger);
     (collector, ledger)
 }
 
@@ -339,7 +351,7 @@ async fn a_lane_that_paid_nothing_is_left_out() {
 async fn a_collector_attaches_each_ledger_once() {
     let keys = Keys::new();
     let (collector, ledger) = collected(&keys, cumulative(3, 3));
-    collector.attach(&chain_config(), keys.key(), &ledger);
+    collector.attach((&governance(), deployment()), keys.key(), &ledger);
     issue(&ledger, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     let lane = only_lane(&collector).await;
     assert_eq!(
@@ -513,13 +525,13 @@ async fn two_ledgers_on_one_lane_merge() {
     // The manifest fetch's ledger, then the entry fetch's, seeded from the
     // watermark the first one persisted.
     let first = Arc::new(PoolLedger::new(cumulative(10, 10)));
-    collector.attach(&chain_config(), keys.key(), &first);
+    collector.attach((&governance(), deployment()), keys.key(), &first);
     first
         .attach_evidence()
         .note_response(&keys.response(B256::repeat_byte(1)));
     let mid = issue(&first, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     let second = Arc::new(PoolLedger::new(mid));
-    collector.attach(&chain_config(), keys.key(), &second);
+    collector.attach((&governance(), deployment()), keys.key(), &second);
     second
         .attach_evidence()
         .note_response(&keys.response(B256::repeat_byte(2)));
@@ -542,10 +554,10 @@ async fn a_merge_does_not_count_the_second_ledgers_reseed() {
     let keys = Keys::new();
     let collector = ReceiptEvidence::new();
     let first = Arc::new(PoolLedger::new(Cumulative::default()));
-    collector.attach(&chain_config(), keys.key(), &first);
+    collector.attach((&governance(), deployment()), keys.key(), &first);
     let mid = issue(&first, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     let second = Arc::new(PoolLedger::new(mid));
-    collector.attach(&chain_config(), keys.key(), &second);
+    collector.attach((&governance(), deployment()), keys.key(), &second);
     assert!(second.reseed(cumulative(10_000, 20 * CHUNK_BYTES)));
     issue(&second, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     let lane = only_lane(&collector).await;
@@ -696,14 +708,20 @@ async fn tampering_with_each_signed_field_is_named() {
     lane0(&mut r).prior.bytes = u64::MAX;
     assert_eq!(r.verify(), vec![ReceiptFault::ClaimBelowPrior { provider }]);
 
+    // The governance chain id binds the responses only, and the payment
+    // chain id the vouchers only.
     let mut r = good.clone();
     r.chain.chain_id += 1;
     assert_eq!(
         r.verify(),
-        vec![
-            ReceiptFault::ResponseSignature { provider, hash },
-            ReceiptFault::VoucherSignature { provider },
-        ]
+        vec![ReceiptFault::ResponseSignature { provider, hash }]
+    );
+
+    let mut r = good.clone();
+    r.chain.payment_chain_id += 1;
+    assert_eq!(
+        r.verify(),
+        vec![ReceiptFault::VoucherSignature { provider }]
     );
 
     let mut r = good.clone();
@@ -837,7 +855,7 @@ async fn the_collector_builds_the_whole_receipt() {
     );
     let hash = B256::repeat_byte(0x44);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    collector.attach(&chain_config(), keys.key(), &ledger);
+    collector.attach((&governance(), deployment()), keys.key(), &ledger);
     ledger.attach_evidence().note_response(&keys.response(hash));
     issue(&ledger, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     collector.note_landed(hash.into(), CHUNK_BYTES);
@@ -986,9 +1004,10 @@ fn the_json_schema_is_pinned() {
     let expected = serde_json::json!({
         "format": "decdn-receipt/1",
         "chain": {
-            "chain_id": 421_614,
-            "payment_pool": a("11"),
+            "chain_id": 11_155_111,
             "slash_judge": a("22"),
+            "payment_chain_id": 421_614,
+            "payment_pool": a("11"),
         },
         "content": {
             "hash": b("04"),

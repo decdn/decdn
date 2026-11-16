@@ -42,6 +42,8 @@
 
 mod admit_store;
 mod backend_source;
+mod buyer_route;
+pub use buyer_route::BuyerPool;
 mod funder;
 mod pull_leg;
 mod ranged_pull;
@@ -652,6 +654,10 @@ pub struct NodeOriginDeps {
     /// Buyer-side payment-pool service (opens/reuses this node's pool and pins a lane per
     /// provider).
     pub buyer: Arc<dyn PoolOpener>,
+    /// The `PaymentPool` the buyer pays through, and the route over this
+    /// node's accepted pools that chose it (ADR 005 § Payment pool routing).
+    /// An upstream is paid only when the route sends it to this pool.
+    pub buyer_pool: BuyerPool,
     /// This node's DHT id, the lookup requester.
     pub self_id: DhtNodeId,
     /// EIP-712 domain verifying the delivery `slash_sig` (ADR 014 §1).
@@ -1271,6 +1277,9 @@ enum ProbeDrop {
     Unverifiable,
     /// The response's `has_blob` and coverage disagree.
     Inconsistent,
+    /// The holder's `payment_pools` hint does not route it to the buyer's
+    /// pool, so it would refuse that pool as `Declined`.
+    PoolNotAccepted,
 }
 
 /// What the probe rounds of one discovery saw (#2366): the counts a
@@ -1303,7 +1312,8 @@ impl ProbeTally {
             | ProbeDrop::TimestampRejected
             | ProbeDrop::NoAddress
             | ProbeDrop::Unverifiable
-            | ProbeDrop::Inconsistent => &mut self.dropped,
+            | ProbeDrop::Inconsistent
+            | ProbeDrop::PoolNotAccepted => &mut self.dropped,
         };
         *slot = slot.saturating_add(1);
     }
@@ -1590,12 +1600,14 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
 /// the pair the same way, scores nothing and warns about the clock (throttled); a
 /// same-region claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
 /// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable-but-absent provider
-/// is recorded in the negative-probe cache.
-// Straight-line probe → classify → build; the tracing macros and the three
-// sequential drop-conditions inflate the cognitive-complexity metric past the
-// threshold (same inflation noted in `chain_staker_set`), and splitting the
-// validation further would obscure the flow rather than clarify it.
-#[allow(clippy::cognitive_complexity)]
+/// is recorded in the negative-probe cache; a holder whose `payment_pools`
+/// hint does not route it to the buyer pool is dropped.
+// Straight-line probe → classify → build; the tracing macros and the
+// sequential drop-conditions inflate the cognitive-complexity and length
+// metrics past their thresholds (same inflation noted in `chain_staker_set`),
+// and splitting the validation further would obscure the flow rather than
+// clarify it.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn probe_candidate(
     deps: &NodeOriginDeps,
     peer: DhtNodeId,
@@ -1706,12 +1718,14 @@ async fn probe_candidate(
         return Err(ProbeDrop::Inconsistent);
     }
     if !resp.body.has_blob {
-        // Reachable but does not hold the blob — not a reputation event (no
-        // delivery attempted); cache the negative so the next lookup for this
-        // hash skips it within the TTL.
+        // Reachable but no holder: no reputation event (no delivery tried);
+        // the negative cache skips it for this hash within the TTL.
         deps.negative_cache
             .record_failure(peer, DhtHash::from_bytes(hash_bytes));
         return Err(ProbeDrop::Absent);
+    }
+    if !deps.buyer_pool.pays(resp_ext.payment_pools.as_deref()) {
+        return Err(ProbeDrop::PoolNotAccepted);
     }
     let rtt = ms_to_u32(probe_rtt.ms);
     // Peer's self-attested region (ADR 030), resolved from the on-chain

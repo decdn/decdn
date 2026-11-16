@@ -7,6 +7,17 @@ use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{Deployment, bind_node_id_domain};
 
+/// One chain at `http://config:8545`, id 1, that no test reaches.
+fn test_chain() -> ChainConfig {
+    crate::session::test_support::one_chain(
+        "http://config:8545".to_string(),
+        1,
+        Address::repeat_byte(0x33),
+        Address::repeat_byte(0x44),
+        None,
+    )
+}
+
 fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> PoolContext {
     ctx_with_deposit(binding, U256::ZERO)
 }
@@ -217,13 +228,8 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
     let rpc = alloy::providers::ProviderBuilder::new()
         .connect_mocked_client(alloy::providers::mock::Asserter::new());
     let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
-    let chain = ChainConfig {
-        rpc_url: "http://config:8545".to_string(),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: None,
-    };
+    let chain = test_chain();
+    let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
     let site = PullSite {
         data_dir: dir.path().to_path_buf(),
         region: None,
@@ -245,6 +251,8 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
             self_address: Address::repeat_byte(0x0A),
             token: Address::repeat_byte(0x22),
             chain: &chain,
+            pool: &pool,
+            passes: &passes,
             site: &site,
             deposit: DepositPolicy {
                 working_deposit: U256::from(1_000_000u64),
@@ -682,13 +690,8 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
     let rpc = alloy::providers::ProviderBuilder::new()
         .connect_mocked_client(alloy::providers::mock::Asserter::new());
     let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
-    let chain = ChainConfig {
-        rpc_url: "http://config:8545".to_string(),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: None,
-    };
+    let chain = test_chain();
+    let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
     let site = PullSite {
         data_dir: dir.path().to_path_buf(),
         region: None,
@@ -709,6 +712,8 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
         self_address: Address::repeat_byte(0x0A),
         token: Address::repeat_byte(0x22),
         chain: &chain,
+        pool: &pool,
+        passes: &passes,
         site: &site,
         deposit: DepositPolicy {
             working_deposit: U256::from(1_000_000u64),

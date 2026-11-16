@@ -31,7 +31,7 @@ use crate::buyer_pool::{
 };
 use crate::fault::PoolOpenRefused;
 use crate::lanes::LaneDeps;
-use crate::session::{ChainAdoption, ChainConfig, DepositPolicy, PoolOpen};
+use crate::session::{ChainAdoption, DepositPolicy, GovernanceChain, PoolOpen};
 use crate::source::{Funder, SourceFuture};
 use crate::{NoAffordableSource, PoolContext, PoolLedger, PoolReplaced, Recovery};
 
@@ -892,7 +892,7 @@ where
             signer,
             voucher_dom,
             provider,
-            deps.chain,
+            (&deps.chain.governance, deps.pool.deployment),
             deps.endpoint,
             grant,
         )
@@ -931,13 +931,13 @@ where
         deps.funding,
         payer,
         provider,
-        deps.chain.deployment(),
+        deps.pool.deployment,
         deps.deposit,
         ended,
     )
     .await?;
     Ok((
-        attach_client_binding(ctx, deps.chain, deps.endpoint)?,
+        attach_client_binding(ctx, &deps.chain.governance, deps.endpoint)?,
         spend,
     ))
 }
@@ -966,7 +966,7 @@ pub(crate) async fn build_delegated_pool_ctx<P>(
     signer: &Arc<PrivateKeySigner>,
     voucher_dom: &Eip712Domain,
     provider: Address,
-    chain: &ChainConfig,
+    (governance, deployment): (&GovernanceChain, Deployment),
     endpoint: &Endpoint,
     grant: &CapabilityGrant,
 ) -> anyhow::Result<PoolContext>
@@ -986,13 +986,13 @@ where
         pool.owner != Address::ZERO,
         "pool {pool_id} named by the capability does not exist on this PaymentPool contract \
          ({}) — wrong --payment-pool-address/chain, or a stale token",
-        chain.payment_pool,
+        deployment.payment_pool,
     );
 
     // A store that cannot be read is this machine's fault: it fails the
     // command rather than retrying the lane build as a chain-side fault.
     let (prior_bytes, prior_amount) = store
-        .delegate_lanes(chain.deployment(), pool_id, self_address)
+        .delegate_lanes(deployment, pool_id, self_address)
         .map_err(|e| {
             anyhow::anyhow!(
                 "read this key's delegate-lane watermarks for pool {pool_id} from the buyer \
@@ -1018,7 +1018,7 @@ where
         .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     let state = BuyerPoolState::new(
         pool_id,
-        chain.deployment(),
+        deployment,
         pool.owner,
         token,
         U256::from(pool.deposit),
@@ -1026,7 +1026,7 @@ where
     let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
         .with_provider(provider, prior_bytes, prior_amount)
         .with_capability(signed_capability);
-    attach_client_binding(ctx, chain, endpoint)
+    attach_client_binding(ctx, governance, endpoint)
 }
 
 /// Attach the ADR 005 client identity binding to an already-built
@@ -1039,19 +1039,20 @@ where
 /// itself around [`open_or_reuse_pool`] — can attach the same binding outside
 /// that critical section.
 ///
-/// No binding when `chain.capacity_bond` is unset — see [`build_pool_ctx`]'s
-/// docs for why that is silent.
+/// The binding domain is the governance chain's `CapacityBond`. No binding
+/// when `governance.capacity_bond` is unset — see [`build_pool_ctx`]'s docs
+/// for why that is silent.
 pub(crate) fn attach_client_binding(
     ctx: PoolContext,
-    chain: &ChainConfig,
+    governance: &GovernanceChain,
     endpoint: &Endpoint,
 ) -> anyhow::Result<PoolContext> {
-    let Some(capacity_bond) = chain.capacity_bond else {
+    let Some(capacity_bond) = governance.capacity_bond else {
         return Ok(ctx);
     };
     ctx.bind_endpoint(
         endpoint,
-        &bind_node_id_domain(chain.chain_id, capacity_bond),
+        &bind_node_id_domain(governance.chain_id, capacity_bond),
     )
 }
 

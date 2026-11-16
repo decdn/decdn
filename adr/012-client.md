@@ -237,9 +237,13 @@ in current schema terms:
   A client with pools on several payment chains lists one entry for each. For each
   candidate node it picks a `PaymentPool` contract that is in its own list and in the node's
   `payment_pools` probe hint, and it sets that contract as `payment_pool` in the `StreamRequest`
-  ([ADR 005 § Payment pool routing](005-protocol.md#payment-pool-routing)). A node that refuses
-  the contract lists its accepted contracts in the refusal, and the client retries that node once
-  on a listed contract where it holds a funded pool.
+  ([ADR 005 § Payment pool routing](005-protocol.md#payment-pool-routing)). It prefers a contract
+  where it already holds a pool, and it gives a node with no hint the first contract in its list.
+  A node that refuses the contract lists its accepted contracts in the refusal, and the client
+  retries that node once on a listed contract in its own list. A fetch pays through one contract
+  per pass, so the nodes routed to another contract are paid in that contract's pass. A
+  delegated client pays only through the first contract in its list, where its capability's pool
+  lives.
   The RPC URLs and keystore live here, **not** under `[network]`/`[keys]`.
 - `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
   probing to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull

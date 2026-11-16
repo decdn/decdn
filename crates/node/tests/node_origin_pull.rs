@@ -106,6 +106,16 @@ fn slash_domain() -> Eip712Domain {
 fn voucher_dom() -> Eip712Domain {
     voucher_domain(CHAIN_ID, Address::repeat_byte(0x34))
 }
+/// The buyer pool of the `voucher_dom` deployment, the one pool the test
+/// nodes accept.
+fn buyer_pool() -> decdn_node::node_origin::BuyerPool {
+    let deployment = decdn_incentive::Deployment {
+        chain_id: CHAIN_ID,
+        payment_pool: Address::repeat_byte(0x34),
+    };
+    decdn_node::node_origin::BuyerPool::choose(&[deployment], |_| false)
+        .unwrap_or_else(|| unreachable!("one accepted pool"))
+}
 fn binding_dom() -> Eip712Domain {
     bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
 }
@@ -920,6 +930,7 @@ async fn build_origin_with_discovery(
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: b_dht,
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -1088,6 +1099,7 @@ async fn build_origin_multi_hash(
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: b_dht,
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -1688,6 +1700,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -11523,6 +11536,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -13188,6 +13202,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: b_dht,
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -14783,6 +14798,7 @@ async fn build_origin_economics(
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: b_dht,
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),

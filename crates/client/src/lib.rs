@@ -234,6 +234,8 @@ pub mod pacer;
 /// latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
 #[doc(hidden)]
 pub mod peer_store;
+// Docs live in `pool_route.rs` as `//!`, for the same reason as `sink` below.
+pub mod pool_route;
 /// Reusable `cdn/probe/v1` client.
 pub mod probe;
 /// Sub-frame byte-progress observation (#1797): a `ProgressReader` that tallies bytes
@@ -1225,6 +1227,10 @@ enum Kind {
         // optional `WatermarkBundle`, which pushed the unboxed variant past
         // clippy's `large_enum_variant` threshold relative to `MidStream`.
         response: Box<StreamResponse>,
+        /// The payment pools the node accepts, which a `Declined` refusal of
+        /// the request's `payment_pool` lists (ADR 005 § Payment pool
+        /// routing). Unsigned.
+        accepted_pools: Option<Vec<PoolAccount>>,
     },
     /// Mid-stream refusal: a bare [`ClientMessage::StreamError`] frame that
     /// arrived after the open stage. It carries no signature (#1042), so there
@@ -1278,6 +1284,7 @@ impl UpstreamRefused {
                 kind: Kind::Open {
                     error,
                     response: Box::new(response),
+                    accepted_pools: ext.payment_pools.clone(),
                 },
             }),
             None => anyhow::anyhow!(
@@ -1339,6 +1346,22 @@ impl UpstreamRefused {
         match &self.kind {
             Kind::Open { response, .. } => Some(response.as_ref()),
             Kind::MidStream { .. } => None,
+        }
+    }
+
+    /// The payment pools the node accepts, when it refused the request's
+    /// `payment_pool` as `Declined` and listed them (ADR 005 § Payment pool
+    /// routing). `None` for any other refusal. The list is unsigned: a wrong
+    /// one costs the requester one more refusal.
+    #[must_use]
+    pub fn accepted_pools(&self) -> Option<&[PoolAccount]> {
+        match &self.kind {
+            Kind::Open {
+                error: StreamError::Declined,
+                accepted_pools: Some(pools),
+                ..
+            } => Some(pools),
+            Kind::Open { .. } | Kind::MidStream { .. } => None,
         }
     }
 }

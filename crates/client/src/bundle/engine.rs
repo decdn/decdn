@@ -98,9 +98,10 @@ use crate::funding::RunFunding;
 use crate::lane_sources::{FirstLeg, LaneSources};
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
+use crate::pool_route::PoolPasses;
 use crate::receipt::ReceiptEvidence;
 use crate::scheduler::{BUILD_DRAIN, fold_late_escrow};
-use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
+use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PaymentPoolChain, PullSite};
 use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
@@ -1044,7 +1045,7 @@ pub(super) async fn discover_candidates(
     site: &PullSite,
     discovery: &DiscoveryOptions,
 ) -> anyhow::Result<Registry> {
-    let capacity_bond = chain.capacity_bond.ok_or_else(|| {
+    let capacity_bond = chain.governance.capacity_bond.ok_or_else(|| {
         anyhow!(
             "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
              blockchain.capacity_bond_address), or pass --node-id to pull from one node"
@@ -1059,7 +1060,7 @@ pub(super) async fn discover_candidates(
         });
     }
     let bootstrap = crate::discovery::bootstrap_nodes(
-        &chain.rpc_url,
+        &chain.governance.rpc_url,
         capacity_bond,
         &site.data_dir,
         discovery.registry_timeout,
@@ -1668,6 +1669,12 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) voucher_dom: Eip712Domain,
     pub(super) slash_dom: Eip712Domain,
     pub(super) chain: ChainConfig,
+    /// The payment pool the run pays through: the first of the buyer's
+    /// route ([`PoolRoute::for_buyer`](crate::pool_route::PoolRoute::for_buyer)).
+    pub(super) pool: PaymentPoolChain,
+    /// The run's routing of each node to a pool. The run pays only the nodes
+    /// routed to [`Self::pool`].
+    pub(super) passes: PoolPasses,
     pub(super) site: PullSite,
     pub(super) relays: Vec<RelayUrl>,
     /// The node every entry is pinned to, or every active registered node for
@@ -1769,6 +1776,8 @@ impl<P: Provider + Clone> PullCtx<P> {
             self_address: self.self_address,
             token: self.token,
             chain: &self.chain,
+            pool: &self.pool,
+            passes: &self.passes,
             site: &self.site,
             deposit: self.deposit,
             // The bundle-level namespace (ADR 002): routes any cache-miss origin

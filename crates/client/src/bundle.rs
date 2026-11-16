@@ -39,7 +39,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{slash_judge_domain, voucher_domain};
+use decdn_incentive::slash_judge_domain;
 use iroh::{Endpoint, RelayUrl};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +47,7 @@ use tokio_util::sync::CancellationToken;
 use crate::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
+use crate::pool_route::{PoolPasses, PoolRoute};
 use crate::receipt::ReceiptEvidence;
 use crate::session::{
     ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PoolOpen, PullSite,
@@ -1221,17 +1222,38 @@ impl BundlePullerBuilder {
                 )
             }
         };
-        let rpc = crate::provider::build_provider(&self.chain.rpc_url, &signer)?.erased();
-        let contract = PaymentPool::new(self.chain.payment_pool, rpc.clone());
+        // The run pays through one pool, the first of the buyer's route, and
+        // pays only the nodes routed to it.
+        let owner = match &payer {
+            engine::RunPayer::Owned(payer) => Some(payer.owner().address()),
+            engine::RunPayer::Delegated(_) => None,
+        };
+        let route = PoolRoute::for_buyer(&self.chain, self.store.as_ref(), owner)?;
+        let deployment = *route
+            .order()
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no payment pool configured"))?;
+        let pool = self
+            .chain
+            .pool(deployment)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no payment pool configured"))?;
+        let passes = PoolPasses::new(route);
+        passes.start(deployment);
+        let rpc = crate::provider::build_provider(&pool.rpc_url, &signer)?.erased();
+        let contract = PaymentPool::new(deployment.payment_pool, rpc.clone());
         let token = contract
             .usdc()
             .call()
             .await
             .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
         let discovery = self.nodes.applied_to(self.discovery);
+        let governance = &self.chain.governance;
         let ctx = engine::PullCtx {
-            voucher_dom: voucher_domain(self.chain.chain_id, self.chain.payment_pool),
-            slash_dom: slash_judge_domain(self.chain.chain_id, self.chain.slash_judge),
+            voucher_dom: deployment.voucher_domain(),
+            slash_dom: slash_judge_domain(governance.chain_id, governance.slash_judge),
+            pool,
+            passes,
             connections: Connections::new(self.endpoint.clone()),
             self_address: signer.address(),
             endpoint: self.endpoint,

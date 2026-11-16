@@ -577,6 +577,7 @@ pub(crate) fn classify_probe(
                 rtt_ms,
                 total_bytes,
                 coverage: resp_ext.coverage,
+                payment_pools: resp_ext.payment_pools,
             },
             sample,
         )
@@ -587,6 +588,7 @@ pub(crate) fn classify_probe(
                 eth_address: cand.eth_address,
                 rtt_ms,
                 multiaddrs: cand.multiaddrs.clone(),
+                payment_pools: resp_ext.payment_pools,
             },
             sample,
         )
@@ -707,6 +709,16 @@ pub async fn probe_and_order(
     }
 
     let size_hint = nearest_size_hint(&holders);
+    let pool_hints = holders
+        .iter()
+        .map(|h| (h.candidate.node_id, h.payment_pools.as_ref()))
+        .chain(
+            non_holders
+                .iter()
+                .map(|c| (c.node_id, c.payment_pools.as_ref())),
+        )
+        .filter_map(|(node_id, hint)| hint.map(|hint| (node_id, hint.clone())))
+        .collect();
     let late = late_slot(round, tail, &holders, warming);
     let ordered = failover_order(holders, &non_holders, warming);
     if let Some((node_id, proxy_rtt, best_holder_rtt)) = ordered.warming_lead {
@@ -723,6 +735,7 @@ pub async fn probe_and_order(
         pinned: false,
         size_hint,
         late,
+        pool_hints,
     })
 }
 
@@ -946,7 +959,8 @@ async fn discover_provider(
         );
         if selected.len() >= store_cfg.min_fresh_candidates {
             let warming = opts.proxy_warming;
-            let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+            let slash_dom =
+                slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
             mark_probe_start();
             let targets = probe_and_order(
                 endpoint,
@@ -972,7 +986,7 @@ async fn discover_provider(
         }
     }
     let bootstrap = discovery::bootstrap_nodes(
-        &chain.rpc_url,
+        &chain.governance.rpc_url,
         capacity_bond,
         &site.data_dir,
         opts.registry_timeout,
@@ -1002,7 +1016,7 @@ async fn discover_provider(
     };
     let selected = select_with_widening(all, site.region.as_deref(), allow, &store_cfg);
     let warming = opts.proxy_warming;
-    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
     mark_probe_start();
     let targets = probe_and_order(
         endpoint,
@@ -1084,6 +1098,7 @@ fn store_fast_path(
         pinned: false,
         size_hint: None,
         late: LateSlot::default(),
+        pool_hints: HashMap::new(),
     })
 }
 
@@ -1273,6 +1288,7 @@ pub fn holders_or_none(
                 pinned: false,
                 size_hint: None,
                 late: LateSlot::default(),
+                pool_hints: HashMap::new(),
             })
         }
     }
@@ -1305,6 +1321,10 @@ pub struct ResolvedTargets {
     /// The probes a streamed round left pending ([`ProbeRound::Stream`]).
     /// Empty on every other path.
     pub(crate) late: LateSlot,
+    /// Each probed node's `payment_pools` hint, keyed by `node_id`: the
+    /// `PaymentPool` contracts it accepts. A node with no entry gave no hint,
+    /// or was not probed ([`crate::pool_route::PoolRoute::choose`]).
+    pub(crate) pool_hints: HashMap<PublicKey, Vec<decdn_protocol::PoolAccount>>,
 }
 
 impl std::fmt::Debug for ResolvedTargets {
@@ -1318,6 +1338,21 @@ impl std::fmt::Debug for ResolvedTargets {
 }
 
 impl ResolvedTargets {
+    /// The payment pool of a fetch's first pass over these holders: the
+    /// first pool of `passes`' route that one of them is routed to
+    /// ([`crate::pool_route::PoolPasses::first`]).
+    #[must_use]
+    pub fn first_pass(
+        &self,
+        passes: &crate::pool_route::PoolPasses,
+    ) -> decdn_incentive::Deployment {
+        passes.first(
+            self.candidates
+                .iter()
+                .map(|c| self.pool_hints.get(&c.node_id).map(Vec::as_slice)),
+        )
+    }
+
     /// Each candidate's signed per-MiB rate, in failover order: the rate its
     /// probe in this resolve signed, else the rate the peer store last
     /// recorded for it ([`crate::quote::store_rate`]). A candidate with
@@ -1367,6 +1402,7 @@ pub(crate) fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedT
         pinned: true,
         size_hint: None,
         late: LateSlot::default(),
+        pool_hints: HashMap::new(),
     }
 }
 
@@ -1415,7 +1451,7 @@ pub async fn resolve_target_node(
         .await);
     }
 
-    let capacity_bond = chain.capacity_bond.ok_or_else(|| {
+    let capacity_bond = chain.governance.capacity_bond.ok_or_else(|| {
         anyhow::Error::new(ResolveConfigFault(
             "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
              blockchain.capacity_bond_address), or pass --node-id to dial directly"
@@ -1538,10 +1574,10 @@ pub(crate) async fn probe_pinned(
     )
     .await;
     log_probe_result(&cand, &res, started);
-    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
     let outcome = classify_probe(&cand, res, hash, timestamp_us, &slash_dom);
     if matches!(outcome, ProbeOutcome::NonHolder(..)) {
-        if chain.capacity_bond.is_none() {
+        if chain.governance.capacity_bond.is_none() {
             tracing::warn!(
                 node = %pinned.node_id,
                 "the pinned node does not hold this blob, and with no CapacityBond \
@@ -1558,6 +1594,14 @@ pub(crate) async fn probe_pinned(
     }
     let mut targets = pinned_targets(pinned.node_id, pinned.provider);
     targets.size_hint = probed_size_hint(&outcome);
+    let hint = match outcome {
+        ProbeOutcome::Holder(probed, _) => probed.payment_pools,
+        ProbeOutcome::NonHolder(candidate, _) => candidate.payment_pools,
+        _ => None,
+    };
+    if let Some(hint) = hint {
+        targets.pool_hints.insert(pinned.node_id, hint);
+    }
     targets
 }
 
