@@ -451,8 +451,8 @@ On boot, the node builds the index from the enumeration views. It pins the gover
 
 - It reads `mutationCount` and keeps the value as its ledger cursor.
 - It pages the address union from `blacklistedAddresses` and keeps only the live members. A live member satisfies `isOriginBlacklisted(a) || isOperatorBlacklisted(a)`. This is the same disjunction that `OriginAssignment` consumers apply, so the index catches an operator that `addOperator` blacklisted without an origin entry.
-- It reads its scope with `getScopeRegions(operator)`. It pages `blacklistedHashes(region, …)` for each returned region and keeps each hash that `isHashBlacklistedForOperator` reports live.
-- For each live emergency entry, it reads `getHashEntry` or `getEmergencyOrigin` and sets `expiresAt` to `addedAt` plus the category term.
+- It reads its scope with `getScopeRegions(operator)`. It pages `blacklistedHashes(region, …)` for each returned region. For each paged hash, one `getHashEntry(region, hash)` read gives both the liveness and the expiry of the entry. An entry is live when its `addedAt` is not 0, and it is not an emergency entry past its category term. The node keeps a hash under a region only when the entry in that region is live.
+- An emergency entry gets `expiresAt` equal to `addedAt` plus its category term. A non-emergency entry gets `expiresAt` 0. For each paged address that `isOriginBlacklisted` reports live, the node reads `getEmergencyOrigin` and sets the expiry of that origin by the same rule.
 - It reads `getRegionalBody` for each region in scope, and `complianceWindow` and `emergencyComplianceWindow`.
 
 Both sets remove by swap-and-pop, so each page and the count it is checked against come from the pinned block. A `seen != count` mismatch aborts the snapshot. The node does not seat a partial set. Enumeration returns raw membership, so the liveness reads drop a lapsed emergency entry that nobody has expired yet.
