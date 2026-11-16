@@ -5152,6 +5152,121 @@ async fn admit_bao_stream_admits_a_partial_range() {
 }
 
 #[tokio::test]
+async fn admit_bao_stream_until_reports_each_chunk_group_and_drains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 4 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+
+    let seen = std::sync::Mutex::new(Vec::new());
+    let on_progress = |end: u64| seen.lock().unwrap().push(end);
+    let (_reader, end) = engine
+        .admit_bao_stream_until(
+            hash,
+            ranges,
+            total,
+            bao.slice(8..),
+            None,
+            crate::AdmitControl {
+                on_progress: Some(&on_progress),
+                stop_at: None,
+            },
+        )
+        .await
+        .map_err(|(_reader, e)| e)
+        .unwrap();
+
+    assert_eq!(end, crate::AdmitEnd::Drained);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![group, 2 * group, 3 * group, 4 * group],
+        "one report per chunk group, each the end of the verified prefix"
+    );
+    assert!(engine.present_ranges(hash).await.unwrap().is_complete());
+}
+
+#[tokio::test]
+async fn admit_bao_stream_until_refuses_a_controlled_multi_span_admit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 4 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let (hash, _, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+    let chunks = |groups: u64| bao_tree::ChunkNum(groups * group / 1024);
+    let two_spans = bao_tree::ChunkRanges::from(chunks(0)..chunks(1))
+        | bao_tree::ChunkRanges::from(chunks(2)..chunks(3));
+
+    let stop_at = AtomicU64::new(u64::MAX);
+    let result = engine
+        .admit_bao_stream_until(
+            hash,
+            two_spans,
+            total,
+            bao.slice(8..),
+            None,
+            crate::AdmitControl {
+                on_progress: None,
+                stop_at: Some(&stop_at),
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err((_, CacheError::Internal(_)))),
+        "a controlled admit over two spans is refused"
+    );
+    assert!(
+        engine.present_ranges(hash).await.unwrap().is_empty(),
+        "nothing is admitted"
+    );
+}
+
+#[tokio::test]
+async fn admit_bao_stream_until_stops_at_a_lowered_end_and_keeps_the_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 8 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+
+    // The end sits inside the third group: the admit stops once the prefix
+    // covers it, at the third group's end.
+    let stop_at = AtomicU64::new(2 * group + 1);
+    let (_reader, end) = engine
+        .admit_bao_stream_until(
+            hash,
+            ranges,
+            total,
+            bao.slice(8..),
+            None,
+            crate::AdmitControl {
+                on_progress: None,
+                stop_at: Some(&stop_at),
+            },
+        )
+        .await
+        .map_err(|(_reader, e)| e)
+        .unwrap();
+
+    assert_eq!(end, crate::AdmitEnd::Stopped);
+    let present = engine.present_ranges(hash).await.unwrap();
+    assert_eq!(
+        present.chunk_ranges(),
+        &bao_tree::ChunkRanges::from(..bao_tree::ChunkNum(3 * group / 1024)),
+        "exactly the verified prefix is present"
+    );
+    assert_eq!(
+        count_tags_for(&engine, hash).await,
+        1,
+        "a stopped admit protects its prefix as a whole admit does"
+    );
+}
+
+#[tokio::test]
 async fn admit_bao_stream_captures_proof_into_the_session_during_import() {
     // With a serve leg attached, the decode pass captures the range's proof
     // nodes straight into the shared session — no post-admit `export_bao`

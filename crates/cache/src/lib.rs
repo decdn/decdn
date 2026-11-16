@@ -71,8 +71,8 @@ pub use circuit_breaker::{
 /// under-reserves by up to two groups.
 pub use decdn_bao_range::CHUNK_GROUP_BYTES;
 pub use engine::{
-    CacheEngine, EvictionCandidates, EvictionPreview, OriginHeldReport, OriginPresence,
-    PresentRanges, ServeAudit,
+    AdmitControl, AdmitEnd, CacheEngine, EvictionCandidates, EvictionPreview, OriginHeldReport,
+    OriginPresence, PresentRanges, ServeAudit,
 };
 pub use error::{
     CacheError, CacheResult, ErrorChain, OriginError, OriginPullError, SupportedEncoding,
