@@ -36,8 +36,8 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     // ADR 011 § Compliance Window — an entry does NOT become slashable at
     // `addedAt`; it becomes slashable at `effectiveAt = addedAt + window`. The
-    // grace exists because nodes learn of an entry by re-enumerating the
-    // deny-set on an interval (10 minutes by default, ADR 011 § Node Behavior):
+    // grace exists because nodes learn of an entry by polling `mutationCount`
+    // on an interval (at most 5 minutes, ADR 011 § Node Behavior):
     // without it, a node serving a request microseconds before the add lands is
     // slashable for a delivery it could not have known was prohibited. Both
     // windows are governance-tunable inside the hardcoded [1 hour, 7 days]
@@ -86,6 +86,57 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         GENERAL,
         CSAM,
         TERRORIST
+    }
+
+    /// @notice What a `Mutation` record does to its key (ADR 011 § Following
+    ///         the mutation ledger). Every kind overwrites the whole state of
+    ///         its key: an add kind sets the key present with the record's
+    ///         `expiresAt`, a remove kind deletes it. Order is ABI-frozen: the
+    ///         value is persisted in the ledger.
+    enum MutationKind {
+        // Governance global add or regional-body add, fresh or a re-add of a
+        // live non-emergency entry. `expiresAt` is 0.
+        HASH_ADD,
+        // Emergency global add, or an emergency re-add of a live emergency
+        // entry. `expiresAt` is the entry's auto-expiry deadline.
+        HASH_EMERGENCY_ADD,
+        // Governance re-add of a live emergency entry. Clears its expiry.
+        HASH_RATIFY,
+        // `removeHashGlobal` or `removeHashRegional`.
+        HASH_REMOVE,
+        // `expireEmergencyEntry`.
+        HASH_EXPIRE,
+        // `setOriginBlacklist(origin, true)`. Clears any emergency expiry.
+        ORIGIN_SET,
+        // `setOriginBlacklist(origin, false)`.
+        ORIGIN_CLEAR,
+        // `emergencyAddOrigin`. `expiresAt` is the auto-expiry deadline.
+        ORIGIN_EMERGENCY_ADD,
+        // `expireEmergencyOrigin`.
+        ORIGIN_EXPIRE,
+        // `addOperator`.
+        OPERATOR_ADD,
+        // `removeOperator`.
+        OPERATOR_REMOVE,
+        // The kinds below change no deny answer: `_isLive` reads only the
+        // entry, so a body's entries stay live through every body change, and
+        // a compliance window moves only the `effectiveAt` of later adds.
+        // `region` is the body's region and `key` the body address.
+        // `registerRegionalBody`.
+        BODY_REGISTER,
+        // `deregisterRegionalBody`.
+        BODY_DEREGISTER,
+        // `suspendRegionalBody`. `expiresAt` is the moment an unratified
+        // suspension lapses.
+        BODY_SUSPEND,
+        // `ratifyRegionalBodySuspension`. The suspension stands; `expiresAt` 0.
+        BODY_SUSPENSION_RATIFY,
+        // `unsuspendRegionalBody`.
+        BODY_UNSUSPEND,
+        // `setComplianceWindow`. `key` is the new window in seconds.
+        COMPLIANCE_WINDOW_SET,
+        // `setEmergencyComplianceWindow`. `key` is the new window in seconds.
+        EMERGENCY_COMPLIANCE_WINDOW_SET
     }
 
     // -----------------------------------------------------------------
@@ -216,18 +267,41 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         the other still holds cannot drop the address from the index.
     EnumerableSet.AddressSet internal _blacklistedAddrs;
 
+    /// @notice One append-only record per state change an authorised caller
+    ///         makes to this contract: every hash, origin, operator, emergency
+    ///         and expiry write, every regional-body change, and every
+    ///         compliance-window change. A call that leaves the state as it was
+    ///         appends nothing.
+    /// @dev    `kind`, `at` and `expiresAt` pack into one slot. `at` is the
+    ///         write's `block.timestamp`. `expiresAt` is 0 when nothing lapses;
+    ///         otherwise the state the record sets holds while
+    ///         `block.timestamp <= expiresAt`, the same deadline `_isLive`,
+    ///         `isOriginBlacklisted` and `_bodySuspended` apply. `region` is the
+    ///         regional key of a regional hash or body record and 0 otherwise.
+    ///         `key` is the hash, the address left-padded to 32 bytes, or the
+    ///         new window in seconds.
+    struct Mutation {
+        MutationKind kind;
+        uint64 at;
+        uint64 expiresAt;
+        bytes32 region;
+        bytes32 key;
+    }
+
+    /// @notice The mutation ledger a node follows by `eth_call` (ADR 011
+    ///         § Following the mutation ledger). Read through `mutationCount`
+    ///         and `getMutations`.
+    Mutation[] internal _mutations;
+
     // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
 
-    /// @notice A hash entered the enforced deny-set. A node treats this as a
-    ///         low-latency signal to re-read the in-scope predicate for the
-    ///         hashes it holds; the authoritative deny-set is the full
-    ///         enumeration (ADR 011 § Node Behavior), so a missed event is
-    ///         recovered by the next re-enumeration rather than by any counter.
+    /// @notice A hash was added or re-added, carrying the audit-trail reason.
+    ///         For indexers and audit; a node follows the mutation ledger
+    ///         instead (ADR 011 § Node Behavior).
     event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, string reason);
-    /// @notice A hash left the enforced deny-set. Signal semantics as in
-    ///         `HashBlacklisted`.
+    /// @notice A hash left the deny-set. Same audience as `HashBlacklisted`.
     event HashRemoved(bytes32 indexed region, bytes32 indexed hash);
     event OperatorBlacklisted(address indexed operator);
     event OperatorBlacklistCleared(address indexed operator);
@@ -357,7 +431,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     }
 
     function removeHashGlobal(bytes32 hash) external onlyRole(GOVERNANCE_ROLE) {
-        _removeHashRegional(GLOBAL_REGION, hash);
+        _removeHashRegional(GLOBAL_REGION, hash, MutationKind.HASH_REMOVE);
     }
 
     /// @dev `REGIONAL_BODY_ROLE` must NOT be able to remove `GLOBAL_REGION`
@@ -367,7 +441,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     function removeHashRegional(bytes32 region, bytes32 hash) external onlyRole(REGIONAL_BODY_ROLE) {
         if (region == bytes32(0) || region == GLOBAL_REGION) revert MissingRegion();
         _requireActiveBodyFor(region);
-        _removeHashRegional(region, hash);
+        _removeHashRegional(region, hash, MutationKind.HASH_REMOVE);
     }
 
     // -----------------------------------------------------------------
@@ -424,6 +498,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         _isOriginBlacklisted[operator] = true;
         _emergencyOrigins[operator] = EmergencyOrigin({ addedAt: uint64(block.timestamp), category: uint8(cat) });
         _syncAddr(operator);
+        _logAddr(MutationKind.ORIGIN_EMERGENCY_ADD, operator, uint64(block.timestamp) + _expiryFor(uint8(cat)));
         emit OriginBlacklistUpdated(operator, true);
         emit EmergencyOriginAdded(operator, uint8(cat), reason);
     }
@@ -432,30 +507,31 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         its category deadline.
     /// @dev    `_isLive` already reports an expired entry as unenforceable, so
     ///         this changes no view answer. It exists to materialize the expiry:
-    ///         it removes the entry from the enumerable `_regionHashes` index and
-    ///         emits `HashRemoved`, so the raw `blacklistedHashes` membership a
-    ///         node enumerates (ADR 011 § Node Behavior) no longer carries the
-    ///         lapsed entry. Mirrors the permissionless-cleanup model of
+    ///         it removes the entry from the enumerable `_regionHashes` index,
+    ///         appends a `HASH_EXPIRE` ledger record and emits `HashRemoved`, so
+    ///         the raw `blacklistedHashes` membership a node enumerates at boot
+    ///         (ADR 011 § Node Behavior) no longer carries the lapsed entry.
+    ///         Mirrors the permissionless-cleanup model of
     ///         `OriginAssignment.pruneInactiveOrigin`.
     function expireEmergencyEntry(bytes32 region, bytes32 hash) external {
         HashEntry storage e = _hashEntries[region][hash];
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);
         if (!_emergencyExpired(e.emergency, e.addedAt, e.category)) revert NotExpired();
-        _removeHashRegional(region, hash);
+        _removeHashRegional(region, hash, MutationKind.HASH_EXPIRE);
     }
 
     /// @notice Permissionless counterpart of `expireEmergencyEntry` for origins.
-    /// @dev    Nodes track the origin deny-set by enumerating
-    ///         `blacklistedAddresses` and following the event tail (ADR 011
-    ///         § Node Behavior). `OriginBlacklistUpdated(origin, false)` emitted
-    ///         here is the low-latency signal an expiry happened; the entry also
-    ///         leaves the enumerated membership on removal.
+    /// @dev    `isOriginBlacklisted` already reports the lapsed origin as
+    ///         unenforceable. This removes it from the `blacklistedAddresses`
+    ///         membership, unless the operator leg still holds it, and appends
+    ///         an `ORIGIN_EXPIRE` ledger record.
     function expireEmergencyOrigin(address origin) external {
         EmergencyOrigin storage eo = _emergencyOrigins[origin];
         if (!_emergencyExpired(eo.addedAt != 0, eo.addedAt, eo.category)) revert NotExpired();
         delete _emergencyOrigins[origin];
         _isOriginBlacklisted[origin] = false;
         _syncAddr(origin);
+        _logAddr(MutationKind.ORIGIN_EXPIRE, origin, 0);
         emit OriginBlacklistUpdated(origin, false);
     }
 
@@ -468,6 +544,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (!isOperatorBlacklisted[operator]) {
             isOperatorBlacklisted[operator] = true;
             _syncAddr(operator);
+            _logAddr(MutationKind.OPERATOR_ADD, operator, 0);
             emit OperatorBlacklisted(operator);
             capacityBond.ejectNode(operator);
         }
@@ -488,6 +565,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (isOperatorBlacklisted[operator]) {
             isOperatorBlacklisted[operator] = false;
             _syncAddr(operator);
+            _logAddr(MutationKind.OPERATOR_REMOVE, operator, 0);
             emit OperatorBlacklistCleared(operator);
         }
         capacityBond.unEjectNode(operator);
@@ -497,11 +575,15 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///      the `_emergencyOrigins` record is what makes a governance-set origin
     ///      permanent. Cleared on both polarities — setting `false` must not
     ///      leave a stale expiry record behind that a later `true` would inherit.
+    ///      Appends a ledger record unless the call leaves both the flag and
+    ///      the expiry record as they were.
     function setOriginBlacklist(address origin, bool blacklisted) external onlyRole(GOVERNANCE_ROLE) {
         if (origin == address(0)) revert ZeroAddress();
+        bool changed = _isOriginBlacklisted[origin] != blacklisted || _emergencyOrigins[origin].addedAt != 0;
         _isOriginBlacklisted[origin] = blacklisted;
         delete _emergencyOrigins[origin];
         _syncAddr(origin);
+        if (changed) _logAddr(blacklisted ? MutationKind.ORIGIN_SET : MutationKind.ORIGIN_CLEAR, origin, 0);
         emit OriginBlacklistUpdated(origin, blacklisted);
     }
 
@@ -590,10 +672,8 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         holes in a paginated view, so a short page would stop meaning "end
     ///         of set"; and the only entries it would drop are emergency ones past
     ///         their category deadline. Omitting those is the FAIL-OPEN direction
-    ///         for a compliance gate, whereas returning them merely over-enforces
-    ///         — which is already what a consumer does today, since it learns of
-    ///         an expiry only from the `HashRemoved` that `expireEmergencyEntry`
-    ///         emits. Callers needing liveness read `getHashEntry` or
+    ///         for a compliance gate, whereas returning them merely over-enforces.
+    ///         Callers needing liveness read `getHashEntry` or
     ///         `isHashBlacklistedForOperator` per hash.
     /// @dev    Order is NOT stable across mutations: removal is swap-and-pop, so a
     ///         removal between two page reads can move an unread element into an
@@ -631,10 +711,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         returned, and the order is unstable across mutations. The live
     ///         per-address predicates remain `isOriginBlacklisted` and
     ///         `isOperatorBlacklisted`.
-    /// @dev    This is the only readable source for the origin deny-set. Like
-    ///         the hash set, it carries no version counter: a consumer reconciles
-    ///         a dropped `OriginBlacklistUpdated` event against this full
-    ///         enumeration (ADR 011 § Node Behavior).
+    /// @dev    A node pages this once at a pinned block, together with
+    ///         `mutationCount` at that block, and then follows the mutation
+    ///         ledger from that count (ADR 011 § Node Behavior).
     function blacklistedAddresses(uint256 offset, uint256 limit) external view returns (address[] memory page) {
         uint256 len = _blacklistedAddrs.length();
         if (offset >= len) return new address[](0);
@@ -646,6 +725,29 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         }
     }
 
+    /// @notice How many records the mutation ledger holds. A node polls this
+    ///         by `eth_call` and reads `getMutations` only when it moves.
+    function mutationCount() external view returns (uint256) {
+        return _mutations.length;
+    }
+
+    /// @notice A page of the mutation ledger, starting at `from` and at most
+    ///         `limit` long, in append order. A page shorter than `limit` means
+    ///         the end of the ledger.
+    /// @dev    The ledger is append-only, so a record's index never changes and
+    ///         a cursor stays valid across any number of later writes.
+    function getMutations(uint256 from, uint256 limit) external view returns (Mutation[] memory page) {
+        uint256 len = _mutations.length;
+        if (from >= len) return new Mutation[](0);
+        // `len - from` rather than `from + limit`, which can overflow.
+        uint256 n = len - from;
+        if (n > limit) n = limit;
+        page = new Mutation[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            page[i] = _mutations[from + i];
+        }
+    }
+
     // -----------------------------------------------------------------
     // Governance setters
     // -----------------------------------------------------------------
@@ -654,6 +756,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         _enforceComplianceWindowBounds(newWindow);
         uint64 old = complianceWindow;
         complianceWindow = newWindow;
+        if (newWindow != old) _log(MutationKind.COMPLIANCE_WINDOW_SET, bytes32(0), bytes32(uint256(newWindow)), 0);
         emit ComplianceWindowUpdated(old, newWindow);
     }
 
@@ -661,6 +764,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         _enforceComplianceWindowBounds(newWindow);
         uint64 old = emergencyComplianceWindow;
         emergencyComplianceWindow = newWindow;
+        if (newWindow != old) {
+            _log(MutationKind.EMERGENCY_COMPLIANCE_WINDOW_SET, bytes32(0), bytes32(uint256(newWindow)), 0);
+        }
         emit EmergencyComplianceWindowUpdated(old, newWindow);
     }
 
@@ -703,6 +809,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         rb.body = body;
         regionOfBody[body] = region;
         _grantRole(REGIONAL_BODY_ROLE, body);
+        _logBody(MutationKind.BODY_REGISTER, region, body, 0);
         emit RegionalBodyRegistered(region, body, signersVerified);
     }
 
@@ -711,6 +818,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         delete _regionalBodies[region];
         delete regionOfBody[body];
         _revokeRole(REGIONAL_BODY_ROLE, body);
+        _logBody(MutationKind.BODY_DEREGISTER, region, body, 0);
         emit RegionalBodyDeregistered(region, body);
     }
 
@@ -725,8 +833,10 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         address body = _requireRegisteredBody(region);
         RegionalBody storage rb = _regionalBodies[region];
         if (_bodySuspended(rb)) revert RegionalBodyAlreadySuspended(region);
-        rb.suspendedAt = uint64(block.timestamp);
+        uint64 now_ = uint64(block.timestamp);
+        rb.suspendedAt = now_;
         rb.suspensionRatified = false;
+        _logBody(MutationKind.BODY_SUSPEND, region, body, now_ + BODY_SUSPENSION_RATIFICATION_WINDOW);
         emit RegionalBodySuspended(region, body);
     }
 
@@ -740,8 +850,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             uint64 closesAt = rb.suspendedAt + BODY_SUSPENSION_RATIFICATION_WINDOW;
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp > closesAt) revert SuspensionWindowClosed(closesAt);
+            rb.suspensionRatified = true;
+            _logBody(MutationKind.BODY_SUSPENSION_RATIFY, region, body, 0);
         }
-        rb.suspensionRatified = true;
         emit RegionalBodySuspensionRatified(region, body);
     }
 
@@ -753,6 +864,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (rb.suspendedAt == 0) revert RegionalBodySuspensionNotActive(region);
         rb.suspendedAt = 0;
         rb.suspensionRatified = false;
+        _logBody(MutationKind.BODY_UNSUSPEND, region, body, 0);
         emit RegionalBodyUnsuspended(region, body);
     }
 
@@ -776,14 +888,19 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     {
         if (hash == bytes32(0)) revert ZeroHash();
         HashEntry storage e = _hashEntries[region][hash];
+        MutationKind kind = emergency ? MutationKind.HASH_EMERGENCY_ADD : MutationKind.HASH_ADD;
         if (_isLive(region, hash)) {
             // A live entry keeps `addedAt` and `effectiveAt`: moving
             // `effectiveAt` later would void slash evidence for serves made
             // after the entry took effect. Re-adding under governance ratifies an
             // emergency entry into a permanent one (`emergency` back to false);
             // an emergency re-add may only escalate the category.
-            if (!emergency) e.emergency = false;
-            else if (uint8(category) > e.category) e.category = uint8(category);
+            if (!emergency) {
+                if (e.emergency) kind = MutationKind.HASH_RATIFY;
+                e.emergency = false;
+            } else if (uint8(category) > e.category) {
+                e.category = uint8(category);
+            }
         } else {
             e.addedAt = uint64(block.timestamp);
             // ADR 011 § Compliance Window. Stamped, not derived — see the
@@ -792,6 +909,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             e.emergency = emergency;
             e.category = uint8(category);
         }
+        // Every add carries a new notice (its reason), so every add appends a
+        // record carrying the entry's resulting expiry.
+        _logHash(kind, region, hash, e.emergency ? e.addedAt + _expiryFor(e.category) : 0);
         // The audit-trail reason always takes the current notice's.
         hashReason[region][hash] = reason;
         // Idempotent: a re-add leaves the index alone.
@@ -800,14 +920,35 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         emit HashBlacklisted(region, hash, reason);
     }
 
-    function _removeHashRegional(bytes32 region, bytes32 hash) internal {
+    function _removeHashRegional(bytes32 region, bytes32 hash, MutationKind kind) internal {
         HashEntry storage e = _hashEntries[region][hash];
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);
         delete _hashEntries[region][hash];
         delete hashReason[region][hash];
         // slither-disable-next-line unused-return
         _regionHashes[region].remove(hash);
+        _logHash(kind, region, hash, 0);
         emit HashRemoved(region, hash);
+    }
+
+    /// @dev Append a hash record. The global key is written as region 0, so a
+    ///      record's `region` is nonzero only for a regional entry.
+    function _logHash(MutationKind kind, bytes32 region, bytes32 hash, uint64 expiresAt) internal {
+        _log(kind, region == GLOBAL_REGION ? bytes32(0) : region, hash, expiresAt);
+    }
+
+    function _logAddr(MutationKind kind, address a, uint64 expiresAt) internal {
+        _log(kind, bytes32(0), bytes32(uint256(uint160(a))), expiresAt);
+    }
+
+    function _logBody(MutationKind kind, bytes32 region, address body, uint64 expiresAt) internal {
+        _log(kind, region, bytes32(uint256(uint160(body))), expiresAt);
+    }
+
+    function _log(MutationKind kind, bytes32 region, bytes32 key, uint64 expiresAt) internal {
+        _mutations.push(
+            Mutation({ kind: kind, at: uint64(block.timestamp), expiresAt: expiresAt, region: region, key: key })
+        );
     }
 
     /// @dev Re-derive `a`'s membership in the union index from BOTH source
