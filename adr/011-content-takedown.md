@@ -447,7 +447,7 @@ This authority extends the DAO's role from negative-only (blacklisting) to posit
 
 Each node keeps a local deny index that mirrors `ContentBlacklist`. The index holds the blacklisted address union (origins and operators), the blacklisted hashes of each region the node has read, the regional-body state and the two compliance windows. Each index entry stores its `expiresAt` (0 for an entry with no auto-expiry). The node evaluates its scope at lookup time. The node reads all chain state by `eth_call`. It does not read event logs.
 
-On boot, the node builds the index from the enumeration views. It pins one block and does all of these reads at that block:
+On boot, the node builds the index from the enumeration views. It pins the governance chain's `safe` block and does all of these reads at that block:
 
 - It reads `mutationCount` and keeps the value as its ledger cursor.
 - It pages the address union from `blacklistedAddresses` and keeps only the live members. A live member satisfies `isOriginBlacklisted(a) || isOperatorBlacklisted(a)`. This is the same disjunction that `OriginAssignment` consumers apply, so the index catches an operator that `addOperator` blacklisted without an origin entry.
@@ -465,9 +465,9 @@ The node MUST NOT accept connections until its initial enumeration completes.
 
 `ContentBlacklist` keeps an append-only mutation ledger. The rule is: everything that changes the blacklist is recorded, and only an authorised caller can write. Each state change appends one `Mutation` record. This covers every hash, origin, operator, emergency and expiry write, every regional-body change (registration, deregistration, suspension, suspension ratification, unsuspension) and every compliance-window change. A hash add or re-add always appends a record, because it carries a new notice in its reason. Any other call that leaves the state as it was appends nothing. The two permissionless expiry calls also append a record, because they change the raw membership. Each record carries all that a node needs to apply it, with no other read.
 
-While running, the node polls `mutationCount` by `eth_call` at an interval of at most 5 minutes. This interval is well inside the 1-hour compliance-window floor ([§ Compliance Window](#compliance-window)) and inside the 30-minute default grace of [§ Serving while chain-stale](#serving-while-chain-stale). Each poll pins one block and does all of its reads at that block:
+While running, the node polls `mutationCount` by `eth_call` at an interval of at most 5 minutes. This interval is well inside the 1-hour compliance-window floor ([§ Compliance Window](#compliance-window)) and inside the 30-minute default grace of [§ Serving while chain-stale](#serving-while-chain-stale). Each poll pins the governance chain's `safe` block and does all of its reads at that block. A record at or below the `safe` block does not change, so a reorg cannot replace a record that the node applied. On Ethereum the `safe` block trails the head by a few minutes, which stays well inside the compliance windows.
 
-1. The node reads `mutationCount`. If the count is below the cursor, a reorg removed records that the node applied. The node then builds a new snapshot as on boot.
+1. The node reads `mutationCount`. If the count is below the cursor, the chain reorganised past the `safe` block. The node then builds a new snapshot as on boot.
 2. The node reads `getScopeRegions(operator)`. [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window) region and ripening transitions change the scope with no write to `ContentBlacklist`. The ledger holds every record since the node's snapshot, but the snapshot holds only the regions in scope at that time. So when a region enters the scope for the first time since boot, the node pages `blacklistedHashes` for it and filters it as on boot. It replaces what the index holds for that region with the result.
 3. If the count is above the cursor, the node reads `getMutations(cursor, …)` in pages up to the count. It applies the records in ledger order and sets the cursor to the count.
 
