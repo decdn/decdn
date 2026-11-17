@@ -257,9 +257,6 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     error BelowMinSweep(uint256 total, uint256 minSweep);
     /// @notice A sweep batch is empty or longer than `MAX_SWEEP_BATCH`.
     error BadSweepBatch(uint256 length);
-    /// @notice A sweep entry has no pending protocol share. A repeated entry
-    ///         reads zero, since its first occurrence cleared it.
-    error NothingPending(address operator);
     /// @notice `pause` or `unpause` from an address other than `pauser`.
     error NotPauser();
 
@@ -487,27 +484,32 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
 
     /// @notice Send each listed operator's pending protocol share and served
     ///         bytes to the governance chain in one bridge transfer.
-    ///         Permissionless. Takes 1 to `MAX_SWEEP_BATCH` operators, each
-    ///         with a non-zero pending share, so every entry carries USDC and
-    ///         a repeated entry is rejected by the same check. Needs the batch
-    ///         total to be at least `minSweep`. Resets every listed `pending`
-    ///         before the bridge call.
+    ///         Permissionless. Takes 1 to `MAX_SWEEP_BATCH` operators. Skips an
+    ///         entry with no pending share, so a repeated entry or an operator
+    ///         swept first by someone else never reverts the batch. Needs the
+    ///         batch total to be non-zero and at least `minSweep`. Resets every
+    ///         swept `pending` before the bridge call.
     function sweep(address[] calldata operators) external nonReentrant {
         uint256 n = operators.length;
         if (n == 0 || n > MAX_SWEEP_BATCH) revert BadSweepBatch(n);
-        SweepShare[] memory shares = new SweepShare[](n);
+        SweepShare[] memory found = new SweepShare[](n);
+        uint256 k = 0;
         uint256 total = 0;
         for (uint256 i = 0; i < n; i++) {
             address operator = operators[i];
             Pending memory p = _pending[operator];
             // slither-disable-next-line incorrect-equality
-            if (p.usdc == 0) revert NothingPending(operator);
+            if (p.usdc == 0) continue;
             delete _pending[operator];
-            shares[i] = SweepShare({ operator: operator, servedBytes: p.servedBytes, amount: p.usdc });
+            found[k++] = SweepShare({ operator: operator, servedBytes: p.servedBytes, amount: p.usdc });
             total += p.usdc;
             emit Swept(operator, p.servedBytes, p.usdc);
         }
-        if (total < minSweep) revert BelowMinSweep(total, minSweep);
+        if (total == 0 || total < minSweep) revert BelowMinSweep(total, minSweep);
+        SweepShare[] memory shares = new SweepShare[](k);
+        for (uint256 i = 0; i < k; i++) {
+            shares[i] = found[i];
+        }
         uint256 fee = _sweepFee(total);
         emit SweepSent(total, fee);
         _sendSweep(shares, total, fee);

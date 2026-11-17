@@ -377,23 +377,41 @@ contract PaymentPoolSweepTest is Test {
         pool.sweep(ops);
     }
 
-    function test_sweep_revertsOnDuplicate() public {
+    /// A repeated entry reads zero after its first occurrence and is skipped.
+    function test_sweep_skipsDuplicate() public {
         bytes32 id = _open();
         _redeem(id, operator, 100e6, 1);
         address[] memory ops = new address[](2);
         ops[0] = operator;
         ops[1] = operator;
-        vm.expectRevert(abi.encodeWithSelector(PaymentPoolBase.NothingPending.selector, operator));
         pool.sweep(ops);
+        PaymentPoolBase.SweepShare[] memory shares = _lastShares();
+        assertEq(shares.length, 1);
+        assertEq(shares[0].operator, operator);
     }
 
-    function test_sweep_revertsOnEntryWithNothingPending() public {
+    /// An entry with nothing pending is skipped, so sweeping one listed
+    /// operator first cannot make the batch revert.
+    function test_sweep_skipsEntryWithNothingPending() public {
         bytes32 id = _open();
         _redeem(id, operator, 100e6, 1);
         address[] memory ops = new address[](2);
-        ops[0] = operator;
-        ops[1] = stranger;
-        vm.expectRevert(abi.encodeWithSelector(PaymentPoolBase.NothingPending.selector, stranger));
+        ops[0] = stranger;
+        ops[1] = operator;
+        pool.sweep(ops);
+        PaymentPoolBase.SweepShare[] memory shares = _lastShares();
+        assertEq(shares.length, 1);
+        assertEq(shares[0].operator, operator);
+        (, uint256 u) = _pending(operator);
+        assertEq(u, 0);
+    }
+
+    /// A batch whose every entry is empty moves nothing.
+    function test_sweep_revertsWhenEveryEntryIsEmpty() public {
+        _open();
+        address[] memory ops = new address[](1);
+        ops[0] = stranger;
+        vm.expectRevert(abi.encodeWithSelector(PaymentPoolBase.BelowMinSweep.selector, uint256(0), uint256(MIN_SWEEP)));
         pool.sweep(ops);
     }
 
