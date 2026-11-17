@@ -412,7 +412,7 @@ reaches the client as the one class `Declined`, so a client cannot tell which
 list a hash is on (ADR 011 § `StreamRequest` Response); the deny keeps the
 cause on the node's own per-reason counters
 (`decdn_serve_stream_rejected_chain_hash_denied_total`,
-`..._hash_denied_total`, `..._evicted_since_probe_total`). A
+`..._hash_denied_total`, `..._withdrawn_total`). A
 fail-closed readiness gate keeps every ALPN listener shut until the first
 enumeration + enforcement pass completes, so a node refuses to serve rather than
 serve un-enforced.

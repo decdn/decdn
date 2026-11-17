@@ -135,7 +135,13 @@ impl ClientHandler {
     /// [`PeerFault`](super::wire::PeerFault) or
     /// [`ClientPaymentFault`](super::wire::ClientPaymentFault); the rest reach the
     /// dispatch sink's `error!` as node faults. An error after a proof credited
-    /// bytes also carries [`PaidProgress`](super::wire::PaidProgress).
+    /// bytes also carries [`PaidProgress`](super::wire::PaidProgress), and one
+    /// after a frame followed the request carries
+    /// [`FrameSeen`](super::wire::FrameSeen).
+    ///
+    /// `reader` is the stream's one proof reader, which may already hold the
+    /// payer's first proof, and `guards` the send checks the stream's
+    /// admission built.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn serve_leg(
         &self,
@@ -153,12 +159,14 @@ impl ClientHandler {
         offset: u64,
         len: u64,
         total_bytes: u64,
+        mut reader: BufferedProofReader,
+        guards: SendGuards,
         first_byte: FirstByteClock,
     ) -> anyhow::Result<ServeEnd> {
         // Bytes the proofs on this stream claimed for it. Owned here so every exit
         // of the loop, `?` included, passes through the one `PaidProgress` tag:
-        // the dispatch sink splits a peer that left into declined or abandoned by
-        // it.
+        // the dispatch sink splits a peer that left into unclaimed, declined or
+        // abandoned by it and by the reader's `FrameSeen` tag.
         let mut paid: u64 = 0;
         // Refresh recency before the first byte goes out, so the blob does not
         // rank oldest for eviction while it streams. Recency only: the frequency
@@ -179,11 +187,13 @@ impl ClientHandler {
             offset,
             len,
             total_bytes,
+            &mut reader,
+            guards,
             first_byte,
             &mut paid,
         )
         .await
-        .map_err(|e| super::wire::tag_paid_progress(e, paid))
+        .map_err(|e| super::wire::tag_frame_seen(super::wire::tag_paid_progress(e, paid), &reader))
     }
 
     /// Await `frame`, the encoder's next frame, unless the stream ends first.
@@ -347,6 +357,8 @@ impl ClientHandler {
         offset: u64,
         len: u64,
         total_bytes: u64,
+        reader: &mut BufferedProofReader,
+        mut guards: SendGuards,
         first_byte: FirstByteClock,
         paid: &mut u64,
     ) -> anyhow::Result<ServeEnd> {
@@ -384,17 +396,12 @@ impl ClientHandler {
         let mut first_byte = Some(first_byte);
         // Wire bytes this stream wrote. The stream's credit is `paid − delivered`.
         let mut delivered: u64 = 0;
-        // One buffered proof reader for the whole stream: every read goes through
-        // it so a pipelined proof buffered ahead of the current one is not lost.
-        let mut reader = BufferedProofReader::default();
         // This stream's chain anchor — which epoch it has been told about, so a
         // bare reveal arriving on it can be placed (ADR 003 §Concurrent
         // Streams, Rule 1). Per stream and in memory only: a restart drops the
         // streams, and the lane's durable record keeps the strongest claim's
         // chain state.
         let mut anchor = StreamAnchor::default();
-        // The takedown, pool and signer checks that run before each send.
-        let mut guards = self.send_guards(lane, &lane_key).await;
 
         // The coherent whole-range bao encoder (ADR 038): ONE verified stream for
         // `R`, produced incrementally — leaf data awaited from the cache the pull
@@ -432,7 +439,7 @@ impl ClientHandler {
                         conn,
                         send,
                         recv,
-                        &mut reader,
+                        reader,
                         &mut anchor,
                         &mut waits,
                         &mut guards,
@@ -491,7 +498,7 @@ impl ClientHandler {
                     conn,
                     send,
                     recv,
-                    &mut reader,
+                    reader,
                     &mut anchor,
                     &mut waits,
                     &mut guards,

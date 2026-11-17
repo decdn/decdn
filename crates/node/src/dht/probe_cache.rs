@@ -61,7 +61,7 @@ pub use crate::dht::records::Hash;
 /// a misbehaving provider is still slashable — and, per ADR 001, below
 /// `probe_hold_duration` ([`decdn_cache::PROBE_HOLD_DURATION`], 35s), so the
 /// provider's eviction hold still covers the blob when that stream opens. The
-/// second bound is what makes `EvictedSinceProbe` rare on the hit path.
+/// second bound is what makes `Withdrawn` rare on the hit path.
 ///
 /// Expressed through `as_secs` because `Duration: Div<u32>` is not `const` — the
 /// same reason [`decdn_cache::PROBE_HOLD_DURATION`] reaches for

@@ -46,15 +46,16 @@ pub(super) enum Acquired {
 }
 
 impl ClientHandler {
-    /// The checks state for one stream. The clock starts now, because admission
-    /// already verified solvency once.
+    /// The checks state for one stream. `funder` is the pool owner the
+    /// stream's admission read, or `None` when no pool view is wired. The clock
+    /// starts now, because admission already verified solvency once.
     pub(super) async fn send_guards(
         &self,
         lane: &Arc<Mutex<LaneDeliveryState>>,
-        lane_key: &LaneKey,
+        funder: Option<Address>,
     ) -> SendGuards {
         SendGuards {
-            funder: self.pool_funder(lane_key.pool_id).await,
+            funder,
             held_signer_cap: Some(lane.lock().await.state.cap),
             last_pool_check: Instant::now(),
             interval: self.pool_recheck_interval(),

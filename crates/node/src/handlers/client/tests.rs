@@ -697,7 +697,7 @@ fn takedown_reject_reasons_are_declined() {
         ServeRejectReason::HashDenied,
         ServeRejectReason::ChainHashDenied,
         ServeRejectReason::OriginDenied,
-        ServeRejectReason::EvictedSinceProbe,
+        ServeRejectReason::Withdrawn,
         ServeRejectReason::InternalError,
         ServeRejectReason::BlobTooLarge,
         ServeRejectReason::RangeNotSatisfiable,

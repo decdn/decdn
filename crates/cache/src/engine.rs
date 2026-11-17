@@ -354,7 +354,7 @@ struct Inner {
     /// Membership is not what stops the serving — the watcher also
     /// [`CacheEngine::evict`]s, which is sticky and durable. What this set adds
     /// is the *reason*, and the reason picks the refusal reason the node
-    /// meters: a denied hash rather than `EvictedSinceProbe`, the reason the
+    /// meters: a denied hash rather than `Withdrawn`, the reason the
     /// eviction arm reports without this slot. On the wire every one of these
     /// refusals is `Declined`, so a governance takedown and this operator's own
     /// denylist stay indistinguishable (ADR 011 §`StreamRequest` Response).

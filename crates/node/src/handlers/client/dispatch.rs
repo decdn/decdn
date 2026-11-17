@@ -15,6 +15,7 @@ use tokio::task::{JoinError, JoinSet};
 use futures_util::FutureExt as _;
 use tracing::Instrument as _;
 
+use super::admission::{Admission, Admitted, DeferredAdmission, UnadmittedStreams};
 use super::outcome::{ErrEnd, ResetCause, ServeEnd};
 use crate::load_shed::RequestClass;
 use crate::metrics::FirstByteClock;
@@ -137,6 +138,9 @@ impl ClientHandler {
         // the fallback for its own unbound streams — no lane it cannot already
         // sign for.
         let bound_addr: Arc<ArcSwapOption<Address>> = Arc::new(ArcSwapOption::empty());
+        // The connection's streams that answered an open and have not passed
+        // admission (`MAX_UNADMITTED_STREAMS_PER_CONNECTION`).
+        let unadmitted = Arc::new(UnadmittedStreams::default());
         let peer = conn.remote_id();
 
         let idle_timeout = self.idle_timeout.unwrap_or(APP_IDLE_TIMEOUT);
@@ -148,6 +152,7 @@ impl ClientHandler {
                     Ok((send, recv)) => {
                         let permit = Arc::clone(&stream_sem).try_acquire_owned().ok();
                         let bound = Arc::clone(&bound_addr);
+                        let unadmitted = Arc::clone(&unadmitted);
                         let this = Arc::clone(&self);
                         // Boxed: the serve future is large (clippy::large_futures),
                         // and spawning the boxed future keeps it off the accept
@@ -159,6 +164,7 @@ impl ClientHandler {
                             recv,
                             permit,
                             bound,
+                            unadmitted,
                             peer,
                         ));
                         inflight.spawn(
@@ -269,8 +275,10 @@ impl ClientHandler {
     /// peer-attributable error ([`PeerFault`](super::wire::PeerFault)) is a peer
     /// that left or broke the protocol: `decdn_serve_stream_client_abandoned_total`
     /// when the serve loop tagged it [`PaidProgress`](super::wire::PaidProgress),
-    /// otherwise `decdn_serve_stream_client_declined_total`. All three log at
-    /// `debug!`. [`ErrEnd::of`] holds the classification.
+    /// `decdn_serve_stream_client_declined_total` when it tagged it
+    /// [`FrameSeen`](super::wire::FrameSeen), and otherwise
+    /// `decdn_serve_stream_unclaimed_total`. All of them log at `debug!`.
+    /// [`ErrEnd::of`] holds the classification.
     ///
     /// `{e:#}` rather than `{e}`: the marker sits in the chain, so the alternate
     /// form is what prints the cause beside it. A stream that ended after payment
@@ -304,11 +312,23 @@ impl ClientHandler {
     /// `conn` is the stream's connection: each proof wait reads its transport
     /// progress ([`proof_wait`](super::proof_wait)).
     ///
-    /// Kept as one linear, ADR-ordered sequence (admit → read → timestamp gate →
-    /// bind → blob gate → lane → sign → deliver); splitting it would scatter the ADR-005
-    /// ordering invariants across helpers — same rationale as the probe
-    /// handler's `serve`.
-    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    /// Kept as one linear, ADR-ordered sequence (stream caps → read → timestamp
+    /// gate → bind → deny gates → pin → blob gate → tier → sign → admit →
+    /// deliver); splitting it would scatter the ADR-005 ordering invariants
+    /// across helpers.
+    ///
+    /// An open that does no fill work (a hit, a partial that covers the span,
+    /// or the node's own origin with a proven size) answers `ok: true` before
+    /// funding admission, which runs at the payer's first proof
+    /// ([`super::admission`]). A miss answers `NotFound` at once unless the
+    /// request sets `pull_through`; one that sets it runs the funding gates,
+    /// then the fill tiers. The stream holds its blob against capacity
+    /// eviction (`InUse`) while it lives.
+    #[allow(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        clippy::too_many_arguments
+    )]
     pub(super) async fn serve_stream(
         self: Arc<Self>,
         conn: Connection,
@@ -316,6 +336,7 @@ impl ClientHandler {
         mut recv: RecvStream,
         permit: Option<OwnedSemaphorePermit>,
         bound_addr: Arc<ArcSwapOption<Address>>,
+        unadmitted: Arc<UnadmittedStreams>,
         peer: PublicKey,
     ) -> anyhow::Result<ServeEnd> {
         // Stream-cap exhausted: reset the stream before reading anything and with
@@ -327,6 +348,14 @@ impl ClientHandler {
         if permit.is_none() {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(ServeEnd::Reset(ResetCause::StreamCapFull));
+        }
+        // Unadmitted cap, on the same footing as the stream cap: a connection
+        // whose answered opens wait unpaid at the cap gets no more of them.
+        // Each such open pins its blob, so without the cap one peer could hold
+        // many blobs against capacity eviction for free.
+        if unadmitted.at_cap() {
+            reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
+            return Ok(ServeEnd::Reset(ResetCause::UnadmittedCapFull));
         }
         // Per-request limiter (ADR 005 §Request rate limiting), on the same
         // footing as the stream cap: refuse before the request is read, with no
@@ -516,7 +545,8 @@ impl ClientHandler {
         // from this node's own Ethereum identity. An unbound request cannot name
         // a lane, so it resolves to `None` — which every downstream gate treats
         // as "not my business" (it cannot make this node spend, because
-        // `pull_authorized` refuses it before every fill tier).
+        // `pull_authorized` refuses it before every fill tier, and admission
+        // refuses it `OwnerMismatch`).
         let self_operator = self.eth_signer.address();
         let lane_key = verified_client.map(|signer| LaneKey {
             pool_id: B256::from(req.pool_id),
@@ -530,11 +560,11 @@ impl ClientHandler {
         // here instead, before an origin-only node's backend `HEAD` and before
         // an unseen pool costs it a `getPool`: a stream of unbound requests for
         // fresh hashes or random `pool_id`s would otherwise spend one of each.
-        // A bound request still reads the chain, because a registered signer
-        // sends no capability and its funding refusal (`Unfunded`) needs the
-        // read; the per-request limiter and the admit-read cap bound what bound
-        // requests can spend. With no pool-view wired (dev/test) the lane gate
-        // below refuses it.
+        // A bound request reads the chain at admission: at its first proof for
+        // an open that does no fill work, before the fill tiers for a miss that
+        // pulls through. The per-request limiter and the admit-read cap bound
+        // what bound requests can spend. With no pool-view wired (dev/test) the
+        // admission refuses it.
         if self.pool_view.is_some() && lane_key.is_none() {
             self.warn_unbound_request(&peer);
             return self
@@ -574,7 +604,7 @@ impl ClientHandler {
                     // operator's metric on the withdrawal: it is this node's own
                     // content, not a foreign hash. Both reasons sign `Declined`.
                     let reason = if self.cache.is_evicted(hash) || self.cache.is_quarantined(hash) {
-                        ServeRejectReason::EvictedSinceProbe
+                        ServeRejectReason::Withdrawn
                     } else {
                         ServeRejectReason::ForeignNamespaceDeclined
                     };
@@ -595,171 +625,15 @@ impl ClientHandler {
             }
         }
 
-        // Pool `getPool` view (owner + remaining), read ONCE and reused by the
-        // funder gate here, the capability owner check, and the floor-`M` solvency
-        // gates below. Read AFTER the origin-only gate, not beside it: a declined
-        // request must not pay for a read it never uses. The wired `PoolView`
-        // answers from the in-memory projection on a hit and, on a miss (a pool
-        // opened before the watcher's cold-start head), does ONE `getPool` to
-        // confirm the pool before this serve is admitted. A `None` here therefore
-        // means the pool does not exist on-chain, is closed/reclaimed, or the read
-        // faulted — the refuse-on-`None` gate just below turns that into a
-        // rejection rather than a fail-open serve. With NO pool-view wired
-        // (dev/test, no chain) the read is `None` and the downstream gates keep
-        // their prior fail-open behavior.
-        let pool_status = match self.pool_view.as_ref() {
-            Some(view) => view.status(B256::from(req.pool_id)).await,
-            None => None,
-        };
-
-        // Confirm-before-serve (ADR 003 §Pool solvency): when a pool-view is wired,
-        // the admit-path `status()` above did a `getPool` on a projection miss, so a
-        // `None` here means the pool does not exist on-chain, is closed/reclaimed, or
-        // the read faulted. Refuse rather than fail open — a node must not admit a
-        // serve against a pool it cannot confirm is live and solvent. `pool_status`
-        // is therefore guaranteed `Some` past this point whenever `pool_view` is
-        // wired, which lets the capability-owner and floor gates below rely on it.
-        // With NO pool-view (dev/test, no chain wired) `pool_status` stays `None` and
-        // the pre-#-gates keep their prior fail-open behavior.
-        if self.pool_view.is_some() && pool_status.is_none() {
-            return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::PoolUnconfirmed,
-                    rate_per_mb,
-                )
-                .await;
-        }
-
-        // Signer authorization confirm (ADR 003 §Capability delegation, §Pool
-        // solvency). On-chain registration is write-once per `(pool, signer)`, so a
-        // registered signer's `cap` and `expiry` bound every voucher this node can
-        // redeem, whatever capability the client presents. Refuse a registered signer
-        // whose registration has expired or whose `cap - spent` no longer covers a
-        // floor: a "spent" capability sprayed to a fresh node is refused, not served
-        // for vouchers this node can never redeem. The registered terms are kept to
-        // clamp the lane below. Unregistered signer or no chain wired -> admit on the
-        // presented capability. A getAuthorization fault with no earlier registered
-        // read of the signer -> None -> refuse as unconfirmed, never as an
-        // exhausted cap.
-        let mut registered_terms: Option<(u64, u64)> = None;
-        if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
-            // The signer must be able to pay one chunk (ADR 003 § Pool solvency).
-            let floor_micro = decdn_incentive::min_payment(CHUNK_BYTES, rate_per_mb);
-            let auth = view
-                .signer_authorization(B256::from(req.pool_id), signer)
-                .await;
-            if let Some(SignerAuthorization::Registered { cap, expiry, .. }) = auth {
-                registered_terms = Some((cap, expiry));
-            }
-            let now = self.coarse_clock.unix_seconds();
-            if let Some(reason) = signer_refusal(auth, floor_micro, now) {
-                return self
-                    .respond_error(&mut send, &req, reason, rate_per_mb)
-                    .await;
-            }
-        }
-
-        // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
-        // pool whose FUNDER (`getPool.owner`) is on the operator's local
-        // `denied_origins` or the on-chain origin blacklist. The funding address is
-        // the pool OWNER from `getPool.owner`, threaded here via the cached
-        // pool-view. The two questions are kept distinct — spend authority is a
-        // signer question, compliance a funder question — so a blacklisted funder
-        // is refused here even under a clean delegate signer.
-        if let Some(status) = pool_status
-            && self.content_deny.is_origin_denied(&status.owner)
-        {
-            return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::OriginDenied,
-                    rate_per_mb,
-                )
-                .await;
-        }
-
-        // Capability intake + lane registration (ADR 003 §Capability delegation).
-        // A bound request whose extension carries a `capability` whose owner
-        // signature verifies against the pool owner (a) registers the lane so the
-        // voucher path serves `(pool_id, signer, this operator)` and (b) persists
-        // the owner-signed grant for the redeemer. A forged-owner grant is dropped
-        // — never registered, never persisted — so it cannot revert the redeemer's
-        // `redeemMany` batch. Best-effort otherwise.
-        // Intake runs only with a confirmed pool: `pool_status` is `Some` whenever a
-        // pool-view is wired (the refuse-on-`None` gate above returned otherwise), so
-        // the owner is known here. With no pool-view wired (dev/test) `pool_status` is
-        // `None` and intake is skipped — the no-chain path registers no lane from a
-        // capability owner it cannot confirm.
-        if let (Some(signer), Some(capability), Some(status)) =
-            (verified_client, ext.capability.as_ref(), pool_status)
-        {
-            self.intake_capability(B256::from(req.pool_id), signer, status.owner, capability);
-        }
-
-        // Resolve the live lane AFTER intake, so a lane just registered from this
-        // request's own capability is visible to the spend + serve gates below.
-        // This is the request's ONE lane read. The cache-miss arm below derives
-        // its spend authority from it (`pull_authorized`) and serves on the same
-        // `Arc`. A second registry read there could see a lane a sibling stream
-        // registered since, and flip the answer between fill tiers (#2315).
-        let known_lane = match lane_key {
-            Some(key) => self.lanes.get(&key).map(|e| Arc::clone(e.value())),
-            None => None,
-        };
-        #[cfg(any(test, feature = "test-support"))]
-        self.fire_lane_after_resolution();
-
-        // Hold the signer's registered terms on the lane (ADR 003 §Capability
-        // delegation): the voucher path refuses past the lane's `cap` and `expiry`,
-        // and the mid-stream signer re-check reads the lane's `cap`. A lane first
-        // registered from a wider capability, or from one presented before the
-        // signer's registration landed elsewhere, narrows here on its next stream.
-        if let (Some(lane), Some((cap, expiry))) = (known_lane.as_ref(), registered_terms) {
-            self.clamp_lane_to_registration(lane, cap, expiry).await;
-        }
-
-        // Funding gates that need the lane (ADR 003 §Pool solvency, ADR 005
-        // §Open-time refusal classes). A lane exists only behind a verified
-        // binding and an owner-signed capability, so a requester that holds one
-        // is proven and hears `Unfunded`; anyone else hears `NotFound`.
-        //
-        // A `Closing` pool takes no top-up, and its redemption ends at the
-        // dispute deadline, so this node does not serve on it. Its owner opens a
-        // new pool. A lane whose capability is inside the expiry margin cannot
-        // pay for a voucher, so admitting it would only stop at the first one.
-        if let Some(status) = pool_status
-            && matches!(
-                status.lifecycle,
-                crate::pool_view::Lifecycle::Closing { .. }
-            )
-        {
-            let reason = ServeRejectReason::PoolClosing {
-                proven: known_lane.is_some(),
-            };
-            return self
-                .respond_error(&mut send, &req, reason, rate_per_mb)
-                .await;
-        }
-        if let Some(lane) = known_lane.as_ref() {
-            let expiry = lane.lock().await.state.expiry;
-            if self.inside_expiry_margin(expiry) {
-                return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::CapabilityExpired,
-                        rate_per_mb,
-                    )
-                    .await;
-            }
-        }
+        // Hold the blob against capacity eviction while this stream lives
+        // (`InUse`), so an open that answers before admission still has its
+        // blob when the payer's first proof arrives. A takedown `evict` still
+        // removes a held blob. A miss drops the hold below: it holds nothing.
+        let mut pin = Some(self.cache.hold_in_use(hash));
 
         // Blob availability gate. A store fault is NOT an absence: an
         // `Unavailable` audit means the node genuinely lacks the blob (NotFound
-        // / EvictedSinceProbe), but `Err` is a transient local store failure
+        // / Withdrawn), but `Err` is a transient local store failure
         // that must not masquerade as a signed `NotFound`. Refuse it for
         // `InternalError` (wire `Declined`) and log. `serve_audit` also carries the complete
         // blob's size in the same store contact, so the delivery size gate
@@ -782,14 +656,28 @@ impl ClientHandler {
                     .await;
             }
         };
+        // A withdrawn hash is never served and never pull-filled. An operator
+        // eviction is sticky and authoritative (#279). A stored-corruption
+        // quarantine holds the corrupt entry until GC reclaims it, so a fill
+        // would pay for bytes that can never serve. Both answer `Withdrawn`.
+        if audit.is_withdrawn() {
+            drop(pin.take());
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::Withdrawn, rate_per_mb)
+                .await;
+        }
         let mut hit_size = audit.hit_size();
         // A covering partial hit answers with the blocks it holds and the
         // span it serves, not the whole blob (`partial_hit_coverage`).
         let mut partial_hit = false;
-        // The initial `None` is unread on every live path (both branches below
-        // either shed and return or overwrite it, and the audit `Err` returns
-        // too) — kept anyway so the slot's declared type and its
-        // `Drop`-at-fn-scope binding stay explicit.
+        // What the funding gates read for a miss that pulls through. Such a
+        // stream is admitted before its fill tiers; every other stream that
+        // reaches the response is admitted at its first proof.
+        let mut admitted_at_open: Option<super::admission::Funding> = None;
+        // The initial `None` is unread on every live path (every branch below
+        // either sheds and returns or overwrites it) — kept anyway so the
+        // slot's declared type and its `Drop`-at-fn-scope binding stay
+        // explicit.
         #[allow(unused_assignments)]
         let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
         // The gate's class. The shed gate admits under it and the first-byte clock
@@ -822,399 +710,388 @@ impl ClientHandler {
                         .await;
                 }
             }
-        } else {
-            // A withdrawn hash is never pull-filled. An operator eviction is
-            // sticky and authoritative (#279). A stored-corruption quarantine
-            // holds the corrupt entry until GC reclaims it, so a fill would pay
-            // for bytes that can never serve. Both answer `EvictedSinceProbe`,
-            // because an earlier probe may have signed `has_blob: true` for
-            // the hash.
-            if audit.is_withdrawn() {
-                return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::EvictedSinceProbe,
-                        rate_per_mb,
-                    )
-                    .await;
-            }
+        } else if let Some(size) = self
+            .partial_hit_size(hash, req.byte_offset, req.byte_len)
+            .await
+        {
             // Partial-serve gate (#1506): a blob that isn't `Complete` may
-            // still fully cover the requested span — the counterpart to the
-            // will-serve coverage a partial holder now advertises over
-            // `cdn/probe/v1` / the DHT. When it does, serve straight from
-            // cache instead of running the miss-path fill legs below: treat
-            // it exactly like the `audit.is_serveable()` cache-hit branch
-            // above (same `CacheHit` shed class, same `hit_size`-driven size
-            // gate + `deliver` downstream), just reached via a different
+            // still fully cover the requested span. When it does, serve
+            // straight from cache instead of running the miss-path fill legs
+            // below: treat it exactly like the `audit.is_serveable()` cache-hit
+            // branch above (same `CacheHit` shed class, same `hit_size`-driven
+            // size gate + `deliver` downstream), just reached via a different
             // audit outcome. An uncovered span is NOT a decline — it simply
-            // falls through to the ordinary miss path, unchanged.
-            if let Some(size) = self
-                .partial_hit_size(hash, req.byte_offset, req.byte_len)
-                .await
-            {
-                // A covering partial is a hit for hit-rate purposes, counted
-                // apart so the payoff of partial-holder advertisement stays
-                // legible (see `Metrics::serve_cache_partial_hit`).
-                self.metrics.serve_cache_partial_hit();
-                request_class = RequestClass::CacheHit;
-                match self.shed.try_admit(request_class, client_node_id) {
-                    Ok(slot) => {
-                        shed_slot = Some(slot);
-                        admitted_at = std::time::Instant::now();
-                    }
-                    Err(reason) => {
-                        self.metrics.load_shed_refused(reason);
-                        tracing::debug!(
-                            ?reason,
-                            %hash,
-                            class = "hit",
-                            "load-shed refusing new serve"
-                        );
-                        return self
-                            .respond_error(
-                                &mut send,
-                                &req,
-                                ServeRejectReason::LoadShedHit,
-                                rate_per_mb,
-                            )
-                            .await;
-                    }
+            // takes the miss path below.
+            //
+            // A covering partial is a hit for hit-rate purposes, counted apart
+            // so the payoff of partial-holder advertisement stays legible (see
+            // `Metrics::serve_cache_partial_hit`).
+            self.metrics.serve_cache_partial_hit();
+            request_class = RequestClass::CacheHit;
+            match self.shed.try_admit(request_class, client_node_id) {
+                Ok(slot) => {
+                    shed_slot = Some(slot);
+                    admitted_at = std::time::Instant::now();
                 }
-                hit_size = Some(size);
-                partial_hit = true;
-            } else {
-                // The shed gate runs before the lane-authority refusal below,
-                // so an unbound / unknown-lane request can transiently hold a
-                // `ShedSlot` until that refusal returns it. This is bounded by
-                // the `ConnectionLimiter` global cap and is
-                // self-limiting: once the node is pressured, further such
-                // requests shed right here without acquiring a slot at all.
-                // Keeping the gate here — ahead of lane authority and any
-                // fill — preserves "shed before committing serve resources /
-                // before any origin spend".
-                //
-                // The miss sibling of the two hit counters above, on the same
-                // pre-shed footing: the gate cannot satisfy this request from
-                // held bytes. It records that classification only — the shed
-                // gate below, the pre-spend deposit gate, and `pull_authorized`
-                // can each end the request before any fill tier runs.
-                self.metrics.serve_cache_miss();
-                request_class = RequestClass::CacheMiss;
-                match self.shed.try_admit(request_class, client_node_id) {
-                    Ok(slot) => {
-                        shed_slot = Some(slot);
-                        admitted_at = std::time::Instant::now();
-                    }
-                    Err(reason) => {
-                        self.metrics.load_shed_refused(reason);
-                        tracing::debug!(
-                            ?reason,
-                            %hash,
-                            class = "miss",
-                            "load-shed refusing new serve"
-                        );
-                        return self
-                            .respond_error(
-                                &mut send,
-                                &req,
-                                ServeRejectReason::LoadShedMiss,
-                                rate_per_mb,
-                            )
-                            .await;
-                    }
+                Err(reason) => {
+                    self.metrics.load_shed_refused(reason);
+                    tracing::debug!(
+                        ?reason,
+                        %hash,
+                        class = "hit",
+                        "load-shed refusing new serve"
+                    );
+                    return self
+                        .respond_error(&mut send, &req, ServeRejectReason::LoadShedHit, rate_per_mb)
+                        .await;
                 }
-                // Node-to-node cache-miss pull-through (#831). Fronting upstream
-                // USDC egress is privileged: gate it on the request PROVING
-                // voucher authority in the named pool — a verified client
-                // binding (`verified_client`) whose address signs a known lane
-                // of that pool (`pull_authorized`). Pool *existence* cannot gate
-                // spend (pool ids are public on-chain via `PoolOpened`, so any
-                // leech could name one); only proven lane authority can. An
-                // unbound request, or one with no lane in that pool, gets a
-                // plain `NotFound` and cannot make this node spend — closing
-                // the proxy-abuse / griefing vector where an unpaid client
-                // drains the buyer deposit. (Multi-hop node→node pulls therefore require the
-                // downstream requester to send a binding; both the direct-client
-                // `decdn get` (#1115) and the node→node requester
-                // (`node_origin`, #1117) do, so chained pull-through works.)
-                // On a successful fill, fall through to the normal size-gate +
-                // delivery path; otherwise it stays a `NotFound`.
-                //
-                // Every request shape — whole blob, bounded, resumed — takes the same
-                // two-leg spine on its preferred tiers: the spine signs first and its
-                // pull leg fetches only the requested span's missing chunk groups
-                // (ADR 037 §Origin-tier pull-through). The FALLBACK tiers below it
-                // (`try_local_populate`, the buffered pull-through) still import the
-                // whole blob before the size gate answers; they serve exactly the
-                // requested span at delivery.
-                // The fault latch (#1129): declared before the first tier so every
-                // tier's `CacheError::Store` lands in it.
-                // `authority` is this request's one answer to `pull_authorized`,
-                // taken from the lane it resolved above. Every tier below reads it
-                // rather than the live registry, so the request sees one answer
-                // throughout: every tier runs on its lane, or none runs and the
-                // request refuses on the `no_lane` path. That holds in both
-                // directions. A lane a sibling stream registers after the
-                // resolution does not authorize this request. A lane `forget_lane`
-                // drops after it (a reclaimed pool) still does: the upstream spend
-                // stays bounded by the credit the lane holds, and a cache hit serves
-                // on a resolved lane the same way.
-                //
-                // Every fill tier below fronts the operator's own origin egress or
-                // real upstream USDC, and the own-origin tier reads the origin
-                // before any later gate runs. So the pre-spend deposit floor
-                // (#1519) runs HERE, before any tier: a pool whose `remaining − M`
-                // cannot cover one chunk (capped by the request's own aligned span
-                // when it bounds itself) is refused before the node spends, so a
-                // dust-deposit pool cannot make the node pay for absent hashes.
-                // `window.rs` keeps its own guard for the pull-through tier. A
-                // `None` view fails open (the on-chain `redeem` is the backstop).
-                // With no authority no tier spends, so the gate is skipped.
-                let authority = Self::pull_authorized(lane_key, known_lane.as_ref());
-                if authority.is_some()
-                    && let Some(status) = pool_status
-                {
-                    let guard_bytes = if req.byte_len > 0 {
-                        aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(CHUNK_BYTES)
-                    } else {
-                        CHUNK_BYTES
-                    };
-                    if !self.pool_remaining_covers_window(
-                        status.remaining,
-                        guard_bytes,
-                        rate_per_mb,
-                    ) {
-                        self.log_deposit_refusal(
-                            B256::from(req.pool_id),
-                            hash,
-                            status
-                                .remaining
-                                .saturating_sub(self.pool_min_remaining_deposit),
-                            decdn_incentive::min_payment(guard_bytes, rate_per_mb),
-                        );
-                        return self
-                            .respond_error(
-                                &mut send,
-                                &req,
-                                ServeRejectReason::InsufficientDeposit,
-                                rate_per_mb,
-                            )
-                            .await;
-                    }
+            }
+            hit_size = Some(size);
+            partial_hit = true;
+        } else {
+            // A miss holds nothing to pin. A fill below that lands the blob
+            // takes a new hold before delivery.
+            drop(pin.take());
+            // The miss sibling of the two hit counters above, on the same
+            // pre-shed footing: the gate cannot satisfy this request from held
+            // bytes. It records that classification only — the shed gate below,
+            // the pull-through flag, the funding gates and `pull_authorized` can
+            // each end the request before any fill tier runs.
+            self.metrics.serve_cache_miss();
+            request_class = RequestClass::CacheMiss;
+            match self.shed.try_admit(request_class, client_node_id) {
+                Ok(slot) => {
+                    shed_slot = Some(slot);
+                    admitted_at = std::time::Instant::now();
                 }
+                Err(reason) => {
+                    self.metrics.load_shed_refused(reason);
+                    tracing::debug!(
+                        ?reason,
+                        %hash,
+                        class = "miss",
+                        "load-shed refusing new serve"
+                    );
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::LoadShedMiss,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
+            }
 
-                let mut fault_seen = false;
+            // The fault latch (#1129): declared before the first tier so every
+            // tier's `CacheError::Store` lands in it.
+            let mut fault_seen = false;
 
-                let mut locally_filled = false;
-
-                // Own-origin serve-miss via the two decoupled legs.
-                // When the node's OWN configured fs/http/s3 origin can prove it
-                // serves `hash` — it knows the size AND publishes the {H}.obao4
-                // outboard — serve the request by running the local pull leg (fill
-                // the cache from origin) beside the serve leg (stream the filling
-                // cache to the paying client), exactly like the node→node window path
-                // but with NO upstream, NO lane, and NO payment on the ingest side.
-                // Time-to-first-byte does not wait for the whole blob to land.
-                //
-                // Any request shape routes here: the serve leg clamps to
-                // `[byte_offset, end)` and the pull leg fills only that span's missing
-                // chunk groups, so a bounded request costs exactly its aligned span
-                // in origin egress.
-                //
-                // Serviceability is confirmed before the response is signed, by
-                // `origin_size` (a live probe of the data object) and
-                // `origin_range_serviceable` (an origin publishes the outboard AND
-                // serves ranged reads of the data). The range half reads one chunk
-                // group until the origin has served a clean range window once, then
-                // reads nothing. So an origin that publishes an outboard but declines
-                // `Range` degrades here instead of failing a signed stream.
-                //
-                // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
-                // published outboard / no ranged reads / no origin size / no origins
-                // => fall through to `try_local_populate` below.
-                // Once serviceable, `serve_via_backend_origin` claims the fill itself
-                // (`CacheEngine::claim_fill`): the first same-hash miss OWNS
-                // the local origin pull; a concurrent one ATTACHES as an observer and
-                // streams the same filling cache to its own client (no double origin
-                // egress). The registry is range-aware, so this coalescing is not
-                // limited to the whole-blob case.
-                // The node serves an origin blob only under a size its origin's
-                // `{H}.sizeproof` proves (ADR 005 § Bounded byte ranges).
-                // The proof comes first; only a proven size sizes the outboard
-                // read of the range probe. An origin blob with no size, or with
-                // no proof of it, is not served from the origin, by the range
-                // encoder or by the buffered populate below.
-                let mut origin_proven = false;
-                if let Some((lk, ln)) = authority {
-                    match self.cache.origin_size(hash).await {
-                        Ok(Some(total)) if self.cache.size_proof(hash, total).await.is_none() => {}
-                        Ok(Some(total)) => {
-                            origin_proven = true;
-                            match self.cache.origin_range_serviceable(hash, total).await {
-                                // Serviceable: the size is proven and an origin
-                                // publishes the outboard and serves ranges. Enter the
-                                // orchestration directly — it claims the fill
-                                // (owner-or-attach) internally after signing the
-                                // response, so no coalescing decision happens here.
-                                Ok(true) => {
-                                    // Boxed: the serve future is large
-                                    // (clippy::large_futures).
-                                    return Box::pin(self.serve_via_backend_origin(
-                                        &conn,
-                                        send,
-                                        recv,
-                                        &req,
-                                        hash,
-                                        client_node_id,
-                                        lk,
-                                        ln,
-                                        total,
-                                        pool_status.map(|s| s.remaining),
-                                        rate_per_mb,
-                                        FirstByteClock::new(
-                                            request_decoded_at,
-                                            admitted_at,
-                                            request_class,
-                                        ),
-                                    ))
-                                    .await;
-                                }
-                                // Size proven but no origin publishes the outboard
-                                // and serves ranges — not serviceable via the range
-                                // encoder. Degrade to the buffered local populate
-                                // below.
-                                Ok(false) => {}
-                                // A genuine origin fault while probing the outboard
-                                // or the first range window. Latch it (#1129) so a
-                                // later-tier miss reports InternalError not NotFound,
-                                // then fall through — another source may still serve.
-                                Err(e) => {
-                                    self.metrics.node_pull_through_error();
-                                    tracing::warn!(%hash, error = %e.display_chain(), "own-origin range probe faulted; falling through");
-                                    fault_seen = true;
-                                }
-                            }
+            // Own-origin serve-miss via the two decoupled legs. When the node's
+            // OWN configured fs/http/s3 origin can prove it serves `hash` — it
+            // proves the size AND publishes the {H}.obao4 outboard and serves
+            // ranges — the node holds the blob for the network's purposes: it
+            // answers `ok: true` with full coverage, whether or not the request
+            // sets `pull_through`, and admits at the first proof. Then the local
+            // pull leg fills the cache from origin beside the serve leg that
+            // streams it to the paying client, with NO upstream, NO lane, and NO
+            // payment on the ingest side. Time-to-first-byte does not wait for
+            // the whole blob to land.
+            //
+            // Any request shape routes here: the serve leg clamps to
+            // `[byte_offset, end)` and the pull leg fills only that span's missing
+            // chunk groups, so a bounded request costs exactly its aligned span
+            // in origin egress.
+            //
+            // Serviceability is confirmed before the response is signed, by
+            // `origin_size` (a live probe of the data object), the origin's
+            // `{H}.sizeproof` (ADR 005 § Bounded byte ranges: the node serves an
+            // origin blob only under a size its origin proves), and
+            // `origin_range_serviceable` (an origin publishes the outboard AND
+            // serves ranged reads of the data). The range half reads one chunk
+            // group until the origin has served a clean range window once, then
+            // reads nothing. So an origin that publishes an outboard but declines
+            // `Range` degrades here instead of failing a signed stream.
+            //
+            // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
+            // published outboard / no ranged reads => the buffered local populate
+            // below, for a request that pulls through. No origin size or no proof
+            // of it => nothing is served from the origin.
+            // Once serviceable, `serve_via_backend_origin` claims the fill itself
+            // (`CacheEngine::claim_fill`) after admission: the first same-hash miss
+            // OWNS the local origin pull; a concurrent one ATTACHES as an observer
+            // and streams the same filling cache to its own client (no double
+            // origin egress).
+            let mut origin_proven = false;
+            match self.cache.origin_size(hash).await {
+                Ok(Some(total)) if self.cache.size_proof(hash, total).await.is_none() => {}
+                Ok(Some(total)) => {
+                    origin_proven = true;
+                    match self.cache.origin_range_serviceable(hash, total).await {
+                        Ok(true) => {
+                            let adm = DeferredAdmission::new(
+                                req.clone(),
+                                ext,
+                                verified_client,
+                                lane_key,
+                                peer,
+                                rate_per_mb,
+                                total,
+                                unadmitted.take(),
+                            );
+                            // Boxed: the serve future is large
+                            // (clippy::large_futures).
+                            return Box::pin(self.serve_via_backend_origin(
+                                &conn,
+                                send,
+                                recv,
+                                &req,
+                                hash,
+                                client_node_id,
+                                adm,
+                                total,
+                                rate_per_mb,
+                                FirstByteClock::new(request_decoded_at, admitted_at, request_class),
+                            ))
+                            .await;
                         }
-                        // No origin states a size, or no origin is configured at
-                        // all: nothing is served from the origin. `origin_size`
-                        // returns Ok(None) only for clean declines; a probe that
-                        // ends on a transport fault reaches the Err arm below.
-                        Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
-                        // Any other origin fault latches `fault_seen` (#1129) so a
-                        // later-tier miss reports InternalError not NotFound.
+                        // Size proven but no origin publishes the outboard and
+                        // serves ranges. Degrade to the buffered local populate
+                        // below.
+                        Ok(false) => {}
+                        // A genuine origin fault while probing the outboard or
+                        // the first range window. Latch it (#1129) so a
+                        // later-tier miss reports InternalError not NotFound,
+                        // then fall through — another source may still serve.
                         Err(e) => {
                             self.metrics.node_pull_through_error();
-                            tracing::warn!(%hash, error = %e.display_chain(), "own-origin size probe faulted; falling through");
+                            tracing::warn!(%hash, error = %e.display_chain(), "own-origin range probe faulted; falling through");
                             fault_seen = true;
                         }
                     }
                 }
-
-                // Reactive LOCAL-origin populate (#1116). Before any node→node
-                // path, try to fill from the node's OWN configured fs/http/s3
-                // origin (`populate_local` never touches the paid `Peer` origin).
-                // This lets a cache-only operator (node→node disabled) reactively
-                // serve its own content, and — when node→node IS enabled — prefers
-                // the local origin over the paid peer window path for a whole-blob
-                // request the operator can satisfy itself. Gated on the SAME proven
-                // lane authority as the paid paths (`pull_authorized`): an S3
-                // origin has egress cost, and the following delivery is billed
-                // per-voucher. A local miss leaves the blob absent and falls through
-                // to the node→node branches below, unchanged.
-                //
-                // A local HARD FAULT (#1129 — the operator's own S3/fs origin
-                // errored, rather than simply not having the blob) also falls
-                // through to the node→node branches: another source may legitimately
-                // still serve. But it is LATCHED in `fault_seen`, because if no later
-                // tier fills, the terminal refusal must report a degraded node
-                // (`InternalError`) rather than an empty one (`NotFound`). Every
-                // terminal MISS below therefore takes its reason from
-                // `FillOutcome::miss_reason` (via `MissRefusal::new`) and is sent
-                // through `respond_miss`. (The lane- and pool-class refusals — `UnknownLane`,
-                // `InsufficientDeposit` — keep their own reasons: they are
-                // client-attributable and would refuse regardless of origin
-                // health.)
-                if !locally_filled
-                    && origin_proven
-                    && let Some(timeout) = self.local_populate
-                    && authority.is_some()
-                {
-                    let local = self.try_local_populate(hash, timeout).await;
-                    fault_seen |= local.is_fault();
-                    locally_filled = local.is_filled();
-                }
-
-                // Window-paced pull-through (#856, ADR 037) is the preferred path
-                // when its provider is set: instead of buffering the whole
-                // blob via `populate` and only THEN serving (fronting 100% of the
-                // upstream cost before any downstream voucher), it runs the pull
-                // leg (fill the cache from upstream) beside the serve leg (stream
-                // the filling cache to the paying client), so the pull draws
-                // only what the downstream lane has paid for, plus the small
-                // `PULL_AHEAD_BYTES` bound.
-                //
-                // Any request shape routes here. `serve_leg` clamps delivery to
-                // `[offset, offset + len)` and bills only the wire it delivers; the
-                // pull leg pulls only `missing_ranges(offset, len)` upstream, so a
-                // bounded or resumed request fronts exactly its span.
-                if locally_filled {
-                    // The whole blob just filled from a local origin (#1116). Skip
-                    // the node→node fill and fall through to the size gate +
-                    // delivery.
-                } else if let Some(origin) = self.pull_through_origin.as_ref()
-                    && let Some((lk, ln)) = authority
-                {
-                    // Boxed: the serve future is large; keep it off the
-                    // `serve_stream` stack frame (clippy::large_futures). The
-                    // orchestration claims the fill (owner-or-attach) internally after
-                    // signing the response, so two concurrent same-hash misses share one
-                    // upstream pull (no double spend, #305) without a decision here.
-                    return Box::pin(self.serve_via_window_pull_through(
-                        &conn,
-                        send,
-                        recv,
-                        &req,
-                        hash,
-                        client_node_id,
-                        lk,
-                        ln,
-                        Arc::clone(origin),
-                        pool_status.map(|s| s.remaining),
-                        fault_seen,
-                        rate_per_mb,
-                        FirstByteClock::new(request_decoded_at, admitted_at, request_class),
-                    ))
-                    .await;
-                } else {
-                    // Buffered pull-through (#831): reached when no window provider
-                    // is set, or when the request has no spend authority. This arm
-                    // is where every unauthorized miss refuses on the `no_lane` path.
-                    // A request not authorized to make this node spend, or a node
-                    // with no pull-through configured, attempts nothing here, so this
-                    // tier contributes no new information. The two keep separate
-                    // paths: only the first is a remote peer's to trigger.
-                    let (buffered, path) = match self.pull_through {
-                        _ if authority.is_none() => (FillOutcome::CleanMiss, MissPath::NoLane),
-                        Some(timeout) => (
-                            self.try_pull_through(hash, timeout).await,
-                            MissPath::BufferedMiss,
-                        ),
-                        None => (FillOutcome::CleanMiss, MissPath::NoPullThrough),
-                    };
-                    if !buffered.is_filled() {
-                        let refusal = MissRefusal::new(fault_seen || buffered.is_fault(), path);
-                        return self
-                            .respond_miss(&mut send, &req, refusal, rate_per_mb)
-                            .await;
-                    }
+                // No origin states a size, or no origin is configured at all:
+                // nothing is served from the origin. `origin_size` returns
+                // Ok(None) only for clean declines; a probe that ends on a
+                // transport fault reaches the Err arm below.
+                Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
+                // Any other origin fault latches `fault_seen` (#1129) so a
+                // later-tier miss reports InternalError not NotFound.
+                Err(e) => {
+                    self.metrics.node_pull_through_error();
+                    tracing::warn!(%hash, error = %e.display_chain(), "own-origin size probe faulted; falling through");
+                    fault_seen = true;
                 }
             }
+
+            // A miss whose request does not ask for pull-through answers
+            // `NotFound` at once, with empty coverage and no pool, chain or
+            // upstream work: the requester asked what this node holds, not for
+            // a fill. An own-origin probe fault above is logged and metered
+            // there; it does not change this answer.
+            if !ext.pull_through {
+                return self
+                    .respond_error(&mut send, &req, ServeRejectReason::CacheMiss, rate_per_mb)
+                    .await;
+            }
+
+            // The funding gates run before any fill tier, so no tier fronts
+            // origin egress or upstream USDC for a request they refuse.
+            let funding = match self
+                .funding_gates(&req, &ext, verified_client, lane_key, rate_per_mb)
+                .await
+            {
+                Ok(funding) => funding,
+                Err(reason) => {
+                    return self
+                        .respond_error(&mut send, &req, reason, rate_per_mb)
+                        .await;
+                }
+            };
+            let pool_status = funding.pool_status;
+
+            // Node-to-node cache-miss pull-through (#831). Fronting upstream
+            // USDC egress is privileged: gate it on the request PROVING
+            // voucher authority in the named pool — a verified client
+            // binding (`verified_client`) whose address signs a known lane
+            // of that pool (`pull_authorized`). Pool *existence* cannot gate
+            // spend (pool ids are public on-chain via `PoolOpened`, so any
+            // leech could name one); only proven lane authority can. An
+            // unbound request, or one with no lane in that pool, gets a
+            // plain `NotFound` and cannot make this node spend — closing
+            // the proxy-abuse / griefing vector where an unpaid client
+            // drains the buyer deposit. (Multi-hop node→node pulls therefore require the
+            // downstream requester to send a binding; both the direct-client
+            // `decdn get` (#1115) and the node→node requester
+            // (`node_origin`, #1117) do, so chained pull-through works.)
+            // On a successful fill, fall through to the normal size-gate +
+            // delivery path; otherwise it stays a `NotFound`.
+            //
+            // Every request shape — whole blob, bounded, resumed — takes the same
+            // two-leg spine on its preferred tiers: the spine signs first and its
+            // pull leg fetches only the requested span's missing chunk groups
+            // (ADR 037 §Origin-tier pull-through). The FALLBACK tiers below it
+            // (`try_local_populate`, the buffered pull-through) still import the
+            // whole blob before the size gate answers; they serve exactly the
+            // requested span at delivery.
+            // `authority` is this request's one answer to `pull_authorized`,
+            // taken from the lane the funding gates resolved. Every tier below
+            // reads it rather than the live registry, so the request sees one
+            // answer throughout: every tier runs on its lane, or none runs and the
+            // request refuses on the `no_lane` path. That holds in both
+            // directions. A lane a sibling stream registers after the
+            // resolution does not authorize this request. A lane `forget_lane`
+            // drops after it (a reclaimed pool) still does: the upstream spend
+            // stays bounded by the credit the lane holds.
+            //
+            // Every fill tier below fronts the operator's own origin egress or
+            // real upstream USDC. So the pre-spend deposit floor (#1519) runs
+            // HERE, before any tier: a pool whose `remaining − M` cannot cover
+            // one chunk (capped by the request's own aligned span when it bounds
+            // itself) is refused before the node spends, so a dust-deposit pool
+            // cannot make the node pay for absent hashes. `window.rs` keeps its
+            // own guard for the pull-through tier. A `None` view fails open (the
+            // on-chain `redeem` is the backstop). With no authority no tier
+            // spends, so the gate is skipped.
+            let authority = Self::pull_authorized(lane_key, funding.known_lane.as_ref());
+            if authority.is_some()
+                && let Some(status) = pool_status
+            {
+                let guard_bytes = if req.byte_len > 0 {
+                    aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(CHUNK_BYTES)
+                } else {
+                    CHUNK_BYTES
+                };
+                if !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb) {
+                    self.log_deposit_refusal(
+                        B256::from(req.pool_id),
+                        hash,
+                        status
+                            .remaining
+                            .saturating_sub(self.pool_min_remaining_deposit),
+                        decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+                    );
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::InsufficientDeposit,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
+            }
+
+            let mut locally_filled = false;
+
+            // Reactive LOCAL-origin populate (#1116). Before any node→node
+            // path, try to fill from the node's OWN configured fs/http/s3
+            // origin (`populate_local` never touches the paid `Peer` origin).
+            // This lets a cache-only operator (node→node disabled) reactively
+            // serve its own content, and — when node→node IS enabled — prefers
+            // the local origin over the paid peer window path for a whole-blob
+            // request the operator can satisfy itself. It imports the whole blob
+            // before the response, so only a request that pulls through reaches
+            // it. Gated on the SAME proven lane authority as the paid paths
+            // (`pull_authorized`): an S3 origin has egress cost, and the
+            // following delivery is billed per-voucher. A local miss leaves the
+            // blob absent and falls through to the node→node branches below,
+            // unchanged.
+            //
+            // A local HARD FAULT (#1129 — the operator's own S3/fs origin
+            // errored, rather than simply not having the blob) also falls
+            // through to the node→node branches: another source may legitimately
+            // still serve. But it is LATCHED in `fault_seen`, because if no later
+            // tier fills, the terminal refusal must report a degraded node
+            // (`InternalError`) rather than an empty one (`NotFound`). Every
+            // terminal MISS below therefore takes its reason from
+            // `FillOutcome::miss_reason` (via `MissRefusal::new`) and is sent
+            // through `respond_miss`. (The lane- and pool-class refusals — `UnknownLane`,
+            // `InsufficientDeposit` — keep their own reasons: they are
+            // client-attributable and would refuse regardless of origin
+            // health.)
+            if origin_proven
+                && let Some(timeout) = self.local_populate
+                && authority.is_some()
+            {
+                let local = self.try_local_populate(hash, timeout).await;
+                fault_seen |= local.is_fault();
+                locally_filled = local.is_filled();
+            }
+
+            // Window-paced pull-through (#856, ADR 037) is the preferred path
+            // when its provider is set: instead of buffering the whole
+            // blob via `populate` and only THEN serving (fronting 100% of the
+            // upstream cost before any downstream voucher), it runs the pull
+            // leg (fill the cache from upstream) beside the serve leg (stream
+            // the filling cache to the paying client), so the pull draws
+            // only what the downstream lane has paid for, plus the small
+            // `PULL_AHEAD_BYTES` bound.
+            //
+            // Any request shape routes here. `serve_leg` clamps delivery to
+            // `[offset, offset + len)` and bills only the wire it delivers; the
+            // pull leg pulls only `missing_ranges(offset, len)` upstream, so a
+            // bounded or resumed request fronts exactly its span.
+            if locally_filled {
+                // The whole blob just filled from a local origin (#1116). Skip
+                // the node→node fill and fall through to the size gate +
+                // delivery.
+            } else if let Some(origin) = self.pull_through_origin.as_ref()
+                && let Some((lk, ln)) = authority
+            {
+                // Boxed: the serve future is large; keep it off the
+                // `serve_stream` stack frame (clippy::large_futures). The
+                // orchestration claims the fill (owner-or-attach) internally after
+                // signing the response, so two concurrent same-hash misses share one
+                // upstream pull (no double spend, #305) without a decision here.
+                return Box::pin(self.serve_via_window_pull_through(
+                    &conn,
+                    send,
+                    recv,
+                    &req,
+                    hash,
+                    client_node_id,
+                    lk,
+                    ln,
+                    Arc::clone(origin),
+                    pool_status,
+                    fault_seen,
+                    rate_per_mb,
+                    FirstByteClock::new(request_decoded_at, admitted_at, request_class),
+                ))
+                .await;
+            } else {
+                // Buffered pull-through (#831): reached when no window provider
+                // is set, or when the request has no spend authority. This arm
+                // is where every unauthorized miss refuses on the `no_lane` path.
+                // A request not authorized to make this node spend, or a node
+                // with no pull-through configured, attempts nothing here, so this
+                // tier contributes no new information. The two keep separate
+                // paths: only the first is a remote peer's to trigger.
+                let (buffered, path) = match self.pull_through {
+                    _ if authority.is_none() => (FillOutcome::CleanMiss, MissPath::NoLane),
+                    Some(timeout) => (
+                        self.try_pull_through(hash, timeout).await,
+                        MissPath::BufferedMiss,
+                    ),
+                    None => (FillOutcome::CleanMiss, MissPath::NoPullThrough),
+                };
+                if !buffered.is_filled() {
+                    let refusal = MissRefusal::new(fault_seen || buffered.is_fault(), path);
+                    return self
+                        .respond_miss(&mut send, &req, refusal, rate_per_mb)
+                        .await;
+                }
+            }
+            // The blob landed: hold it for the rest of the stream.
+            pin = Some(self.cache.hold_in_use(hash));
+            admitted_at_open = Some(funding);
         }
         // Held at fn scope so the slot lives across `deliver` / `serve_via_*` and
         // releases its admission counters on every exit, including the boxed
         // miss-serve return paths below.
         let _shed_slot = shed_slot;
+        let _pin = pin;
 
         // Size gate. A plain cache hit
         // carries its size from the `serve_audit` above (#1789 item 7 part B),
@@ -1298,71 +1175,80 @@ impl ClientHandler {
                 .await;
         }
 
-        // Resolve the lane (must be pre-persisted — see module docs / #327).
-        // The lane is keyed by `(pool_id, bound_signer, this operator)`; a
-        // request with no verified binding cannot name a lane, and a bound client
-        // whose signer has no lane for this pool resolves to `None`. Both are
-        // refused pre-serve as an unknown lane: a binding that does not match the
-        // lane's signer resolves to no lane. The mid-stream reason cannot ride in
-        // the initial `StreamResponse`, so use the delivery-side `NotFound` here
-        // (avoids leaking lane existence).
-        let Some(lane_key) = lane_key else {
-            self.warn_unbound_request(&peer);
-            return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::OwnerMismatch,
-                    rate_per_mb,
-                )
-                .await;
-        };
-        let Some(lane) = known_lane else {
-            if let Some(suppressed) = self.unknown_lane_warn.admit() {
-                tracing::warn!(
-                    %peer,
-                    ?lane_key,
-                    suppressed,
-                    interval = ?self.unknown_lane_warn.interval(),
-                    "stream request on unknown lane; refusing pre-serve"
-                );
+        let admission = match admitted_at_open {
+            // A miss the fill tiers above landed: its funding gates already ran.
+            // The fill tiers ran on a proven lane (`pull_authorized`), so the
+            // lane resolves here; the refusals below are defensive.
+            Some(funding) => {
+                let Some(lane_key) = lane_key else {
+                    self.warn_unbound_request(&peer);
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::OwnerMismatch,
+                            rate_per_mb,
+                        )
+                        .await;
+                };
+                let Some(lane) = funding.known_lane else {
+                    return self
+                        .respond_error(&mut send, &req, ServeRejectReason::UnknownLane, rate_per_mb)
+                        .await;
+                };
+                // Pool admission gate (ADR 003 § Pool solvency) on the landed
+                // blob's size: the pool's `remaining − M` must cover the
+                // request's chunk-group-aligned span at this node's rate, capped
+                // at one chunk. Admission runs the same gate for an open that
+                // answers before it.
+                let guard_bytes =
+                    aligned_span(req.byte_offset, req.byte_len, total_bytes).min(CHUNK_BYTES);
+                if let Some(status) = funding.pool_status
+                    && !self.pool_remaining_covers_window(
+                        status.remaining,
+                        guard_bytes,
+                        rate_per_mb,
+                    )
+                {
+                    self.log_deposit_refusal(
+                        B256::from(req.pool_id),
+                        hash,
+                        status
+                            .remaining
+                            .saturating_sub(self.pool_min_remaining_deposit),
+                        decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+                    );
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::InsufficientDeposit,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
+                let guards = self
+                    .send_guards(&lane, funding.pool_status.map(|s| s.owner))
+                    .await;
+                Admission::Admitted(Admitted {
+                    lane_key,
+                    lane,
+                    guards,
+                })
             }
-            return self
-                .respond_error(&mut send, &req, ServeRejectReason::UnknownLane, rate_per_mb)
-                .await;
+            // An open that does no fill work answers before admission, which
+            // runs at the payer's first proof.
+            None => Admission::OnFirstProof(DeferredAdmission::new(
+                req.clone(),
+                ext,
+                verified_client,
+                lane_key,
+                peer,
+                rate_per_mb,
+                total_bytes,
+                unadmitted.take(),
+            )),
         };
-
-        // Pool admission gate (ADR 003 § Pool solvency): the pool's `remaining − M`
-        // must cover one chunk at this node's rate. The same gate runs on the
-        // pull-through tiers in `window.rs` (keep the two in step). `guard_bytes` is
-        // the chunk-group-aligned span (what `export_bao_range_stream` bills),
-        // capped at one chunk. Here `total_bytes` is known, so a request that spans
-        // less than a chunk prices at its exact span.
-        //
-        // `remaining` comes from the cached `getPool` view resolved above; a `None`
-        // view fails open (the on-chain `redeem` is the backstop). Either way, refuse
-        // `InsufficientDeposit` when the pool can no longer cover the gate.
-        let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes).min(CHUNK_BYTES);
-        if let Some(status) = pool_status
-            && !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
-        {
-            self.log_deposit_refusal(
-                B256::from(req.pool_id),
-                hash,
-                status
-                    .remaining
-                    .saturating_sub(self.pool_min_remaining_deposit),
-                decdn_incentive::min_payment(guard_bytes, rate_per_mb),
-            );
-            return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::InsufficientDeposit,
-                    rate_per_mb,
-                )
-                .await;
-        }
 
         // Build and sign the success response. A complete blob serves every
         // block; a covering partial serves its own.
@@ -1380,7 +1266,7 @@ impl ClientHandler {
         first_byte.mark_responded();
 
         // Stream the blob against the stream's credit.
-        self.deliver(
+        Box::pin(self.deliver(
             &conn,
             &mut send,
             &mut recv,
@@ -1388,12 +1274,11 @@ impl ClientHandler {
             req.byte_offset,
             req.byte_len,
             total_bytes,
-            lane_key,
-            &lane,
+            admission,
             client_node_id,
             rate_per_mb,
             first_byte,
-        )
+        ))
         .await
     }
 }
@@ -1446,7 +1331,7 @@ pub(super) fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: 
 /// at `now` refuses as [`ServeRejectReason::CapabilityExpired`]. A live
 /// registration whose headroom cannot pay `floor_micro` refuses as
 /// [`ServeRejectReason::SignerCapExhausted`]. `None` from this function admits.
-fn signer_refusal(
+pub(super) fn signer_refusal(
     auth: Option<SignerAuthorization>,
     floor_micro: U256,
     now: u64,

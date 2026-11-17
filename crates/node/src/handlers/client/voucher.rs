@@ -201,7 +201,7 @@ impl ClientHandler {
         rate_per_mb: u64,
         proofs: &ChunkProofs,
     ) -> anyhow::Result<VoucherStop> {
-        // Unknown lane: `serve_stream` refuses one pre-serve, so this is a
+        // Unknown lane: admission refuses one before any frame, so this is a
         // defensive backstop matching the sole callers (which forward `Some`).
         let Some(lane) = lane else {
             return self

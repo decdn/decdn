@@ -978,7 +978,7 @@ async fn takedown_forgets_the_warming_tag() -> Result<()> {
 
 /// The restart path. `evicted.log` records that a hash was evicted, never
 /// *why*, and the deny-set starts empty on every boot, so a hash evicted on a
-/// prior boot would answer `EvictedSinceProbe` forever. The enumeration
+/// prior boot would answer `Withdrawn` forever. The enumeration
 /// re-check back-fills the governance reason.
 #[tokio::test]
 async fn an_already_evicted_hash_is_back_filled_into_the_deny_set() -> Result<()> {

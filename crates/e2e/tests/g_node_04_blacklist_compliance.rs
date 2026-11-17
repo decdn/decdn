@@ -91,7 +91,7 @@ const REMOVAL_OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 /// The node's refusal counter for a governance hash deny.
 const CHAIN_HASH_DENIED: &str = "decdn_serve_stream_rejected_chain_hash_denied_total";
 /// The node's refusal counter for a blob it no longer holds after a probe.
-const EVICTED_SINCE_PROBE: &str = "decdn_serve_stream_rejected_evicted_since_probe_total";
+const WITHDRAWN: &str = "decdn_serve_stream_rejected_withdrawn_total";
 
 /// `OffenseType.Blacklist` discriminant (`ISlashJudge` enum: Rate, Blacklist).
 const OFFENSE_BLACKLIST: u8 = 1;
@@ -297,7 +297,7 @@ async fn declined_counters(node: &NodeFixture) -> anyhow::Result<String> {
     for reason in [
         "chain_hash_denied",
         "hash_denied",
-        "evicted_since_probe",
+        "withdrawn",
         "foreign_declined",
         "internal_error",
         "range_not_satisfiable",
@@ -386,7 +386,7 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
         &mut session,
         &node,
         hash,
-        EVICTED_SINCE_PROBE,
+        WITHDRAWN,
         Duration::from_secs(180),
         || time::mine(chain.admin()),
     )

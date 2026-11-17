@@ -607,11 +607,13 @@ impl std::error::Error for ClientPaymentFault {}
 ///
 /// The reference requester closes every stream with code `0`, and the node does
 /// not read the code, so it cannot see why a peer left. It can see how far the
-/// stream got. A peer that leaves before paying declined the quote — the routine
-/// shape of a header handshake — and a peer that leaves after paying abandoned a
-/// delivery. Both serve loops attach
-/// this marker at their outer boundary when their paid-byte count is nonzero,
-/// and the dispatch sink reads it to split a peer-attributable end between
+/// stream got. A peer that leaves before it sends a proof did not take the
+/// open; a peer that sends proofs that credit nothing and leaves declined the
+/// quote; and a peer that leaves after paying abandoned a delivery. Both serve
+/// loops attach this marker at their outer boundary when their paid-byte count
+/// is nonzero, and [`FrameSeen`] when a frame followed the request. The
+/// dispatch sink reads both to split a peer-attributable end between
+/// `decdn_serve_stream_unclaimed_total`,
 /// `decdn_serve_stream_client_declined_total` and
 /// `decdn_serve_stream_client_abandoned_total`. Attach it with
 /// [`anyhow::Error::context`] and recover it with `anyhow::Error::is`, or with
@@ -629,6 +631,35 @@ impl std::fmt::Display for PaidProgress {
 }
 
 impl std::error::Error for PaidProgress {}
+
+/// Marker for a serve-stream error that ended after a frame followed the
+/// request: a payment proof, or a frame that failed to decode as one. An error
+/// without it ended before the payer sent anything after its request, which
+/// the dispatch sink counts as an unclaimed open. Attach it with
+/// [`tag_frame_seen`] and recover it with `anyhow::Error::is`.
+#[derive(Debug)]
+pub(super) struct FrameSeen;
+
+impl std::fmt::Display for FrameSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("after the payer's first frame")
+    }
+}
+
+impl std::error::Error for FrameSeen {}
+
+/// Tag a serve loop's error with [`FrameSeen`] when `reader` took a whole frame
+/// off the stream.
+pub(super) fn tag_frame_seen(
+    e: anyhow::Error,
+    reader: &super::BufferedProofReader,
+) -> anyhow::Error {
+    if reader.frame_seen() {
+        e.context(FrameSeen)
+    } else {
+        e
+    }
+}
 
 /// Tag a serve loop's error with [`PaidProgress`] when `paid` — the wire bytes
 /// that accepted vouchers credited on the stream — is nonzero.

@@ -2810,7 +2810,7 @@ async fn serve_audit_reports_presence_size_and_eviction() -> anyhow::Result<()> 
 /// size, so a caller cannot advertise the wire size of content the serve
 /// path would refuse. `evicted` stays false: a chain-denied hash is a
 /// different refusal from an eviction and the miss path must not report it
-/// as `EvictedSinceProbe`.
+/// as `Withdrawn`.
 #[tokio::test]
 async fn serve_audit_withholds_the_size_of_a_denied_blob() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;

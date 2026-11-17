@@ -38,10 +38,11 @@ impl ClientHandler {
     /// funded the delivery (`getPool.owner`), not whichever throwaway key happened
     /// to sign the vouchers. So a blacklisted delegate signer over a clean funder
     /// is not refused, and a clean delegate signer never launders a blacklisted
-    /// funder. That gate runs at the serve gate's open-time funder check in
-    /// `dispatch.rs`, which precedes every fill tier — a blacklisted funder is
-    /// refused there before this authority is consulted, so no fill fronts USDC
-    /// or origin egress on a blacklisted funder's behalf.
+    /// funder. That gate is the funder check of the funding gates
+    /// (`ClientHandler::funding_gates`), which run before every fill tier — a
+    /// blacklisted funder is refused there before this authority is consulted,
+    /// so no fill fronts USDC or origin egress on a blacklisted funder's
+    /// behalf.
     pub(super) fn pull_authorized(
         lane_key: Option<LaneKey>,
         known_lane: Option<&Arc<Mutex<LaneDeliveryState>>>,

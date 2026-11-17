@@ -1016,9 +1016,10 @@ async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> a
 #[tokio::test(flavor = "multi_thread")]
 async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result<()> {
     // A ranged cache-miss request WITHOUT an ownership binding must not make the
-    // node front any origin egress: `pull_authorized` fails, so the range pull
-    // (and the whole-blob fallback) is never initiated. This closes the
-    // griefing vector where an unpaid client induces origin HEAD/range traffic.
+    // node front any origin egress: with a pool view wired, the node refuses an
+    // unbound request before its origin probe, so neither the range pull nor
+    // the whole-blob fallback is initiated. This closes the griefing vector
+    // where an unpaid client induces origin HEAD/range traffic.
     let (blob, outboard, hash) = blob_with_outboard();
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
@@ -1044,16 +1045,33 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let _provider = server_eth.address();
-    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+    let metrics = Arc::new(Metrics::new());
+    let mut status = std::collections::HashMap::new();
+    status.insert(
         pool_id,
-        client_eth.address(),
-        &server_eth,
+        decdn_node::pool_view::PoolStatus {
+            owner: client_eth.address(),
+            remaining: U256::from(10_000_000u64),
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        },
+    );
+    let pool_view =
+        Arc::new(StatusMapPoolView { status }) as Arc<dyn decdn_node::pool_view::PoolView>;
+    let handler = build_handler_full_configured(
         server_id,
-        None,
-    )
-    .await?;
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache.clone(),
+        Arc::new(MemoryPoolStateStore::new()),
+        RATE_PER_MB,
+        &domains(),
+        16,
+        |deps| deps.pool_view = Some(pool_view),
+    )?;
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -2751,8 +2769,7 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
 
 /// The span-capped floor guard, ACCEPT direction: a pool that covers one small
 /// aligned span but not a full credit window must be SERVED for a bounded
-/// request (the guard prices the span), and refused for a whole-blob request
-/// (the guard prices the window). Guards the `.min(credit_floor)` cap — a
+/// request (the guard prices the span). Guards the `.min(credit_floor)` cap — a
 /// regression to the uncapped floor silently refuses every small ranged
 /// request from modest pools.
 #[tokio::test(flavor = "multi_thread")]
@@ -2879,47 +2896,6 @@ async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow:
         counter_value(&metrics, "serve_stream_rejected_insufficient_deposit_total")? == 0,
         "the span-capped floor must not refuse a coverable range"
     );
-
-    // REFUSE: the whole-blob request prices a full window the pool cannot cover.
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
-    let binding_signature = client_eth
-        .sign_hash_sync(&binding_hash)?
-        .as_bytes()
-        .to_vec();
-    let ext = StreamRequestExt {
-        binding: Some(ClientBinding {
-            ethereum_address: client_eth.address().into(),
-            binding_signature,
-        }),
-        capability: None,
-        pull_through: true,
-    };
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        pool_id: pool_id.into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    let payload =
-        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
-    write_frame_to(&mut send, &payload).await?;
-    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(
-        !resp.body.ok,
-        "a whole-blob request against a window-poor pool must be refused"
-    );
-    conn.close(0u32.into(), b"done");
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())

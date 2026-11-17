@@ -81,7 +81,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_capability_expired_total",
     "decdn_serve_stream_rejected_chain_hash_denied_total",
     "decdn_serve_stream_rejected_chain_stale_total",
-    "decdn_serve_stream_rejected_evicted_since_probe_total",
+    "decdn_serve_stream_rejected_withdrawn_total",
     "decdn_serve_stream_rejected_foreign_declined_total",
     "decdn_serve_stream_rejected_hash_denied_total",
     "decdn_serve_stream_rejected_insufficient_deposit_total",
@@ -97,6 +97,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_signer_cap_exhausted_total",
     "decdn_serve_stream_rejected_stream_cap_full_total",
     "decdn_serve_stream_rejected_timestamp_skew_total",
+    "decdn_serve_stream_rejected_unadmitted_cap_full_total",
     "decdn_serve_stream_rejected_unknown_lane_total",
     "decdn_serve_stream_request_unreadable_total",
     "decdn_serve_stream_midstream_pool_exhausted_total",
@@ -108,6 +109,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_proof_budget_exhausted_total",
     "decdn_serve_stream_client_declined_total",
     "decdn_serve_stream_client_abandoned_total",
+    "decdn_serve_stream_unclaimed_total",
     "decdn_serve_stream_node_fault_total",
     "decdn_serve_rate_limit_rejected_per_peer_total",
     "decdn_serve_rate_limit_rejected_global_total",
@@ -1752,7 +1754,7 @@ pub struct DecdnMetrics {
     /// Sibling of `serve_cache_partial_hit` and `serve_cache_miss`. At most one
     /// of the three is bumped per request, and two requests that reach
     /// `serve_audit` bump none: a withdrawn hash (operator evict or corruption
-    /// quarantine) is refused for `evicted_since_probe`, and a `serve_audit` store
+    /// quarantine) is refused for `withdrawn`, and a `serve_audit` store
     /// fault is refused for `internal_error`. Neither is an availability class — one
     /// is a refusal, the other is the store failing to answer — so the ratio's
     /// denominator deliberately excludes both. Field has no `_total` suffix
@@ -1855,14 +1857,15 @@ pub struct DecdnMetrics {
     /// the lazy origin directory cache (positive + negative entries).
     /// Bounded by the configured cache capacity (LRU eviction).
     pub origin_directory_cache_size: Gauge,
-    /// Paid-delivery (`serve_stream`) requests refused because the blob was
-    /// deliberately evicted between probe and stream (#279). One `Counter` per
+    /// Paid-delivery (`serve_stream`) requests refused because the node
+    /// withdrew the blob: an operator evict or a corruption quarantine with no
+    /// blacklist entry behind it (#279). One `Counter` per
     /// reason — like the `dispatch_rejected_*` convention — because a plain counter
     /// field carries no label dimension, and the wire `StreamError` deliberately
     /// conflates the three `NotFound` reasons (`cache_miss`, `unknown_lane`,
     /// `owner_mismatch`) (#876). Visible name:
-    /// `decdn_serve_stream_rejected_evicted_since_probe_total`.
-    pub serve_stream_rejected_evicted_since_probe: Counter,
+    /// `decdn_serve_stream_rejected_withdrawn_total`.
+    pub serve_stream_rejected_withdrawn: Counter,
     /// `serve_stream` requests refused because the blob is absent and
     /// pull-through was unavailable or failed to fill it. Visible name:
     /// `decdn_serve_stream_rejected_cache_miss_total`.
@@ -2032,7 +2035,7 @@ pub struct DecdnMetrics {
     /// operator alone. Visible name:
     /// `decdn_serve_stream_rejected_chain_hash_denied_total`.
     ///
-    /// Not to be confused with `serve_stream_rejected_evicted_since_probe`,
+    /// Not to be confused with `serve_stream_rejected_withdrawn`,
     /// which sees only evictions with no blacklist entry behind them (corruption
     /// recovery, a manual `decdn node evict`).
     pub serve_stream_rejected_chain_hash_denied: Counter,
@@ -2120,6 +2123,13 @@ pub struct DecdnMetrics {
     /// sends no signed response. A client that opens more concurrent streams
     /// than the cap drives it.
     pub serve_stream_rejected_stream_cap_full: Counter,
+    /// `decdn_serve_stream_rejected_unadmitted_cap_full_total`:
+    /// `cdn/client/v1` streams reset with `RATE_LIMITED` because the connection
+    /// already held `MAX_UNADMITTED_STREAMS_PER_CONNECTION` streams that
+    /// answered an open and have not passed admission. The node reads no
+    /// request and sends no signed response. A peer that opens streams and
+    /// does not pay on them drives it.
+    pub serve_stream_rejected_unadmitted_cap_full: Counter,
     /// `decdn_serve_stream_request_unreadable_total`: `cdn/client/v1` streams
     /// reset because the node could not read the first request: the read timed
     /// out, the peer reset the stream or dropped the connection, the length
@@ -2136,14 +2146,20 @@ pub struct DecdnMetrics {
     /// even when the peer leaves before it reads the reject frame.
     pub serve_stream_voucher_rejected: Counter,
     /// `decdn_serve_stream_client_declined_total`: `cdn/client/v1` streams the
-    /// requester left before any voucher credited a byte. The routine shapes are a
-    /// requester that reads the signed `StreamResponse` and does not take the
-    /// quote, and the header handshake a downstream node's miss pull opens and
-    /// closes without adopting. A peer that sends a malformed proof before paying
-    /// counts here too. The reference requester closes every stream with code `0`,
-    /// and the node does not read the code, so it sees only that the peer left,
-    /// not why. Peer-side, logged at `debug!`.
+    /// requester left after it sent a frame past its request and before any
+    /// voucher credited a byte: a malformed proof, or proofs that credited
+    /// nothing. The reference requester closes every stream with code `0`, and
+    /// the node does not read the code, so it sees only that the peer left, not
+    /// why. Peer-side, logged at `debug!`.
     pub serve_stream_client_declined: Counter,
+    /// `decdn_serve_stream_unclaimed_total`: `cdn/client/v1` streams the
+    /// requester left before it sent anything after its request. The routine
+    /// shapes are an open whose answer the requester reads and does not take
+    /// (a discovery open, a quote it declines, a header handshake a downstream
+    /// node's miss pull does not adopt), and an open it cancels or lets time
+    /// out while the node waits for its first proof. Peer-side, logged at
+    /// `debug!`.
+    pub serve_stream_unclaimed: Counter,
     /// `decdn_serve_stream_client_abandoned_total`: paying `cdn/client/v1`
     /// streams the requester left or broke the protocol on after at least one
     /// voucher credited bytes: it stopped reading, reset the stream, dropped the
@@ -3477,8 +3493,8 @@ recorders! {
     node_pull_rate_above_ceiling => node_pull_rate_above_ceiling.inc();
 
     /// Record a paid-delivery (`serve_stream`) request refused because the
-    /// blob was evicted between probe and stream (#876).
-    serve_stream_rejected_evicted_since_probe => serve_stream_rejected_evicted_since_probe.inc();
+    /// node withdrew the blob (#876).
+    serve_stream_rejected_withdrawn => serve_stream_rejected_withdrawn.inc();
 
     /// Record a `serve_stream` request refused on a cache miss that
     /// pull-through could not fill (#876).
@@ -3612,6 +3628,10 @@ recorders! {
     /// was full.
     serve_stream_rejected_stream_cap_full => serve_stream_rejected_stream_cap_full.inc();
 
+    /// Record a `cdn/client/v1` stream reset because the connection held its cap
+    /// of streams that answered and have not passed admission.
+    serve_stream_rejected_unadmitted_cap_full => serve_stream_rejected_unadmitted_cap_full.inc();
+
     /// Record a `cdn/client/v1` stream reset because its first request could not
     /// be read. Peer-side.
     serve_stream_request_unreadable => serve_stream_request_unreadable.inc();
@@ -3619,9 +3639,13 @@ recorders! {
     /// Record a paying `cdn/client/v1` stream stopped on a rejected voucher.
     serve_stream_voucher_rejected => serve_stream_voucher_rejected.inc();
 
-    /// Record a `cdn/client/v1` stream the requester left before any voucher
-    /// credited a byte. Peer-side.
+    /// Record a `cdn/client/v1` stream the requester left after a frame followed
+    /// its request and before any voucher credited a byte. Peer-side.
     serve_stream_client_declined => serve_stream_client_declined.inc();
+
+    /// Record a `cdn/client/v1` stream the requester left before it sent
+    /// anything after its request. Peer-side.
+    serve_stream_unclaimed => serve_stream_unclaimed.inc();
 
     /// Record a paying `cdn/client/v1` stream the requester left after a voucher
     /// credited bytes. Peer-side.

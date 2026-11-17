@@ -10516,13 +10516,13 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
 }
 
 /// A leaf that drops while B waits for its first proof is a pull-through abandon
-/// (#2134) and a serve-stream decline (#2073). B sends nothing before the lane
-/// holds credit, so it waits on the proof read, which fails on a
+/// (#2134) and an unclaimed serve stream (#2073). B sends nothing before the
+/// lane holds credit, so it waits on the proof read, which fails on a
 /// peer-attributable transport error, and B meters the pull-through abandon. The
-/// leaf never paid, so the inbound stream counts as a decline. It is neither a
-/// node fault nor a spent proof budget.
+/// leaf sent nothing after its request, so the inbound stream counts as
+/// unclaimed. It is neither a node fault nor a spent proof budget.
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline() -> Result<()> {
+async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_unclaimed() -> Result<()> {
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x5Eu8; payload_len];
     let hash = support::register_payload(&payload);
@@ -10578,8 +10578,9 @@ async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
     assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
     assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
-    // The leaf left before paying the first interval: a decline on the serve leg.
-    assert_counter(&b_metrics, "serve_stream_client_declined_total", 1)?;
+    // The leaf left before it sent a proof: an unclaimed serve stream.
+    assert_counter(&b_metrics, "serve_stream_unclaimed_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_client_declined_total", 0)?;
     support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
@@ -10670,7 +10671,7 @@ async fn window_pull_through_leaf_gone_while_the_pull_owes_the_first_byte_ends_t
     );
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
     assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
-    assert_counter(&b_metrics, "serve_stream_client_declined_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_unclaimed_total", 1)?;
     assert_counter(&b_metrics, "node_pull_leg_no_progress_total", 0)?;
     support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
 

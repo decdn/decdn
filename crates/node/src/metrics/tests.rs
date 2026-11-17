@@ -718,7 +718,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
     // `(no data)`) and each method must bump exactly its own counter.
     let metrics = Metrics::new();
     let reasons = [
-        "decdn_serve_stream_rejected_evicted_since_probe_total",
+        "decdn_serve_stream_rejected_withdrawn_total",
         "decdn_serve_stream_rejected_cache_miss_total",
         "decdn_serve_stream_rejected_internal_error_total",
         "decdn_serve_stream_rejected_unknown_lane_total",
@@ -751,7 +751,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
         );
     }
 
-    metrics.serve_stream_rejected_evicted_since_probe();
+    metrics.serve_stream_rejected_withdrawn();
     metrics.serve_stream_rejected_cache_miss();
     metrics.serve_stream_rejected_internal_error();
     metrics.serve_stream_rejected_unknown_lane();

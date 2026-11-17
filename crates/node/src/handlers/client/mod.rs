@@ -12,7 +12,10 @@
 //! finishing with [`ClientMessage::StreamEnd`]. A delivery fault rides in the
 //! initial response (`ok: false` + [`StreamError`]); a mid-stream voucher
 //! rejection is sent as a [`ClientMessage::StreamError`] and the stream is
-//! closed **cleanly** (no QUIC reset) so the client can read the reason.
+//! closed **cleanly** (no QUIC reset) so the client can read the reason. An
+//! open that does no fill work answers before funding admission, which runs at
+//! the payer's first proof; its refusal rides in a [`ClientMessage::StreamError`]
+//! before any `ChunkData` (see `admission`).
 //!
 //! # Scope (#317 / #327)
 //!
@@ -69,6 +72,7 @@ use outcome::ServeStop;
 // types, consts, and free functions stay in this module so every submodule
 // (and the test module) can reach them via `use super::*` — Rust makes a
 // module's private items visible to its descendants (#1254).
+mod admission;
 mod credit;
 mod delivery;
 mod dispatch;
@@ -89,6 +93,14 @@ pub(crate) use proof_wait::PROOF_WAIT_CEILING;
 /// streams at this value; the application semaphore makes the per-ALPN bound
 /// explicit and testable.
 pub const MAX_CLIENT_STREAMS: usize = 100;
+
+/// Per-connection cap on streams that answered an open but have not yet
+/// passed funding admission. An open beyond it resets with `RATE_LIMITED`
+/// before its request is read. Without it, one peer pins many blobs with
+/// unpaid opens and blocks capacity eviction for paid fills. Twice the
+/// client's `SELECT_K` (5), so a payer that opens one stream per candidate
+/// stays well inside it.
+pub const MAX_UNADMITTED_STREAMS_PER_CONNECTION: usize = 10;
 
 // Per-stage timeouts so a stalled peer cannot pin a stream task indefinitely.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -328,9 +340,9 @@ impl ClientHandler {
 /// here so an operator can, e.g., isolate an unknown-lane abuse campaign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeRejectReason {
-    /// The node withdrew the blob after a probe: an operator evict or a
-    /// corruption quarantine with no blacklist entry behind it.
-    EvictedSinceProbe,
+    /// The node withdrew the blob: an operator evict or a corruption
+    /// quarantine with no blacklist entry behind it.
+    Withdrawn,
     CacheMiss,
     /// A fault in this node: a local store fault, or a fill that faulted on
     /// this node's own side. Signed `Declined`, never a false absence.
@@ -480,7 +492,7 @@ impl ServeRejectReason {
             // code for all of them means a client cannot tell a local denylist
             // from a governance entry or a withdrawn blob, so it cannot map an
             // operator's private legal exposure (ADR 011 §StreamRequest Response).
-            Self::EvictedSinceProbe
+            Self::Withdrawn
             | Self::InternalError
             | Self::RangeNotSatisfiable
             | Self::BlobTooLarge
@@ -1123,12 +1135,13 @@ pub struct ClientHandler {
     frame_target_bytes: u64,
     /// Live content deny-set (ADR 011), keyed on the pool FUNDER. Consulted at
     /// two points, both of which must gate or the check is bypassable: the
-    /// open-time funder gate in `serve_stream`, right after the pool status
-    /// resolves, and [`Self::takedown_landed`], the per-interval in-flight
-    /// re-check every serve leg runs. The open-time gate precedes every fill
-    /// tier, so omitting it would have this node front upstream USDC or origin
-    /// egress on a blacklisted funder's behalf. The hash half of ADR 011 is the
-    /// cache's own deny state (`CacheEngine::is_denied` / `refuses`).
+    /// funder gate of the stream's admission (`funding_gates`), right after the
+    /// pool status resolves, and [`Self::takedown_landed`], the per-interval
+    /// in-flight re-check every serve leg runs. The admission precedes every
+    /// fill tier and the first frame, so omitting it would have this node front
+    /// upstream USDC or origin egress on a blacklisted funder's behalf. The
+    /// hash half of ADR 011 is the cache's own deny state
+    /// (`CacheEngine::is_denied` / `refuses`).
     pub(crate) content_deny: Arc<crate::content_deny::ContentDenylist>,
     /// Served per-MB price, fixed at startup (see
     /// [`ClientHandlerDeps::rate_per_mb`]).
@@ -1326,20 +1339,6 @@ impl ClientHandler {
             .unwrap_or(crate::pool_view::POOL_RECHECK_INTERVAL)
     }
 
-    /// The pool's cached `getPool` status (owner + `remaining`), or `None` when no
-    /// pool-view is wired or the read faulted. The takedown funder resolution
-    /// ([`Self::pool_funder`]) reads through this at the START of a serve leg; a
-    /// `None` result makes the caller fail open — a transient RPC blip must not stop
-    /// a paying stream, and the on-chain `redeem` is the backstop. MAY block on a
-    /// `getPool` fetch on a cache miss, so it is NOT for the voucher-boundary path
-    /// — the mid-stream re-check uses [`Self::pool_recheck_stop`].
-    pub(super) async fn pool_view_status(
-        &self,
-        pool_id: B256,
-    ) -> Option<crate::pool_view::PoolStatus> {
-        self.pool_view.as_ref()?.status(pool_id).await
-    }
-
     /// Count a pool re-check that reads the pool view while
     /// [`Self::chain_freshness`] reads stale, and log a throttled `warn!` naming
     /// the stream. [`Self::pool_recheck_stop`] calls it once it has a view.
@@ -1493,14 +1492,6 @@ impl ClientHandler {
         let headroom = held_cap.saturating_sub(U256::from(spent));
         let floor_micro = decdn_incentive::min_payment(CHUNK_BYTES, rate_per_mb);
         headroom < floor_micro
-    }
-
-    /// The pool's funder (`getPool.owner`) for the ADR 011 mid-stream takedown
-    /// re-check, or `None` when no pool-view is wired or the read faulted (the
-    /// re-check then falls back to the open-time gates and the hash-denylist
-    /// re-check). Cached, so a per-MB call is cheap.
-    pub(super) async fn pool_funder(&self, pool_id: B256) -> Option<Address> {
-        self.pool_view_status(pool_id).await.map(|s| s.owner)
     }
 
     /// Recover an owner-signed capability's EIP-712 signer (ADR 003
@@ -1712,7 +1703,7 @@ impl ClientHandler {
                 %peer,
                 suppressed,
                 interval = ?self.unbound_request_warn.interval(),
-                "stream request with no verified binding; refusing pre-serve"
+                "stream request with no verified binding; refusing it"
             );
         }
     }
@@ -1994,7 +1985,7 @@ impl ClientHandler {
     /// Blacklist Event: "In-flight streams for a blacklisted hash are terminated
     /// at the next MB boundary")?
     ///
-    /// The open-time gates in `dispatch.rs` are not enough on their own: a
+    /// The open-time and admission gates are not enough on their own: a
     /// multi-GB blob can still be streaming minutes after a one-hour removal
     /// order took effect, and serving past the compliance window is slashable
     /// (ADR 026 §Slashing and burn). Both halves are re-checked because both can
@@ -2297,6 +2288,10 @@ pub(super) struct BufferedProofReader {
     /// Unconsumed bytes read from the stream, at a frame boundary or partway
     /// into the next frame's header/body.
     buf: Vec<u8>,
+    /// A proof [`Self::fill_one`] decoded and the next [`Self::read`] returns.
+    pending: Option<Proof>,
+    /// Whether a whole frame came off the stream, a proof or not.
+    frame_seen: bool,
 }
 
 impl BufferedProofReader {
@@ -2317,6 +2312,9 @@ impl BufferedProofReader {
     /// [`PeerFault`](wire::PeerFault), so the dispatch sink logs it at `debug!`.
     /// The two bounds checks do not: those are this node's own invariants.
     pub(super) async fn read(&mut self, recv: &mut RecvStream) -> anyhow::Result<Proof> {
+        if let Some(proof) = self.pending.take() {
+            return Ok(proof);
+        }
         loop {
             if let Some(result) = self.take_buffered()? {
                 return result;
@@ -2343,6 +2341,29 @@ impl BufferedProofReader {
                 .ok_or_else(|| anyhow::anyhow!("short read length out of range"))?;
             self.buf.extend_from_slice(chunk);
         }
+    }
+
+    /// Wait until one whole proof is buffered, without handing it out: the
+    /// next [`Self::read`] returns it. The deferred admission waits here for
+    /// the payer's first proof, and the serve loop then consumes that proof
+    /// as usual. **Cancellation-safe**, as [`Self::read`] is.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::read`].
+    pub(super) async fn fill_one(&mut self, recv: &mut RecvStream) -> anyhow::Result<()> {
+        if self.pending.is_none() {
+            let proof = self.read(recv).await?;
+            self.pending = Some(proof);
+        }
+        Ok(())
+    }
+
+    /// Whether a whole frame came off the stream: a proof, or a frame that
+    /// failed to decode as one. A stream that ends with this `false` ended
+    /// before its payer sent anything after the request.
+    pub(super) const fn frame_seen(&self) -> bool {
+        self.frame_seen
     }
 
     /// Take the next whole frame out of the buffer, if one is there.
@@ -2385,6 +2406,7 @@ impl BufferedProofReader {
                     .context(format!("proof decode failed: {e}"))),
             };
         self.buf.drain(..total);
+        self.frame_seen = true;
         Ok(Some(result))
     }
 }

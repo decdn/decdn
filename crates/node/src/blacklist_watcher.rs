@@ -1045,7 +1045,7 @@ where
         // not yet recorded as governance-denied. `evicted.log` persists the eviction
         // but records no cause, and the deny-set lives only in memory, so after a
         // restart every takedown evicted on a prior boot would otherwise keep
-        // answering `EvictedSinceProbe` forever.
+        // answering `Withdrawn` forever.
         if !cache.is_chain_denied(hash) {
             match scope_check(contract, operator, hash).await {
                 Ok(true) => deny_hash(cache, hash),

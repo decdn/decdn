@@ -6,14 +6,15 @@ use bytes::Bytes;
 use decdn_cache::CacheResult;
 use futures_util::{Stream, StreamExt};
 
+use super::admission::{Admission, Admitted};
 use super::credit::Acquired;
 use super::outcome::ServeEnd;
 use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::StreamAnchor;
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
-    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, Connection, Hash,
-    LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream,
+    B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, Connection, Hash,
+    RecvStream, SendStream,
 };
 use crate::metrics::FirstByteClock;
 
@@ -173,9 +174,15 @@ impl ClientHandler {
     /// Stream blob bytes to the paying client against the stream's credit (ADR
     /// 003 § Credit Window): the node sends a frame only when the payment the
     /// stream's own proofs claimed covers it, and reads the payer's proofs while
-    /// the credit falls short. Returns how the stream ended: `Completed`, or a
+    /// the credit falls short. Returns how the stream ended: `Completed`, a
     /// mid-stream stop (a rejected voucher, a drained pool or signer cap, a
-    /// takedown, a spent proof budget).
+    /// takedown, a spent proof budget), or `Refused` when the stream answered
+    /// before admission and its admission refused at the payer's first proof.
+    ///
+    /// `admission` is [`Admission::OnFirstProof`] for an open that answered
+    /// before admission: the loop waits for the payer's first proof while the
+    /// store sets up its export, then admits ([`Self::admit_on_first_proof`]).
+    /// A refusal goes out as a `StreamError` before any `ChunkData`.
     ///
     /// # Errors
     ///
@@ -184,7 +191,9 @@ impl ClientHandler {
     /// [`PeerFault`](super::wire::PeerFault) or
     /// [`ClientPaymentFault`](super::wire::ClientPaymentFault); the rest reach the
     /// dispatch sink's `error!` as node faults. An error after a proof credited
-    /// bytes also carries [`PaidProgress`](super::wire::PaidProgress).
+    /// bytes also carries [`PaidProgress`](super::wire::PaidProgress), and one
+    /// after a frame followed the request carries
+    /// [`FrameSeen`](super::wire::FrameSeen).
     ///
     /// The node's exposure to unpaid delivery is zero: every byte it sends was
     /// covered by payment a proof on this stream had already claimed.
@@ -198,17 +207,20 @@ impl ClientHandler {
         byte_offset: u64,
         byte_len: u64,
         total_bytes: u64,
-        lane_key: LaneKey,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
+        admission: Admission,
         client_node_id: B256,
         rate_per_mb: u64,
         first_byte: FirstByteClock,
     ) -> anyhow::Result<ServeEnd> {
         // Bytes the proofs on this stream claimed for it. Owned here so every exit
         // of the loop, `?` included, passes through the one `PaidProgress` tag:
-        // the dispatch sink splits a peer that left into declined or abandoned by
-        // it.
+        // the dispatch sink splits a peer that left into unclaimed, declined or
+        // abandoned by it and by the reader's `FrameSeen` tag.
         let mut paid: u64 = 0;
+        // One buffered proof reader for the whole stream: it buffers a pipelined
+        // proof across waits, so every proof read MUST go through it — a second
+        // reader would lose bytes it read ahead.
+        let mut reader = BufferedProofReader::default();
         // Refresh recency before the first byte goes out, so a blob still
         // carrying the open-time seed does not rank oldest for eviction while it
         // streams. Recency only: the frequency sighting waits for `StreamEnd`.
@@ -221,15 +233,15 @@ impl ClientHandler {
             byte_offset,
             byte_len,
             total_bytes,
-            lane_key,
-            lane,
+            admission,
+            &mut reader,
             client_node_id,
             rate_per_mb,
             first_byte,
             &mut paid,
         )
         .await
-        .map_err(|e| super::wire::tag_paid_progress(e, paid))
+        .map_err(|e| super::wire::tag_frame_seen(super::wire::tag_paid_progress(e, paid), &reader))
     }
 
     /// The body of [`Self::deliver`]. `paid` counts the bytes the proofs on
@@ -246,8 +258,8 @@ impl ClientHandler {
         byte_offset: u64,
         byte_len: u64,
         total_bytes: u64,
-        lane_key: LaneKey,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
+        admission: Admission,
+        reader: &mut BufferedProofReader,
         client_node_id: B256,
         rate_per_mb: u64,
         first_byte: FirstByteClock,
@@ -285,32 +297,56 @@ impl ClientHandler {
         // Splits the span's idle time by what this loop waits on, and records
         // the path's state, at every exit (#2348), the export's setup
         // included.
+        //
+        // An open that answered before admission waits for the payer's first
+        // proof here, beside the export's setup, so the store read overlaps the
+        // payer's round trip. Admission then runs once, before the first frame.
+        // The empty blob carries no wire, so its payer owes no proof: it admits
+        // at once.
         let mut waits = ServeWaits::start(conn);
-        let data = waits
-            .time(
-                Wait::Store,
-                self.cache
-                    .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes),
-            )
-            .await
-            .map_err(|e| anyhow::Error::from(e).context("cache export_bao_range_stream failed"))?;
+        let export = async {
+            waits
+                .time(
+                    Wait::Store,
+                    self.cache
+                        .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes),
+                )
+                .await
+                .map_err(|e| anyhow::Error::from(e).context("cache export_bao_range_stream failed"))
+        };
+        let (data, admitted) = match admission {
+            Admission::Admitted(admitted) => (export.await?, admitted),
+            Admission::OnFirstProof(adm) => {
+                let data = if total_bytes == 0 {
+                    export.await?
+                } else {
+                    let (data, ()) =
+                        tokio::try_join!(export, self.await_first_proof(conn, recv, reader))?;
+                    data
+                };
+                match self.admit_on_first_proof(adm).await {
+                    Ok(admitted) => (data, admitted),
+                    Err(reason) => return self.refuse_admission(send, reason).await,
+                }
+            }
+        };
+        let Admitted {
+            lane_key,
+            lane,
+            mut guards,
+        } = admitted;
+        let lane = &lane;
 
         let chunk_bytes = CHUNK_BYTES;
         let mut first_byte = Some(first_byte);
         // Wire bytes this stream wrote. The stream's credit is `paid − delivered`.
         let mut delivered: u64 = 0;
-        // One buffered proof reader for the whole stream: it buffers a pipelined
-        // proof across waits, so every proof read MUST go through it — a second
-        // reader would lose bytes it read ahead.
-        let mut reader = BufferedProofReader::default();
         // This stream's chain anchor — which epoch it has been told about, so a
         // bare reveal arriving on it can be placed (ADR 003 §Concurrent
         // Streams, Rule 1). Per stream and in memory only: a restart drops the
         // streams, and the lane's durable record keeps the strongest claim's
         // chain state.
         let mut anchor = StreamAnchor::default();
-        // The takedown, pool and signer checks that run before each send.
-        let mut guards = self.send_guards(lane, &lane_key).await;
 
         // `ChunkFramer` yields no frames for an empty export and never a
         // zero-length frame, so the empty blob makes no pass through the loop and
@@ -346,7 +382,7 @@ impl ClientHandler {
                     conn,
                     send,
                     recv,
-                    &mut reader,
+                    reader,
                     &mut anchor,
                     &mut waits,
                     &mut guards,

@@ -3,6 +3,7 @@
 use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
 
+use super::admission::{Admitted, DeferredAdmission};
 use super::dispatch::{aligned_span, range_out_of_bounds};
 use super::serve_encoder::{encoded_ranges, serve_end};
 
@@ -10,10 +11,11 @@ use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
-    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, CoverageShortfall, Hash, LaneDeliveryState,
-    LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
-    StreamRequest, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, CoverageShortfall,
+    Hash, LaneDeliveryState, LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream,
+    SendStream, ServeRejectReason, StreamRequest, WINDOW_PULL_FALLBACK_DEADLINE,
 };
+use crate::pool_view::PoolStatus;
 
 /// The held chunk ranges whose proof a serve-miss for `[offset, +len)` seeds:
 /// `present` clipped to the chunk-group-aligned ranges the serve leg encodes.
@@ -120,7 +122,7 @@ impl ClientHandler {
         lane_key: LaneKey,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         origin: Arc<NodeOrigin>,
-        pool_remaining: Option<U256>,
+        pool_status: Option<PoolStatus>,
         fault_seen: bool,
         rate_per_mb: u64,
         mut first_byte: FirstByteClock,
@@ -128,9 +130,9 @@ impl ClientHandler {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
         // before the availability check, and refuses a blacklisted funder at
-        // its open-time funder gate, which precedes every fill tier. Keep it
-        // that way — if this function ever gains a second caller, that caller
-        // owes both checks, because this is a spend-and-serve path.
+        // its funding gates (the funder check), which precede every fill tier.
+        // Keep it that way — if this function ever gains a second caller, that
+        // caller owes both checks, because this is a spend-and-serve path.
         //
         // They cover the request, not the stream: a takedown landing after this
         // point is caught before each frame inside the serve leg (`serve_leg`, ADR
@@ -149,15 +151,15 @@ impl ClientHandler {
         // The price is CAPPED BY THE REQUEST'S ALIGNED SPAN when the request
         // bounds itself — the same pricing `dispatch.rs` uses, so a request
         // accepted there is never refused here for a sub-chunk span.
-        // `pool_remaining` is the cached `getPool.remaining` threaded from the
-        // serve gate; `None` (no pool-view, unknown pool, or a read fault) fails
-        // open — the on-chain `redeem` is the backstop.
+        // `pool_status` is the `getPool` view the funding gates read; `None`
+        // (no pool-view wired) fails open — the on-chain `redeem` is the
+        // backstop.
         let guard_bytes = if req.byte_len > 0 {
             aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(chunk_bytes)
         } else {
             chunk_bytes
         };
-        if let Some(remaining) = pool_remaining
+        if let Some(remaining) = pool_status.map(|s| s.remaining)
             && !self.pool_remaining_covers_window(remaining, guard_bytes, rate_per_mb)
         {
             let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
@@ -570,6 +572,7 @@ impl ClientHandler {
         // It mints its outboard reader from the shared per-hash outboard and reads the
         // registry-wide fill liveness for the no-hang guarantee, pacing every pull it
         // draws from (its own plus any attached sibling).
+        let guards = self.send_guards(lane, pool_status.map(|s| s.owner)).await;
         let serve_result = self
             .serve_leg(
                 conn,
@@ -586,6 +589,8 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
+                BufferedProofReader::default(),
+                guards,
                 first_byte,
             )
             .await;
@@ -629,8 +634,11 @@ impl ClientHandler {
     /// request may be whole-blob, bounded, or resumed: the serve leg clamps delivery
     /// to `[byte_offset, end)` and the local pull leg fills only that span's missing
     /// chunk groups, so a bounded request pulls exactly its aligned span from
-    /// origin. The caller has proven lane authority (`pull_authorized`).
-    /// Terminal: consumes `send`/`recv`.
+    /// origin. The open answers before admission: once the response is out,
+    /// this waits for the payer's first proof and runs `adm`
+    /// ([`Self::admit_on_first_proof`]) before it claims the fill, so an open
+    /// the payer does not take starts no origin pull. Terminal: consumes
+    /// `send`/`recv`.
     ///
     /// Like the peer twin, this claims the fill itself (`CacheEngine::claim_fill`)
     /// after signing the response: it either OWNS a fresh local pull for `hash` or
@@ -640,10 +648,10 @@ impl ClientHandler {
     /// the same filling cache to its own client — so the node eats the S3 egress
     /// once, not twice (a real dollar saving).
     ///
-    /// The ADR 011 open-time deny gates are already discharged (a denylisted hash
-    /// is refused before the availability check; a blacklisted funder is refused
-    /// at `serve_stream`'s open-time funder gate, which precedes every fill tier). A
-    /// takedown that lands mid-stream is caught before each frame inside
+    /// The ADR 011 deny gates are discharged before the fill: a denylisted hash
+    /// is refused before the availability check, and a blacklisted funder by
+    /// the admission at the first proof, which precedes the claim. A takedown
+    /// that lands mid-stream is caught before each frame inside
     /// [`Self::serve_leg`].
     ///
     /// Faults are scored LOCAL (never against a provider — there is none): the serve
@@ -658,10 +666,8 @@ impl ClientHandler {
         req: &StreamRequest,
         hash: Hash,
         client_node_id: B256,
-        lane_key: LaneKey,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
+        adm: DeferredAdmission,
         total_bytes: u64,
-        pool_remaining: Option<U256>,
         rate_per_mb: u64,
         mut first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
@@ -671,58 +677,18 @@ impl ClientHandler {
         // this tier having been entered.
         self.metrics.local_outboard_serve();
 
-        // The owning lane is resolved and its ownership proven by the caller;
-        // `lane` / `lane_key` are threaded in for the downstream proof
-        // collection.
-        let chunk_bytes = CHUNK_BYTES;
-
-        // Pre-flight pool admission guard — the own-origin twin of the peer path
-        // and of `dispatch.rs`. Refuse the serve when the pool's on-chain
-        // remaining minus the refundable floor `M` cannot cover one chunk.
-        // `pool_remaining` is the cached `getPool.remaining` threaded from the
-        // serve gate; `None` fails open (on-chain `redeem` is the backstop). The
-        // own-origin leg fronts no upstream USDC, but delivery is billed per
-        // chunk, so a pool that cannot cover one is refused here for wire-parity
-        // with the peer path rather than served for free.
-        //
-        // (2) Bounds gate first, on the probed geometry, BEFORE the guard and the
-        // signature: an offset at or past the end is `RangeNotSatisfiable` here
-        // exactly as on the direct-serve path: never `InsufficientDeposit` (the
-        // range, not the pool, is the problem), and never a signed `ok: true`
-        // that turns a bad range into a stream failure. An end past the blob is
-        // NOT out of bounds: it is served clamped to the blob's end. This total is
-        // the node's OWN origin probe, so no counterparty steers the gate (#1895).
+        // (2) Bounds gate first, on the probed geometry, BEFORE the signature:
+        // an offset at or past the end is `RangeNotSatisfiable` here exactly as
+        // on the direct-serve path, never a signed `ok: true` that turns a bad
+        // range into a stream failure. An end past the blob is NOT out of
+        // bounds: it is served clamped to the blob's end. This total is the
+        // node's OWN origin probe, so no counterparty steers the gate (#1895).
         if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
             return self
                 .respond_error(
                     &mut send,
                     req,
                     ServeRejectReason::RangeNotSatisfiable,
-                    rate_per_mb,
-                )
-                .await;
-        }
-
-        // The price is capped by the request's aligned span — priced against the
-        // PROBED total, so a resumed tail near the blob end span-caps too, and a
-        // request accepted at dispatch is never refused here for a sub-chunk span.
-        // In bounds per the gate above, so `aligned_span` never saturates.
-        let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes).min(chunk_bytes);
-        if let Some(remaining) = pool_remaining
-            && !self.pool_remaining_covers_window(remaining, guard_bytes, rate_per_mb)
-        {
-            let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
-            self.log_deposit_refusal(
-                B256::from(req.pool_id),
-                hash,
-                headroom,
-                decdn_incentive::min_payment(guard_bytes, rate_per_mb),
-            );
-            return self
-                .respond_error(
-                    &mut send,
-                    req,
-                    ServeRejectReason::InsufficientDeposit,
                     rate_per_mb,
                 )
                 .await;
@@ -748,6 +714,26 @@ impl ClientHandler {
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         first_byte.mark_responded();
+
+        // (4a) Admission at the payer's first proof (`super::admission`), before
+        // the claim, so an open the payer does not take spawns no pull leg. The
+        // admission's deposit gate prices the request's aligned span against
+        // the PROBED total, capped at one chunk: the own-origin leg fronts no
+        // upstream USDC, but delivery is billed per chunk. A refusal rides in a
+        // `StreamError` before any `ChunkData`.
+        let mut reader = BufferedProofReader::default();
+        if let Err(e) = self.await_first_proof(conn, &mut recv, &mut reader).await {
+            return Err(super::wire::tag_frame_seen(e, &reader));
+        }
+        let Admitted {
+            lane_key,
+            lane,
+            guards,
+        } = match self.admit_on_first_proof(adm).await {
+            Ok(admitted) => admitted,
+            Err(reason) => return self.refuse_admission(&mut send, reason).await,
+        };
+        let lane = &lane;
 
         // (5) The two decoupled legs (ADR 037). Identical coordination
         // shape to the peer twin: the SERVE leg runs HERE on the accept task (it must
@@ -887,6 +873,8 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
+                reader,
+                guards,
                 first_byte,
             )
             .await;
