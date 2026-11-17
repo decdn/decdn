@@ -153,7 +153,7 @@ async fn run() -> anyhow::Result<()> {
     .context("B's on-chain served-bytes never advanced")?;
     // Vote weight reads `FeeRouter`'s epoch counter, which only a received
     // sweep credits, so B's pending share is swept now, at what it holds.
-    chain.sweep(node_b.operator_addr()).await?;
+    chain.sweep(&[node_b.operator_addr()]).await?;
 
     // ---- A serves bytes too. The per-operator vote cap is sized from the
     // OTHER operators' bytes in the window (ADR 036), so B's weight needs bytes
@@ -169,7 +169,36 @@ async fn run() -> anyhow::Result<()> {
     })
     .await?
     .context("A's on-chain served-bytes never reached B's")?;
-    chain.sweep(node_a.operator_addr()).await?;
+    // A sweeps through the real `decdn node sweep`, listing B as a batch
+    // partner. B's share was swept above, so the batch carries B only if B
+    // redeemed again since; A's share is always in it, first.
+    let swept = node_cli_json(
+        &node_a,
+        &[
+            "sweep",
+            "--with",
+            &format!("{:#x}", node_b.operator_addr()),
+            "--json",
+        ],
+    )?;
+    let pool_line = &swept[0];
+    assert_eq!(pool_line["outcome"], "swept", "{swept}");
+    let shares = pool_line["swept"].as_array().context("swept shares")?;
+    assert!(
+        (1..=2).contains(&shares.len()),
+        "A alone, or A and B: {swept}"
+    );
+    assert_eq!(
+        shares[0]["operator"].as_str().map(str::to_lowercase),
+        Some(format!("{:#x}", node_a.operator_addr())),
+        "{swept}"
+    );
+    let sweep_tx: B256 = pool_line["tx"]
+        .as_str()
+        .context("sweep tx")?
+        .parse()
+        .context("parse sweep tx")?;
+    chain.receive_sweep(sweep_tx).await?;
     // ---- Cross an epoch boundary so those bytes sit in a fully-elapsed epoch
     // inside the trailing window at the proposal snapshot.
     time::increase_time(chain.admin(), 8 * DAY).await?;
@@ -348,6 +377,27 @@ fn run_node_cli(node: &NodeFixture, args: &[&str]) -> anyhow::Result<()> {
         args.join(" "),
     );
     Ok(())
+}
+
+/// Run `decdn node <args…>` like [`run_node_cli`] and parse its stdout as
+/// JSON.
+fn node_cli_json(node: &NodeFixture, args: &[&str]) -> anyhow::Result<serde_json::Value> {
+    let out = decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?
+        .arg("node")
+        .args(args)
+        .arg("--config")
+        .arg(node.config_path())
+        .output()
+        .context("spawn decdn node")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`decdn node {}` exited non-zero: {}\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    serde_json::from_slice(&out.stdout).context("parse `decdn node` JSON output")
 }
 
 /// Run the built `decdn appeal slash` command against the rendered config and

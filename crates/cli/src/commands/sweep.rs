@@ -3,22 +3,25 @@
 //! Redemption-path interface, ADR 016 § Bridge adapters).
 //!
 //! Each `redeemMany` leaves the protocol share of its payout in the pool, as
-//! `pending(operator)`. `sweep` sends it once it reaches the pool's
-//! `minSweep`: the pool burns the USDC over CCTP V2 to the governance chain's
-//! `CctpSweepReceiver`, with the operator and its served bytes as the hook
-//! data. CCTP then needs an attestation from Circle's attestation service
-//! (Iris). `receive-sweeps` fetches the message and its attestation for each
-//! sweep transaction, waits while the attestation is pending, and calls
-//! `CctpSweepReceiver.receiveSweep`, which mints the USDC and deposits it into
-//! `FeeRouter` for the operator. Both calls are permissionless; the operator
-//! runs them by hand, and no daemon task does.
+//! `pending(operator)`. `sweep` sends a batch of shares: the operator's own,
+//! plus any `--with` operators that agree to share the governance-chain
+//! receive. The pool burns the batch total over CCTP V2 to the governance
+//! chain's `CctpSweepReceiver` once it reaches `minSweep`, with one
+//! `SweepShare` (operator, served bytes, amount) per swept operator as the
+//! hook data. CCTP then needs an attestation from Circle's attestation
+//! service (Iris). `receive-sweeps` finds every batch that carried the
+//! operator's share, fetches its message and attestation once, waits while
+//! the attestation is pending, and calls `CctpSweepReceiver.receiveSweep`
+//! once per message, which mints the USDC and deposits each entry's share
+//! into `FeeRouter`. Both calls are permissionless; the operator runs them by
+//! hand, and no daemon task does.
 
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolEvent, SolValue};
 use anyhow::Context as _;
 use decdn_client::session::PaymentPoolChain;
 use decdn_common::cli;
@@ -37,46 +40,98 @@ mod iris;
 
 pub(crate) use iris::{IrisWait, MessageStatus, fetch_messages};
 
-/// What `sweep` does with one pool, from its pending share and `minSweep`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One operator's pending protocol share in a pool, read before a sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct PendingShare {
+    /// The operator.
+    pub(crate) operator: Address,
+    /// Its pending share, micro-USDC.
+    pub(crate) micro_usdc: u64,
+}
+
+/// What `sweep` does with one pool, from the batch's pending shares and
+/// `minSweep`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SweepPlan {
-    /// The share has reached `minSweep`: send `sweep(operator)`.
+    /// The batch total has reached `minSweep`: send `sweep(operators)`.
     Send {
-        /// The pending share, micro-USDC.
-        pending: u64,
+        /// The operators with a share, in input order.
+        operators: Vec<Address>,
+        /// The batch total, micro-USDC.
+        total: u64,
     },
-    /// The share is under `minSweep`, or empty: the pool would revert
+    /// The batch total is under `minSweep`, or zero: the pool would revert
     /// `BelowMinSweep`, so nothing is sent.
     Below {
-        /// The pending share, micro-USDC.
-        pending: u64,
+        /// The batch total, micro-USDC.
+        total: u64,
         /// The pool's `minSweep`, micro-USDC.
         min_sweep: u64,
     },
 }
 
-/// The plan for a pending share of `pending` against `min_sweep`. The pool
-/// sends a share at or above `minSweep` and never an empty one.
-pub(crate) const fn plan_sweep(pending: u64, min_sweep: u64) -> SweepPlan {
-    if pending == 0 || pending < min_sweep {
-        SweepPlan::Below { pending, min_sweep }
-    } else {
-        SweepPlan::Send { pending }
+/// The plan for the shares `shares` against `min_sweep`. The batch keeps
+/// each operator with a share once, in input order, and leaves out the rest,
+/// as the pool does. The pool sends a total at or above `minSweep` and never
+/// an empty one.
+///
+/// # Errors
+///
+/// The batch holds more than `max_batch` operators: the pool reverts
+/// `BadSweepBatch`.
+pub(crate) fn plan_sweep(
+    shares: &[PendingShare],
+    min_sweep: u64,
+    max_batch: usize,
+) -> anyhow::Result<SweepPlan> {
+    let mut operators: Vec<Address> = Vec::with_capacity(shares.len());
+    let mut total = 0u64;
+    for share in shares {
+        if share.micro_usdc == 0 || operators.contains(&share.operator) {
+            continue;
+        }
+        operators.push(share.operator);
+        total = total.saturating_add(share.micro_usdc);
     }
+    anyhow::ensure!(
+        operators.len() <= max_batch,
+        "{} operators have a share, but one sweep carries at most {max_batch}; pass fewer --with",
+        operators.len()
+    );
+    Ok(if total == 0 || total < min_sweep {
+        SweepPlan::Below { total, min_sweep }
+    } else {
+        SweepPlan::Send { operators, total }
+    })
 }
 
-/// The `Swept` event `pool` emitted for `operator` in `receipt`.
+/// The `Swept` events `pool` emitted in `receipt`, one per swept operator in
+/// batch order.
 pub(crate) fn swept_from_receipt(
     receipt: &TransactionReceipt,
     pool: Address,
-    operator: Address,
-) -> Option<PaymentPool::Swept> {
+) -> Vec<PaymentPool::Swept> {
+    receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.address() == pool)
+        .filter_map(|log| PaymentPool::Swept::decode_log(&log.inner).ok())
+        .map(|log| log.data)
+        .collect()
+}
+
+/// The `SweepSent` event `pool` emitted in `receipt`: the batch total and
+/// the bridge fee it allowed.
+pub(crate) fn sweep_sent_from_receipt(
+    receipt: &TransactionReceipt,
+    pool: Address,
+) -> Option<PaymentPool::SweepSent> {
     receipt.inner.logs().iter().find_map(|log| {
-        if log.address() != pool {
-            return None;
-        }
-        let swept = PaymentPool::Swept::decode_log(&log.inner).ok()?.data;
-        (swept.operator == operator).then_some(swept)
+        (log.address() == pool)
+            .then(|| PaymentPool::SweepSent::decode_log(&log.inner).ok())
+            .flatten()
+            .map(|log| log.data)
     })
 }
 
@@ -95,6 +150,17 @@ pub(crate) fn message_sent(receipt: &TransactionReceipt) -> Option<Bytes> {
 const SOURCE_DOMAIN: std::ops::Range<usize> = 4..8;
 const NONCE: std::ops::Range<usize> = 12..44;
 const DESTINATION_CALLER: std::ops::Range<usize> = 108..140;
+/// Where the burn body's hook data starts: the `MessageV2` body offset (148)
+/// plus the `BurnMessageV2` hook-data offset (228).
+const HOOK_DATA: usize = 148 + 228;
+
+/// The `SweepShare[]` a sweep message's hook data carries: one entry per
+/// swept operator, in batch order. `None` when the message is too short or
+/// its hook data does not decode.
+pub(crate) fn sweep_shares(message: &[u8]) -> Option<Vec<PaymentPool::SweepShare>> {
+    let hook = message.get(HOOK_DATA..)?;
+    <Vec<PaymentPool::SweepShare>>::abi_decode(hook).ok()
+}
 
 /// The source domain in a CCTP message header.
 pub(crate) fn source_domain(message: &[u8]) -> Option<u32> {
@@ -151,6 +217,17 @@ fn resolve_operator(
     })
 }
 
+/// One swept operator's share, from the pool's `Swept` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SweptShare {
+    /// The operator.
+    pub(crate) operator: Address,
+    /// The share sent, micro-USDC.
+    pub(crate) micro_usdc: u64,
+    /// The served bytes sent with it.
+    pub(crate) served_bytes: u64,
+}
+
 /// One pool's line of `decdn node sweep` output.
 #[derive(Debug, Serialize)]
 struct SweepLine {
@@ -158,102 +235,162 @@ struct SweepLine {
     pool: String,
     /// `swept`, `below_min_sweep` or `dry_run`.
     outcome: &'static str,
-    /// The pending share before the sweep, micro-USDC.
-    pending_micro_usdc: u64,
+    /// Each listed operator's pending share before the sweep: this operator
+    /// first, then each `--with` operator.
+    pending: Vec<PendingShare>,
+    /// The batch total before the sweep, micro-USDC.
+    total_micro_usdc: u64,
     /// The pool's `minSweep`, micro-USDC.
     min_sweep_micro_usdc: u64,
     /// The sweep transaction, when one was sent.
     tx: Option<String>,
-    /// What the `Swept` event says was sent, micro-USDC.
-    swept_micro_usdc: Option<u64>,
-    /// The served bytes the `Swept` event carried.
-    served_bytes: Option<u64>,
+    /// Each swept operator's share, from the `Swept` events.
+    swept: Vec<SweptShare>,
+    /// The batch total the `SweepSent` event says was burned, micro-USDC.
+    sent_micro_usdc: Option<u64>,
+    /// The bridge fee the `SweepSent` event says the sweep allowed,
+    /// micro-USDC.
+    max_fee_micro_usdc: Option<u64>,
+}
+
+impl SweepLine {
+    /// The human-readable form: one line for the pool, then one per swept
+    /// operator.
+    fn text(&self) -> String {
+        let base = format!(
+            "pool={} total_usdc={} min_sweep_usdc={} operators={}",
+            self.pool,
+            format_usdc(self.total_micro_usdc),
+            format_usdc(self.min_sweep_micro_usdc),
+            self.pending.iter().filter(|p| p.micro_usdc > 0).count()
+        );
+        match (self.outcome, &self.tx) {
+            ("swept", Some(tx)) => std::iter::once(format!(
+                "{base} tx={tx} sent_usdc={} max_fee_usdc={}",
+                format_usdc(self.sent_micro_usdc.unwrap_or(0)),
+                format_usdc(self.max_fee_micro_usdc.unwrap_or(0))
+            ))
+            .chain(self.swept.iter().map(|share| {
+                format!(
+                    "  operator={} swept_usdc={} served_bytes={}",
+                    share.operator,
+                    format_usdc(share.micro_usdc),
+                    share.served_bytes
+                )
+            }))
+            .collect::<Vec<_>>()
+            .join("\n"),
+            ("dry_run", _) => format!("{base} (dry run: would sweep)"),
+            _ => format!("{base} (below minSweep; nothing sent)"),
+        }
+    }
 }
 
 /// `decdn node sweep`.
 ///
 /// # Errors
 ///
-/// A pool or keystore that does not resolve, an RPC on another chain, a
-/// failed read, or a sweep that reverts or does not confirm.
+/// A pool, keystore or `--with` address that does not resolve, an RPC on
+/// another chain, a failed read, a batch over `MAX_SWEEP_BATCH()`, or a sweep
+/// that reverts or does not confirm.
 pub async fn sweep(args: &cli::SweepArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     let op = resolve_operator(&args.operator, global_config)?;
     let pools = chain_pools(&args.payment, &op.file)?;
+    let others = args
+        .with
+        .iter()
+        .map(|raw| chain_ctx::parse_nonzero_address(raw, "--with"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let signer =
         chain_ctx::load_signer_with_password_file(op.password_file.as_deref(), &op.keystore)
             .await?;
-    let operator = signer.address();
+    let operators: Vec<Address> = std::iter::once(signer.address()).chain(others).collect();
     let mut lines = Vec::with_capacity(pools.len());
     for pool in &pools {
-        lines.push(sweep_pool(pool, &signer, operator, args.operator.dry_run).await?);
+        lines.push(sweep_pool(pool, &signer, &operators, args.operator.dry_run).await?);
     }
-    print_lines(&lines, args.operator.json, |line| {
-        let base = format!(
-            "pool={} pending_usdc={} min_sweep_usdc={}",
-            line.pool,
-            format_usdc(line.pending_micro_usdc),
-            format_usdc(line.min_sweep_micro_usdc)
-        );
-        match (line.outcome, &line.tx) {
-            ("swept", Some(tx)) => format!(
-                "{base} tx={tx} swept_usdc={} served_bytes={}",
-                format_usdc(line.swept_micro_usdc.unwrap_or(0)),
-                line.served_bytes.unwrap_or(0)
-            ),
-            ("dry_run", _) => format!("{base} (dry run: would sweep)"),
-            _ => format!("{base} (below minSweep; nothing sent)"),
-        }
-    })
+    print_lines(&lines, args.operator.json, SweepLine::text)
 }
 
-/// Read one pool's share and send its sweep when the plan says so.
+/// Read the listed operators' shares in one pool and send the batch's sweep
+/// when the plan says so.
 async fn sweep_pool(
     pool: &PaymentPoolChain,
     signer: &alloy::signers::local::PrivateKeySigner,
-    operator: Address,
+    operators: &[Address],
     dry_run: bool,
 ) -> anyhow::Result<SweepLine> {
     let account = pool.deployment.pool_account().to_string();
     let provider = decdn_client::provider::build_provider(&pool.rpc_url, signer)?;
     ensure_chain(&provider, pool.deployment.chain_id, &account).await?;
     let contract = PaymentPool::new(pool.deployment.payment_pool, &provider);
-    let pending = bounded(
-        "PaymentPool.pending(operator)",
-        contract.pending(operator).call(),
+    let mut pending = Vec::with_capacity(operators.len());
+    for &operator in operators {
+        let share = bounded(
+            "PaymentPool.pending(operator)",
+            contract.pending(operator).call(),
+        )
+        .await?;
+        pending.push(PendingShare {
+            operator,
+            micro_usdc: u64::try_from(share.usdcAmount).unwrap_or(u64::MAX),
+        });
+    }
+    let min_sweep = bounded("PaymentPool.minSweep()", contract.minSweep().call()).await?;
+    let max_batch = bounded(
+        "PaymentPool.MAX_SWEEP_BATCH()",
+        contract.MAX_SWEEP_BATCH().call(),
     )
     .await?;
-    let pending_micro = u64::try_from(pending.usdcAmount).unwrap_or(u64::MAX);
-    let min_sweep = bounded("PaymentPool.minSweep()", contract.minSweep().call()).await?;
+    let plan = plan_sweep(
+        &pending,
+        min_sweep,
+        usize::try_from(max_batch).unwrap_or(usize::MAX),
+    )
+    .with_context(|| format!("sweeping {account}"))?;
+    let total = match &plan {
+        SweepPlan::Send { total, .. } | SweepPlan::Below { total, .. } => *total,
+    };
     let mut line = SweepLine {
         pool: account.clone(),
         outcome: "below_min_sweep",
-        pending_micro_usdc: pending_micro,
+        pending,
+        total_micro_usdc: total,
         min_sweep_micro_usdc: min_sweep,
         tx: None,
-        swept_micro_usdc: None,
-        served_bytes: None,
+        swept: Vec::new(),
+        sent_micro_usdc: None,
+        max_fee_micro_usdc: None,
     };
-    if let SweepPlan::Below { .. } = plan_sweep(pending_micro, min_sweep) {
+    let SweepPlan::Send { operators, .. } = plan else {
         return Ok(line);
-    }
+    };
     if dry_run {
         line.outcome = "dry_run";
         return Ok(line);
     }
     let mut outcome = SendOutcome::NotSent;
     let receipt = send_for_receipt(
-        contract.sweep(operator),
+        contract.sweep(operators),
         &format!("PaymentPool.sweep on {account}"),
-        Some("re-run `decdn node sweep`: a share already swept reads as below minSweep"),
+        Some("re-run `decdn node sweep`: a share already swept reads as nothing pending"),
         &mut outcome,
     )
     .await?;
-    let swept = swept_from_receipt(&receipt, pool.deployment.payment_pool, operator)
-        .context("the sweep landed but its receipt carries no Swept event for this operator")?;
+    let sent = sweep_sent_from_receipt(&receipt, pool.deployment.payment_pool)
+        .context("the sweep landed but its receipt carries no SweepSent event")?;
     line.outcome = "swept";
     line.tx = Some(format!("{:#x}", receipt.transaction_hash));
-    line.swept_micro_usdc = Some(u64::try_from(swept.amount).unwrap_or(u64::MAX));
-    line.served_bytes = Some(u64::try_from(swept.servedBytes).unwrap_or(u64::MAX));
+    line.swept = swept_from_receipt(&receipt, pool.deployment.payment_pool)
+        .into_iter()
+        .map(|swept| SweptShare {
+            operator: swept.operator,
+            micro_usdc: u64::try_from(swept.amount).unwrap_or(u64::MAX),
+            served_bytes: u64::try_from(swept.servedBytes).unwrap_or(u64::MAX),
+        })
+        .collect();
+    line.sent_micro_usdc = Some(u64::try_from(sent.amount).unwrap_or(u64::MAX));
+    line.max_fee_micro_usdc = Some(u64::try_from(sent.maxFee).unwrap_or(u64::MAX));
     Ok(line)
 }
 
@@ -320,6 +457,11 @@ pub(crate) struct ReceiveLine {
     /// `received`, `already_received`, `pending`, `dry_run` or
     /// `not_for_receiver`.
     pub(crate) outcome: String,
+    /// How many operators the sweep message carries, from its hook data.
+    pub(crate) batch_operators: Option<usize>,
+    /// This operator's entry in the message's hook data, micro-USDC, before
+    /// any bridge fee.
+    pub(crate) share_micro_usdc: Option<u64>,
     /// The `receiveSweep` transaction, when one was sent.
     pub(crate) receive_tx: Option<String>,
 }
@@ -401,6 +543,7 @@ pub async fn receive_sweeps(
             })
             .collect::<anyhow::Result<Vec<_>>>()?
     };
+    let sweeps = distinct(sweeps);
     if sweeps.is_empty() {
         println!("no sweep transactions found for {operator}");
         return Ok(());
@@ -413,6 +556,7 @@ pub async fn receive_sweeps(
         &sweeps,
         &Receiving {
             governance: &governance,
+            operator,
             receiver,
             iris: &iris,
             client: &client,
@@ -421,21 +565,49 @@ pub async fn receive_sweeps(
         },
     )
     .await?;
-    print_lines(&lines, args.operator.json, |line| {
-        let tx = line
+    print_lines(&lines, args.operator.json, ReceiveLine::text)
+}
+
+impl ReceiveLine {
+    /// The human-readable form.
+    fn text(&self) -> String {
+        let tx = self
             .receive_tx
             .as_deref()
             .map(|tx| format!(" receive_tx={tx}"))
             .unwrap_or_default();
+        let batch = self
+            .batch_operators
+            .map(|n| format!(" batch_operators={n}"))
+            .unwrap_or_default();
+        let share = self
+            .share_micro_usdc
+            .map(|micro| format!(" share_usdc={}", format_usdc(micro)))
+            .unwrap_or_default();
         format!(
-            "pool={} sweep_tx={} outcome={}{tx}",
-            line.pool, line.sweep_tx, line.outcome
+            "pool={} sweep_tx={} outcome={}{batch}{share}{tx}",
+            self.pool, self.sweep_tx, self.outcome
         )
-    })
+    }
+}
+
+/// `sweeps` with each `(pool, tx)` kept once, in first-seen order. A batch
+/// transaction is one CCTP message whatever the operators it carries, so it
+/// is received once.
+pub(crate) fn distinct(sweeps: Vec<SweepTx>) -> Vec<SweepTx> {
+    let mut out: Vec<SweepTx> = Vec::with_capacity(sweeps.len());
+    for sweep in sweeps {
+        if !out.contains(&sweep) {
+            out.push(sweep);
+        }
+    }
+    out
 }
 
 /// Scan every pool for the operator's `Swept` events and return their
-/// transactions in chain order, pool by pool.
+/// transactions in chain order, pool by pool. A batch that carried the
+/// operator's share is found whoever sent it, since `Swept` indexes the
+/// operator.
 async fn find_sweeps(
     select: &cli::PoolSelectArgs,
     from_block: Option<u64>,
@@ -485,6 +657,8 @@ async fn find_sweeps(
 pub(crate) struct Receiving<'a, P> {
     /// Wallet provider on the governance chain.
     pub(crate) governance: &'a P,
+    /// The operator whose share each line reports.
+    pub(crate) operator: Address,
     /// The `CctpSweepReceiver`.
     pub(crate) receiver: Address,
     /// The Iris base URL.
@@ -553,10 +727,18 @@ pub(crate) async fn receive_one<P: Provider + Clone>(
                 sweep.tx
             )
         })?;
+    let shares = message_sent(receipt).and_then(|message| sweep_shares(&message));
     let line = |outcome: &str, receive_tx: Option<String>| ReceiveLine {
         pool: account.clone(),
         sweep_tx: format!("{:#x}", sweep.tx),
         outcome: outcome.to_owned(),
+        batch_operators: shares.as_ref().map(Vec::len),
+        share_micro_usdc: shares.as_ref().and_then(|shares| {
+            shares
+                .iter()
+                .find(|share| share.operator == on.operator)
+                .map(|share| u64::try_from(share.amount).unwrap_or(u64::MAX))
+        }),
         receive_tx,
     };
     let messages = match fetch_messages(on.client, on.iris, domain, sweep.tx, on.wait).await? {

@@ -65,15 +65,18 @@ pub enum NodeCommand {
     Earnings(EarningsArgs),
     /// Send the operator's pending protocol share to the governance chain
     /// (ADR 003 § Redemption-path interface). For each payment pool it reads
-    /// `pending(operator)` and `minSweep()`, and calls `sweep(operator)` when
-    /// the share has reached `minSweep`. The sweep burns the USDC over CCTP;
-    /// `decdn node receive-sweeps` completes it on the governance chain.
+    /// `pending` for the operator and every `--with` operator, and
+    /// `minSweep()`, and calls `sweep(operators)` with the operators that
+    /// have a share once the batch total reaches `minSweep`. The sweep burns
+    /// the USDC over CCTP; `decdn node receive-sweeps` completes it on the
+    /// governance chain.
     Sweep(SweepArgs),
     /// Complete the operator's sweeps on the governance chain. For each sweep
-    /// transaction it fetches the CCTP message and attestation from Circle's
-    /// attestation service (Iris), waits while the attestation is pending,
-    /// and calls `CctpSweepReceiver.receiveSweep`. A sweep already received
-    /// is skipped.
+    /// transaction that carried the operator's share it fetches the CCTP
+    /// message and attestation from Circle's attestation service (Iris) once,
+    /// waits while the attestation is pending, and calls
+    /// `CctpSweepReceiver.receiveSweep` once per message. A sweep already
+    /// received, by this operator or another one in the batch, is skipped.
     ReceiveSweeps(ReceiveSweepsArgs),
     /// Print every slash the node's watcher has detected against its own
     /// operator via `admin_v1_slashes` (#1032, G-NODE-05): per slash the
@@ -414,6 +417,13 @@ pub struct SweepArgs {
     /// The pools to sweep. Every configured pool without `--pool`.
     #[command(flatten)]
     pub payment: super::common::PoolSelectArgs,
+
+    /// Another operator to sweep in the same batch, so the operators share
+    /// one CCTP transfer and one receive on the governance chain. Repeat for
+    /// several (one batch holds at most `MAX_SWEEP_BATCH()` operators,
+    /// including this one). An operator with nothing pending is left out.
+    #[arg(long = "with", value_name = "ADDRESS")]
+    pub with: Vec<String>,
 
     /// The operator keystore, data dir, config file and output flags. The
     /// keystore pays the gas and names the operator whose share is swept.

@@ -1,5 +1,5 @@
 use alloy::primitives::{Address, B256, U256};
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolError, SolEvent};
 
 use alloy::sol_types::SolCall;
 
@@ -382,7 +382,19 @@ fn signer_authorization_covers_a_floor_within_headroom_and_expiry() {
 fn sweep_event_signatures_match_contracts() {
     assert_eq!(
         PaymentPool::Swept::SIGNATURE,
-        "Swept(address,uint256,uint256,uint256)"
+        "Swept(address,uint256,uint256)"
+    );
+    assert_eq!(
+        PaymentPool::SweepSent::SIGNATURE,
+        "SweepSent(uint256,uint256)"
+    );
+    assert_eq!(
+        PaymentPool::BelowMinSweep::SIGNATURE,
+        "BelowMinSweep(uint256,uint256)"
+    );
+    assert_eq!(
+        PaymentPool::BadSweepBatch::SIGNATURE,
+        "BadSweepBatch(uint256)"
     );
     assert_eq!(
         super::FeeRouter::Deposited::SIGNATURE,
@@ -401,7 +413,11 @@ fn pool_immutable_selectors_match_contract() {
     assert_eq!(PaymentPool::operatorBpsCall::SIGNATURE, "operatorBps()");
     assert_eq!(PaymentPool::sweepDomainCall::SIGNATURE, "sweepDomain()");
     assert_eq!(PaymentPool::pendingCall::SIGNATURE, "pending(address)");
-    assert_eq!(PaymentPool::sweepCall::SIGNATURE, "sweep(address)");
+    assert_eq!(PaymentPool::sweepCall::SIGNATURE, "sweep(address[])");
+    assert_eq!(
+        PaymentPool::MAX_SWEEP_BATCHCall::SIGNATURE,
+        "MAX_SWEEP_BATCH()"
+    );
     assert_eq!(
         super::CctpSweepReceiver::receiveSweepCall::SIGNATURE,
         "receiveSweep(bytes,bytes)"

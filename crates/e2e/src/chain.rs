@@ -1089,16 +1089,15 @@ impl ChainFixture {
         Ok(swept.saturating_add(pending.servedBytes))
     }
 
-    /// Carry `operator`'s pending protocol share and served bytes to
-    /// `FeeRouter`, as `decdn node sweep` and `decdn node receive-sweeps` do:
-    /// `PaymentPool.sweep(operator)` burns through the loopback CCTP, and
-    /// `CctpSweepReceiver.receiveSweep` delivers its message (the loopback
-    /// accepts any non-empty attestation). The served bytes then count in
-    /// `FeeRouter`'s epoch counter, which governance vote weight reads.
-    pub async fn sweep(&self, operator: Address) -> anyhow::Result<()> {
-        use decdn_incentive::payment_pool::{CctpSweepReceiver, MessageTransmitterV2};
+    /// Carry the listed operators' pending protocol shares and served bytes
+    /// to `FeeRouter` in one batch, as `decdn node sweep` and
+    /// `decdn node receive-sweeps` do: `PaymentPool.sweep(operators)` burns
+    /// through the loopback CCTP, and [`Self::receive_sweep`] delivers its
+    /// message. The served bytes then count in `FeeRouter`'s epoch counter,
+    /// which governance vote weight reads.
+    pub async fn sweep(&self, operators: &[Address]) -> anyhow::Result<()> {
         let receipt = crate::bindings::PaymentPool::new(self.addrs.payment_pool, &self.admin)
-            .sweep(operator)
+            .sweep(operators.to_vec())
             .send()
             .await
             .context("PaymentPool.sweep send")?
@@ -1106,6 +1105,21 @@ impl ChainFixture {
             .await
             .context("PaymentPool.sweep receipt")?;
         crate::ensure_mined(&receipt, "PaymentPool.sweep")?;
+        self.receive_sweep(receipt.transaction_hash).await
+    }
+
+    /// Deliver the CCTP message of the sweep transaction `sweep_tx` with
+    /// `CctpSweepReceiver.receiveSweep` (the loopback accepts any non-empty
+    /// attestation), as `decdn node receive-sweeps` does after Circle
+    /// attests it.
+    pub async fn receive_sweep(&self, sweep_tx: B256) -> anyhow::Result<()> {
+        use decdn_incentive::payment_pool::{CctpSweepReceiver, MessageTransmitterV2};
+        let receipt = self
+            .admin
+            .get_transaction_receipt(sweep_tx)
+            .await
+            .context("the sweep receipt")?
+            .with_context(|| format!("sweep {sweep_tx:#x} has no receipt"))?;
         let message = receipt
             .logs()
             .iter()

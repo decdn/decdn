@@ -40,16 +40,17 @@
 //!   signer's capability in the same call) and `redeemMany` (register a
 //!   batch of capabilities, then redeem a batch of vouchers, in one
 //!   transaction — the node's redeem sweep collapses a tick's redemptions
-//!   into one tx), and `sweep(operator)` (anyone may send an operator's
-//!   pending protocol share over CCTP to the governance chain's
-//!   `CctpSweepReceiver` once it reaches `minSweep`);
+//!   into one tx), and `sweep(operators)` (anyone may send the pending
+//!   protocol shares of up to `MAX_SWEEP_BATCH()` operators over CCTP to the
+//!   governance chain's `CctpSweepReceiver` in one transfer once the batch
+//!   total reaches `minSweep`);
 //! - events: `PoolOpened` (the buyer decodes its pool id from the open
 //!   receipt), `PoolToppedUp`, `PoolRedeemed` (one per pool group of a
 //!   `redeemMany`; the seller decodes its paid watermarks from its own
 //!   receipts), `PoolCloseInitiated` (the owner started the grace-window
 //!   close), `PoolReclaimed` (the residual was refunded and the pool is now
-//!   closed), and `Swept` (an operator's pending share left for the
-//!   governance chain).
+//!   closed), `Swept` (one per operator whose pending share left for the
+//!   governance chain) and `SweepSent` (one per batch: its total and fee).
 //!
 //! The capability/voucher EIP-712 domain (name `"PaymentPool"`, version
 //! `"1"`) lives in [`crate::voucher`]; the `capability` argument to `redeem`
@@ -320,10 +321,25 @@ mod sol_types {
             /// `pending(msg.sender)`.
             function redeemMany(PoolBatch[] calldata batches) external returns (uint256 totalPaid);
 
-            /// Permissionless: send `operator`'s pending protocol share and its
-            /// served bytes over CCTP to the governance chain's
-            /// `CctpSweepReceiver`. Reverts `BelowMinSweep` under `minSweep`.
-            function sweep(address operator) external;
+            /// One swept operator's entry in a sweep's CCTP hook data,
+            /// `abi.encode(SweepShare[])`, in `sweep` input order. Field
+            /// order is part of the ABI tuple; do not rearrange.
+            struct SweepShare {
+                address operator;
+                uint256 servedBytes;
+                uint256 amount;
+            }
+
+            /// Most operators one `sweep` carries.
+            function MAX_SWEEP_BATCH() external view returns (uint256);
+
+            /// Permissionless: send the pending protocol shares and served
+            /// bytes of 1 to `MAX_SWEEP_BATCH` operators over CCTP to the
+            /// governance chain's `CctpSweepReceiver` in one transfer. Skips
+            /// an operator with nothing pending. Reverts `BadSweepBatch` on
+            /// an empty or over-long list, and `BelowMinSweep` when the batch
+            /// total is zero or under `minSweep`.
+            function sweep(address[] calldata operators) external;
 
             // -----------------------------------------------------------------
             // Events
@@ -367,8 +383,18 @@ mod sol_types {
             event PoolReclaimed(bytes32 indexed poolId, address indexed owner, uint256 ownerRefund);
 
             /// `sweep` sent `amount` and `servedBytes` for `operator` to the
-            /// governance chain. `maxFee` is the bridge fee the sweep allowed.
-            event Swept(address indexed operator, uint256 servedBytes, uint256 amount, uint256 maxFee);
+            /// governance chain. One per swept operator in the batch.
+            event Swept(address indexed operator, uint256 servedBytes, uint256 amount);
+
+            /// `sweep` burned the batch total `amount` over CCTP. `maxFee` is
+            /// the bridge fee the sweep allowed. One per batch.
+            event SweepSent(uint256 amount, uint256 maxFee);
+
+            /// A sweep batch total is zero or under `minSweep`.
+            error BelowMinSweep(uint256 total, uint256 minSweep);
+
+            /// A sweep batch is empty or longer than `MAX_SWEEP_BATCH`.
+            error BadSweepBatch(uint256 length);
         }
     }
 
@@ -407,9 +433,9 @@ mod sol_types {
     alloy::sol! {
         #[sol(rpc)]
         contract CctpSweepReceiver {
-            /// Receive one attested CCTP sweep and deposit the minted USDC
-            /// into `FeeRouter` for the operator named in the hook data.
-            /// Permissionless. Mirrors `contracts/src/CctpSweepReceiver.sol`.
+            /// Receive one attested CCTP sweep batch and deposit the minted
+            /// USDC into `FeeRouter`, pro rata, for each operator in the hook
+            /// data. Permissionless. Mirrors `contracts/src/CctpSweepReceiver.sol`.
             function receiveSweep(bytes calldata message, bytes calldata attestation) external;
 
             /// The `FeeRouter` every sweep is deposited into.
@@ -419,8 +445,9 @@ mod sol_types {
             /// attestation and marks its nonce used.
             function messageTransmitter() external view returns (address);
 
-            /// One sweep landed. `pool` is the burn's `messageSender` and
-            /// `amount` the USDC deposited into `FeeRouter`.
+            /// One operator's entry of a sweep batch landed. `pool` is the
+            /// burn's `messageSender` and `amount` the USDC deposited into
+            /// `FeeRouter` for `operator`.
             event SweepReceived(uint32 indexed sourceDomain, address indexed pool, address indexed operator, uint256 amount);
         }
     }
