@@ -670,6 +670,7 @@ fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result
          publisher_registry_address  = \"{publisher_registry}\"\n\
          slash_appeal_address        = \"{slash_appeal}\"\n\
          cctp_sweep_receiver_address = \"{cctp_sweep_receiver}\"\n\
+         cctp_iris_url               = \"{iris}\"\n\
          # Optional tuning knobs (economics, poll intervals) are commented in the\n\
          # blank template — see `decdn config init --chain none`.\n\
          {payment}\n",
@@ -683,6 +684,7 @@ fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result
         publisher_registry = a.publisher_registry,
         slash_appeal = a.slash_appeal,
         cctp_sweep_receiver = a.cctp_sweep_receiver,
+        iris = chain.cctp_iris_url,
         payment = render_payment_chains(chain)?,
     ))
 }
@@ -1012,6 +1014,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
 # slash_appeal_address = ""          # `decdn appeal slash` target (ADR 028)
 # cctp_sweep_receiver_address = ""   # governance-chain CctpSweepReceiver; `decdn node receive-sweeps` submits attested sweeps to it
+# cctp_iris_url = ""                 # Circle CCTP attestation service base URL for `decdn node receive-sweeps` (https://iris-api-sandbox.circle.com on testnets, https://iris-api.circle.com on mainnet)
 # Payment chains: one table per chain, after every other [blockchain] key (at
 # least one; no pool twice). Settlement token = each pool's own usdc().
 # [[blockchain.payment_chains]]

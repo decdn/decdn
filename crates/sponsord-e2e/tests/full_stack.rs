@@ -132,8 +132,10 @@ async fn the_installer_gets_a_capability_through_the_gate_and_runs_decdn() {
 
     let calls = std::fs::read_to_string(stub.join("calls")).unwrap();
     assert!(calls.starts_with(&format!("get decdn:{HASH}/ ")));
-    assert!(calls.contains(&format!("--payment-pool-address {TEST_PAYMENT_POOL}")));
-    assert!(calls.contains(&format!("--chain-id {TEST_CHAIN_ID}")));
+    assert!(calls.contains(&format!(
+        "--pool eip155:{TEST_CHAIN_ID}:{TEST_PAYMENT_POOL}"
+    )));
+    assert!(calls.contains(&format!("--governance-chain-id {TEST_CHAIN_ID}")));
     assert!(!state_dir.exists(), "state is deleted after a good pull");
 
     // decdn got the capability the daemon signed for the script's key, as

@@ -188,3 +188,41 @@ fn capability_token_from_file_is_trimmed() {
         "--capability and --capability-file are mutually exclusive"
     );
 }
+
+/// The governance chain and the payment pool have their own flags.
+#[test]
+fn governance_and_pool_flags_parse_apart() {
+    let parsed = parse(&[
+        "--governance-rpc-url",
+        "http://gov",
+        "--governance-chain-id",
+        "11155111",
+        "--pool",
+        "eip155:421614:0x00000000000000000000000000000000000000aa",
+        "--pool-rpc-url",
+        "http://pay",
+    ]);
+    assert_eq!(
+        parsed.governance.governance_rpc_url.as_deref(),
+        Some("http://gov")
+    );
+    assert_eq!(parsed.governance.governance_chain_id, Some(11_155_111));
+    assert_eq!(
+        parsed.payment.pool.as_deref(),
+        Some("eip155:421614:0x00000000000000000000000000000000000000aa")
+    );
+    assert_eq!(parsed.payment.pool_rpc_url.as_deref(), Some("http://pay"));
+}
+
+/// `--pool-rpc-url` names the RPC of `--pool`'s chain, so it needs `--pool`.
+/// The single-chain flags are gone.
+#[test]
+fn pool_rpc_url_requires_pool_and_old_flags_are_gone() {
+    assert!(TestCli::try_parse_from(["test", "--pool-rpc-url", "http://pay"]).is_err());
+    for flag in ["--rpc-url", "--payment-pool-address", "--chain-id"] {
+        assert!(
+            TestCli::try_parse_from(["test", flag, "1"]).is_err(),
+            "{flag} must be gone"
+        );
+    }
+}

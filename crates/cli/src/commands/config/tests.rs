@@ -81,6 +81,7 @@ fn default_config_template_covers_every_wired_field() {
         eth_keystore,
         payment_chains,
         cctp_sweep_receiver_address,
+        cctp_iris_url,
         capacity_bond_address,
         origin_assignment_address,
         origin_directory_positive_ttl_sec,
@@ -121,6 +122,7 @@ fn default_config_template_covers_every_wired_field() {
             "cctp_sweep_receiver_address =",
             cctp_sweep_receiver_address.is_none(),
         ),
+        ("cctp_iris_url =", cctp_iris_url.is_none()),
         ("capacity_bond_address =", capacity_bond_address.is_none()),
         (
             "origin_assignment_address =",
@@ -369,6 +371,7 @@ fn render_config_for_a_known_chain_is_runnable() {
     assert_eq!(bc.publisher_registry_address, Some(a.publisher_registry));
     assert_eq!(bc.slash_appeal_address, Some(a.slash_appeal));
     assert_eq!(bc.cctp_sweep_receiver_address, Some(a.cctp_sweep_receiver));
+    assert_eq!(bc.cctp_iris_url.as_deref(), Some(chain.cctp_iris_url));
     assert_payment_chains(&bc, chain);
 
     // Splicing preserved the other sections.

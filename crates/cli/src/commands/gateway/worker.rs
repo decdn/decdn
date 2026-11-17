@@ -729,7 +729,7 @@ async fn rebuild_pool_payer<B: Backend>(
         closed = %replaced.closed,
         opened = %replaced.opened,
         "the gateway's pool was replaced; once its dispute window ends, reclaim the closed \
-         pool with `decdn pool reclaim --pool {}`",
+         pool with `decdn pool reclaim --pool-id {}`",
         replaced.closed
     );
     match backend.pool_payer(host).await {

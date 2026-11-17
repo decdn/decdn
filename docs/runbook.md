@@ -561,8 +561,8 @@ diagnostic.
    (`buyer pool store read failed before on-chain reconciliation`). Any of the
    three means the answer is unknown, not clean — fix the cause and restart to
    re-run the sweep.
-3. Recover those with `decdn pool close --pool <poolId>`, then
-   `decdn pool reclaim --pool <poolId>` once the pool's `disputeWindow` has
+3. Recover those with `decdn pool close --pool-id <poolId>`, then
+   `decdn pool reclaim --pool-id <poolId>` once the pool's `disputeWindow` has
    elapsed (48-72h, governance-set). Both commands run their on-chain leg
    normally from a node host but leave the daemon's row alone — they cannot
    write a store the daemon holds — and say so.
@@ -969,6 +969,38 @@ must hold code that answers `PaymentPool.getRateBounds()`, a view only
 the same deploy manifest — aborts boot instead of triggering the drop. Buyer pool rows are not dropped by this path. Each
 buyer row carries its own chain id and `PaymentPool` address, and the buyer
 ignores a row from another deployment.
+
+## Sweeping the protocol share
+
+Each `redeemMany` pays the operator share on the payment chain at once. The
+pool keeps the protocol share as `pending(operator)` until a sweep sends it
+over CCTP to the governance chain's `CctpSweepReceiver`, which deposits it into
+`FeeRouter`. The sweep carries the operator's rebate and its vote weight. The
+daemon does not sweep: run it by hand, about once per epoch.
+
+1. Check what each pool holds: `decdn node earnings` prints one `pool …` line
+   per `PaymentPool` with the pending protocol share and `minSweep`.
+2. Send it: `decdn node sweep` reads `pending(operator)` and `minSweep()` on
+   every configured pool and calls `sweep(operator)` where the share has
+   reached `minSweep`. `--pool eip155:<chainId>:<address>` sweeps one pool;
+   `--dry-run` sends nothing. The operator keystore pays the gas on each
+   payment chain.
+3. Complete it on the governance chain: `decdn node receive-sweeps` scans each
+   pool for the operator's `Swept` events (from the known deployment block, or
+   `--from-block`), reads each message and attestation from Circle's
+   attestation service (`blockchain.cctp_iris_url` or `--iris`; the sandbox
+   `https://iris-api-sandbox.circle.com` on testnets), and calls
+   `CctpSweepReceiver.receiveSweep`. A standard transfer waits for
+   source-chain finality, so the attestation can stay pending for many
+   minutes: the command waits about half an hour, then reports `pending`, and
+   a re-run completes it. A sweep already received reports
+   `already_received`. To complete one known sweep, pass
+   `--pool <caip10> --tx <sweep tx hash>`.
+
+The command needs `blockchain.cctp_sweep_receiver_address` (or
+`--cctp-sweep-receiver-address`). `decdn node doctor` checks that each pool's
+`sweepRecipient()` equals it: a mismatch means the pool belongs to another
+deployment, and its sweeps land where this governance chain never sees them.
 
 ## Testnet faucet
 

@@ -182,6 +182,10 @@ pub struct BlockchainConfig {
     /// payment pool's CCTP sweep lands. Optional; read only by the CLI command
     /// that submits attested sweeps.
     pub cctp_sweep_receiver_address: Option<String>,
+    /// Base URL of Circle's CCTP attestation service (Iris), such as
+    /// `https://iris-api.circle.com`. Optional; read only by the CLI command
+    /// that submits attested sweeps, which defaults to the known target's.
+    pub cctp_iris_url: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
     /// `OriginAssignment` contract address. Optional: when set, the node runs the

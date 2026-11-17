@@ -396,23 +396,33 @@ fn check_chain_against(
         )
     })?;
     let mut faults = Vec::new();
-    let known_pools = known
-        .payment_chains()?
-        .into_iter()
-        .flat_map(|payment| payment.payment_pools)
+    let payment = known.payment_chains()?;
+    let payment_chain = payment
+        .iter()
+        .find(|p| p.chain_id == chain.payment_chain_id);
+    if payment_chain.is_none() {
+        faults.push(format!(
+            "payment_chain_id {} is not one of chain {}'s payment chains in this build",
+            chain.payment_chain_id, chain.chain_id
+        ));
+    }
+    let known_pools = payment_chain
+        .map(|p| p.payment_pools.as_slice())
+        .unwrap_or_default()
+        .iter()
         .map(|pool| {
             pool.parse::<Address>().with_context(|| {
                 format!(
-                    "this build's payment_pool for chain {} is not an address: {pool:?}",
-                    chain.chain_id
+                    "this build's payment_pool for payment chain {} is not an address: {pool:?}",
+                    chain.payment_chain_id
                 )
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    if !known_pools.contains(&chain.payment_pool) {
+    if payment_chain.is_some() && !known_pools.contains(&chain.payment_pool) {
         faults.push(format!(
-            "payment_pool {} is not one of chain {}'s payment pools in this build",
-            chain.payment_pool, chain.chain_id
+            "payment_pool {} is not one of payment chain {}'s pools in this build",
+            chain.payment_pool, chain.payment_chain_id
         ));
     }
     let raw_judge = &addresses.slash_judge;
@@ -523,18 +533,23 @@ async fn settle_file(args: &ReceiptSettleArgs, config_path: Option<&Path>) -> an
             faults.len()
         );
     }
-    let chain_id = receipt.chain.chain_id;
     if !chain_known {
-        eprintln!("note: {}", unknown_chain_note(chain_id));
+        eprintln!("note: {}", unknown_chain_note(receipt.chain.chain_id));
     }
-    let known = known_chains::by_chain_id(chain_id);
-    let (rpc_url, span) = settle_coordinates(args, chain_id, config_path)?;
+    // The redemptions land on the pool's payment chain, not the governance
+    // chain the stream responses sign for.
+    let chain_id = receipt.chain.payment_chain_id;
+    let known_payment = known_chains::by_chain_id(receipt.chain.chain_id)
+        .map(known_chains::KnownChain::payment_chains)
+        .transpose()?
+        .and_then(|chains| chains.into_iter().find(|p| p.chain_id == chain_id));
+    let (rpc_url, span) = settle_coordinates(args, chain_id, known_payment.as_ref(), config_path)?;
     let provider = decdn_client::provider::build_read_provider(&rpc_url)?;
     let rpc_chain_id = bounded("eth_chainId", provider.get_chain_id()).await?;
     anyhow::ensure!(
         rpc_chain_id == chain_id,
-        "the RPC serves chain {rpc_chain_id}, but the receipt is for chain {chain_id}; pass \
-         --rpc-url for that chain"
+        "the RPC serves chain {rpc_chain_id}, but the receipt's pool is on payment chain \
+         {chain_id}; pass --rpc-url for that chain"
     );
     let head = bounded("the latest block number", provider.get_block_number()).await?;
     let from = if let Some(block) = args.from_block {
@@ -546,7 +561,7 @@ async fn settle_file(args: &ReceiptSettleArgs, config_path: Option<&Path>) -> an
                 receipt.window.started
             )
         })?;
-        let floor = known.map_or(0, |k| k.l2_start_block);
+        let floor = known_payment.as_ref().map_or(0, |k| k.start_block);
         block_at_or_after(
             &provider,
             started.saturating_sub(CLOCK_SKEW_SECS),
@@ -597,12 +612,13 @@ async fn settle_file(args: &ReceiptSettleArgs, config_path: Option<&Path>) -> an
 }
 
 /// The RPC endpoint and the first `eth_getLogs` window span `settle` scans
-/// chain `chain_id` with: `--rpc-url`, else `blockchain.rpc_url` when the
-/// config names the same chain, else the chain's public RPC when this build
-/// knows it.
+/// payment chain `chain_id` with: `--rpc-url`, else the `rpc_url` of the
+/// configured `[[blockchain.payment_chains]]` entry with that chain id, else
+/// `known`'s public RPC.
 fn settle_coordinates(
     args: &ReceiptSettleArgs,
     chain_id: u64,
+    known: Option<&known_chains::PaymentChainAddresses>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<(String, NonZeroU64)> {
     let file = chain_ctx::load_optional_config(config_path)?;
@@ -610,12 +626,15 @@ fn settle_coordinates(
         .rpc_url
         .clone()
         .or_else(|| {
-            (file.chain_id() == Some(chain_id))
-                .then(|| file.rpc_url().map(str::to_owned))
-                .flatten()
+            file.payment_chains()
+                .iter()
+                .find(|entry| entry.chain_id == Some(chain_id))
+                .and_then(|entry| entry.rpc_url.clone())
         })
-        .or_else(|| known_chains::by_chain_id(chain_id).map(|k| k.public_rpc.to_owned()))
-        .ok_or_else(|| anyhow::anyhow!("no RPC is known for chain {chain_id}; pass --rpc-url"))?;
+        .or_else(|| known.map(|k| k.public_rpc.to_owned()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no RPC is known for payment chain {chain_id}; pass --rpc-url")
+        })?;
     let span = NonZeroU64::new(
         file.get_logs_max_block_span()
             .unwrap_or(DEFAULT_GET_LOGS_MAX_BLOCK_SPAN),

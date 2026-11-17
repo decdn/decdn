@@ -49,6 +49,11 @@ pub struct KnownChain {
     /// Where an operator gets this target's payment token, for a target that
     /// has a public faucet. `decdn setup` points an unfunded buyer wallet here.
     pub usdc_faucet: Option<&'static str>,
+    /// Base URL of Circle's CCTP attestation service (Iris) for this target:
+    /// the sandbox for a testnet, production for mainnet. `decdn node
+    /// receive-sweeps` reads it when the config sets no
+    /// `blockchain.cctp_iris_url`.
+    pub cctp_iris_url: &'static str,
     /// The embedded governance manifest `deployments/<chainId>.json`.
     pub(crate) governance_manifest: &'static str,
     /// The payment chains, in the order `config init` writes them.
@@ -64,6 +69,10 @@ pub struct KnownPaymentChain {
     pub chain_id: u64,
     /// The payment chain's public JSON-RPC endpoint.
     pub public_rpc: &'static str,
+    /// The block the `PaymentPool` was created in: where a from-genesis log
+    /// scan of the pool starts (`decdn node earnings --address`, `decdn node
+    /// receive-sweeps`). Update it with the manifest on a redeploy.
+    pub start_block: u64,
     /// The embedded payment manifest `deployments/<chainId>-payment.json`.
     pub(crate) manifest: &'static str,
 }
@@ -110,6 +119,8 @@ pub struct PaymentChainAddresses {
     pub chain_id: u64,
     /// `rpc_url`: the payment chain's public endpoint.
     pub public_rpc: &'static str,
+    /// The block the pool was created in ([`KnownPaymentChain::start_block`]).
+    pub start_block: u64,
     /// `payment_pools`: the manifest's `PaymentPool`.
     pub payment_pools: Vec<String>,
     /// The payment token on this chain, the manifest's `externalDeps.usdc`.
@@ -191,6 +202,7 @@ pub(crate) fn parse_payment_manifest(
         label: chain.label,
         chain_id: chain.chain_id,
         public_rpc: chain.public_rpc,
+        start_block: chain.start_block,
         payment_pools: vec![manifest.contract("PaymentPool", &what)?],
         usdc,
     })

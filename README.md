@@ -384,7 +384,10 @@ daemon and its onramp are two more ([`docs/sponsord/`](docs/sponsord/README.md))
 The global `--config <path>` selects the config file, and every `decdn-node run` flag also
 reads a `DECDN_*` environment variable (`decdn-node run --help`). Every chain endpoint and
 contract address comes from the config file, and each command also accepts it as a flag
-(`--rpc-url`, `--*-address`). Operator terms accepted at registration live in
+(`--rpc-url`, `--*-address`). The payment commands (`get`, `gateway`, `quote`, `pool`, `node
+earnings`, `node sweep`, `node receive-sweeps`) name the governance chain with
+`--governance-rpc-url` / `--governance-chain-id` and one `PaymentPool` with
+`--pool eip155:<chainId>:<address>` and `--pool-rpc-url`. Operator terms accepted at registration live in
 [`crates/cli/TERMS.md`](crates/cli/TERMS.md), embedded verbatim in the CLI.
 
 </details>

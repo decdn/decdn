@@ -355,24 +355,6 @@ pub mod decdn_client::endpoint
 pub fn decdn_client::endpoint::client_discovery(core::option::Option<&std::path::Path>) -> anyhow::Result<decdn_common::config::resolved::ResolvedDiscovery>
 pub async fn decdn_client::endpoint::client_endpoint(&[iroh_base::relay_url::RelayUrl], &decdn_common::config::resolved::ResolvedDiscovery) -> anyhow::Result<iroh::endpoint::Endpoint>
 pub fn decdn_client::endpoint::resolve_relays(core::option::Option<&str>, core::option::Option<&std::path::Path>) -> anyhow::Result<alloc::vec::Vec<iroh_base::relay_url::RelayUrl>>
-pub mod decdn_client::pool_route
-pub struct decdn_client::pool_route::PoolPasses
-impl decdn_client::pool_route::PoolPasses
-pub fn decdn_client::pool_route::PoolPasses::admits(&self, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, core::option::Option<&[decdn_protocol::pool_account::PoolAccount]>) -> bool
-pub fn decdn_client::pool_route::PoolPasses::declined(&self, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, &[decdn_protocol::pool_account::PoolAccount])
-pub fn decdn_client::pool_route::PoolPasses::first<'h>(&self, impl core::iter::traits::collect::IntoIterator<Item = core::option::Option<&'h [decdn_protocol::pool_account::PoolAccount]>>) -> decdn_incentive::deployment::Deployment
-pub fn decdn_client::pool_route::PoolPasses::new(decdn_client::pool_route::PoolRoute) -> Self
-pub fn decdn_client::pool_route::PoolPasses::next(&self) -> core::option::Option<decdn_incentive::deployment::Deployment>
-pub const fn decdn_client::pool_route::PoolPasses::route(&self) -> &decdn_client::pool_route::PoolRoute
-pub fn decdn_client::pool_route::PoolPasses::start(&self, decdn_incentive::deployment::Deployment)
-pub struct decdn_client::pool_route::PoolRoute
-impl decdn_client::pool_route::PoolRoute
-pub fn decdn_client::pool_route::PoolRoute::choose(&self, core::option::Option<&[decdn_protocol::pool_account::PoolAccount]>) -> core::option::Option<decdn_incentive::deployment::Deployment>
-pub fn decdn_client::pool_route::PoolRoute::for_buyer(&decdn_client::session::ChainConfig, &dyn decdn_incentive::buyer_pool::BuyerPoolStore, core::option::Option<alloy_primitives::bits::address::Address>) -> anyhow::Result<Self>
-pub fn decdn_client::pool_route::PoolRoute::new(&[decdn_incentive::deployment::Deployment], impl core::ops::function::Fn(decdn_incentive::deployment::Deployment) -> bool) -> core::option::Option<Self>
-pub fn decdn_client::pool_route::PoolRoute::order(&self) -> &[decdn_incentive::deployment::Deployment]
-pub fn decdn_client::pool_route::PoolRoute::retry(&self, decdn_incentive::deployment::Deployment, &[decdn_protocol::pool_account::PoolAccount]) -> core::option::Option<decdn_incentive::deployment::Deployment>
-pub fn decdn_client::pool_route::PoolRoute::single(decdn_incentive::deployment::Deployment) -> Self
 pub mod decdn_client::probe
 pub struct decdn_client::probe::ProbeRtt
 pub decdn_client::probe::ProbeRtt::direct: bool

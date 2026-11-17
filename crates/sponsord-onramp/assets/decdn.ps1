@@ -345,10 +345,11 @@
       '--keystore', $KeystoreFile,
       '--keystore-password-file', $PasswordFile,
       '--data-dir', $DataDir,
-      '--rpc-url', $RpcUrl,
-      '--payment-pool-address', $PaymentPool,
+      '--governance-rpc-url', $RpcUrl,
+      '--pool', "eip155:${ChainId}:${PaymentPool}",
+      '--pool-rpc-url', $RpcUrl,
       '--capacity-bond-address', $CapacityBond,
-      '--chain-id', $ChainId
+      '--governance-chain-id', $ChainId
     )
     if ($SlashJudge) { $PullArgs += '--slash-judge-address', $SlashJudge }
 

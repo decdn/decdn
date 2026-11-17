@@ -350,10 +350,11 @@ get() {
     --keystore "${STATE}/keystore.json" \
     --keystore-password-file "${STATE}/password" \
     --data-dir "$data_dir" \
-    --rpc-url "$RPC_URL" \
-    --payment-pool-address "$PAYMENT_POOL" \
+    --governance-rpc-url "$RPC_URL" \
+    --pool "eip155:${CHAIN_ID}:${PAYMENT_POOL}" \
+    --pool-rpc-url "$RPC_URL" \
     --capacity-bond-address "$CAPACITY_BOND" \
-    --chain-id "$CHAIN_ID" \
+    --governance-chain-id "$CHAIN_ID" \
     ${SLASH_JUDGE:+--slash-judge-address "$SLASH_JUDGE"}
 
   umask "$user_umask"

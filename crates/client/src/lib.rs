@@ -235,6 +235,8 @@ pub mod pacer;
 #[doc(hidden)]
 pub mod peer_store;
 // Docs live in `pool_route.rs` as `//!`, for the same reason as `sink` below.
+// An engine seam: the fetch drives it, an SDK caller never does.
+#[doc(hidden)]
 pub mod pool_route;
 /// Reusable `cdn/probe/v1` client.
 pub mod probe;

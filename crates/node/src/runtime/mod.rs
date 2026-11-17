@@ -889,6 +889,9 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// cache, then its own `getPool` reads (never the serve path's
     /// negative-caching resolver).
     admin_pools: Vec<admin::AdminPool>,
+    /// Per pool, the reader of the operator's pending protocol share for
+    /// `admin_v1_earnings`.
+    earnings_pools: Vec<admin::EarningsPool>,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     /// Bring-up node-id binding self-check (#1034), carried through to
     /// `AdminState` so `admin_v1_health` can report it. A plain value, not a
@@ -1411,6 +1414,7 @@ async fn build_chain_and_handlers(
     let mut routes = Vec::with_capacity(infra.pools.len());
     let mut settlement_wiring = Vec::with_capacity(infra.pools.len());
     let mut admin_pools = Vec::with_capacity(infra.pools.len());
+    let mut earnings_pools = Vec::with_capacity(infra.pools.len());
     for (pool, shares) in infra.pools.iter().zip(pool_shares) {
         // Redeem-hint channel (#327), created outside
         // `PoolSettlementService::bootstrap` so the sender rides the pool's
@@ -1457,6 +1461,15 @@ async fn build_chain_and_handlers(
                     ),
                 ))),
             ),
+        });
+        earnings_pools.push(admin::EarningsPool {
+            deployment: pool.deployment,
+            share: Some(Arc::new(admin::protocol_share::ChainProtocolShare::new(
+                decdn_incentive::payment_pool::PaymentPool::new(
+                    pool.deployment.payment_pool,
+                    wallet_provider.clone(),
+                ),
+            ))),
         });
         let mut route = crate::handlers::client::PoolRoute::new(pool.deployment, pool.lane_store());
         route.pool_view =
@@ -1667,6 +1680,7 @@ async fn build_chain_and_handlers(
         shed_controller,
         payment_services,
         admin_pools,
+        earnings_pools,
         blacklist_ready_rx,
         binding_report,
         serve_economics,
@@ -2399,6 +2413,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 .map(PoolSettlementService::redeem_schedule)
                 .collect(),
             ledger_started_at_unix: infra.store_files.ledger_started_at_unix(),
+            pools: ch.earnings_pools.clone(),
         })
         // Buyer-pool introspection for `admin_v1_pools` (#2078). The SAME store
         // handle `BuyerPoolService` records into, so the admin surface reports

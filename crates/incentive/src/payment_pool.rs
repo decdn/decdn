@@ -415,14 +415,32 @@ mod sol_types {
             /// The `FeeRouter` every sweep is deposited into.
             function feeRouter() external view returns (address);
 
+            /// The local CCTP `MessageTransmitterV2` that verifies each
+            /// attestation and marks its nonce used.
+            function messageTransmitter() external view returns (address);
+
             /// One sweep landed. `pool` is the burn's `messageSender` and
             /// `amount` the USDC deposited into `FeeRouter`.
             event SweepReceived(uint32 indexed sourceDomain, address indexed pool, address indexed operator, uint256 amount);
         }
     }
+
+    alloy::sol! {
+        #[sol(rpc)]
+        contract MessageTransmitterV2 {
+            /// Circle CCTP V2: nonzero once the message with this nonce was
+            /// received. The testnet `LoopbackCctp` answers a `bool`, which
+            /// decodes to the same word.
+            function usedNonces(bytes32 nonce) external view returns (uint256);
+
+            /// Circle CCTP V2: a message left this chain. A sweep's
+            /// transaction carries one, whose header names the source domain.
+            event MessageSent(bytes message);
+        }
+    }
 }
 
-pub use sol_types::{CctpSweepReceiver, FeeRouter, PaymentPool};
+pub use sol_types::{CctpSweepReceiver, FeeRouter, MessageTransmitterV2, PaymentPool};
 
 /// Narrow a USDC amount, or a byte count, to the `uint64` the `PaymentPool`
 /// carries in its packed fields.

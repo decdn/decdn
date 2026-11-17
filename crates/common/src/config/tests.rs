@@ -646,6 +646,12 @@ fn expand_env_per_field_error_context() -> anyhow::Result<()> {
                 ..Default::default()
             });
         }),
+        ("blockchain.cctp_iris_url", |c, v| {
+            c.blockchain = Some(types::BlockchainConfig {
+                cctp_iris_url: Some(v.to_string()),
+                ..Default::default()
+            });
+        }),
         ("blockchain.capacity_bond_address", |c, v| {
             c.blockchain = Some(types::BlockchainConfig {
                 origin_assignment_address: None,

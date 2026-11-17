@@ -210,6 +210,9 @@ enum BuyerUsdcPlan {
         working_deposit: u64,
         /// The `PaymentPool` whose `usdc()` is the wallet's token.
         pool: Address,
+        /// The JSON-RPC endpoint of the pool's payment chain: the pool and
+        /// its token are read there, never on the governance chain.
+        rpc_url: String,
     },
 }
 
@@ -303,11 +306,15 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         BuyerUsdcPlan::Read {
             working_deposit,
             pool,
+            rpc_url,
         } => Some(BuyerUsdc {
             working_deposit,
-            balance: match read_wallet_usdc(&provider, pool, operator).await {
-                Ok(balance) => BuyerBalance::Read(balance),
-                Err(reason) => BuyerBalance::ReadError(reason),
+            balance: match decdn_client::provider::build_read_provider(&rpc_url) {
+                Ok(pool_provider) => match read_wallet_usdc(&pool_provider, pool, operator).await {
+                    Ok(balance) => BuyerBalance::Read(balance),
+                    Err(reason) => BuyerBalance::ReadError(reason),
+                },
+                Err(err) => BuyerBalance::ReadError(sanitize_err_chain(&err)),
             },
         }),
     };
@@ -906,18 +913,26 @@ fn buyer_usdc_plan(file: &chain_ctx::FileConfig) -> BuyerUsdcPlan {
     if working_deposit == 0 {
         return config_error("blockchain.buyer_working_deposit_micro_usdc must be > 0".to_owned());
     }
-    let Some(raw) = file
-        .first_payment_chain()
-        .and_then(|chain| chain.payment_pools.first())
+    let Some((chain, raw)) = file
+        .payment_chains()
+        .iter()
+        .find_map(|chain| chain.payment_pools.first().map(|raw| (chain, raw)))
     else {
         return config_error(
             "no [[blockchain.payment_chains]] entry names a payment pool".to_owned(),
         );
     };
-    match chain_ctx::parse_nonzero_address(raw, "payment_pool_address") {
+    let Some(rpc_url) = chain.rpc_url.clone() else {
+        return config_error(
+            "the [[blockchain.payment_chains]] entry of the node's buyer pool sets no rpc_url"
+                .to_owned(),
+        );
+    };
+    match chain_ctx::parse_nonzero_address(raw, "payment_pools") {
         Ok(pool) => BuyerUsdcPlan::Read {
             working_deposit,
             pool,
+            rpc_url,
         },
         Err(err) => config_error(sanitize_err_chain(&err)),
     }

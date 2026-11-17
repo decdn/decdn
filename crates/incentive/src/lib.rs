@@ -91,6 +91,7 @@ pub mod pool_open_error;
 pub mod probe_sig;
 pub mod publisher_registry;
 pub mod rate;
+pub mod settlement_receipt;
 pub mod sig_canon;
 pub mod slash_appeal;
 pub mod slash_judge;

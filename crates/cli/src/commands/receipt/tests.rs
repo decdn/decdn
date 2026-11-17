@@ -337,6 +337,7 @@ fn a_known_chain_pins_the_contract_addresses() {
         .payment_pools
         .remove(0);
     let mut receipt = bundle_receipt(chain.chain_id);
+    receipt.chain.payment_chain_id = 84_532;
     let ChainCheck::Known(faults) = check_chain_against(&receipt.chain, Some(chain)).unwrap()
     else {
         panic!("the fixture is a known chain");
@@ -347,6 +348,17 @@ fn a_known_chain_pins_the_contract_addresses() {
     assert_eq!(
         check_chain_against(&receipt.chain, Some(chain)).unwrap(),
         ChainCheck::Known(Vec::new())
+    );
+    // The right pool address on another payment chain is another deployment.
+    receipt.chain.payment_chain_id = chain.chain_id;
+    let ChainCheck::Known(faults) = check_chain_against(&receipt.chain, Some(chain)).unwrap()
+    else {
+        panic!("the fixture is a known chain");
+    };
+    assert_eq!(faults.len(), 1, "{faults:?}");
+    assert!(
+        faults.iter().all(|f| f.contains("payment_chain_id")),
+        "{faults:?}"
     );
     assert_eq!(
         check_chain(&bundle_receipt(31_337).chain).unwrap(),

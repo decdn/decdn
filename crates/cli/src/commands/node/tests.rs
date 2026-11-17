@@ -565,6 +565,7 @@ fn mk_lane(
     eligible: bool,
 ) -> LaneSnapshot {
     LaneSnapshot {
+        pool: "eip155:84532:0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
         pool_id: pool_id.to_string(),
         counterparty: Some(counterparty.to_string()),
         // Self-signing default; the delegated and unknown-owner renderings
@@ -668,7 +669,25 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
     );
     // Second row: no activity → "never", not eligible → "no".
     assert!(s.contains("never"), "never sentinel missing: {s}");
+    // Each row names the PaymentPool contract: its chain id and a short
+    // address.
+    assert!(s.contains("POOL"), "pool header missing: {s}");
+    assert!(
+        s.contains("84532:0xb0b0b0b0b0"),
+        "pool contract preview missing: {s}"
+    );
     Ok(())
+}
+
+/// The pool column shortens a CAIP-10 account to its chain id and address
+/// preview, and passes anything else through.
+#[test]
+fn short_pool_keeps_the_chain_and_a_short_address() {
+    assert_eq!(
+        short_pool("eip155:84532:0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0"),
+        "84532:0xb0b0b0b0b0…"
+    );
+    assert_eq!(short_pool("garbage"), "garbage");
 }
 
 #[test]
@@ -751,7 +770,7 @@ fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
     assert!(s.contains("SIGNER"), "SIGNER header missing: {s}");
     let row = s
         .lines()
-        .find(|l| l.starts_with("0xaaaaaaaaaa"))
+        .find(|l| l.contains(" 0xaaaaaaaaaa"))
         .unwrap_or_default();
     assert!(
         row.contains(&short_node_id(&delegate)),
@@ -793,7 +812,7 @@ fn write_lanes_table_renders_an_unknown_counterparty() -> anyhow::Result<()> {
     let s = String::from_utf8(buf)?;
     let row = s
         .lines()
-        .find(|l| l.starts_with("0xaaaaaaaaaa"))
+        .find(|l| l.contains(" 0xaaaaaaaaaa"))
         .unwrap_or_default();
     assert!(
         row.contains("unknown"),
@@ -1161,7 +1180,44 @@ mod earnings {
                 last_sweep_at_unix: Some(NOW - 50),
                 next_sweep_at_unix: Some(NOW + 250),
             }),
+            pools: Vec::new(),
         }
+    }
+
+    /// Each pool gets a line: what its settlements paid and the protocol
+    /// share waiting for `decdn node sweep`.
+    #[test]
+    fn write_earnings_renders_one_line_per_pool() {
+        let mut resp = response();
+        resp.pools = vec![
+            decdn_common::admin::PoolEarnings {
+                pool: "eip155:84532:0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_owned(),
+                settled: period(COVERED_FROM, 600_000, 1_000_000_000, 2),
+                protocol_share: Some(decdn_common::admin::ProtocolShare {
+                    pending_micro_usdc: 1_500_000,
+                    pending_bytes: 4_096,
+                    min_sweep_micro_usdc: 1_000_000,
+                }),
+            },
+            decdn_common::admin::PoolEarnings {
+                pool: "eip155:421614:0xc0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0".to_owned(),
+                settled: period(COVERED_FROM, 0, 0, 0),
+                protocol_share: None,
+            },
+        ];
+        let s = render(&resp);
+        let lines: Vec<&str> = s.lines().collect();
+        let first = lines.get(7).copied().unwrap_or_default();
+        assert!(
+            first.starts_with("pool eip155:84532:0xb0b0")
+                && first.contains("net 0.600000 USDC")
+                && first.contains("gross 1.000000 USDC")
+                && first.contains("protocol share 1.500000 USDC pending")
+                && first.contains("ready: decdn node sweep"),
+            "{first}"
+        );
+        let second = lines.get(8).copied().unwrap_or_default();
+        assert!(second.contains("protocol share unknown"), "{second}");
     }
 
     fn render(resp: &EarningsResponse) -> String {

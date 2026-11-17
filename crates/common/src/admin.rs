@@ -399,6 +399,10 @@ pub struct PullThroughStatus {
 /// pool) saturates rather than wraps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneSnapshot {
+    /// The `PaymentPool` contract the lane pays through, as a CAIP-10 account
+    /// (`eip155:<chainId>:0x<address>`, lowercase hex). [`Self::pool_id`]
+    /// names a pool inside this contract.
+    pub pool: String,
     /// Lowercase hex of the on-chain `PaymentPool` id (`LaneKey::pool_id`),
     /// `0x`-prefixed — same 32-byte encoding `alloy`'s `B256` `Display`
     /// produces. Shared by every lane drawing from the same pool.
@@ -543,6 +547,37 @@ pub struct EarningsResponse {
     /// figures were built from the chain alone (`decdn node earnings
     /// --address`), which sees no lane state.
     pub pending: Option<PendingRedeem>,
+    /// One entry per `PaymentPool` contract, in configured order: what the
+    /// settlements through it paid and the protocol share it holds for the
+    /// operator until a sweep.
+    pub pools: Vec<PoolEarnings>,
+}
+
+/// The earnings through one `PaymentPool` contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolEarnings {
+    /// The contract, as a CAIP-10 account (`eip155:<chainId>:0x<address>`,
+    /// lowercase hex).
+    pub pool: String,
+    /// Every settlement through this contract that the figures cover, summed.
+    /// Its `from_unix` is [`EarningsResponse::covered_from_unix`].
+    pub settled: EarningsPeriod,
+    /// The operator's protocol share the contract holds until a sweep
+    /// (`PaymentPool.pending(operator)`), with the smallest share a sweep
+    /// sends. `None` when the read failed or the node has no operator.
+    pub protocol_share: Option<ProtocolShare>,
+}
+
+/// The pending protocol share of one operator in one `PaymentPool`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolShare {
+    /// Micro-USDC waiting for a sweep (`pending(operator).usdcAmount`).
+    pub pending_micro_usdc: u64,
+    /// The paid-proportional bytes that ride with it
+    /// (`pending(operator).servedBytes`).
+    pub pending_bytes: u64,
+    /// The smallest share `sweep` sends (`minSweep()`), micro-USDC.
+    pub min_sweep_micro_usdc: u64,
 }
 
 /// The settlements landed in one period, summed.

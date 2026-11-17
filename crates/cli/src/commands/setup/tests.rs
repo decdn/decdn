@@ -363,6 +363,7 @@ fn keyless_buyer_usdc_reports_no_wallet_without_a_read() {
     let row = keyless_buyer_usdc(BuyerUsdcPlan::Read {
         working_deposit: 10_000_000,
         pool: Address::repeat_byte(0x11),
+        rpc_url: "http://payment.example".to_owned(),
     })
     .unwrap();
     assert_eq!(
@@ -425,13 +426,17 @@ fn with_pools(pools: &[&str], extra: &str) -> chain_ctx::FileConfig {
 fn buyer_usdc_plan_resolves_the_pool_like_the_daemon() {
     let plan = buyer_usdc_plan(&with_pools(&[POOL_A, POOL_B], ""));
     assert_eq!(plan_pool(&plan), Some(POOL_A.parse().unwrap()));
-    assert!(matches!(
-        plan,
-        BuyerUsdcPlan::Read {
-            working_deposit: 10_000_000,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &plan,
+            BuyerUsdcPlan::Read {
+                working_deposit: 10_000_000,
+                rpc_url,
+                ..
+            } if rpc_url == "http://payment.example"
+        ),
+        "the pool's token is read on the pool's own payment chain"
+    );
 
     // No pool anywhere: the daemon refuses to start. No known-chain fallback.
     let unset = file("[blockchain]\nchain_id = 421614\n");
@@ -748,6 +753,7 @@ mod earnings_key {
             since: None,
             last_settlement: None,
             pending: None,
+            pools: Vec::new(),
         };
         attach_earnings(&mut summary, &Ok(Some(resp)));
         assert_eq!(

@@ -740,7 +740,7 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
                 "--deposit-micro-usdc",
                 &DEPOSIT_MICRO_USDC.to_string(),
             ]),
-            chain_flags(&chain),
+            pool_flags(&chain),
             owner_flags(&owner_keystore, owner_dir.path()),
         ]
         .concat(),
@@ -809,7 +809,7 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
                 strs(&[
                     "pool",
                     "assign",
-                    "--pool",
+                    "--pool-id",
                     &format!("{pool_id:#x}"),
                     "--signer",
                     &delegate,
@@ -818,7 +818,7 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
                     "--expiry-secs",
                     "3600",
                 ]),
-                chain_flags(&chain),
+                pool_flags(&chain),
                 owner_flags(&owner_keystore, owner_dir.path()),
             ]
             .concat(),
@@ -930,16 +930,34 @@ fn private_tempdir(role: &str) -> anyhow::Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-/// The chain coordinates as flags, so no config file is needed.
-fn chain_flags(chain: &ChainFixture) -> Vec<String> {
+/// The payment pool coordinates as flags, so no config file is needed. Every
+/// `pool` subcommand takes these alone.
+fn pool_flags(chain: &ChainFixture) -> Vec<String> {
     vec![
-        "--rpc-url".into(),
+        "--pool".into(),
+        format!(
+            "eip155:{}:{:#x}",
+            chain.chain_id(),
+            chain.addrs().payment_pool
+        ),
+        "--pool-rpc-url".into(),
         chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
     ]
+}
+
+/// The governance and payment pool coordinates as flags, as `get` and
+/// `gateway` take them. One anvil serves both chains.
+fn chain_flags(chain: &ChainFixture) -> Vec<String> {
+    [
+        vec![
+            "--governance-rpc-url".into(),
+            chain.rpc_url(),
+            "--governance-chain-id".into(),
+            chain.chain_id().to_string(),
+        ],
+        pool_flags(chain),
+    ]
+    .concat()
 }
 
 /// The paid-pull flags that pin `node`. `--capacity-bond-address` is the

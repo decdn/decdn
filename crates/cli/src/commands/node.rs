@@ -69,6 +69,10 @@ pub async fn node_dispatch(
         cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Lanes(c) => lanes(c, global_config).await,
         cli::NodeCommand::Earnings(e) => earnings(e, global_config).await,
+        cli::NodeCommand::Sweep(s) => crate::commands::sweep::sweep(s, global_config).await,
+        cli::NodeCommand::ReceiveSweeps(r) => {
+            crate::commands::sweep::receive_sweeps(r, global_config).await
+        }
         cli::NodeCommand::Slashes(s) => slashes(s, global_config).await,
         cli::NodeCommand::Pools(p) => pools(p, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
@@ -741,10 +745,48 @@ pub(crate) fn write_earnings(
             last.block_number,
         )?,
     }
-    match &resp.pending {
-        Some(pending) => write_pending(w, pending, now_unix),
-        None => Ok(()),
+    if let Some(pending) = &resp.pending {
+        write_pending(w, pending, now_unix)?;
     }
+    for pool in &resp.pools {
+        write_pool_earnings(w, pool)?;
+    }
+    Ok(())
+}
+
+/// One pool's line of [`write_earnings`]: what its settlements paid, and the
+/// protocol share it holds for `decdn node sweep`.
+fn write_pool_earnings(
+    w: &mut impl io::Write,
+    pool: &decdn_common::admin::PoolEarnings,
+) -> io::Result<()> {
+    let settled = &pool.settled;
+    let share = match &pool.protocol_share {
+        None => "protocol share unknown".to_owned(),
+        Some(share) => {
+            let ready = if share.pending_micro_usdc > 0
+                && share.pending_micro_usdc >= share.min_sweep_micro_usdc
+            {
+                "ready: decdn node sweep"
+            } else {
+                "below min sweep"
+            };
+            format!(
+                "protocol share {} USDC pending (min sweep {}; {ready})",
+                format_usdc(share.pending_micro_usdc),
+                format_usdc(share.min_sweep_micro_usdc),
+            )
+        }
+    };
+    writeln!(
+        w,
+        "pool {}: net {} USDC, gross {} USDC, {} over {} settlements; {share}",
+        pool.pool,
+        format_usdc(settled.net_micro_usdc),
+        format_usdc(settled.gross_micro_usdc),
+        human_bytes(settled.bytes_settled),
+        settled.settlements,
+    )
 }
 
 /// The daemon-mode pending lines of [`write_earnings`]: the redeemable total
@@ -864,12 +906,13 @@ fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result
     if resp.lanes.is_empty() {
         return writeln!(w, "(no open lanes)");
     }
-    // Fixed-column layout: lane preview | counterparty preview | voucher
-    // signer preview | nonce | outstanding | unredeemed | deposit |
-    // last-voucher age | eligible.
+    // Fixed-column layout: pool contract | lane preview | counterparty
+    // preview | voucher signer preview | nonce | outstanding | unredeemed |
+    // deposit | last-voucher age | eligible.
     writeln!(
         w,
-        "{:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} {:>12} ELIGIBLE",
+        "{:<22} {:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} {:>12} ELIGIBLE",
+        "POOL",
         "LANE",
         "COUNTERPARTY",
         "SIGNER",
@@ -888,6 +931,7 @@ fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result
 /// Render one lane as a fixed-column row. Split out so the column
 /// formatting stays in one place and the loop body reads as a single call.
 fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
+    let pool = short_pool(&c.pool);
     let lane = short_node_id(&c.pool_id);
     // The node names the pool owner only once its pool view has seen the pool;
     // say so rather than leave the column blank.
@@ -910,8 +954,8 @@ fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
     let eligible = if c.settlement_eligible { "yes" } else { "no" };
     writeln!(
         w,
-        "{lane:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {:>12} {last_voucher:>12} \
-         {eligible}",
+        "{pool:<22} {lane:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {:>12} \
+         {last_voucher:>12} {eligible}",
         c.last_nonce,
         format_usdc(c.outstanding_micro_usdc),
         format_usdc(c.unredeemed_micro_usdc),
@@ -1258,6 +1302,17 @@ fn port_from_config_file(
                 path.display()
             )),
         },
+    }
+}
+
+/// A `PaymentPool` CAIP-10 account as `<chainId>:<address preview>`, for a
+/// table column. Anything that is not `<namespace>:<chain>:<address>` passes
+/// through unchanged.
+fn short_pool(account: &str) -> String {
+    let mut parts = account.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(chain), Some(address)) => format!("{chain}:{}", short_node_id(address)),
+        _ => account.to_owned(),
     }
 }
 

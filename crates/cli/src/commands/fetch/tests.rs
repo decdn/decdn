@@ -14,8 +14,8 @@ fn common() -> cli::ClientFetchArgs {
         addr: None,
         relay_url: None,
         provider_address: Some("0x0000000000000000000000000000000000000001".into()),
-        rpc_url: None,
-        payment_pool_address: None,
+        governance: cli::GovernanceChainArgs::default(),
+        payment: cli::PoolSelectArgs::default(),
         slash_judge_address: None,
         capacity_bond_address: None,
         region: None,
@@ -24,7 +24,6 @@ fn common() -> cli::ClientFetchArgs {
         proxy_warming_margin_ms: 30,
         max_sources: 4,
         give_up_after_secs: None,
-        chain_id: None,
         keystore: None,
         keystore_password_file: None,
         data_dir: Some(PathBuf::from("/tmp/d")),
@@ -359,21 +358,44 @@ fn unbound_non_notfound_error_is_untouched() {
 #[test]
 fn flags_override_config() {
     let mut c = common();
-    c.rpc_url = Some("http://flag:8545".into());
-    c.chain_id = Some(99);
+    c.governance.governance_rpc_url = Some("http://gov-flag:8545".into());
+    c.governance.governance_chain_id = Some(99);
     let pp = "0x1111111111111111111111111111111111111111";
-    c.payment_pool_address = Some(pp.into());
+    c.payment.pool = Some(format!("eip155:421614:{pp}"));
+    c.payment.pool_rpc_url = Some("http://flag:8545".into());
     c.slash_judge_address = Some("0x2222222222222222222222222222222222222222".into());
     let file = config(
         "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
     );
     let r = resolve_chain(&c, &file).unwrap();
+    assert_eq!(
+        r.config.payment_pools.len(),
+        1,
+        "--pool pays through one pool"
+    );
     let pool = r.config.first_pool().unwrap();
     assert_eq!(pool.rpc_url, "http://flag:8545");
-    assert_eq!(r.config.governance.chain_id, 99);
+    assert_eq!(pool.deployment.chain_id, 421_614);
     assert_eq!(pool.deployment.payment_pool, Address::from_str(pp).unwrap());
-    // The registry stays on the governance chain's RPC.
-    assert_eq!(r.config.governance.rpc_url, "http://config:8545");
+    assert_eq!(r.config.governance.chain_id, 99);
+    assert_eq!(r.config.governance.rpc_url, "http://gov-flag:8545");
+}
+
+/// The registry and the signature domains live on the governance chain, so a
+/// fetch needs its RPC: a payment chain's endpoint never stands in for it.
+#[test]
+fn the_governance_rpc_is_required() {
+    let file = config(
+        "[blockchain]\npayment_chains = [{ rpc_url = \"http://pay:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+    );
+    let err = resolve_chain(&common(), &file).expect_err("no governance rpc");
+    assert!(err.to_string().contains("--governance-rpc-url"), "{err}");
+    let mut c = common();
+    c.governance.governance_rpc_url = Some("http://gov:8545".into());
+    assert_eq!(
+        resolve_chain(&c, &file).unwrap().config.governance.rpc_url,
+        "http://gov:8545"
+    );
 }
 
 /// The governance chain and each payment chain keep their own RPC endpoint
@@ -618,7 +640,7 @@ fn a_self_owned_pool_no_voucher_fits_names_the_top_up_command() {
     let hinted = format!("{:#}", with_top_up_hint(err, Some(pool)));
     assert!(
         hinted.contains(&format!(
-            "decdn pool top-up --pool {pool} --amount-micro-usdc"
+            "decdn pool top-up --pool-id {pool} --amount-micro-usdc"
         )),
         "{hinted}"
     );

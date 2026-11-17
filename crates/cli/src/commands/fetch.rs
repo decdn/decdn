@@ -48,8 +48,8 @@ use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use decdn_client::pool_route::{PoolPasses, PoolRoute};
 use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::session::{
-    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, GovernanceChain, PaymentPoolChain,
-    PinnedNode, PoolOpen, ProxyWarmingParams, PullSite,
+    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, GovernanceChain, PinnedNode,
+    PoolOpen, ProxyWarmingParams, PullSite,
 };
 use decdn_client::targets::{
     ProbeOpts, ProbeRound, ResolveConfigFault, holders_or_none, resolve_target_node,
@@ -204,67 +204,30 @@ fn parse_region_allowlist(file: &FileConfig) -> Vec<decdn_protocol::Region> {
         .collect()
 }
 
-/// The payment pools a command can pay through: every pool of every
-/// `[[blockchain.payment_chains]]` entry, in the order the config lists them.
-/// `--rpc-url` and `--payment-pool-address` override the first pool's RPC
-/// endpoint and contract. With no entry, the flags name the one pool, on the
-/// governance chain id `governance_chain_id`; an entry with no chain id is on
-/// it too.
+/// The governance chain's id and RPC endpoint: the flag, else
+/// `[blockchain]`. The id defaults to the initial network's; the endpoint is
+/// required, because the registry and the signature domains live there.
 ///
 /// # Errors
 ///
-/// No pool and no RPC endpoint is named, or an address is malformed or zero.
-fn resolve_payment_pools(
-    args: &cli::ClientFetchArgs,
+/// No governance RPC endpoint is named.
+pub(crate) fn resolve_governance(
+    args: &cli::GovernanceChainArgs,
     bc: Option<&decdn_common::config::types::BlockchainConfig>,
-    governance_chain_id: u64,
-) -> anyhow::Result<Vec<PaymentPoolChain>> {
-    let mut pools = Vec::new();
-    for entry in bc.map(|b| b.payment_chains.as_slice()).unwrap_or_default() {
-        let chain_id = entry.chain_id.unwrap_or(governance_chain_id);
-        for raw in &entry.payment_pools {
-            // `--rpc-url` stands in for the first pool's endpoint only.
-            let rpc_url = entry
-                .rpc_url
-                .clone()
-                .or_else(|| pools.is_empty().then(|| args.rpc_url.clone()).flatten())
-                .context("rpc_url not set (a [[blockchain.payment_chains]] rpc_url)")?;
-            pools.push(PaymentPoolChain {
-                rpc_url,
-                deployment: decdn_incentive::Deployment {
-                    chain_id,
-                    payment_pool: super::chain_ctx::parse_nonzero_address(raw, "payment_pools")?,
-                },
-            });
-        }
-    }
-    let flag_pool = args
-        .payment_pool_address
-        .as_deref()
-        .map(|raw| super::chain_ctx::parse_nonzero_address(raw, "payment_pool_address"))
-        .transpose()?;
-    match pools.first_mut() {
-        Some(first) => {
-            if let Some(rpc_url) = &args.rpc_url {
-                first.rpc_url.clone_from(rpc_url);
-            }
-            if let Some(payment_pool) = flag_pool {
-                first.deployment.payment_pool = payment_pool;
-            }
-        }
-        None => pools.push(PaymentPoolChain {
-            rpc_url: args.rpc_url.clone().context(
-                "rpc_url not set (--rpc-url or a [[blockchain.payment_chains]] rpc_url)",
-            )?,
-            deployment: decdn_incentive::Deployment {
-                chain_id: governance_chain_id,
-                payment_pool: flag_pool.context(
-                    "payment pool not set (--payment-pool-address or a payment_pools entry)",
-                )?,
-            },
-        }),
-    }
-    Ok(pools)
+) -> anyhow::Result<(u64, String)> {
+    let chain_id = args
+        .governance_chain_id
+        .or_else(|| bc.and_then(|b| b.chain_id))
+        .unwrap_or(DEFAULT_CHAIN_ID);
+    let rpc_url = args
+        .governance_rpc_url
+        .clone()
+        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
+        .context(
+            "governance rpc_url not set (--governance-rpc-url or blockchain.rpc_url): the \
+             node registry and the signature domains live on the governance chain",
+        )?;
+    Ok((chain_id, rpc_url))
 }
 
 pub(crate) fn resolve_chain(
@@ -272,18 +235,15 @@ pub(crate) fn resolve_chain(
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedChain> {
     let bc = file.blockchain.as_ref();
-    let governance_chain_id = args
-        .chain_id
-        .or_else(|| bc.and_then(|b| b.chain_id))
-        .unwrap_or(DEFAULT_CHAIN_ID);
-    let payment_pools = resolve_payment_pools(args, bc, governance_chain_id)?;
-    // The registry and every non-payment domain live on the governance chain.
-    // A command that names no governance RPC runs on one chain: its first
-    // payment pool's.
-    let governance_rpc_url = bc
-        .and_then(|b| b.rpc_url.clone())
-        .or_else(|| payment_pools.first().map(|pool| pool.rpc_url.clone()))
-        .context("rpc_url not set (blockchain.rpc_url)")?;
+    let (governance_chain_id, governance_rpc_url) = resolve_governance(&args.governance, bc)?;
+    let payment_pools = super::pool_select::resolve_pools(
+        &args.payment,
+        bc.map(|b| b.payment_chains.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(Into::into),
+        governance_chain_id,
+    )?;
 
     let sj_raw = args
         .slash_judge_address
@@ -1660,7 +1620,7 @@ pub(crate) fn print_reclaim_notes(replacements: &[PoolReplaced]) {
     for replaced in replacements {
         eprintln!(
             "note: pool {} accepts no more funds and may still hold a balance; once its \
-             dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
+             dispute window ends, reclaim it with: decdn pool reclaim --pool-id {}",
             replaced.closed, replaced.closed
         );
     }
@@ -1748,7 +1708,7 @@ pub(crate) fn with_top_up_hint(err: anyhow::Error, pool_id: Option<PoolId>) -> a
     }
     let pool = pool_id.map_or_else(|| "<pool id>".to_string(), |id| id.to_string());
     err.context(format!(
-        "top up with: decdn pool top-up --pool {pool} --amount-micro-usdc <MICRO_USDC>"
+        "top up with: decdn pool top-up --pool-id {pool} --amount-micro-usdc <MICRO_USDC>"
     ))
 }
 

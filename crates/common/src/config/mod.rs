@@ -1352,6 +1352,20 @@ fn resolve_blockchain_into(
         );
     }
 
+    // Optional, CLI-only like the receiver address; checked here so `decdn
+    // config validate` reports a malformed value.
+    if let Some(iris) = file
+        .and_then(|b| b.cctp_iris_url.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        bag.check(
+            url::Url::parse(iris).is_ok_and(|u| matches!(u.scheme(), "http" | "https")),
+            "blockchain.cctp_iris_url",
+            "blockchain.cctp_iris_url must be an http(s) URL, such as \
+             https://iris-api.circle.com",
+        );
+    }
+
     let capacity_bond_address = resolve_contract_address(
         "blockchain.capacity_bond_address",
         "capacity_bond_address",
@@ -3535,6 +3549,7 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
             &mut b.cctp_sweep_receiver_address,
             "blockchain.cctp_sweep_receiver_address",
         )?;
+        expand_str(&mut b.cctp_iris_url, "blockchain.cctp_iris_url")?;
         expand_str(
             &mut b.capacity_bond_address,
             "blockchain.capacity_bond_address",

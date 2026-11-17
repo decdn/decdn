@@ -1213,6 +1213,7 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
         pool_stores: vec![store as Arc<dyn PoolStateStore>],
         schedules: vec![RedeemSchedule::default()],
         ledger_started_at_unix: now - 50 * 86_400,
+        pools: Vec::new(),
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 

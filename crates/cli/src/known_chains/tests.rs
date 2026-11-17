@@ -40,6 +40,7 @@ const FIXTURE_PAYMENT: &[KnownPaymentChain] = &[KnownPaymentChain {
     label: "Base Sepolia",
     chain_id: 84_532,
     public_rpc: "https://sepolia.base.org",
+    start_block: 2_000,
     manifest: PAYMENT_MANIFEST,
 }];
 
@@ -52,6 +53,7 @@ pub(crate) static FIXTURE: KnownChain = KnownChain {
     public_rpc: "https://gov.example/rpc",
     l2_start_block: 1_000,
     usdc_faucet: Some("https://faucet.example"),
+    cctp_iris_url: "https://iris-api-sandbox.circle.com",
     governance_manifest: GOVERNANCE_MANIFEST,
     payment_chains: FIXTURE_PAYMENT,
 };
@@ -80,6 +82,7 @@ fn the_payment_manifest_yields_its_pool_and_token() -> anyhow::Result<()> {
             label: "Base Sepolia",
             chain_id: 84_532,
             public_rpc: "https://sepolia.base.org",
+            start_block: 2_000,
             payment_pools: vec!["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".to_owned()],
             usdc: "0x0000000000000000000000000000000000000013".to_owned(),
         }]
@@ -112,6 +115,7 @@ fn a_payment_manifest_without_a_pool_is_refused() {
         label: "stale",
         chain_id: 84_532,
         public_rpc: "https://sepolia.base.org",
+        start_block: 0,
         manifest: r#"{"chainId": 84532, "contracts": {}, "externalDeps": {"usdc": "0x0000000000000000000000000000000000000013"}}"#,
     }];
     let err = STALE

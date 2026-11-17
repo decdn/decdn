@@ -48,9 +48,7 @@ fn list_args(data_dir: &std::path::Path, json: bool) -> PoolArgs {
             timeout_ms: 5_000,
             chain: PoolChainArgs {
                 data_dir: Some(data_dir.to_path_buf()),
-                rpc_url: None,
-                payment_pool_address: None,
-                chain_id: None,
+                payment: decdn_common::cli::PoolSelectArgs::default(),
                 keystore: None,
                 keystore_password_file: None,
             },
@@ -355,10 +353,10 @@ fn list_all_is_not_refused_on_a_node_data_dir() {
             "list",
             "--all",
             // Nothing listens here, so the chain read fails after the guard.
-            "--rpc-url",
+            "--pool",
+            "eip155:421614:0x0000000000000000000000000000000000000001",
+            "--pool-rpc-url",
             "http://127.0.0.1:1",
-            "--payment-pool-address",
-            "0x0000000000000000000000000000000000000001",
             "--data-dir",
         ])
         .arg(dir.path())
@@ -492,7 +490,7 @@ mod node_dir_guards {
         let stderr = refused(&[
             "pool",
             "top-up",
-            "--pool",
+            "--pool-id",
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--amount-micro-usdc",
             "1000000",

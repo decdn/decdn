@@ -620,21 +620,33 @@ fn fill_chain_defaults(common: &mut ClientFetchArgs, file: &FileConfig) -> anyho
         return Ok(());
     };
     let addresses = chain.addresses()?;
-    // The gateway pays on the first payment chain's first pool, as `decdn get`
-    // does; a config file that names any payment chain supplies all three.
+    if common.governance.governance_rpc_url.is_none()
+        && bc.and_then(|b| b.rpc_url.as_ref()).is_none()
+    {
+        common.governance.governance_rpc_url = Some(chain.public_rpc.to_owned());
+    }
+    if common.governance.governance_chain_id.is_none() && bc.and_then(|b| b.chain_id).is_none() {
+        common.governance.governance_chain_id = Some(chain.chain_id);
+    }
+    // With no configured payment chain and no `--pool`, the gateway pays
+    // through the known target's first pool; a config file that names any
+    // payment chain supplies its own pools.
     let configured_payment = bc.is_some_and(|b| !b.payment_chains.is_empty());
     if let Some(payment) = chain.payment_chains()?.into_iter().next()
         && !configured_payment
+        && common.payment.pool.is_none()
+        && let Some(pool) = payment.payment_pools.first()
     {
-        if common.rpc_url.is_none() {
-            common.rpc_url = Some(payment.public_rpc.to_owned());
-        }
-        if common.chain_id.is_none() {
-            common.chain_id = Some(payment.chain_id);
-        }
-        if common.payment_pool_address.is_none() {
-            common.payment_pool_address = payment.payment_pools.into_iter().next();
-        }
+        let pool = parse_nonzero_address(pool, "payment_pools")?;
+        common.payment.pool = Some(
+            decdn_incentive::Deployment {
+                chain_id: payment.chain_id,
+                payment_pool: pool,
+            }
+            .pool_account()
+            .to_string(),
+        );
+        common.payment.pool_rpc_url = Some(payment.public_rpc.to_owned());
     }
     if common.slash_judge_address.is_none()
         && bc.and_then(|b| b.slash_judge_address.as_ref()).is_none()

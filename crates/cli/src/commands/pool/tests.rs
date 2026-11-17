@@ -90,9 +90,7 @@ fn format_expiry_breaks_out_days_hours_minutes() {
 
 fn args() -> cli::PoolChainArgs {
     cli::PoolChainArgs {
-        rpc_url: None,
-        payment_pool_address: None,
-        chain_id: None,
+        payment: cli::PoolSelectArgs::default(),
         keystore: None,
         keystore_password_file: None,
         data_dir: Some(PathBuf::from("/tmp/d")),
@@ -106,10 +104,9 @@ fn config(body: &str) -> FileConfig {
 #[test]
 fn flags_override_config() {
     let mut a = args();
-    a.rpc_url = Some("http://flag:8545".into());
-    a.chain_id = Some(99);
     let pp = "0x1111111111111111111111111111111111111111";
-    a.payment_pool_address = Some(pp.into());
+    a.payment.pool = Some(format!("eip155:99:{pp}"));
+    a.payment.pool_rpc_url = Some("http://flag:8545".into());
     let file = config(
         "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\n\
          payment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\n",
@@ -118,6 +115,32 @@ fn flags_override_config() {
     assert_eq!(r.rpc_url, "http://flag:8545");
     assert_eq!(r.chain_id, 99);
     assert_eq!(r.payment_pool, Address::from_str(pp).unwrap());
+}
+
+/// Without `--pool` a command acts on the first configured pool, on its own
+/// payment chain; `--pool` picks another configured pool and its endpoint.
+#[test]
+fn pool_flag_picks_a_configured_pool_on_its_chain() {
+    let file = config(
+        "[blockchain]\nrpc_url = \"http://gov:8545\"\nchain_id = 11155111\n\
+         [[blockchain.payment_chains]]\nrpc_url = \"http://base:8545\"\nchain_id = 84532\n\
+         payment_pools = [\"0x3333333333333333333333333333333333333333\"]\n\
+         [[blockchain.payment_chains]]\nrpc_url = \"http://arb:8545\"\nchain_id = 421614\n\
+         payment_pools = [\"0x4444444444444444444444444444444444444444\"]\n",
+    );
+    let first = resolve_chain(&args(), &file).unwrap();
+    assert_eq!(
+        (first.rpc_url.as_str(), first.chain_id),
+        ("http://base:8545", 84_532)
+    );
+    let mut a = args();
+    a.payment.pool = Some("eip155:421614:0x4444444444444444444444444444444444444444".into());
+    let picked = resolve_chain(&a, &file).unwrap();
+    assert_eq!(
+        (picked.rpc_url.as_str(), picked.chain_id),
+        ("http://arb:8545", 421_614)
+    );
+    assert_eq!(resolve_pools(&args(), &file).unwrap().len(), 2);
 }
 
 #[test]
@@ -177,13 +200,25 @@ fn explicit_data_dir_not_client_scoped() {
 fn missing_payment_pool_errors() {
     let file = config("[blockchain]\nrpc_url = \"http://config:8545\"\n");
     let err = resolve_chain(&args(), &file).unwrap_err();
-    assert!(err.to_string().contains("rpc_url not set"), "{err}");
+    assert!(
+        err.to_string().contains("no payment pool configured"),
+        "{err}"
+    );
     let file = config(
         "[blockchain]\nrpc_url = \"http://config:8545\"\n\
          payment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [] }]\n",
     );
     let err = resolve_chain(&args(), &file).unwrap_err();
-    assert!(err.to_string().contains("payment pool not set"), "{err}");
+    assert!(
+        err.to_string().contains("no payment pool configured"),
+        "{err}"
+    );
+    let file = config(
+        "[blockchain]\npayment_chains = [{ payment_pools = \
+         [\"0x3333333333333333333333333333333333333333\"] }]\n",
+    );
+    let err = resolve_chain(&args(), &file).unwrap_err();
+    assert!(err.to_string().contains("rpc_url not set"), "{err}");
 }
 
 /// A present-but-zero payment pool fails fast via the shared
@@ -197,7 +232,7 @@ fn rejects_zero_payment_pool() {
     );
     let err = resolve_chain(&args(), &file).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("payment_pool_address"), "{err}");
+    assert!(msg.contains("payment_pools"), "{err}");
     assert!(msg.contains("must not be the zero address"), "{err}");
 }
 
@@ -291,10 +326,19 @@ fn write_chain_pools_separates_untracked_from_unreadable() {
     ];
 
     let mut buf = Vec::new();
-    write_chain_pools(&mut buf, Address::repeat_byte(0xab), 42, &rows, NOW, true).unwrap();
+    let contract = "eip155:42:0x1111111111111111111111111111111111111111";
+    write_chain_pools(
+        &mut buf,
+        Address::repeat_byte(0xab),
+        contract,
+        &rows,
+        NOW,
+        true,
+    )
+    .unwrap();
     let out = String::from_utf8(buf).unwrap();
 
-    assert!(out.contains("chain_id=42"), "{out}");
+    assert!(out.contains(&format!("contract={contract}")), "{out}");
     assert!(out.contains("pools=3"), "{out}");
     assert!(out.contains("open"), "{out}");
     assert!(out.contains("closing"), "{out}");
@@ -410,7 +454,15 @@ fn a_buyer_load_keeps_its_skipped_rows() {
 #[test]
 fn write_chain_pools_empty_emits_sentinel() {
     let mut buf = Vec::new();
-    write_chain_pools(&mut buf, Address::repeat_byte(0xab), 1, &[], 0, true).unwrap();
+    write_chain_pools(
+        &mut buf,
+        Address::repeat_byte(0xab),
+        "eip155:1:0x01",
+        &[],
+        0,
+        true,
+    )
+    .unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(out.contains("pools=0"), "{out}");
     assert!(out.contains("owns no pools"), "{out}");
@@ -432,14 +484,14 @@ fn reclaimable_now_agrees_between_table_and_json() {
         tracked: Some(true),
     };
     assert_eq!(reclaimable_label(&row, NOW), "now");
-    assert!(ChainPoolJson::at(&row, NOW).reclaimable_now);
+    assert!(ChainPoolJson::at("eip155:1:0x01", &row, NOW).reclaimable_now);
 
     let inside = ChainPoolRow {
         dispute_deadline: NOW + 60,
         ..row
     };
     assert!(reclaimable_label(&inside, NOW).starts_with("Unix "));
-    assert!(!ChainPoolJson::at(&inside, NOW).reclaimable_now);
+    assert!(!ChainPoolJson::at("eip155:1:0x01", &inside, NOW).reclaimable_now);
 }
 
 /// The daemon renderer shares [`write_pools`]'s columns and its empty
@@ -547,7 +599,7 @@ fn a_tx() -> TxHash {
     TxHash::from([0xab; 32])
 }
 
-const RECLAIM_NOTE: &str = "run `decdn pool reclaim --pool 0x11` after Unix 99";
+const RECLAIM_NOTE: &str = "run `decdn pool reclaim --pool-id 0x11` after Unix 99";
 
 /// A deleted row is the clean close: nothing maps this owner to the pool
 /// that is now winding down.
@@ -601,7 +653,7 @@ fn a_faulted_clear_fails_and_keeps_the_reclaim_instruction() {
         "the close landed, so the reclaim deadline must survive the failure: {msg}"
     );
     assert!(
-        msg.contains(&format!("decdn pool close --pool {}", a_pool())),
+        msg.contains(&format!("decdn pool close --pool-id {}", a_pool())),
         "a re-run of the close clears the row, so the warning names it: {msg}"
     );
 }
@@ -665,7 +717,7 @@ fn single_reclaim_gate_names_the_cause() {
         ),
         (
             gate(owner, PaymentPool::Status::Open, 0, 300),
-            "decdn pool close --pool",
+            "decdn pool close --pool-id",
         ),
         (
             gate(
@@ -783,7 +835,7 @@ fn a_disagreeing_owner_read_refuses_to_issue() {
 }
 
 /// `getPool` zero-fills an unknown key rather than reverting, so a wrong
-/// `--pool`, `--payment-pool-address` or `--chain-id` arrives as a
+/// `--pool-id` or `--pool` arrives as a
 /// *successful* read of a zero owner. That is not an ownership dispute, and
 /// telling the operator to "sign with the owner keystore" sends them after
 /// the wrong fault.
@@ -798,7 +850,7 @@ fn an_unopened_pool_is_diagnosed_as_missing_not_as_a_wrong_keystore() {
     let msg = format!("{err:#}");
     assert!(msg.contains("does not exist"), "{msg}");
     assert!(
-        msg.contains("--payment-pool-address"),
+        msg.contains("--pool-id and --pool"),
         "the likely fault is a misconfigured contract or chain, so name them: {msg}"
     );
     assert!(

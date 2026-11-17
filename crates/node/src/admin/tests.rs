@@ -1069,8 +1069,14 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
     let threshold = U256::from(1_000_000u64);
     // Only pool 1's owner resolved; pool 2's read failed.
     let owners = pools_owned_by(&[(1, owner)]);
-    let snaps = build_lane_snapshots(&states, threshold, &ages, &owners);
+    let snaps = build_lane_snapshots(ADMIN_DEPLOYMENT, &states, threshold, &ages, &owners);
     assert_eq!(snaps.len(), 2);
+    assert!(
+        snaps
+            .iter()
+            .all(|snap| snap.pool == "eip155:31337:0x3434343434343434343434343434343434343434"),
+        "every lane names its PaymentPool contract as CAIP-10"
+    );
     // No activity recorded → both have `None`; within the `None`
     // group ordering is by descending outstanding, so the
     // 2_500_000-claim lane comes first.
@@ -1114,7 +1120,13 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
 fn build_lane_snapshots_threshold_is_inclusive() {
     let states = vec![mk_lane(1, 0xAA, 1_000_000)];
     let ages = HashMap::new();
-    let snaps = build_lane_snapshots(&states, U256::from(1_000_000u64), &ages, &HashMap::new());
+    let snaps = build_lane_snapshots(
+        ADMIN_DEPLOYMENT,
+        &states,
+        U256::from(1_000_000u64),
+        &ages,
+        &HashMap::new(),
+    );
     assert!(
         snaps.first().expect("snapshot").settlement_eligible,
         "outstanding == threshold must be eligible (>=)"
@@ -1151,6 +1163,7 @@ fn build_lane_snapshots_report_the_verified_chain_frontier() {
     };
     let snapshot = |state: LaneState, threshold: u64| {
         build_lane_snapshots(
+            ADMIN_DEPLOYMENT,
             &[state],
             U256::from(threshold),
             &HashMap::new(),
@@ -1193,6 +1206,7 @@ fn build_lane_snapshots_orders_active_lanes_first() {
     // lane must still sort first (recency beats size).
     let ages = HashMap::from([(active.key(), 3u64)]);
     let snaps = build_lane_snapshots(
+        ADMIN_DEPLOYMENT,
         &[idle, active],
         U256::from(1_000_000u64),
         &ages,
@@ -1515,6 +1529,7 @@ fn build_lane_snapshots_report_the_unredeemed_part() {
     let mut over_paid = mk_lane(1, 2, 100);
     over_paid.paid_cumulative = U256::from(500u64);
     let snapshots = build_lane_snapshots(
+        ADMIN_DEPLOYMENT,
         &[partly_paid, over_paid],
         U256::MAX,
         &HashMap::new(),
@@ -1592,7 +1607,77 @@ mod earnings {
             since,
             &[RedeemSchedule::default()],
             started,
+            &[],
         )
+    }
+
+    /// Each pool gets its own settled sum and its pending protocol share; a
+    /// pool whose share read failed reports none.
+    #[test]
+    fn each_pool_reports_its_settlements_and_protocol_share() {
+        let first = decdn_incentive::Deployment {
+            chain_id: 31_337,
+            payment_pool: Address::repeat_byte(0x9c),
+        };
+        let second = decdn_incentive::Deployment {
+            chain_id: 421_614,
+            payment_pool: Address::repeat_byte(0x9d),
+        };
+        let mut other = row(4, NOW - 60, 5, 9, 50);
+        other.deployment = second;
+        let mut all = rows();
+        all.push(other);
+        let share = ProtocolShare {
+            pending_micro_usdc: 30,
+            pending_bytes: 300,
+            min_sweep_micro_usdc: 1_000,
+        };
+        let resp = build_earnings_response(
+            &all,
+            &[],
+            None,
+            NOW,
+            None,
+            &[RedeemSchedule::default()],
+            STARTED,
+            &[(first, Some(share.clone())), (second, None)],
+        );
+        let pools: Vec<_> = resp
+            .pools
+            .iter()
+            .map(|p| {
+                (
+                    p.pool.as_str(),
+                    p.settled.settlements,
+                    p.settled.net_micro_usdc,
+                    p.settled.gross_micro_usdc,
+                    p.settled.bytes_settled,
+                    p.protocol_share.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pools,
+            vec![
+                (
+                    "eip155:31337:0x9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c",
+                    3,
+                    70,
+                    140,
+                    700,
+                    Some(share)
+                ),
+                (
+                    "eip155:421614:0x9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d",
+                    1,
+                    5,
+                    9,
+                    50,
+                    None
+                ),
+            ]
+        );
+        assert_eq!(resp.since_ledger_start.settlements, 4, "totals span pools");
     }
 
     #[test]
