@@ -333,8 +333,9 @@ async fn scan_pool(
     let from_unix = block_timestamp(&provider, from).await?;
 
     eprintln!(
-        "scanning {account} USDC transfers to {operator} over blocks {from}..={head} \
-         (windows of {span} blocks, shrinking if the provider rejects them)"
+        "scanning USDC transfers from pool {} on chain {} to {operator} over blocks \
+         {from}..={head} (windows of {span} blocks, shrinking if the provider rejects them)",
+        deployment.payment_pool, deployment.chain_id
     );
     let filter = Filter::new()
         .address(usdc)
