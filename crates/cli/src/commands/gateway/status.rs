@@ -1,6 +1,6 @@
 //! `GET /_status`: one JSON read of what the gateway holds and did, for
-//! `decdn dashboard` and the operator. A loopback gateway answers it on its own host
-//! behind the gateway token; any gateway answers it on `--metrics-listen`.
+//! `decdn dashboard` and the operator. Every gateway answers it on its bare
+//! host with no token, and on `--metrics-listen`.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -9,11 +9,10 @@ use alloy::primitives::Address;
 use decdn_common::redact::sanitize_err_chain;
 use serde::Serialize;
 
-use super::allowance::BucketView;
 use super::metrics::Counters;
 use super::pointer::Held;
 use super::worker::PoolSnapshot;
-use super::{ActivePullView, Capability, Gateway, now_secs};
+use super::{ActivePullView, Capability, Gateway};
 
 /// How long `/_status` waits for the worker to read the store.
 const POOL_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,10 +44,8 @@ pub(super) struct Status {
     counters: Counters,
     /// The pulls in flight, oldest first.
     active_pulls: Vec<ActivePullView>,
-    /// The capabilities a loopback gateway holds; a public one holds none.
+    /// The capabilities the gateway holds, in the order it pays with them.
     capabilities: Vec<Capability>,
-    /// A public gateway's allowance buckets; `None` on loopback.
-    allowance: Option<Vec<BucketView>>,
     /// A public gateway's pointers; `None` on loopback.
     pointers: Option<Vec<Held>>,
     /// What the buyer-pool store holds; `None` when it could not be read.
@@ -61,21 +58,13 @@ impl Gateway {
     /// Gather the status. The store read runs on the pull worker, bounded
     /// by [`POOL_QUERY_TIMEOUT`].
     pub(super) async fn status(&self) -> Status {
-        let delegates: Vec<_> = self
-            .delegates
-            .lock()
-            .await
-            .values()
-            .filter_map(|d| d.capability.as_ref())
-            .map(|r| (r.grant.pool_id, r.grant.signer))
-            .collect();
+        let delegates = self.delegates().lanes();
         let (pools, pool_error) =
             match tokio::time::timeout(POOL_QUERY_TIMEOUT, self.pulls.pools(delegates)).await {
                 Ok(Ok(pools)) => (Some(pools), None),
                 Ok(Err(e)) => (None, Some(sanitize_err_chain(&e))),
                 Err(_) => (None, Some("the store read timed out".to_owned())),
             };
-        let now = now_secs();
         Status {
             mode: if self.public() {
                 Mode::Public
@@ -90,8 +79,7 @@ impl Gateway {
             payment_pool: self.chain.payment_pool,
             counters: self.metrics.snapshot(),
             active_pulls: self.active_pulls(),
-            capabilities: self.capabilities().await,
-            allowance: self.public.as_ref().map(|p| p.allowance.view(now)),
+            capabilities: self.capabilities(),
             pointers: self.public.as_ref().map(|p| p.pointers.all()),
             pools,
             pool_error,

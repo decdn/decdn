@@ -7,20 +7,13 @@ export function Capabilities(props: { rows: CapabilityRow[] }) {
     <Panel title="Capabilities" note="Held in memory; a restart drops them">
       {props.rows.length === 0 ? (
         <Empty>
-          No capability is registered. Pages and the browser extension register
-          one with <code>PUT /_capability</code>.
+          No capability is registered. A pool owner issues one to the key{" "}
+          <code>GET /_delegate</code> returns, and registers it with{" "}
+          <code>PUT /_capability</code>.
         </Empty>
       ) : (
         <Table
-          head={[
-            "Key",
-            "Pool",
-            "Scope",
-            "Registered by",
-            "Spent of cap",
-            "Bytes",
-            "Expires",
-          ]}
+          head={["Key", "Pool", "Pays for", "Spent of cap", "Bytes", "Expires"]}
         >
           {props.rows.map((c) => (
             <tr key={`${c.signer}-${c.pool}`}>
@@ -30,8 +23,11 @@ export function Capabilities(props: { rows: CapabilityRow[] }) {
               <Cell mono title={c.pool}>
                 {shortHex(c.pool)}
               </Cell>
-              <Cell>{c.scope}</Cell>
-              <Cell>{c.origin ?? "token holder"}</Cell>
+              <Cell>
+                {c.namespaces === null
+                  ? "any request"
+                  : `namespace ${c.namespaces.join(", ")}`}
+              </Cell>
               <td className="border-b border-line py-2 pr-4">
                 {c.used === null || c.spentMicro === null ? (
                   <span className="text-ink-3">

@@ -76,8 +76,6 @@ pub(super) enum GatewayState {
     Waiting,
     /// No gateway listens at the URL.
     Absent,
-    /// The gateway asks for a token the dashboard does not hold.
-    Unauthorized,
     /// The gateway answered something else, or not in time.
     Error { message: String },
     /// The gateway's own `/_status` body, passed through.

@@ -23,15 +23,8 @@ export function ActivePulls(props: { pulls: ActivePull[] }) {
                   ? `${formatBytes(p.range[1])} at ${formatBytes(p.range[0])}`
                   : "whole"}
               </Cell>
-              <Cell
-                mono
-                title={
-                  p.payer.kind === "capability" ? p.payer.signer : undefined
-                }
-              >
-                {p.payer.kind === "pool"
-                  ? "gateway pool"
-                  : shortHex(p.payer.signer)}
+              <Cell mono title={p.payer.signer}>
+                {shortHex(p.payer.signer)}
               </Cell>
               <Cell>{formatDuration(p.since_secs)}</Cell>
               <Cell>{formatBytes(p.delivered_bytes)}</Cell>

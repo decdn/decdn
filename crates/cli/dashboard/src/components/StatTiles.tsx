@@ -8,9 +8,9 @@ export interface Tile {
 }
 
 /**
- * The tiles for `c`. A 402 is a spent allowance on a public gateway, and a
- * page no capability covers on a loopback one: both modes show it, under
- * its own name.
+ * The tiles for `c`. A gateway with no capability that can pay answers 402
+ * on loopback and 503 on a public gateway: both modes show that count under
+ * one name.
  */
 export function tiles(c: Counters, publicMode: boolean): Tile[] {
   const list: Tile[] = [
@@ -32,7 +32,7 @@ export function tiles(c: Counters, publicMode: boolean): Tile[] {
     {
       label: "Cache hits",
       value: formatCount(c.cache_hits),
-      hint: "Read whole out of the cache, with no pull and no allowance",
+      hint: "Read whole out of the cache, with no pull",
     },
     {
       label: "Not found",
@@ -45,9 +45,13 @@ export function tiles(c: Counters, publicMode: boolean): Tile[] {
       hint: "Refused before any pull",
     },
     {
-      label: "Pool could not pay",
-      value: formatCount(c.pull_failures_funding),
-      hint: "Answered 503",
+      label: "No capability could pay",
+      value: formatCount(
+        publicMode ? c.pull_failures_funding : c.requests_payment_required,
+      ),
+      hint: publicMode
+        ? "Answered 503: no registered capability could pay"
+        : "Answered 402: no registered capability could pay",
     },
     {
       label: "Upstream failed",
@@ -55,19 +59,6 @@ export function tiles(c: Counters, publicMode: boolean): Tile[] {
       hint: "Answered 502",
     },
   ];
-  list.push(
-    publicMode
-      ? {
-          label: "Allowance spent",
-          value: formatCount(c.requests_allowance_exhausted),
-          hint: "Answered 402: the day's allowance is spent",
-        }
-      : {
-          label: "No capability for the page",
-          value: formatCount(c.requests_allowance_exhausted),
-          hint: "Answered 402: no registered capability covers the page's host",
-        },
-  );
   if (publicMode) {
     list.push({
       label: "Pointer updates",

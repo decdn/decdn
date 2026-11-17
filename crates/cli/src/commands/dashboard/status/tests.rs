@@ -445,7 +445,7 @@ fn gateway_states_carry_their_tag() {
         .unwrap()
     };
     assert_eq!(tag(GatewayState::Waiting)["state"], "waiting");
-    assert_eq!(tag(GatewayState::Unauthorized)["state"], "unauthorized");
+    assert_eq!(tag(GatewayState::Absent)["state"], "absent");
     let error = tag(GatewayState::Error {
         message: "HTTP 500".to_owned(),
     });

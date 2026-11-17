@@ -11,7 +11,7 @@
     "requests_ok": 128400,
     "requests_not_found": 312,
     "requests_refused": 41,
-    "requests_allowance_exhausted": 7,
+    "requests_payment_required": 7,
     "pull_failures_funding": 1,
     "pull_failures_other": 3,
     "pulls_active": 2,
@@ -20,7 +20,6 @@
   },
   "active_pulls": [],
   "capabilities": [],
-  "allowance": null,
   "pointers": null,
   "pools": null,
   "pool_error": "the pull worker did not answer within 5 s"

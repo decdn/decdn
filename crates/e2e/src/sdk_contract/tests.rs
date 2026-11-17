@@ -159,20 +159,15 @@ fn public_fixture_carries_two_namespaces() {
     );
 }
 
-/// Each client flavour registers its own capability: the Python loader picks
-/// `capabilities[i]` for flavour `i`, and the TypeScript loader reads `host`
-/// and `capability`, which are the first.
+/// Each client flavour registers its own capability: the loaders pick
+/// `capabilities[i]` for flavour `i`.
 #[test]
 fn loopback_fixture_carries_two_capabilities() {
-    let grants = [
-        (PAGE_HOSTS[0], "dcap1:first"),
-        (PAGE_HOSTS[1], "dcap1:second"),
-    ];
+    let grants = ["dcap1:first", "dcap1:second"];
     let fixture = loopback_fixture(
         &Content::new(),
         "http://127.0.0.1:8484",
         "127.0.0.1:8484",
-        "token",
         &grants,
     )
     .unwrap();
@@ -182,21 +177,20 @@ fn loopback_fixture_carries_two_capabilities() {
         Some(&json!("http://127.0.0.1:8484"))
     );
     assert_eq!(fixture.get("connect"), Some(&json!("127.0.0.1:8484")));
-    assert_eq!(fixture.get("token"), Some(&json!("token")));
+    assert!(fixture.get("token").is_none());
     assert_eq!(
         fixture.get("capabilities"),
         Some(&json!([
-            { "host": "example.com", "capability": "dcap1:first" },
-            { "host": "example.net", "capability": "dcap1:second" },
+            { "capability": "dcap1:first" },
+            { "capability": "dcap1:second" },
         ]))
     );
-    // The fields the TypeScript loader reads are the first entry's.
-    assert_eq!(fixture.get("host"), Some(&json!("example.com")));
-    assert_eq!(fixture.get("capability"), Some(&json!("dcap1:first")));
+    assert!(fixture.get("host").is_none());
+    assert!(fixture.get("capability").is_none());
 }
 
-/// A fixture with no namespace or no capability has no first entry for the
-/// fields the TypeScript loader reads, so the helpers refuse it.
+/// A fixture with no namespace or no capability runs no client flavour, so
+/// the helpers refuse it.
 #[test]
 fn fixtures_refuse_no_flavour() {
     let public = public_fixture(
@@ -210,7 +204,7 @@ fn fixtures_refuse_no_flavour() {
         },
     );
     assert!(public.is_err());
-    let loopback = loopback_fixture(&Content::new(), "http://x", "x", "t", &[]);
+    let loopback = loopback_fixture(&Content::new(), "http://x", "x", &[]);
     assert!(loopback.is_err());
 }
 

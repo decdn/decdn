@@ -17,13 +17,14 @@
 //! namespace alone, `<ns>.<domain>`, names the bundle the namespace's pointer
 //! gives.
 //!
-//! A site origin takes no gateway token: the browser's `Sec-Fetch-*` headers,
-//! which page scripts cannot set, decide what a request may spend.
+//! The browser's `Sec-Fetch-*` headers and `Origin`, which page scripts
+//! cannot set, decide what a request to a loopback gateway may spend
+//! ([`browser_gate`], [`may_spend`]).
 
 use std::net::SocketAddr;
 
 use data_encoding::BASE32_NOPAD;
-use hyper::{HeaderMap, StatusCode};
+use hyper::{HeaderMap, Method, StatusCode};
 use url::Url;
 
 /// A `<hash32>` label's length.
@@ -172,24 +173,64 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// Whether a request may spend on a site origin: the token holder always;
-/// in a browser, the site's own requests (`same-origin`), the user's own
-/// (`none`: a typed URL, a bookmark), and a top-level navigation from
-/// anywhere, so a link opens a site at any path. Every other cross-origin
-/// request is refused, so no other page can make the gateway pay. A request
-/// without `Sec-Fetch-Site` comes from outside a browser and needs the token.
-pub(super) fn may_spend(
+/// Whether a request may use a loopback gateway, from its method and its
+/// browser headers. A top-level `GET` navigation passes from anywhere
+/// (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`), so a link on
+/// any page opens content on the gateway. Every other request passes only
+/// when it comes from no page on another site (`Sec-Fetch-Site:
+/// cross-site`), from no page whose `Origin` is not one of the gateway's own
+/// (`own` says which are), and from no browser that sends no
+/// `Sec-Fetch-Site` (one with an `Origin`, or a `User-Agent` that starts
+/// `Mozilla/`). A client outside a browser sends none of these and passes.
+/// So another page can make the gateway pay only for content the user's
+/// browser opens as a whole page, and reads no response, and the gateway
+/// needs no token.
+pub(super) fn browser_gate(
+    method: &Method,
     headers: &HeaderMap,
-    authorized: bool,
+    own: impl Fn(&str) -> bool,
 ) -> Result<(), (StatusCode, &'static str)> {
-    if authorized {
+    let top_level = header(headers, "sec-fetch-mode") == Some("navigate")
+        && header(headers, "sec-fetch-dest") == Some("document");
+    if top_level && method == Method::GET {
         return Ok(());
     }
-    let Some(fetch_site) = header(headers, "sec-fetch-site") else {
+    let fetch_site = header(headers, "sec-fetch-site");
+    if fetch_site == Some("cross-site") {
         return Err((
-            StatusCode::UNAUTHORIZED,
-            "token required outside a browser\n",
+            StatusCode::FORBIDDEN,
+            "a page on another site may not use the gateway\n",
         ));
+    }
+    let origin = header(headers, "origin");
+    if let Some(origin) = origin
+        && !origin.strip_prefix("http://").is_some_and(&own)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a page on another origin may not use the gateway\n",
+        ));
+    }
+    let browser = origin.is_some()
+        || header(headers, "user-agent").is_some_and(|ua| ua.starts_with("Mozilla/"));
+    if fetch_site.is_none() && browser {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a browser that sends no Sec-Fetch-Site may not use the gateway\n",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a request that passed [`browser_gate`] may spend on a site
+/// origin: in a browser, the site's own requests (`same-origin`), the user's
+/// own (`none`: a typed URL, a bookmark), and a top-level navigation from
+/// anywhere, so a link opens a site at any path. Every other request from a
+/// page is refused, so no other page can make the gateway pay. A client
+/// outside a browser sends no `Sec-Fetch-Site` and may.
+pub(super) fn may_spend(headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
+    let Some(fetch_site) = header(headers, "sec-fetch-site") else {
+        return Ok(());
     };
     let top_level = is_navigation(headers) && header(headers, "sec-fetch-dest") == Some("document");
     if matches!(fetch_site, "same-origin" | "none") || top_level {
@@ -211,20 +252,10 @@ pub(super) fn is_navigation(headers: &HeaderMap) -> bool {
 }
 
 /// The policy every site response carries: a page loads only from its own
-/// origin, plus on loopback the bare gateway origin for `/_delegate` and
-/// `/_capability`, so it reaches no content outside what the gateway serves
-/// it. A public gateway has no API a page may call. Inline code comes from
-/// the same bundle as the page, so it runs.
-pub(super) fn content_security_policy(domain: &SiteDomain) -> String {
-    let connect = match domain {
-        SiteDomain::Loopback { listen } => format!(" http://{listen}"),
-        SiteDomain::Public { .. } => String::new(),
-    };
-    format!(
-        "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; \
-         connect-src 'self'{connect}"
-    )
-}
+/// origin, so it reaches no content outside what the gateway serves it.
+/// Inline code comes from the same bundle as the page, so it runs.
+pub(super) const CONTENT_SECURITY_POLICY: &str =
+    "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src 'self'";
 
 /// The `Content-Type` for an entry on a site origin: the type its name
 /// gives, text in UTF-8, and bytes for a name with no known extension.
