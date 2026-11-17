@@ -1,9 +1,11 @@
 //! `decdn quote <URI>` (#2600): what a pull of a `decdn:` URI costs, from the
 //! rates the nodes sign, before any paid byte.
 //!
-//! The command plans what a `decdn get` of the URI downloads, runs one unpaid
-//! probe round ([`decdn_client::quote::census`]) over every node the pull can
-//! draw from, and prints:
+//! The command plans what a `decdn get` of the URI downloads, unlocks the
+//! keystore and names the pool as `decdn get` does, runs one round of
+//! voucher-less stream opens ([`decdn_client::quote::census`]) over every node
+//! the pull can draw from, cancels each stream once it has answered, and
+//! prints:
 //!
 //! ```text
 //! bundle   29.0 GB in 4 entries
@@ -30,30 +32,28 @@ use alloy::primitives::U256;
 use anyhow::Context as _;
 use decdn_client::PoolOpenRefused;
 use decdn_client::bundle::{BundleManifest, PlannedBlob, planned_downloads};
-use decdn_client::endpoint as client_endpoint;
 use decdn_client::quote::{
-    CENSUS_ENTRY_SAMPLE, Census, PriceRange, PricedBlob, RateHint, census, hint_rates, price,
-    wire_bytes,
+    CENSUS_ENTRY_SAMPLE, Census, PriceRange, PricedBlob, RateHint, census, census_nodes,
+    hint_rates, price, wire_bytes,
 };
 use decdn_client::session::{PoolOpen, ProxyWarmingParams};
 use decdn_client::targets::ResolveConfigFault;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::{ClientFetchArgs, QuoteArgs};
-use decdn_common::config::load_file_config;
-use iroh::{Endpoint, RelayUrl};
+use decdn_incentive::CapabilityGrant;
 
 use super::bundle_pull::{self, human_bytes};
 use super::fetch;
 use super::interrupt::UnreconciledEscrows;
 
-/// Run `decdn quote`: plan the pull `args.uri` names, probe its nodes, and
+/// Run `decdn quote`: plan the pull `args.uri` names, open its nodes, and
 /// print the quote.
 ///
 /// # Errors
 ///
 /// The URI does not parse, a flag combination is invalid, the chain
-/// coordinates or relays do not resolve, the manifest fetch fails, or no
-/// node answers the probe round.
+/// coordinates or relays do not resolve, the keystore does not unlock, the
+/// manifest fetch fails, or no node answers an open.
 pub async fn quote(args: &QuoteArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let uri: DecdnUri = args
         .uri
@@ -64,8 +64,8 @@ pub async fn quote(args: &QuoteArgs, config_path: Option<&Path>) -> anyhow::Resu
     if args.output.is_none() {
         super::get::refuse_file_at_bundle_dir(&uri, &quote_out(args, &uri))?;
     }
-    let mut host = QuoteHost::open(&args.common, config_path).await?;
-    let result = quote_on(&mut host, args, &uri).await;
+    let host = QuoteHost::open(&args.common, config_path).await?;
+    let result = quote_on(&host, args, &uri).await;
     host.close().await;
     let view = result?;
     let mut stdout = std::io::stdout().lock();
@@ -139,11 +139,7 @@ fn hidden_warning(uri: &DecdnUri, manifest: &BundleManifest) -> Option<String> {
 /// no open pool gets [`open_refused`]'s error before any transaction. Without
 /// `-o`, a plan a default `decdn get` refuses gets a warning
 /// ([`hidden_warning`]).
-async fn quote_on(
-    host: &mut QuoteHost,
-    args: &QuoteArgs,
-    uri: &DecdnUri,
-) -> anyhow::Result<QuoteView> {
+async fn quote_on(host: &QuoteHost, args: &QuoteArgs, uri: &DecdnUri) -> anyhow::Result<QuoteView> {
     let out = quote_out(args, uri);
     let plan = match uri.target {
         UriTarget::Blob => Plan::Blob(uri.hash),
@@ -157,26 +153,21 @@ async fn quote_on(
                 Ok(manifest) => manifest,
                 Err(note) => {
                     eprintln!("{note}");
-                    bundle_pull::fetch_manifest_paid(
-                        &args.common,
-                        &out,
-                        uri,
-                        (&mut host.chain, open),
-                        (&host.endpoint, &host.relays),
-                    )
-                    .await
-                    .map_err(|err| {
-                        let Some(refused) = PoolOpenRefused::find(&err).map(open_refused) else {
-                            return err;
-                        };
-                        // An escrow the fetch still holds keeps its note, which
-                        // names the transaction to reconcile.
-                        if err.downcast_ref::<UnreconciledEscrows>().is_some() {
-                            err.context(refused)
-                        } else {
-                            anyhow::Error::msg(refused)
-                        }
-                    })?
+                    host.fetch_manifest(&args.common, &out, uri, open)
+                        .await
+                        .map_err(|err| {
+                            let Some(refused) = PoolOpenRefused::find(&err).map(open_refused)
+                            else {
+                                return err;
+                            };
+                            // An escrow the fetch still holds keeps its note,
+                            // which names the transaction to reconcile.
+                            if err.downcast_ref::<UnreconciledEscrows>().is_some() {
+                                err.context(refused)
+                            } else {
+                                anyhow::Error::msg(refused)
+                            }
+                        })?
                 }
             };
             if args.output.is_none()
@@ -188,7 +179,7 @@ async fn quote_on(
         }
         _ => anyhow::bail!("unsupported URI target in {:?}", args.uri),
     };
-    host.price(&args.common, &plan).await
+    host.price(&args.common, &plan, uri.namespace).await
 }
 
 /// The error of a quote whose manifest fetch would open a pool without
@@ -206,56 +197,65 @@ pub(crate) fn open_refused(refused: &PoolOpenRefused) -> String {
     )
 }
 
-/// What a quote prices on: the chain, the relays and one endpoint for the
-/// probe round and any manifest fetch.
+/// What a quote prices on: a fetch host (the chain, the relays, the buyer
+/// store, and one endpoint with one connection per node) and the keystore
+/// payer, unlocked once for the census and any manifest fetch.
 pub(crate) struct QuoteHost {
-    chain: fetch::ResolvedChain,
-    relays: Vec<RelayUrl>,
-    endpoint: Endpoint,
+    host: fetch::FetchHost,
+    payer: fetch::Payer,
+    /// The `--capability` delegation, when the quote pays from another
+    /// owner's pool.
+    grant: Option<CapabilityGrant>,
 }
 
 impl QuoteHost {
-    /// Resolve `common` and the config at `config_path`, and bind the
-    /// endpoint. Opens no buyer store and no keystore.
+    /// Resolve `common` and the config at `config_path`, open the buyer
+    /// store and bind the endpoint, as `decdn get` does. Unlocks no keystore
+    /// yet.
     ///
     /// # Errors
     ///
     /// A flag combination clap cannot express, unresolvable chain
-    /// coordinates or relays, or an endpoint that cannot bind.
+    /// coordinates or relays, an unreadable capability, a refused data dir,
+    /// or an endpoint that cannot bind.
     pub(crate) async fn open(
         common: &ClientFetchArgs,
         config_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        common.validate()?;
-        let relays = client_endpoint::resolve_relays(common.relay_url.as_deref(), config_path)?;
-        let disc = client_endpoint::client_discovery(config_path)?;
-        let file = load_file_config(config_path)?;
-        let chain = fetch::resolve_chain(common, &file)?;
-        let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
-        Ok(Self {
-            chain,
-            relays,
-            endpoint,
-        })
+        let (host, grant) = fetch::FetchHost::open(common, config_path, false).await?;
+        let payer = fetch::Payer::keystore(grant.clone());
+        Ok(Self { host, payer, grant })
     }
 
-    /// Probe the nodes for `plan`'s sampled blobs and price it.
+    /// Open the nodes for `plan`'s sampled blobs and price it. The nodes
+    /// resolve before the keystore unlocks, so a failed discovery costs no
+    /// password prompt. The opens name the payer's pool like a pull's
+    /// discovery, with `namespace` as their routing hint, and pay nothing.
     ///
     /// # Errors
     ///
-    /// Discovery fails, or no node answers.
+    /// Discovery fails, the keystore does not unlock, the pool cannot be
+    /// named, or no node answers.
     pub(crate) async fn price(
         &self,
         common: &ClientFetchArgs,
         plan: &Plan,
+        namespace: Option<u64>,
     ) -> anyhow::Result<QuoteView> {
         let discovery = fetch::discovery_options(common)?;
+        let chain = self.host.chain();
+        let site = (&chain.config, &chain.site);
+        let nodes = census_nodes(site, self.host.relays(), &discovery).await?;
+        let ctx = self.payer.discovery_ctx(&self.host).await?;
+        let namespace_id = namespace.map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
+            alloy::primitives::U256::from(n).to_be_bytes()
+        });
         let census = census(
-            &self.endpoint,
-            (&self.chain.config, &self.chain.site),
-            &self.relays,
-            &discovery,
+            &nodes,
+            (self.host.connections(), &ctx),
+            site,
             &plan.sample(),
+            namespace_id,
         )
         .await?;
         view(
@@ -267,9 +267,41 @@ impl QuoteHost {
         )
     }
 
-    /// Close the endpoint, so its connections end cleanly.
+    /// Fetch the manifest of the bundle `uri` names into `out`'s cache, paid
+    /// by the quote's payer, which opens a pool only under `open`
+    /// ([`bundle_pull::fetch_manifest_paid`]).
+    ///
+    /// # Errors
+    ///
+    /// The keystore does not unlock, or the fetch fails.
+    async fn fetch_manifest(
+        &self,
+        common: &ClientFetchArgs,
+        out: &Path,
+        uri: &DecdnUri,
+        open: PoolOpen,
+    ) -> anyhow::Result<BundleManifest> {
+        let signer = self.payer.signer(&self.host).await?;
+        bundle_pull::fetch_manifest_paid(
+            common,
+            out,
+            uri,
+            bundle_pull::PullerBuyer {
+                chain: self.host.chain(),
+                grant: self.grant.as_ref(),
+                store: &self.host.store(),
+                signer: Some(signer),
+            },
+            open,
+            (self.host.endpoint(), self.host.relays()),
+        )
+        .await
+    }
+
+    /// Wait for the host's queued writes, then close the endpoint, so its
+    /// connections end cleanly.
     pub(crate) async fn close(self) {
-        self.endpoint.close().await;
+        self.host.close().await;
     }
 }
 
@@ -293,7 +325,7 @@ pub(crate) enum Target {
 /// What a pull downloads.
 #[derive(Debug, Clone)]
 pub(crate) enum Plan {
-    /// The blob with this hash. Its size comes from the probe round.
+    /// The blob with this hash. Its size comes from the census.
     Blob([u8; 32]),
     /// A bundle, or one of its entries.
     Bundle {
@@ -360,7 +392,7 @@ impl Plan {
         }
     }
 
-    /// The blobs the probe round asks about: a blob URI's one blob, or the
+    /// The blobs the census asks about: a blob URI's one blob, or the
     /// [`CENSUS_ENTRY_SAMPLE`] largest planned downloads. Rates are per node,
     /// so the sample's rates stand in for the rest of a bundle.
     fn sample(&self) -> Vec<[u8; 32]> {
@@ -380,15 +412,15 @@ impl Plan {
     }
 }
 
-/// A bundle quote's probe sample: how many of its blobs it probed, and how
-/// much of its download they carry.
+/// A bundle quote's sample: how many of its blobs the census asked about,
+/// and how much of its download they carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Sample {
-    /// The blobs probed.
+    /// The blobs the census asked about.
     pub(crate) blobs: usize,
     /// The bundle's distinct blobs with a planned download.
     pub(crate) sized: usize,
-    /// The probed blobs' planned download, in content bytes.
+    /// The sampled blobs' planned download, in content bytes.
     pub(crate) bytes: u64,
 }
 
@@ -402,14 +434,14 @@ pub(crate) struct QuoteView {
     pub(crate) content_bytes: Option<u64>,
     /// The wire bytes it pays for, bao proof included.
     pub(crate) wire_bytes: Option<u64>,
-    /// How many nodes the round probed for each blob.
-    pub(crate) probed: usize,
-    /// The fewest and most holders of any probed blob; `None` when the
-    /// round probed no blob.
+    /// How many nodes the census opened for each blob.
+    pub(crate) opened: usize,
+    /// The fewest and most holders of any sampled blob; `None` when the
+    /// census asked about no blob.
     pub(crate) holders: Option<(usize, usize)>,
-    /// The most probes of one blob that got no answer.
+    /// The most opens of one blob that got no answer.
     pub(crate) unanswered: usize,
-    /// The most probes of one blob a node kept shedding.
+    /// The most opens of one blob a node shed.
     pub(crate) rate_limited: usize,
     /// The node list is the peer store's, because the registry read failed.
     pub(crate) outage_fallback: bool,
@@ -422,9 +454,9 @@ pub(crate) struct QuoteView {
     pub(crate) above_ceiling: usize,
     /// The cost; `None` when the size or every rate is unknown.
     pub(crate) price: Option<PriceRange>,
-    /// A bundle's probe sample; `None` for a blob.
+    /// A bundle's census sample; `None` for a blob.
     pub(crate) sample: Option<Sample>,
-    /// Probed blobs no usable node answered for. Their bytes are priced at
+    /// Sampled blobs no usable node answered for. Their bytes are priced at
     /// the other blobs' rates.
     pub(crate) unrated_blobs: usize,
     /// Distinct blobs whose manifest entries declare no size, which the
@@ -456,19 +488,19 @@ pub(crate) fn view(
     let mut above = HashSet::new();
     let (mut unanswered, mut rate_limited, mut unrated_blobs) = (0, 0, 0);
     let mut blob_size = None;
-    for probed in &census.hashes {
+    for asked in &census.hashes {
         // The blob's wire bytes: a blob URI's from the nearest holder's
         // size, a bundle blob's from its planned download ranges.
         let wire = match plan {
             Plan::Blob(_) => {
-                blob_size = probed.size_hint().map(decdn_client::ProvenSize::get);
+                blob_size = asked.size_hint().map(decdn_client::ProvenSize::get);
                 blob_size.map(wire_bytes).transpose()?
             }
             Plan::Bundle { blobs, .. } => {
-                blobs.iter().find(|b| b.hash == probed.hash).map(|b| b.wire)
+                blobs.iter().find(|b| b.hash == asked.hash).map(|b| b.wire)
             }
         };
-        let order: Vec<u64> = probed
+        let order: Vec<u64> = asked
             .serve_order(ceiling, warming)
             .iter()
             .map(|a| a.rate_per_mb)
@@ -480,14 +512,14 @@ pub(crate) fn view(
         if order.is_empty() && matches!(plan, Plan::Bundle { .. }) {
             unrated_blobs += 1;
         }
-        holders = Some(widen(holders, probed.holders()));
+        holders = Some(widen(holders, asked.holders()));
         // A node that refused this machine's timestamp gave no usable
         // answer either. A census in which at least three nodes, and most
         // of them, refuse it fails earlier, with an error that names the
         // clock.
-        unanswered = unanswered.max(probed.unreachable + probed.clock_skewed);
-        rate_limited = rate_limited.max(probed.rate_limited);
-        for answer in &probed.answers {
+        unanswered = unanswered.max(asked.unreachable + asked.clock_skewed);
+        rate_limited = rate_limited.max(asked.rate_limited);
+        for answer in &asked.answers {
             if ceiling != 0 && answer.rate_per_mb > ceiling {
                 above.insert(answer.candidate.node_id);
             }
@@ -539,7 +571,7 @@ pub(crate) fn view(
         target: plan.target(),
         content_bytes,
         wire_bytes: wire_total,
-        probed: census.probed,
+        opened: census.opened,
         holders,
         unanswered,
         rate_limited,
@@ -572,18 +604,18 @@ pub(crate) fn write_quote(w: &mut impl Write, view: &QuoteView) -> std::io::Resu
         let held = if hi == 0 {
             format!(
                 "none of {} hold it; they pull it through from origin",
-                view.probed
+                view.opened
             )
         } else if lo == hi {
-            format!("{hi} of {} hold it", view.probed)
+            format!("{hi} of {} hold it", view.opened)
         } else {
-            format!("{lo}–{hi} of {} hold each blob", view.probed)
+            format!("{lo}–{hi} of {} hold each blob", view.opened)
         };
         let silent = match (view.unanswered, view.rate_limited) {
             (0, 0) => String::new(),
             (n, 0) => format!(" ({n} did not answer)"),
-            (0, m) => format!(" ({m} rate-limited the probe)"),
-            (n, m) => format!(" ({n} did not answer, {m} rate-limited the probe)"),
+            (0, m) => format!(" ({m} rate-limited the open)"),
+            (n, m) => format!(" ({n} did not answer, {m} rate-limited the open)"),
         };
         let rates = view.rates.map_or_else(
             || "no usable rate".to_owned(),
@@ -636,7 +668,7 @@ pub(crate) fn write_quote(w: &mut impl Write, view: &QuoteView) -> std::io::Resu
     if view.unrated_blobs > 0 && view.price.is_some() {
         writeln!(
             w,
-            "note     {} probed blob(s) got no usable rate; their bytes are priced at the \
+            "note     {} sampled blob(s) got no usable rate; their bytes are priced at the \
              others' rates, but the pull may not get them",
             view.unrated_blobs
         )?;
@@ -672,7 +704,7 @@ pub(crate) fn json_quote(uri: &str, view: &QuoteView) -> serde_json::Value {
         "path": path,
         "content_bytes": view.content_bytes,
         "wire_bytes": view.wire_bytes,
-        "nodes_probed": view.probed,
+        "nodes_opened": view.opened,
         "holders_min": view.holders.map(|h| h.0),
         "holders_max": view.holders.map(|h| h.1),
         "unanswered": view.unanswered,
@@ -749,19 +781,21 @@ pub(crate) fn print_estimate(
 /// A fault the real run fails on the same way: a flag combination clap
 /// cannot express (a `--provider-address` without `--node-id`), a malformed
 /// `--node-id` or `--provider-address`, both checked before any chain is
-/// resolved, or nodes that answered but whose probe signatures did not
+/// resolved, or nodes that answered but whose answer signatures did not
 /// recover to their operators ([`ResolveConfigFault`]), because the
-/// configured chain is not theirs.
+/// configured chain is not theirs. A keystore that does not unlock, or any
+/// other quote failure, is a reason.
 pub(crate) async fn dry_run_quote(
     common: &ClientFetchArgs,
     config_path: Option<&Path>,
     plan: &Plan,
+    namespace: Option<u64>,
 ) -> anyhow::Result<Result<QuoteView, String>> {
     common.validate()?;
     fetch::discovery_options(common)?;
     let quoted = async {
         let host = QuoteHost::open(common, config_path).await?;
-        let view = host.price(common, plan).await;
+        let view = host.price(common, plan, namespace).await;
         host.close().await;
         view
     }
@@ -779,7 +813,8 @@ pub(crate) async fn dry_run_quote(
 }
 
 /// `decdn get --dry-run decdn:<hash>`: print where the blob would land and
-/// its quote, and exit. Nothing is paid and no keystore is opened.
+/// its quote, and exit. The quote unlocks the keystore and names the pool as
+/// `decdn get` does; nothing is paid and no transaction is sent.
 ///
 /// # Errors
 ///
@@ -791,7 +826,13 @@ pub(crate) async fn dry_run_blob(
     uri: &DecdnUri,
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let quoted = dry_run_quote(&args.common, config_path, &Plan::Blob(uri.hash)).await?;
+    let quoted = dry_run_quote(
+        &args.common,
+        config_path,
+        &Plan::Blob(uri.hash),
+        uri.namespace,
+    )
+    .await?;
     let hash = blake3::Hash::from_bytes(uri.hash).to_hex();
     if let Err(warning) = &quoted {
         eprintln!("warning: {warning}");

@@ -76,6 +76,10 @@ pub struct OpenedStream {
     pub(crate) rtt: Option<PathRtt>,
     /// When the answer arrived.
     pub(crate) answered_at: tokio::time::Instant,
+    /// A discovery open's permit on its node's connection
+    /// ([`Connections::discovery_permit`]), released when the stream is
+    /// adopted or ends; `None` for a pull's open.
+    pub(crate) permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl std::fmt::Debug for OpenedStream {
@@ -399,6 +403,7 @@ pub(crate) async fn open_answer(
         signer: args.ctx.client_signer.address(),
         rtt,
         answered_at,
+        permit: None,
     })
 }
 
@@ -505,7 +510,11 @@ async fn open_on_warm(
 /// the transport's estimate, never the time to the answer, which includes any
 /// work the node did before it answered.
 ///
-/// `open` bounds the dial, and again the exchange.
+/// `open` bounds the dial, and again the exchange. Before either, the open
+/// waits for one of the target's discovery-open permits in `conns`, which the
+/// stream holds until it is adopted or ends: a node resets the streams past
+/// its bound on one connection's streams with no voucher yet, so a caller
+/// that discovers many hashes at once on one node queues instead.
 ///
 /// # Errors
 ///
@@ -540,6 +549,9 @@ pub async fn discovery_open(
     pull_through: bool,
     open: Duration,
 ) -> anyhow::Result<OpenedStream> {
+    // Taken before the timestamp is stamped: a wait for a permit must not
+    // age the request.
+    let permit = conns.discovery_permit(target.id).await?;
     let args = OpenArgs {
         ctx,
         slash_domain,
@@ -552,7 +564,9 @@ pub async fn discovery_open(
         open,
         pull_through,
     };
-    open_shared(conns, target, args, true, true).await
+    let mut opened = open_shared(conns, target, args, true, true).await?;
+    opened.permit = Some(permit);
+    Ok(opened)
 }
 
 #[cfg(test)]

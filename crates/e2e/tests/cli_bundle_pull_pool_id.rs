@@ -229,9 +229,9 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // The node wrote the wire bytes of the three pulls and no more. The
-    // manifest gives no entry a size, so each pull takes its size from a
-    // probe of the pinned node, not from a stream it opens and drops unread
-    // (#2619). For each entry such a stream costs at least the 64 KiB first
+    // manifest gives no entry a size, so each pull takes its size from the
+    // answer to an open of the pinned node, whose stream the pull adopts, not
+    // from a stream it opens and drops unread (#2619). For each entry such a stream costs at least the 64 KiB first
     // frame; for the small manifest, its whole wire size, inside the slack.
     let served = node
         .scrape_metric(SERVED)

@@ -221,14 +221,15 @@ pub enum NodeCommand {
     /// Unpaid client-side discovery of active nodes via
     /// `CapacityBond.getRegisteredNodes` (#1481). Maps node-ids/regions to
     /// operator Ethereum addresses — the input `decdn get
-    /// --provider-address` needs — without spending anything: it builds a
-    /// signer-less read-only provider and never loads a keystore, unlike
+    /// --provider-address` needs — without spending anything: the listing
+    /// builds a signer-less read-only provider and loads no keystore, unlike
     /// every other on-chain `node` subcommand above.
     ///
     /// With neither `--node-id` nor `--region`, lists every active node.
     /// Pass `--probe` to additionally rank the (region-shortlisted)
-    /// candidates by measured `cdn/probe/v1` round-trip time; without it,
-    /// candidates are listed with no RTT.
+    /// candidates by the round-trip time of one voucher-less `cdn/client/v1`
+    /// open each, which unlocks the client keystore to name its pool;
+    /// without it, candidates are listed with no RTT.
     Lookup(LookupArgs),
     /// Diagnose config, on-disk state, disk budget, and reachability.
     // Boxed to keep `NodeCommand`'s variants close in size (`DoctorArgs` is by
@@ -942,15 +943,24 @@ pub struct LookupArgs {
     #[arg(long, value_name = "CODE")]
     pub region: Option<String>,
 
-    /// Probe each matching candidate over `cdn/probe/v1` and sort ascending
-    /// by measured round-trip time. Candidates that don't answer are kept at
-    /// the end (rather than dropped) with no RTT. Without this flag, no
-    /// network probing happens and candidates carry no RTT.
+    /// Open one `cdn/client/v1` stream to each matching candidate (at most
+    /// five, sampled) and sort ascending by the measured round-trip time.
+    /// Each open asks about a blob no node holds, so the node answers a
+    /// signed `NotFound` at once; the stream is cancelled before any voucher,
+    /// and nothing is paid. The opens name your client pool as `decdn get`
+    /// does, so this unlocks the client keystore (`--keystore`, else
+    /// `<data-dir>/keystore.json`, where the data dir defaults to
+    /// `~/.decdn/client`) and reads `blockchain.payment_pool_address` and
+    /// `blockchain.slash_judge_address` from the config. Each answer must
+    /// verify against the node's registered operator address. Candidates
+    /// that don't answer, or whose answer does not verify, are kept at the
+    /// end (rather than dropped) with no RTT. Without this flag, no node is
+    /// opened and candidates carry no RTT.
     #[arg(long)]
     pub probe: bool,
 
-    /// Roundtrip timeout in milliseconds for each `--probe` probe. Ignored
-    /// without `--probe`.
+    /// Bound in milliseconds on each `--probe` open's dial, and again on its
+    /// exchange. Ignored without `--probe`.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
 

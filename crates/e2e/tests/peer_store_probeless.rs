@@ -326,7 +326,7 @@ async fn run() -> anyhow::Result<()> {
     // the lanes the store routes to leave no range uncovered while they still
     // build, so the acquire loop asks for no discovery (#2677).
     anyhow::ensure!(
-        log.contains("fetch timings") && !log.contains("probe_start_ms"),
+        log.contains("fetch timings") && !log.contains("discovery_start_ms"),
         "fetch #2 ran a discovery round before the transfer:\n{log}"
     );
     anyhow::ensure!(
@@ -380,7 +380,7 @@ async fn run() -> anyhow::Result<()> {
     // The fetch timings name a discovery round only when one ran, and its
     // stream would be the first leg instead of the size open.
     anyhow::ensure!(
-        log.contains("fetch timings") && !log.contains("probe_start_ms"),
+        log.contains("fetch timings") && !log.contains("discovery_start_ms"),
         "the streamed fetch ran a discovery round, so no size open ran:\n{log}"
     );
     let legs: Vec<&str> = log

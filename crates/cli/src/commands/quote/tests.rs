@@ -66,7 +66,7 @@ fn entry(path: &str, hash: u8, size: Option<u64>) -> ManifestEntry {
 fn a_blob_quote_prices_its_holders() {
     let hash = [9; 32];
     let census = Census {
-        probed: 8,
+        opened: 8,
         hashes: vec![hash_census(
             hash,
             vec![
@@ -103,7 +103,7 @@ fn a_blob_quote_prices_its_holders() {
 fn a_node_above_the_ceiling_is_left_out() {
     let hash = [9; 32];
     let census = Census {
-        probed: 2,
+        opened: 2,
         hashes: vec![hash_census(
             hash,
             vec![answer(1, 10.0, 50, true, GB), answer(2, 20.0, 10, true, GB)],
@@ -126,7 +126,7 @@ fn a_node_above_the_ceiling_is_left_out() {
 
 fn view_all_above(hash: [u8; 32]) -> QuoteView {
     let census = Census {
-        probed: 1,
+        opened: 1,
         hashes: vec![hash_census(hash, vec![answer(1, 10.0, 50, true, GB)])],
         outage_fallback: false,
     };
@@ -139,7 +139,7 @@ fn view_all_above(hash: [u8; 32]) -> QuoteView {
 fn a_cold_blob_has_rates_but_no_size() {
     let hash = [9; 32];
     let census = Census {
-        probed: 3,
+        opened: 3,
         hashes: vec![hash_census(hash, vec![answer(1, 10.0, 10, false, 0)])],
         outage_fallback: false,
     };
@@ -155,7 +155,7 @@ fn a_cold_blob_has_rates_but_no_size() {
     );
 }
 
-/// A bundle quote probes its largest blobs, prices the rest at their mean
+/// A bundle quote opens its largest blobs, prices the rest at their mean
 /// rate, counts a blob two paths name once, and reports the sample.
 #[test]
 fn a_bundle_quote_samples_its_largest_blobs() {
@@ -168,7 +168,7 @@ fn a_bundle_quote_samples_its_largest_blobs() {
     let sample = plan.sample();
     assert_eq!(sample, vec![[6; 32], [5; 32], [4; 32], [3; 32]]);
     let census = Census {
-        probed: 3,
+        opened: 3,
         hashes: sample
             .iter()
             .map(|&h| {
@@ -215,12 +215,14 @@ fn a_bundle_quote_samples_its_largest_blobs() {
     let json = json_quote("decdn:b/", &view);
     assert_eq!(json["target"], "bundle");
     assert_eq!(json["entries"], 8);
+    assert_eq!(json["nodes_opened"], 3);
+    assert!(json.get("nodes_probed").is_none());
     assert_eq!(json["sampled_blobs"], 4);
     assert_eq!(json["sampled_content_bytes"], 18 * GB);
     assert_eq!(json["unsized_blobs"], 1);
 }
 
-/// A probed blob no usable node answered for still costs its bytes, at the
+/// A sampled blob no usable node answered for still costs its bytes, at the
 /// other blobs' rates, and the quote says so. Nodes that did not answer are
 /// named apart from non-holders.
 #[test]
@@ -231,7 +233,7 @@ fn a_blob_with_no_usable_rate_is_priced_and_named() {
     );
     let plan = Plan::bundle(&manifest, None).unwrap();
     let census = Census {
-        probed: 4,
+        opened: 4,
         hashes: vec![
             HashCensus {
                 unreachable: 3,
@@ -250,10 +252,13 @@ fn a_blob_with_no_usable_rate_is_priced_and_named() {
     assert_eq!(price.low, decdn_incentive::rate::min_payment(all, 10));
     let out = text(&view);
     assert!(
-        out.contains("0–1 of 4 hold each blob (3 did not answer, 1 rate-limited the probe)"),
+        out.contains("0–1 of 4 hold each blob (3 did not answer, 1 rate-limited the open)"),
         "{out}"
     );
-    assert!(out.contains("1 probed blob(s) got no usable rate"), "{out}");
+    assert!(
+        out.contains("1 sampled blob(s) got no usable rate"),
+        "{out}"
+    );
     assert!(out.contains("the registry read failed"), "{out}");
     let json = json_quote("decdn:b/", &view);
     assert_eq!(json["unanswered"], 3);
@@ -262,13 +267,13 @@ fn a_blob_with_no_usable_rate_is_priced_and_named() {
     assert_eq!(json["unrated_blobs"], 1);
 }
 
-/// A bundle with nothing to probe makes no claim about its nodes: one whose
+/// A bundle with nothing to sample makes no claim about its nodes: one whose
 /// blobs declare no size has an unknown price, and an empty one costs
 /// nothing.
 #[test]
-fn a_bundle_with_nothing_to_probe_makes_no_node_claim() {
+fn a_bundle_with_nothing_to_sample_makes_no_node_claim() {
     let empty = Census {
-        probed: 5,
+        opened: 5,
         hashes: Vec::new(),
         outage_fallback: false,
     };
@@ -315,7 +320,7 @@ fn an_entry_plan_keeps_its_entry() {
     );
     assert_eq!(plan.sample(), vec![[2; 32]]);
     let census = Census {
-        probed: 1,
+        opened: 1,
         hashes: vec![hash_census([2; 32], vec![answer(1, 10.0, 10, true, 0)])],
         outage_fallback: false,
     };
@@ -344,7 +349,7 @@ fn an_entry_plan_keeps_its_entry() {
 fn the_json_quote_is_exact() {
     let hash = [9; 32];
     let census = Census {
-        probed: 1,
+        opened: 1,
         hashes: vec![hash_census(hash, vec![answer(1, 10.0, 8, true, 1 << 20)])],
         outage_fallback: false,
     };
@@ -436,7 +441,7 @@ async fn a_dry_run_quote_rejects_bad_pin_flags_first() {
         ),
     ] {
         let common = parse(&extra);
-        let err = dry_run_quote(&common, Some(&config), &Plan::Blob([1; 32]))
+        let err = dry_run_quote(&common, Some(&config), &Plan::Blob([1; 32]), None)
             .await
             .expect_err("a bad pin flag fails the dry run");
         assert!(format!("{err:#}").contains(want), "{err:#}");

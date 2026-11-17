@@ -1433,3 +1433,44 @@ mod earnings {
         Ok(())
     }
 }
+
+/// `node lookup --probe` resolves its payer from the client flags `decdn get`
+/// takes: the lookup's chain flags carry over, and every other flag keeps its
+/// default, so the data dir and keystore stay the client's unless named.
+#[test]
+fn lookup_payer_args_carry_the_chain_flags_and_default_the_rest() {
+    use clap::Parser as _;
+    let parsed = cli::Cli::try_parse_from([
+        "decdn",
+        "node",
+        "lookup",
+        "--probe",
+        "--rpc-url",
+        "http://127.0.0.1:8545",
+        "--chain-id",
+        "31337",
+        "--keystore",
+        "/tmp/buyer.json",
+        "--capacity-bond-address",
+        "0x0000000000000000000000000000000000000042",
+    ])
+    .unwrap();
+    let cli::Command::Node(node) = parsed.command else {
+        panic!("a node command");
+    };
+    let cli::NodeCommand::Lookup(lookup) = node.cmd else {
+        panic!("a lookup");
+    };
+    let args = payer_args(&lookup.chain).unwrap();
+    assert_eq!(args.rpc_url.as_deref(), Some("http://127.0.0.1:8545"));
+    assert_eq!(args.chain_id, Some(31_337));
+    assert_eq!(args.keystore.as_deref(), Some(Path::new("/tmp/buyer.json")));
+    assert_eq!(
+        args.capacity_bond_address.as_deref(),
+        Some("0x0000000000000000000000000000000000000042")
+    );
+    assert_eq!(args.data_dir, None, "the client data dir stays the default");
+    assert_eq!(args.node_id, None);
+    assert_eq!(args.capability, None);
+    assert_eq!(args.max_sources, 4);
+}

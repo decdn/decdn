@@ -19,11 +19,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, Bytes};
 use decdn_incentive::slash_judge_domain;
-use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
+use iroh::{EndpointAddr, PublicKey, RelayUrl};
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::discovery::{self, NodeCandidate};
-use crate::probe::probe_once;
 use crate::session::{
     ChainConfig, DiscoveryOptions, FetchMarks, PinnedNode, ProxyWarmingParams, PullSite,
 };
@@ -31,11 +30,6 @@ use crate::{
     Connections, OpenedStream, PoolContext, UnverifiedAnswer, UpstreamRateLimited,
     UpstreamTimestampRejected,
 };
-
-/// Per-candidate probe timeout of a probe round (#936). The K probes run
-/// concurrently, so this bounds selection latency rather than the overall fetch
-/// (`--timeout-ms`); a dead candidate falls out of selection after this.
-const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
 
 /// Per-candidate bound on a discovery open: the dial and the exchange. The K
 /// opens run concurrently, so this bounds selection latency rather than the
@@ -161,60 +155,6 @@ pub(crate) fn no_serve_target_error(d: Dropouts) -> anyhow::Error {
 /// unsigned code, so one or two hostile candidates must not be able to end it.
 pub(crate) const CLOCK_SKEW_FATAL_MIN: usize = 3;
 
-/// The waits between probe attempts on a candidate that sheds the probe with
-/// `APP_ERR_RATE_LIMITED`. ADR 005's per-peer limit refills one probe every
-/// 200 ms, so these clear the burst that concurrent entries of one bundle pull
-/// send at its start. A candidate that still sheds after the last wait counts
-/// as rate-limited, never as silent.
-const PROBE_SHED_BACKOFFS_MS: [u64; 3] = [250, 500, 1000];
-
-/// One probe attempt's result.
-pub(crate) type ProbeResult = anyhow::Result<(
-    decdn_protocol::message::ProbeResponse,
-    decdn_protocol::ProbeResponseExt,
-    crate::probe::ProbeRtt,
-)>;
-
-/// Probe one candidate, probing it again after each [`PROBE_SHED_BACKOFFS_MS`]
-/// wait while it sheds the probe. Any other result — an answer, a timeout, a
-/// transport failure — returns at once.
-///
-/// Each attempt stamps its own `timestamp_us` from the wall clock just before
-/// it sends: a node refuses a timestamp more than 30 seconds from its clock,
-/// and the returned timestamp is the one the last attempt sent, which is the
-/// one its answer echoes and [`classify_probe`] verifies against.
-pub(crate) async fn probe_candidate(
-    endpoint: &Endpoint,
-    target: EndpointAddr,
-    hash: [u8; 32],
-) -> (u64, ProbeResult) {
-    let mut backoffs = PROBE_SHED_BACKOFFS_MS.iter();
-    loop {
-        let timestamp_us = micros_now();
-        let res = probe_once(
-            endpoint,
-            target.clone(),
-            hash,
-            timestamp_us,
-            Duration::from_millis(SELECT_PROBE_TIMEOUT_MS),
-        )
-        .await;
-        match (&res, backoffs.next()) {
-            (Err(e), Some(&ms)) if is_shed(e) => {
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-            }
-            (Err(e), None) if is_shed(e) => {
-                tracing::info!(
-                    "{} kept rate-limiting this client's probe: {e:#}",
-                    target.id
-                );
-                return (timestamp_us, res);
-            }
-            _ => return (timestamp_us, res),
-        }
-    }
-}
-
 /// Whether a failed request was the node shedding it with
 /// `APP_ERR_RATE_LIMITED`.
 fn is_shed(err: &anyhow::Error) -> bool {
@@ -317,26 +257,6 @@ where
     (settled, pending)
 }
 
-/// Log one probe's raw result at `debug`, with the time since the round started.
-fn log_probe_result(cand: &NodeCandidate, res: &ProbeResult, started: std::time::Instant) {
-    match res {
-        Ok((resp, _, rtt)) => tracing::debug!(
-            node = %cand.node_id,
-            elapsed_ms = started.elapsed().as_millis(),
-            rtt_ms = rtt.ms,
-            rtt_direct = rtt.direct,
-            has_blob = resp.body.has_blob,
-            "probe answered"
-        ),
-        Err(error) => tracing::debug!(
-            node = %cand.node_id,
-            elapsed_ms = started.elapsed().as_millis(),
-            error = %format_args!("{error:#}"),
-            "probe failed"
-        ),
-    }
-}
-
 /// Log one discovery open's raw result at `debug`, with the time since the
 /// round started.
 fn log_open_result(
@@ -367,8 +287,7 @@ fn log_open_result(
 /// answer.
 pub(crate) type Sample = (PublicKey, f64, u64);
 
-/// One asked candidate, verified and classified ([`classify_open`],
-/// [`classify_probe`]).
+/// One asked candidate, verified and classified ([`classify_open`]).
 pub(crate) enum OpenOutcome {
     /// A verified answer that serves the span, or a signed `NotFound` with
     /// the blocks a partial holder holds, with its peer-store sample.
@@ -397,10 +316,6 @@ pub(crate) enum OpenOutcome {
 }
 
 impl OpenOutcome {
-    const fn is_holder(&self) -> bool {
-        matches!(self, Self::Holder(..))
-    }
-
     /// A verified answer, holder or not.
     const fn is_answer(&self) -> bool {
         matches!(self, Self::Holder(..) | Self::NonHolder(..))
@@ -662,96 +577,6 @@ impl OpenTally {
     }
 }
 
-/// The size `ext` states for `hash`, proven: `Ok(None)` when it states none,
-/// `Err(())` when it states one with no valid size proof. A stated size is a
-/// fact only with its proof (ADR 005 § Bounded byte ranges), and a size with
-/// no valid proof is a fault of the node: the caller drops the answer before
-/// the size can reach a plan or a price.
-fn stated_size(
-    cand: &NodeCandidate,
-    hash: [u8; 32],
-    ext: &decdn_protocol::ProbeResponseExt,
-) -> Result<Option<crate::ProvenSize>, ()> {
-    let Some(proof) = ext.size_proof.as_ref() else {
-        return Ok(None);
-    };
-    crate::check_size_proof(hash, proof)
-        .map(Some)
-        .map_err(|e| tracing::warn!("dropping a probe response from {}: {e}", cand.node_id))
-}
-
-/// Verify `cand`'s probe result and classify it. Every response is verified
-/// before it can influence the order (ADR 014 §1). A failure is requester-local
-/// policy, with no reputation effect, because an unrecovered signature
-/// attributes nothing to anyone.
-/// `timestamp_us` is the timestamp the probe that produced `res` sent.
-pub(crate) fn classify_probe(
-    cand: &NodeCandidate,
-    res: ProbeResult,
-    hash: [u8; 32],
-    timestamp_us: u64,
-    slash_domain: &alloy::sol_types::Eip712Domain,
-) -> OpenOutcome {
-    let (resp, resp_ext, rtt) = match res {
-        Ok(answer) => answer,
-        Err(e) if is_shed(&e) => return OpenOutcome::RateLimited,
-        Err(e) if is_timestamp_rejected(&e) => {
-            log_timestamp_rejected(cand, &e);
-            return OpenOutcome::ClockSkewed;
-        }
-        Err(_) => return OpenOutcome::Unreachable,
-    };
-    if let Err(e) = crate::probe::verify_probe_response(
-        &resp,
-        cand.eth_address,
-        slash_domain,
-        hash,
-        timestamp_us,
-    ) {
-        // The answer counts as none: discovery drops the candidate from
-        // selection, and a pinned node gives no size. The operator needs
-        // told why, so log it at `warn`.
-        tracing::warn!(
-            "ignoring an unverifiable probe response from {}: {e}",
-            cand.node_id
-        );
-        return OpenOutcome::Unverifiable;
-    }
-    // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
-    // construction on an honest responder, except for the empty root, whose
-    // coverage is empty either way (#2471). `coverage` is not in the signed
-    // set, and an inconsistency has no attributable author, so drop the
-    // candidate rather than score it.
-    if !resp_ext.consistent_with(&resp.body) {
-        tracing::warn!(
-            "dropping a probe response from {} with has_blob/coverage mismatch",
-            cand.node_id
-        );
-        return OpenOutcome::Unusable;
-    }
-    let Ok(total_bytes) = stated_size(cand, hash, &resp_ext) else {
-        return OpenOutcome::Unusable;
-    };
-    let rtt_ms = rtt.ms;
-    let rate_per_mb = resp.body.rate_per_mb;
-    // Every verified responder contributes a sample, holder or not.
-    let sample = (cand.node_id, rtt_ms, rate_per_mb);
-    if resp.body.has_blob {
-        OpenOutcome::Holder(
-            discovery::Probed {
-                candidate: cand.clone(),
-                rtt_ms,
-                rate_per_mb,
-                total_bytes,
-                coverage: resp_ext.coverage,
-            },
-            sample,
-        )
-    } else {
-        OpenOutcome::NonHolder(warming_candidate(cand, rtt_ms), sample)
-    }
-}
-
 /// `cand` as a proxy-warming or pull-through candidate at `rtt_ms`.
 fn warming_candidate(cand: &NodeCandidate, rtt_ms: f64) -> discovery::WarmingCandidate {
     discovery::WarmingCandidate {
@@ -774,11 +599,24 @@ pub(crate) async fn open_candidate(
     hash: [u8; 32],
     pull_through: bool,
 ) -> anyhow::Result<OpenedStream> {
-    let target = probe_target(cand, relay);
+    let target = candidate_target(cand, relay);
+    open_at(&target, cand, spec, slash_domain, hash, pull_through).await
+}
+
+/// [`open_candidate`] at a dial `target` the caller built, such as a pinned
+/// node's with its `--addr`.
+pub(crate) async fn open_at(
+    target: &EndpointAddr,
+    cand: &NodeCandidate,
+    spec: OpenSpec<'_>,
+    slash_domain: &alloy::sol_types::Eip712Domain,
+    hash: [u8; 32],
+    pull_through: bool,
+) -> anyhow::Result<OpenedStream> {
     let open = |span| {
         crate::discovery_open(
             spec.conns,
-            &target,
+            target,
             cand.eth_address,
             spec.ctx,
             slash_domain,
@@ -1032,65 +870,6 @@ pub async fn open_and_order(
     })
 }
 
-/// Probe `candidates` for `hash` over `endpoint` and return the ordered
-/// provider-failover list, as [`open_and_order`] does from opens. A bundle
-/// entry resolves its holders this way.
-pub async fn probe_and_order(
-    endpoint: &Endpoint,
-    candidates: &[NodeCandidate],
-    relay_hint: Option<&RelayUrl>,
-    hash: [u8; 32],
-    warming: ProxyWarmingParams,
-    slash_domain: &alloy::sol_types::Eip712Domain,
-    round: OpenRound,
-) -> anyhow::Result<ResolvedTargets> {
-    // Probe concurrently in one task. `probe_once`'s internal timeout bounds
-    // each leg; a candidate that sheds the probe is probed again after a short
-    // wait (`probe_candidate`). Each attempt stamps its own timestamp, because
-    // a streamed round's tail can outlive a node's 30-second clock-skew bound.
-    let started = std::time::Instant::now();
-    let probes = candidates.iter().cloned().map(|cand| {
-        let target = probe_target(&cand, relay_hint.cloned());
-        let endpoint = endpoint.clone();
-        let slash_domain = slash_domain.clone();
-        async move {
-            let (timestamp_us, res) = probe_candidate(&endpoint, target, hash).await;
-            log_probe_result(&cand, &res, started);
-            classify_probe(&cand, res, hash, timestamp_us, &slash_domain)
-        }
-    });
-    let (outcomes, tail) = settle_opens(
-        probes,
-        round.grace(),
-        round.cold_grace(),
-        OpenOutcome::is_holder,
-        OpenOutcome::is_answer,
-    )
-    .await;
-
-    let OpenTally {
-        holders,
-        non_holders,
-        samples,
-        dropouts,
-    } = OpenTally::of(candidates.len(), outcomes);
-    if holders.is_empty() && non_holders.is_empty() {
-        return Err(no_serve_target_error(dropouts));
-    }
-    let size_hint = nearest_size_hint(&holders);
-    let late = late_probe_slot(round, tail, &holders, warming);
-    let ordered = failover_order(holders, &non_holders, warming);
-    Ok(ResolvedTargets {
-        candidates: ordered.order,
-        coverage_by_node: ordered.coverage_by_node,
-        samples,
-        pinned: false,
-        size_hint,
-        late,
-        opened: OpenedSlot::default(),
-    })
-}
-
 /// A streamed round's pending opens as its [`LateSlot`], with the best RTT
 /// among the `holders` it returned. Empty for a settled round or an empty
 /// tail. A late answer's stream is cancelled as it arrives, and its outcome
@@ -1115,20 +894,6 @@ where
         outcome
     });
     late_stream_slot(round, empty, outcomes, holders, warming)
-}
-
-/// [`late_slot`] for a probe round's pending probes.
-fn late_probe_slot<F>(
-    round: OpenRound,
-    tail: futures_util::stream::FuturesUnordered<F>,
-    holders: &[discovery::Probed],
-    warming: ProxyWarmingParams,
-) -> LateSlot
-where
-    F: std::future::Future<Output = OpenOutcome> + Send + 'static,
-{
-    let empty = tail.is_empty();
-    late_stream_slot(round, empty, tail, holders, warming)
 }
 
 /// The [`LateSlot`] of a streamed round's pending `tail`; `empty` says the
@@ -1357,7 +1122,7 @@ async fn discover_provider(
 ) -> anyhow::Result<ResolvedTargets> {
     let mark_round_start = || {
         if let Some(marks) = open.marks {
-            marks.probe_started();
+            marks.discovery_started();
         }
     };
     // Open-less fast path: when the store already holds enough fresh,
@@ -1605,13 +1370,13 @@ pub(crate) fn select_up_to(
 pub(crate) fn spawn_harvest(
     data_dir: &Path,
     registry: Vec<NodeCandidate>,
-    probed: Vec<(PublicKey, f64, u64)>,
+    samples: Vec<(PublicKey, f64, u64)>,
 ) -> tokio::task::JoinHandle<()> {
     let dir = data_dir.to_path_buf();
     tokio::spawn(async move {
         let store = crate::PeerStore::open(&dir);
         let cfg = crate::StoreConfig::default();
-        harvest(&store, &registry, probed, now_secs(), &cfg);
+        harvest(&store, &registry, samples, now_secs(), &cfg);
     })
 }
 
@@ -1631,7 +1396,7 @@ struct HarvestTally {
 fn harvest(
     store: &crate::PeerStore,
     registry: &[NodeCandidate],
-    probed: Vec<(PublicKey, f64, u64)>,
+    samples: Vec<(PublicKey, f64, u64)>,
     now: u64,
     cfg: &crate::StoreConfig,
 ) -> HarvestTally {
@@ -1653,7 +1418,7 @@ fn harvest(
             store.upsert_identity(cand, now),
         );
     }
-    for (node_id, rtt_ms, rate) in probed {
+    for (node_id, rtt_ms, rate) in samples {
         let written = store.record_sample(&node_id, rtt_ms, rate, now, cfg);
         file(&node_id, "an answer sample", written);
     }
@@ -1753,7 +1518,7 @@ pub struct ResolvedTargets {
     pub(crate) late: LateSlot,
     /// The holders' streams the round left open, keyed by node: the fetch
     /// adopts the winner's and cancels the rest. Empty when no holder
-    /// answered, on the fast path, and for a probe round.
+    /// answered, and on the fast path.
     pub(crate) opened: OpenedSlot,
 }
 
@@ -1954,17 +1719,12 @@ pub(crate) fn pinned_target(
         region_hint: None,
         multiaddrs: Bytes::new(),
     };
-    let mut target = probe_target(&cand, relay);
+    let mut target = candidate_target(&cand, relay);
     if let Some(addr) = pinned.addr {
         target = target.with_ip_addr(addr);
     }
     (cand, target)
 }
-
-/// How long the size probe of a pinned node may take. The size saves at most
-/// the credit window a header-only open makes the node write, so a slow probe
-/// is not worth the wait: the fetch takes its size from that open instead.
-const PINNED_PROBE_TIMEOUT_MS: u64 = 2_000;
 
 /// The pinned node as its own only holder, opened with pull-through for the
 /// fetch's first leg (`open.spec.span`): the size its answer proves is the
@@ -1982,7 +1742,7 @@ pub(crate) async fn open_pinned(
 ) -> ResolvedTargets {
     let (cand, target) = pinned_target(pinned, relay);
     if let Some(marks) = open.marks {
-        marks.probe_started();
+        marks.discovery_started();
     }
     let started = std::time::Instant::now();
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
@@ -2025,66 +1785,11 @@ pub(crate) async fn open_pinned(
     targets
 }
 
-/// The pinned node as its own only holder, with the size its probe proves as
-/// the fetch's size: [`open_pinned`] over a probe, for a bundle entry.
-/// Without a size, the fetch reads one from the header of a paid open, and the node can write up to a credit window into that
-/// stream before the fetch drops it. A probe that fails, that does not verify,
-/// or whose node does not hold the blob or names no size leaves the size to
-/// that header: the node stays the fetch's only holder either way. One
-/// attempt, with no backoff on a shed probe: a pinned client sends every
-/// probe to the one node, and a shed one costs only the header open. The
-/// probe waits for no direct path, since its RTT goes unused.
-pub(crate) async fn probe_pinned(
-    endpoint: &Endpoint,
-    chain: &ChainConfig,
-    relay: Option<RelayUrl>,
-    pinned: PinnedNode,
-    hash: [u8; 32],
-    marks: Option<&dyn FetchMarks>,
-) -> ResolvedTargets {
-    let (cand, target) = pinned_target(pinned, relay);
-    if let Some(marks) = marks {
-        marks.probe_started();
-    }
-    let started = std::time::Instant::now();
-    let timestamp_us = micros_now();
-    let res = crate::probe::probe_answer_once(
-        endpoint,
-        target,
-        hash,
-        timestamp_us,
-        Duration::from_millis(PINNED_PROBE_TIMEOUT_MS),
-    )
-    .await;
-    log_probe_result(&cand, &res, started);
-    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-    let outcome = classify_probe(&cand, res, hash, timestamp_us, &slash_dom);
-    if matches!(outcome, OpenOutcome::NonHolder(..)) {
-        if chain.capacity_bond.is_none() {
-            tracing::warn!(
-                node = %pinned.node_id,
-                "the pinned node does not hold this blob, and with no CapacityBond \
-                 configured this client sends no identity binding, so the node \
-                 refuses to fill the miss"
-            );
-        } else {
-            tracing::info!(
-                node = %pinned.node_id,
-                "the pinned node does not hold this blob; it serves it only if it can \
-                 fill the miss"
-            );
-        }
-    }
-    let mut targets = pinned_targets(pinned.node_id, pinned.provider);
-    targets.size_hint = answered_size_hint(&outcome);
-    targets
-}
-
 /// The size an outcome offers as the fetch's size: the size a holder proves
 /// in an answer that verifies, else none.
 const fn answered_size_hint(outcome: &OpenOutcome) -> Option<crate::ProvenSize> {
     match outcome {
-        OpenOutcome::Holder(probed, _) => probed.total_bytes,
+        OpenOutcome::Holder(holder, _) => holder.total_bytes,
         _ => None,
     }
 }
@@ -2092,7 +1797,7 @@ const fn answered_size_hint(outcome: &OpenOutcome) -> Option<crate::ProvenSize> 
 /// Build a dial target for a discovered candidate: its `node_id`, an optional
 /// relay hint, and its registry multiaddrs as direct-address hints (ADR 001 §
 /// Node Discovery). See [`crate::lanes::lane_target`] for why both ride the first packet.
-pub(crate) fn probe_target(cand: &NodeCandidate, relay: Option<RelayUrl>) -> EndpointAddr {
+pub(crate) fn candidate_target(cand: &NodeCandidate, relay: Option<RelayUrl>) -> EndpointAddr {
     let mut target = EndpointAddr::new(cand.node_id);
     if let Some(url) = relay {
         target = target.with_relay_url(url);

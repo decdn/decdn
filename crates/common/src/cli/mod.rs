@@ -121,8 +121,9 @@ pub enum Command {
     Whoami(WhoamiArgs),
     /// Manage configuration files (`init`, `validate`).
     Config(ConfigArgs),
-    /// Probe a running node over the `cdn/probe/v1` ALPN.
-    Probe(ProbeArgs),
+    /// Open a `cdn/client/v1` stream to a running node, print its signed
+    /// answer, and cancel the stream before any voucher.
+    Probe(Box<ProbeArgs>),
     /// Serve `decdn:` URIs over HTTP: to a browser from a loopback gateway,
     /// or to anyone from a public gateway (`--public-url`). Either pays only
     /// with the capabilities pool owners register to its delegate keys.
@@ -135,7 +136,7 @@ pub enum Command {
     /// paid `cdn/client/v1` path, paying per-MB from a `PaymentPool`.
     Get(Box<GetArgs>),
     /// Price a pull of what a `decdn:` URI names from the rates the nodes
-    /// sign in their probe answers, before any paid byte.
+    /// sign in their answers to stream opens, before any paid byte.
     Quote(Box<QuoteArgs>),
     /// Check a pull receipt `decdn get --receipt` wrote (`verify`), or add the
     /// on-chain redemptions that settle it (`settle`).

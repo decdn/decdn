@@ -1,8 +1,8 @@
 use super::*;
 use crate::ProvenSize;
 use anyhow::Context as _;
+use iroh::Endpoint;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// [`no_serve_target_error`] over the five counts a probe round tallies.
 fn nst(
@@ -100,31 +100,10 @@ fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp(
     );
 }
 
-/// A probe the node refused with `APP_ERR_TIMESTAMP_SKEW` classifies as
-/// [`OpenOutcome::ClockSkewed`], not as an unreachable node, so the terminal
-/// error can name the clock.
+/// A round tallies a clock-skew refusal apart from an unreachable node, so
+/// the terminal error can name the clock.
 #[test]
-fn classify_probe_types_a_timestamp_refusal_as_clock_skewed() {
-    let cand = NodeCandidate {
-        node_id: node_key(1),
-        eth_address: Address::repeat_byte(1),
-        region_hint: None,
-        multiaddrs: Bytes::new(),
-    };
-    let domain = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x0D));
-    let refused: ProbeResult = Err(anyhow::Error::new(crate::UpstreamTimestampRejected {
-        label: Some("probe-error".to_owned()),
-    })
-    .context("read response"));
-    assert!(matches!(
-        classify_probe(&cand, refused, [7; 32], micros_now(), &domain),
-        OpenOutcome::ClockSkewed
-    ));
-    let silent: ProbeResult = Err(anyhow::anyhow!("connect failed: timed out"));
-    assert!(matches!(
-        classify_probe(&cand, silent, [7; 32], micros_now(), &domain),
-        OpenOutcome::Unreachable
-    ));
+fn a_round_tallies_a_timestamp_refusal_apart_from_silence() {
     let tally = OpenTally::of(2, vec![OpenOutcome::ClockSkewed, OpenOutcome::Unreachable]);
     assert_eq!(
         (tally.dropouts.clock_skewed, tally.dropouts.unreachable),
@@ -219,8 +198,8 @@ async fn settle_collects_answers_ready_with_the_first_holder() {
     assert_eq!(tail.len(), 1);
 }
 
-/// A late probe that records when it answers, then reports `Unreachable`.
-fn recording_probe(
+/// A late open that records when it answers, then reports `Unreachable`.
+fn recording_open(
     after: Duration,
     answered: &Arc<std::sync::Mutex<Option<Duration>>>,
 ) -> impl std::future::Future<Output = OpenOutcome> + Send + 'static {
@@ -243,16 +222,16 @@ fn no_warming() -> ProxyWarmingParams {
     }
 }
 
-/// A streamed round's pending probes keep running while nothing polls the
-/// tail, so a slow unlock between the round and the fetch neither times
+/// A streamed round's pending opens keep running while nothing polls the
+/// tail, so a slow lane build between the round and the fetch neither times
 /// them out nor inflates their RTT. The answer waits in the tail.
 #[tokio::test(start_paused = true)]
-async fn late_probes_run_while_the_tail_is_not_polled() {
+async fn late_opens_run_while_the_tail_is_not_polled() {
     use futures_util::StreamExt as _;
     let answered = Arc::new(std::sync::Mutex::new(None));
     let tail: futures_util::stream::FuturesUnordered<_> =
-        std::iter::once(recording_probe(Duration::from_millis(100), &answered)).collect();
-    let slot = late_probe_slot(OpenRound::Stream, tail, &[], no_warming());
+        std::iter::once(recording_open(Duration::from_millis(100), &answered)).collect();
+    let slot = late_stream_slot(OpenRound::Stream, false, tail, &[], no_warming());
 
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(*answered.lock().unwrap(), Some(Duration::from_millis(100)));
@@ -264,13 +243,13 @@ async fn late_probes_run_while_the_tail_is_not_polled() {
     assert!(late.tail.next().await.is_none());
 }
 
-/// Dropping the late probes stops the ones still running.
+/// Dropping the late opens stops the ones still running.
 #[tokio::test(start_paused = true)]
-async fn late_probes_stop_when_dropped() {
+async fn late_opens_stop_when_dropped() {
     let answered = Arc::new(std::sync::Mutex::new(None));
     let tail: futures_util::stream::FuturesUnordered<_> =
-        std::iter::once(recording_probe(Duration::from_secs(1), &answered)).collect();
-    let slot = late_probe_slot(OpenRound::Stream, tail, &[], no_warming());
+        std::iter::once(recording_open(Duration::from_secs(1), &answered)).collect();
+    let slot = late_stream_slot(OpenRound::Stream, false, tail, &[], no_warming());
     tokio::time::sleep(Duration::from_millis(100)).await;
     drop(slot);
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -342,14 +321,14 @@ async fn settle_cold_cutoff_ignores_failed_probes() {
     assert_eq!(started.elapsed(), Duration::from_millis(600));
 }
 
-/// A loopback probe server that closes every connection with `code`, and
-/// counts the connections it saw.
-async fn closing_probe_server(
+/// A loopback `cdn/client/v1` server that closes every connection with
+/// `code`, and counts the connections it saw.
+async fn closing_server(
     code: u32,
 ) -> (Endpoint, EndpointAddr, Arc<std::sync::atomic::AtomicUsize>) {
     use iroh::endpoint::{RelayMode, presets};
     let ep = Endpoint::builder(presets::Minimal)
-        .alpns(vec![decdn_protocol::ALPN_PROBE.to_vec()])
+        .alpns(vec![decdn_protocol::ALPN_CLIENT.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind_addr(std::net::SocketAddrV4::new(
             std::net::Ipv4Addr::LOCALHOST,
@@ -376,8 +355,7 @@ async fn closing_probe_server(
             let Ok(conn) = incoming.await else { continue };
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             conn.close(code.into(), b"per_peer");
-            // Wait for the close to reach the client before the next accept,
-            // as the node's probe limiter does.
+            // Wait for the close to reach the client before the next accept.
             conn.closed().await;
         }
     });
@@ -398,59 +376,12 @@ async fn client_endpoint() -> Endpoint {
         .unwrap()
 }
 
-/// A candidate that sheds every probe with `APP_ERR_RATE_LIMITED` is probed
-/// once plus once after each backoff, and its error still reads as a shed —
-/// so `probe_and_order` counts it as rate-limited, not silent.
+/// A pinned node that sheds its open stays the fetch's only holder, with no
+/// size hint and no stream (#2619). It is opened once, at its `--addr`, and
+/// the shed open is not retried: the lane opens its own leg.
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_candidate_retries_a_shedding_candidate_then_reports_the_shed() {
-    let (server, target, seen) = closing_probe_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
-    let client = client_endpoint().await;
-    let started = Instant::now();
-    let started_us = micros_now();
-
-    let (timestamp_us, res) = probe_candidate(&client, target, [7; 32]).await;
-
-    let err = res.expect_err("every probe was shed");
-    assert!(is_shed(&err), "the shed survives the retries: {err:#}");
-    assert_eq!(
-        seen.load(std::sync::atomic::Ordering::SeqCst),
-        PROBE_SHED_BACKOFFS_MS.len() + 1
-    );
-    let waited: u64 = PROBE_SHED_BACKOFFS_MS.iter().sum();
-    assert!(started.elapsed() >= Duration::from_millis(waited));
-    // Each attempt stamps its own timestamp, and the one returned is the last
-    // attempt's: it was taken after every backoff, not at the first attempt.
-    assert!(
-        timestamp_us >= started_us + waited * 1_000,
-        "the returned timestamp {timestamp_us} is the first attempt's, not the last's \
-         (started at {started_us}, waited {waited} ms)"
-    );
-    client.close().await;
-    server.close().await;
-}
-
-/// Any other failure returns at once: a node that closes with a code other
-/// than `APP_ERR_RATE_LIMITED` is not probed again.
-#[tokio::test(flavor = "multi_thread")]
-async fn probe_candidate_does_not_retry_a_failure_that_is_not_a_shed() {
-    let (server, target, seen) = closing_probe_server(0).await;
-    let client = client_endpoint().await;
-
-    let (_, res) = probe_candidate(&client, target, [7; 32]).await;
-
-    let err = res.expect_err("the connection was closed");
-    assert!(!is_shed(&err), "{err:#}");
-    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
-    client.close().await;
-    server.close().await;
-}
-
-/// A pinned node that sheds its size probe stays the fetch's only holder,
-/// with no size hint (#2619). It is probed once, at its `--addr`, and a shed
-/// probe is not retried: the hint is worth no backoff.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
-    let (server, target, seen) = closing_probe_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
+async fn a_pinned_node_that_sheds_its_open_stays_the_holder_with_no_hint() {
+    let (server, target, seen) = closing_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
     let client = client_endpoint().await;
     let provider = Address::repeat_byte(0x42);
     let pinned = PinnedNode {
@@ -458,10 +389,19 @@ async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
         provider,
         addr: target.ip_addrs().next().copied(),
     };
-    let targets = probe_pinned(&client, &offline_chain(), None, pinned, [7; 32], None).await;
+    let conns = crate::Connections::new(client.clone());
+    let ctx = open_ctx();
+    let open = OpenOpts {
+        marks: None,
+        round: OpenRound::Stream,
+        known_size: None,
+        spec: spec(&conns, &ctx, 0),
+    };
+    let targets = open_pinned(&offline_chain(), None, pinned, [7; 32], open).await;
 
     assert!(targets.pinned);
     assert!(targets.size_hint.is_none());
+    assert_eq!(targets.opened.len(), 0);
     assert_eq!(
         targets
             .candidates
@@ -470,7 +410,7 @@ async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
             .collect::<Vec<_>>(),
         vec![(server.id(), provider)]
     );
-    // One probe: a shed one is not retried.
+    // One connection: a shed open is not retried.
     assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     client.close().await;
     server.close().await;
@@ -480,7 +420,7 @@ async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
 /// takes it as the first size claim and opens nothing (#2619).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pinned_fetch_with_a_known_size_opens_nothing() {
-    let (server, target, seen) = closing_probe_server(0).await;
+    let (server, target, seen) = closing_server(0).await;
     let client = client_endpoint().await;
     let site_dir = tempfile::tempdir().unwrap();
     let opts = DiscoveryOptions {
@@ -516,7 +456,7 @@ async fn a_pinned_fetch_with_a_known_size_opens_nothing() {
     server.close().await;
 }
 
-/// A chain no test reaches: the pinned probe verifies answers against its
+/// A chain no test reaches: the pinned open verifies answers against its
 /// slash domain and reads nothing else from it.
 fn offline_chain() -> ChainConfig {
     ChainConfig {
@@ -639,7 +579,7 @@ fn identity_fresh_candidates_gathers_latency_stale_peers() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A pinned `--node-id` is one probed-as-holder candidate. It carries no size
+/// A pinned `--node-id` is one candidate that counts as a holder. It carries no size
 /// hint of its own (#2218): a blob fetch takes its open's ([`open_pinned`]).
 #[test]
 fn a_pinned_node_resolves_with_no_size_hint() {
@@ -654,11 +594,11 @@ fn a_pinned_node_resolves_with_no_size_hint() {
     );
 }
 
-/// A pinned node's probe gives the first size claim only when it verifies as
-/// a holder that names a size (#2619). Any other outcome leaves the claim to a
-/// header-only open.
+/// A pinned node's open gives the first size claim only when it verifies as
+/// a holder that proves a size (#2619). Any other outcome leaves the claim to
+/// the lane's own open.
 #[test]
-fn a_pinned_probe_hints_only_a_verified_holder_size() {
+fn a_pinned_open_hints_only_a_verified_holder_size() {
     let sample = (harvest_key(7), 5.0, 1);
     let sized = holder(7, 5.0);
     let size = sized.total_bytes;
@@ -1001,172 +941,6 @@ fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
     assert_ne!(h1.coverage, h2.coverage);
     // A node that was never probed has no entry.
     assert!(!out.coverage_by_node.contains_key(&node_key(99)));
-}
-
-/// #2471: a holder of the empty root answers `has_blob: true` over an empty
-/// coverage, because the blob spans no block. The consumer takes that answer
-/// as a holder with a size hint of 0 for the empty root, takes a node that
-/// signs `has_blob: false` over the same coverage as a non-holder, and drops
-/// the `has_blob: true` pairing as malformed for every other hash.
-#[test]
-fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result<()> {
-    use alloy::signers::local::PrivateKeySigner;
-    use decdn_incentive::{ProbeSlashData, slash_judge_domain};
-    use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
-    use decdn_protocol::{Coverage, EMPTY_ROOT, ProbeResponseExt};
-
-    const TS: u64 = 1_700_000_000_000_000;
-    let signer = PrivateKeySigner::random();
-    let domain = slash_judge_domain(421_614, alloy::primitives::Address::repeat_byte(0x0D));
-    let cand = NodeCandidate {
-        node_id: node_key(1),
-        eth_address: signer.address(),
-        region_hint: None,
-        multiaddrs: alloy::primitives::Bytes::new(),
-    };
-    let answer = |hash: [u8; 32],
-                  has_blob: bool|
-     -> anyhow::Result<(ProbeResponse, ProbeResponseExt, crate::probe::ProbeRtt)> {
-        let body = ProbeResponseBody {
-            hash,
-            has_blob,
-            rate_per_mb: 10,
-            timestamp_us: TS,
-        };
-        let slash_sig = ProbeSlashData {
-            hash: hash.into(),
-            has_blob,
-            rate_per_mb: 10,
-            timestamp_us: TS,
-        }
-        .sign(&signer, &domain)
-        .map_err(|e| anyhow::anyhow!("sign: {e}"))?
-        .as_bytes()
-        .to_vec();
-        Ok((
-            ProbeResponse { body, slash_sig },
-            ProbeResponseExt {
-                coverage: Coverage::empty(),
-                size_proof: Some(decdn_protocol::SizeProof::default()),
-            },
-            crate::probe::ProbeRtt {
-                ms: 5.0,
-                direct: true,
-            },
-        ))
-    };
-
-    match classify_probe(&cand, answer(EMPTY_ROOT, true), EMPTY_ROOT, TS, &domain) {
-        OpenOutcome::Holder(probed, _) => {
-            assert_eq!(probed.total_bytes, Some(ProvenSize::assume_for_tests(0)));
-            assert!(probed.coverage.is_empty());
-        }
-        _ => anyhow::bail!("the empty root's holder must classify as a holder"),
-    }
-    assert!(
-        matches!(
-            classify_probe(&cand, answer(EMPTY_ROOT, false), EMPTY_ROOT, TS, &domain),
-            OpenOutcome::NonHolder(..)
-        ),
-        "a chain-stale or opted-out node signs has_blob:false for the empty root and is a \
-         non-holder, not a malformed answer"
-    );
-    let other_hash = [0x11u8; 32];
-    assert!(
-        matches!(
-            classify_probe(&cand, answer(other_hash, true), other_hash, TS, &domain),
-            OpenOutcome::Unusable
-        ),
-        "an empty coverage with has_blob:true is malformed for a non-empty root"
-    );
-    Ok(())
-}
-
-/// A probe answer states a size only in its proof, and keeps it only when the
-/// proof verifies under the hash. A wrong size with real but mismatched proof
-/// bytes and a 2^60 size with garbage proof bytes both drop the answer, so the
-/// size never reaches a plan.
-#[test]
-fn a_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
-    use alloy::signers::local::PrivateKeySigner;
-    use decdn_incentive::{ProbeSlashData, slash_judge_domain};
-    use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
-    use decdn_protocol::{Coverage, ProbeResponseExt, SizeProof};
-
-    const TS: u64 = 1_700_000_000_000_000;
-    let blob: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
-    let size = u64::try_from(blob.len())?;
-    let hash = *blake3::hash(&blob).as_bytes();
-    let proof_bytes = decdn_bao_range::encode_outboard(blob.as_slice(), size)?
-        .size_proof
-        .to_vec();
-    let proof = SizeProof::new(size, proof_bytes.clone())?;
-    let signer = PrivateKeySigner::random();
-    let domain = slash_judge_domain(421_614, alloy::primitives::Address::repeat_byte(0x0D));
-    let cand = NodeCandidate {
-        node_id: node_key(1),
-        eth_address: signer.address(),
-        region_hint: None,
-        multiaddrs: alloy::primitives::Bytes::new(),
-    };
-    let answer = |size_proof: Option<SizeProof>| -> anyhow::Result<(
-        ProbeResponse,
-        ProbeResponseExt,
-        crate::probe::ProbeRtt,
-    )> {
-        let body = ProbeResponseBody {
-            hash,
-            has_blob: true,
-            rate_per_mb: 10,
-            timestamp_us: TS,
-        };
-        let slash_sig = ProbeSlashData {
-            hash: hash.into(),
-            has_blob: true,
-            rate_per_mb: 10,
-            timestamp_us: TS,
-        }
-        .sign(&signer, &domain)
-        .map_err(|e| anyhow::anyhow!("sign: {e}"))?
-        .as_bytes()
-        .to_vec();
-        Ok((
-            ProbeResponse { body, slash_sig },
-            ProbeResponseExt {
-                coverage: Coverage::full(1),
-                size_proof,
-            },
-            crate::probe::ProbeRtt {
-                ms: 5.0,
-                direct: true,
-            },
-        ))
-    };
-    let classify = |size_proof| classify_probe(&cand, answer(size_proof), hash, TS, &domain);
-
-    match classify(Some(proof)) {
-        OpenOutcome::Holder(probed, _) => {
-            assert_eq!(probed.total_bytes.map(ProvenSize::get), Some(size));
-        }
-        _ => anyhow::bail!("a proven size keeps the holder"),
-    }
-    match classify(None) {
-        OpenOutcome::Holder(probed, _) => assert_eq!(probed.total_bytes, None),
-        _ => anyhow::bail!("a holder that states no size is still a holder"),
-    }
-    for (what, size_proof) in [
-        (
-            "a wrong size",
-            SizeProof::new(size + 1, proof_bytes.clone())?,
-        ),
-        ("a huge size", SizeProof::new(1u64 << 60, vec![0xAB; 4000])?),
-    ] {
-        assert!(
-            matches!(classify(Some(size_proof)), OpenOutcome::Unusable),
-            "{what} drops the answer"
-        );
-    }
-    Ok(())
 }
 
 /// A candidate's rate hint is its answer's sample from this resolve, else the

@@ -1666,7 +1666,7 @@ fn a_dry_run_plan_always_names_its_quote() {
     assert_eq!(empty["quote_error"], "nothing to fetch");
 }
 
-/// An empty config file: a dry run's quote then resolves no chain and probes
+/// An empty config file: a dry run's quote then resolves no chain and opens
 /// nothing, whatever config the machine running the tests has.
 fn offline_config() -> std::path::PathBuf {
     static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();

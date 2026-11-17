@@ -24,7 +24,7 @@ pub(crate) enum Mark {
     /// Discovery starts its round of opens. Absent when the peer store's fresh
     /// latencies choose the holders without a round, or when a `--node-id`
     /// fetch knows the blob's size.
-    ProbeStart,
+    DiscoveryStart,
     /// The first holder set is resolved.
     Resolved,
     /// The first lane's pool is open or reused and its source is ready.
@@ -51,7 +51,7 @@ pub(crate) struct FetchTimings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) endpoint: Option<u64>,
-    pub(crate) probe_start: Option<u64>,
+    pub(crate) discovery_start: Option<u64>,
     pub(crate) resolved: Option<u64>,
     pub(crate) unlocked: Option<u64>,
     pub(crate) lane: Option<u64>,
@@ -112,7 +112,7 @@ impl FetchTimings {
     pub(crate) fn snapshot(&self) -> Snapshot {
         Snapshot {
             endpoint: self.ms(Mark::Endpoint),
-            probe_start: self.ms(Mark::ProbeStart),
+            discovery_start: self.ms(Mark::DiscoveryStart),
             resolved: self.ms(Mark::Resolved),
             unlocked: self.ms(Mark::Unlocked),
             lane: self.ms(Mark::Lane),
@@ -131,7 +131,7 @@ impl FetchTimings {
             output,
             ok,
             endpoint_ms = s.endpoint,
-            probe_start_ms = s.probe_start,
+            discovery_start_ms = s.discovery_start,
             resolved_ms = s.resolved,
             unlocked_ms = s.unlocked,
             lane_ms = s.lane,
@@ -144,8 +144,8 @@ impl FetchTimings {
 
 /// The SDK reports the marks it reaches inside discovery and lane building.
 impl decdn_client::session::FetchMarks for FetchTimings {
-    fn probe_started(&self) {
-        self.mark(Mark::ProbeStart);
+    fn discovery_started(&self) {
+        self.mark(Mark::DiscoveryStart);
     }
 
     fn lane_built(&self) {

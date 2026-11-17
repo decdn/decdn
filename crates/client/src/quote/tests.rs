@@ -267,7 +267,7 @@ fn tally_sorts_outcomes_by_hash() {
         (9, cand(7, 7), OpenOutcome::Unreachable),
     ];
     let census = tally(6, &hashes, outcomes, false);
-    assert_eq!(census.probed, 6);
+    assert_eq!(census.opened, 6);
     let [first, second] = census.hashes.as_slice() else {
         panic!("two hashes");
     };
@@ -291,7 +291,7 @@ fn tally_sorts_outcomes_by_hash() {
 #[test]
 fn samples_keep_each_nodes_nearest_answer() {
     let census = Census {
-        probed: 1,
+        opened: 1,
         hashes: vec![
             census_of(vec![answer(1, 1, 30.0, 10, true)]),
             census_of(vec![answer(1, 1, 20.0, 20, false)]),
@@ -301,29 +301,29 @@ fn samples_keep_each_nodes_nearest_answer() {
     assert_eq!(census.samples(), vec![(node_key(1), 20.0, 20)]);
 }
 
-/// A census errors only when it probed a hash and no node answered any:
+/// A census errors only when it asked about a hash and no node answered any:
 /// one answered hash is enough, and no hash at all is no error. The error
-/// counts nodes, not probes.
+/// counts nodes, not opens.
 #[test]
-fn unanswered_needs_every_probed_hash_silent() {
+fn unanswered_needs_every_asked_hash_silent() {
     let silent = |unreachable| HashCensus {
         unreachable,
         ..census_of(Vec::new())
     };
     let none = Census {
-        probed: 3,
+        opened: 3,
         hashes: Vec::new(),
         outage_fallback: false,
     };
     assert!(unanswered(&none).is_none());
     let partial = Census {
-        probed: 3,
+        opened: 3,
         hashes: vec![census_of(vec![answer(1, 1, 5.0, 10, true)]), silent(3)],
         outage_fallback: false,
     };
     assert!(unanswered(&partial).is_none());
     let all = Census {
-        probed: 3,
+        opened: 3,
         hashes: vec![silent(3), silent(3)],
         outage_fallback: false,
     };
@@ -335,7 +335,7 @@ fn unanswered_needs_every_probed_hash_silent() {
 #[test]
 fn unanswered_names_unverifiable_answers() {
     let census = Census {
-        probed: 2,
+        opened: 2,
         hashes: vec![HashCensus {
             unverifiable: 2,
             ..census_of(Vec::new())
@@ -356,7 +356,7 @@ fn unanswered_names_unverifiable_answers() {
 #[test]
 fn unanswered_names_the_clock_when_the_nodes_refuse_the_timestamp() {
     let census = Census {
-        probed: 3,
+        opened: 3,
         hashes: vec![HashCensus {
             clock_skewed: 3,
             ..census_of(Vec::new())
@@ -374,7 +374,7 @@ fn unanswered_names_the_clock_when_the_nodes_refuse_the_timestamp() {
     assert!(!msg.contains("did not answer"), "{msg}");
 
     let two = Census {
-        probed: 2,
+        opened: 2,
         hashes: vec![HashCensus {
             clock_skewed: 2,
             ..census_of(Vec::new())
@@ -431,4 +431,106 @@ fn wire_bytes_add_the_proof() {
     assert_eq!(wire_bytes(0).unwrap(), 0);
     let wire = wire_bytes(MIB).unwrap();
     assert!(wire > MIB && wire < MIB + MIB / 100, "{wire}");
+}
+
+/// A census asks a node with a voucher-less open of the whole blob that names
+/// the payer's pool and asks no pull-through, keeps the verified quote, size
+/// and coverage, and cancels the stream: the node sees a reset and no paid
+/// frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_census_opens_each_node_and_cancels_every_stream() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    use crate::session::PinnedNode;
+    use std::sync::Arc;
+
+    let chain = ChainConfig {
+        rpc_url: "http://127.0.0.1:1".to_owned(),
+        chain_id: 31_337,
+        payment_pool: Address::repeat_byte(0x01),
+        slash_judge: Address::repeat_byte(0x02),
+        capacity_bond: None,
+    };
+    let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 9,
+        },
+        slash_judge_domain(chain.chain_id, chain.slash_judge),
+    )
+    .await?;
+    let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await?;
+    let conns = Connections::new(client.clone());
+    let ctx = PoolContext::new(
+        alloy::primitives::B256::repeat_byte(0x11),
+        U256::ZERO,
+        Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+        decdn_incentive::voucher_domain(chain.chain_id, chain.payment_pool),
+    );
+    let site_dir = tempfile::tempdir()?;
+    let site = PullSite {
+        data_dir: site_dir.path().to_path_buf(),
+        region: None,
+        region_allowlist: Vec::new(),
+    };
+    let discovery = DiscoveryOptions {
+        pinned: Some(PinnedNode {
+            node_id: node.endpoint.id(),
+            provider: node.operator_address(),
+            addr: node.addr.ip_addrs().next().copied(),
+        }),
+        ..DiscoveryOptions::default()
+    };
+
+    let nodes = census_nodes((&chain, &site), &[], &discovery).await?;
+    assert_eq!(nodes.len(), 1, "a pinned node is the list alone");
+    let census = census(
+        &nodes,
+        (&conns, &ctx),
+        (&chain, &site),
+        &[hash],
+        decdn_protocol::client::NO_NAMESPACE,
+    )
+    .await?;
+
+    assert_eq!(census.opened, 1);
+    let [answered] = census.hashes.as_slice() else {
+        panic!("one hash");
+    };
+    let [answer] = answered.answers.as_slice() else {
+        panic!("one answer, got {answered:?}");
+    };
+    assert!(answer.has_blob);
+    assert_eq!(answer.rate_per_mb, 9);
+    assert_eq!(
+        answer.total_bytes.map(ProvenSize::get),
+        Some(u64::try_from(blob.len())?)
+    );
+    assert!(!answer.coverage.is_empty());
+    let requests = node
+        .seen
+        .requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let [(req, ext)] = requests.as_slice() else {
+        panic!("one request, got {}", requests.len());
+    };
+    assert_eq!(req.pool_id, ctx.pool_id.0);
+    assert_eq!((req.byte_offset, req.byte_len), (0, 0));
+    assert!(!ext.pull_through, "a census open asks no pull-through");
+    for _ in 0..200 {
+        if Seen::count(&node.seen.resets) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(Seen::count(&node.seen.resets), 1, "the stream is cancelled");
+    assert_eq!(Seen::count(&node.seen.paid), 0, "nothing is paid");
+    client.close().await;
+    Ok(())
 }

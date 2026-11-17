@@ -83,24 +83,6 @@ pub async fn probe_once(
     probe_with(endpoint, target, hash, timestamp_us, timeout, true).await
 }
 
-/// [`probe_once`] for its answer alone: it does not wait for hole punching to
-/// select a direct path, so the RTT it reports is the exchange's. For a caller
-/// that reads only the answer, which a relayed path would otherwise hold for
-/// up to [`DIRECT_PATH_GRACE`].
-///
-/// # Errors
-///
-/// The same as [`probe_once`].
-pub(crate) async fn probe_answer_once(
-    endpoint: &Endpoint,
-    target: EndpointAddr,
-    hash: [u8; 32],
-    timestamp_us: u64,
-    timeout: Duration,
-) -> anyhow::Result<(ProbeResponse, ProbeResponseExt, ProbeRtt)> {
-    probe_with(endpoint, target, hash, timestamp_us, timeout, false).await
-}
-
 /// One probe exchange within `timeout`, then, when `direct_path` is set, the
 /// wait for a direct-path RTT ([`exchange_within`]).
 async fn probe_with(

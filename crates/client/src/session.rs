@@ -186,8 +186,8 @@ impl Default for DiscoveryOptions {
 /// reached; the caller keeps the first.
 #[doc(hidden)]
 pub trait FetchMarks: Send + Sync {
-    /// Discovery starts a round of opens, or of probes.
-    fn probe_started(&self);
+    /// Discovery starts a round of opens.
+    fn discovery_started(&self);
     /// A lane's pool is open or reused, and its source is ready.
     fn lane_built(&self);
     /// A holder joined the running fetch from an answer that arrived late.

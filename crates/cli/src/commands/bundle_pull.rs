@@ -854,11 +854,10 @@ pub(crate) async fn bundle_pull(
         super::get::refuse_file_at_bundle_dir(uri, &dest.path)?;
     }
 
-    // Dry-run short-circuits before any payment, transaction or keystore
-    // prompt.
+    // Dry-run short-circuits before any payment or transaction.
     if args.dry_run {
-        // Boxed: the quote's probe round would otherwise grow every pull's
-        // future past the `large_futures` limit.
+        // Boxed: the quote's discovery round would otherwise grow every
+        // pull's future past the `large_futures` limit.
         return Box::pin(dry_run(
             args,
             dest,
@@ -945,7 +944,12 @@ async fn pull_over(
     );
     let mut puller = open_puller(
         &args.common,
-        (chain, grant.as_ref(), store),
+        PullerBuyer {
+            chain,
+            grant: grant.as_ref(),
+            store,
+            signer: None,
+        },
         (endpoint, relays),
         uri.namespace,
         lanes,
@@ -983,18 +987,32 @@ async fn pull_over(
     result
 }
 
+/// Who a puller pays as: the chain, the `--capability` delegation, the buyer
+/// store, and the buyer key when a caller already unlocked it.
+pub(crate) struct PullerBuyer<'a> {
+    /// The chain the run pays on, and its site.
+    pub(crate) chain: &'a fetch::ResolvedChain,
+    /// The delegation, when the run pays from another owner's pool.
+    pub(crate) grant: Option<&'a CapabilityGrant>,
+    /// The buyer-pool store.
+    pub(crate) store: &'a Arc<dyn BuyerPoolStore>,
+    /// The buyer key a caller already unlocked; with none, the keystore
+    /// unlocks once the node selection resolves.
+    pub(crate) signer: Option<Arc<PrivateKeySigner>>,
+}
+
 /// The run's puller: its node selection, its buyer key and funding, and
 /// its pull settings, with `observer`, the receipt `evidence` when there is
-/// one, and `escrows` attached. `lanes` is the `--jobs` and
-/// `--max-lane-streams` pair. `open` says whether a self-owned run may open
-/// a pool when it has none.
+/// one, and `escrows` attached. `buyer` names who pays. `lanes` is the `--jobs` and `--max-lane-streams` pair. `open`
+/// says whether a self-owned run may open a pool when it has none.
 async fn open_puller(
     common: &ClientFetchArgs,
-    (chain, grant, store): (
-        &fetch::ResolvedChain,
-        Option<&CapabilityGrant>,
-        &Arc<dyn BuyerPoolStore>,
-    ),
+    PullerBuyer {
+        chain,
+        grant,
+        store,
+        signer,
+    }: PullerBuyer<'_>,
     (endpoint, relays): (&Endpoint, &[RelayUrl]),
     namespace: Option<u64>,
     (jobs, max_lane_streams): (usize, usize),
@@ -1004,11 +1022,14 @@ async fn open_puller(
     // The node selection is resolved BEFORE the keystore prompt, so a failed
     // discovery never prompts. A registry read is bounded by `--timeout-ms`
     // (#1349), inside the read so a timeout still falls through to the peer
-    // store. No sampling or probing happens here: each entry samples and
-    // probes its own candidates.
+    // store. No sampling or opening happens here: each entry samples and
+    // opens its own candidates, naming the run's payer.
     let discovery = fetch::discovery_options(common)?;
     let nodes = select_nodes(&chain.config, &chain.site, &discovery).await?;
-    let signer = load_buyer_signer(chain)?;
+    let signer = match signer {
+        Some(signer) => signer,
+        None => load_buyer_signer(chain)?,
+    };
     let funding = match grant {
         None => Funding::SelfOwned {
             owner: signer,
@@ -1053,28 +1074,23 @@ async fn open_puller(
 /// or fetched and cached there: a paid pull from the caller's pool, which it
 /// tops up as `decdn get` does, and opens only under `open`
 /// ([`decdn_client::PoolOpenRefused`] when it may not). `decdn quote` calls it
-/// for a bundle with no cached manifest. A Ctrl-C ends the fetch
+/// for a bundle with no cached manifest, paid as `buyer`. A Ctrl-C ends the fetch
 /// [`Interrupted`].
 pub(crate) async fn fetch_manifest_paid(
     common: &ClientFetchArgs,
     out: &Path,
     uri: &DecdnUri,
-    (chain, open): (&mut fetch::ResolvedChain, PoolOpen),
+    buyer: PullerBuyer<'_>,
+    open: PoolOpen,
     (endpoint, relays): (&Endpoint, &[RelayUrl]),
 ) -> anyhow::Result<BundleManifest> {
-    let grant = fetch::resolve_delegation_grant(common, chain)?;
-    let store: Arc<dyn BuyerPoolStore> = Arc::new(open_client_store_for_buy(
-        &chain.site.data_dir,
-        chain.data_dir_source,
-        "pull",
-    )?);
     let escrows = UnconfirmedEscrows::default();
     // No bars: a manifest fetch reports no run totals. Warnings and pool
     // notes still print.
     let observer = Arc::new(PullObserver::new(true, run_label(out), None));
     let puller = open_puller(
         common,
-        (chain, grant.as_ref(), &store),
+        buyer,
         (endpoint, relays),
         uri.namespace,
         (1, usize::from(DEFAULT_MAX_LANE_STREAMS)),
@@ -1495,10 +1511,11 @@ fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
     })
 }
 
-/// Print the would-fetch plan and its quote, and exit. Nothing is paid, no
-/// transaction is sent and no keystore is opened. The quote reads the node
-/// registry when the peer store cannot supply it, and sends one unpaid probe
-/// round, whose samples it records in the peer store. The plan lists the
+/// Print the would-fetch plan and its quote, and exit. Nothing is paid and no
+/// transaction is sent. The quote unlocks the keystore and names the pool as
+/// a pull does, reads the node registry when the peer store cannot supply
+/// it, and sends one round of voucher-less opens, each cancelled once it has
+/// answered, whose samples it records in the peer store. The plan lists the
 /// entries of the bundle's manifest as cached in the output root by an
 /// earlier pull or `decdn quote`. The cache is read even under `--overwrite`,
 /// which makes a real pull fetch the manifest again: the cache is
@@ -1515,7 +1532,7 @@ fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
 /// `quote: null` under `--json`, since the quote needs the manifest's sizes.
 /// A quote that fails prints a warning, and `quote: null` with its
 /// `quote_error` under `--json`, except a fault the real run fails on too (an
-/// invalid or malformed `--node-id`/`--provider-address`, or probe
+/// invalid or malformed `--node-id`/`--provider-address`, or answer
 /// signatures that do not recover to their operators), which fails the dry
 /// run ([`quote::dry_run_quote`]).
 async fn dry_run(
@@ -1570,7 +1587,7 @@ async fn dry_run(
         None
     } else {
         let plan = quote::Plan::of_target(&manifest, &uri.target)?;
-        Some(quote::dry_run_quote(&args.common, config_path, &plan).await?)
+        Some(quote::dry_run_quote(&args.common, config_path, &plan, uri.namespace).await?)
     };
     if let Some(Err(warning)) = &quoted {
         eprintln!("warning: {warning}");

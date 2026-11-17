@@ -1,6 +1,6 @@
 //! Live anvil-backed e2e for `decdn quote` (#2600): the shipped `decdn` binary
 //! prices a blob and a bundle from the rates two real nodes sign in their
-//! `cdn/probe/v1` answers.
+//! answers to voucher-less `cdn/client/v1` opens.
 //!
 //! The unit tests in `decdn-client` and the CLI prove the ranking and the
 //! price math against hand-built answers. What only the real wire proves is
@@ -16,7 +16,7 @@
 //!      blob's wire bytes at each.
 //!   2. `--max-rate-per-mb 10` leaves the more expensive node out of the
 //!      price.
-//!   3. A pinned `--node-id` quote probes that node alone.
+//!   3. A pinned `--node-id` quote opens that node alone.
 //!   4. `decdn get --dry-run` prints the quote block, and under `--json`
 //!      carries the quote, and writes no output file.
 //!   5. A bundle quote with no cached manifest and no open pool stops
@@ -76,7 +76,7 @@ fn make_blob(len: u32, seed: u32) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cli_quote_prices_from_signed_probe_rates() -> anyhow::Result<()> {
+async fn cli_quote_prices_from_signed_open_rates() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
         .context("cli quote e2e exceeded the overall timeout")??;
@@ -219,7 +219,7 @@ fn blob_quotes(j: &Journey) -> anyhow::Result<()> {
     let quote = json(&j.decdn(&["quote", &uri, "--json"])?)?;
     assert_eq!(quote["target"], "blob");
     assert_eq!(quote["content_bytes"], j.blob.len());
-    assert_eq!(quote["nodes_probed"], 2, "{quote}");
+    assert_eq!(quote["nodes_opened"], 2, "{quote}");
     assert_eq!(quote["holders_min"], 2, "{quote}");
     assert_eq!(quote["rate_min_per_mib"], CHEAP_RATE, "{quote}");
     assert_eq!(quote["rate_max_per_mib"], DEAR_RATE, "{quote}");
@@ -245,7 +245,7 @@ fn blob_quotes(j: &Journey) -> anyhow::Result<()> {
         "{capped}"
     );
 
-    // (3) A pinned node is probed alone.
+    // (3) A pinned node is opened alone.
     let node_id = j.cheap.node_id().to_string();
     let provider = j.cheap.operator_addr().to_string();
     let addr = format!("127.0.0.1:{}", j.cheap.bind_port());
@@ -260,7 +260,7 @@ fn blob_quotes(j: &Journey) -> anyhow::Result<()> {
         "--addr",
         &addr,
     ])?)?;
-    assert_eq!(pinned["nodes_probed"], 1, "{pinned}");
+    assert_eq!(pinned["nodes_opened"], 1, "{pinned}");
     assert_eq!(pinned["rate_max_per_mib"], CHEAP_RATE, "{pinned}");
 
     Ok(())

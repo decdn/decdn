@@ -1,11 +1,12 @@
 //! What a pull costs before it pays a byte (#2600).
 //!
-//! Every node signs its per-MiB rate into each `cdn/probe/v1` answer, so the
-//! price of a pull is known from one unpaid probe round. [`census`] probes
-//! every node a pull can draw from for each hash and keeps every verified
-//! answer. [`HashCensus::serve_order`] orders those answers the way the pull
-//! orders its holders, and [`price`] turns the rates into a low, high and
-//! likely cost.
+//! Every node signs its per-MiB rate into its answer to each `cdn/client/v1`
+//! open, so the price of a pull is known from one round of voucher-less opens
+//! ([`crate::discovery_open`]), each cancelled once it has answered. [`census`]
+//! opens every node a pull can draw from for each hash and keeps every
+//! verified answer. [`HashCensus::serve_order`] orders those answers the way
+//! the pull orders its holders, and [`price`] turns the rates into a low, high
+//! and likely cost.
 //!
 //! The reference node fixes its rate at startup, so one rate holds for every
 //! hash it serves. The rates a sample of a bundle's blobs gets therefore stand
@@ -17,68 +18,75 @@ use alloy::primitives::{Address, U256};
 use decdn_incentive::rate::min_payment;
 use decdn_incentive::slash_judge_domain;
 use futures_util::StreamExt as _;
-use iroh::{Endpoint, PublicKey, RelayUrl};
+use iroh::{EndpointAddr, PublicKey, RelayUrl};
 
 use crate::discovery::{self, NodeCandidate};
 use crate::session::{ChainConfig, DiscoveryOptions, ProxyWarmingParams, PullSite};
 use crate::targets::{
-    Dropouts, OpenOutcome, classify_probe, failover_order, no_serve_target_error, pinned_target,
-    probe_candidate, probe_target, select_up_to, spawn_harvest,
+    Dropouts, OpenOutcome, OpenSpec, candidate_target, classify_open, failover_order,
+    no_serve_target_error, open_at, pinned_target, select_up_to, spawn_harvest,
 };
+use crate::{Connections, PoolContext};
 
-/// How many of a bundle's distinct blobs a quote probes: the largest ones by
-/// planned download. A node's default per-peer probe limit is a burst of
-/// five (ADR 005 § Probe rate limiting). A quote that first fetches its
-/// manifest has already spent one probe per node on the same endpoint, so
-/// four keeps the round inside the burst. Rates are per node, so the
-/// sample's rates stand in for the rest of the bundle.
+/// How many of a bundle's distinct blobs a quote asks about: the largest ones
+/// by planned download. Each sampled blob costs every node one open, one
+/// signed answer and one size proof, and pins the blob on the node until the
+/// quote cancels the stream. Rates are per node, so more blobs add that cost
+/// and no rate the sample does not already carry; four of the largest also
+/// carry most of the bytes the estimate prices.
 pub const CENSUS_ENTRY_SAMPLE: usize = 4;
 
-/// How many probes of a census are in flight at once.
+/// How many opens of a census are in flight at once, across every node: the
+/// dials, streams and answers this machine handles at a time. What one node
+/// sees is bounded per connection beside it (a [`Connections`] map holds at
+/// most eight discovery opens on one node), so a census of many hashes waits
+/// for its own opens rather than having a node reset them.
 const CENSUS_CONCURRENCY: usize = 32;
 
-/// One node's verified answer to a census probe.
+/// One node's verified answer to a census open.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct NodeAnswer {
     /// The node that answered.
     pub candidate: NodeCandidate,
-    /// The probe's round-trip time, in milliseconds.
+    /// The path RTT to the node, in milliseconds, measured after its answer.
     pub rtt_ms: f64,
     /// The rate the node signed, in micro-USDC per MiB.
     pub rate_per_mb: u64,
-    /// Whether the node holds the blob in its cache. A node that does not
-    /// can still serve it through its own origin.
+    /// Whether the node holds the blob: it served the open, or refused it
+    /// with the blocks it holds of a blob it holds in part. A node that does
+    /// not can still serve the blob through its own origin.
     pub has_blob: bool,
-    /// The blob size the node stated, proven against the hash by the size
-    /// proof in its answer; `None` from a non-holder, or from a holder that
-    /// stated no size.
+    /// The blob size the node proved in its answer; `None` from a non-holder
+    /// and from a partial holder, whose refusal proves no size.
     pub total_bytes: Option<crate::ProvenSize>,
-    /// The byte ranges the node holds. Unsigned; empty exactly when
-    /// `has_blob` is false, which the census checks before it keeps an
-    /// answer.
+    /// The discovery blocks the node holds. Unsigned; checked against the
+    /// signed answer before the census keeps it, and empty exactly when
+    /// `has_blob` is false, except for the empty blob, which has no block.
     pub coverage: decdn_protocol::Coverage,
 }
 
-/// Every answer one hash got in a [`census`], and how many probes got none.
+/// Every answer one hash got in a [`census`], and how many opens got none.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct HashCensus {
-    /// The probed blob.
+    /// The blob the census asked about.
     pub hash: [u8; 32],
     /// The verified answers, holders and non-holders, in answer order.
     pub answers: Vec<NodeAnswer>,
-    /// Probes that got no answer.
+    /// Opens that got no answer.
     pub unreachable: usize,
-    /// Probes the node kept shedding.
+    /// Opens the node shed.
     pub rate_limited: usize,
-    /// Probes the node refused for clock skew: its clock and this machine's
+    /// Opens the node refused for clock skew: its clock and this machine's
     /// differ by more than 30 seconds.
     pub clock_skewed: usize,
-    /// Answers whose signature did not recover to the node's operator.
+    /// Answers that did not verify: a signature that did not recover to the
+    /// node's operator, a size with no valid size proof, or a coverage that
+    /// disagrees with the signed answer.
     pub unverifiable: usize,
-    /// Answers whose `has_blob` and coverage disagree, or that state a size
-    /// with no valid size proof.
+    /// Verified answers the census cannot use: the node declined the blob, or
+    /// refused the open for a reason that says nothing of the blob.
     pub unusable: usize,
 }
 
@@ -100,7 +108,7 @@ impl HashCensus {
             .and_then(|a| a.total_bytes)
     }
 
-    /// The answers a pull that probed every node would draw from, in the
+    /// The answers a pull that opened every node would draw from, in the
     /// order it tries them: proxy-warming non-holders first when warming
     /// engages, then the holders nearest RTT first, or the non-holders
     /// nearest first as pull-through sources when no node holds the blob.
@@ -150,85 +158,149 @@ const fn within_ceiling(rate: u64, ceiling: u64) -> bool {
     ceiling == 0 || rate <= ceiling
 }
 
-/// What a [`census`] learned: every answer for each hash it probed.
+/// What a [`census`] learned: every answer for each hash it asked about.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct Census {
-    /// How many nodes it probed for each hash.
-    pub probed: usize,
-    /// One entry per probed hash, in the order given.
+    /// How many nodes it opened for each hash.
+    pub opened: usize,
+    /// One entry per hash, in the order given.
     pub hashes: Vec<HashCensus>,
     /// The node list is the registry-outage fallback: the peer store's
     /// last-known nodes, because the registry read failed.
     pub outage_fallback: bool,
 }
 
-/// Probe every node a pull of `hashes` can draw from, and keep every
-/// verified answer.
-///
-/// The nodes are a bundle pull's list ([`crate::bundle::select_nodes`]):
-/// the peer store's identity-fresh records, else one `CapacityBond` read.
-/// The site's region allowlist narrows the list, with a single fetch's
-/// widening rule, unless it is the registry-outage fallback; the list is not
-/// sampled down. A pinned node is probed alone. Every answer is verified against its operator's
-/// address before it counts (ADR 014 §1), and every verified answer is
-/// recorded in the peer store, so a pull that follows ranks on fresh RTTs.
-/// The probes are unpaid.
+/// The nodes a [`census`] opens: every node a pull can draw from, with each
+/// one's dial target.
+#[derive(Debug, Clone)]
+pub struct CensusNodes {
+    /// Each node, with its dial target.
+    nodes: Vec<(NodeCandidate, EndpointAddr)>,
+    /// The list is the registry-outage fallback.
+    outage_fallback: bool,
+}
+
+impl CensusNodes {
+    /// How many nodes the census opens for each hash.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether the census has no node to open.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+/// The nodes a pull of `discovery` can draw from, for a [`census`]: a bundle
+/// pull's list ([`crate::bundle::select_nodes`]), the peer store's
+/// identity-fresh records, else one `CapacityBond` read. The site's region
+/// allowlist narrows the list, with a single fetch's widening rule, unless it
+/// is the registry-outage fallback; the list is not sampled down. A pinned
+/// node is the list alone. Resolve the nodes before you unlock a key, so a
+/// failed discovery costs no password prompt.
 ///
 /// # Errors
 ///
-/// Discovery fails ([`crate::bundle::select_nodes`]), or `hashes` is not
-/// empty and no node answered any probe; the error names how the probes
-/// failed.
-pub async fn census(
-    endpoint: &Endpoint,
+/// Discovery fails ([`crate::bundle::select_nodes`]).
+pub async fn census_nodes(
     (chain, site): (&ChainConfig, &PullSite),
     relays: &[RelayUrl],
     discovery: &DiscoveryOptions,
-    hashes: &[[u8; 32]],
-) -> anyhow::Result<Census> {
+) -> anyhow::Result<CensusNodes> {
     let relay = relays.first().cloned();
-    let (nodes, outage_fallback) = if let Some(pinned) = discovery.pinned {
-        (vec![pinned_target(pinned, relay)], false)
+    if let Some(pinned) = discovery.pinned {
+        return Ok(CensusNodes {
+            nodes: vec![pinned_target(pinned, relay)],
+            outage_fallback: false,
+        });
+    }
+    let (registry, outage_fallback) = crate::bundle::registry_nodes(chain, site, discovery).await?;
+    let allow: &[decdn_protocol::Region] = if outage_fallback {
+        &[]
     } else {
-        let (registry, outage_fallback) =
-            crate::bundle::registry_nodes(chain, site, discovery).await?;
-        let allow: &[decdn_protocol::Region] = if outage_fallback {
-            &[]
-        } else {
-            site.region_allowlist.as_slice()
-        };
-        let selected = select_up_to(
-            registry,
-            site.region.as_deref(),
-            allow,
-            &crate::StoreConfig::default(),
-            usize::MAX,
-        );
-        let nodes = selected
-            .into_iter()
-            .map(|c| {
-                let target = probe_target(&c, relay.clone());
-                (c, target)
-            })
-            .collect();
-        (nodes, outage_fallback)
+        site.region_allowlist.as_slice()
     };
+    let selected = select_up_to(
+        registry,
+        site.region.as_deref(),
+        allow,
+        &crate::StoreConfig::default(),
+        usize::MAX,
+    );
+    let nodes = selected
+        .into_iter()
+        .map(|c| {
+            let target = candidate_target(&c, relay.clone());
+            (c, target)
+        })
+        .collect();
+    Ok(CensusNodes {
+        nodes,
+        outage_fallback,
+    })
+}
+
+/// Open each of `nodes` for each of `hashes`, and keep every verified answer.
+///
+/// Each open is a voucher-less `cdn/client/v1` open of the whole blob that
+/// asks no pull-through ([`crate::discovery_open`]), on `conns`, and names
+/// `ctx`'s pool, signer, binding and capability like a pull's discovery: a
+/// holder answers its signed quote, its proven size and its coverage, and a
+/// node that misses answers a signed `NotFound` at once. The census cancels
+/// every stream once it has answered, so it pays nothing. `namespace_id` is
+/// the routing hint each open carries. Every answer is verified against its
+/// operator's address under `chain`'s `SlashJudge` before it counts (ADR 014
+/// §1), and every verified answer is recorded in `site`'s peer store, so a
+/// pull that follows ranks on fresh RTTs.
+///
+/// # Errors
+///
+/// `hashes` is not empty and no node answered any open; the error names how
+/// the opens failed.
+pub async fn census(
+    nodes: &CensusNodes,
+    (conns, ctx): (&Connections, &PoolContext),
+    (chain, site): (&ChainConfig, &PullSite),
+    hashes: &[[u8; 32]],
+    namespace_id: [u8; 32],
+) -> anyhow::Result<Census> {
+    let CensusNodes {
+        nodes,
+        outage_fallback,
+    } = nodes;
+    let outage_fallback = *outage_fallback;
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-    let probes = hashes.iter().enumerate().flat_map(|(at, &hash)| {
+    // The whole blob, with no rate ceiling: the census keeps every answer,
+    // and `serve_order` applies the ceiling the pull would.
+    let spec = OpenSpec {
+        conns,
+        ctx,
+        namespace_id,
+        span: (0, 0),
+        max_rate_per_mb: 0,
+    };
+    let opens = hashes.iter().enumerate().flat_map(|(at, &hash)| {
         nodes
             .iter()
             .map(move |(cand, target)| (at, hash, cand, target))
     });
-    let outcomes: Vec<(usize, NodeCandidate, OpenOutcome)> = futures_util::stream::iter(probes)
+    let outcomes: Vec<(usize, NodeCandidate, OpenOutcome)> = futures_util::stream::iter(opens)
         .map(|(at, hash, cand, target)| {
             let slash_dom = &slash_dom;
             async move {
-                // `probe_candidate` stamps each attempt: a node refuses a
-                // timestamp more than 30 s from its clock, and a census can
-                // run longer.
-                let (timestamp_us, res) = probe_candidate(endpoint, target.clone(), hash).await;
-                let outcome = classify_probe(cand, res, hash, timestamp_us, slash_dom);
+                // Each open stamps its own timestamp once it holds its
+                // node's permit: a node refuses one more than 30 s from its
+                // clock, and a census can run longer. The open bounds its own
+                // dial and exchange.
+                let res = open_at(target, cand, spec, slash_dom, hash, false).await;
+                let (outcome, stream) = classify_open(cand, res, 0);
+                if let Some(stream) = stream {
+                    stream.cancel();
+                }
                 (at, cand.clone(), outcome)
             }
         })
@@ -239,7 +311,7 @@ pub async fn census(
     // Awaited, not detached: the command exits next, and the pull that
     // follows it ranks on these samples.
     if let Err(e) = spawn_harvest(&site.data_dir, Vec::new(), census.samples()).await {
-        tracing::warn!("could not record the quote's probe samples in the peer store: {e}");
+        tracing::warn!("could not record the quote's answer samples in the peer store: {e}");
     }
     match unanswered(&census) {
         Some(err) => Err(err),
@@ -248,7 +320,7 @@ pub async fn census(
 }
 
 /// The error for a census of at least one hash in which no node answered any
-/// probe, or `None`. The counts are the first hash's, one per node: every
+/// open, or `None`. The counts are the first hash's, one per node: every
 /// hash went unanswered, and a configuration fault fails them all alike.
 pub(crate) fn unanswered(census: &Census) -> Option<anyhow::Error> {
     let first = census.hashes.first()?;
@@ -256,7 +328,7 @@ pub(crate) fn unanswered(census: &Census) -> Option<anyhow::Error> {
         return None;
     }
     Some(no_serve_target_error(Dropouts {
-        asked: census.probed,
+        asked: census.opened,
         unreachable: first.unreachable,
         rate_limited: first.rate_limited,
         unverifiable: first.unverifiable,
@@ -267,10 +339,10 @@ pub(crate) fn unanswered(census: &Census) -> Option<anyhow::Error> {
 }
 
 /// Sort `outcomes`, each tagged with the index of its hash in `hashes`, into
-/// one [`HashCensus`] per hash. `probed` is the number of nodes probed for
+/// one [`HashCensus`] per hash. `opened` is the number of nodes opened for
 /// each hash.
 pub(crate) fn tally(
-    probed: usize,
+    opened: usize,
     hashes: &[[u8; 32]],
     outcomes: Vec<(usize, NodeCandidate, OpenOutcome)>,
     outage_fallback: bool,
@@ -292,13 +364,13 @@ pub(crate) fn tally(
             continue;
         };
         match outcome {
-            OpenOutcome::Holder(probed, (_, _, rate_per_mb)) => entry.answers.push(NodeAnswer {
+            OpenOutcome::Holder(holder, (_, _, rate_per_mb)) => entry.answers.push(NodeAnswer {
                 candidate,
-                rtt_ms: probed.rtt_ms,
+                rtt_ms: holder.rtt_ms,
                 rate_per_mb,
                 has_blob: true,
-                total_bytes: probed.total_bytes,
-                coverage: probed.coverage,
+                total_bytes: holder.total_bytes,
+                coverage: holder.coverage,
             }),
             OpenOutcome::NonHolder(warming, (_, _, rate_per_mb)) => {
                 entry.answers.push(NodeAnswer {
@@ -320,7 +392,7 @@ pub(crate) fn tally(
         }
     }
     Census {
-        probed,
+        opened,
         hashes: per_hash,
         outage_fallback,
     }
@@ -455,8 +527,8 @@ fn split_cost(wire: u64, rates: &[u64], lanes: usize) -> U256 {
         .fold(U256::ZERO, U256::saturating_add)
 }
 
-/// One node's rate as a pull already knows it: from its own probe round, or
-/// from the peer store. What `decdn get` prices its one-line estimate from.
+/// One node's rate as a pull already knows it: from its own discovery round,
+/// or from the peer store. What `decdn get` prices its one-line estimate from.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateHint {

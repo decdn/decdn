@@ -1,12 +1,13 @@
 //! The setup both examples share: a buyer identity and payment pool, an iroh
-//! endpoint, the probed holders of one blob, and the paid lanes to them.
+//! endpoint, the holders of one blob that answer a discovery open, and the
+//! paid lanes to them.
 //!
 //! Every value comes from an environment variable, so the examples read the same
 //! way against any deployment. See [`Env::from_env`] for the list.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
@@ -16,9 +17,11 @@ use decdn_client::buyer_pool::{
     OwnedPayer, ProgressWrite, WatermarkRow, ensure_allowance, open_pool, self_owned_lane_ctx,
 };
 use decdn_client::discovery::{self, NodeCandidate};
+use decdn_client::lanes::LanePayer;
+use decdn_client::session::ChainConfig;
 use decdn_client::{
-    Funder, PeerSource, PoolContext, PoolLedger, PullDeadlines, Recovery, SourceFuture,
-    StreamCandidate, VoucherProgress, endpoint, probe, provider,
+    Connections, Funder, PeerSource, PoolContext, PoolLedger, PullDeadlines, Recovery,
+    SourceFuture, StreamCandidate, VoucherProgress, discovery_open, endpoint, provider,
 };
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::load_signer;
@@ -29,13 +32,14 @@ use decdn_incentive::{
 use decdn_protocol::Coverage;
 use iroh::{Endpoint, EndpointAddr};
 
-/// How long one probe round trip may take before the holder is skipped.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How many registry nodes to probe for the blob.
-const PROBE_SAMPLE: usize = 16;
+/// How long one discovery open may take, the dial and again the exchange,
+/// before the node is skipped.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many registry nodes to open for the blob.
+const OPEN_SAMPLE: usize = 16;
 
 /// One verified holder of the blob: the node, the ranges it holds, and the
-/// per-MB rate it signed in its probe answer.
+/// per-MB rate it signed in its answer.
 pub(crate) struct Holder {
     candidate: NodeCandidate,
     coverage: Coverage,
@@ -160,9 +164,12 @@ impl Buyer {
 
     /// Find the registered nodes that hold `hash`, and the blob's size.
     ///
-    /// Every probe answer is verified before it counts (ADR 014 §1). An answer
-    /// whose signature does not verify, or whose `has_blob` and coverage
-    /// disagree, is dropped.
+    /// Each node gets one voucher-less `cdn/client/v1` open of the whole blob
+    /// that names the buyer's pool and asks no pull-through: a holder answers
+    /// its signed quote, its proven size and its coverage, and a node that
+    /// misses answers `NotFound` at once. Every answer is verified before it
+    /// counts (ADR 014 §1); one that does not verify is dropped. Each stream
+    /// is cancelled once it has answered, so nothing is paid here.
     pub(crate) async fn holders(
         &self,
         hash: [u8; 32],
@@ -171,53 +178,68 @@ impl Buyer {
             &self.env.rpc_url,
             self.env.capacity_bond,
             &self.env.data_dir,
-            PROBE_TIMEOUT,
+            OPEN_TIMEOUT,
         )
         .await?;
         if let Some(warning) = bootstrap.warning() {
             tracing::warn!("{warning}");
         }
-        let sample = discovery::select_candidates(bootstrap.into_peers(), None, PROBE_SAMPLE);
+        let sample = discovery::select_candidates(bootstrap.into_peers(), None, OPEN_SAMPLE);
+
+        // The opens carry the buyer's pool, lane key and identity binding like
+        // any open; the node admits the payer only at the first voucher.
+        let chain = ChainConfig {
+            rpc_url: self.env.rpc_url.clone(),
+            chain_id: self.env.chain_id,
+            payment_pool: self.env.payment_pool,
+            slash_judge: self.env.slash_judge,
+            capacity_bond: Some(self.env.capacity_bond),
+        };
+        let contract = PaymentPool::new(
+            self.env.payment_pool,
+            provider::build_provider(&self.env.rpc_url, self.payer.owner())?,
+        );
+        let ctx = decdn_client::funding::discovery_ctx(
+            &self.store,
+            &contract,
+            LanePayer::Owned(&self.payer),
+            &chain,
+            &self.endpoint,
+            &self.voucher_domain,
+            Some(self.pool.pool_id),
+        )
+        .await?;
+        let conns = Connections::new(self.endpoint.clone());
 
         let mut holders = Vec::new();
         let mut total_bytes = None;
         for candidate in sample {
-            let timestamp_us = now_us()?;
-            let Ok((resp, ext, _rtt_ms)) = probe::probe_once(
-                &self.endpoint,
-                dial_target(&candidate),
+            let Ok(opened) = discovery_open(
+                &conns,
+                &dial_target(&candidate),
+                candidate.eth_address,
+                &ctx,
+                &self.slash_domain,
                 hash,
-                timestamp_us,
-                PROBE_TIMEOUT,
+                decdn_protocol::client::NO_NAMESPACE,
+                (0, 0),
+                false,
+                OPEN_TIMEOUT,
             )
             .await
             else {
                 continue;
             };
-            let verified = probe::verify_probe_response(
-                &resp,
-                candidate.eth_address,
-                &self.slash_domain,
-                hash,
-                timestamp_us,
-            );
-            if verified.is_err() || !ext.consistent_with(&resp.body) || !resp.body.has_blob {
-                continue;
+            // A served answer carries a size its proof proved.
+            if opened.served() {
+                total_bytes = total_bytes.or(opened.proven_size());
+                holders.push(Holder {
+                    candidate,
+                    coverage: opened.coverage().clone(),
+                    rate_per_mb: opened.rate_per_mb(),
+                });
             }
-            // A stated size counts only once its proof verifies.
-            let proven = match &ext.size_proof {
-                Some(proof) => match decdn_client::check_size_proof(hash, proof) {
-                    Ok(proven) => Some(proven),
-                    Err(_) => continue,
-                },
-                None => None,
-            };
-            total_bytes = total_bytes.or(proven);
-            holders.push(Holder {
-                candidate,
-                coverage: ext.coverage,
-                rate_per_mb: resp.body.rate_per_mb,
-            });
+            opened.cancel();
         }
         let total_bytes = total_bytes.context("no verified holder reported the blob's size")?;
         Ok((holders, total_bytes))
@@ -270,10 +292,10 @@ impl Buyer {
                 &self.slash_domain,
                 provider,
                 decdn_protocol::client::NO_NAMESPACE,
-                // No received-byte ceiling beyond the probed size.
+                // No received-byte ceiling beyond the proven size.
                 0,
                 // Refuse a stream quote above the rate the node signed in its
-                // probe answer. `0` would set no ceiling at all.
+                // discovery answer. `0` would set no ceiling at all.
                 holder.rate_per_mb,
                 deadlines,
                 None,
@@ -360,12 +382,4 @@ async fn prior_payment<P: Provider + Clone>(
 /// dial hints so a reachable node connects without a relay.
 fn dial_target(candidate: &NodeCandidate) -> EndpointAddr {
     discovery::with_dial_addrs(EndpointAddr::new(candidate.node_id), candidate)
-}
-
-/// The probe timestamp: microseconds since the Unix epoch. The node echoes it,
-/// and the verifier checks the echo.
-fn now_us() -> Result<u64> {
-    Ok(u64::try_from(
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros(),
-    )?)
 }

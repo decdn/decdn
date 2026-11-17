@@ -1,6 +1,6 @@
 //! Arguments for `decdn quote <URI>` (#2600): price a pull of what a `decdn:`
-//! URI names from the rates the nodes sign in their probe answers, before any
-//! paid byte.
+//! URI names from the rates the nodes sign in their answers to stream opens,
+//! before any paid byte.
 
 use std::path::PathBuf;
 
@@ -10,12 +10,16 @@ use super::fetch::ClientFetchArgs;
 
 /// `decdn quote` — price a pull of what a `decdn:` URI names.
 ///
-/// A probe round over every node a pull can draw from returns each node's
-/// signed per-MiB rate. The quote prints the size, the nodes that hold the
-/// content and their rates, the `--max-rate-per-mb` ceiling, and the cost of
-/// a fresh pull (files already on disk still count): on the cheapest node,
-/// on the most expensive, and the likely cost over the nodes a pull that
-/// probed every node would use. The probes are unpaid.
+/// The quote unlocks your keystore and names your pool as `decdn get` does,
+/// then opens one `cdn/client/v1` stream to every node a pull can draw from
+/// for each blob it prices. Each node answers with its signed per-MiB rate,
+/// the blob's proven size, and the blocks it holds, and the quote cancels the
+/// stream before any voucher: the opens are unpaid and send no transaction.
+/// The quote prints the size, the nodes that hold the content and their
+/// rates, the `--max-rate-per-mb` ceiling, and the cost of a fresh pull
+/// (files already on disk still count): on the cheapest node, on the most
+/// expensive, and the likely cost over the nodes a pull that opened every
+/// node would use.
 ///
 /// A blob's size is the nearest holder's report. A bundle's size comes from
 /// its manifest. A manifest an earlier pull or quote cached in the output
@@ -54,10 +58,10 @@ pub struct QuoteArgs {
     #[arg(long)]
     pub open_pool: bool,
 
-    /// Retrieval flags: peer discovery, chain coordinates, the rate ceiling,
+    /// Retrieval flags: peer discovery, chain coordinates, the keystore and
+    /// pool flags that name the payer every open carries, the rate ceiling,
     /// and `--max-sources` and the proxy-warming flags, which set the order
-    /// and the likely cost. The keystore and pool flags apply only when a
-    /// bundle's manifest must be fetched.
+    /// and the likely cost.
     #[command(flatten)]
     pub common: ClientFetchArgs,
 }

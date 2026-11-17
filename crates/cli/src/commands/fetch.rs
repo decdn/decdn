@@ -1,7 +1,7 @@
 //! The blob route of `decdn get` (`decdn:<hash>`): the client-side paid pull
 //! of a single content-addressed blob over `cdn/client/v1` (issues #391, #940).
 //!
-//! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
+//! The turnkey paid pull: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover the holders, #936),
 //! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, take the
 //! blob's proven size (the winning holder's answer to a voucher-less open,
@@ -341,7 +341,7 @@ pub(crate) fn resolve_chain(
 
 /// Client-side proxy-warming knobs (#1174, ADR 037), distilled from
 /// [`cli::ClientFetchArgs`]. RTT thresholds are held as `f64` ms to compare
-/// directly against probe RTTs.
+/// directly against discovery RTTs.
 pub(crate) fn proxy_warming(args: &cli::ClientFetchArgs) -> ProxyWarmingParams {
     // Widen through u32 so the u64 → f64 cast is lossless (ms knobs are
     // small); saturate the implausible overflow rather than lose precision.
@@ -564,7 +564,7 @@ pub(crate) fn manifest_cap_mb(max_blob_mb: u64) -> u64 {
 /// once.
 ///
 /// With `--node-id` the node is dialed explicitly. Without it, `fetch`
-/// auto-discovers (#936): read the active set from `CapacityBond`, probe a
+/// auto-discovers (#936): read the active set from `CapacityBond`, open a
 /// random, region-first sample of candidates, and derive `--provider-address` from each
 /// candidate's registry entry, striping across them (#1174).
 ///
@@ -868,8 +868,8 @@ const MAX_SIZE_HINTS: usize = 4096;
 /// Blob sizes by hash, each one a size a holder proved or a whole fetch
 /// verified ([`BlobFetch::size_only`]), oldest first out
 /// within [`MAX_SIZE_HINTS`] entries. A hash fixes its blob's size, so a hit
-/// is a later fetch's size, and a pinned node is not probed for
-/// it (ADR 005 § Probe rate limiting bounds those probes per peer).
+/// is a later fetch's size, and a pinned node is not opened for it before
+/// its lane opens.
 #[derive(Default)]
 pub(crate) struct SizeHints {
     sizes: std::collections::HashMap<[u8; 32], ProvenSize>,
@@ -991,6 +991,27 @@ impl FetchHost {
         Arc::clone(&self.store)
     }
 
+    /// The chain this host pays on, and its site.
+    pub(crate) const fn chain(&self) -> &ResolvedChain {
+        &self.chain
+    }
+
+    /// The relays the host's endpoint dials through.
+    pub(crate) fn relays(&self) -> &[RelayUrl] {
+        &self.relays
+    }
+
+    /// The host's endpoint.
+    pub(crate) const fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// The host's connection per node, which every fetch and discovery open
+    /// on the host shares.
+    pub(crate) const fn connections(&self) -> &Connections {
+        &self.connections
+    }
+
     /// The chain and `PaymentPool` this host pays on.
     pub(crate) const fn deployment(&self) -> decdn_incentive::Deployment {
         self.chain.config.deployment()
@@ -1030,8 +1051,8 @@ pub(crate) struct Payer {
 
 enum PayerKey {
     /// The keystore the flags name, with the `--capability` delegation when
-    /// there is one. The first fetch under the payer loads it once its holder
-    /// resolution ends, and every later fetch under the payer reuses it.
+    /// there is one. The first use of the payer loads it, before any
+    /// discovery open, and every later use reuses it.
     Keystore {
         grant: Option<CapabilityGrant>,
         loaded: tokio::sync::OnceCell<(Arc<alloy::signers::local::PrivateKeySigner>, PayerKeys)>,
@@ -1125,6 +1146,38 @@ impl Payer {
         }
     }
 
+    /// The key that signs for this payer on `host`: the held key, or the
+    /// keystore, unlocked at the first call ([`Self::keys`]).
+    ///
+    /// # Errors
+    ///
+    /// The keystore's password cannot be read, or the keystore does not
+    /// unlock; the capability names another signer.
+    pub(crate) async fn signer(
+        &self,
+        host: &FetchHost,
+    ) -> anyhow::Result<Arc<alloy::signers::local::PrivateKeySigner>> {
+        Ok(self.keys(host).await?.0)
+    }
+
+    /// The context a discovery open of this payer sends on `host`
+    /// ([`discovery_pool`]): the payer's pool, lane key, binding and
+    /// capability. It unlocks the keystore at the first call, as
+    /// [`fetch_on`] does, and sends no transaction.
+    ///
+    /// # Errors
+    ///
+    /// The keystore does not unlock, or the pool cannot be named
+    /// ([`decdn_client::funding::discovery_ctx`]).
+    pub(crate) async fn discovery_ctx(&self, host: &FetchHost) -> anyhow::Result<PoolContext> {
+        let (signer, keys) = self.keys(host).await?;
+        let config = &host.chain.config;
+        let rpc = provider::build_provider(&config.rpc_url, &signer)?;
+        let contract = PaymentPool::new(config.payment_pool, rpc);
+        let voucher_dom = voucher_domain(config.chain_id, config.payment_pool);
+        discovery_pool(host, &keys, &contract, &voucher_dom).await
+    }
+
     /// Fetches paying with `credential`, sharing its lanes' voucher ledgers.
     ///
     /// # Errors
@@ -1163,6 +1216,36 @@ impl Payer {
             PayerKey::Held { .. } => true,
         }
     }
+}
+
+/// The context `keys`' discovery opens send on `host`, before any lane is
+/// built ([`decdn_client::funding::discovery_ctx`]): the pool the lanes pay
+/// from (the capability's, the store's record, or the pool the owner's next
+/// `openPool` opens), the lane key, the client binding and the capability.
+///
+/// # Errors
+///
+/// The buyer store cannot be read, the `ownerPoolNonce` read fails, or a key
+/// cannot sign.
+async fn discovery_pool<P>(
+    host: &FetchHost,
+    keys: &PayerKeys,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    voucher_dom: &alloy::sol_types::Eip712Domain,
+) -> anyhow::Result<PoolContext>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    discovery_ctx(
+        host.store.as_ref(),
+        contract,
+        keys.lane_payer(),
+        &host.chain.config,
+        &host.endpoint,
+        voucher_dom,
+        None,
+    )
+    .await
 }
 
 /// Fetch the blob `args` names on `host`, paid by `payer`, with its verified
@@ -1267,16 +1350,7 @@ pub(crate) async fn fetch_on(
     // The pool the discovery opens name: the one the lanes will pay from.
     // A failed chain read starts the fetch with no holder, and the acquire
     // loop's discovery asks again.
-    let open_ctx = discovery_ctx(
-        store.as_ref(),
-        &contract,
-        keys.lane_payer(),
-        config,
-        endpoint,
-        &voucher_dom,
-        None,
-    )
-    .await;
+    let open_ctx = discovery_pool(host, &keys, &contract, &voucher_dom).await;
     let resolved = holders_or_none(match &open_ctx {
         Ok(ctx) => {
             // A size an earlier fetch on the host proved is the first size,

@@ -1,101 +1,69 @@
 use super::*;
 use decdn_protocol::SLASH_SIG_LEN;
-use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
-use std::assert_matches;
 
-fn fixture(
-    rate_per_mb: u64,
-    has_blob: bool,
-    total_bytes: Option<u64>,
-) -> (ProbeResponse, decdn_protocol::ProbeResponseExt) {
-    (
-        ProbeResponse {
-            body: ProbeResponseBody {
-                hash: [0xAB; 32],
-                has_blob,
-                rate_per_mb,
-                timestamp_us: 1_700_000_000_000_000,
-            },
-            slash_sig: vec![0xCD; SLASH_SIG_LEN],
-        },
-        decdn_protocol::ProbeResponseExt {
-            coverage: if has_blob {
-                decdn_protocol::Coverage::full(1)
-            } else {
-                decdn_protocol::Coverage::empty()
-            },
-            size_proof: total_bytes.map(|size| decdn_protocol::SizeProof::new(size, []).unwrap()),
-        },
-    )
-}
-
-/// #252: the requester gate (`ProbeResponse::validate`, invoked on the
-/// receive path in `run_probe`) MUST reject a zero `rate_per_mb` — a
-/// zero-rate node trivially wins selection while earning nothing, so it is
-/// an obvious misconfiguration the client refuses. The upper `MAX_RATE_PER_MB`
-/// bound is enforced at decode time; zero is the requester-side obligation.
-#[test]
-fn validate_rejects_zero_rate_response() {
-    let (resp, _resp_ext) = fixture(0, true, Some(4096));
-    let err = resp.validate().expect_err("zero rate must be rejected");
-    assert_matches!(
-        err,
-        decdn_protocol::MessageValidationError::RateIsZero,
-        "expected RateIsZero, got {err:?}"
-    );
+fn fixture(ok: bool, total_bytes: Option<u64>) -> ProbeAnswer {
+    ProbeAnswer {
+        hash: [0xAB; 32],
+        ok,
+        rate_per_mb: 10,
+        total_bytes,
+        coverage_blocks: usize::from(ok),
+        timestamp_us: 1_700_000_000_000_000,
+        rtt_ms: 12.5,
+        slash_sig: vec![0xCD; SLASH_SIG_LEN],
+    }
 }
 
 /// JSON wire shape: every key the operator-facing `--json` contract
 /// guarantees. Catches a renamed key, a dropped field, or a type drift.
 #[test]
 fn json_output_keys_and_types() {
-    let (resp, resp_ext) = fixture(10, true, Some(4096));
     let mut buf: Vec<u8> = Vec::new();
-    write_probe_response(&mut buf, &resp, &resp_ext, 12.5, true).unwrap();
-    let text = std::str::from_utf8(&buf).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    write_probe_answer(&mut buf, &fixture(true, Some(4096)), true).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
 
-    assert!(parsed.is_object(), "top level must be an object");
-    let obj = parsed.as_object().unwrap();
+    let obj = parsed.as_object().expect("top level must be an object");
     assert_eq!(
         obj.len(),
-        7,
-        "seven keys: hash/has_blob/rate_per_mb/total_bytes/timestamp_us/rtt_ms/slash_sig"
+        8,
+        "eight keys: hash/ok/rate_per_mb/total_bytes/coverage_blocks/timestamp_us/rtt_ms/\
+         slash_sig"
     );
-    assert_eq!(obj.get("hash").unwrap().as_str().map(str::len), Some(64));
-    assert_eq!(obj.get("has_blob").unwrap().as_bool(), Some(true));
-    assert_eq!(obj.get("rate_per_mb").unwrap().as_u64(), Some(10));
-    assert_eq!(obj.get("total_bytes").unwrap().as_u64(), Some(4096));
+    assert_eq!(obj["hash"].as_str().map(str::len), Some(64));
+    assert_eq!(obj["ok"].as_bool(), Some(true));
+    assert!(obj.get("has_blob").is_none());
+    assert_eq!(obj["rate_per_mb"].as_u64(), Some(10));
+    assert_eq!(obj["total_bytes"].as_u64(), Some(4096));
+    assert_eq!(obj["coverage_blocks"].as_u64(), Some(1));
+    assert_eq!(obj["timestamp_us"].as_u64(), Some(1_700_000_000_000_000));
+    assert!(obj["rtt_ms"].is_number());
     assert_eq!(
-        obj.get("timestamp_us").unwrap().as_u64(),
-        Some(1_700_000_000_000_000)
-    );
-    assert!(obj.get("rtt_ms").unwrap().is_number());
-    assert_eq!(
-        obj.get("slash_sig").unwrap().as_str().map(str::len),
+        obj["slash_sig"].as_str().map(str::len),
         Some(SLASH_SIG_LEN * 2),
         "slash_sig is hex-encoded (2 chars/byte)"
     );
 }
 
-/// `total_bytes` serializes as JSON `null` when the node didn't include
-/// a size (ADR 005: optional field).
+/// `total_bytes` serializes as JSON `null` for a refusal, which proves no
+/// size.
 #[test]
-fn json_total_bytes_null_when_absent() {
-    let (resp, resp_ext) = fixture(10, false, None);
+fn json_total_bytes_null_for_a_refusal() {
     let mut buf: Vec<u8> = Vec::new();
-    write_probe_response(&mut buf, &resp, &resp_ext, 1.0, true).unwrap();
+    write_probe_answer(&mut buf, &fixture(false, None), true).unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
     assert!(parsed["total_bytes"].is_null());
-    assert_eq!(parsed["has_blob"].as_bool(), Some(false));
+    assert_eq!(parsed["ok"].as_bool(), Some(false));
+    assert_eq!(parsed["coverage_blocks"].as_u64(), Some(0));
 }
 
-/// `rtt_ms` is quantized to ms precision. `12.5009` rounds to `12.501`.
+/// `rtt_ms` is quantized to microsecond precision. `12.5009` rounds to
+/// `12.501`.
 #[test]
-fn json_rtt_ms_quantized_to_ms_precision() {
-    let (resp, resp_ext) = fixture(10, true, None);
+fn json_rtt_ms_quantized() {
+    let mut answer = fixture(true, None);
+    answer.rtt_ms = 12.500_9;
     let mut buf: Vec<u8> = Vec::new();
-    write_probe_response(&mut buf, &resp, &resp_ext, 12.500_9, true).unwrap();
+    write_probe_answer(&mut buf, &answer, true).unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
     let rtt = parsed["rtt_ms"].as_f64().unwrap();
     assert!(
@@ -108,9 +76,8 @@ fn json_rtt_ms_quantized_to_ms_precision() {
 /// without `-s`/slurp.
 #[test]
 fn json_output_is_single_line() {
-    let (resp, resp_ext) = fixture(10, true, Some(1));
     let mut buf: Vec<u8> = Vec::new();
-    write_probe_response(&mut buf, &resp, &resp_ext, 1.0, true).unwrap();
+    write_probe_answer(&mut buf, &fixture(true, Some(1)), true).unwrap();
     let text = std::str::from_utf8(&buf).unwrap();
     assert_eq!(
         text.lines().count(),
@@ -119,27 +86,29 @@ fn json_output_is_single_line() {
     );
 }
 
-/// Pretty output emits seven labelled lines in a stable order — operator
-/// scripts grep for `has_blob:` / `rtt:` etc. without `--json`.
+/// Pretty output emits eight labelled lines in a stable order — operator
+/// scripts grep for `ok:` / `rtt:` etc. without `--json`.
 #[test]
 fn pretty_output_emits_labelled_lines_in_stable_order() {
-    let (resp, resp_ext) = fixture(7, true, Some(2048));
+    let mut answer = fixture(true, Some(2048));
+    answer.rtt_ms = 1.234;
     let mut buf: Vec<u8> = Vec::new();
-    write_probe_response(&mut buf, &resp, &resp_ext, 1.234, false).unwrap();
+    write_probe_answer(&mut buf, &answer, false).unwrap();
     let text = std::str::from_utf8(&buf).unwrap();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 7);
+    assert_eq!(lines.len(), 8);
     assert!(lines[0].starts_with("hash:"));
-    assert!(lines[1].starts_with("has_blob:"));
+    assert!(lines[1].starts_with("ok:"));
     assert!(lines[2].starts_with("rate_per_mb:"));
     assert!(lines[3].starts_with("total_bytes:"));
-    assert!(lines[4].starts_with("timestamp_us:"));
-    assert!(lines[5].starts_with("rtt:"));
-    assert!(lines[6].starts_with("slash_sig:"));
+    assert!(lines[4].starts_with("coverage_blocks:"));
+    assert!(lines[5].starts_with("timestamp_us:"));
+    assert!(lines[6].starts_with("rtt:"));
+    assert!(lines[7].starts_with("slash_sig:"));
     assert!(
-        lines[5].contains("1.234 ms"),
+        lines[6].contains("1.234 ms"),
         "pretty rtt: line keeps 3-decimal format, got {:?}",
-        lines[5],
+        lines[6],
     );
 }
 
@@ -158,27 +127,17 @@ fn parse_hash_rejects_wrong_length() {
     assert!(parse_hash(&"ab".repeat(33)).is_err());
 }
 
-/// `decdn probe` fails on an answer whose size proof does not verify (no
-/// proof bytes, or a proof of another size), and passes a proven size or no
-/// size at all.
-#[test]
-fn a_stated_size_must_carry_its_proof() {
-    let data = vec![0x11u8; 5000];
-    let size = data.len() as u64;
-    let eo = decdn_bao_range::encode_outboard(data.as_slice(), size).unwrap();
-    let hash = *blake3::hash(&data).as_bytes();
-    let proof = |size| decdn_protocol::SizeProof::new(size, eo.size_proof.to_vec()).unwrap();
-    let ext = |size_proof| decdn_protocol::ProbeResponseExt {
-        coverage: decdn_protocol::Coverage::empty(),
-        size_proof,
+/// `decdn probe` names one node: without `--node-id` it stops before it
+/// resolves a chain or binds an endpoint.
+#[tokio::test]
+async fn a_probe_needs_a_node_id() {
+    use clap::Parser as _;
+    let cli =
+        decdn_common::cli::Cli::try_parse_from(["decdn", "probe", "--hash", &"ab".repeat(32)])
+            .unwrap();
+    let decdn_common::cli::Command::Probe(args) = cli.command else {
+        panic!("a probe command");
     };
-    assert!(check_stated_size(hash, &ext(Some(proof(size)))).is_ok());
-    assert!(check_stated_size(hash, &ext(None)).is_ok());
-    let empty = decdn_protocol::SizeProof::new(size, []).unwrap();
-    let unproven = check_stated_size(hash, &ext(Some(empty))).unwrap_err();
-    assert!(
-        format!("{unproven:#}").contains("rejecting probe response"),
-        "{unproven:#}"
-    );
-    assert!(check_stated_size(hash, &ext(Some(proof(size + 1)))).is_err());
+    let err = probe(&args, None).await.unwrap_err();
+    assert!(err.to_string().contains("--node-id"), "{err:#}");
 }

@@ -181,6 +181,17 @@ pub struct Connections {
     inner: Arc<ConnectionsInner>,
 }
 
+/// The most discovery opens ([`crate::discovery_open`]) one map keeps on one
+/// node's connection at once, from the open until the stream is adopted or
+/// ends. A node holds at most 10 streams per connection that have sent no
+/// voucher, and resets every stream past that. A paid lane's open counts
+/// toward that bound until its first voucher too, so the map leaves room for
+/// two of those beside its discovery opens. A caller that discovers many
+/// hashes at once on one node (a price census, a bundle's entries, the
+/// gateway's concurrent requests) waits for a permit rather than having its
+/// opens reset.
+pub(crate) const MAX_DISCOVERY_OPENS_PER_NODE: usize = 8;
+
 /// A node's connection slot. The async lock makes concurrent callers for one
 /// node wait on one dial.
 type Slot = Arc<tokio::sync::Mutex<Option<Arc<WarmConnection>>>>;
@@ -227,6 +238,8 @@ struct ConnectionsInner {
     /// on the caller's.
     dial_runtime: Option<Handle>,
     slots: Mutex<HashMap<PublicKey, Slot>>,
+    /// Each node's discovery-open permits ([`MAX_DISCOVERY_OPENS_PER_NODE`]).
+    opens: Mutex<HashMap<PublicKey, Arc<tokio::sync::Semaphore>>>,
     /// How many dials this map has made.
     #[cfg(any(test, feature = "test-util"))]
     dials: std::sync::atomic::AtomicU64,
@@ -256,6 +269,7 @@ impl Connections {
                 alpn,
                 dial_runtime,
                 slots: Mutex::new(HashMap::new()),
+                opens: Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-util"))]
                 dials: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -359,6 +373,33 @@ impl Connections {
         {
             *held = None;
         }
+    }
+
+    /// One of `node`'s discovery-open permits, waiting while the map holds
+    /// [`MAX_DISCOVERY_OPENS_PER_NODE`] of them. The caller holds the permit
+    /// for as long as its open stream has sent no voucher.
+    ///
+    /// # Errors
+    ///
+    /// Never in practice: the map never closes a node's permits.
+    pub(crate) async fn discovery_permit(
+        &self,
+        node: PublicKey,
+    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+        let permits = Arc::clone(
+            self.inner
+                .opens
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(node)
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(MAX_DISCOVERY_OPENS_PER_NODE))
+                }),
+        );
+        permits
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("the discovery-open permits of node {node} closed"))
     }
 
     /// How many dials this map has made.

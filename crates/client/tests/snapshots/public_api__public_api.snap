@@ -413,8 +413,12 @@ pub fn decdn_client::provider::build_read_provider(&str) -> anyhow::Result<impl 
 pub mod decdn_client::quote
 #[non_exhaustive] pub struct decdn_client::quote::Census
 pub decdn_client::quote::Census::hashes: alloc::vec::Vec<decdn_client::quote::HashCensus>
+pub decdn_client::quote::Census::opened: usize
 pub decdn_client::quote::Census::outage_fallback: bool
-pub decdn_client::quote::Census::probed: usize
+pub struct decdn_client::quote::CensusNodes
+impl decdn_client::quote::CensusNodes
+pub const fn decdn_client::quote::CensusNodes::is_empty(&self) -> bool
+pub const fn decdn_client::quote::CensusNodes::len(&self) -> usize
 #[non_exhaustive] pub struct decdn_client::quote::HashCensus
 pub decdn_client::quote::HashCensus::answers: alloc::vec::Vec<decdn_client::quote::NodeAnswer>
 pub decdn_client::quote::HashCensus::clock_skewed: usize
@@ -442,7 +446,8 @@ pub struct decdn_client::quote::PricedBlob
 pub decdn_client::quote::PricedBlob::rates: alloc::vec::Vec<u64>
 pub decdn_client::quote::PricedBlob::wire: u64
 pub const decdn_client::quote::CENSUS_ENTRY_SAMPLE: usize
-pub async fn decdn_client::quote::census(&iroh::endpoint::Endpoint, (&decdn_client::session::ChainConfig, &decdn_client::session::PullSite), &[iroh_base::relay_url::RelayUrl], &decdn_client::session::DiscoveryOptions, &[[u8; 32]]) -> anyhow::Result<decdn_client::quote::Census>
+pub async fn decdn_client::quote::census(&decdn_client::quote::CensusNodes, (&decdn_client::connection::Connections, &decdn_client::PoolContext), (&decdn_client::session::ChainConfig, &decdn_client::session::PullSite), &[[u8; 32]], [u8; 32]) -> anyhow::Result<decdn_client::quote::Census>
+pub async fn decdn_client::quote::census_nodes((&decdn_client::session::ChainConfig, &decdn_client::session::PullSite), &[iroh_base::relay_url::RelayUrl], &decdn_client::session::DiscoveryOptions) -> anyhow::Result<decdn_client::quote::CensusNodes>
 pub fn decdn_client::quote::price(&[decdn_client::quote::PricedBlob], u64, usize) -> core::option::Option<decdn_client::quote::PriceRange>
 pub fn decdn_client::quote::wire_bytes(u64) -> anyhow::Result<u64>
 pub mod decdn_client::receipt

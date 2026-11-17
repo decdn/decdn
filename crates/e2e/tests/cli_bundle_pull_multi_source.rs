@@ -12,7 +12,7 @@
 //! blob has exactly ONE holder, so its loop runs one lane.
 //!
 //! The large blob is four times `min_split_size`, so the split does not depend
-//! on which holder answers the probe first. An entry's probe round starts the
+//! on which holder answers its open first. An entry's discovery round starts the
 //! fetch at the first holder that answers. That lane takes the whole blob when
 //! it is the only lane, and the other holder joins a few milliseconds later. A
 //! lane that joins late splits a range only while the range misses at least

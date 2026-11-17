@@ -118,6 +118,72 @@ async fn a_discovery_open_returns_the_verified_answer() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A map holds at most `MAX_DISCOVERY_OPENS_PER_NODE` discovery opens on one
+/// node at once, below the node's bound on a connection's streams with no
+/// voucher. One more open waits for a permit, and it answers once a held
+/// stream is cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_opens_on_one_node_wait_past_the_permit_bound() -> anyhow::Result<()> {
+    use crate::connection::MAX_DISCOVERY_OPENS_PER_NODE;
+    let blob = blob();
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 7,
+        },
+        domain(),
+    )
+    .await?;
+    let (ep, conns) = client().await?;
+    let ctx = ctx(1);
+    let hash = hash_of(&blob);
+    let mut held = Vec::new();
+    for _ in 0..MAX_DISCOVERY_OPENS_PER_NODE {
+        held.push(open_on(&node, &conns, &ctx, hash).await?);
+    }
+    let next = {
+        let (conns, ctx, node_addr, operator) = (
+            conns.clone(),
+            ctx.clone(),
+            node.addr.clone(),
+            node.operator_address(),
+        );
+        tokio::spawn(async move {
+            discovery_open(
+                &conns,
+                &node_addr,
+                operator,
+                &ctx,
+                &domain(),
+                hash,
+                decdn_protocol::client::NO_NAMESPACE,
+                (0, 0),
+                false,
+                OPEN,
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    anyhow::ensure!(
+        Seen::count(&node.seen.opens) == MAX_DISCOVERY_OPENS_PER_NODE,
+        "the open past the bound waits for a permit, and the node sees it not"
+    );
+    anyhow::ensure!(!next.is_finished());
+    held.pop()
+        .ok_or_else(|| anyhow::anyhow!("a held stream"))?
+        .cancel();
+    let opened = tokio::time::timeout(OPEN, next).await???;
+    anyhow::ensure!(opened.served());
+    anyhow::ensure!(Seen::count(&node.seen.opens) == MAX_DISCOVERY_OPENS_PER_NODE + 1);
+    opened.cancel();
+    for stream in held {
+        stream.cancel();
+    }
+    ep.close().await;
+    Ok(())
+}
+
 /// Cancelling a stream resets it at the node, and the shared connection stays
 /// open: the next open on the node takes a new stream on it, with no dial.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
