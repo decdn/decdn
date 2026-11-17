@@ -276,6 +276,12 @@ impl Connections {
         }
     }
 
+    /// The endpoint every connection of this map dials from.
+    #[must_use]
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.inner.endpoint
+    }
+
     /// The ALPN every connection of this map dials.
     #[must_use]
     #[doc(hidden)]

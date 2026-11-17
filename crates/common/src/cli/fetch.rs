@@ -13,8 +13,7 @@
 //! dir) resolve **flag > `[blockchain]`/`[identity]` config > default**, so a
 //! configured client runs `decdn get decdn:<hash> -o …` with no chain flags.
 //! Fields are kept as `String`/`Option`; the `cli` binary parses addresses and
-//! merges the config. [`super::probe::ProbeArgs`] flattens the same flags to
-//! name its node and its payer.
+//! merges the config.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

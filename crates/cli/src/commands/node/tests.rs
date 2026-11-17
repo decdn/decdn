@@ -1434,43 +1434,144 @@ mod earnings {
     }
 }
 
-/// `node lookup --probe` resolves its payer from the client flags `decdn get`
-/// takes: the lookup's chain flags carry over, and every other flag keeps its
-/// default, so the data dir and keystore stay the client's unless named.
-#[test]
-fn lookup_payer_args_carry_the_chain_flags_and_default_the_rest() {
-    use clap::Parser as _;
-    let parsed = cli::Cli::try_parse_from([
-        "decdn",
-        "node",
-        "lookup",
-        "--probe",
-        "--rpc-url",
-        "http://127.0.0.1:8545",
-        "--chain-id",
-        "31337",
-        "--keystore",
-        "/tmp/buyer.json",
-        "--capacity-bond-address",
-        "0x0000000000000000000000000000000000000042",
-    ])
+/// A loopback `cdn/client/v1` node that answers every open with a signed
+/// `NotFound` from `operator` under `domain`, and counts the opens.
+async fn not_found_node(
+    operator: alloy::signers::local::PrivateKeySigner,
+    domain: alloy::sol_types::Eip712Domain,
+) -> (
+    iroh::Endpoint,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use decdn_protocol::client::{
+        ClientMessage, StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
+    };
+    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .alpns(vec![decdn_protocol::ALPN_CLIENT.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind_addr(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        ))
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (server, seen) = (ep.clone(), std::sync::Arc::clone(&opens));
+    tokio::spawn(async move {
+        while let Some(incoming) = server.accept().await {
+            let Ok(conn) = incoming.await else { continue };
+            let (operator, domain, seen) = (
+                operator.clone(),
+                domain.clone(),
+                std::sync::Arc::clone(&seen),
+            );
+            tokio::spawn(async move {
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    let Ok(frame) = decdn_protocol::read_frame(&mut recv, 4096).await else {
+                        continue;
+                    };
+                    let Ok((ClientMessage::StreamRequest(req), _)) =
+                        decdn_protocol::decode_message::<ClientMessage>(&frame)
+                    else {
+                        continue;
+                    };
+                    let body = StreamResponseBody {
+                        hash: req.hash,
+                        ok: false,
+                        rate_per_mb: 7,
+                        timestamp_us: req.timestamp_us,
+                    };
+                    let sig =
+                        decdn_incentive::stream_sig::StreamSlashData::from_response_body(&body)
+                            .sign(&operator, &domain)
+                            .unwrap();
+                    let resp = StreamResponse {
+                        body,
+                        slash_sig: sig.as_bytes().to_vec(),
+                    };
+                    let ext = StreamResponseExt::refused(
+                        StreamError::NotFound,
+                        decdn_protocol::Coverage::empty(),
+                    );
+                    let payload =
+                        decdn_protocol::client::encode_stream_response(&resp, Some(&ext)).unwrap();
+                    let _ = decdn_protocol::write_frame(&mut send, &payload).await;
+                    let _ = send.finish();
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    (ep, opens)
+}
+
+/// `node lookup --probe` ranks the nodes with no keystore, no buyer store and
+/// no `PaymentPool`: the opens sign under a throwaway key and name a
+/// placeholder pool, and a node answers the sentinel miss before any funding
+/// gate. A node that answers gets an RTT and leads; one that is unreachable
+/// sorts last with none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookup_ranking_needs_no_keystore() {
+    let chain = decdn_client::session::ChainConfig {
+        // Nothing reads the chain: a dead RPC proves it.
+        rpc_url: "http://127.0.0.1:1".to_owned(),
+        chain_id: 31_337,
+        payment_pool: Address::ZERO,
+        slash_judge: Address::repeat_byte(0x02),
+        capacity_bond: Some(Address::repeat_byte(0x03)),
+    };
+    let operator = alloy::signers::local::PrivateKeySigner::random();
+    let domain = decdn_incentive::slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let (node, opens) = not_found_node(operator.clone(), domain).await;
+    let socket = node
+        .bound_sockets()
+        .into_iter()
+        .find(std::net::SocketAddr::is_ipv4)
+        .unwrap();
+    let packed = decdn_incentive::node_register::pack_multiaddrs(&[format!(
+        "/ip4/{}/udp/{}/quic-v1",
+        socket.ip(),
+        socket.port()
+    )])
     .unwrap();
-    let cli::Command::Node(node) = parsed.command else {
-        panic!("a node command");
+    let answering = NodeCandidate {
+        node_id: node.id(),
+        eth_address: operator.address(),
+        region_hint: None,
+        multiaddrs: alloy::primitives::Bytes::from(packed),
     };
-    let cli::NodeCommand::Lookup(lookup) = node.cmd else {
-        panic!("a lookup");
+    let silent = NodeCandidate {
+        node_id: iroh::SecretKey::from_bytes(&[9; 32]).public(),
+        eth_address: Address::repeat_byte(9),
+        region_hint: None,
+        multiaddrs: alloy::primitives::Bytes::new(),
     };
-    let args = payer_args(&lookup.chain).unwrap();
-    assert_eq!(args.rpc_url.as_deref(), Some("http://127.0.0.1:8545"));
-    assert_eq!(args.chain_id, Some(31_337));
-    assert_eq!(args.keystore.as_deref(), Some(Path::new("/tmp/buyer.json")));
+    let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let conns = decdn_client::Connections::new(client.clone());
+
+    let rows = rank_by_open(
+        vec![silent.clone(), answering.clone()],
+        &conns,
+        None,
+        &chain,
+        Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+
     assert_eq!(
-        args.capacity_bond_address.as_deref(),
-        Some("0x0000000000000000000000000000000000000042")
+        rows.iter().map(|r| r.node_id).collect::<Vec<_>>(),
+        vec![answering.node_id, silent.node_id]
     );
-    assert_eq!(args.data_dir, None, "the client data dir stays the default");
-    assert_eq!(args.node_id, None);
-    assert_eq!(args.capability, None);
-    assert_eq!(args.max_sources, 4);
+    assert!(rows[0].rtt_ms.is_some(), "the answering node has an RTT");
+    assert!(rows[1].rtt_ms.is_none(), "the silent node has none");
+    assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+    client.close().await;
+    node.close().await;
 }

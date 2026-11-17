@@ -73,7 +73,7 @@ impl ProbeAnswer {
 ///
 /// # Errors
 ///
-/// No `--node-id`, a malformed hash, node id or address, unresolvable chain
+/// A malformed hash, node id or address, unresolvable chain
 /// coordinates, a keystore that does not unlock, an open that fails or times
 /// out, or an answer that does not verify.
 pub async fn probe(
@@ -81,11 +81,10 @@ pub async fn probe(
     config_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
-    let common = &args.common;
-    common.validate()?;
-    let pinned = fetch::discovery_options(common)?.pinned.ok_or_else(|| {
-        anyhow::anyhow!("decdn probe asks one node: pass --node-id and --provider-address")
-    })?;
+    let common = &fetch_args(args)?;
+    let pinned = fetch::discovery_options(common)?
+        .pinned
+        .ok_or_else(|| anyhow::anyhow!("decdn probe asks one node: pass --node-id"))?;
     let (host, grant) = FetchHost::open(common, config_path, false).await?;
     let payer = Payer::keystore(grant);
     let answered = async {
@@ -111,7 +110,7 @@ pub async fn probe(
             decdn_protocol::client::NO_NAMESPACE,
             (0, 0),
             false,
-            Duration::from_millis(args.open_timeout_ms),
+            Duration::from_millis(args.timeout_ms),
         )
         .await?;
         let answer = ProbeAnswer::of(&opened);
@@ -126,6 +125,40 @@ pub async fn probe(
     write_probe_answer(&mut stdout, &answer, args.json)
         .map_err(|e| anyhow::anyhow!("failed to write the answer: {e}"))?;
     Ok(())
+}
+
+/// `decdn get`'s retrieval flags for `args`: the node, chain, keystore,
+/// data-dir and capability flags `decdn probe` takes, and every other flag at
+/// its default ([`fetch::default_fetch_args`]).
+///
+/// # Errors
+///
+/// Never in practice: the defaults parse.
+pub(crate) fn fetch_args(args: &cli::ProbeArgs) -> anyhow::Result<cli::ClientFetchArgs> {
+    let mut common = fetch::default_fetch_args()?;
+    common.node_id = Some(args.node_id.clone());
+    common.provider_address = Some(args.provider_address.clone());
+    common.addr = args.addr;
+    common.relay_url.clone_from(&args.relay_url);
+    common.rpc_url.clone_from(&args.rpc_url);
+    common.chain_id = args.chain_id;
+    common
+        .payment_pool_address
+        .clone_from(&args.payment_pool_address);
+    common
+        .slash_judge_address
+        .clone_from(&args.slash_judge_address);
+    common
+        .capacity_bond_address
+        .clone_from(&args.capacity_bond_address);
+    common.keystore.clone_from(&args.keystore);
+    common
+        .keystore_password_file
+        .clone_from(&args.keystore_password_file);
+    common.data_dir.clone_from(&args.data_dir);
+    common.capability.clone_from(&args.capability);
+    common.capability_file.clone_from(&args.capability_file);
+    Ok(common)
 }
 
 /// Render an answer to `w` in pretty or JSON form.

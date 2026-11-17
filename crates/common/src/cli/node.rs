@@ -228,8 +228,8 @@ pub enum NodeCommand {
     /// With neither `--node-id` nor `--region`, lists every active node.
     /// Pass `--probe` to additionally rank the (region-shortlisted)
     /// candidates by the round-trip time of one voucher-less `cdn/client/v1`
-    /// open each, which unlocks the client keystore to name its pool;
-    /// without it, candidates are listed with no RTT.
+    /// open each, signed under a throwaway key, so no keystore loads; without
+    /// it, candidates are listed with no RTT.
     Lookup(LookupArgs),
     /// Diagnose config, on-disk state, disk budget, and reachability.
     // Boxed to keep `NodeCommand`'s variants close in size (`DoctorArgs` is by
@@ -947,15 +947,14 @@ pub struct LookupArgs {
     /// five, sampled) and sort ascending by the measured round-trip time.
     /// Each open asks about a blob no node holds, so the node answers a
     /// signed `NotFound` at once; the stream is cancelled before any voucher,
-    /// and nothing is paid. The opens name your client pool as `decdn get`
-    /// does, so this unlocks the client keystore (`--keystore`, else
-    /// `<data-dir>/keystore.json`, where the data dir defaults to
-    /// `~/.decdn/client`) and reads `blockchain.payment_pool_address` and
-    /// `blockchain.slash_judge_address` from the config. Each answer must
-    /// verify against the node's registered operator address. Candidates
-    /// that don't answer, or whose answer does not verify, are kept at the
-    /// end (rather than dropped) with no RTT. Without this flag, no node is
-    /// opened and candidates carry no RTT.
+    /// and nothing is paid. The opens sign under a throwaway key made for
+    /// this run, so no keystore, buyer store or payment pool is needed. Each
+    /// answer must verify against the node's registered operator address
+    /// under the `SlashJudge` (`--slash-judge-address` or
+    /// `blockchain.slash_judge_address`). Candidates that don't answer, or
+    /// whose answer does not verify, are kept at the end (rather than
+    /// dropped) with no RTT. Without this flag, no node is opened and
+    /// candidates carry no RTT.
     #[arg(long)]
     pub probe: bool,
 
@@ -963,6 +962,12 @@ pub struct LookupArgs {
     /// exchange. Ignored without `--probe`.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
+
+    /// `SlashJudge` contract address (0x hex): the domain each `--probe`
+    /// answer's signature verifies under. Overrides
+    /// `blockchain.slash_judge_address`. Ignored without `--probe`.
+    #[arg(long, value_name = "0xADDR")]
+    pub slash_judge_address: Option<String>,
 
     // `--json` is supplied by the flattened `ChainArgs` (`CommonChainArgs.json`);
     // declaring it here too would collide (clap requires unique arg names).

@@ -127,17 +127,87 @@ fn parse_hash_rejects_wrong_length() {
     assert!(parse_hash(&"ab".repeat(33)).is_err());
 }
 
-/// `decdn probe` names one node: without `--node-id` it stops before it
-/// resolves a chain or binds an endpoint.
-#[tokio::test]
-async fn a_probe_needs_a_node_id() {
+/// `decdn probe` takes only the flags it uses: `--node-id` and
+/// `--provider-address` are required, `--timeout-ms` is the open's bound, and
+/// a `decdn get` flag it has no use for does not parse.
+#[test]
+fn probe_flags_are_its_own() {
     use clap::Parser as _;
-    let cli =
-        decdn_common::cli::Cli::try_parse_from(["decdn", "probe", "--hash", &"ab".repeat(32)])
-            .unwrap();
+    let hash = "ab".repeat(32);
+    let parse = |argv: &[&str]| decdn_common::cli::Cli::try_parse_from(argv);
+    assert!(parse(&["decdn", "probe", "--hash", &hash]).is_err());
+    assert!(parse(&["decdn", "probe", "--node-id", "x", "--hash", &hash]).is_err());
+    let base = [
+        "decdn",
+        "probe",
+        "--node-id",
+        "x",
+        "--provider-address",
+        "0x1",
+        "--hash",
+        &hash,
+    ];
+    for unused in ["--max-sources", "--max-rate-per-mb", "--give-up-after-secs"] {
+        let mut argv = base.to_vec();
+        argv.extend([unused, "4"]);
+        assert!(parse(&argv).is_err(), "{unused} is not a probe flag");
+    }
+    let mut argv = base.to_vec();
+    argv.extend(["--timeout-ms", "750"]);
+    let decdn_common::cli::Command::Probe(probe) = parse(&argv).unwrap().command else {
+        panic!("a probe command");
+    };
+    assert_eq!(probe.timeout_ms, 750);
+}
+
+/// The probe's flags fill `decdn get`'s retrieval flags, and every other one
+/// keeps its default.
+#[test]
+fn probe_fetch_args_carry_its_flags_and_default_the_rest() {
+    use clap::Parser as _;
+    let hash = "ab".repeat(32);
+    let cli = decdn_common::cli::Cli::try_parse_from([
+        "decdn",
+        "probe",
+        "--node-id",
+        "nodeid",
+        "--provider-address",
+        "0x0000000000000000000000000000000000000042",
+        "--hash",
+        &hash,
+        "--addr",
+        "127.0.0.1:4433",
+        "--rpc-url",
+        "http://127.0.0.1:8545",
+        "--slash-judge-address",
+        "0x0000000000000000000000000000000000000002",
+        "--keystore",
+        "/tmp/buyer.json",
+        "--capability",
+        "dcap1:x",
+    ])
+    .unwrap();
     let decdn_common::cli::Command::Probe(args) = cli.command else {
         panic!("a probe command");
     };
-    let err = probe(&args, None).await.unwrap_err();
-    assert!(err.to_string().contains("--node-id"), "{err:#}");
+    let common = fetch_args(&args).unwrap();
+    assert_eq!(common.node_id.as_deref(), Some("nodeid"));
+    assert_eq!(
+        common.provider_address.as_deref(),
+        Some("0x0000000000000000000000000000000000000042")
+    );
+    assert_eq!(common.addr, Some("127.0.0.1:4433".parse().unwrap()));
+    assert_eq!(common.rpc_url.as_deref(), Some("http://127.0.0.1:8545"));
+    assert_eq!(
+        common.slash_judge_address.as_deref(),
+        Some("0x0000000000000000000000000000000000000002")
+    );
+    assert_eq!(
+        common.keystore.as_deref(),
+        Some(std::path::Path::new("/tmp/buyer.json"))
+    );
+    assert_eq!(common.capability.as_deref(), Some("dcap1:x"));
+    assert_eq!(common.data_dir, None);
+    assert_eq!(common.max_sources, 4);
+    common.validate().unwrap();
 }

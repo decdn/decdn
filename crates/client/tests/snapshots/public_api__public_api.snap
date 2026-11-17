@@ -261,6 +261,7 @@ pub fn decdn_client::config::PullConfig::default() -> Self
 pub mod decdn_client::connection
 pub struct decdn_client::connection::Connections
 impl decdn_client::connection::Connections
+pub fn decdn_client::connection::Connections::endpoint(&self) -> &iroh::endpoint::Endpoint
 pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> Self
 pub mod decdn_client::credential
 #[non_exhaustive] pub enum decdn_client::credential::CapabilityCause
@@ -848,6 +849,7 @@ impl core::ops::drop::Drop for decdn_client::stop::ClockHold<'_>
 pub fn decdn_client::stop::ClockHold<'_>::drop(&mut self)
 pub struct decdn_client::Connections
 impl decdn_client::connection::Connections
+pub fn decdn_client::connection::Connections::endpoint(&self) -> &iroh::endpoint::Endpoint
 pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> Self
 pub struct decdn_client::Credential
 pub decdn_client::Credential::capability: decdn_incentive::capability::SignedCapability

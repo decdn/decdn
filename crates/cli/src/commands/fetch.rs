@@ -339,6 +339,21 @@ pub(crate) fn resolve_chain(
     })
 }
 
+/// Every retrieval flag at its default, as clap parses an empty command
+/// line: the base a command that takes only some of `decdn get`'s flags
+/// (`decdn probe`) fills its own into, so the defaults have one definition.
+///
+/// # Errors
+///
+/// Never in practice: the defaults parse.
+pub(crate) fn default_fetch_args() -> anyhow::Result<cli::ClientFetchArgs> {
+    use clap::{Args as _, FromArgMatches as _};
+    let matches = cli::ClientFetchArgs::augment_args(clap::Command::new("decdn"))
+        .try_get_matches_from(["decdn"])
+        .context("the retrieval flags' defaults")?;
+    cli::ClientFetchArgs::from_arg_matches(&matches).context("the retrieval flags' defaults")
+}
+
 /// Client-side proxy-warming knobs (#1174, ADR 037), distilled from
 /// [`cli::ClientFetchArgs`]. RTT thresholds are held as `f64` ms to compare
 /// directly against discovery RTTs.

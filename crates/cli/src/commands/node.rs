@@ -16,6 +16,7 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use serde::{Deserialize, Serialize};
 
 use decdn_client::discovery::{self, NodeCandidate, SELECT_K, select_candidates};
+use decdn_client::endpoint as client_endpoint;
 use decdn_common::admin::{
     AdminRpcClient, BindingStatus, BuyerPoolsResponse, DrainRequest, DrainResponse, EarningsPeriod,
     EarningsRequest, EarningsResponse, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot,
@@ -30,7 +31,6 @@ use decdn_protocol::Region;
 use crate::commands::bundle_pull::human_bytes;
 use crate::commands::chain_ctx;
 use crate::commands::civil_time;
-use crate::commands::fetch;
 
 pub(crate) mod earnings_chain;
 
@@ -1473,9 +1473,8 @@ fn format_interval(secs: u64) -> String {
 /// Filters (`--node-id`, `--region`) are applied by the pure, network-free
 /// `filter_candidates`. With `--probe`, the result, sampled down to `SELECT_K`,
 /// is ranked by the path RTT of one voucher-less `cdn/client/v1` open to each
-/// node via `open_and_rank`, which unlocks the client keystore and names its
-/// pool as `decdn get` does; without it, candidates are printed as listed,
-/// with no RTT.
+/// node via `open_and_rank`, under a throwaway key that loads no keystore;
+/// without it, candidates are printed as listed, with no RTT.
 pub async fn lookup(args: &cli::LookupArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     let config_path = args.chain.common.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
@@ -1517,7 +1516,7 @@ pub async fn lookup(args: &cli::LookupArgs, global_config: Option<&Path>) -> any
         // `filter_candidates` already matches, and without it no client
         // region is passed. Only the shuffle and the cap apply.
         let shortlisted = select_candidates(filtered, args.region.as_deref(), SELECT_K);
-        open_and_rank(shortlisted, &args.chain, config_path, args.timeout_ms).await?
+        open_and_rank(shortlisted, args, &resolved, config_path).await?
     } else {
         filtered.into_iter().map(LookupRow::from).collect()
     };
@@ -1572,112 +1571,155 @@ impl From<NodeCandidate> for LookupRow {
     }
 }
 
-/// The client flags `decdn get` resolves its payer from, taken from `chain`:
-/// the RPC, chain id, keystore, data dir, keystore password file and
-/// `CapacityBond` flags, and every other flag at its default. The
-/// `PaymentPool` and `SlashJudge` addresses come from the config. With no
-/// `--data-dir` or `--keystore`, the payer is the client's
-/// (`~/.decdn/client`), as for `decdn get`, not the node operator's.
-///
-/// # Errors
-///
-/// Never in practice: the defaults parse.
-fn payer_args(chain: &cli::ChainArgs) -> anyhow::Result<cli::ClientFetchArgs> {
-    use clap::{Args as _, FromArgMatches as _};
-    let matches = cli::ClientFetchArgs::augment_args(clap::Command::new("lookup"))
-        .try_get_matches_from(["lookup"])
-        .context("the client flags' defaults")?;
-    let mut args =
-        cli::ClientFetchArgs::from_arg_matches(&matches).context("the client flags' defaults")?;
-    let common = &chain.common;
-    args.rpc_url.clone_from(&common.rpc_url);
-    args.chain_id = common.chain_id;
-    args.keystore.clone_from(&common.keystore);
-    args.data_dir.clone_from(&common.data_dir);
-    args.keystore_password_file
-        .clone_from(&common.keystore_password_file);
-    args.capacity_bond_address
-        .clone_from(&chain.capacity_bond_address);
-    Ok(args)
+/// The sentinel blob `--probe` asks about: no node holds it, so every node
+/// answers a signed `NotFound` at once.
+fn lookup_sentinel() -> [u8; 32] {
+    *blake3::hash(b"decdn-node-lookup-sentinel/v1").as_bytes()
 }
 
 /// Open each of `candidates` over `cdn/client/v1` for a fixed sentinel hash
-/// and sort ascending by the connection's path RTT. No blob needs to exist at
-/// the sentinel hash: an open of an absent hash still returns a full signed
-/// `NotFound` answer, so any hash works for RTT. Each open is voucher-less,
-/// asks no pull-through and is cancelled once it has answered, so the node
-/// fetches nothing and nothing is paid; it names the client payer's pool,
-/// which unlocks the keystore once ([`payer_args`], [`fetch::Payer`]). Each
-/// answer must verify against the candidate's registry address. A candidate
-/// that cannot be reached (offline, no route, timeout), or whose answer does
-/// not verify, is kept at the end with `rtt_ms: None` and a warning on stderr
-/// rather than dropped or failing the whole lookup — the point of `--probe`
-/// is to rank the reachable subset, not to require every candidate to answer.
+/// and sort ascending by the connection's path RTT ([`rank_by_open`]). The
+/// endpoint is discovery-enabled, as `decdn get`'s is. The answers verify
+/// against `--slash-judge-address`, else `blockchain.slash_judge_address`.
 async fn open_and_rank(
     candidates: Vec<NodeCandidate>,
-    chain: &cli::ChainArgs,
+    args: &cli::LookupArgs,
+    resolved: &chain_ctx::Resolved,
     config_path: Option<&Path>,
-    timeout_ms: u64,
 ) -> anyhow::Result<Vec<LookupRow>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let common = payer_args(chain)?;
-    let (host, grant) = fetch::FetchHost::open(&common, config_path, false).await?;
-    let payer = fetch::Payer::keystore(grant);
-    let rows = async {
-        let ctx = payer.discovery_ctx(&host).await?;
-        let config = &host.chain().config;
-        let slash_dom = decdn_incentive::slash_judge_domain(config.chain_id, config.slash_judge);
-        let timeout = Duration::from_millis(timeout_ms);
-        let hash = *blake3::hash(b"decdn-node-lookup-sentinel/v1").as_bytes();
-        let mut rows = Vec::with_capacity(candidates.len());
-        for c in candidates {
-            let mut target = EndpointAddr::new(c.node_id);
-            if let Some(url) = host.relays().first() {
-                target = target.with_relay_url(url.clone());
-            }
-            let target = discovery::with_dial_addrs(target, &c);
-            let opened = decdn_client::discovery_open(
-                host.connections(),
-                &target,
-                c.eth_address,
-                &ctx,
-                &slash_dom,
-                hash,
-                decdn_protocol::client::NO_NAMESPACE,
-                (0, 0),
-                false,
-                timeout,
+    let file = decdn_common::config::load_file_config(config_path)?;
+    let slash_judge_raw = args
+        .slash_judge_address
+        .clone()
+        .or_else(|| {
+            file.blockchain
+                .as_ref()
+                .and_then(|b| b.slash_judge_address.clone())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--probe verifies each answer: slash_judge_address not set (pass \
+                 --slash-judge-address or set blockchain.slash_judge_address)"
             )
-            .await;
-            let rtt_ms = match opened {
-                Ok(opened) => {
-                    let rtt = opened.rtt().map(|(ms, _)| ms);
-                    opened.cancel();
-                    rtt
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: open of node {} failed: {}",
-                        short_node_id(&node_id_hex(&c.node_id)),
-                        decdn_common::redact::sanitize_err_chain(&e)
-                    );
-                    None
-                }
-            };
-            rows.push(LookupRow {
-                node_id: c.node_id,
-                eth_address: c.eth_address,
-                region_hint: c.region_hint,
-                rtt_ms,
-            });
-        }
-        anyhow::Ok(rows)
-    }
+        })?;
+    let slash_judge = chain_ctx::parse_nonzero_address(&slash_judge_raw, "slash_judge_address")?;
+    let chain = decdn_client::session::ChainConfig {
+        rpc_url: resolved.rpc_url.clone(),
+        chain_id: resolved.chain_id,
+        // No voucher is sent, so the voucher domain's contract is never used.
+        payment_pool: Address::ZERO,
+        slash_judge,
+        capacity_bond: Some(resolved.capacity_bond_address),
+    };
+    let relays = client_endpoint::resolve_relays(None, config_path)?;
+    let discovery_cfg = client_endpoint::client_discovery(config_path)?;
+    let endpoint = client_endpoint::client_endpoint(&relays, &discovery_cfg).await?;
+    let conns = decdn_client::Connections::new(endpoint.clone());
+    let rows = rank_by_open(
+        candidates,
+        &conns,
+        relays.first(),
+        &chain,
+        Duration::from_millis(args.timeout_ms),
+    )
     .await;
-    host.close().await;
-    let mut rows = rows?;
+    endpoint.close().await;
+    rows
+}
+
+/// Open each of `candidates` on `conns` for the sentinel hash and sort
+/// ascending by the connection's path RTT. No blob needs to exist at the
+/// sentinel hash: an open of an absent hash still returns a full signed
+/// `NotFound` answer, so any hash works for RTT. Each open is voucher-less,
+/// asks no pull-through and is cancelled once it has answered, so the node
+/// fetches nothing and nothing is paid.
+///
+/// The opens name a throwaway payer: a key made for this run, an in-memory
+/// buyer store, and a placeholder pool. A node answers a miss that asks no
+/// pull-through before it checks the pool or the signer, so the lookup needs
+/// no keystore, no buyer store and no `PaymentPool`. The key still signs the
+/// identity binding under `chain`'s `CapacityBond`, as every open carries
+/// one. Each answer must verify against the candidate's registry address
+/// under `chain`'s `SlashJudge`. A candidate that cannot be reached
+/// (offline, no route, timeout), or whose answer does not verify, is kept at
+/// the end with `rtt_ms: None` and a warning on stderr rather than dropped
+/// or failing the whole lookup — the point of `--probe` is to rank the
+/// reachable subset, not to require every candidate to answer.
+async fn rank_by_open(
+    candidates: Vec<NodeCandidate>,
+    conns: &decdn_client::Connections,
+    relay: Option<&iroh::RelayUrl>,
+    chain: &decdn_client::session::ChainConfig,
+    timeout: Duration,
+) -> anyhow::Result<Vec<LookupRow>> {
+    let signer = std::sync::Arc::new(alloy::signers::local::PrivateKeySigner::random());
+    let payer = decdn_client::buyer_pool::OwnedPayer::sole(std::sync::Arc::clone(&signer));
+    let store = decdn_incentive::buyer_pool::MemoryBuyerPoolStore::new();
+    let contract = decdn_incentive::payment_pool::PaymentPool::new(
+        chain.payment_pool,
+        decdn_client::provider::build_provider(&chain.rpc_url, &signer)?,
+    );
+    let voucher_dom = decdn_incentive::voucher_domain(chain.chain_id, chain.payment_pool);
+    // A known pool: the context reads no chain to name one.
+    let placeholder =
+        decdn_client::funding::predicted_pool_id(signer.address(), alloy::primitives::U256::ZERO);
+    let ctx = decdn_client::funding::discovery_ctx(
+        &store,
+        &contract,
+        decdn_client::lanes::LanePayer::Owned(&payer),
+        chain,
+        conns.endpoint(),
+        &voucher_dom,
+        Some(placeholder),
+    )
+    .await?;
+    let slash_dom = decdn_incentive::slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let hash = lookup_sentinel();
+    let mut rows = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let mut target = EndpointAddr::new(c.node_id);
+        if let Some(url) = relay {
+            target = target.with_relay_url(url.clone());
+        }
+        let target = discovery::with_dial_addrs(target, &c);
+        let opened = decdn_client::discovery_open(
+            conns,
+            &target,
+            c.eth_address,
+            &ctx,
+            &slash_dom,
+            hash,
+            decdn_protocol::client::NO_NAMESPACE,
+            (0, 0),
+            false,
+            timeout,
+        )
+        .await;
+        let rtt_ms = match opened {
+            Ok(opened) => {
+                let rtt = opened.rtt().map(|(ms, _)| ms);
+                opened.cancel();
+                rtt
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: open of node {} failed: {}",
+                    short_node_id(&node_id_hex(&c.node_id)),
+                    decdn_common::redact::sanitize_err_chain(&e)
+                );
+                None
+            }
+        };
+        rows.push(LookupRow {
+            node_id: c.node_id,
+            eth_address: c.eth_address,
+            region_hint: c.region_hint,
+            rtt_ms,
+        });
+    }
 
     // Ascending by RTT; unreachable candidates (`None`) sort last, ties among
     // them preserving open order.
