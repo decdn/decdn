@@ -10,6 +10,7 @@ pub mod appeal;
 pub mod bond;
 pub mod bundle_pull;
 pub(crate) mod buyer_store;
+pub(crate) mod capability_pool;
 pub mod chain_ctx;
 pub mod chunker;
 pub(crate) mod civil_time;

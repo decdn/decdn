@@ -50,6 +50,12 @@ async fn main() -> Result<()> {
     )?;
     let out_dir = PathBuf::from(args.next().context("pass an output directory")?);
 
+    // The capability's pool lives on this contract: its owner signed the
+    // capability under this contract's EIP-712 domain.
+    let deployment = Deployment {
+        chain_id: var("DECDN_PAYMENT_CHAIN_ID")?.parse()?,
+        payment_pool: var("DECDN_PAYMENT_POOL")?.parse()?,
+    };
     let chain = ChainConfig::new(
         GovernanceChain {
             rpc_url: var("DECDN_RPC_URL")?,
@@ -59,10 +65,7 @@ async fn main() -> Result<()> {
         },
         vec![PaymentPoolChain {
             rpc_url: var("DECDN_PAYMENT_RPC_URL")?,
-            deployment: Deployment {
-                chain_id: var("DECDN_PAYMENT_CHAIN_ID")?.parse()?,
-                payment_pool: var("DECDN_PAYMENT_POOL")?.parse()?,
-            },
+            deployment,
         }],
     )?;
     let site = PullSite {
@@ -87,7 +90,10 @@ async fn main() -> Result<()> {
         site,
         endpoint.clone(),
         store,
-        Funding::Delegated { slot: slot.clone() },
+        Funding::Delegated {
+            slot: slot.clone(),
+            pool: deployment,
+        },
         discovery,
         nodes,
     )

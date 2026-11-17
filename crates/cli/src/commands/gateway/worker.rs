@@ -44,7 +44,7 @@ use tokio::io::DuplexStream;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use super::super::fetch::{BlobFetch, Credential, FetchHost, Payer, Sink, fetch_on};
+use super::super::fetch::{BlobFetch, Credential, Delegation, FetchHost, Payer, Sink, fetch_on};
 use super::super::fetch_timings::FetchTimings;
 
 /// Who pays for a pull.
@@ -275,7 +275,7 @@ pub(super) struct FetchBackend {
 
 impl Backend for FetchBackend {
     /// The host, and the `--capability` delegation the flags name, if any.
-    type Host = (FetchHost, Option<CapabilityGrant>);
+    type Host = (FetchHost, Option<Delegation>);
     type Payer = Payer;
 
     async fn open(&self) -> anyhow::Result<Self::Host> {
@@ -286,11 +286,11 @@ impl Backend for FetchBackend {
         Payer::held(credential)
     }
 
-    async fn pool_payer(&self, (host, grant): &Self::Host) -> anyhow::Result<Option<Payer>> {
+    async fn pool_payer(&self, (host, delegation): &Self::Host) -> anyhow::Result<Option<Payer>> {
         if !self.pool {
             return Ok(None);
         }
-        let payer = Payer::pool(grant.clone(), host.escrows.clone());
+        let payer = Payer::pool(delegation.clone(), host.escrows.clone());
         payer.unlock(host).await?;
         Ok(Some(payer))
     }
@@ -314,18 +314,15 @@ impl Backend for FetchBackend {
 
     /// Read off the async thread, so a slow store read never stalls the
     /// pulls running on it. The `--capability` grant a public gateway pays
-    /// under signs delegate lanes too, on the first configured pool, so its
-    /// key is read beside the registered capabilities'.
+    /// under signs delegate lanes too, on its pool's contract, so its key is
+    /// read beside the registered capabilities'.
     async fn pools(
         &self,
-        (host, grant): &Self::Host,
+        (host, delegation): &Self::Host,
         delegates: &[DelegateKey],
     ) -> anyhow::Result<PoolSnapshot> {
         let store = host.store();
-        let grant = grant
-            .as_ref()
-            .map(|grant| anyhow::Ok((host.deployment()?, grant)))
-            .transpose()?;
+        let grant = delegation.as_ref().map(|d| (d.pool, &d.grant));
         let queries = lane_queries(grant, delegates);
         tokio::task::spawn_blocking(move || read_pools(store.as_ref(), &queries)).await?
     }

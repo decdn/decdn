@@ -150,15 +150,14 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use bytes::Bytes;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
-use decdn_client::session::{ChainConfig, PaymentPoolChain};
+use decdn_client::session::ChainConfig;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::address::parse_nonzero_address;
 use decdn_common::cli::{self, ClientFetchArgs, GatewayArgs};
 use decdn_common::config::{FileConfig, load_file_config};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
-use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::publisher_registry::PublisherRegistry;
-use decdn_incentive::{CapabilityGrant, Deployment, PoolId};
+use decdn_incentive::{CapabilityGrant, Deployment};
 use http_body_util::{BodyExt as _, Limited, StreamBody};
 use hyper::body::{Body as HttpBody, Frame};
 use hyper::service::service_fn;
@@ -168,6 +167,7 @@ use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit, oneshot};
 
+use super::capability_pool::{CapabilityPoolError, capability_pool, read_pool_owner};
 use super::fetch::{
     BlobFetch, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb, resolve_chain,
 };
@@ -827,81 +827,6 @@ fn may_register(caller: &Caller, scope: &Scope) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// Whether a pool whose on-chain owner is `on_chain` accepts a capability its
-/// signature recovers to `signed_by`.
-fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Result<(), String> {
-    if on_chain.is_zero() {
-        Err(format!(
-            "pool {pool_id} does not exist on this deployment\n"
-        ))
-    } else if on_chain != signed_by {
-        Err(format!(
-            "the capability is not signed by the owner of pool {pool_id}\n"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// The configured `PaymentPool` contract `grant` spends from. A capability's
-/// EIP-712 domain binds one contract (its payment chain id and address), so
-/// its signature recovers to the pool's owner under that contract's domain
-/// only. Each configured pool is tried in order: the signer the grant
-/// recovers to under its domain, against `read_owner`'s on-chain owner of
-/// `grant.pool_id` there. The first pool where they match is the
-/// capability's.
-///
-/// # Errors
-///
-/// The status and text to answer with: 422 when the signature is malformed,
-/// or when every pool was read and none matches; 502 when no pool matches and
-/// a read failed.
-async fn capability_pool<F, Fut>(
-    grant: &CapabilityGrant,
-    pools: &[PaymentPoolChain],
-    read_owner: F,
-) -> Result<Deployment, (StatusCode, String)>
-where
-    F: Fn(&PaymentPoolChain, PoolId) -> Fut,
-    Fut: std::future::Future<Output = Result<Address, String>>,
-{
-    let unprocessable = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
-    let mut owners = Vec::with_capacity(pools.len());
-    let mut unread = None;
-    for pool in pools {
-        let signed_by = grant
-            .owner(&pool.deployment.voucher_domain())
-            .map_err(|e| unprocessable(format!("{e}\n")))?;
-        match read_owner(pool, grant.pool_id).await {
-            Ok(on_chain) if owner_matches(on_chain, signed_by, grant.pool_id).is_ok() => {
-                return Ok(pool.deployment);
-            }
-            Ok(on_chain) => owners.push((on_chain, signed_by)),
-            Err(e) => {
-                unread.get_or_insert(e);
-            }
-        }
-    }
-    if let Some(e) = unread {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("could not read the capability's pool on-chain: {e}\n"),
-        ));
-    }
-    // A pool that exists on some contract is named as not signed by its
-    // owner; one that exists on none, as missing.
-    let (on_chain, signed_by) = owners
-        .iter()
-        .copied()
-        .find(|(on_chain, _)| !on_chain.is_zero())
-        .unwrap_or_default();
-    Err(unprocessable(
-        owner_matches(on_chain, signed_by, grant.pool_id)
-            .err()
-            .unwrap_or_default(),
-    ))
 }
 
 /// A delegate key and the capability registered to it, if any.
@@ -1923,27 +1848,29 @@ impl Gateway {
     }
 
     /// The configured `PaymentPool` contract whose on-chain owner of `grant`'s
-    /// pool signed it ([`capability_pool`]). Whether the pool can pay shows
-    /// only when a pull draws on it: a funding stop retires the capability.
+    /// pool signed it ([`capability_pool`]), or the status and text to answer
+    /// with: 422 for a malformed signature or no matching pool, 502 when no
+    /// pool matches and a read failed. Whether the pool can pay shows only
+    /// when a pull draws on it: a funding stop retires the capability.
     async fn verify_owner(
         &self,
         grant: &CapabilityGrant,
     ) -> Result<Deployment, (StatusCode, String)> {
         capability_pool(grant, &self.chain.payment_pools, |pool, pool_id| {
-            let rpc_url = pool.rpc_url.clone();
-            let contract = pool.deployment.payment_pool;
+            let pool = pool.clone();
             async move {
-                let rpc = decdn_client::provider::build_read_provider(&rpc_url)
-                    .map_err(|e| sanitize_err_chain(&e))?;
-                PaymentPool::new(contract, rpc)
-                    .getPool(pool_id)
-                    .call()
+                read_pool_owner(&pool, pool_id)
                     .await
-                    .map(|pool| pool.owner)
-                    .map_err(|e| sanitize_error_sources(&e))
+                    .map_err(|e| sanitize_err_chain(&e))
             }
         })
         .await
+        .map_err(|e| match e {
+            CapabilityPoolError::Malformed(text) | CapabilityPoolError::NoMatch(text) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, text)
+            }
+            CapabilityPoolError::Unread(text) => (StatusCode::BAD_GATEWAY, text),
+        })
     }
 
     async fn list(&self) -> Response<Body> {

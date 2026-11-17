@@ -31,7 +31,6 @@ use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::get::{DEFAULT_JOBS, DEFAULT_MAX_LANE_STREAMS};
 use decdn_common::cli::{ClientFetchArgs, GetArgs};
 use decdn_common::config::load_file_config;
-use decdn_incentive::CapabilityGrant;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::eth_identity::{PasswordUse, load_signer};
 use iroh::{Endpoint, RelayUrl};
@@ -877,10 +876,11 @@ pub(crate) async fn bundle_pull(
 
     // Delegated adoption: `--capability`/`--capability-file` names a pool the
     // caller does NOT own and a capability authorizing this client's key to
-    // spend against it (every entry pulls from that one pool). `None` => the
-    // unchanged self-owned pool path; a delegated grant also zeroes the working
-    // deposit in `chain`, so its funding recovery step has nothing to add.
-    let grant = fetch::resolve_delegation_grant(common, &mut chain)?;
+    // spend against it (every entry pulls from that one pool, on the contract
+    // whose owner signed it). `None` => the unchanged self-owned pool path; a
+    // delegation also zeroes the working deposit in `chain`, so its funding
+    // recovery step has nothing to add.
+    let delegation = fetch::resolve_delegation(common, &mut chain).await?;
 
     // Same guard as the blob route, for the same reason and before the same
     // password prompt: a node's data dir is a buy target only when the
@@ -899,7 +899,7 @@ pub(crate) async fn bundle_pull(
         dest,
         uri,
         &chain,
-        grant,
+        delegation,
         &store,
         &endpoint,
         &relays,
@@ -922,7 +922,7 @@ async fn pull_over(
     dest: &Destination,
     uri: &DecdnUri,
     chain: &fetch::ResolvedChain,
-    grant: Option<CapabilityGrant>,
+    delegation: Option<fetch::Delegation>,
     store: &Arc<dyn BuyerPoolStore>,
     endpoint: &Endpoint,
     relays: &[RelayUrl],
@@ -945,7 +945,7 @@ async fn pull_over(
     );
     let mut puller = open_puller(
         &args.common,
-        (chain, grant.as_ref(), store),
+        (chain, delegation.as_ref(), store),
         (endpoint, relays),
         uri.namespace,
         lanes,
@@ -990,9 +990,9 @@ async fn pull_over(
 /// a pool when it has none.
 async fn open_puller(
     common: &ClientFetchArgs,
-    (chain, grant, store): (
+    (chain, delegation, store): (
         &fetch::ResolvedChain,
-        Option<&CapabilityGrant>,
+        Option<&fetch::Delegation>,
         &Arc<dyn BuyerPoolStore>,
     ),
     (endpoint, relays): (&Endpoint, &[RelayUrl]),
@@ -1009,7 +1009,7 @@ async fn open_puller(
     let discovery = fetch::discovery_options(common)?;
     let nodes = select_nodes(&chain.config, &chain.site, &discovery).await?;
     let signer = load_buyer_signer(chain)?;
-    let funding = match grant {
+    let funding = match delegation {
         None => Funding::SelfOwned {
             owner: signer,
             deposit: DepositPolicy {
@@ -1017,8 +1017,9 @@ async fn open_puller(
                 ..chain.deposit_policy(false)?
             },
         },
-        Some(grant) => Funding::Delegated {
-            slot: fetch::delegated_slot(grant, signer)?,
+        Some(delegation) => Funding::Delegated {
+            slot: fetch::delegated_slot(&delegation.grant, signer)?,
+            pool: delegation.pool,
         },
     };
     let builder = BundlePuller::builder(
@@ -1062,7 +1063,7 @@ pub(crate) async fn fetch_manifest_paid(
     (chain, open): (&mut fetch::ResolvedChain, PoolOpen),
     (endpoint, relays): (&Endpoint, &[RelayUrl]),
 ) -> anyhow::Result<BundleManifest> {
-    let grant = fetch::resolve_delegation_grant(common, chain)?;
+    let delegation = fetch::resolve_delegation(common, chain).await?;
     let store: Arc<dyn BuyerPoolStore> = Arc::new(open_client_store_for_buy(
         &chain.site.data_dir,
         chain.data_dir_source,
@@ -1074,7 +1075,7 @@ pub(crate) async fn fetch_manifest_paid(
     let observer = Arc::new(PullObserver::new(true, run_label(out), None));
     let mut puller = open_puller(
         common,
-        (chain, grant.as_ref(), &store),
+        (chain, delegation.as_ref(), &store),
         (endpoint, relays),
         uri.namespace,
         (1, usize::from(DEFAULT_MAX_LANE_STREAMS)),

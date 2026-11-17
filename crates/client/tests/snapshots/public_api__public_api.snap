@@ -19,6 +19,7 @@ pub decdn_client::bundle::ForeignReason::UnreadableCache(alloc::string::String)
 pub decdn_client::bundle::ForeignReason::Unrecorded
 #[non_exhaustive] pub enum decdn_client::bundle::Funding
 pub decdn_client::bundle::Funding::Delegated
+pub decdn_client::bundle::Funding::Delegated::pool: decdn_incentive::deployment::Deployment
 pub decdn_client::bundle::Funding::Delegated::slot: decdn_client::credential::CredentialSlot
 pub decdn_client::bundle::Funding::SelfOwned
 pub decdn_client::bundle::Funding::SelfOwned::deposit: decdn_client::session::DepositPolicy

@@ -39,7 +39,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::slash_judge_domain;
+use decdn_incentive::{Deployment, slash_judge_domain};
 use iroh::{Endpoint, RelayUrl};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -591,6 +591,9 @@ pub enum Funding {
     Delegated {
         /// The delegate key and the owner-signed capability.
         slot: CredentialSlot,
+        /// The `PaymentPool` contract of the capability's pool: every pass
+        /// pays through it.
+        pool: Deployment,
     },
 }
 
@@ -1201,12 +1204,21 @@ impl BundlePullerBuilder {
     /// store cannot read or record its lane salt (a self-owned run), or the
     /// `PaymentPool` token read fails.
     pub async fn build(self) -> anyhow::Result<BundlePuller> {
-        let (signer, payer, deposit) = match self.funding {
+        // The first pass pays through the first pool of the buyer's route,
+        // and pays only the nodes routed to it; each later pass pays through
+        // the next pool a node is routed to (ADR 005 § Payment pool routing).
+        // A delegated run pays through its capability's contract only.
+        let (signer, payer, deposit, route) = match self.funding {
             Funding::SelfOwned { owner, deposit } => {
                 let payer = OwnedPayer::for_store(Arc::clone(&owner), self.store.as_ref())?;
-                (owner, engine::RunPayer::Owned(payer), deposit)
+                let route = PoolRoute::for_buyer(
+                    &self.chain,
+                    self.store.as_ref(),
+                    Some(payer.owner().address()),
+                )?;
+                (owner, engine::RunPayer::Owned(payer), deposit, route)
             }
-            Funding::Delegated { slot } => {
+            Funding::Delegated { slot, pool } => {
                 // A delegate owns no pool, so it funds and adopts none. Its
                 // lanes sign under the slot's credential as each is built; the
                 // provider below sends no transaction.
@@ -1220,27 +1232,21 @@ impl BundlePullerBuilder {
                     slot.current().signer,
                     engine::RunPayer::Delegated(slot),
                     deposit,
+                    PoolRoute::single(pool),
                 )
             }
         };
         let self_address = signer.address();
-        // The first pass pays through the first pool of the buyer's route,
-        // and pays only the nodes routed to it; each later pass pays through
-        // the next pool a node is routed to (ADR 005 § Payment pool routing).
-        let owner = match &payer {
-            engine::RunPayer::Owned(payer) => Some(payer.owner().address()),
-            engine::RunPayer::Delegated(_) => None,
-        };
-        let route = PoolRoute::for_buyer(&self.chain, self.store.as_ref(), owner)?;
         let deployment = *route
             .order()
             .first()
             .ok_or_else(|| anyhow::anyhow!("no payment pool configured"))?;
-        let pool = self
-            .chain
-            .pool(deployment)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no payment pool configured"))?;
+        let pool = self.chain.pool(deployment).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "payment pool {} is not configured",
+                deployment.pool_account()
+            )
+        })?;
         let passes = PoolPasses::new(route);
         passes.start(deployment);
         let connect = move |pool: &PaymentPoolChain| {
