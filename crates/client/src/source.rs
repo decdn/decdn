@@ -30,15 +30,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
-use anyhow::Context as _;
 use decdn_bao_range::AlignedRange;
 use decdn_incentive::PoolId;
 use iroh::{Endpoint, EndpointAddr};
 
 use crate::sink::PullReader;
 use crate::{
-    Connections, PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader,
-    VoucherProgress,
+    Connections, OpenedStream, PoolContext, PoolLedger, PullDeadlines, UpstreamPull,
+    UpstreamPullHeader, VoucherProgress,
 };
 
 /// A boxed, `Send` future returned by the async trait methods in this module,
@@ -422,21 +421,24 @@ impl<'a> PeerSource<'a> {
     }
 
     /// Open the pull on the target's connection in `connections`, dialling
-    /// one when the target has none. `deadlines.open` bounds the dial, and
-    /// again the stream open that follows it.
-    ///
-    /// The pull holds the connection while it runs. A transport fault on the
-    /// open or on a later read (a connection reset, a closed connection, an
-    /// idle timeout, an open or read that falls under its deadline) unpins
-    /// this connection from the map, so the next open dials again. Any other
-    /// failure (a refusal, a bad response, a hash mismatch) leaves the
-    /// connection pinned for the next open.
-    ///
-    /// A connection that was pinned before this open and is closed under it
-    /// is a stale pin: the target reaped it idle between legs, or its budget
-    /// ran out. The open then redials once and opens again. No byte is paid
-    /// before the header, so the retry costs nothing. A connection this open
-    /// dialled itself that fails is the target's failure, and is not retried.
+    /// one when the target has none ([`crate::opened::open_shared`]), and adopt
+    /// it ([`Self::adopt`]). `deadlines.open` bounds the dial, and again the
+    /// stream open that follows it. A pinned connection closed under the open
+    /// is redialled once; a transport fault unpins the connection.
+    #[tracing::instrument(
+        name = "open_progressive_pull",
+        skip_all,
+        fields(
+            error = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.kind = "client",
+            peer = %self.target.id,
+            hash = %decdn_protocol::ContentHash::from_bytes(hash),
+            pool_id = %ctx.pool_id,
+            byte_offset = byte_offset,
+            byte_len = byte_len,
+        )
+    )]
     async fn open_shared(
         &self,
         connections: &Connections,
@@ -445,77 +447,87 @@ impl<'a> PeerSource<'a> {
         byte_offset: u64,
         byte_len: u64,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-        debug_assert_eq!(
-            connections.alpn(),
-            decdn_protocol::ALPN_CLIENT,
-            "a pull opens on a cdn/client/v1 map"
-        );
-        let lease = self.lease(connections).await?;
-        let pinned = lease.is_pinned();
-        let warm = lease.into_warm();
-        let err = match self
-            .open_on(connections, warm.clone(), ctx, hash, byte_offset, byte_len)
-            .await
-        {
-            Ok(opened) => return Ok(opened),
-            Err(err) => err,
-        };
-        if !(pinned && warm.is_closed()) {
-            return Err(err);
-        }
-        tracing::debug!(
-            peer = %self.target.id,
-            close = ?warm.connection().close_reason(),
-            error = %err,
-            "pooled connection closed under the open; redialling once"
-        );
-        let fresh = self.lease(connections).await?.into_warm();
-        self.open_on(connections, fresh, ctx, hash, byte_offset, byte_len)
-            .await
-            .with_context(|| format!("after a redial; the pinned connection failed: {err:#}"))
+        let result = self
+            .open_shared_inner(connections, ctx, hash, byte_offset, byte_len)
+            .await;
+        crate::record_open_result(&tracing::Span::current(), &result);
+        result
     }
 
-    /// The target's connection in `connections`, dialled when it has none,
-    /// under `deadlines.open`.
-    async fn lease(&self, connections: &Connections) -> anyhow::Result<crate::connection::Lease> {
-        let open = self.deadlines.open;
-        tokio::time::timeout(open, connections.get_or_dial(&self.target))
-            .await
-            .map_err(|_| anyhow::Error::new(crate::PullTimeout { after: open }))?
-    }
-
-    /// Open the pull as a stream on `warm`, which the pull holds and unpins
-    /// from `connections` on a transport fault.
-    async fn open_on(
+    /// The body of [`Self::open_shared`].
+    async fn open_shared_inner(
         &self,
         connections: &Connections,
-        warm: Arc<crate::WarmConnection>,
         ctx: &PoolContext,
         hash: [u8; 32],
         byte_offset: u64,
         byte_len: u64,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-        let conn = warm.connection().clone();
-        crate::open_progressive_pull_on(
-            &conn,
-            crate::connection::ConnOwner::Shared {
-                warm,
-                map: connections.clone(),
-            },
+        let args = crate::opened::OpenArgs {
+            ctx,
+            slash_domain: self.slash_domain,
+            expected_signer: self.expected_signer,
+            hash,
+            namespace_id: self.namespace_id,
+            byte_offset,
+            byte_len,
+            timestamp_us: micros_now(),
+            open: self.deadlines.open,
+            // Every lane, gap and retry open asks the node to fill what it
+            // misses.
+            pull_through: true,
+        };
+        let opened =
+            crate::opened::open_shared(connections, &self.target, args, false, false).await?;
+        self.adopt_with(ctx, opened)
+    }
+
+    /// Adopt `opened`, a stream a discovery opened on this source's node, as
+    /// a pull on this source's lane: its context, ledger, cap, rate ceiling and
+    /// deadlines ([`OpenedStream::into_pull`]).
+    ///
+    /// # Errors
+    ///
+    /// The stream's node is not this source's target, the lane cannot pay the
+    /// stream ([`OpenedStream::paid_by`]), or any error
+    /// [`OpenedStream::into_pull`] returns.
+    pub(crate) fn adopt(
+        &self,
+        opened: OpenedStream,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        let ctx = {
+            self.ctx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pool context lock poisoned"))?
+                .clone()
+        };
+        anyhow::ensure!(
+            opened.peer() == self.target.id,
+            "a stream opened on {} cannot be adopted by the lane to {}",
+            opened.peer(),
+            self.target.id
+        );
+        self.adopt_with(&ctx, opened)
+    }
+
+    /// [`Self::adopt`] under the context snapshot `ctx`.
+    fn adopt_with(
+        &self,
+        ctx: &PoolContext,
+        opened: OpenedStream,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        opened.into_pull(
             ctx,
             Arc::clone(&self.ledger),
-            self.slash_domain,
-            self.expected_signer,
-            hash,
-            self.namespace_id,
-            byte_offset,
-            micros_now(),
             self.max_blob_size_bytes,
             self.max_rate_per_mb,
             self.deadlines,
-            byte_len,
         )
-        .await
+    }
+
+    /// Whether this source's lane can pay `opened` ([`OpenedStream::paid_by`]).
+    pub(crate) fn can_adopt(&self, opened: &OpenedStream) -> bool {
+        opened.peer() == self.target.id && self.ctx.lock().is_ok_and(|ctx| opened.paid_by(&ctx))
     }
 }
 

@@ -3,8 +3,9 @@
 //! build their paid lanes.
 //!
 //! Discovery is [`resolve_target_node`]; a lane is one provider's pool lane
-//! (`build_multi_lane`). The provider records each built lane's watermark
-//! handle, so the command persists what every lane paid once the fetch ends,
+//! (`build_multi_lane`). The first lane adopts the stream discovery opened on
+//! its node, so the fetch's first leg costs no second round trip. The provider
+//! records each built lane's watermark handle, so the command persists what every lane paid once the fetch ends,
 //! and files each delivery fault in the peer store the next run's fast path
 //! reads.
 
@@ -16,7 +17,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
 use decdn_bao_range::AlignedRange;
 use decdn_incentive::{LaneKey, PoolId};
-use iroh::{PublicKey, RelayUrl};
+use iroh::RelayUrl;
 use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::WatermarkRow;
@@ -32,13 +33,13 @@ use crate::source::{PrimedSource, SourceFuture, SourceStream};
 use crate::stream_cap::LaneStreamCap;
 use crate::streamer::stream_pacer;
 use crate::targets::{
-    LateProbes, ProbeOpts, ProbeOutcome, ProbeRound, ResolvedTargets, now_secs, pinned_targets,
-    resolve_target_node, spawn_harvest,
+    LateOpens, OpenOpts, OpenOutcome, OpenRound, OpenSpec, OpenedSlot, ResolvedTargets, cancel_all,
+    now_secs, pinned_targets, resolve_target_node, spawn_harvest,
 };
 use crate::{
-    CredentialSlot, Holder, LaneLease, LaneLedgers, PeerHealth, PeerSource, PoolContext,
-    RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate, UpstreamPullHeader,
-    first_open, is_range_past_end,
+    CredentialSlot, Holder, LaneLease, LaneLedgers, OpenedStream, PeerHealth, PeerSource,
+    PoolContext, RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate,
+    UpstreamPullHeader, first_open, is_range_past_end,
 };
 
 /// The first leg the drive after a [`LaneSources::first_claim`] opens, so the
@@ -63,7 +64,7 @@ pub enum FirstLeg {
 const UNBOUNDED_SIZE: u64 = 1 << 62;
 
 /// A fetch's first size ([`LaneSources::first_claim`]): a size a holder
-/// proved, in a probe answer or in a header.
+/// proved in its answer to an open.
 #[derive(Debug)]
 pub struct FirstClaim {
     /// The proven size.
@@ -72,9 +73,9 @@ pub struct FirstClaim {
     pub holders: Vec<Holder>,
 }
 
-/// `hint` (a probe's proven size) as the first size over `holders`, or, with
-/// none, what `open` learns from the proven header of a whole-blob open. A
-/// probe's size needs no open.
+/// `hint` (a size proven before the fetch) as the first size over `holders`,
+/// or, with none, what `open` learns from the proven header of an open. A
+/// size proven before the fetch needs no open.
 ///
 /// # Errors
 ///
@@ -126,6 +127,16 @@ pub(crate) fn size_open_span(
     )
 }
 
+/// The span a fetch's discovery opens ask for, `(byte_offset, byte_len)`: the
+/// span of its first leg (`size_open_span`), or the whole blob, `(0, 0)`. The
+/// winner's stream is then the first leg, and the fetch adopts it
+/// ([`LaneSources::first_claim`]).
+#[must_use]
+pub fn discovery_span(hash: [u8; 32], first_leg: FirstLeg, max_blob_bytes: u64) -> (u64, u64) {
+    size_open_span(hash, first_leg, max_blob_bytes)
+        .map_or((0, 0), |span| (span.fetch_start(), span.fetch_len()))
+}
+
 /// The range the streamed drive's first leg asks for, when the pull of `span`
 /// at the proven `total_bytes` is that leg; `None` otherwise.
 ///
@@ -169,6 +180,29 @@ async fn open_whole_primed(
     Ok((header, whole, range))
 }
 
+/// A lane's adoption of a discovery stream as its first leg
+/// ([`LaneSources::first_claim`]): the header, the pull, the range the drive's
+/// first leg asks for when the pull is that leg, and when the stream answered.
+type AdoptedLeg = anyhow::Result<(
+    UpstreamPullHeader,
+    PullReader,
+    Option<AlignedRange>,
+    tokio::time::Instant,
+)>;
+
+/// Whether a fetch adopts the winner's discovery stream as its first leg.
+///
+/// A streamed drive's first leg is one read-ahead window, so the winner
+/// serves it while the other lanes build, and adopting it saves the round
+/// trip. A download's first leg is the whole blob: the lane that adopts it is
+/// started alone and the drive plans the whole blob for it, so a download
+/// adopts only when one holder is known. With more, it takes the answer's
+/// size, cancels the streams, and stripes the blob across the holders from
+/// the start.
+pub(crate) const fn adopts_the_winner(first_leg: FirstLeg, holders: usize) -> bool {
+    matches!(first_leg, FirstLeg::Streamed { .. }) || holders <= 1
+}
+
 /// What a failed fetch's lanes saw, for explaining the failure to the user
 /// ([`LaneSources::fault_context`]).
 #[derive(Debug, Clone)]
@@ -210,11 +244,11 @@ pub struct LaneSources<'a, P> {
     recovery: &'a Arc<RecoveryGate>,
     /// Every holder's node, keyed by its on-chain provider address.
     nodes: Mutex<HashMap<Address, NodeCandidate>>,
-    /// The per-MiB rate each verified probe answer signed this fetch, keyed by
-    /// node id: the probe-relative bound every lane build folds into its
-    /// stream-rate ceiling ([`lane_rate_ceiling`]), so a node is never paid a
-    /// stream rate above the quote it was selected on.
-    probe_rates: Mutex<HashMap<PublicKey, u64>>,
+    /// The streams discovery left open on the holders, keyed by node
+    /// ([`ResolvedTargets::opened`]), until [`Self::first_claim`] adopts one
+    /// and cancels the rest. A stream still held when the sources drop is
+    /// cancelled.
+    opened: OpenedSlot,
     peer_store: crate::PeerStore,
     /// Every built lane's watermark handle, in build order.
     handles: Mutex<Vec<FaceLaneHandle>>,
@@ -222,13 +256,13 @@ pub struct LaneSources<'a, P> {
     /// start of its provider ([`SourceProvider::built`]), or to the first
     /// `connect` for it.
     parked: Mutex<HashMap<Address, StreamCandidate<PrimedSource<PeerSource<'a>>>>>,
-    /// The proven size of the last probe that gave one
+    /// The proven size of the last resolve that gave one
     /// ([`ResolvedTargets::size_hint`]): the fetch's first size.
     size_hint: Mutex<Option<crate::ProvenSize>>,
-    /// The pending probes of the streamed round the holders came from
+    /// The pending opens of the streamed round the holders came from
     /// ([`ResolvedTargets::late`]), until [`SourceProvider::arrivals`] takes
     /// them.
-    late: Mutex<Option<LateProbes>>,
+    late: Mutex<Option<LateOpens>>,
 }
 
 impl<P> std::fmt::Debug for LaneSources<'_, P> {
@@ -269,7 +303,7 @@ where
             lane_cap,
             recovery,
             nodes: Mutex::new(HashMap::new()),
-            probe_rates: Mutex::new(HashMap::new()),
+            opened: OpenedSlot::default(),
             peer_store: crate::PeerStore::open(&deps.site.data_dir),
             handles: Mutex::new(Vec::new()),
             parked: Mutex::new(HashMap::new()),
@@ -279,9 +313,9 @@ where
     }
 
     /// The holders `targets` names, indexing each one's node for `connect`.
-    /// A probe's proven size is kept for [`Self::first_claim`], a streamed
-    /// round's pending probes for [`SourceProvider::arrivals`], and each
-    /// probed rate for the lane's stream-rate ceiling (`lane_rate_ceiling`).
+    /// A proven size is kept for [`Self::first_claim`], the holders' open
+    /// streams for the first claim to adopt, and a streamed round's pending
+    /// opens for [`SourceProvider::arrivals`].
     pub fn holders_from(&self, targets: &ResolvedTargets) -> Vec<Holder> {
         if let Some(hint) = targets.size_hint {
             *self
@@ -292,11 +326,32 @@ where
         if let Some(late) = targets.late.take() {
             *self.late.lock().unwrap_or_else(PoisonError::into_inner) = Some(late);
         }
-        holders_from(
-            targets,
-            &mut self.lock_nodes(),
-            &mut self.lock_probe_rates(),
+        let opened = targets.opened.take();
+        if !opened.is_empty() {
+            self.opened.replace(opened);
+        }
+        holders_from(targets, &mut self.lock_nodes())
+    }
+
+    /// The context and span a discovery open of this fetch sends: the payer's
+    /// pool, key, binding and capability ([`crate::funding::discovery_ctx`]),
+    /// on the pool a built lane of the run already pays from when there is
+    /// one, for the whole blob.
+    ///
+    /// # Errors
+    ///
+    /// Any error [`crate::funding::discovery_ctx`] returns.
+    pub async fn discovery_ctx(&self) -> anyhow::Result<PoolContext> {
+        crate::funding::discovery_ctx(
+            self.deps.store.as_ref(),
+            self.deps.contract,
+            self.payer,
+            self.deps.chain,
+            self.deps.endpoint,
+            self.voucher_dom,
+            self.deps.funding.pool_id(),
         )
+        .await
     }
 
     /// The [`Holder`] for a late `join` ([`admit_late`]), counted as joined.
@@ -404,25 +459,39 @@ where
         self.recovery
     }
 
-    /// The fetch's first size (#2218): the probe's proven size when a
-    /// probe gave one ([`Self::holders_from`]), with no open at all. Without
-    /// one (the peer-store fast path, or a pinned `--node-id` whose probe gave
-    /// no size), an open of `first_leg` on one of `holders` learns the size one
-    /// holder signs from its header ([`first_open`]), with the acquire loop's
-    /// recovery: a holder that faults cools and another is tried until one
-    /// answers, a fault only the user can fix ends it, and `stop` gives up.
+    /// The fetch's first size (#2218), and the adoption of the stream
+    /// discovery opened on the winning holder.
+    ///
+    /// With holders' streams open ([`Self::holders_from`]) and a first leg
+    /// the winner's stream can be ([`adopts_the_winner`]), an open of
+    /// `first_leg` on one of `holders` learns the size one holder signs, with
+    /// the acquire loop's recovery ([`first_open`]): a holder that faults cools
+    /// and another is tried until one answers, a fault only the user can fix
+    /// ends it, and `stop` gives up. A lane whose node discovery opened adopts
+    /// that stream ([`PeerSource`]'s `adopt`) when the stream asked for the
+    /// first leg's span and the lane pays from the stream's pool under its key,
+    /// so the answer costs no second round trip; any other lane opens its own,
+    /// with pull-through. Every stream no lane adopted is cancelled once the
+    /// claim ends.
+    ///
+    /// Otherwise every open stream is cancelled, and the size proven before
+    /// the fetch (the winner's answer's, or an earlier fetch's) is the first
+    /// size when there is one, with no open at all. Without one (the peer-store
+    /// fast path, or a pinned `--node-id` whose open gave no size), the open
+    /// above runs with no stream to adopt.
+    ///
     /// The open's pull is primed on the lane for its next open alone
     /// ([`PrimedSource::prime_next`]) once its header is read: the drive's
-    /// first leg on the lane is the range the open pulled
-    /// ([`FirstLeg`]), so it adopts the pull within two seconds of the
-    /// open, and any other first leg closes it before opening its own, so the
-    /// node never holds the floor it reserved for the pull beside the leg's.
-    /// A lane that opens nothing closes it when it drops. The lane that
-    /// answered is parked for the fetch, which starts it with no build
-    /// ([`SourceProvider::built`]) before any other lane builds, so the
-    /// fetch plans the first leg for that lane alone; every other lane the
-    /// open built drops, and with it any stream permit it held. Returns the size
-    /// and every holder known, those the open's discovery found included.
+    /// first leg on the lane is the range the open pulled ([`FirstLeg`]), so
+    /// it adopts the pull within two seconds of the answer, and any other
+    /// first leg closes it before opening its own, so the node never holds
+    /// the floor it reserved for the pull beside the leg's. A lane that opens
+    /// nothing closes it when it drops. The lane that answered is parked for
+    /// the fetch, which starts it with no build ([`SourceProvider::built`])
+    /// before any other lane builds, so the fetch plans the first leg for
+    /// that lane alone; every other lane the open built drops, and with it any
+    /// stream permit it held. Returns the size and every holder known, those
+    /// the open's discovery found included.
     ///
     /// # Errors
     ///
@@ -439,10 +508,20 @@ where
             .size_hint
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        first_claim_or_open(hint, holders, |holders| {
+        let adopting = self.opened.len() > 0 && adopts_the_winner(first_leg, holders.len());
+        let claim = if adopting {
             self.open_for_header(hash, holders, first_leg, health, stop)
-        })
-        .await
+                .await
+        } else {
+            first_claim_or_open(hint, holders, |holders| {
+                self.open_for_header(hash, holders, first_leg, health, stop)
+            })
+            .await
+        };
+        // A stream no lane adopted is a loser: the node holds it, and pins its
+        // blob, until it is reset.
+        cancel_all(self.opened.take());
+        claim
     }
 
     /// The size one of `holders` signs, from the header of an open of
@@ -465,15 +544,23 @@ where
             self.recovery,
             credentials.as_ref(),
             |lane| async move {
-                let opened_at = tokio::time::Instant::now();
-                let (header, pull, range) = self
-                    .open_first_leg(lane.source.inner(), hash, first_leg)
-                    .await?;
                 let provider = lane
                     .ctx
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .provider;
+                let source = lane.source.inner();
+                let adopted = self
+                    .take_opened(provider)
+                    .and_then(|stream| self.adopt_first_leg(source, stream, hash, first_leg));
+                let (header, pull, range, opened_at) = if let Some(adopted) = adopted {
+                    adopted?
+                } else {
+                    let opened_at = tokio::time::Instant::now();
+                    let (header, pull, range) =
+                        self.open_first_leg(source, hash, first_leg).await?;
+                    (header, pull, range, opened_at)
+                };
                 self.record_open(provider, header.rate_per_mb);
                 // The open checked the header's proof; a header without one
                 // is that source's fault.
@@ -509,6 +596,50 @@ where
             total_bytes,
             holders,
         })
+    }
+
+    /// The stream discovery left open on `provider`'s node, taken.
+    fn take_opened(&self, provider: Address) -> Option<OpenedStream> {
+        let node_id = self.lock_nodes().get(&provider).map(|n| n.node_id)?;
+        self.opened.remove(&node_id)
+    }
+
+    /// Adopt `stream` as the pull of `first_leg` of `hash` on `source`: the
+    /// header, the pull, the range the drive's first leg asks for when the
+    /// pull is that leg, and when the stream answered. `None`, with the stream
+    /// cancelled, when `source` cannot adopt it: the stream asked for another
+    /// span than the first leg's ([`discovery_span`]), or the lane pays from
+    /// another pool or under another key than the stream's.
+    fn adopt_first_leg(
+        &self,
+        source: &PeerSource<'a>,
+        stream: OpenedStream,
+        hash: [u8; 32],
+        first_leg: FirstLeg,
+    ) -> Option<AdoptedLeg> {
+        let max_blob_bytes = self.deps.max_blob_bytes;
+        let span = size_open_span(hash, first_leg, max_blob_bytes);
+        let want = discovery_span(hash, first_leg, max_blob_bytes);
+        if stream.span() != want || !source.can_adopt(&stream) {
+            tracing::debug!(
+                peer = %stream.peer(),
+                span = ?stream.span(),
+                want = ?want,
+                "the lane cannot adopt the discovery stream; it opens its own"
+            );
+            stream.cancel();
+            return None;
+        }
+        let answered_at = stream.answered_at();
+        let (header, pull) = match source.adopt(stream) {
+            Ok(adopted) => adopted,
+            Err(err) => return Some(Err(err)),
+        };
+        let range = match &span {
+            Some(span) => primed_first_leg(first_leg, max_blob_bytes, span, header.total_bytes),
+            None => decdn_bao_range::align_range(0, 0, header.total_bytes).ok(),
+        };
+        Some(Ok((header, PullReader::new(pull), range, answered_at)))
     }
 
     /// Open `first_leg` of `hash` on `source` for its signed header. Returns the
@@ -633,12 +764,6 @@ where
         self.nodes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn lock_probe_rates(&self) -> std::sync::MutexGuard<'_, HashMap<PublicKey, u64>> {
-        self.probe_rates
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// Take `provider`'s lane that the first open parked, if it is still
     /// parked. The first open built it through [`Self::build`], so it already
     /// holds what `build` gives every lane.
@@ -697,11 +822,6 @@ where
             .ok_or_else(|| anyhow::anyhow!("no known node for provider {}", holder.provider))?;
         let addr = self.discovery.pinned.and_then(|pinned| pinned.addr);
         let target = lane_target(&candidate, addr, self.relays);
-        let rate_ceiling = lane_rate_ceiling(
-            &self.lock_probe_rates(),
-            &candidate.node_id,
-            self.deps.max_rate_per_mb,
-        );
         // A lane built after a swap records the new key's earlier spend first.
         if let LanePayer::Delegated(slot) = self.payer {
             self.seed_spend(slot);
@@ -712,7 +832,6 @@ where
             self.voucher_dom,
             holder.provider,
             target,
-            rate_ceiling,
             self.open_lock,
             self.ledgers,
             ended,
@@ -787,7 +906,7 @@ where
     fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>> {
         Box::pin(async move {
             // A pinned node is the only holder a rediscovery can find, and only
-            // the fetch's first size reads a probe's size, so it probes nothing.
+            // the fetch's first size reads an answer's size, so it opens nothing.
             if let Some(pinned) = self.discovery.pinned {
                 return Ok(self.holders_from(&pinned_targets(pinned.node_id, pinned.provider)));
             }
@@ -795,31 +914,40 @@ where
             // settles its round and drops the tail.
             let mut opts = self.discovery.clone();
             opts.rediscover = true;
-            let probe = ProbeOpts {
+            let ctx = self.discovery_ctx().await?;
+            let open = OpenOpts {
                 marks: None,
-                round: ProbeRound::Settle,
+                round: OpenRound::Settle,
                 known_size: None,
+                spec: OpenSpec {
+                    conns: self.deps.connections,
+                    ctx: &ctx,
+                    namespace_id: self.deps.namespace_id,
+                    span: (0, 0),
+                    max_rate_per_mb: self.deps.max_rate_per_mb,
+                },
             };
             let targets = resolve_target_node(
                 &opts,
                 (self.deps.chain, self.deps.site),
-                self.deps.endpoint,
                 self.relays,
                 hash,
-                probe,
+                open,
             )
             .await?;
+            // A rediscovery adopts no stream: each lane opens its own legs.
+            cancel_all(targets.opened.take());
             Ok(self.holders_from(&targets))
         })
     }
 
     /// The late answers of the streamed round the holders came from: each
     /// holder, and each non-holder the warming rule picks ([`late_join`]), as
-    /// it answers. Every verified answer's probe sample is harvested into the
-    /// peer store once the round ends.
+    /// it answers. Every verified answer's sample is harvested into the peer
+    /// store once the round ends.
     fn arrivals(&self) -> Option<SourceStream<'_, Holder>> {
         use futures_util::StreamExt as _;
-        let LateProbes {
+        let LateOpens {
             tail,
             best_holder_rtt_ms,
             warming,
@@ -836,8 +964,6 @@ where
                 async move {
                     while let Some(outcome) = tail.next().await {
                         if let Some(sample) = outcome.sample() {
-                            let (node_id, _, rate_per_mb) = sample;
-                            self.lock_probe_rates().insert(node_id, rate_per_mb);
                             samples.push(sample);
                         }
                         if let Some(holder) = late_join(outcome, &mut best, warming)
@@ -924,7 +1050,7 @@ impl PeerEvent {
     }
 }
 
-/// A late probe answer that joins the running fetch.
+/// A late answer that joins the running fetch.
 pub(crate) enum LateJoin {
     /// A verified holder.
     Holder(crate::discovery::Probed),
@@ -932,22 +1058,22 @@ pub(crate) enum LateJoin {
     Proxy(crate::discovery::WarmingCandidate),
 }
 
-/// Whether a late probe `outcome` joins the running fetch. A verified holder
+/// Whether a late `outcome` joins the running fetch. A verified holder
 /// always joins and lowers `best_holder_rtt_ms`. A verified non-holder joins
 /// as a proxy when the warming rule
 /// ([`crate::discovery::proxy_warming_order`]) picks it against the best
 /// holder known so far. Nothing else joins.
 pub(crate) fn late_join(
-    outcome: ProbeOutcome,
+    outcome: OpenOutcome,
     best_holder_rtt_ms: &mut f64,
     warming: ProxyWarmingParams,
 ) -> Option<LateJoin> {
     match outcome {
-        ProbeOutcome::Holder(holder, _) => {
+        OpenOutcome::Holder(holder, _) => {
             *best_holder_rtt_ms = best_holder_rtt_ms.min(holder.rtt_ms);
             Some(LateJoin::Holder(holder))
         }
-        ProbeOutcome::NonHolder(candidate, _) => {
+        OpenOutcome::NonHolder(candidate, _) => {
             let picked = warming.enabled
                 && !crate::discovery::proxy_warming_order(
                     *best_holder_rtt_ms,
@@ -958,18 +1084,20 @@ pub(crate) fn late_join(
                 .is_empty();
             picked.then_some(LateJoin::Proxy(candidate))
         }
-        ProbeOutcome::Unreachable
-        | ProbeOutcome::RateLimited
-        | ProbeOutcome::ClockSkewed
-        | ProbeOutcome::Unverifiable
-        | ProbeOutcome::Unusable => None,
+        OpenOutcome::Unreachable
+        | OpenOutcome::RateLimited
+        | OpenOutcome::ClockSkewed
+        | OpenOutcome::Unverifiable
+        | OpenOutcome::Unusable
+        | OpenOutcome::Declined
+        | OpenOutcome::OverCeiling => None,
     }
 }
 
 /// The [`Holder`] for a late `join`, its node indexed in `nodes` for
 /// `connect`, or `None` when `nodes` already has a node of the join's
 /// operator: one node per operator, and the node the set already has answered
-/// first, as in [`holders_from`]. A holder carries its probed coverage; a
+/// first, as in [`holders_from`]. A holder carries its answered coverage; a
 /// warming proxy carries none and is not a probed holder.
 pub(crate) fn admit_late(
     nodes: &mut HashMap<Address, NodeCandidate>,
@@ -1009,33 +1137,34 @@ pub(crate) fn admit_late(
 }
 
 /// The holders `targets` names, in its order, one per operator: a candidate
-/// whose on-chain provider already has a holder is skipped, so the nearer
-/// node by rank wins (the rule of [`crate::discovery::admit_sources`]).
-/// Each holder carries its probed coverage (`None`, a full holder, when
-/// nothing was measured) and its probed RTT, or its rank in the order when it
-/// was not probed. A candidate with measured coverage, and a pinned
+/// whose on-chain provider already has a holder is skipped, so the higher
+/// ranked node wins (the rule of [`crate::discovery::admit_sources`]).
+/// Each holder carries its answered coverage (`None`, a full holder, when
+/// nothing was measured) and its measured RTT, or its rank in the order when
+/// it was not asked. A candidate with measured coverage, and a pinned
 /// `--node-id`, is a probed holder ([`Holder::probed_holder`]); a
 /// pull-through or proxy-warming target and a peer-store fast-path candidate
 /// are not. Each holder's node goes into `nodes`, keyed by provider, and
 /// replaces the node a rediscovery found for that operator before, so the next
-/// lane build dials the node the latest probe ranked. A lane already built
-/// keeps its node. Each verified sample's signed rate goes into `probe_rates`,
-/// keyed by node id, for the lane's stream-rate ceiling
-/// ([`lane_rate_ceiling`]).
+/// lane build dials the node the latest round ranked. A lane already built
+/// keeps its node.
+///
+/// The acquire loop starts the holder with the lowest RTT first, and the
+/// order ranks a cheaper or wider holder ahead of a nearer one in the same
+/// RTT band (`holder_rank`). So each holder's RTT is raised to the RTT of the
+/// holder ranked before it, and the loop starts holders in failover order. The
+/// raise is at most one rank band.
 pub(crate) fn holders_from(
     targets: &ResolvedTargets,
     nodes: &mut HashMap<Address, NodeCandidate>,
-    probe_rates: &mut HashMap<PublicKey, u64>,
 ) -> Vec<Holder> {
-    for &(node_id, _, rate_per_mb) in &targets.probed_samples {
-        probe_rates.insert(node_id, rate_per_mb);
-    }
     let rtt: HashMap<_, f64> = targets
-        .probed_samples
+        .samples
         .iter()
         .map(|&(node_id, rtt_ms, _)| (node_id, rtt_ms))
         .collect();
     let mut holders: Vec<Holder> = Vec::with_capacity(targets.candidates.len());
+    let mut floor = 0.0_f64;
     for (rank, candidate) in targets.candidates.iter().enumerate() {
         if holders.iter().any(|h| h.provider == candidate.eth_address) {
             continue;
@@ -1043,7 +1172,9 @@ pub(crate) fn holders_from(
         let rtt_ms = rtt
             .get(&candidate.node_id)
             .copied()
-            .unwrap_or_else(|| f64::from(u32::try_from(rank).unwrap_or(u32::MAX)));
+            .unwrap_or_else(|| f64::from(u32::try_from(rank).unwrap_or(u32::MAX)))
+            .max(floor);
+        floor = rtt_ms;
         let coverage = targets.coverage_by_node.get(&candidate.node_id).cloned();
         holders.push(Holder {
             provider: candidate.eth_address,
@@ -1054,26 +1185,6 @@ pub(crate) fn holders_from(
         nodes.insert(candidate.eth_address, candidate.clone());
     }
     holders
-}
-
-/// The stream-rate ceiling a lane to `node_id` is built with:
-/// [`crate::effective_rate_ceiling`] of the rate the node's last recorded
-/// verified probe signed this fetch (`0`, no probe-relative bound, when no
-/// sample was harvested: the peer-store fast path, or a pinned `--node-id`)
-/// and the absolute `max_rate_per_mb` config cap. The probe-relative fold the
-/// daemon's node-to-node miss pull also applies, so a node that signs a low
-/// probe rate — the quote the node was selected on — and a higher stream rate
-/// is refused at the open ([`crate::RateAboveCeiling`]) even at the config
-/// default of `0`.
-pub(crate) fn lane_rate_ceiling(
-    probe_rates: &HashMap<PublicKey, u64>,
-    node_id: &PublicKey,
-    max_rate_per_mb: u64,
-) -> u64 {
-    crate::effective_rate_ceiling(
-        probe_rates.get(node_id).copied().unwrap_or(0),
-        max_rate_per_mb,
-    )
 }
 
 #[cfg(test)]

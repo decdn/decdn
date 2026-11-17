@@ -22,7 +22,7 @@ use iroh::{Endpoint, PublicKey, RelayUrl};
 use crate::discovery::{self, NodeCandidate};
 use crate::session::{ChainConfig, DiscoveryOptions, ProxyWarmingParams, PullSite};
 use crate::targets::{
-    ProbeOutcome, classify_probe, failover_order, no_serve_target_error, pinned_target,
+    Dropouts, OpenOutcome, classify_probe, failover_order, no_serve_target_error, pinned_target,
     probe_candidate, probe_target, select_up_to, spawn_harvest,
 };
 
@@ -117,6 +117,7 @@ impl HashCensus {
                 holders.push(discovery::Probed {
                     candidate: answer.candidate.clone(),
                     rtt_ms: answer.rtt_ms,
+                    rate_per_mb: answer.rate_per_mb,
                     total_bytes: answer.total_bytes,
                     coverage: answer.coverage.clone(),
                 });
@@ -219,7 +220,7 @@ pub async fn census(
             .iter()
             .map(move |(cand, target)| (at, hash, cand, target))
     });
-    let outcomes: Vec<(usize, NodeCandidate, ProbeOutcome)> = futures_util::stream::iter(probes)
+    let outcomes: Vec<(usize, NodeCandidate, OpenOutcome)> = futures_util::stream::iter(probes)
         .map(|(at, hash, cand, target)| {
             let slash_dom = &slash_dom;
             async move {
@@ -254,13 +255,15 @@ pub(crate) fn unanswered(census: &Census) -> Option<anyhow::Error> {
     if census.hashes.iter().any(|h| !h.answers.is_empty()) {
         return None;
     }
-    Some(no_serve_target_error(
-        census.probed,
-        first.unreachable,
-        first.rate_limited,
-        first.unverifiable,
-        first.clock_skewed,
-    ))
+    Some(no_serve_target_error(Dropouts {
+        asked: census.probed,
+        unreachable: first.unreachable,
+        rate_limited: first.rate_limited,
+        unverifiable: first.unverifiable,
+        clock_skewed: first.clock_skewed,
+        declined: 0,
+        over_ceiling: 0,
+    }))
 }
 
 /// Sort `outcomes`, each tagged with the index of its hash in `hashes`, into
@@ -269,7 +272,7 @@ pub(crate) fn unanswered(census: &Census) -> Option<anyhow::Error> {
 pub(crate) fn tally(
     probed: usize,
     hashes: &[[u8; 32]],
-    outcomes: Vec<(usize, NodeCandidate, ProbeOutcome)>,
+    outcomes: Vec<(usize, NodeCandidate, OpenOutcome)>,
     outage_fallback: bool,
 ) -> Census {
     let mut per_hash: Vec<HashCensus> = hashes
@@ -289,7 +292,7 @@ pub(crate) fn tally(
             continue;
         };
         match outcome {
-            ProbeOutcome::Holder(probed, (_, _, rate_per_mb)) => entry.answers.push(NodeAnswer {
+            OpenOutcome::Holder(probed, (_, _, rate_per_mb)) => entry.answers.push(NodeAnswer {
                 candidate,
                 rtt_ms: probed.rtt_ms,
                 rate_per_mb,
@@ -297,7 +300,7 @@ pub(crate) fn tally(
                 total_bytes: probed.total_bytes,
                 coverage: probed.coverage,
             }),
-            ProbeOutcome::NonHolder(warming, (_, _, rate_per_mb)) => {
+            OpenOutcome::NonHolder(warming, (_, _, rate_per_mb)) => {
                 entry.answers.push(NodeAnswer {
                     candidate,
                     rtt_ms: warming.rtt_ms,
@@ -307,11 +310,13 @@ pub(crate) fn tally(
                     coverage: decdn_protocol::Coverage::empty(),
                 });
             }
-            ProbeOutcome::Unreachable => entry.unreachable += 1,
-            ProbeOutcome::RateLimited => entry.rate_limited += 1,
-            ProbeOutcome::ClockSkewed => entry.clock_skewed += 1,
-            ProbeOutcome::Unverifiable => entry.unverifiable += 1,
-            ProbeOutcome::Unusable => entry.unusable += 1,
+            OpenOutcome::Unreachable => entry.unreachable += 1,
+            OpenOutcome::RateLimited => entry.rate_limited += 1,
+            OpenOutcome::ClockSkewed => entry.clock_skewed += 1,
+            OpenOutcome::Unverifiable => entry.unverifiable += 1,
+            OpenOutcome::Unusable | OpenOutcome::Declined | OpenOutcome::OverCeiling => {
+                entry.unusable += 1;
+            }
         }
     }
     Census {

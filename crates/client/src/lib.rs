@@ -45,13 +45,14 @@
 //! 3. **Bring up an endpoint** with [`endpoint::client_endpoint`].
 //! 4. **Find the holders.** Read the registered nodes
 //!    ([`discovery::bootstrap_nodes`]), pick a sample
-//!    ([`discovery::select_candidates`]), and probe each one
-//!    ([`probe::probe_once`]). Verify every answer
-//!    ([`probe::verify_probe_response`]) before it counts, and drop an answer
-//!    whose `has_blob` and coverage disagree, or that states a size with no
-//!    valid size proof ([`check_size_proof`]). A probe answer's size
-//!    ([`discovery::Probed::total_bytes`]) is proven: pass it as the fetch's
-//!    size, which plans the whole blob from the start.
+//!    ([`discovery::select_candidates`]), and open the blob on each one
+//!    ([`discovery_open`]) with no pull-through, under a [`PoolContext`] of
+//!    your pool and lane key bound to your endpoint. The open sends no voucher:
+//!    each answer is verified before it returns, and carries the node's
+//!    signed quote, its proven size of the blob, and its coverage. A node
+//!    that does not hold the blob answers a signed `NotFound` at once. Adopt
+//!    the stream of the holder you choose ([`OpenedStream::into_pull`]) and
+//!    cancel the others ([`OpenedStream::cancel`]).
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
 //!    what the `(pool, lane key, provider)` lane has already paid, and bind it
@@ -59,8 +60,8 @@
 //!    ([`PoolContext::bind_endpoint`]). A node that misses the blob in its
 //!    cache serves an unbound lane nothing. Create its ledger with
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
-//!    [`StreamCandidate::new`]. Cap the lane's rate at the rate the node signed
-//!    in its probe answer ([`effective_rate_ceiling`]).
+//!    [`StreamCandidate::new`]. Cap the lane's rate at the most you pay per
+//!    MiB.
 //! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`], over
 //!    a [`StaticSources`] of the lanes. Every lane streams at once unless
 //!    [`Downloader::max_lanes`] caps it.
@@ -115,9 +116,7 @@
 //!   `(signer, provider)` lane. Two candidates for one provider sign competing
 //!   vouchers on the same lane.
 //! - **Always set a rate ceiling.** A `max_rate_per_mb` of `0` means no
-//!   ceiling, so a node can quote low on the probe and high on the stream.
-//!   Pass [`effective_rate_ceiling`] of the probed rate and any absolute cap you
-//!   hold.
+//!   ceiling, so a lane pays whatever rate a node signs.
 //! - **Never resume a lane below its on-chain watermark.** A voucher at or below
 //!   the watermark redeems nothing, so the provider streams bytes it can never
 //!   cash. A self-owned lane the buyer store has not seen resumes from the
@@ -224,12 +223,14 @@ mod ledger;
 /// the one [`ledgers::LaneHandle`] every concurrent fetch on that lane shares.
 #[doc(hidden)]
 pub mod ledgers;
+mod opened;
 #[doc(hidden)]
 pub mod ordered_writes;
 /// The pure pacing axis (#1608): [`pacer::Pacer`] / [`pacer::BudgetPacer`] decide
 /// draw / wait / done / refuse for the gap-driven driver, with no I/O.
 #[doc(hidden)]
 pub mod pacer;
+mod path_rtt;
 pub mod payer_window;
 /// Persisted per-peer knowledge base: registry-fed identity plus interaction-fed
 /// latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
@@ -301,6 +302,7 @@ pub use downloader::{DownloadTarget, Downloader};
 pub use driver::PoolExhausted;
 pub use fault::PoolOpenRefused;
 pub use ledger::{Cumulative, PoolLedger};
+pub use opened::{OpenedStream, UnverifiedAnswer, discovery_open};
 pub use recovery::RecoveryGate;
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{Funder, PeerSource, PoolReplaced, Recovery, SourceFuture};
@@ -626,12 +628,13 @@ pub fn sign_client_binding(
 
 /// Build the trailing [`StreamRequestExt`]: the context's client identity
 /// binding and owner capability, when it carries them, and `pull_through`.
-/// Applied by `open_stream`, the single request site, so the capability rides
+/// Applied by [`exchange`], the single request site, so the capability rides
 /// the same session-start request as the binding.
 ///
-/// Every open asks for `pull_through`: a pull expects the node to fill a span
-/// it does not hold before it answers.
-fn request_ext(ctx: &PoolContext) -> StreamRequestExt {
+/// A pull asks for `pull_through`: it expects the node to fill a span it does
+/// not hold before it answers. A discovery open does not: a node that misses
+/// answers at once ([`discovery_open`]).
+fn request_ext(ctx: &PoolContext, pull_through: bool) -> StreamRequestExt {
     StreamRequestExt {
         binding: ctx.client_binding.clone(),
         capability: ctx.capability.as_ref().map(|signed| WireCapability {
@@ -639,7 +642,7 @@ fn request_ext(ctx: &PoolContext) -> StreamRequestExt {
             expiry: signed.capability.expiry,
             owner_signature: signed.signature.as_bytes().to_vec(),
         }),
-        pull_through: true,
+        pull_through,
     }
 }
 
@@ -922,94 +925,37 @@ impl std::fmt::Display for BlobTooLarge {
 
 impl std::error::Error for BlobTooLarge {}
 
-/// Typed sentinel for a server that signed an open-stage `StreamResponse`
-/// (`ok == true`) quoting a per-MB `rate_per_mb` above the buyer's effective
-/// ceiling (#1375). The buyer aborts **before paying**, so the profitable
-/// "quote low on the probe, quote high on the stream, then deliver" bait-and-switch
-/// never gets paid.
-///
-/// The ceiling is the lower of two bounds the caller supplies: the probe rate the
-/// candidate was selected on (a stream quote may not exceed what the probe
-/// advertised) and an optional absolute buyer config (`max_rate_per_mb`). Because
-/// the probe-relative bound is always applied by both built-in pull paths — the
-/// node's miss pull and the client's lane build (a caller that assembles a
-/// [`PeerSource`] by hand applies only the ceiling it passes) — a *completed*
-/// delivery is by construction priced at or below the probe rate — so it can never
-/// be rate-manipulation (`SlashJudge` requires `stream.ratePerMb > probe.ratePerMb`),
-/// and the challengeable case is exactly this abort.
-///
-/// Carries the operator's own signed `response` — already verified against
-/// `expected_signer` by `verify_response` before construction, so it still
-/// recovers to the delivering node and a caller could replay it (paired with the
-/// same node's `ProbeResponse`) to `SlashJudge` with no re-signing.
-///
-/// **Slashability caveat.** The evidence is only rate-*manipulation* evidence when
-/// the **probe-relative** bound was the one exceeded: `SlashJudge` requires
-/// `stream.ratePerMb > probe.ratePerMb`. The ceiling here is
-/// `min(probe_rate, config_absolute)` ([`effective_rate_ceiling`]), so when the
-/// buyer's absolute `config` bound is the binding one the quote may sit at or below
-/// the probe rate and be perfectly honest. A challenger must therefore still
-/// confirm `quote > probeRate` before submitting; this type does not assert it.
-///
-/// **Consumption.** The signed response is retained *on the error* so a caller can
-/// act on it, but the node's pull-failure handler does not itself submit a
-/// challenge — auto-slashing is deferred (the same footing as the daemon never
-/// auto-challenging an [`UpstreamRefused`], whose evidence is exercised only by the
-/// e2e harness today). `evidence()` is the only accessor; the field is private and
-/// the sole constructor derives it from the verified response, so the
-/// verified-signature invariant cannot be bypassed by a hand-built value.
+/// Typed sentinel for a node that signed an open-stage `StreamResponse`
+/// (`ok == true`) quoting a per-MB `rate_per_mb` above the payer's ceiling
+/// (`max_rate_per_mb`, #1375). The payer refuses the stream **before paying**:
+/// the quote rides the signed answer, so the payer sees it before any byte,
+/// and every voucher signs the rate it pays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateAboveCeiling {
     quoted_rate_per_mb: u64,
     ceiling_rate_per_mb: u64,
-    response: StreamResponse,
 }
 
 impl RateAboveCeiling {
-    /// Build the abort error for an open-stage quote above `ceiling`. Crate-private
-    /// and the SINGLE construction path (`open_progressive_pull` routes through
-    /// it), so `quoted_rate_per_mb` is always
-    /// *derived* from `response.body.rate_per_mb` and cannot desync from the
-    /// retained evidence — the same "derive, don't trust the caller to set it
-    /// consistently" discipline as [`UpstreamRefused::open`]. Callers MUST have run
-    /// `verify_response` on `response` first (the field docs' signature invariant).
-    fn over_ceiling(response: StreamResponse, ceiling_rate_per_mb: u64) -> anyhow::Error {
+    /// The refusal of a quote of `quoted_rate_per_mb` above
+    /// `ceiling_rate_per_mb`.
+    fn over_ceiling(quoted_rate_per_mb: u64, ceiling_rate_per_mb: u64) -> anyhow::Error {
         anyhow::Error::new(Self {
-            quoted_rate_per_mb: response.body.rate_per_mb,
+            quoted_rate_per_mb,
             ceiling_rate_per_mb,
-            response,
         })
     }
 
-    /// The per-MB rate the server quoted in the signed `StreamResponse`.
+    /// The per-MB rate the node quoted in its signed `StreamResponse`.
     #[must_use]
     pub const fn quoted_rate_per_mb(&self) -> u64 {
         self.quoted_rate_per_mb
     }
 
-    /// The effective ceiling the quote exceeded (min of probe rate and config).
+    /// The ceiling the quote exceeded.
     #[must_use]
     pub const fn ceiling_rate_per_mb(&self) -> u64 {
         self.ceiling_rate_per_mb
-    }
-
-    /// The operator's own signed `StreamResponse`, verified against
-    /// `expected_signer` before this value was built. See the type docs for the
-    /// slashability caveat (only `quote > probeRate` is manipulation).
-    #[must_use]
-    pub const fn evidence(&self) -> &StreamResponse {
-        &self.response
-    }
-}
-
-impl std::fmt::Debug for RateAboveCeiling {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Elide the signed body + 65-byte `slash_sig` to a length, as `UpstreamRefused`
-        // does, so a logged abort stays readable.
-        f.debug_struct("RateAboveCeiling")
-            .field("quoted_rate_per_mb", &self.quoted_rate_per_mb)
-            .field("ceiling_rate_per_mb", &self.ceiling_rate_per_mb)
-            .field("evidence_slash_sig_len", &self.response.slash_sig.len())
-            .finish()
     }
 }
 
@@ -1017,26 +963,14 @@ impl std::fmt::Display for RateAboveCeiling {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "server quoted {} per MB, exceeding the buyer ceiling {} per MB (RateAboveCeiling)",
+            "node quoted {} per MB, above the --max-rate-per-mb ceiling of {} per MB \
+             (RateAboveCeiling)",
             self.quoted_rate_per_mb, self.ceiling_rate_per_mb
         )
     }
 }
 
 impl std::error::Error for RateAboveCeiling {}
-
-/// Combine the two buyer rate ceilings into one effective bound, treating `0` as
-/// "unbounded" on each input (the probe-relative bound and the absolute config
-/// bound are both optional). Returns `0` only when BOTH are unbounded.
-#[must_use]
-pub const fn effective_rate_ceiling(probe_relative: u64, config_absolute: u64) -> u64 {
-    match (probe_relative, config_absolute) {
-        (0, c) => c,
-        (p, 0) => p,
-        (p, c) if p < c => p,
-        (_, c) => c,
-    }
-}
 
 /// Typed sentinel for the buyer's own per-candidate pull deadline firing (#857).
 /// Returned (not a bare string) so the pull orchestrator can `downcast_ref` and
@@ -1048,7 +982,7 @@ pub const fn effective_rate_ceiling(probe_relative: u64, config_absolute: u64) -
 ///
 /// Since #1134 it is raised by OUR OWN wall clocks only, and the message is
 /// deliberately stage-NEUTRAL because there are THREE of them: the shared
-/// `open_stream` open bound (`PullDeadlines::open`), the optional overall
+/// `exchange` open bound (`PullDeadlines::open`), the optional overall
 /// `hard_cap` the `test-util` wrappers apply, and the stall clock elapsing before
 /// the FIRST byte (`cumulative == 0`) in the streaming loop — where it is
 /// measuring the server's time-to-first-byte, not mid-stream inactivity. `decdn-node`
@@ -1979,7 +1913,7 @@ pub async fn stream_fetch_shared(
     .await
 }
 
-/// Where an [`open_stream`] gets its QUIC connection.
+/// Where an [`exchange`] gets its QUIC connection.
 enum ConnSource<'a> {
     /// Dial a fresh one-shot connection to `target`. The pull owns it and closes
     /// it on its terminal method (`finish`/`abort`/drop).
@@ -1992,48 +1926,36 @@ enum ConnSource<'a> {
     Reuse(&'a iroh::endpoint::Connection),
 }
 
-/// The OPEN stage of a `cdn/client/v1` pull, the single request site behind
-/// [`open_progressive_pull`]: get the connection from `source` (dial a fresh one,
-/// or reuse a warm one), open the bi-stream, send the [`StreamRequest`], then read
-/// and verify the signed [`StreamResponse`]. Returns the live connection, its
-/// streams, and the verified response for the caller to stream from.
+/// The OPEN stage of a `cdn/client/v1` stream, the single request site behind
+/// every open: get the connection from `source` (dial a fresh one, or reuse a
+/// warm one), open the bi-stream, send the [`StreamRequest`], then read the
+/// signed [`StreamResponse`]. Returns the live connection, its streams, and the
+/// answer, unverified: the caller verifies it ([`verify_response`]) before it
+/// acts on any field.
 ///
-/// **Bounded as a whole by `open`** (#1134), and that bound lives HERE rather than
-/// in the caller for a reason worth stating: the production pull paths run with no
-/// overall wall-clock cap, so that a blob of any size can complete as long as bytes
-/// keep arriving. Leaving the open to "whatever the caller wraps us in" therefore
-/// means leaving it *unbounded* — and this is precisely the stage where a peer can
-/// accept a connection, take our request, and then say nothing at all. Such a peer
-/// would hang the pull until the QUIC idle timeout.
+/// **Bounded as a whole by `args.open`** (#1134), and that bound lives HERE
+/// rather than in the caller for a reason worth stating: the production pull
+/// paths run with no overall wall-clock cap, so that a blob of any size can
+/// complete as long as bytes keep arriving. Leaving the open to "whatever the
+/// caller wraps us in" therefore means leaving it *unbounded* — and this is
+/// precisely the stage where a peer can accept a connection, take our request,
+/// and then say nothing at all. Such a peer would hang the pull until the QUIC
+/// idle timeout.
 ///
 /// The stall bound cannot cover this stage: it measures inactivity BETWEEN bytes,
 /// and here no byte has arrived yet. A wall clock is the right tool because the
 /// open is bounded work whose duration does not scale with the blob.
-///
-/// A `slash_sig` that does not recover to `expected_signer`, a mismatched echoed
-/// field, or a zero rate fails here (see [`verify_response`]) — before any byte is
-/// paid for. A refusal (`body.ok == false`) is returned to the caller intact, since
-/// only the caller knows how to classify it.
-#[allow(clippy::too_many_arguments)]
-async fn open_stream(
+async fn exchange(
     source: ConnSource<'_>,
-    ctx: &PoolContext,
-    slash_domain: &Eip712Domain,
-    expected_signer: Address,
-    hash: [u8; 32],
-    namespace_id: [u8; 32],
-    byte_offset: u64,
-    byte_len: u64,
-    timestamp_us: u64,
-    open: Duration,
+    args: &opened::OpenArgs<'_>,
 ) -> anyhow::Result<(
     iroh::endpoint::Connection,
     SendStream,
     RecvStream,
     StreamResponse,
     StreamResponseExt,
-    Option<ProvenSize>,
 )> {
+    let open = args.open;
     tokio::time::timeout(open, async move {
         let conn = match source {
             ConnSource::Dial { endpoint, target } => {
@@ -2057,7 +1979,7 @@ async fn open_stream(
             .map_err(|e| rate_limited::transport_error("open_bi failed", e))?;
 
         let req = StreamRequest {
-            hash,
+            hash: args.hash,
             // The serving node routes on this for its pull-through authorized-origin
             // gate and origin-directory fallback (ADR 005 §Namespace routing). A
             // client fetch passes the namespace it published under; a node-to-node
@@ -2065,19 +1987,20 @@ async fn open_stream(
             // already has the bytes (ADR 002 §Retrieval by namespace) — while a pull
             // to a directory-discovered cold origin passes the served namespace so
             // that origin's gate resolves and it can fill from its own backend.
-            namespace_id,
-            pool_id: ctx.pool_id.into(),
-            byte_offset,
+            namespace_id: args.namespace_id,
+            pool_id: args.ctx.pool_id.into(),
+            byte_offset: args.byte_offset,
             // `0` = whole-tail fetch; a caller requesting a bounded middle gap
             // (the gap-driven driver, #1608, via `PeerSource`) passes the gap's
             // length so the server scopes both the serve and the payment to it.
-            byte_len,
-            timestamp_us,
+            byte_len: args.byte_len,
+            timestamp_us: args.timestamp_us,
         };
         // Two-phase encode (ADR 005): attach the client identity binding when the
         // context carries one, so the serving node can prove lane authority and
-        // authorize a cache-miss origin pull (#1115), and ask for the miss path.
-        let ext = request_ext(ctx);
+        // authorize a cache-miss origin pull (#1115), and say whether a miss
+        // fills before the answer.
+        let ext = request_ext(args.ctx, args.pull_through);
         let payload = decdn_protocol::encode_stream_request(&req, Some(&ext))
             .map_err(|e| anyhow::anyhow!("encode stream request: {e}").context(LocalPullFault))?;
         write_frame(&mut send, &payload)
@@ -2085,17 +2008,7 @@ async fn open_stream(
             .map_err(|e| rate_limited::transport_error("write stream request", e))?;
 
         let (resp, resp_ext) = read_stream_response(&mut recv).await?;
-        let proven = verify_response(
-            &resp,
-            &resp_ext,
-            slash_domain,
-            expected_signer,
-            hash,
-            timestamp_us,
-            byte_offset,
-            byte_len,
-        )?;
-        Ok((conn, send, recv, resp, resp_ext, proven))
+        Ok((conn, send, recv, resp, resp_ext))
     })
     .await
     .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
@@ -2998,7 +2911,7 @@ impl UpstreamPullHeader {
 /// stands.
 ///
 /// **Deadlines.** The *open* (handshake) phase is bounded inside
-/// [`open_progressive_pull`] by `PullDeadlines::open`, via the shared `open_stream`
+/// [`open_progressive_pull`] by `PullDeadlines::open`, via the shared `exchange`
 /// helper — NOT by the caller (#1134). `decdn-node` does additionally wrap the open
 /// in its per-candidate budget, but that is belt-and-braces: a bound left to the
 /// caller is a bound a caller can forget.
@@ -3113,7 +3026,7 @@ impl std::fmt::Debug for UpstreamPull {
 /// [`ResumeOffsetPastEnd`] offset. The cap surfaces later, as a [`BlobTooLarge`]
 /// abort once the stream's received bytes cross the cap's worth from its offset.
 ///
-/// The open stage is bounded by `deadlines.open`, inside the shared `open_stream`
+/// The open stage is bounded by `deadlines.open`, inside the shared `exchange`
 /// helper — NOT left to the caller (#1134). `node_origin` additionally wraps this
 /// call in its per-candidate budget, which is belt-and-braces rather than the sole
 /// bound. `deadlines.window` and `deadlines.floor_bps` are the throughput floor the returned
@@ -3190,13 +3103,11 @@ pub async fn open_progressive_pull(
 
 /// Like [`open_progressive_pull`], but opens the pull on the warm connection
 /// `conn` instead of dialling a fresh one (#1848). `owner` names where `conn`
-/// comes from: a caller-owned [`WarmConnection`] or a [`Connections`] map's
-/// connection. The warm connection is reused across
-/// many hashes (one dial, a fresh bi-stream per hash: one stream = one hash, no
-/// wire change) and stays open when this pull ends, so the pull never closes
-/// it. A map's connection is held by the pull while it runs, and a transport
-/// fault on the open or on a later read unpins it from the map
-/// ([`Connections::invalidate`]).
+/// comes from: a caller-owned [`WarmConnection`]. The warm connection is
+/// reused across many hashes (one dial, a fresh bi-stream per hash: one
+/// stream = one hash, no wire change) and stays open when this pull ends, so
+/// the pull never closes it. A lane on a [`Connections`] map opens through
+/// [`PeerSource`] instead.
 ///
 /// Every other argument behaves exactly as on [`open_progressive_pull`]; see its
 /// docs. There is no `endpoint`/`target` pair — the warm connection already names
@@ -3216,6 +3127,7 @@ pub async fn open_progressive_pull(
         byte_len = byte_len,
     )
 )]
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) async fn open_progressive_pull_on(
     conn: &iroh::endpoint::Connection,
     owner: connection::ConnOwner,
@@ -3257,10 +3169,12 @@ pub(crate) async fn open_progressive_pull_on(
 }
 
 /// The shared body behind [`open_progressive_pull`] (dial) and
-/// [`open_progressive_pull_on`] (reuse). `owner` records what the pull owns of
-/// its connection, so the returned [`UpstreamPull`] knows whether its terminal
-/// method closes the connection (owned, one-shot) or leaves it open for the
-/// next hash (warm), and whether a read fault unpins it from a map.
+/// [`open_progressive_pull_on`] (reuse): open the stream and verify its answer
+/// ([`opened::open_answer`]), then adopt it ([`OpenedStream::into_pull`]).
+/// `owner` records what the pull owns of its connection, so the returned
+/// [`UpstreamPull`] knows whether its terminal method closes the connection
+/// (owned, one-shot) or leaves it open for the next hash (warm), and whether a
+/// read fault unpins it from a map.
 #[allow(clippy::too_many_arguments)]
 async fn open_progressive_pull_impl(
     source: ConnSource<'_>,
@@ -3284,10 +3198,7 @@ async fn open_progressive_pull_impl(
     byte_len: u64,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let result: anyhow::Result<(UpstreamPullHeader, UpstreamPull)> = async {
-        let window = deadlines.window;
-        let floor_bps = deadlines.floor_bps;
-        let (conn, send, recv, resp, resp_ext, proven) = open_stream(
-            source,
+        let args = opened::OpenArgs {
             ctx,
             slash_domain,
             expected_signer,
@@ -3303,103 +3214,13 @@ async fn open_progressive_pull_impl(
             byte_offset,
             byte_len,
             timestamp_us,
-            deadlines.open,
-        )
-        .await?;
-        let Some(proven) = proven.filter(|_| resp.body.ok) else {
-            return Err(UpstreamRefused::open(resp, &resp_ext));
+            open: deadlines.open,
+            // A pull expects the node to fill a span it misses before it answers.
+            pull_through: true,
         };
-        // `verify_response` proved the size against the hash. The
-        // `max_blob_size_bytes` cap still binds on the bytes that arrive, inside
-        // `UpstreamPull::next_chunk`: one stream of a large blob is streamed and paid
-        // for only up to the cap's worth, wherever it starts.
-        // Buyer-side rate ceiling (#1375): refuse an over-ceiling quote before the
-        // first paid interval, carrying the signed quote out as rate-manipulation
-        // evidence. `0` = unbounded.
-        if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
-            return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
-        }
-        // The node accepted at a rate this pull pays: its signed answer is
-        // receipt evidence for the lane (#2599).
-        if let Some(evidence) = ledger.evidence() {
-            evidence.note_response(&resp);
-        }
-        let rate_per_mb = resp.body.rate_per_mb;
-        // Wire-byte bound (bao-encoded size of the aligned range), not content bytes:
-        // the window path forwards this stream verbatim and pays the upstream in wire
-        // bytes (ADR 038 §Payment metering).
-        let total_bytes = proven.get();
-        let expected_wire_bytes = served_wire_len(byte_offset, byte_len, total_bytes)?;
-        // Per-stream bound on received bytes (#1895), as WIRE so `next_chunk` can
-        // enforce it without decoding: the wire size of the cap's worth of content
-        // from this offset. The cap bounds the bytes held for one blob, so one
-        // stream never carries more content than the cap, wherever in the blob it
-        // starts. Enforced on the bytes that ACTUALLY arrive. The caller's driver
-        // meters the bytes the
-        // store holds across streams (`driver::fill_gap`). `0` = unlimited. The
-        // empty blob carries no content, so a cap has nothing to bound and no
-        // range to size against a signed size of zero.
-        let max_received_wire = if max_blob_size_bytes == 0 || total_bytes == 0 {
-            0
-        } else {
-            aligned_wire_len(byte_offset, max_blob_size_bytes, total_bytes)?
-        };
-        // The size is proven, so a stream whose wire runs past the cap can never
-        // complete. Refuse it before paying anything, rather than pay ahead for
-        // bytes the cap would refuse.
-        if max_received_wire > 0 && expected_wire_bytes > max_received_wire {
-            return Err(anyhow::Error::new(BlobTooLarge {
-                reached: expected_wire_bytes,
-                ceiling: max_received_wire,
-            }));
-        }
-        let header = UpstreamPullHeader {
-            total_bytes,
-            size_proof: resp_ext.size_proof().cloned(),
-            rate_per_mb,
-            interval_bytes: CHUNK_BYTES,
-            origin_attestation: resp_ext
-                .origin_attestation
-                .clone()
-                .or_else(|| decdn_protocol::OriginAttestation::from_response(&resp)),
-        };
-        let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let floor = progress::ThroughputFloor::new(
-            progress::FloorConfig { window, floor_bps },
-            Arc::clone(&progress_counter),
-            tokio::time::Instant::now(),
-        );
-        let mut sampler = tokio::time::interval(stall_sample_period(window));
-        sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ledger.note_rate(rate_per_mb);
-        let pull = UpstreamPull {
-            window,
-            progress_counter,
-            floor,
-            sampler,
-            conn,
-            owner,
-            send,
-            recv,
-            ctx: ctx.clone(),
-            ledger,
-            hash,
-            byte_offset,
-            byte_len,
-            rate_per_mb,
-            meter: StreamMeter::default(),
-            expected_wire_bytes,
-            max_received_wire,
-            cumulative: 0,
-            verified: 0,
-            paid: 0,
-            node_failed: false,
-            settled: false,
-            ended: false,
-            returned_at: None,
-            opened_at: tokio::time::Instant::now(),
-        };
-        Ok((header, pull))
+        opened::open_answer(source, owner, args, false, false)
+            .await?
+            .into_pull(ctx, ledger, max_blob_size_bytes, max_rate_per_mb, deadlines)
     }
     .await;
     record_open_result(&tracing::Span::current(), &result);
@@ -4561,6 +4382,20 @@ fn verify_response(
         .size_proof()
         .map(|proof| check_size_proof(hash, proof))
         .transpose()?;
+    // A served span that starts at or past the proven size holds no byte, so
+    // no coverage can agree with it. Name that first: a caller that cut the
+    // span with no proven size asks for the whole blob on it
+    // ([`is_range_past_end`]).
+    if resp.body.ok
+        && let Some(size) = proven
+        && size.get() <= byte_offset
+        && (byte_offset > 0 || byte_len > 0)
+    {
+        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
+            total_bytes: size.get(),
+            byte_offset,
+        }));
+    }
     // The unsigned coverage must agree with the signed answer for the span
     // asked: a served answer covers it, a refusal does not. A node that sends
     // a disagreeing pair is at fault, as for a proof that does not verify.
@@ -4645,7 +4480,7 @@ const fn variant_name(msg: &ClientMessage) -> &'static str {
 /// Record a failed [`open_progressive_pull`] on its span once: the error text
 /// and an error status, so a failed dial or handshake is not exported as a
 /// slow success.
-fn record_open_result<T>(span: &tracing::Span, result: &anyhow::Result<T>) {
+pub(crate) fn record_open_result<T>(span: &tracing::Span, result: &anyhow::Result<T>) {
     if let Err(e) = result {
         span.record("error", tracing::field::display(format_args!("{e:#}")));
         span.record("otel.status_code", "ERROR");

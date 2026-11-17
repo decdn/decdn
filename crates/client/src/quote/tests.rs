@@ -151,16 +151,17 @@ fn price_extends_the_sample_to_unsampled_bytes() {
     assert_eq!(got.likely, U256::from(80));
 }
 
-/// The serve order is the pull's: holders nearest first, then nothing
-/// else, with one node per operator and none above the ceiling.
+/// The serve order is the pull's: holders by RTT band, then quote, then
+/// nothing else, with one node per operator and none above the ceiling.
 #[test]
 fn serve_order_is_holders_by_rtt_within_the_ceiling() {
     let census = census_of(vec![
         answer(1, 1, 40.0, 10, true),
         answer(2, 2, 10.0, 99, true),
         answer(3, 3, 20.0, 12, true),
-        // Same operator as node 3, farther: dropped.
-        answer(4, 3, 30.0, 5, true),
+        // Same operator as node 3, a band farther: dropped, whatever its
+        // quote.
+        answer(4, 3, 50.0, 5, true),
         // A non-holder does not serve while a holder does.
         answer(5, 5, 1.0, 1, false),
     ]);
@@ -235,16 +236,17 @@ fn size_hint_is_the_nearest_holders() {
 #[test]
 fn tally_sorts_outcomes_by_hash() {
     let hashes = [[1; 32], [2; 32]];
-    let holder = ProbeOutcome::Holder(
+    let holder = OpenOutcome::Holder(
         discovery::Probed {
             candidate: cand(1, 1),
             rtt_ms: 12.0,
+            rate_per_mb: 17,
             total_bytes: Some(ProvenSize::assume_for_tests(99)),
             coverage: decdn_protocol::Coverage::empty(),
         },
         (node_key(1), 12.0, 17),
     );
-    let non_holder = ProbeOutcome::NonHolder(
+    let non_holder = OpenOutcome::NonHolder(
         discovery::WarmingCandidate {
             node_id: node_key(2),
             eth_address: Address::repeat_byte(2),
@@ -256,13 +258,13 @@ fn tally_sorts_outcomes_by_hash() {
     let outcomes = vec![
         (0, cand(1, 1), holder),
         (1, cand(2, 2), non_holder),
-        (1, cand(3, 3), ProbeOutcome::Unreachable),
-        (0, cand(4, 4), ProbeOutcome::RateLimited),
-        (0, cand(5, 5), ProbeOutcome::Unverifiable),
-        (1, cand(6, 6), ProbeOutcome::Unusable),
-        (1, cand(8, 8), ProbeOutcome::ClockSkewed),
+        (1, cand(3, 3), OpenOutcome::Unreachable),
+        (0, cand(4, 4), OpenOutcome::RateLimited),
+        (0, cand(5, 5), OpenOutcome::Unverifiable),
+        (1, cand(6, 6), OpenOutcome::Unusable),
+        (1, cand(8, 8), OpenOutcome::ClockSkewed),
         // An index past the hashes is dropped.
-        (9, cand(7, 7), ProbeOutcome::Unreachable),
+        (9, cand(7, 7), OpenOutcome::Unreachable),
     ];
     let census = tally(6, &hashes, outcomes, false);
     assert_eq!(census.probed, 6);
@@ -326,7 +328,7 @@ fn unanswered_needs_every_probed_hash_silent() {
         outage_fallback: false,
     };
     let err = format!("{}", unanswered(&all).unwrap());
-    assert!(err.contains("none of the 3 probed node(s)"), "{err}");
+    assert!(err.contains("none of the 3 asked node(s)"), "{err}");
 }
 
 /// A signature that does not recover is a configuration fault, named so.

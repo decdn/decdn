@@ -1,5 +1,6 @@
-//! Persisted per-peer knowledge base: registry-fed identity, probe-fed latency,
-//! and price from probes and stream opens, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
+//! Persisted per-peer knowledge base: registry-fed identity, latency and price
+//! from discovery answers, and price from stream opens, keyed by iroh
+//! [`iroh::PublicKey`], one JSON file per peer.
 
 use crate::discovery::NodeCandidate;
 use alloy::primitives::{Address, Bytes};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// EWMA weight applied to a new latency sample.
 pub const EWMA_ALPHA: f64 = 0.3;
-/// Age past which a latency sample is no longer trusted for the probe-less path.
+/// Age past which a latency sample is no longer trusted for the fast path that skips discovery.
 pub const LATENCY_TTL_SECS: u64 = 600;
 /// Age past which registry-fed identity is refreshed on the next discovery.
 pub const IDENTITY_REFRESH_SECS: u64 = 86_400;
@@ -17,7 +18,7 @@ pub const IDENTITY_REFRESH_SECS: u64 = 86_400;
 pub const IDENTITY_PRUNE_SECS: u64 = 604_800;
 /// Duration a just-failed peer is suppressed from selection.
 pub const FAILURE_SUPPRESS_SECS: u64 = 300;
-/// Fresh, distinct candidates required to take the probe-less fast path.
+/// Fresh, distinct candidates required to take the fast path that skips discovery.
 pub const MIN_FRESH_CANDIDATES: usize = 3;
 /// Maximum stats-bearing records retained before eviction.
 pub const LRU_CAP: usize = 4_096;
@@ -57,7 +58,7 @@ impl Default for StoreConfig {
 }
 
 /// Everything the client knows about one peer: identity (registry-fed) and
-/// stats (probe- and stream-fed), aging on separate clocks.
+/// stats (fed by discovery answers and stream opens), aging on separate clocks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRecord {
     /// iroh endpoint id — the record's key and filename.
@@ -83,16 +84,18 @@ pub struct PeerRecord {
     pub multiaddrs: Bytes,
     /// Seconds since the Unix epoch when identity was last confirmed against the registry.
     pub identity_seen_at_secs: u64,
-    /// EWMA-smoothed probe round-trip time in milliseconds (dial to the signed
-    /// `cdn/probe/v1` response); `None` until the first sample. Only probes feed
-    /// it: on a cache miss a stream open's latency includes the node's own
-    /// upstream work, so it measures the content's cache state, not the node's
-    /// distance.
+    /// EWMA-smoothed path round-trip time in milliseconds; `None` until the
+    /// first sample. Every discovery open feeds it: the sample is the QUIC
+    /// path's RTT estimate after the answer, the direct path's when hole
+    /// punching selects one, so it measures the node's distance. The time
+    /// from a request to its answer never feeds it: on a cache miss that
+    /// includes the node's own upstream work, which measures the content's
+    /// cache state, not the node's distance.
     pub latency_ms: Option<f64>,
     /// Seconds since the Unix epoch of the most recent latency sample.
     pub last_sampled_at_secs: Option<u64>,
-    /// Most recent price quote from a probe or stream response; a diagnostic
-    /// hint only, never authoritative.
+    /// Most recent price quote from a signed answer; a diagnostic hint only,
+    /// never authoritative.
     pub rate_per_mb: Option<u64>,
     /// Number of latency samples folded so far (gates EWMA warm-up).
     pub sample_count: u32,
@@ -155,7 +158,8 @@ impl PeerRecord {
         now_secs.saturating_sub(self.identity_seen_at_secs) <= cfg.identity_refresh_secs
     }
 
-    /// Eligible for the probe-less fast path: has a fresh latency sample and is not suppressed.
+    /// Eligible for the fast path that skips discovery: has a fresh latency sample and is not
+    /// suppressed.
     #[must_use]
     pub const fn selectable(&self, now_secs: u64, cfg: &StoreConfig) -> bool {
         self.latency_ms.is_some()
@@ -193,8 +197,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// Serializes every mutation of the store within this process. Each mutation
 /// reads a whole record, changes it, and writes the whole record back, so two
 /// unserialized writers lose one update: a stream open that races the
-/// off-path probe harvest writes back a record read before the probe sample
-/// landed. The lock is process-wide rather than per store, because each
+/// off-path harvest of discovery answers writes back a record read before the
+/// answer's sample landed. The lock is process-wide rather than per store, because each
 /// [`PeerStore::open`] of one directory is a separate value. Concurrent
 /// `decdn` processes are not serialized: the atomic rename keeps each record
 /// whole, and the last writer wins.
@@ -336,7 +340,7 @@ impl PeerStore {
         self.write(&rec)
     }
 
-    /// Fold a probe RTT sample, set price, stamp freshness, and clear any failure.
+    /// Fold a path RTT sample, set price, stamp freshness, and clear any failure.
     pub fn record_sample(
         &self,
         node_id: &PublicKey,

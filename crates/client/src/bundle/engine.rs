@@ -104,7 +104,7 @@ use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
 use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
-    ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
+    OpenRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
     probe_and_order, probe_pinned,
 };
 use crate::{
@@ -1706,8 +1706,7 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// sources, and a pinned node's dial address. An entry's first holders
     /// come from [`Self::nodes`].
     pub(super) discovery: DiscoveryOptions,
-    /// The absolute per-MB rate cap, folded per lane with the rate the
-    /// candidate's own probe signed; `0` sets no absolute cap.
+    /// The most a lane pays per MiB; `0` sets no ceiling.
     pub(super) max_rate_per_mb: u64,
     /// The largest blob one entry fetches.
     pub(super) max_blob_bytes: u64,
@@ -1886,10 +1885,10 @@ impl<P: Provider + Clone> PullCtx<P> {
                     hash,
                     self.discovery.proxy_warming,
                     &self.slash_dom,
-                    ProbeRound::Stream,
+                    OpenRound::Stream,
                 )
                 .await?;
-                self.record_rates(&targets.probed_samples);
+                self.record_rates(&targets.samples);
                 Ok(targets)
             }
         }

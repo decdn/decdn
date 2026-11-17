@@ -1135,10 +1135,8 @@ impl BundlePullerBuilder {
         self
     }
 
-    /// The absolute per-MB rate cap, folded per lane with the rate the
-    /// candidate's own probe signed ([`crate::effective_rate_ceiling`]);
-    /// `0`, the default, sets no absolute cap, and a probed lane is still
-    /// capped at its probe rate.
+    /// The most a lane pays per MiB: a lane refuses a stream whose signed
+    /// quote is above it. `0`, the default, sets no ceiling.
     pub const fn max_rate_per_mb(mut self, rate: u64) -> Self {
         self.max_rate_per_mb = rate;
         self

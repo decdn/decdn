@@ -7786,9 +7786,8 @@ async fn buyer_refuses_an_over_ceiling_blob_without_paying() -> anyhow::Result<(
 
 /// Buyer-side RATE gate (#1375): the rate analogue of `buyer_rejects_oversized_total_bytes`.
 /// The server quotes `RATE_PER_MB` in a valid, signed `ok == true` `StreamResponse`, but the
-/// buyer's ceiling is below it. The buyer must refuse BEFORE paying a single voucher, and the
-/// abort must carry the server's OWN signed quote out as `RateAboveCeiling` evidence — that is
-/// the rate-manipulation attestation a challenger replays to `SlashJudge` with no re-signing.
+/// buyer's ceiling is below it. The buyer must refuse BEFORE paying a single voucher, with a
+/// typed `RateAboveCeiling` that names the quote and the ceiling.
 #[tokio::test(flavor = "multi_thread")]
 async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
     let payload = vec![0x5Au8; 4096];
@@ -7834,22 +7833,6 @@ async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
         refused.quoted_rate_per_mb(),
         refused.ceiling_rate_per_mb(),
     );
-    // The retained evidence is the server's own signed quote and still recovers to it, so a
-    // challenger can replay it to `SlashJudge` unchanged.
-    let evidence = refused.evidence();
-    anyhow::ensure!(
-        evidence.body.rate_per_mb == RATE_PER_MB && evidence.body.ok,
-        "the retained evidence must be the signed ok:true over-quote"
-    );
-    // The whole value proposition of retaining the response: its `slash_sig` still
-    // ecrecovers to the delivering operator, so it is replayable with no re-signing.
-    // (Mirrors `an_open_stage_refusal_preserves_the_signed_stream_response`.)
-    let recovered = alloy::primitives::Signature::try_from(evidence.slash_sig.as_slice())?;
-    StreamSlashData::from_response_body(&evidence.body).verify_signer(
-        &recovered,
-        server_eth.address(),
-        &slash_domain(),
-    )?;
     anyhow::ensure!(
         progress.advanced().is_none(),
         "no voucher may be paid when the buyer refuses the rate up front: {:?}",

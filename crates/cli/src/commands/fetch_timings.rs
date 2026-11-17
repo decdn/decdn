@@ -18,14 +18,15 @@ use std::time::{Duration, Instant};
 pub(crate) enum Mark {
     /// The iroh endpoint is bound.
     Endpoint,
-    /// Discovery starts its probe round. Absent when the peer store's fresh
-    /// latencies choose the holders without a probe, or when a `--node-id`
+    /// The keystore signer is unlocked: discovery opens carry the payer's
+    /// pool, binding and capability.
+    Unlocked,
+    /// Discovery starts its round of opens. Absent when the peer store's fresh
+    /// latencies choose the holders without a round, or when a `--node-id`
     /// fetch knows the blob's size.
     ProbeStart,
     /// The first holder set is resolved.
     Resolved,
-    /// The keystore signer is unlocked.
-    Unlocked,
     /// The first lane's pool is open or reused and its source is ready.
     Lane,
     /// The first verified content byte reaches the user: written to stdout, or

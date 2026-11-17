@@ -227,8 +227,8 @@ fn aligned_wire_len_clamps_when_the_response_total_is_smaller_than_the_requested
 }
 
 /// `request_ext` carries exactly the context's binding and capability, and
-/// always asks for the miss path. This is the mapping the single request site
-/// (`open_stream`) relies on, so it guards a refactor that would silently
+/// the `pull_through` flag the open asks for. This is the mapping the single request site
+/// (`exchange`) relies on, so it guards a refactor that would silently
 /// drop the binding (#1115) or the `pull_through` flag.
 #[test]
 fn request_ext_reflects_the_context() -> anyhow::Result<()> {
@@ -252,18 +252,22 @@ fn request_ext_reflects_the_context() -> anyhow::Result<()> {
         client_binding: None,
         capability: None,
     };
-    // Unbound ⇒ no binding and no capability, and still the miss path.
-    let ext = request_ext(&ctx);
+    // Unbound ⇒ no binding and no capability; the flag rides as asked.
+    let ext = request_ext(&ctx, true);
     anyhow::ensure!(
         ext.binding.is_none() && ext.capability.is_none(),
         "unbound ctx carries no binding"
     );
-    anyhow::ensure!(ext.pull_through, "every open asks for the miss path");
+    anyhow::ensure!(ext.pull_through, "a pull asks for the miss path");
+    anyhow::ensure!(
+        !request_ext(&ctx, false).pull_through,
+        "a discovery open does not"
+    );
 
     // Bound ⇒ ext carries exactly the binding.
     let binding = sign_client_binding(&signer, B256::repeat_byte(0xAB), &domain)?;
     let ctx = ctx.with_client_binding(binding.clone());
-    let ext = request_ext(&ctx);
+    let ext = request_ext(&ctx, true);
     anyhow::ensure!(
         ext.binding == Some(binding),
         "ext must carry the exact binding"
@@ -284,7 +288,7 @@ fn request_ext_reflects_the_context() -> anyhow::Result<()> {
     }
     .sign(&owner, &domain)?;
     let ctx = ctx.with_capability(capability.clone());
-    let ext = request_ext(&ctx);
+    let ext = request_ext(&ctx, true);
     let wire_cap = ext
         .capability
         .ok_or_else(|| anyhow::anyhow!("ext must carry the capability"))?;
@@ -1470,32 +1474,6 @@ fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {
         err.downcast_ref::<UpstreamRefused>().is_none(),
         "a response with no error code must not become a typed refusal"
     );
-}
-
-/// #1375: the two buyer ceilings combine as a min with `0` meaning "unbounded"
-/// on each input, so a completed pull is always bounded by the LOWER of the
-/// probe-relative and absolute bounds — and unbounded only when both are.
-#[test]
-fn effective_rate_ceiling_is_min_with_zero_as_unbounded() {
-    use super::effective_rate_ceiling;
-    assert_eq!(
-        effective_rate_ceiling(0, 0),
-        0,
-        "both unbounded => unbounded"
-    );
-    assert_eq!(
-        effective_rate_ceiling(10, 0),
-        10,
-        "config unbounded => probe"
-    );
-    assert_eq!(
-        effective_rate_ceiling(0, 900),
-        900,
-        "probe unbounded => config"
-    );
-    assert_eq!(effective_rate_ceiling(10, 900), 10, "min: probe binds");
-    assert_eq!(effective_rate_ceiling(900, 10), 10, "min: config binds");
-    assert_eq!(effective_rate_ceiling(42, 42), 42, "equal bounds");
 }
 
 /// A **mid-stream** refusal carries no signature, so it must never carry a

@@ -18,7 +18,7 @@ use decdn_client::buyer_pool::{
 use decdn_client::discovery::{self, NodeCandidate};
 use decdn_client::{
     Funder, PeerSource, PoolContext, PoolLedger, PullDeadlines, Recovery, SourceFuture,
-    StreamCandidate, VoucherProgress, effective_rate_ceiling, endpoint, probe, provider,
+    StreamCandidate, VoucherProgress, endpoint, probe, provider,
 };
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::load_signer;
@@ -274,7 +274,7 @@ impl Buyer {
                 0,
                 // Refuse a stream quote above the rate the node signed in its
                 // probe answer. `0` would set no ceiling at all.
-                effective_rate_ceiling(holder.rate_per_mb, 0),
+                holder.rate_per_mb,
                 deadlines,
                 None,
             );

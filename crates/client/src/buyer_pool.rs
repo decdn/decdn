@@ -362,6 +362,35 @@ pub fn self_owned_lane_ctx(
     )
 }
 
+/// The [`PoolContext`] `payer`'s lane key opens a stream under on `pool_id`
+/// before any lane is built: a discovery open. It pays no provider yet and
+/// carries a freshly issued self-owned capability, as
+/// [`self_owned_lane_ctx`] does, so the node takes the capability at the open.
+///
+/// # Errors
+///
+/// Propagates a signing error from the owner key while issuing the capability.
+pub(crate) fn self_owned_open_ctx(
+    pool_id: B256,
+    payer: &OwnedPayer,
+    voucher_domain: &Eip712Domain,
+) -> Result<PoolContext> {
+    let capability = issue_self_capability(
+        payer,
+        pool_id,
+        SELF_CAPABILITY_CAP,
+        SELF_CAPABILITY_EXPIRY,
+        voucher_domain,
+    )?;
+    Ok(PoolContext::new(
+        pool_id,
+        U256::ZERO,
+        Arc::clone(payer.lane()),
+        voucher_domain.clone(),
+    )
+    .with_capability(capability))
+}
+
 /// The buyer-store write that records one lane's [`VoucherProgress`], so a later
 /// reuse or a restart resumes the lane at the right cumulative `bytes` /
 /// `amount`.

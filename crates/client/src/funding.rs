@@ -871,6 +871,89 @@ impl LaneKeys<'_> {
     }
 }
 
+/// The context a fetch's discovery opens send ([`crate::discovery_open`]),
+/// before any lane is built: the pool the fetch's lanes pay from, the key
+/// they sign under, its client binding, and its capability. A discovery open
+/// carries these like any open, and the node defers funding admission to the
+/// first voucher, so the pool need not be open yet. The context pays no
+/// provider: a lane that adopts an open's stream pays it under its own
+/// context, which names the same pool and key ([`crate::OpenedStream::paid_by`]).
+///
+/// The pool is, in turn:
+///
+/// - a delegated payer's: the pool its capability names;
+/// - `known_pool`: the pool a built lane of the run already pays from;
+/// - the pool the buyer store records for the owner on this deployment;
+/// - else the pool the owner's next `openPool` opens, predicted from the
+///   chain's `ownerPoolNonce` as `keccak256(owner, nonce)`
+///   ([`predicted_pool_id`]).
+///
+/// A lane build can still settle on another pool: the recorded pool closed,
+/// or the chain shows a live pool the store lost. A stream opened on the
+/// other pool is then not adopted, and the lane opens its own.
+///
+/// # Errors
+///
+/// The buyer store cannot be read, the `ownerPoolNonce` read fails, or a
+/// signing error from the owner or delegate key.
+pub async fn discovery_ctx<P>(
+    store: &dyn BuyerPoolStore,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    payer: crate::lanes::LanePayer<'_>,
+    chain: &ChainConfig,
+    endpoint: &Endpoint,
+    voucher_dom: &Eip712Domain,
+    known_pool: Option<PoolId>,
+) -> anyhow::Result<PoolContext>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let ctx = match payer {
+        crate::lanes::LanePayer::Delegated(slot) => {
+            let credential = slot.current();
+            PoolContext::new(
+                credential.capability.capability.pool_id,
+                U256::ZERO,
+                credential.signer,
+                voucher_dom.clone(),
+            )
+            .with_capability(credential.capability)
+        }
+        crate::lanes::LanePayer::Owned(payer) => {
+            let owner = payer.owner().address();
+            let deployment = chain.deployment();
+            let recorded = store
+                .get_by_owner(owner)
+                .map_err(|e| {
+                    anyhow::anyhow!("read this wallet's buyer pool from the buyer store: {e}")
+                        .context(crate::LocalPullFault)
+                })?
+                .filter(|state| state.is_on(deployment))
+                .map(|state| state.pool_id);
+            let pool_id = if let Some(pool_id) = known_pool.or(recorded) {
+                pool_id
+            } else {
+                let nonce = contract.ownerPoolNonce(owner).call().await.context(
+                    "read PaymentPool.ownerPoolNonce() to name the pool this fetch opens",
+                )?;
+                predicted_pool_id(owner, nonce)
+            };
+            crate::buyer_pool::self_owned_open_ctx(pool_id, payer, voucher_dom)?
+        }
+    };
+    attach_client_binding(ctx, chain, endpoint)
+}
+
+/// The id `PaymentPool.openPool` gives `owner`'s pool at `nonce`:
+/// `keccak256(abi.encodePacked(owner, nonce))`.
+#[must_use]
+pub fn predicted_pool_id(owner: Address, nonce: U256) -> PoolId {
+    let mut packed = Vec::with_capacity(52);
+    packed.extend_from_slice(owner.as_slice());
+    packed.extend_from_slice(&nonce.to_be_bytes::<32>());
+    alloy::primitives::keccak256(packed)
+}
+
 /// Select the pool context for one lane of `deps`' run: the delegated
 /// adoption path for [`LaneKeys::Delegated`] (adopt the named pool, present
 /// the owner's capability, no open), else the self-owned open-or-reuse path,

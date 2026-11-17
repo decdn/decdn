@@ -51,7 +51,8 @@ pub struct Holder {
     /// after repeated refusals inside it, or
     /// `None` for the whole blob.
     pub coverage: Option<Coverage>,
-    /// The probed round-trip time. Lower starts first.
+    /// The measured round-trip time, raised where needed so the holders start
+    /// in failover order. Lower starts first.
     pub rtt_ms: f64,
     /// Whether a probe reported that this provider holds the blob. A probed
     /// holder is never marked absent: on the wire a `NotFound` also means load

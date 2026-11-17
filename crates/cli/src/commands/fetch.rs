@@ -4,7 +4,8 @@
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover the holders, #936),
 //! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, take the
-//! blob's proven size (a probe answer's, or the header of a whole-blob open
+//! blob's proven size (the winning holder's answer to a voucher-less open,
+//! whose stream the first leg adopts, or the header of the first leg's open
 //! when there is none), and fetch it through the acquire loop
 //! ([`decdn_client::acquire`]) across one [`decdn_client::PeerSource`] lane
 //! per holder (signing cumulative vouchers, resuming each lane's persisted
@@ -42,8 +43,8 @@ use anyhow::Context as _;
 use decdn_client::ProvenSize;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
-use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
-use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources};
+use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token, discovery_ctx};
+use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources, discovery_span};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use decdn_client::payer_window::PayAheadPolicy;
 use decdn_client::receipt::ReceiptEvidence;
@@ -52,7 +53,8 @@ use decdn_client::session::{
     ProxyWarmingParams, PullSite,
 };
 use decdn_client::targets::{
-    ProbeOpts, ProbeRound, ResolveConfigFault, holders_or_none, resolve_target_node,
+    OpenOpts, OpenRound, OpenSpec, ResolveConfigFault, check_resolvable, holders_or_none,
+    resolve_target_node,
 };
 use decdn_client::{
     Connections, CredentialSlot, DownloadTarget, Downloader, Holder, LaneLedgers,
@@ -786,7 +788,7 @@ pub(crate) struct BlobFetch {
     /// to a file.
     pub(crate) range: Option<(u64, u64)>,
     /// Learn the blob's size and write no byte: the first size a holder
-    /// proves (its probe answer, or the header of the first leg's open,
+    /// proves (its answer to a discovery open, or the header of the first leg's open,
     /// ADR 005 § Bounded byte ranges) joins the host's verified sizes
     /// ([`FetchHost::verified_size`]). A fault before it (such as no holder)
     /// fails the fetch. Never set with `range`.
@@ -1164,9 +1166,11 @@ impl Payer {
 }
 
 /// Fetch the blob `args` names on `host`, paid by `payer`, with its verified
-/// bytes going to `sink`: resolve the holders, take the proven size (a probe
-/// answer's, or the header of a whole-blob open when there is none), then fetch it
-/// through the acquire loop. `--output` names the destination only for
+/// bytes going to `sink`: unlock the payer, resolve the holders with
+/// voucher-less opens that name the payer's pool, take the proven size (the
+/// winning holder's answer, whose stream the first leg adopts, or the header of
+/// the first leg's open when there is none), then fetch it through the acquire
+/// loop. `--output` names the destination only for
 /// [`Sink::Output`]. The fetch ends on done, a fault only the user can fix,
 /// or the stop policy: a terminal waits for Ctrl-C, a script gives up after
 /// 10 minutes without progress, and `--give-up-after-secs` overrides both.
@@ -1210,43 +1214,22 @@ pub(crate) async fn fetch_on(
         "a size lookup takes no byte window"
     );
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
-    // Only a configuration fault ends the fetch here; with no holder yet, the
-    // first open discovers them. The round streams: the fetch starts at the
-    // first verified holder, and the holders that answer later join it.
+    // A configuration fault ends the fetch here, before the keystore prompts
+    // for a password; with no holder yet, the first open discovers them. The
+    // round streams: the fetch starts at the first verified holder, and the
+    // holders that answer later join it.
     let discovery = discovery_options(common)?;
+    check_resolvable(&discovery, &chain.config)?;
     // The payer's credit window toward each node follows the track record the
     // peer store keeps per operator address; the guard writes it back once this
     // fetch ends, whatever ends it.
     let _trust = PayerTrust::open(&chain.site.data_dir);
-    // A size an earlier fetch on the host proved is the first size, and a
-    // pinned node is not probed for it.
-    let probe = ProbeOpts {
-        marks: Some(timings),
-        round: ProbeRound::Stream,
-        known_size: known_size(&hash, sizes),
-    };
-    let resolved = holders_or_none(
-        resolve_target_node(
-            &discovery,
-            (&chain.config, &chain.site),
-            endpoint,
-            relays,
-            hash,
-            probe,
-        )
-        .await,
-    )?;
-    timings.mark(Mark::Resolved);
-    // Read before the pass loop: the holders' rates as this resolve and the
-    // peer store know them, for the estimate the first pass prints.
-    let rate_hints = args
-        .estimate
-        .then(|| resolved.rate_hints(&PeerStore::open(&chain.site.data_dir)));
 
-    // Buyer key: the held delegate key, else the keystore, loaded after holder
-    // resolution so a configuration fault never prompts for a keystore
-    // password ([`Payer::keys`]). A delegated payer signs under one credential
-    // slot across every fetch it pays for, both passes of each fetch included.
+    // Buyer key: the held delegate key, else the keystore. A discovery open
+    // carries the payer's pool, binding and capability like any open, so the
+    // key loads before discovery. A delegated payer signs under one
+    // credential slot across every fetch it pays for, both passes of each
+    // fetch included.
     let (signer, keys) = payer.keys(host).await?;
     timings.mark(Mark::Unlocked);
     let self_address = signer.address();
@@ -1256,6 +1239,75 @@ pub(crate) async fn fetch_on(
     let contract = PaymentPool::new(config.payment_pool, rpc.clone());
     let voucher_dom = voucher_domain(config.chain_id, config.payment_pool);
     let slash_dom = slash_judge_domain(config.chain_id, config.slash_judge);
+
+    let max_blob_bytes = held_cap(common.max_blob_mb, args.size_cap);
+    // The namespace routing hint (ADR 005 § Namespace routing): the URI's
+    // `?ns=<id>` → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort
+    // cache/DHT).
+    let namespace_id = args
+        .namespace
+        .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
+            alloy::primitives::U256::from(n).to_be_bytes()
+        });
+    // The drive's first leg: a size lookup's is the blob's first byte, so its
+    // open pays for one chunk group at most. Discovery opens ask for this
+    // span, so the winner's stream is the first leg.
+    let first_leg = if args.size_only {
+        FirstLeg::Streamed {
+            window: (0, 1),
+            read_ahead: 0,
+        }
+    } else if streams {
+        FirstLeg::Streamed {
+            window: args.range.unwrap_or((0, 0)),
+            read_ahead: stream_read_ahead(args.read_ahead),
+        }
+    } else {
+        FirstLeg::Whole
+    };
+
+    // The pool the discovery opens name: the one the lanes will pay from.
+    // A failed chain read starts the fetch with no holder, and the acquire
+    // loop's discovery asks again.
+    let open_ctx = discovery_ctx(
+        store.as_ref(),
+        &contract,
+        keys.lane_payer(),
+        config,
+        endpoint,
+        &voucher_dom,
+        None,
+    )
+    .await;
+    let resolved = holders_or_none(match &open_ctx {
+        Ok(ctx) => {
+            // A size an earlier fetch on the host proved is the first size,
+            // and a pinned node is not opened for it.
+            let open = OpenOpts {
+                marks: Some(timings),
+                round: OpenRound::Stream,
+                known_size: known_size(&hash, sizes),
+                spec: OpenSpec {
+                    conns: connections,
+                    ctx,
+                    namespace_id,
+                    span: discovery_span(hash, first_leg, max_blob_bytes),
+                    max_rate_per_mb: common.max_rate_per_mb,
+                },
+            };
+            resolve_target_node(&discovery, (&chain.config, &chain.site), relays, hash, open).await
+        }
+        Err(err) => Err(anyhow::anyhow!(
+            "could not name the pool the discovery opens pay from: {err:#}"
+        )),
+    })?;
+    timings.mark(Mark::Resolved);
+    // Read before the pass loop: the holders' rates as this resolve and the
+    // peer store know them, for the estimate the first pass prints.
+    let rate_hints = args
+        .estimate
+        .then(|| resolved.rate_hints(&PeerStore::open(&chain.site.data_dir)));
+
     // The pool's token is `PaymentPool.usdc()`, immutable per contract, so the
     // host reads it once. A repeat fetch already holds it in the persisted pool
     // row, so read it there and skip the eth_call; only a first-ever pool (no
@@ -1275,15 +1327,6 @@ pub(crate) async fn fetch_on(
         })
         .await?;
 
-    let max_blob_bytes = held_cap(common.max_blob_mb, args.size_cap);
-    // The namespace routing hint (ADR 005 § Namespace routing): the URI's
-    // `?ns=<id>` → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort
-    // cache/DHT).
-    let namespace_id = args
-        .namespace
-        .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
-            alloy::primitives::U256::from(n).to_be_bytes()
-        });
     // A node that accepts the connection and never answers is as dead as one that
     // stops mid-stream, so the same window answers both (#1134). The pull carries
     // no overall wall-clock cap: it completes for any blob size as long as the
@@ -1365,23 +1408,9 @@ pub(crate) async fn fetch_on(
         // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
-            // The blob's size, proven: the probe's answer, or the header of an
-            // open of the drive's first leg, which that leg then adopts. A
-            // size lookup's leg is the blob's first byte, so its open pays
-            // for one chunk group at most.
-            let first_leg = if args.size_only {
-                FirstLeg::Streamed {
-                    window: (0, 1),
-                    read_ahead: 0,
-                }
-            } else if streams {
-                FirstLeg::Streamed {
-                    window: args.range.unwrap_or((0, 0)),
-                    read_ahead: stream_read_ahead(args.read_ahead),
-                }
-            } else {
-                FirstLeg::Whole
-            };
+            // The blob's size, proven: the winning holder's answer, whose
+            // stream the drive's first leg adopts, or the header of an open of
+            // that leg.
             let claim = sources
                 .first_claim(hash, holders, first_leg, health, &stop)
                 .await?;

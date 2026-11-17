@@ -686,19 +686,22 @@ pub fn admit_sources(ordered: Vec<NodeCandidate>, max_sources: usize) -> Vec<Nod
     out
 }
 
-/// A probed candidate that holds the blob, with its measured RTT.
+/// A candidate that holds the blob, with its measured RTT and its quote.
 #[derive(Debug, Clone)]
 pub struct Probed {
-    /// The node that answered the probe with `has_blob = true`.
+    /// The node that answered: a discovery open's `ok`, or a probe's
+    /// `has_blob = true`.
     pub candidate: NodeCandidate,
-    /// Round-trip time measured by the probe, in milliseconds.
+    /// Round-trip time measured for the answer, in milliseconds.
     pub rtt_ms: f64,
+    /// The per-MiB rate the node signed in its answer.
+    pub rate_per_mb: u64,
     /// The blob size the node stated, proven against the hash by the size
     /// proof in its answer before this value exists (ADR 005 § Bounded byte
     /// ranges). `None` when the node stated no size.
     pub total_bytes: Option<crate::ProvenSize>,
-    /// Which discovery blocks this holder answered `has_blob:true` for
-    /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`.
+    /// Which discovery blocks this holder holds or can serve
+    /// (`decdn_protocol::coverage`), taken from its answer's extension.
     /// Unsigned and outside `slash_sig`: a hint for the scheduler's segment
     /// assignment, never a commitment. `has_blob:true` means "will serve at
     /// least one block" (for every blob with a block), so this may be a

@@ -210,8 +210,8 @@ async fn run_holder_down_at_start() -> anyhow::Result<()> {
         .await
         .context("mint buyer USDC")?;
 
-    // The sole holder is down before the fetch starts: its probe fails, and
-    // the fetch must keep discovering rather than exit.
+    // The sole holder is down before the fetch starts: its discovery open
+    // fails, and the fetch must keep discovering rather than exit.
     node.stop()
         .context("stop the sole holder before the fetch")?;
 
@@ -224,7 +224,7 @@ async fn run_holder_down_at_start() -> anyhow::Result<()> {
     cmd.arg("get").args(&args).kill_on_drop(true);
     let fetch = tokio::spawn(async move { cmd.output().await });
 
-    // Past one whole probe round (a 5 s probe timeout), so the first probe
+    // Past one whole discovery round (a 5 s open timeout), so the first open
     // has failed before the holder comes up.
     tokio::time::sleep(Duration::from_secs(12)).await;
     if fetch.is_finished() {
@@ -264,7 +264,7 @@ async fn run_holder_down_at_start() -> anyhow::Result<()> {
 
 /// The `decdn get` argv (after the `get` subcommand) to pull `hash` by
 /// auto-discovery: no `--node-id`, so the CLI reads the `CapacityBond`
-/// registry and probes each node.
+/// registry and opens the blob on each node.
 fn discovery_fetch_argv(
     chain: &ChainFixture,
     hash: &Hash,

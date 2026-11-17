@@ -221,12 +221,10 @@ pub struct ClientFetchArgs {
 
     /// Refuse a provider that quotes a per-MB stream rate above this many USDC
     /// base units **before** paying any voucher (#1375). `0` (the default) = no
-    /// absolute ceiling. For a bundle this applies per entry. Each lane is also
-    /// capped at the rate the candidate's own probe signed — the quote the node
-    /// was selected on — as the node's automatic node-to-node pull caps its upstream, so
-    /// a provider that quotes low on the probe then high on the stream is refused
-    /// even at the default. A pull that harvests no probe rate (the peer-store
-    /// fast path, a pinned `--node-id`) is bounded by this value alone.
+    /// ceiling. For a bundle this applies per entry. Every stream answer carries
+    /// the node's signed quote, so the fetch sees the rate before it pays:
+    /// discovery leaves out a node that quotes above the ceiling, and a lane
+    /// refuses a stream whose quote is above it.
     #[arg(long, value_name = "UNITS", default_value_t = 0)]
     pub max_rate_per_mb: u64,
 

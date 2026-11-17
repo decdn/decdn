@@ -101,8 +101,20 @@ use decdn_client::{
     BlobTooLarge, Cumulative, HashMismatch, LegNoProgress, LocalPullFault, PoolContext, PoolLedger,
     PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd,
     UpstreamRateLimited, UpstreamRefused, UpstreamTimestampRejected, UpstreamVoucherRejected,
-    VoucherProgress, effective_rate_ceiling, sign_client_binding,
+    VoucherProgress, sign_client_binding,
 };
+
+/// The lower of two per-MB rate ceilings, `0` meaning "unbounded" on each
+/// input: the rate the candidate quoted and the node's own bound. Returns `0`
+/// only when both are unbounded.
+const fn effective_rate_ceiling(candidate: u64, bound: u64) -> u64 {
+    match (candidate, bound) {
+        (0, b) => b,
+        (c, 0) => c,
+        (c, b) if c < b => c,
+        (_, b) => b,
+    }
+}
 
 /// Throttle for the `warn!` on an upstream that refused this node's request
 /// timestamp (`APP_ERR_TIMESTAMP_SKEW`). Process-wide: every pull and probe
@@ -516,7 +528,7 @@ pub struct NodeOriginConfig {
     /// are stored, never on the peer's `total_bytes` (#1895).
     pub max_blob_size_bytes: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling (`cache.max_rate_per_mb`), `0` =
-    /// unlimited (#1375). Combined via [`effective_rate_ceiling`] with the
+    /// unlimited (#1375). Combined via `effective_rate_ceiling` with the
     /// probe-relative bound (the rate the chosen candidate advertised) so the node
     /// refuses a stream quote that exceeds the lower of the two before paying — and
     /// retains the signed over-quote as rate-manipulation evidence.

@@ -4,16 +4,37 @@ use anyhow::Context as _;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// A node that sheds this client's probes is named as rate-limited, apart
+/// [`no_serve_target_error`] over the five counts a probe round tallies.
+fn nst(
+    asked: usize,
+    unreachable: usize,
+    rate_limited: usize,
+    unverifiable: usize,
+    clock_skewed: usize,
+) -> anyhow::Error {
+    no_serve_target_error(Dropouts {
+        asked,
+        unreachable,
+        rate_limited,
+        unverifiable,
+        clock_skewed,
+        ..Dropouts::default()
+    })
+}
+
+/// A node that sheds this client's requests is named as rate-limited, apart
 /// from the silent ones; with none, the message keeps its two counts.
 #[test]
 fn no_serve_target_error_names_rate_limited_nodes_apart_from_silent_ones() {
-    let msg = no_serve_target_error(3, 1, 2, 0, 0).to_string();
+    let msg = nst(3, 1, 2, 0, 0).to_string();
     assert!(msg.contains("1 did not answer"), "{msg}");
-    assert!(msg.contains("2 rate-limited this client's probes"), "{msg}");
+    assert!(
+        msg.contains("2 rate-limited this client's requests"),
+        "{msg}"
+    );
     assert!(msg.contains("0 answered but were unusable"), "{msg}");
 
-    let msg = no_serve_target_error(3, 3, 0, 0, 0).to_string();
+    let msg = nst(3, 3, 0, 0, 0).to_string();
     assert!(!msg.contains("rate-limited"), "{msg}");
     assert!(!msg.contains("timestamp"), "{msg}");
     assert!(msg.contains("3 did not answer, 0 answered"), "{msg}");
@@ -28,14 +49,14 @@ fn no_serve_target_error_names_rate_limited_nodes_apart_from_silent_ones() {
 fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp() {
     assert_eq!(CLOCK_SKEW_FATAL_MIN, 3);
     for (probed, unreachable, skewed) in [(3, 0, 3), (4, 1, 3), (5, 0, 4)] {
-        let err = no_serve_target_error(probed, unreachable, 0, 0, skewed);
+        let err = nst(probed, unreachable, 0, 0, skewed);
         assert!(
             err.downcast_ref::<ResolveConfigFault>().is_some(),
             "{skewed} of {probed} clock refusals is this machine's fault: {err:#}"
         );
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("{skewed} of {probed} probed node(s) refused")),
+            msg.contains(&format!("{skewed} of {probed} asked node(s) refused")),
             "{msg}"
         );
         assert!(msg.contains("Check this machine's clock"), "{msg}");
@@ -43,7 +64,7 @@ fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp(
     }
     // The clock check runs before the unverifiable one: a wrong clock leaves
     // nothing to verify.
-    let err = no_serve_target_error(3, 0, 0, 1, 3);
+    let err = nst(3, 0, 0, 1, 3);
     assert!(
         err.to_string().contains("Check this machine's clock"),
         "{err:#}"
@@ -52,7 +73,7 @@ fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp(
     // One or two refusers never end the command, even as a majority; three
     // that are not a majority do not either.
     for (probed, unreachable, skewed) in [(1, 0, 1), (2, 0, 2), (3, 1, 2), (4, 3, 1), (7, 4, 3)] {
-        let err = no_serve_target_error(probed, unreachable, 0, 0, skewed);
+        let err = nst(probed, unreachable, 0, 0, skewed);
         assert!(
             err.downcast_ref::<ResolveConfigFault>().is_none(),
             "{skewed} of {probed} refusals must not end the command: {err:#}"
@@ -74,15 +95,13 @@ fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp(
         );
     }
     assert!(
-        !no_serve_target_error(3, 3, 0, 0, 0)
-            .to_string()
-            .contains("time server"),
+        !nst(3, 3, 0, 0, 0).to_string().contains("time server"),
         "no refusal, no clock hint"
     );
 }
 
 /// A probe the node refused with `APP_ERR_TIMESTAMP_SKEW` classifies as
-/// [`ProbeOutcome::ClockSkewed`], not as an unreachable node, so the terminal
+/// [`OpenOutcome::ClockSkewed`], not as an unreachable node, so the terminal
 /// error can name the clock.
 #[test]
 fn classify_probe_types_a_timestamp_refusal_as_clock_skewed() {
@@ -99,15 +118,18 @@ fn classify_probe_types_a_timestamp_refusal_as_clock_skewed() {
     .context("read response"));
     assert!(matches!(
         classify_probe(&cand, refused, [7; 32], micros_now(), &domain),
-        ProbeOutcome::ClockSkewed
+        OpenOutcome::ClockSkewed
     ));
     let silent: ProbeResult = Err(anyhow::anyhow!("connect failed: timed out"));
     assert!(matches!(
         classify_probe(&cand, silent, [7; 32], micros_now(), &domain),
-        ProbeOutcome::Unreachable
+        OpenOutcome::Unreachable
     ));
-    let tally = ProbeTally::of(vec![ProbeOutcome::ClockSkewed, ProbeOutcome::Unreachable]);
-    assert_eq!((tally.clock_skewed, tally.unreachable), (1, 1));
+    let tally = OpenTally::of(2, vec![OpenOutcome::ClockSkewed, OpenOutcome::Unreachable]);
+    assert_eq!(
+        (tally.dropouts.clock_skewed, tally.dropouts.unreachable),
+        (1, 1)
+    );
 }
 
 /// A probe outcome after `ms` on the paused clock: `(id, holder)`.
@@ -125,7 +147,7 @@ async fn settle_keeps_every_answer_inside_the_grace() {
         answer_after(150, 2, false),
         answer_after(260, 3, true),
     ];
-    let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(probes, grace, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false), (3, true)]);
     assert!(tail.is_empty());
@@ -142,7 +164,7 @@ async fn settle_leaves_a_straggler_past_the_grace_in_the_tail() {
         answer_after(170, 2, false),
         answer_after(1850, 3, true),
     ];
-    let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(probes, grace, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false)]);
     assert_eq!(tail.len(), 1);
@@ -155,7 +177,7 @@ async fn settle_waits_for_every_probe_without_a_holder() {
     let grace = Duration::from_millis(250);
     let started = tokio::time::Instant::now();
     let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
-    let (got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let (got, tail) = settle_opens(probes, grace, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got.len(), 2);
     assert!(tail.is_empty());
     assert_eq!(started.elapsed(), Duration::from_millis(1850));
@@ -172,7 +194,7 @@ async fn settle_streams_from_the_first_holder() {
         answer_after(170, 2, false),
         answer_after(1850, 3, true),
     ];
-    let (got, mut tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+    let (got, mut tail) = settle_opens(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, true)]);
     assert_eq!(started.elapsed(), Duration::from_millis(25));
     let mut late = Vec::new();
@@ -191,7 +213,7 @@ async fn settle_collects_answers_ready_with_the_first_holder() {
         answer_after(25, 2, false),
         answer_after(900, 3, true),
     ];
-    let (mut got, tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false)]);
     assert_eq!(tail.len(), 1);
@@ -201,7 +223,7 @@ async fn settle_collects_answers_ready_with_the_first_holder() {
 fn recording_probe(
     after: Duration,
     answered: &Arc<std::sync::Mutex<Option<Duration>>>,
-) -> impl std::future::Future<Output = ProbeOutcome> + Send + 'static {
+) -> impl std::future::Future<Output = OpenOutcome> + Send + 'static {
     let answered = Arc::clone(answered);
     let started = tokio::time::Instant::now();
     async move {
@@ -209,7 +231,7 @@ fn recording_probe(
         if let Ok(mut slot) = answered.lock() {
             *slot = Some(started.elapsed());
         }
-        ProbeOutcome::Unreachable
+        OpenOutcome::Unreachable
     }
 }
 
@@ -230,14 +252,14 @@ async fn late_probes_run_while_the_tail_is_not_polled() {
     let answered = Arc::new(std::sync::Mutex::new(None));
     let tail: futures_util::stream::FuturesUnordered<_> =
         std::iter::once(recording_probe(Duration::from_millis(100), &answered)).collect();
-    let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+    let slot = late_probe_slot(OpenRound::Stream, tail, &[], no_warming());
 
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(*answered.lock().unwrap(), Some(Duration::from_millis(100)));
     let mut late = slot.take().expect("a streamed round keeps its tail");
     assert!(matches!(
         late.tail.next().await,
-        Some(ProbeOutcome::Unreachable)
+        Some(OpenOutcome::Unreachable)
     ));
     assert!(late.tail.next().await.is_none());
 }
@@ -248,7 +270,7 @@ async fn late_probes_stop_when_dropped() {
     let answered = Arc::new(std::sync::Mutex::new(None));
     let tail: futures_util::stream::FuturesUnordered<_> =
         std::iter::once(recording_probe(Duration::from_secs(1), &answered)).collect();
-    let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+    let slot = late_probe_slot(OpenRound::Stream, tail, &[], no_warming());
     tokio::time::sleep(Duration::from_millis(100)).await;
     drop(slot);
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -260,7 +282,7 @@ async fn late_probes_stop_when_dropped() {
 #[tokio::test(start_paused = true)]
 async fn settle_without_a_cold_cutoff_waits_for_every_probe() {
     let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
-    let (got, tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+    let (got, tail) = settle_opens(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got.len(), 2);
     assert!(tail.is_empty());
 }
@@ -277,7 +299,7 @@ async fn settle_cold_cutoff_returns_the_non_holders_in_hand() {
         answer_after(1850, 3, true),
     ];
     let cold = Some(Duration::from_millis(250));
-    let (got, mut tail) = settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+    let (got, mut tail) = settle_opens(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, false), (2, false)]);
     assert_eq!(started.elapsed(), Duration::from_millis(275));
     assert_eq!(tail.next().await, Some((3, true)));
@@ -294,7 +316,7 @@ async fn settle_cold_cutoff_yields_to_a_holder() {
         answer_after(1850, 3, false),
     ];
     let cold = Some(Duration::from_millis(250));
-    let (got, tail) = settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+    let (got, tail) = settle_opens(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, false), (2, true)]);
     assert_eq!(started.elapsed(), Duration::from_millis(120));
     assert_eq!(tail.len(), 1);
@@ -307,7 +329,7 @@ async fn settle_cold_cutoff_ignores_failed_probes() {
     // `(id, holder)`; id 9 stands for a failed probe.
     let probes = vec![answer_after(10, 9, false), answer_after(600, 1, false)];
     let cold = Some(Duration::from_millis(250));
-    let (got, tail) = settle_probes(
+    let (got, tail) = settle_opens(
         probes,
         Duration::ZERO,
         cold,
@@ -389,7 +411,7 @@ async fn probe_candidate_retries_a_shedding_candidate_then_reports_the_shed() {
     let (timestamp_us, res) = probe_candidate(&client, target, [7; 32]).await;
 
     let err = res.expect_err("every probe was shed");
-    assert!(probe_shed(&err), "the shed survives the retries: {err:#}");
+    assert!(is_shed(&err), "the shed survives the retries: {err:#}");
     assert_eq!(
         seen.load(std::sync::atomic::Ordering::SeqCst),
         PROBE_SHED_BACKOFFS_MS.len() + 1
@@ -417,7 +439,7 @@ async fn probe_candidate_does_not_retry_a_failure_that_is_not_a_shed() {
     let (_, res) = probe_candidate(&client, target, [7; 32]).await;
 
     let err = res.expect_err("the connection was closed");
-    assert!(!probe_shed(&err), "{err:#}");
+    assert!(!is_shed(&err), "{err:#}");
     assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     client.close().await;
     server.close().await;
@@ -455,9 +477,9 @@ async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
 }
 
 /// A pinned fetch that knows the blob's size (a gateway's manifest entry)
-/// takes it as the first size claim and probes nothing (#2619).
+/// takes it as the first size claim and opens nothing (#2619).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
+async fn a_pinned_fetch_with_a_known_size_opens_nothing() {
     let (server, target, seen) = closing_probe_server(0).await;
     let client = client_endpoint().await;
     let site_dir = tempfile::tempdir().unwrap();
@@ -474,22 +496,18 @@ async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
         region: None,
         region_allowlist: Vec::new(),
     };
-    let probe = ProbeOpts {
+    let conns = crate::Connections::new(client.clone());
+    let ctx = open_ctx();
+    let open = OpenOpts {
         marks: None,
-        round: ProbeRound::Stream,
+        round: OpenRound::Stream,
         known_size: Some(ProvenSize::assume_for_tests(4096)),
+        spec: spec(&conns, &ctx, 0),
     };
 
-    let targets = resolve_target_node(
-        &opts,
-        (&offline_chain(), &site),
-        &client,
-        &[],
-        [7; 32],
-        probe,
-    )
-    .await
-    .unwrap();
+    let targets = resolve_target_node(&opts, (&offline_chain(), &site), &[], [7; 32], open)
+        .await
+        .unwrap();
 
     assert!(targets.pinned);
     assert_eq!(targets.size_hint, Some(ProvenSize::assume_for_tests(4096)));
@@ -622,7 +640,7 @@ fn identity_fresh_candidates_gathers_latency_stale_peers() -> anyhow::Result<()>
 }
 
 /// A pinned `--node-id` is one probed-as-holder candidate. It carries no size
-/// hint of its own (#2218): a blob fetch takes its probe's ([`probe_pinned`]).
+/// hint of its own (#2218): a blob fetch takes its open's ([`open_pinned`]).
 #[test]
 fn a_pinned_node_resolves_with_no_size_hint() {
     let provider = Address::repeat_byte(0x42);
@@ -645,11 +663,14 @@ fn a_pinned_probe_hints_only_a_verified_holder_size() {
     let sized = holder(7, 5.0);
     let size = sized.total_bytes;
     assert!(size.is_some());
-    assert_eq!(probed_size_hint(&ProbeOutcome::Holder(sized, sample)), size);
+    assert_eq!(
+        answered_size_hint(&OpenOutcome::Holder(sized, sample)),
+        size
+    );
     let mut unsized_holder = holder(7, 5.0);
     unsized_holder.total_bytes = None;
     assert_eq!(
-        probed_size_hint(&ProbeOutcome::Holder(unsized_holder, sample)),
+        answered_size_hint(&OpenOutcome::Holder(unsized_holder, sample)),
         None
     );
     let non_holder = discovery::WarmingCandidate {
@@ -659,14 +680,16 @@ fn a_pinned_probe_hints_only_a_verified_holder_size() {
         multiaddrs: Bytes::new(),
     };
     for outcome in [
-        ProbeOutcome::NonHolder(non_holder, sample),
-        ProbeOutcome::Unreachable,
-        ProbeOutcome::RateLimited,
-        ProbeOutcome::ClockSkewed,
-        ProbeOutcome::Unverifiable,
-        ProbeOutcome::Unusable,
+        OpenOutcome::NonHolder(non_holder, sample),
+        OpenOutcome::Unreachable,
+        OpenOutcome::RateLimited,
+        OpenOutcome::ClockSkewed,
+        OpenOutcome::Unverifiable,
+        OpenOutcome::Unusable,
+        OpenOutcome::Declined,
+        OpenOutcome::OverCeiling,
     ] {
-        assert_eq!(probed_size_hint(&outcome), None);
+        assert_eq!(answered_size_hint(&outcome), None);
     }
 }
 
@@ -699,7 +722,8 @@ fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
     assert_eq!(targets.candidates[1].node_id, harvest_key(3));
     assert_eq!(targets.candidates[2].node_id, harvest_key(1));
     assert!(targets.coverage_by_node.is_empty());
-    assert!(targets.probed_samples.is_empty());
+    assert!(targets.samples.is_empty());
+    assert_eq!(targets.opened.len(), 0, "the fast path opens nothing");
     assert!(
         targets.size_hint.is_none(),
         "nothing was probed, so the first claim comes from a header open"
@@ -718,7 +742,7 @@ fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
 
 /// #2196: nearby nodes serving cold misses from a distant origin open slowly,
 /// but a stream open is not a distance sample. After repeated opens on the
-/// near nodes, the fast path still ranks them by probe RTT, ahead of the
+/// near nodes, the fast path still ranks them by path RTT, ahead of the
 /// origin.
 #[test]
 fn stream_opens_do_not_rank_near_nodes_behind_the_origin() -> anyhow::Result<()> {
@@ -726,7 +750,7 @@ fn stream_opens_do_not_rank_near_nodes_behind_the_origin() -> anyhow::Result<()>
     let dir = tempfile::tempdir()?;
     let store = crate::PeerStore::open(dir.path());
     let now = now_secs();
-    // Probe RTTs: two nearby caches and the transatlantic origin.
+    // Path RTTs: two nearby caches and the transatlantic origin.
     for (b, rtt) in [(1u8, 57.0), (2, 78.0), (3, 394.0)] {
         store.upsert_identity(&harvest_candidate(b), now)?;
         store.record_sample(&harvest_key(b), rtt, 1, now, &cfg)?;
@@ -752,7 +776,7 @@ fn stream_opens_do_not_rank_near_nodes_behind_the_origin() -> anyhow::Result<()>
 }
 
 /// A failed first open stamps the peer, so the fast path skips it, and
-/// leaves its probe RTT alone.
+/// leaves its path RTT alone.
 #[test]
 fn failed_first_open_suppresses_the_peer() -> anyhow::Result<()> {
     let cfg = crate::StoreConfig::default();
@@ -947,7 +971,7 @@ fn failover_order_carries_registry_multiaddrs() -> anyhow::Result<()> {
 }
 
 /// With neither a holder nor a reachable non-holder, the order is empty —
-/// the genuinely terminal case `probe_and_order` turns into an error before
+/// the genuinely terminal case `open_and_order` turns into an error before
 /// it ever calls this.
 #[test]
 fn failover_order_empty_when_no_holder_and_no_non_holder() {
@@ -1033,7 +1057,7 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
     };
 
     match classify_probe(&cand, answer(EMPTY_ROOT, true), EMPTY_ROOT, TS, &domain) {
-        ProbeOutcome::Holder(probed, _) => {
+        OpenOutcome::Holder(probed, _) => {
             assert_eq!(probed.total_bytes, Some(ProvenSize::assume_for_tests(0)));
             assert!(probed.coverage.is_empty());
         }
@@ -1042,7 +1066,7 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
     assert!(
         matches!(
             classify_probe(&cand, answer(EMPTY_ROOT, false), EMPTY_ROOT, TS, &domain),
-            ProbeOutcome::NonHolder(..)
+            OpenOutcome::NonHolder(..)
         ),
         "a chain-stale or opted-out node signs has_blob:false for the empty root and is a \
          non-holder, not a malformed answer"
@@ -1051,7 +1075,7 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
     assert!(
         matches!(
             classify_probe(&cand, answer(other_hash, true), other_hash, TS, &domain),
-            ProbeOutcome::Unusable
+            OpenOutcome::Unusable
         ),
         "an empty coverage with has_blob:true is malformed for a non-empty root"
     );
@@ -1121,13 +1145,13 @@ fn a_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
     let classify = |size_proof| classify_probe(&cand, answer(size_proof), hash, TS, &domain);
 
     match classify(Some(proof)) {
-        ProbeOutcome::Holder(probed, _) => {
+        OpenOutcome::Holder(probed, _) => {
             assert_eq!(probed.total_bytes.map(ProvenSize::get), Some(size));
         }
         _ => anyhow::bail!("a proven size keeps the holder"),
     }
     match classify(None) {
-        ProbeOutcome::Holder(probed, _) => assert_eq!(probed.total_bytes, None),
+        OpenOutcome::Holder(probed, _) => assert_eq!(probed.total_bytes, None),
         _ => anyhow::bail!("a holder that states no size is still a holder"),
     }
     for (what, size_proof) in [
@@ -1138,18 +1162,18 @@ fn a_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
         ("a huge size", SizeProof::new(1u64 << 60, vec![0xAB; 4000])?),
     ] {
         assert!(
-            matches!(classify(Some(size_proof)), ProbeOutcome::Unusable),
+            matches!(classify(Some(size_proof)), OpenOutcome::Unusable),
             "{what} drops the answer"
         );
     }
     Ok(())
 }
 
-/// A candidate's rate hint is its probe sample from this resolve, else the
+/// A candidate's rate hint is its answer's sample from this resolve, else the
 /// peer store's last rate; a candidate with neither is left out, and the
 /// order stays the failover order.
 #[test]
-fn rate_hints_prefer_the_probe_then_the_store() -> anyhow::Result<()> {
+fn rate_hints_prefer_the_answer_then_the_store() -> anyhow::Result<()> {
     let (mut targets, node_a, node_b) = tests_support::two_holder_targets();
     let dir = tempfile::tempdir()?;
     let store = crate::PeerStore::open(dir.path());
@@ -1157,7 +1181,7 @@ fn rate_hints_prefer_the_probe_then_the_store() -> anyhow::Result<()> {
     // The store knows b at 40; a's probe sample (1) wins over its store rate.
     store.record_sample(&node_a.node_id, 10.0, 99, now_secs(), &cfg)?;
     store.record_sample(&node_b.node_id, 20.0, 40, now_secs(), &cfg)?;
-    targets.probed_samples = vec![(node_a.node_id, 10.0, 1)];
+    targets.samples = vec![(node_a.node_id, 10.0, 1)];
     let hints = targets.rate_hints(&store);
     let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
     assert_eq!(got, vec![(node_a.eth_address, 1), (node_b.eth_address, 40)]);
@@ -1168,4 +1192,449 @@ fn rate_hints_prefer_the_probe_then_the_store() -> anyhow::Result<()> {
     let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
     assert_eq!(got, vec![(node_a.eth_address, 1)]);
     Ok(())
+}
+
+/// A payer context for discovery opens in these tests.
+fn open_ctx() -> PoolContext {
+    PoolContext::new(
+        alloy::primitives::B256::repeat_byte(0x11),
+        alloy::primitives::U256::ZERO,
+        Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+        decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33)),
+    )
+}
+
+/// The whole-blob open spec over `conns` and `ctx`, at `max_rate_per_mb`.
+fn spec<'a>(conns: &'a Connections, ctx: &'a PoolContext, max_rate_per_mb: u64) -> OpenSpec<'a> {
+    OpenSpec {
+        conns,
+        ctx,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        span: (0, 0),
+        max_rate_per_mb,
+    }
+}
+
+fn open_domain() -> alloy::sol_types::Eip712Domain {
+    decdn_incentive::slash_judge_domain(31_337, Address::repeat_byte(0x02))
+}
+
+fn served_blob() -> Vec<u8> {
+    (0..70_000u32).map(|i| (i % 251) as u8).collect()
+}
+
+/// Wait until `cond` holds, for at most two seconds.
+async fn eventually(what: &str, cond: impl Fn() -> bool) -> anyhow::Result<()> {
+    for _ in 0..200 {
+        if cond() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("timed out waiting for {what}")
+}
+
+/// A discovery open's failure classifies by what the node did: a shed is
+/// rate-limited, a timestamp refusal clock-skewed, an answer that does not
+/// verify unverifiable, and anything else unreachable.
+#[test]
+fn classify_open_types_each_failure() {
+    type Case = (anyhow::Error, fn(&OpenOutcome) -> bool);
+    let cand = harvest_candidate(1);
+    let cases: Vec<Case> = vec![
+        (
+            anyhow::Error::new(crate::UpstreamRateLimited { label: None }).context("open_bi"),
+            |o| matches!(o, OpenOutcome::RateLimited),
+        ),
+        (
+            anyhow::Error::new(crate::UpstreamTimestampRejected { label: None })
+                .context("read response"),
+            |o| matches!(o, OpenOutcome::ClockSkewed),
+        ),
+        (
+            anyhow::anyhow!("slash_sig verification failed").context(UnverifiedAnswer),
+            |o| matches!(o, OpenOutcome::Unverifiable),
+        ),
+        (anyhow::anyhow!("connect failed: timed out"), |o| {
+            matches!(o, OpenOutcome::Unreachable)
+        }),
+    ];
+    for (err, is) in cases {
+        let what = format!("{err:#}");
+        let (outcome, stream) = classify_open(&cand, Err(err), 0);
+        assert!(is(&outcome), "{what}");
+        assert!(stream.is_none());
+    }
+}
+
+/// A node that misses the blob answers a signed `NotFound`: it is a
+/// non-holder, kept as a pull-through target with its sample, and its stream
+/// is not kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_not_found_answer_is_a_warming_candidate() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let node = FakeNode::spawn(
+        Answer::Refuse {
+            error: decdn_protocol::client::StreamError::NotFound,
+            rate: 6,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let cand = node.candidate()?;
+    let targets = open_and_order(
+        std::slice::from_ref(&cand),
+        None,
+        [7; 32],
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Stream,
+    )
+    .await?;
+    assert_eq!(
+        targets
+            .candidates
+            .iter()
+            .map(|c| c.node_id)
+            .collect::<Vec<_>>(),
+        vec![cand.node_id],
+        "the non-holder is the cold pull-through target"
+    );
+    assert!(
+        targets.coverage_by_node.is_empty(),
+        "a non-holder has no coverage"
+    );
+    assert!(targets.size_hint.is_none());
+    assert_eq!(targets.opened.len(), 0, "a refusal leaves no stream");
+    assert!(
+        targets
+            .samples
+            .iter()
+            .any(|&(id, _, rate)| id == cand.node_id && rate == 6),
+        "a non-holder's verified answer is sampled"
+    );
+    client.close().await;
+    Ok(())
+}
+
+/// A holder that quotes above `--max-rate-per-mb` is left out and its stream
+/// reset; a holder under the ceiling stays. With every holder over it, the
+/// terminal error names the ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_max_quote_is_excluded() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let serve = |rate| Answer::Serve {
+        blob: blob.clone(),
+        rate,
+    };
+    let dear = FakeNode::spawn(serve(50), open_domain()).await?;
+    let cheap = FakeNode::spawn(serve(5), open_domain()).await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let candidates = vec![dear.candidate()?, cheap.candidate()?];
+    let targets = open_and_order(
+        &candidates,
+        None,
+        hash,
+        spec(&conns, &ctx, 10),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await?;
+    assert_eq!(
+        targets
+            .candidates
+            .iter()
+            .map(|c| c.node_id)
+            .collect::<Vec<_>>(),
+        vec![cheap.endpoint.id()],
+        "only the holder under the ceiling is ordered"
+    );
+    eventually("the over-ceiling stream reset", || {
+        Seen::count(&dear.seen.resets) == 1
+    })
+    .await?;
+    drop(targets);
+
+    let err = open_and_order(
+        &candidates[..1],
+        None,
+        hash,
+        spec(&conns, &ctx, 10),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("no holder under the ceiling"))?;
+    assert!(
+        err.to_string()
+            .contains("1 quoted above the --max-rate-per-mb ceiling"),
+        "{err:#}"
+    );
+    client.close().await;
+    Ok(())
+}
+
+/// An answer whose coverage disagrees with its signed `ok` is unverifiable,
+/// which the terminal error reports as a configuration fault to check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_coverage_inconsistent_answer_is_unverifiable() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let node = FakeNode::spawn(Answer::Inconsistent { blob }, open_domain()).await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let cand = node.candidate()?;
+    let res = open_candidate(
+        &cand,
+        None,
+        spec(&conns, &ctx, 0),
+        &open_domain(),
+        hash,
+        false,
+    )
+    .await;
+    let (outcome, stream) = classify_open(&cand, res, 0);
+    assert!(matches!(outcome, OpenOutcome::Unverifiable));
+    assert!(stream.is_none());
+    let err = open_and_order(
+        std::slice::from_ref(&cand),
+        None,
+        hash,
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("an unverifiable answer serves nothing"))?;
+    assert!(
+        err.downcast_ref::<ResolveConfigFault>().is_some(),
+        "{err:#}"
+    );
+    client.close().await;
+    Ok(())
+}
+
+/// A node that declines the blob is counted apart in the terminal error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_answer_is_named_in_the_terminal_error() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let node = FakeNode::spawn(
+        Answer::Refuse {
+            error: decdn_protocol::client::StreamError::Declined,
+            rate: 6,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let err = open_and_order(
+        &[node.candidate()?],
+        None,
+        [7; 32],
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a declining node serves nothing"))?;
+    assert!(err.to_string().contains("1 declined the blob"), "{err:#}");
+    client.close().await;
+    Ok(())
+}
+
+/// A round keeps each holder's stream open for the fetch to adopt, and a
+/// stream nobody takes is reset when the targets drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_round_keeps_each_holders_stream_until_the_targets_drop() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 4,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let targets = open_and_order(
+        &[node.candidate()?],
+        None,
+        hash,
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Stream,
+    )
+    .await?;
+    assert_eq!(targets.opened.len(), 1);
+    assert_eq!(
+        targets.size_hint.map(ProvenSize::get),
+        Some(u64::try_from(blob.len())?)
+    );
+    assert!(targets.samples.iter().any(|&(_, rtt, _)| rtt < f64::MAX));
+    assert_eq!(Seen::count(&node.seen.resets), 0);
+    drop(targets);
+    eventually("the unadopted stream reset", || {
+        Seen::count(&node.seen.resets) == 1
+    })
+    .await?;
+    client.close().await;
+    Ok(())
+}
+
+/// A late answer keeps its verified facts and its stream is cancelled as it
+/// arrives: the fetch adopts only a first-round stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_answer_keeps_its_facts_and_cancels_its_stream() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    use futures_util::StreamExt as _;
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 4,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let cand = node.candidate()?;
+    let res = open_candidate(
+        &cand,
+        None,
+        spec(&conns, &ctx, 0),
+        &open_domain(),
+        hash,
+        false,
+    )
+    .await;
+    let (outcome, stream) = classify_open(&cand, res, 0);
+    let tail: futures_util::stream::FuturesUnordered<_> =
+        std::iter::once(std::future::ready((cand.node_id, outcome, stream))).collect();
+    let slot = late_slot(OpenRound::Stream, tail, &[], no_warming());
+    let mut late = slot
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("a streamed tail"))?;
+    match late.tail.next().await {
+        Some(OpenOutcome::Holder(probed, _)) => {
+            assert_eq!(
+                probed.total_bytes.map(ProvenSize::get),
+                Some(u64::try_from(blob.len())?)
+            );
+            assert_eq!(probed.rate_per_mb, 4);
+            assert!(!probed.coverage.is_empty());
+        }
+        _ => anyhow::bail!("the late holder keeps its facts"),
+    }
+    eventually("the late stream reset", || {
+        Seen::count(&node.seen.resets) == 1
+    })
+    .await?;
+    client.close().await;
+    Ok(())
+}
+
+/// A pinned `--node-id` opens once, with pull-through, for the fetch's first
+/// leg: its proven size is the fetch's first size, and its stream is kept for
+/// the fetch to adopt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_open_asks_pull_through_and_keeps_its_stream() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let chain = offline_chain();
+    let domain = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 4,
+        },
+        domain,
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let pinned = PinnedNode {
+        node_id: node.endpoint.id(),
+        provider: node.operator_address(),
+        addr: node.addr.ip_addrs().next().copied(),
+    };
+    let open = OpenOpts {
+        marks: None,
+        round: OpenRound::Stream,
+        known_size: None,
+        spec: spec(&conns, &ctx, 0),
+    };
+    let targets = open_pinned(&chain, None, pinned, hash, open).await;
+    assert!(targets.pinned);
+    assert_eq!(
+        targets.size_hint.map(ProvenSize::get),
+        Some(u64::try_from(blob.len())?)
+    );
+    assert_eq!(targets.opened.len(), 1);
+    assert_eq!(Seen::count(&node.seen.opens), 1);
+    let pull_through = node
+        .seen
+        .requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .first()
+        .map(|(_, ext)| ext.pull_through);
+    assert_eq!(pull_through, Some(true));
+    drop(targets);
+    client.close().await;
+    Ok(())
+}
+
+/// Within one RTT band the cheaper quote leads, then the wider coverage; a
+/// nearer band always leads whatever its quote.
+#[test]
+fn holders_rank_by_rtt_band_then_quote_then_coverage() {
+    let mut near_dear = holder(1, 5.0);
+    near_dear.rate_per_mb = 9;
+    let mut near_cheap = holder(2, 15.0);
+    near_cheap.rate_per_mb = 3;
+    let mut near_cheap_wide = holder(3, 18.0);
+    near_cheap_wide.rate_per_mb = 3;
+    near_cheap_wide.coverage = decdn_protocol::Coverage::full(4);
+    let mut far_cheapest = holder(4, 45.0);
+    far_cheapest.rate_per_mb = 1;
+    let out = super::failover_order(
+        vec![far_cheapest, near_dear, near_cheap, near_cheap_wide],
+        &[],
+        warming_params(false),
+    );
+    let ids: Vec<_> = out.order.iter().map(|c| c.node_id).collect();
+    assert_eq!(
+        ids,
+        vec![node_key(3), node_key(2), node_key(1), node_key(4)],
+        "band 0 by quote then coverage, then band 2"
+    );
 }

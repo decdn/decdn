@@ -154,8 +154,8 @@ pub struct PinnedNode {
 pub struct DiscoveryOptions {
     /// The one node to fetch from. `None` discovers the holders.
     pub pinned: Option<PinnedNode>,
-    /// Read the registry and probe, even when the peer store holds a fresh
-    /// candidate set.
+    /// Read the registry and run a discovery round, even when the peer store
+    /// holds a fresh candidate set.
     pub rediscover: bool,
     /// How many holders one fetch stripes across at once.
     pub max_sources: usize,
@@ -186,10 +186,10 @@ impl Default for DiscoveryOptions {
 /// reached; the caller keeps the first.
 #[doc(hidden)]
 pub trait FetchMarks: Send + Sync {
-    /// Discovery starts a probe round.
+    /// Discovery starts a round of opens, or of probes.
     fn probe_started(&self);
     /// A lane's pool is open or reused, and its source is ready.
     fn lane_built(&self);
-    /// A holder joined the running fetch from a probe that answered late.
+    /// A holder joined the running fetch from an answer that arrived late.
     fn holder_joined(&self);
 }

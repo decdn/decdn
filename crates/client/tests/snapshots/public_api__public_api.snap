@@ -326,6 +326,7 @@ pub fn decdn_client::discovery::NodeCandidate::dial_addrs(&self) -> alloc::vec::
 pub struct decdn_client::discovery::Probed
 pub decdn_client::discovery::Probed::candidate: decdn_client::discovery::NodeCandidate
 pub decdn_client::discovery::Probed::coverage: decdn_protocol::coverage::Coverage
+pub decdn_client::discovery::Probed::rate_per_mb: u64
 pub decdn_client::discovery::Probed::rtt_ms: f64
 pub decdn_client::discovery::Probed::total_bytes: core::option::Option<decdn_bao_range::size_proof::ProvenSize>
 pub const decdn_client::discovery::BOOTSTRAP_UNREACHABLE: &str
@@ -923,6 +924,23 @@ pub fn decdn_client::source_set::NoNodeWillServe::fmt(&self, &mut core::fmt::For
 impl core::error::Error for decdn_client::source_set::NoSourceHasBlob
 impl core::fmt::Display for decdn_client::source_set::NoSourceHasBlob
 pub fn decdn_client::source_set::NoSourceHasBlob::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::OpenedStream
+impl decdn_client::OpenedStream
+pub const fn decdn_client::OpenedStream::answered_at(&self) -> tokio::time::instant::Instant
+pub fn decdn_client::OpenedStream::cancel(self)
+pub const fn decdn_client::OpenedStream::coverage(&self) -> &decdn_protocol::coverage::Coverage
+pub const fn decdn_client::OpenedStream::ext(&self) -> &decdn_protocol::client::StreamResponseExt
+pub fn decdn_client::OpenedStream::into_pull(self, &decdn_client::PoolContext, alloc::sync::Arc<decdn_client::PoolLedger>, u64, u64, decdn_client::PullDeadlines) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)>
+pub fn decdn_client::OpenedStream::paid_by(&self, &decdn_client::PoolContext) -> bool
+pub fn decdn_client::OpenedStream::peer(&self) -> iroh_base::key::PublicKey
+pub const fn decdn_client::OpenedStream::proven_size(&self) -> core::option::Option<decdn_bao_range::size_proof::ProvenSize>
+pub const fn decdn_client::OpenedStream::rate_per_mb(&self) -> u64
+pub const fn decdn_client::OpenedStream::response(&self) -> &decdn_protocol::client::StreamResponse
+pub fn decdn_client::OpenedStream::rtt(&self) -> core::option::Option<(f64, bool)>
+pub const fn decdn_client::OpenedStream::served(&self) -> bool
+pub const fn decdn_client::OpenedStream::span(&self) -> (u64, u64)
+impl core::fmt::Debug for decdn_client::OpenedStream
+pub fn decdn_client::OpenedStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::PeerSource<'a>
 impl<'a> decdn_client::source::PeerSource<'a>
 pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines, core::option::Option<decdn_client::connection::Connections>) -> Self
@@ -1015,11 +1033,8 @@ pub fn decdn_client::PullTimeout::fmt(&self, &mut core::fmt::Formatter<'_>) -> c
 pub struct decdn_client::RateAboveCeiling
 impl decdn_client::RateAboveCeiling
 pub const fn decdn_client::RateAboveCeiling::ceiling_rate_per_mb(&self) -> u64
-pub const fn decdn_client::RateAboveCeiling::evidence(&self) -> &decdn_protocol::client::StreamResponse
 pub const fn decdn_client::RateAboveCeiling::quoted_rate_per_mb(&self) -> u64
 impl core::error::Error for decdn_client::RateAboveCeiling
-impl core::fmt::Debug for decdn_client::RateAboveCeiling
-pub fn decdn_client::RateAboveCeiling::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for decdn_client::RateAboveCeiling
 pub fn decdn_client::RateAboveCeiling::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::RecoveryGate
@@ -1084,6 +1099,10 @@ pub decdn_client::UnprovenSize::total_bytes: u64
 impl core::error::Error for decdn_client::UnprovenSize
 impl core::fmt::Display for decdn_client::UnprovenSize
 pub fn decdn_client::UnprovenSize::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::UnverifiedAnswer
+impl core::error::Error for decdn_client::UnverifiedAnswer
+impl core::fmt::Display for decdn_client::UnverifiedAnswer
+pub fn decdn_client::UnverifiedAnswer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::UpstreamRefused
 impl decdn_client::UpstreamRefused
 pub const fn decdn_client::UpstreamRefused::error(&self) -> &decdn_protocol::client::StreamError
@@ -1122,6 +1141,6 @@ pub trait decdn_client::Funder: core::marker::Send + core::marker::Sync
 pub fn decdn_client::Funder::pool_spent(&self) -> core::option::Option<alloy_primitives::aliases::U256>
 pub fn decdn_client::Funder::recover(&self, alloy_primitives::aliases::U256) -> decdn_bao_range::ingest::SourceFuture<'_, decdn_client::source::Recovery>
 pub fn decdn_client::check_size_proof([u8; 32], &decdn_protocol::size_proof::SizeProof) -> core::result::Result<decdn_bao_range::size_proof::ProvenSize, decdn_client::UnprovenSize>
-pub const fn decdn_client::effective_rate_ceiling(u64, u64) -> u64
+pub async fn decdn_client::discovery_open(&decdn_client::connection::Connections, &iroh_base::endpoint_addr::EndpointAddr, alloy_primitives::bits::address::Address, &decdn_client::PoolContext, &alloy_sol_types::eip712::Eip712Domain, [u8; 32], [u8; 32], (u64, u64), bool, core::time::Duration) -> anyhow::Result<decdn_client::OpenedStream>
 pub type decdn_client::ProgressCallback = (dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync)
 pub type decdn_client::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>

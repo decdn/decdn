@@ -25,6 +25,7 @@ use decdn_protocol::{
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 
+use crate::path_rtt::{DIRECT_PATH_GRACE, PathRtt, direct_path_rtt};
 use crate::rate_limited::transport_error;
 
 /// The round-trip time one probe measured.
@@ -143,19 +144,6 @@ async fn probe_with(
     ))
 }
 
-/// The longest [`probe_once`] waits after its exchange for hole punching to
-/// select a direct path. The probe's `timeout` can cut the wait shorter.
-const DIRECT_PATH_GRACE: Duration = Duration::from_millis(500);
-
-/// [`ProbeRtt`] before the conversion to milliseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PathRtt {
-    /// The smaller of the exchange RTT and the direct-path RTT.
-    rtt: Duration,
-    /// Whether a direct path reported its RTT in time.
-    direct: bool,
-}
-
 /// Run `exchange` within `budget`, then let `direct` report a direct-path RTT
 /// for what is left of `budget`, at most [`DIRECT_PATH_GRACE`].
 ///
@@ -190,22 +178,6 @@ async fn exchange_within<C, R>(
         },
     };
     Ok((conn, resp, rtt))
-}
-
-/// The RTT estimate of the direct path `conn` selects, or `None` when the
-/// paths stream ends without one. A first exchange rides the relay until hole
-/// punching finishes, and the relay path says nothing about the direct path
-/// the paid stream then uses. A path is selected only once validated, so its
-/// estimate comes from real samples. The caller bounds the wait.
-async fn direct_path_rtt(conn: &Connection) -> Option<Duration> {
-    use futures_util::StreamExt as _;
-    let mut snapshots = conn.paths_stream();
-    while let Some(paths) = snapshots.next().await {
-        if let Some(path) = paths.iter().find(|path| path.is_ip() && path.is_selected()) {
-            return Some(path.rtt());
-        }
-    }
-    None
 }
 
 /// Verify a [`ProbeResponse`] the way a requester must before acting on it
