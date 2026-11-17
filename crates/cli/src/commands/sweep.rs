@@ -623,8 +623,8 @@ async fn find_sweeps(
         ensure_chain(&provider, deployment.chain_id, &pool).await?;
         let head = bounded("eth_blockNumber", provider.get_block_number()).await?;
         eprintln!(
-            "scanning {pool} for {operator}'s Swept events over blocks {}..={head}",
-            target.from_block
+            "scanning pool {} on chain {} for {operator}'s Swept events over blocks {}..={head}",
+            deployment.payment_pool, deployment.chain_id, target.from_block
         );
         let filter = Filter::new()
             .address(deployment.payment_pool)
