@@ -52,6 +52,7 @@ function status(overrides: Partial<GatewayStatus> = {}): GatewayStatus {
       pull_failures_other: 0,
       pulls_active: 0,
       pointer_updates: 0,
+      cache_hits: 0,
     },
     active_pulls: [],
     capabilities: [],

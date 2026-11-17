@@ -22,6 +22,24 @@ use decdn_protocol::client::{
     StreamError, StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
 };
 
+/// A span with no end, as the cache's bitfield gives the span that holds a
+/// blob's last chunk, runs to the end of the blob.
+#[test]
+fn an_open_span_runs_to_the_end_of_the_blob() {
+    use bao_tree::{ChunkNum, ChunkRanges};
+    let total = 10 * 1024 + 300;
+    assert_eq!(
+        contiguous_byte_ranges(&ChunkRanges::from(ChunkNum(0)..), total),
+        vec![(0, total)]
+    );
+    let held = ChunkRanges::from(ChunkNum(0)..ChunkNum(2)) | ChunkRanges::from(ChunkNum(8)..);
+    assert_eq!(
+        contiguous_byte_ranges(&held, total),
+        vec![(0, 2048), (8192, total - 8192)]
+    );
+    assert_eq!(ranges_content_len(&held, total), 2048 + total - 8192);
+}
+
 /// A store that fails a query ends the command as this machine's fault: no
 /// source caused it. A range the store refuses as out of bounds is about the
 /// request, so it is not marked.

@@ -16,6 +16,7 @@ export interface Counters {
   pull_failures_other: number;
   pulls_active: number;
   pointer_updates: number;
+  cache_hits: number;
 }
 
 export type Payer = { kind: "pool" } | { kind: "capability"; signer: string };

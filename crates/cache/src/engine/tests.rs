@@ -4636,6 +4636,31 @@ async fn origin_range_wire_hard_faults_on_wrong_length_outboard() -> anyhow::Res
     Ok(())
 }
 
+/// An origin size claim past the engine's blob cap reads no outboard: the
+/// claim would otherwise size the outboard read itself.
+#[tokio::test]
+async fn an_origin_size_past_the_blob_cap_reads_no_outboard() -> anyhow::Result<()> {
+    let (_data, hash, origin, _aligned) = multi_window_stub();
+    let origin = Arc::new(origin);
+    let tmp = tempfile::tempdir()?;
+    let engine =
+        CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 1).await?;
+    let claim = (1u64 << 20) + 1;
+    anyhow::ensure!(
+        engine
+            .origin_fetch_outboard_bytes(hash, claim)
+            .await?
+            .is_none(),
+        "a size claim past the cap must read no outboard"
+    );
+    anyhow::ensure!(
+        origin.outboard_fetches.load(Ordering::SeqCst) == 0,
+        "the origin must not be asked for the outboard, asked {}",
+        origin.outboard_fetches.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
+
 /// Every draw of one hash reuses the outboard the first draw read: the origin
 /// serves `{H}.obao4` once, however many draws follow.
 #[tokio::test]
@@ -5148,6 +5173,121 @@ async fn admit_bao_stream_admits_a_partial_range() {
     assert!(
         engine.eviction_candidates().contains_key(&hash),
         "a streamed partial is an eviction candidate with no serve after it (#2157)"
+    );
+}
+
+#[tokio::test]
+async fn admit_bao_stream_until_reports_each_chunk_group_and_drains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 4 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+
+    let seen = std::sync::Mutex::new(Vec::new());
+    let on_progress = |end: u64| seen.lock().unwrap().push(end);
+    let (_reader, end) = engine
+        .admit_bao_stream_until(
+            hash,
+            ranges,
+            total,
+            bao.slice(8..),
+            None,
+            crate::AdmitControl {
+                on_progress: Some(&on_progress),
+                stop_at: None,
+            },
+        )
+        .await
+        .map_err(|(_reader, e)| e)
+        .unwrap();
+
+    assert_eq!(end, crate::AdmitEnd::Drained);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![group, 2 * group, 3 * group, 4 * group],
+        "one report per chunk group, each the end of the verified prefix"
+    );
+    assert!(engine.present_ranges(hash).await.unwrap().is_complete());
+}
+
+#[tokio::test]
+async fn admit_bao_stream_until_refuses_a_controlled_multi_span_admit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 4 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let (hash, _, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+    let chunks = |groups: u64| bao_tree::ChunkNum(groups * group / 1024);
+    let two_spans = bao_tree::ChunkRanges::from(chunks(0)..chunks(1))
+        | bao_tree::ChunkRanges::from(chunks(2)..chunks(3));
+
+    let stop_at = AtomicU64::new(u64::MAX);
+    let result = engine
+        .admit_bao_stream_until(
+            hash,
+            two_spans,
+            total,
+            bao.slice(8..),
+            None,
+            crate::AdmitControl {
+                on_progress: None,
+                stop_at: Some(&stop_at),
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err((_, CacheError::Internal(_)))),
+        "a controlled admit over two spans is refused"
+    );
+    assert!(
+        engine.present_ranges(hash).await.unwrap().is_empty(),
+        "nothing is admitted"
+    );
+}
+
+#[tokio::test]
+async fn admit_bao_stream_until_stops_at_a_lowered_end_and_keeps_the_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 8 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+
+    // The end sits inside the third group: the admit stops once the prefix
+    // covers it, at the third group's end.
+    let stop_at = AtomicU64::new(2 * group + 1);
+    let (_reader, end) = engine
+        .admit_bao_stream_until(
+            hash,
+            ranges,
+            total,
+            bao.slice(8..),
+            None,
+            crate::AdmitControl {
+                on_progress: None,
+                stop_at: Some(&stop_at),
+            },
+        )
+        .await
+        .map_err(|(_reader, e)| e)
+        .unwrap();
+
+    assert_eq!(end, crate::AdmitEnd::Stopped);
+    let present = engine.present_ranges(hash).await.unwrap();
+    assert_eq!(
+        present.chunk_ranges(),
+        &bao_tree::ChunkRanges::from(..bao_tree::ChunkNum(3 * group / 1024)),
+        "exactly the verified prefix is present"
+    );
+    assert_eq!(
+        count_tags_for(&engine, hash).await,
+        1,
+        "a stopped admit protects its prefix as a whole admit does"
     );
 }
 

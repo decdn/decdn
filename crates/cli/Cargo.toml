@@ -88,16 +88,20 @@ url = { workspace = true }
 decdn-incentive = { workspace = true, features = ["redb"] }
 # `decdn get` (issues #391, #2449): the standalone client-side paid pull reuses the
 # shared `cdn/client/v1` requester. `decdn-client` depends only on `blake3` for
-# content verification (NOT iroh-blobs), so the CLI's iroh-blobs-free invariant
-# (#578) holds — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
+# content verification, not iroh-blobs (#578).
 decdn-client = { workspace = true }
 # `decdn origin import` (#1904) seeds a filesystem cache origin: it writes each
 # blob's sharded data object plus its `{hex}.obao4` pre-order bao outboard, which
 # must match the daemon's own encoding at `IROH_BLOCK_SIZE`. The `bao-range` leaf
 # crate owns that outboard encoder and the `.obao4` layout contract shared with
-# the cache reader; it depends only on `bao-tree`, so the iroh-blobs-free
-# invariant (#578) holds — already in this binary's tree via `decdn-client`.
+# the cache reader; it depends only on `bao-tree`, and is already in this
+# binary's tree via `decdn-client`.
 decdn-bao-range = { workspace = true }
+# `decdn gateway` caches what it pulls in a `CacheEngine` and serves repeat
+# requests from it. The store-only build links iroh-blobs and no AWS SDK.
+decdn-cache = { workspace = true }
+# The chunk-range type the gateway cache's store answers presence in.
+bao-tree = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -111,12 +115,10 @@ rand = { workspace = true }
 # `decdn origin import --dry-run` (issue #391): directory walk + glob
 # exclude + streaming BLAKE3. `blake3` is used directly for the bundle
 # digest.
-# The *entire* CLI is free of iroh-blobs / the AWS SDK: the
-# config-vocabulary types `decdn-common` needs live in the
-# `decdn-config-types` leaf crate, so `cli → common → config-types`
-# does not drag in `decdn-cache` (see `appendix-binaries.md` §
-# binary-size). Verify with
-# `cargo tree -p decdn-cli -e normal -i iroh-blobs` (must be empty).
+# The CLI is free of the AWS SDK: it links `decdn-cache` store-only, and
+# the config-vocabulary types `decdn-common` needs live in the
+# `decdn-config-types` leaf crate. Verify with
+# `cargo tree -p decdn-cli -e normal -i aws-config` (must be empty).
 # `tempfile` is also a runtime dep here because writing a bundle manifest
 # to disk (`origin import --bundle`) is atomic via `NamedTempFile::persist`
 # — a unique
@@ -196,13 +198,13 @@ zip = { workspace = true }
 decdn-incentive = { workspace = true, features = ["redb", "test-util"] }
 # `ScriptedSource` and `StaticSources` drive the acquire loop in unit tests.
 decdn-client = { workspace = true, features = ["test-util"] }
+# The gateway cache store's tests feed it bao through an in-memory reader.
+iroh-io = { workspace = true }
 # Integration tests in `tests/admin_rpc.rs` exercise the loopback admin
 # RPC end-to-end against a real `AdminState` spawned from the daemon
-# crate, so the daemon's surface is a dev-dependency here. `decdn-cache`
-# is needed to construct the `CacheEngine` the admin server runs against.
+# crate, so the daemon's surface is a dev-dependency here.
 # None of this leaks into the `decdn` binary's release dep tree.
 decdn-node = { workspace = true }
-decdn-cache = { workspace = true }
 # The admin-RPC tests stand up their own jsonrpsee server too; the `decdn`
 # binary links only the client half (#2454).
 jsonrpsee = { workspace = true, features = ["server"] }

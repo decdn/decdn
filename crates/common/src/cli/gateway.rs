@@ -32,6 +32,13 @@ pub struct GatewayArgs {
     #[arg(long, value_name = "ADDR", value_parser = parse_loopback_addr)]
     pub metrics_listen: Option<SocketAddr>,
 
+    /// MiB the gateway keeps of what it pulled, under `<data-dir>/cache`, to
+    /// serve a later request for the same bytes without a pull. A request
+    /// the cache answers whole costs no allowance. It shrinks below this to
+    /// keep 8 GiB of the volume free; `0` turns the cache off.
+    #[arg(long, value_name = "MIB", default_value_t = 10240)]
+    pub cache_mb: u64,
+
     /// Discovery and chain flags, as `decdn get` takes them. A loopback
     /// gateway holds its own delegate keys and registered capabilities, so
     /// the keystore and capability flags do not apply to it; a public gateway

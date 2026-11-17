@@ -16,6 +16,13 @@ bao-tree = { workspace = true }
 bytes = { workspace = true }
 positioned-io = { workspace = true }
 thiserror = { workspace = true }
+# The pull-side store contract (`ingest`): its futures return `anyhow`
+# results, its reader is an `iroh_io::AsyncStreamReader`, and a streaming
+# store wakes its reader through a `tokio::sync::Notify`. None of the three is
+# the blob store.
+anyhow = { workspace = true }
+iroh-io = { workspace = true }
+tokio = { workspace = true }
 
 [features]
 # Exposes the shared `RangedStore` conformance suite (`conformance::run_all`)

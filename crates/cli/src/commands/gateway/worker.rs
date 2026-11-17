@@ -44,7 +44,9 @@ use tokio::io::DuplexStream;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use super::super::fetch::{BlobFetch, Credential, Delegation, FetchHost, Payer, Sink, fetch_on};
+use super::super::fetch::{
+    BlobFetch, CacheStores, Credential, Delegation, FetchHost, Payer, Sink, fetch_on,
+};
 use super::super::fetch_timings::FetchTimings;
 
 /// Who pays for a pull.
@@ -271,6 +273,9 @@ pub(super) struct FetchBackend {
     /// reads `--keystore` and funds the pool, and every [`Payment::Pool`] pull
     /// shares one payer. Otherwise every pull pays with a held key.
     pub(super) pool: bool,
+    /// The gateway cache every pull streams into, or `None` for a scratch
+    /// directory per pull.
+    pub(super) cache: Option<CacheStores>,
 }
 
 impl Backend for FetchBackend {
@@ -279,7 +284,9 @@ impl Backend for FetchBackend {
     type Payer = Payer;
 
     async fn open(&self) -> anyhow::Result<Self::Host> {
-        FetchHost::open(&self.common, self.config_path.as_deref(), !self.pool).await
+        let (host, grant) =
+            FetchHost::open(&self.common, self.config_path.as_deref(), !self.pool).await?;
+        Ok((host.with_stream_cache(self.cache.clone()), grant))
     }
 
     fn payer(&self, credential: Credential) -> anyhow::Result<Payer> {

@@ -414,6 +414,18 @@ async fn test_gateway_in(
     public: Option<Public>,
     worker_slots: usize,
 ) -> Arc<Gateway> {
+    test_gateway_cached(backend, common, sites, public, worker_slots, None).await
+}
+
+/// [`test_gateway_in`] serving repeat requests out of `cache`.
+async fn test_gateway_cached(
+    backend: impl worker::Backend,
+    common: cli::ClientFetchArgs,
+    sites: SiteDomain,
+    public: Option<Public>,
+    worker_slots: usize,
+    cache: Option<CacheEngine>,
+) -> Arc<Gateway> {
     let token = matches!(sites, SiteDomain::Loopback { .. }).then(|| TEST_TOKEN.to_owned());
     assert_eq!(matches!(sites, SiteDomain::Public { .. }), public.is_some());
     let pool = decdn_incentive::Deployment {
@@ -440,6 +452,7 @@ async fn test_gateway_in(
         chain,
         delegates: Mutex::new(HashMap::new()),
         pulls: PullWorker::start(backend, worker_slots).await.unwrap(),
+        cache,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
         manifest_fills: std::sync::Mutex::default(),
@@ -3009,6 +3022,21 @@ async fn a_raw_blob_past_the_blob_cap_answers_413_with_no_pull() {
     assert_eq!(*logs.ranges.lock().unwrap(), [Some((0, 4))]);
 }
 
+/// A bundle entry whose declared size passes `--max-blob-mb` answers 413 as a
+/// raw blob does: the manifest pulls, the entry does not.
+#[tokio::test]
+async fn an_entry_past_the_blob_cap_answers_413_with_no_entry_pull() {
+    let manifest = serde_json::json!({"version": 1, "entries": [
+        {"path": "huge.bin", "hash": alloy::hex::encode(ENTRY), "size": 3 << 20},
+    ]})
+    .to_string()
+    .into_bytes();
+    let (gateway, caps) = recording_gateway(Reply::Bytes(manifest), &["--max-blob-mb", "2"]).await;
+    let (status, body) = get(&gateway, &format!("/{}/huge.bin", alloy::hex::encode(BLOB))).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(caps.lock().unwrap().len(), 1, "only the manifest pulls");
+}
+
 /// A raw blob of verified size takes one `Range`, as a sized entry does: 206
 /// over the window, and 416 with the size for a window past the end, with
 /// no pull.
@@ -4326,4 +4354,216 @@ async fn another_namespace_does_not_wait_on_a_fill() {
     pulls_reach(&caps, 2).await;
     abort_held(first).await;
     abort_held(second).await;
+}
+
+/// The bytes the cache tests serve: text, so a response body reads as a
+/// string, and longer than one chunk group.
+fn cached_text() -> String {
+    "cached bytes ".repeat(3_000)
+}
+
+/// A cache under `dir` holding `range` of `data` (`(0, len)` for all of it),
+/// and the blob's hash.
+async fn cache_holding(dir: &Path, data: &[u8], range: (u64, u64)) -> (CacheEngine, [u8; 32]) {
+    let engine = CacheEngine::open(dir, Vec::new(), 0).await.unwrap();
+    let root = admit(&engine, data, range).await;
+    (engine, root)
+}
+
+/// Admit `range` of `data` (`(0, len)` for all of it) into `engine`, and
+/// return the blob's hash.
+async fn admit(engine: &CacheEngine, data: &[u8], range: (u64, u64)) -> [u8; 32] {
+    let outboard =
+        bao_tree::io::outboard::PreOrderMemOutboard::create(data, decdn_bao_range::IROH_BLOCK_SIZE);
+    let root = *outboard.root.as_bytes();
+    let total = u64::try_from(data.len()).unwrap();
+    let aligned = decdn_bao_range::align_range(range.0, range.1, total).unwrap();
+    let start = usize::try_from(aligned.fetch_start()).unwrap();
+    let end = usize::try_from(aligned.fetch_end()).unwrap();
+    let wire = decdn_bao_range::encode_verified_range(
+        root,
+        &aligned,
+        &data[start..end],
+        Bytes::from(outboard.data),
+    )
+    .unwrap();
+    engine
+        .admit_bao_stream(
+            decdn_cache::Hash::from_bytes(root),
+            aligned.chunk_ranges().clone(),
+            total,
+            wire.slice(8..),
+            None,
+        )
+        .await
+        .map_err(|(_, e)| e)
+        .unwrap();
+    root
+}
+
+/// A public gateway that can start no pull, with `allowance` bytes a day and
+/// `cache`.
+async fn cached_public_gateway(
+    allowance: u64,
+    cache: CacheEngine,
+    pointers_dir: &Path,
+) -> Arc<Gateway> {
+    let sites = SiteDomain::Public {
+        origin: "https://decdn.test".parse().unwrap(),
+    };
+    let public = public_with(Allowance::with_namespaces(allowance, []), pointers_dir);
+    test_gateway_cached(NoPulls, flags(&[]), sites, Some(public), 1, Some(cache)).await
+}
+
+/// A blob the cache holds whole is served from it with its length: no pull,
+/// and nothing charged against an allowance far smaller than the blob.
+#[tokio::test]
+async fn a_cached_blob_is_served_with_no_pull_and_no_allowance() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cached_text();
+    let len = u64::try_from(text.len()).unwrap();
+    let (cache, hash) = cache_holding(&dir.path().join("cache"), text.as_bytes(), (0, len)).await;
+    let gateway = cached_public_gateway(10, cache, dir.path()).await;
+
+    let path = format!("/{}", alloy::hex::encode(hash));
+    let answer = request(&gateway, "decdn.test", &path, &[]).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body, text);
+    assert_eq!(
+        answer.header(header::CONTENT_LENGTH),
+        Some(len.to_string().as_str())
+    );
+    let allowance = &gateway.public.as_ref().unwrap().allowance;
+    assert_eq!(allowance.remaining(None, now_secs()), Ok(10));
+    let counters = gateway.metrics.snapshot();
+    assert_eq!(counters.cache_hits, 1);
+    assert_eq!(counters.bytes_served, len);
+}
+
+/// A `Range` the cache holds is served from it as a 206, with its
+/// `Content-Range`.
+#[tokio::test]
+async fn a_cached_range_is_served_from_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cached_text();
+    let len = u64::try_from(text.len()).unwrap();
+    let (cache, hash) = cache_holding(&dir.path().join("cache"), text.as_bytes(), (0, len)).await;
+    let gateway = cached_public_gateway(10, cache, dir.path()).await;
+
+    let path = format!("/{}", alloy::hex::encode(hash));
+    let range = [(header::RANGE.as_str(), "bytes=100-199")];
+    let answer = request(&gateway, "decdn.test", &path, &range).await;
+    assert_eq!(
+        answer.status,
+        StatusCode::PARTIAL_CONTENT,
+        "{}",
+        answer.body
+    );
+    assert_eq!(answer.body, text[100..200]);
+    assert_eq!(
+        answer.header(header::CONTENT_RANGE),
+        Some(format!("bytes 100-199/{len}").as_str())
+    );
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 1);
+}
+
+/// A cache entry that does not hold the bytes a request asks for is no hit:
+/// the request goes to a pull.
+#[tokio::test]
+async fn a_partial_entry_that_misses_the_request_is_no_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cached_text();
+    let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+    let (cache, hash) = cache_holding(&dir.path().join("cache"), text.as_bytes(), (0, group)).await;
+    let gateway = cached_public_gateway(u64::MAX, cache, dir.path()).await;
+
+    let path = format!("/{}", alloy::hex::encode(hash));
+    let answer = request(&gateway, "decdn.test", &path, &[]).await;
+    assert_ne!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 0);
+}
+
+/// A spent allowance still serves what the cache holds whole, since a hit
+/// costs it nothing; a blob the cache lacks gets the 402.
+#[tokio::test]
+async fn a_spent_allowance_still_serves_a_cached_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cached_text();
+    let len = u64::try_from(text.len()).unwrap();
+    let (cache, hash) = cache_holding(&dir.path().join("cache"), text.as_bytes(), (0, len)).await;
+    let gateway = cached_public_gateway(10, cache, dir.path()).await;
+    let allowance = &gateway.public.as_ref().unwrap().allowance;
+    allowance.charge(None, 10, now_secs());
+    assert!(allowance.remaining(None, now_secs()).is_err(), "spent");
+
+    let cached = format!("/{}", alloy::hex::encode(hash));
+    let answer = request(&gateway, "decdn.test", &cached, &[]).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body, text);
+
+    let missing = format!("/{}", alloy::hex::encode(OTHER));
+    let refused = request(&gateway, "decdn.test", &missing, &[]).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 1);
+}
+
+/// With the allowance spent, a site's entry and its `/` come out of the
+/// cache, manifest included: the manifest is read from the cache too, so
+/// nothing pulls.
+#[tokio::test]
+async fn a_spent_allowance_still_serves_a_cached_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(&dir.path().join("cache"), Vec::new(), 0)
+        .await
+        .unwrap();
+    let text = cached_text();
+    let page = b"<p>cached page</p>".to_vec();
+    let text_hash = admit(&engine, text.as_bytes(), (0, text.len() as u64)).await;
+    let page_hash = admit(&engine, &page, (0, page.len() as u64)).await;
+    let manifest = serde_json::json!({"version": 1, "entries": [
+        {"path": "a.txt", "hash": alloy::hex::encode(text_hash), "size": text.len()},
+        {"path": "index.html", "hash": alloy::hex::encode(page_hash), "size": page.len()},
+    ]})
+    .to_string()
+    .into_bytes();
+    let bundle = admit(&engine, &manifest, (0, manifest.len() as u64)).await;
+    let gateway = cached_public_gateway(10, engine, dir.path()).await;
+    gateway
+        .public
+        .as_ref()
+        .unwrap()
+        .allowance
+        .charge(None, 10, now_secs());
+    let host = gateway.sites.site_host(&Site {
+        hash: bundle,
+        namespace: None,
+    });
+
+    let entry = send(&gateway, Method::GET, &host, "/a.txt", &[]).await;
+    assert_eq!(entry.status, StatusCode::OK, "{}", entry.body);
+    assert_eq!(entry.body, text);
+    let root = send(&gateway, Method::GET, &host, "/", &[]).await;
+    assert_eq!(root.status, StatusCode::OK, "{}", root.body);
+    assert_eq!(root.body.as_bytes(), page.as_slice());
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 2);
+}
+
+/// A loopback page no capability covers gets the 402 even for a blob the
+/// cache holds whole: the refusal is how the page learns to register a
+/// capability, and the SDK contract pins it.
+#[tokio::test]
+async fn a_page_with_no_capability_gets_402_even_for_a_cached_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cached_text();
+    let len = u64::try_from(text.len()).unwrap();
+    let (cache, hash) = cache_holding(&dir.path().join("cache"), text.as_bytes(), (0, len)).await;
+    let sites = SiteDomain::Loopback {
+        listen: "127.0.0.1:8484".parse().unwrap(),
+    };
+    let gateway = test_gateway_cached(NoPulls, flags(&[]), sites, None, 1, Some(cache)).await;
+
+    let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(hash))).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+    assert!(body.contains("no capability covers"), "{body}");
+    assert_eq!(gateway.metrics.snapshot().cache_hits, 0);
 }

@@ -82,6 +82,31 @@ async fn healthz_ok() {
     assert_eq!(v, json!({"ok": true}));
 }
 
+/// Every response forbids framing, the gate page's included, and so does a
+/// route the onramp does not serve.
+#[tokio::test]
+async fn every_response_forbids_framing() {
+    let app = sponsord_onramp::http::router(app_state_with_fakes().await);
+    for req in [
+        get("/healthz"),
+        get(&format!("/fund?client={CLIENT}")),
+        get("/decdn.sh"),
+        poll(),
+        fund(),
+        get("/no-such-route"),
+    ] {
+        let uri = req.uri().clone();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get("content-security-policy").unwrap(),
+            "frame-ancestors 'none'",
+            "{uri}"
+        );
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY", "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn fund_issues_a_token_the_poll_then_returns() {
     let (state, fakes) = app_state_with_options(FakeOptions::default()).await;

@@ -784,9 +784,9 @@ contract CapacityBond is
     // Region self-attestation (ADR 030)
     // -----------------------------------------------------------------
 
-    /// @notice Update the operator's region. The first call has no cooldown
-    ///         (operators may correct their initial `registerNode` region);
-    ///         every subsequent call is gated by `regionStabilityWindow`.
+    /// @notice Update the operator's region. Every call is gated by
+    ///         `regionStabilityWindow`, counted from the registration or the
+    ///         change that set the current region.
     /// @dev    The new region is stored in the operator's `NodeInfo.regionHint`
     ///         so all downstream readers (`getRegisteredNodes`, off-chain DHT)
     ///         see the same source of truth. `regionPrev` retains the prior
@@ -812,22 +812,34 @@ contract CapacityBond is
         // `regionLastChanged` is stamped at registration and on every change, so
         // the stability-window cooldown applies uniformly from the moment the
         // current region took effect — including an operator's first change.
+        _requireRegionCooldownElapsed();
+
+        emit RegionUpdated(info.nodeId, _setRegion(info, newRegion), newRegion);
+    }
+
+    /// @dev ADR 030 § Cooldown: reverts `RegionCooldownActive` until
+    ///      `regionStabilityWindow` has elapsed since `regionLastChanged`.
+    function _requireRegionCooldownElapsed() internal view {
         uint64 readyAt = regionLastChanged[msg.sender] + uint64(regionStabilityWindow);
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < readyAt) revert RegionCooldownActive(readyAt);
-
-        emit RegionUpdated(info.nodeId, _setRegion(info, newRegion), newRegion);
     }
 
     /// @dev ADR 030 § Region-stability window: a region change snapshots the
     ///      old region into `regionPrev`, so its entries keep applying until the
     ///      change ripens; an unchanged region keeps the existing snapshot.
-    ///      `regionLastChanged` is stamped on every call, so it is never 0 for an
-    ///      active node, and both the ripening window and the `updateRegion`
-    ///      cooldown run from it. A re-registration restarts the window.
+    ///      A change is subject to the `updateRegion` cooldown on every path, so
+    ///      a deregister/re-register cycle cannot flip the region twice inside
+    ///      one window and push the serve-time region out of both slots. A
+    ///      first registration (`regionLastChanged == 0`) has no prior region
+    ///      and skips the cooldown. `regionLastChanged` is stamped on every
+    ///      call, so it is never 0 for an active node, and both the ripening
+    ///      window and the cooldown run from it. A re-registration restarts the
+    ///      window.
     function _setRegion(NodeInfo storage info, string calldata newRegion) internal returns (string memory oldRegion) {
         oldRegion = info.regionHint;
         if (keccak256(bytes(oldRegion)) != keccak256(bytes(newRegion))) {
+            if (regionLastChanged[msg.sender] != 0) _requireRegionCooldownElapsed();
             regionPrev[msg.sender] = oldRegion;
             info.regionHint = newRegion;
         }

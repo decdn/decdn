@@ -1,6 +1,6 @@
 //! The gateway's metrics: what it served, refused and failed, as Prometheus
 //! text exposition and as the `counters` of `/_status`. Hand-rolled as
-//! `sponsord`'s are (a registry crate would add a shape of its own for nine
+//! `sponsord`'s are (a registry crate would add a shape of its own for ten
 //! series).
 //!
 //! One unlabeled sibling counter per outcome, as `adr/appendix-observability.md`
@@ -27,6 +27,7 @@ pub(super) struct Metrics {
     pull_failures_other: AtomicU64,
     pulls_active: AtomicU64,
     pointer_updates: AtomicU64,
+    cache_hits: AtomicU64,
 }
 
 /// One read of every counter in [`Metrics`]. Each field has the name of its
@@ -52,6 +53,8 @@ pub(super) struct Counters {
     pub(super) pulls_active: u64,
     /// Namespace pointers stored.
     pub(super) pointer_updates: u64,
+    /// Responses read whole out of the cache, with no pull.
+    pub(super) cache_hits: u64,
 }
 
 impl Metrics {
@@ -95,6 +98,11 @@ impl Metrics {
         self.pointer_updates.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A response is read whole out of the cache.
+    pub(super) fn cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read every counter.
     pub(super) fn snapshot(&self) -> Counters {
         let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -108,6 +116,7 @@ impl Metrics {
             pull_failures_other: read(&self.pull_failures_other),
             pulls_active: read(&self.pulls_active),
             pointer_updates: read(&self.pointer_updates),
+            cache_hits: read(&self.cache_hits),
         }
     }
 
@@ -125,8 +134,9 @@ impl Metrics {
             pull_failures_other,
             pulls_active,
             pointer_updates,
+            cache_hits,
         } = self.snapshot();
-        let series: [(&str, &str, &str, u64); 9] = [
+        let series: [(&str, &str, &str, u64); 10] = [
             (
                 "decdn_gateway_bytes_served_total",
                 "counter",
@@ -182,6 +192,12 @@ impl Metrics {
                 "counter",
                 "Namespace pointers stored through PUT /_pointer.",
                 pointer_updates,
+            ),
+            (
+                "decdn_gateway_cache_hits_total",
+                "counter",
+                "Responses read whole out of the gateway cache, with no pull and no allowance.",
+                cache_hits,
             ),
         ];
         let mut out = String::new();

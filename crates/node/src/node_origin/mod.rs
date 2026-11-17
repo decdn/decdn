@@ -40,7 +40,6 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
-mod admit_store;
 mod backend_source;
 mod buyer_route;
 pub use buyer_route::BuyerPool;
@@ -50,8 +49,8 @@ mod ranged_pull;
 pub(crate) use ranged_pull::planned_len;
 mod timed_source;
 
-pub(crate) use admit_store::NodeAdmitStore;
 pub(crate) use backend_source::BackendSource;
+pub(crate) use decdn_cache::CacheStore;
 pub(crate) use funder::NodeFunder;
 use funder::{SETTLE_POLL_STEP, settle_window};
 pub(crate) use pull_leg::{
@@ -2265,7 +2264,7 @@ async fn recover_unfunded(
 
 /// The content bytes `store` holds of its `total_bytes` blob, or `None` when
 /// the store cannot answer.
-async fn held_bytes(store: &NodeAdmitStore, total_bytes: u64) -> Option<u64> {
+async fn held_bytes(store: &CacheStore, total_bytes: u64) -> Option<u64> {
     use decdn_client::RangedStore as _;
     let missing = store.missing_ranges(0, total_bytes).await.ok()?;
     let chunk = |n: bao_tree::ChunkNum| n.0.saturating_mul(1024).min(total_bytes);
@@ -2665,8 +2664,8 @@ async fn pull_from_candidate_in_span(
             .build()?;
         let _entered = pull_span.enter();
         Ok::<_, std::io::Error>(rt.block_on(async move {
-            let store = NodeAdmitStore::new(engine, hash, total_bytes, None)
-                .counting_received(Arc::clone(&metrics));
+            let store =
+                CacheStore::new(engine, hash, total_bytes).on_admitted(counting_received(&metrics));
             // Capture the lane seed before `ctx` moves behind the mutex, so the
             // on-thread settle can tell whether this stream advanced the watermark.
             let pool_id = ctx.pool_id;
@@ -3795,6 +3794,23 @@ fn now_micros() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
+/// Count each admitted leg's content into `decdn_bytes_received_total`. For
+/// the paid node-to-node pulls only, so an operator's own-origin fill through
+/// the same store is not counted as bytes received from peers.
+pub(crate) fn counting_received(metrics: &Arc<Metrics>) -> decdn_cache::OnAdmitted {
+    let metrics = Arc::clone(metrics);
+    Arc::new(move |bytes| metrics.bytes_received(bytes))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation
+)]
+mod store_fault_tests;

@@ -15,6 +15,7 @@ fn every_series_exports_at_zero() {
         "decdn_gateway_pull_failures_other_total",
         "decdn_gateway_pulls_active",
         "decdn_gateway_pointer_updates_total",
+        "decdn_gateway_cache_hits_total",
     ] {
         assert!(text.contains(&format!("# TYPE {name} ")), "{name}: {text}");
         assert!(
@@ -49,8 +50,10 @@ fn outcomes_count_under_their_siblings() {
     metrics.pull_started();
     metrics.pull_ended();
     metrics.pointer_updated();
+    metrics.cache_hit();
     let text = metrics.render();
     for line in [
+        "decdn_gateway_cache_hits_total 1",
         "decdn_gateway_requests_ok_total 3",
         "decdn_gateway_requests_not_found_total 1",
         "decdn_gateway_requests_allowance_exhausted_total 1",
@@ -84,6 +87,7 @@ fn snapshot_and_exposition_agree() {
     metrics.bytes(4_096);
     metrics.pull_started();
     metrics.pointer_updated();
+    metrics.cache_hit();
     let snapshot = metrics.snapshot();
     assert_eq!(
         snapshot,
@@ -97,6 +101,7 @@ fn snapshot_and_exposition_agree() {
             pull_failures_other: 1,
             pulls_active: 1,
             pointer_updates: 1,
+            cache_hits: 1,
         }
     );
     let json = serde_json::to_value(snapshot).unwrap_or_default();

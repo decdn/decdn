@@ -14,7 +14,9 @@ use sponsord_api::onramp::routes;
 
 use crate::state::AppState;
 
-/// The onramp's routes over `state`.
+/// The onramp's routes over `state`. Every response forbids framing:
+/// `Content-Security-Policy: frame-ancestors 'none'` and
+/// `X-Frame-Options: DENY`.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route(routes::HEALTHZ, get(healthz))
@@ -23,7 +25,22 @@ pub fn router(state: AppState) -> Router {
         .route(routes::FUND_PAGE, get(fund::page))
         .route(routes::FUND, post(fund::submit))
         .route(routes::CAPABILITY, get(capability::get))
+        .layer(axum::middleware::map_response(deny_framing))
         .with_state(state)
+}
+
+/// Forbid every site from framing `resp`: `Content-Security-Policy:
+/// frame-ancestors 'none'`, and `X-Frame-Options: DENY` for browsers without
+/// CSP. A framed gate page would let another site's visitors solve the gate
+/// for keys that site chose.
+async fn deny_framing(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    resp
 }
 
 async fn healthz() -> Json<Health> {
