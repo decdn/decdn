@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 
 import { CctpSweepReceiver } from "../src/CctpSweepReceiver.sol";
+import { PaymentPoolBase } from "../src/PaymentPoolBase.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { IFeeRouter } from "../src/interfaces/IFeeRouter.sol";
 import { MintableUSDC } from "./mocks/MintableUSDC.sol";
@@ -63,19 +64,41 @@ contract CctpSweepReceiverTest is Test {
         receiver = new CctpSweepReceiver(dstUsdc, transmitter, address(dstMessenger), IFeeRouter(address(router)));
     }
 
+    function _share(address op, uint256 servedBytes, uint256 amount)
+        internal
+        pure
+        returns (PaymentPoolBase.SweepShare[] memory shares)
+    {
+        shares = new PaymentPoolBase.SweepShare[](1);
+        shares[0] = PaymentPoolBase.SweepShare({ operator: op, servedBytes: servedBytes, amount: amount });
+    }
+
     /// @dev Burns `amount` on the source side the way `PaymentPool.sweep` does
     ///      and returns the message Circle would attest.
     function _sweep(address op, uint256 servedBytes, uint256 amount) internal returns (bytes memory) {
+        return _sweepShares(_share(op, servedBytes, amount), amount);
+    }
+
+    function _sweepShares(PaymentPoolBase.SweepShare[] memory shares, uint256 amount) internal returns (bytes memory) {
         srcUsdc.mint(pool, amount);
         vm.startPrank(pool);
         srcUsdc.approve(address(srcMessenger), amount);
         bytes32 to = CctpMessage.toBytes32(address(receiver));
-        srcMessenger.depositForBurnWithHook(amount, DST, to, address(srcUsdc), to, 0, 2000, abi.encode(op, servedBytes));
+        srcMessenger.depositForBurnWithHook(amount, DST, to, address(srcUsdc), to, 0, 2000, abi.encode(shares));
         vm.stopPrank();
         return srcMessenger.lastMessage();
     }
 
     function _burn(bytes32 recipient, bytes32 mintRecipient, bytes32 burnToken, uint256 fee)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return _burnShares(recipient, mintRecipient, burnToken, fee, abi.encode(_share(operator, 5, 1000e6)));
+    }
+
+    /// @dev A message as Circle would attest it, with a 1000 USDC burn.
+    function _burnShares(bytes32 recipient, bytes32 mintRecipient, bytes32 burnToken, uint256 fee, bytes memory hook)
         internal
         view
         returns (bytes memory)
@@ -94,9 +117,27 @@ contract CctpSweepReceiverTest is Test {
                 messageSender: CctpMessage.toBytes32(pool),
                 maxFee: fee,
                 feeExecuted: fee,
-                hookData: abi.encode(operator, uint256(5))
+                hookData: hook
             })
         );
+    }
+
+    function _usdcBurn(uint256 fee, bytes memory hook) internal view returns (bytes memory) {
+        return _burnShares(
+            CctpMessage.toBytes32(address(dstMessenger)),
+            CctpMessage.toBytes32(address(receiver)),
+            CctpMessage.toBytes32(address(srcUsdc)),
+            fee,
+            hook
+        );
+    }
+
+    function _activeOps(uint256 n) internal returns (address[] memory ops) {
+        ops = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ops[i] = address(uint160(0x20000 + i));
+            bond.set(ops[i], true, 1000);
+        }
     }
 
     function _epoch() internal view returns (uint64) {
@@ -169,6 +210,107 @@ contract CctpSweepReceiverTest is Test {
     function test_receiveSweep_rejectsShortMessage() public {
         vm.expectRevert(CctpSweepReceiver.MalformedMessage.selector);
         receiver.receiveSweep(new bytes(400), hex"01");
+    }
+
+    /// One message credits every operator in the batch, bytes and rebate.
+    function test_receiveSweep_creditsEachOperatorInBatch() public {
+        address[] memory ops = _activeOps(3);
+        PaymentPoolBase.SweepShare[] memory shares = new PaymentPoolBase.SweepShare[](3);
+        for (uint256 i = 0; i < 3; i++) {
+            shares[i] = PaymentPoolBase.SweepShare({ operator: ops[i], servedBytes: 100 + i, amount: (i + 1) * 4e6 });
+        }
+        bytes memory message = _sweepShares(shares, 24e6);
+        for (uint256 i = 0; i < 3; i++) {
+            vm.expectEmit(true, true, true, true, address(receiver));
+            emit SweepReceived(SRC, pool, ops[i], (i + 1) * 4e6);
+        }
+        receiver.receiveSweep(message, hex"01");
+
+        for (uint256 i = 0; i < 3; i++) {
+            assertEq(dstUsdc.balanceOf(ops[i]), (i + 1) * 3e6, "rebate");
+            assertEq(router.bytesPerEpoch(ops[i], _epoch()), 100 + i, "credit");
+        }
+        assertEq(dstUsdc.balanceOf(treasury), 6e6, "treasury");
+        assertEq(dstUsdc.balanceOf(address(receiver)), 0, "receiver keeps nothing");
+    }
+
+    function test_receiveSweep_maxBatch() public {
+        uint256 max = receiver.MAX_SWEEP_BATCH();
+        address[] memory ops = _activeOps(max);
+        PaymentPoolBase.SweepShare[] memory shares = new PaymentPoolBase.SweepShare[](max);
+        for (uint256 i = 0; i < max; i++) {
+            shares[i] = PaymentPoolBase.SweepShare({ operator: ops[i], servedBytes: 7, amount: 1e6 });
+        }
+        receiver.receiveSweep(_sweepShares(shares, max * 1e6), hex"01");
+        for (uint256 i = 0; i < max; i++) {
+            assertEq(router.bytesPerEpoch(ops[i], _epoch()), 7, "credit");
+        }
+    }
+
+    /// A bridge fee splits pro rata; the last entry takes the rounding
+    /// remainder, so the deposits sum to what was minted.
+    function test_receiveSweep_splitsFeeProRataRemainderToLast() public {
+        address[] memory ops = _activeOps(3);
+        PaymentPoolBase.SweepShare[] memory shares = new PaymentPoolBase.SweepShare[](3);
+        shares[0] = PaymentPoolBase.SweepShare({ operator: ops[0], servedBytes: 1, amount: 300e6 });
+        shares[1] = PaymentPoolBase.SweepShare({ operator: ops[1], servedBytes: 1, amount: 300e6 });
+        shares[2] = PaymentPoolBase.SweepShare({ operator: ops[2], servedBytes: 1, amount: 400e6 });
+        uint256 minted = 1000e6 - (1e6 + 1);
+
+        vm.expectEmit(true, true, true, true, address(receiver));
+        emit SweepReceived(SRC, pool, ops[0], 299_699_999);
+        vm.expectEmit(true, true, true, true, address(receiver));
+        emit SweepReceived(SRC, pool, ops[1], 299_699_999);
+        vm.expectEmit(true, true, true, true, address(receiver));
+        emit SweepReceived(SRC, pool, ops[2], minted - 2 * 299_699_999);
+        receiver.receiveSweep(_usdcBurn(1e6 + 1, abi.encode(shares)), hex"01");
+
+        uint256 total = dstUsdc.balanceOf(treasury);
+        for (uint256 i = 0; i < 3; i++) {
+            total += dstUsdc.balanceOf(ops[i]);
+        }
+        assertEq(total, minted, "every minted unit lands");
+        assertEq(dstUsdc.balanceOf(address(receiver)), 0, "receiver keeps nothing");
+    }
+
+    /// An entry whose pro-rata share rounds to zero is skipped; the rest of
+    /// the batch still lands.
+    function test_receiveSweep_skipsZeroShare() public {
+        address[] memory ops = _activeOps(2);
+        PaymentPoolBase.SweepShare[] memory shares = new PaymentPoolBase.SweepShare[](2);
+        shares[0] = PaymentPoolBase.SweepShare({ operator: ops[0], servedBytes: 11, amount: 1 });
+        shares[1] = PaymentPoolBase.SweepShare({ operator: ops[1], servedBytes: 22, amount: 1000e6 - 1 });
+
+        vm.expectEmit(true, true, true, true, address(receiver));
+        emit SweepReceived(SRC, pool, ops[1], 999e6);
+        receiver.receiveSweep(_usdcBurn(1e6, abi.encode(shares)), hex"01");
+
+        assertEq(router.bytesPerEpoch(ops[0], _epoch()), 0, "zero share credits nothing");
+        assertEq(router.bytesPerEpoch(ops[1], _epoch()), 22, "credit");
+        assertEq(dstUsdc.balanceOf(address(receiver)), 0, "receiver keeps nothing");
+    }
+
+    function test_receiveSweep_rejectsEmptyBatch() public {
+        bytes memory message = _usdcBurn(0, abi.encode(new PaymentPoolBase.SweepShare[](0)));
+        vm.expectRevert(CctpSweepReceiver.MalformedMessage.selector);
+        receiver.receiveSweep(message, hex"01");
+    }
+
+    function test_receiveSweep_rejectsOverMaxBatch() public {
+        uint256 n = receiver.MAX_SWEEP_BATCH() + 1;
+        PaymentPoolBase.SweepShare[] memory shares = new PaymentPoolBase.SweepShare[](n);
+        for (uint256 i = 0; i < n; i++) {
+            shares[i] = PaymentPoolBase.SweepShare({ operator: operator, servedBytes: 1, amount: 1 });
+        }
+        bytes memory message = _usdcBurn(0, abi.encode(shares));
+        vm.expectRevert(CctpSweepReceiver.MalformedMessage.selector);
+        receiver.receiveSweep(message, hex"01");
+    }
+
+    function test_receiveSweep_rejectsZeroSum() public {
+        bytes memory message = _usdcBurn(0, abi.encode(_share(operator, 1, 0)));
+        vm.expectRevert(CctpSweepReceiver.MalformedMessage.selector);
+        receiver.receiveSweep(message, hex"01");
     }
 
     function test_receiveSweep_replayReverts() public {

@@ -13,8 +13,8 @@ Deployable contracts in [`src/`](src/). `PaymentPool` runs on each payment chain
 | `Token` | Fixed-supply (1B) ERC20 with permit + burn; no mint post-genesis | [026](../adr/026-tokenomics.md) |
 | `CapacityBond` | Operator registry; custodies the TOKEN bond, executes escrow-on-slash, supplies the active flag and declared capacity `FeeRouter` credits against | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
 | `FeeRouter` | Permissionless `deposit` of each sweep: rebate / buyback / treasury split and the canonical served-bytes accountant for vote weight | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
-| `CctpSweepReceiver` | Stateless CCTP V2 bridge adapter: receives a sweep and deposits it into `FeeRouter` | [016](../adr/016-contract-interactions.md#bridge-adapters) |
-| `PaymentPool` | Payment-chain USDC pool with off-chain vouchers and on-chain redemption; pays `operatorBps` at redemption and sweeps the rest over CCTP. Built on the bridge-neutral `PaymentPoolBase` | [003](../adr/003-payments.md) |
+| `CctpSweepReceiver` | Stateless CCTP V2 bridge adapter: receives a sweep and deposits each operator's share into `FeeRouter` | [016](../adr/016-contract-interactions.md#bridge-adapters) |
+| `PaymentPool` | Payment-chain USDC pool with off-chain vouchers and on-chain redemption; pays `operatorBps` at redemption and sweeps the rest over CCTP, up to 32 operators per transfer. Built on the bridge-neutral `PaymentPoolBase` | [003](../adr/003-payments.md) |
 | `SlashJudge` | On-chain adjudicator for signature-dependent slashable offenses; verifies the EIP-712 slash signature through a commit–reveal challenge | [014](../adr/014-on-chain-verification.md) |
 | `SlashAppeal` | Slash-appeal state machine (open → ratify/reverse) holding a per-appeal TOKEN bond | [028](../adr/028-slashing-appeals.md) |
 | `OriginAssignment` | Namespace origin sets: a vetted publisher seats and unseats bonded operators as origins for its namespaces | [011](../adr/011-content-takedown.md) |

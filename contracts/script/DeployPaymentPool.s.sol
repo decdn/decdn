@@ -25,7 +25,7 @@ import { ITokenMessengerV2 } from "../src/interfaces/ICctpV2.sol";
 ///                                       censorship window, ADR 003)
 ///           - `OPERATOR_BPS`          (default 6000)
 ///           - `MIN_SWEEP`             (default 1_000_000 = 1 USDC; size it so one
-///                                       sweep's protocol share covers the
+///                                       sweep's batch total covers the
 ///                                       governance-chain receive gas)
 ///           - `MIN_DEPOSIT`           (default 0, the dormant Sybil floor)
 contract DeployPaymentPool is Script {

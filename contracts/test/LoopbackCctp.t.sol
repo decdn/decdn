@@ -6,6 +6,7 @@ import { Vm } from "forge-std/Vm.sol";
 
 import { LoopbackCctp } from "../testnet/LoopbackCctp.sol";
 import { CctpSweepReceiver } from "../src/CctpSweepReceiver.sol";
+import { PaymentPoolBase } from "../src/PaymentPoolBase.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { IFeeRouter } from "../src/interfaces/IFeeRouter.sol";
 import { MintableUSDC } from "./mocks/MintableUSDC.sol";
@@ -22,7 +23,9 @@ contract LoopbackCctpTest is Test {
         LoopbackCctp cctp = new LoopbackCctp(0);
         MockCreditBond bond = new MockCreditBond(EPOCH);
         address operator = address(0xB0B);
+        address other = address(0xCAFE);
         bond.set(operator, true, 1000);
+        bond.set(other, true, 1000);
         FeeRouter router = new FeeRouter({
             usdc_: usdc,
             capacityBond_: bond,
@@ -44,15 +47,21 @@ contract LoopbackCctpTest is Test {
         usdc.approve(address(cctp), 40e6);
         bytes32 to = bytes32(uint256(uint160(address(receiver))));
         vm.recordLogs();
-        cctp.depositForBurnWithHook(40e6, 0, to, address(usdc), to, 0, 2000, abi.encode(operator, uint256(777)));
+        PaymentPoolBase.SweepShare[] memory shares = new PaymentPoolBase.SweepShare[](2);
+        shares[0] = PaymentPoolBase.SweepShare({ operator: operator, servedBytes: 777, amount: 32e6 });
+        shares[1] = PaymentPoolBase.SweepShare({ operator: other, servedBytes: 333, amount: 8e6 });
+        cctp.depositForBurnWithHook(40e6, 0, to, address(usdc), to, 0, 2000, abi.encode(shares));
         vm.stopPrank();
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes memory message = abi.decode(logs[logs.length - 1].data, (bytes));
         receiver.receiveSweep(message, hex"01");
 
-        assertEq(usdc.balanceOf(operator), 30e6, "rebate");
-        assertEq(router.bytesPerEpoch(operator, uint64(block.timestamp / EPOCH)), 777, "credit");
+        uint64 epoch = uint64(block.timestamp / EPOCH);
+        assertEq(usdc.balanceOf(operator), 24e6, "operator rebate");
+        assertEq(usdc.balanceOf(other), 6e6, "other rebate");
+        assertEq(router.bytesPerEpoch(operator, epoch), 777, "operator credit");
+        assertEq(router.bytesPerEpoch(other, epoch), 333, "other credit");
         vm.expectRevert("Nonce already used");
         receiver.receiveSweep(message, hex"01");
     }

@@ -2411,7 +2411,9 @@ contract PaymentPoolTest is Test {
         (uint256 bytesAfter, uint256 pendingAfter) = pool.pending(provider);
         assertEq(pendingAfter, pendingBefore, "reclaim leaves the operator's pending share");
         assertEq(bytesAfter, bytesBefore, "and its pending bytes");
-        pool.sweep(provider);
+        address[] memory operators = new address[](1);
+        operators[0] = provider;
+        pool.sweep(operators);
         assertEq(usdc.balanceOf(address(pool)), 0, "the pending share still sweeps after reclaim");
     }
 

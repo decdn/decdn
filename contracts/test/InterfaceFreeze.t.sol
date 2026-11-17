@@ -29,7 +29,7 @@ contract PaymentPoolInterfaceFreezeTest is Test {
         );
         assertEq(p.closePool.selector, bytes4(keccak256("closePool(bytes32)")), "closePool");
         assertEq(p.reclaim.selector, bytes4(keccak256("reclaim(bytes32)")), "reclaim");
-        assertEq(p.sweep.selector, bytes4(keccak256("sweep(address)")), "sweep");
+        assertEq(p.sweep.selector, bytes4(keccak256("sweep(address[])")), "sweep");
         assertEq(p.pending.selector, bytes4(keccak256("pending(address)")), "pending");
         assertEq(p.pause.selector, bytes4(keccak256("pause()")), "pause");
         assertEq(p.unpause.selector, bytes4(keccak256("unpause()")), "unpause");
@@ -55,6 +55,7 @@ contract PaymentPoolInterfaceFreezeTest is Test {
         assertEq(p.minSweep.selector, bytes4(keccak256("minSweep()")), "minSweep");
         assertEq(p.minDeposit.selector, bytes4(keccak256("minDeposit()")), "minDeposit");
         assertEq(p.pauser.selector, bytes4(keccak256("pauser()")), "pauser");
+        assertEq(p.MAX_SWEEP_BATCH.selector, bytes4(keccak256("MAX_SWEEP_BATCH()")), "MAX_SWEEP_BATCH");
         assertEq(p.tokenMessenger.selector, bytes4(keccak256("tokenMessenger()")), "tokenMessenger");
         assertEq(p.sweepRecipient.selector, bytes4(keccak256("sweepRecipient()")), "sweepRecipient");
         assertEq(p.sweepDomain.selector, bytes4(keccak256("sweepDomain()")), "sweepDomain");

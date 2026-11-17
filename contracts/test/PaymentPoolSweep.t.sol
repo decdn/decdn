@@ -51,7 +51,8 @@ contract PaymentPoolSweepTest is Test {
     address internal treasury = address(0xD7);
     uint64 internal expiry;
 
-    event Swept(address indexed operator, uint256 servedBytes, uint256 amount, uint256 maxFee);
+    event Swept(address indexed operator, uint256 servedBytes, uint256 amount);
+    event SweepSent(uint256 amount, uint256 maxFee);
 
     function setUp() public {
         vm.warp(EPOCH + 1);
@@ -168,6 +169,31 @@ contract PaymentPoolSweepTest is Test {
         return pool.pending(op);
     }
 
+    function _one(address op) internal pure returns (address[] memory ops) {
+        ops = new address[](1);
+        ops[0] = op;
+    }
+
+    /// @dev `n` distinct active operators, each with a redeemed voucher of
+    ///      `amount` / `servedBytes` on `poolId`.
+    function _operators(bytes32 poolId, uint256 n, uint64 amount, uint64 servedBytes)
+        internal
+        returns (address[] memory ops)
+    {
+        ops = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ops[i] = address(uint160(0x10000 + i));
+            bond.set(ops[i], true, 1000);
+            _redeem(poolId, ops[i], amount, servedBytes);
+        }
+    }
+
+    /// @dev The hook data of the last burn, decoded.
+    function _lastShares() internal view returns (PaymentPoolBase.SweepShare[] memory) {
+        bytes memory m = srcMessenger.lastMessage();
+        return abi.decode(_slice(m, 148 + 228, m.length - 148 - 228), (PaymentPoolBase.SweepShare[]));
+    }
+
     // -----------------------------------------------------------------
     // Constructor
     // -----------------------------------------------------------------
@@ -251,7 +277,7 @@ contract PaymentPoolSweepTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(PaymentPoolBase.BelowMinSweep.selector, uint256(8e6), uint256(MIN_SWEEP))
         );
-        pool.sweep(operator);
+        pool.sweep(_one(operator));
     }
 
     function test_sweep_burnsPendingToReceiverAndResets() public {
@@ -259,9 +285,11 @@ contract PaymentPoolSweepTest is Test {
         _redeem(id, operator, 100e6, 5_000_000);
 
         vm.expectEmit(true, true, true, true, address(pool));
-        emit Swept(operator, 5_000_000, 40e6, 0);
+        emit Swept(operator, 5_000_000, 40e6);
+        vm.expectEmit(true, true, true, true, address(pool));
+        emit SweepSent(40e6, 0);
         vm.prank(stranger);
-        pool.sweep(operator);
+        pool.sweep(_one(operator));
 
         (uint256 b, uint256 u) = _pending(operator);
         assertEq(u, 0, "pending usdc reset");
@@ -275,29 +303,178 @@ contract PaymentPoolSweepTest is Test {
         assertEq(uint256(bytes32(_slice(m, 148 + 68, 32))), 40e6, "amount");
         assertEq(bytes32(_slice(m, 148 + 100, 32)), CctpMessage.toBytes32(address(pool)), "messageSender");
         assertEq(uint256(bytes32(_slice(m, 148 + 132, 32))), 0, "maxFee without getMinFeeAmount");
-        assertEq(_slice(m, 148 + 228, 64), abi.encode(operator, uint256(5_000_000)), "hookData");
+        PaymentPoolBase.SweepShare[] memory want = new PaymentPoolBase.SweepShare[](1);
+        want[0] = PaymentPoolBase.SweepShare({ operator: operator, servedBytes: 5_000_000, amount: 40e6 });
+        assertEq(_slice(m, 148 + 228, m.length - 148 - 228), abi.encode(want), "hookData");
     }
 
-    function test_sweep_usesMessengerMinFeeWhenPresent() public {
+    function test_sweep_usesMessengerMinFeeOnTheTotal() public {
         srcMessenger.setMinFee(14); // 1.4 bps
         bytes32 id = _open();
-        _redeem(id, operator, 500e6, 1);
-        pool.sweep(operator);
+        address[] memory ops = _operators(id, 2, 250e6, 1);
+        pool.sweep(ops);
         bytes memory m = srcMessenger.lastMessage();
         assertEq(uint256(bytes32(_slice(m, 148 + 132, 32))), (200e6 * 14) / 10_000, "maxFee = getMinFeeAmount");
     }
 
+    /// Each share is below `minSweep`; together they reach it.
+    function test_sweep_batchOfTinySharesReachesMinSweep() public {
+        bytes32 id = _open();
+        address[] memory ops = _operators(id, 5, 5e6, 7);
+        (, uint256 u) = _pending(ops[0]);
+        assertLt(u, MIN_SWEEP, "each share alone is below minSweep");
+
+        pool.sweep(ops);
+
+        for (uint256 i = 0; i < ops.length; i++) {
+            (uint256 b, uint256 left) = _pending(ops[i]);
+            assertEq(left, 0, "pending usdc reset");
+            assertEq(b, 0, "pending bytes reset");
+        }
+        bytes memory m = srcMessenger.lastMessage();
+        assertEq(uint256(bytes32(_slice(m, 148 + 68, 32))), 10e6, "one burn of the total");
+        PaymentPoolBase.SweepShare[] memory shares = _lastShares();
+        assertEq(shares.length, 5);
+        for (uint256 i = 0; i < shares.length; i++) {
+            assertEq(shares[i].operator, ops[i], "input order");
+            assertEq(shares[i].servedBytes, 7);
+            assertEq(shares[i].amount, 2e6);
+        }
+    }
+
+    function test_sweep_emitsSweptPerOperator() public {
+        bytes32 id = _open();
+        address[] memory ops = _operators(id, 3, 10e6, 9);
+        for (uint256 i = 0; i < ops.length; i++) {
+            vm.expectEmit(true, true, true, true, address(pool));
+            emit Swept(ops[i], 9, 4e6);
+        }
+        vm.expectEmit(true, true, true, true, address(pool));
+        emit SweepSent(12e6, 0);
+        pool.sweep(ops);
+    }
+
+    function test_sweep_maxBatchSucceeds() public {
+        bytes32 id = _open();
+        uint256 max = pool.MAX_SWEEP_BATCH();
+        address[] memory ops = _operators(id, max, 10e6, 3);
+        pool.sweep(ops);
+        assertEq(_lastShares().length, max);
+        // The burn body stays under CCTP V2's 8192-byte `maxMessageBodySize`.
+        assertEq(srcMessenger.lastMessage().length - 148, 3364, "message body size");
+    }
+
+    function test_sweep_revertsEmpty() public {
+        vm.expectRevert(abi.encodeWithSelector(PaymentPoolBase.BadSweepBatch.selector, uint256(0)));
+        pool.sweep(new address[](0));
+    }
+
+    function test_sweep_revertsAboveMax() public {
+        bytes32 id = _open();
+        uint256 max = pool.MAX_SWEEP_BATCH();
+        address[] memory ops = _operators(id, max + 1, 1e6, 1);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPoolBase.BadSweepBatch.selector, max + 1));
+        pool.sweep(ops);
+    }
+
+    function test_sweep_revertsOnDuplicate() public {
+        bytes32 id = _open();
+        _redeem(id, operator, 100e6, 1);
+        address[] memory ops = new address[](2);
+        ops[0] = operator;
+        ops[1] = operator;
+        vm.expectRevert(abi.encodeWithSelector(PaymentPoolBase.NothingPending.selector, operator));
+        pool.sweep(ops);
+    }
+
+    function test_sweep_revertsOnEntryWithNothingPending() public {
+        bytes32 id = _open();
+        _redeem(id, operator, 100e6, 1);
+        address[] memory ops = new address[](2);
+        ops[0] = operator;
+        ops[1] = stranger;
+        vm.expectRevert(abi.encodeWithSelector(PaymentPoolBase.NothingPending.selector, stranger));
+        pool.sweep(ops);
+    }
+
     /// The sweep lands end to end: CCTP mints to the receiver, which deposits
-    /// into FeeRouter and credits the operator.
+    /// into FeeRouter and credits each operator.
     function test_sweep_landsInFeeRouter() public {
         bytes32 id = _open();
+        address other = address(0xCAFE);
+        bond.set(other, true, 1000);
         _redeem(id, operator, 100e6, 5_000_000);
-        pool.sweep(operator);
+        _redeem(id, other, 50e6, 2_000_000);
+        address[] memory ops = new address[](2);
+        ops[0] = operator;
+        ops[1] = other;
+        pool.sweep(ops);
         receiver.receiveSweep(srcMessenger.lastMessage(), hex"01");
 
-        assertEq(dstUsdc.balanceOf(operator), 30e6, "rebate on the governance chain");
-        assertEq(dstUsdc.balanceOf(treasury), 10e6, "treasury remainder");
-        assertEq(router.bytesPerEpoch(operator, uint64(block.timestamp / EPOCH)), 5_000_000, "credit");
+        uint64 epoch = uint64(block.timestamp / EPOCH);
+        assertEq(dstUsdc.balanceOf(operator), 30e6, "operator rebate on the governance chain");
+        assertEq(dstUsdc.balanceOf(other), 15e6, "other rebate on the governance chain");
+        assertEq(dstUsdc.balanceOf(treasury), 15e6, "treasury remainder");
+        assertEq(router.bytesPerEpoch(operator, epoch), 5_000_000, "operator credit");
+        assertEq(router.bytesPerEpoch(other, epoch), 2_000_000, "other credit");
+    }
+
+    /// Gas of a full batch on both chains, logged per operator. The receive
+    /// runs against cold storage, the way a fresh transaction meets it.
+    function test_sweep_gasPerOperator() public {
+        bytes32 id = _open();
+        uint256 max = pool.MAX_SWEEP_BATCH();
+        // Two 6 USDC shares make the smallest batch that reaches `minSweep`.
+        address[] memory ops = _operators(id, max, 15e6, 3);
+        address[] memory pair = new address[](2);
+        pair[0] = ops[0];
+        pair[1] = ops[1];
+        address[] memory rest = new address[](max - 2);
+        for (uint256 i = 2; i < max; i++) {
+            rest[i - 2] = ops[i];
+        }
+
+        uint256 sendPair = _sweepGas(pair);
+        bytes memory messagePair = srcMessenger.lastMessage();
+        uint256 sendRest = _sweepGas(rest);
+        bytes memory messageRest = srcMessenger.lastMessage();
+        uint256 receivePair = _receiveGas(messagePair);
+        uint256 receiveRest = _receiveGas(messageRest);
+
+        uint256 sendPerOp = (sendRest - sendPair) / (max - 4);
+        uint256 receivePerOp = (receiveRest - receivePair) / (max - 4);
+        emit log_named_uint("sweep: gas per operator", sendPerOp);
+        emit log_named_uint("sweep: fixed gas", sendPair - 2 * sendPerOp);
+        emit log_named_uint("receiveSweep: gas per operator", receivePerOp);
+        emit log_named_uint("receiveSweep: fixed gas", receivePair - 2 * receivePerOp);
+        emit log_named_uint("receiveSweep: full batch estimate", receivePair + receivePerOp * (max - 2));
+        assertLt(receivePair + receivePerOp * (max - 2), 5_000_000, "a full batch receive stays far under a block");
+    }
+
+    function _coolAll() internal {
+        vm.cool(address(pool));
+        vm.cool(address(srcUsdc));
+        vm.cool(address(srcMessenger));
+        vm.cool(address(dstUsdc));
+        vm.cool(address(dstMessenger));
+        vm.cool(address(transmitter));
+        vm.cool(address(router));
+        vm.cool(address(receiver));
+        vm.cool(address(bond));
+    }
+
+    function _sweepGas(address[] memory ops) internal returns (uint256) {
+        _coolAll();
+        uint256 g = gasleft();
+        pool.sweep(ops);
+        return g - gasleft();
+    }
+
+    function _receiveGas(bytes memory message) internal returns (uint256) {
+        _coolAll();
+        uint256 g = gasleft();
+        receiver.receiveSweep(message, hex"01");
+        return g - gasleft();
     }
 
     // -----------------------------------------------------------------
@@ -324,7 +501,7 @@ contract PaymentPoolSweepTest is Test {
         pool.topUp(id, 1e6);
 
         _redeem(id, operator, 100e6, 2);
-        pool.sweep(operator);
+        pool.sweep(_one(operator));
         assertEq(srcUsdc.balanceOf(operator), 60e6, "redeem runs while paused");
 
         vm.prank(pauser);

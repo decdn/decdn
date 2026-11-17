@@ -157,7 +157,9 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         );
 
         vm.recordLogs();
-        pool.sweep(operator);
+        address[] memory operators = new address[](1);
+        operators[0] = operator;
+        pool.sweep(operators);
         d.sweepReceiver.receiveSweep(_lastCctpMessage(), hex"01");
 
         // Launch split, read from cfg so the assertion tracks the deploy config.

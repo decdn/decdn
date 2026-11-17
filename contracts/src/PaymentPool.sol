@@ -9,13 +9,13 @@ import { ITokenMessengerV2 } from "./interfaces/ICctpV2.sol";
 
 /// @title PaymentPool
 /// @notice The CCTP V2 payment pool (ADR 003 § PaymentPool, ADR 016 § Bridge
-///         adapters). `sweep` burns an operator's pending protocol share with
-///         `depositForBurnWithHook` at standard finality, minting it to the
-///         governance-chain `CctpSweepReceiver`, which deposits it into
-///         `FeeRouter`.
+///         adapters). `sweep` burns a batch of operators' pending protocol
+///         shares with one `depositForBurnWithHook` at standard finality,
+///         minting the total to the governance-chain `CctpSweepReceiver`,
+///         which deposits each share into `FeeRouter`.
 /// @dev    The receiver is both `mintRecipient` and `destinationCaller`, so
 ///         only it can receive the message. `maxFee` is the messenger's
-///         `getMinFeeAmount(amount)`, or 0 when the messenger has no such
+///         `getMinFeeAmount(total)`, or 0 when the messenger has no such
 ///         function.
 contract PaymentPool is PaymentPoolBase {
     using SafeERC20 for IERC20;
@@ -41,7 +41,7 @@ contract PaymentPool is PaymentPoolBase {
     /// @param sweepDomain_    CCTP domain of the governance chain.
     /// @param disputeWindow_  Grace window in seconds.
     /// @param operatorBps_    Same-transaction operator share (at most 10000).
-    /// @param minSweep_       Smallest sweep in USDC base units.
+    /// @param minSweep_       Smallest sweep batch total in USDC base units.
     /// @param minDeposit_     Minimum credited `openPool` deposit.
     /// @param pauser_         The address that may pause inflows.
     constructor(
@@ -71,20 +71,13 @@ contract PaymentPool is PaymentPoolBase {
         return abi.decode(ret, (uint256));
     }
 
-    /// @dev Burn `amount` to the receiver with `(operator, servedBytes)` as the
-    ///      hook data.
-    function _sendSweep(address operator, uint256 servedBytes, uint256 amount, uint256 fee) internal override {
+    /// @dev Burn `amount` to the receiver with `abi.encode(shares)` as the hook
+    ///      data.
+    function _sendSweep(SweepShare[] memory shares, uint256 amount, uint256 fee) internal override {
         bytes32 recipient = bytes32(uint256(uint160(sweepRecipient)));
         usdc.forceApprove(address(tokenMessenger), amount);
         tokenMessenger.depositForBurnWithHook(
-            amount,
-            sweepDomain,
-            recipient,
-            address(usdc),
-            recipient,
-            fee,
-            STANDARD_FINALITY,
-            abi.encode(operator, servedBytes)
+            amount, sweepDomain, recipient, address(usdc), recipient, fee, STANDARD_FINALITY, abi.encode(shares)
         );
     }
 }

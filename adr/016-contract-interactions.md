@@ -28,15 +28,19 @@ The contracts run on two kinds of chain.
 Two interfaces cross between the tiers. Both ride in one message.
 
 1. **The sweep.** A bridge message from a payment chain to the governance chain. It carries the protocol share (USDC).
-2. **The bytes feed.** The served-bytes record `(operator, bytes)` in the sweep's payload. There is no other bytes path.
+2. **The bytes feed.** The served-bytes records `(operator, bytes, amount)` in the sweep's payload, one per operator in the batch. There is no other bytes path.
 
-`PaymentPool.sweep(operator)` sends the sweep. A bridge adapter on the governance chain receives it and calls `FeeRouter.deposit(operator, bytes, amount)` with the USDC that arrived ([§ Bridge adapters](#bridge-adapters)). The protocol share is the part of each redemption that is not paid to the operator on the payment chain.
+`PaymentPool.sweep(operators[])` sends one sweep for up to `MAX_SWEEP_BATCH` (32) operators. A bridge adapter on the governance chain receives it and calls `FeeRouter.deposit(operator, bytes, amount)` once per operator, with that operator's part of the USDC that arrived ([§ Bridge adapters](#bridge-adapters)). The protocol share is the part of each redemption that is not paid to the operator on the payment chain.
 
 #### Bridge adapters
 
 `FeeRouter` knows no bridge. Its one entry point, `deposit`, pulls USDC from the caller and credits the named operator. Anyone may call it. The credit is priced on USDC that stays with the protocol ([§ Contract: FeeRouter](#contract-feerouter)), so the caller and the source of the USDC do not matter.
 
-A bridge adapter is a stateless governance-chain contract with no roles. It speaks one bridge's receive interface, measures the USDC that arrived, and calls `deposit`. The reference deployment has one adapter, `CctpSweepReceiver`, for CCTP V2. Each `PaymentPool` deployment names its adapter and bridge as immutables.
+A bridge adapter is a stateless governance-chain contract with no roles. It speaks one bridge's receive interface, measures the USDC that arrived, and calls `deposit` for each operator in the batch. The reference deployment has one adapter, `CctpSweepReceiver`, for CCTP V2. Each `PaymentPool` deployment names its adapter and bridge as immutables.
+
+**Batch payload.** The sweep payload is `abi.encode(SweepShare[])`. Each `SweepShare` is `(address operator, uint256 servedBytes, uint256 amount)`, in `sweep` input order. `amount` is the operator's pending USDC on the payment chain. The adapter splits the USDC that arrived, `U`, pro rata to the entry amounts: entry `i` gets `U × amount_i / Σ amount`, rounded down. The last entry gets the remainder, so the deposits sum to `U`. A bridge fee therefore comes out of every share alike. The adapter skips an entry whose part is 0, because `deposit` rejects a zero amount and one dust entry must not block the message. The adapter rejects an empty payload, a payload longer than `MAX_SWEEP_BATCH`, and a payload whose amounts sum to 0.
+
+**Batch limit.** `MAX_SWEEP_BATCH` is 32. A full batch's CCTP burn body is 3364 bytes. The deployed `MessageTransmitterV2` on Ethereum and on Arbitrum Sepolia accepts a body of at most 8192 bytes (`maxMessageBodySize`). The governance-chain receive costs about 93k gas per operator with the real `FeeRouter` and cold storage, so a full batch adds about 3M gas to the CCTP receive. That is a small fraction of an Ethereum block.
 
 To add a bridge, deploy a new adapter on the governance chain and a `PaymentPool` variant for that bridge on the payment chain. `FeeRouter` does not change, and no governance action is needed. Every `PaymentPool` variant shares one base and one external interface (`openPool`, `topUp`, `redeemMany`, `pending`, `sweep`, `closePool`, `reclaim`). Only the bridge call inside `sweep` differs.
 
@@ -52,9 +56,9 @@ deCDN contracts use audited [OpenZeppelin Contracts](https://docs.openzeppelin.c
 | --- | --- | --- | --- | --- | --- |
 | TOKEN (ERC-20) | Governance chain | [026](026-tokenomics.md#adr-026-tokenomics) | No (fungible token) | — | `ERC20`, `ERC20Burnable`, `ERC20Permit` (fixed-supply per [ADR 026 § Supply and distribution](026-tokenomics.md#supply-and-distribution); no post-genesis mint function; `ERC20Burnable` is the sink for the 50% burn leg of the slashing path — 50% challenger / 50% burn at finality — per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); `ERC20Votes` is intentionally omitted because Governor vote weight is derived from `FeeRouter` epoch accounting, not from per-account checkpoint structures, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), so the per-transfer checkpoint cost is not earned) |
 | CapacityBond | Governance chain | [003](003-payments.md#adr-003-payment-model), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` (operator-registry contract. Exposes the lock-to-capacity curve `bond = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), `isActive(operator)` per [ADR 003](003-payments.md#adr-003-payment-model) `ICapacityBond`, `declaredMbps(operator)` for capacity-tier checks, `firstBondedAt(operator)` for the `age_ramp` source on `DecdnGovernor` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), the per-operator slash records (`operatorSlashCount` / `operatorSlashIdAt` / `getSlashRecord`) for the slash-aware voting-weight zero-out per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out), and `bindNodeId` / `reclaimNodeId` for the NodeId↔Ethereum-address binding) |
-| PaymentPool | Payment chain | [003](003-payments.md#adr-003-payment-model) | Yes | USDC | `ReentrancyGuard`, `EIP712`, `SunsettingPausable` with an immutable `pauser` (USDC-only; the USDC address is fixed at deployment; one funded pool backs many capped signers to many nodes; no bond read, no governance, no roles; `redeemMany` pays `operatorBps` to the operator and accrues the protocol share in `pending`; `sweep(operator)` sends it over CCTP to `CctpSweepReceiver`) |
+| PaymentPool | Payment chain | [003](003-payments.md#adr-003-payment-model) | Yes | USDC | `ReentrancyGuard`, `EIP712`, `SunsettingPausable` with an immutable `pauser` (USDC-only; the USDC address is fixed at deployment; one funded pool backs many capped signers to many nodes; no bond read, no governance, no roles; `redeemMany` pays `operatorBps` to the operator and accrues the protocol share in `pending`; `sweep(operators[])` sends a batch of up to 32 shares over CCTP to `CctpSweepReceiver` in one transfer) |
 | FeeRouter | Governance chain | [026](026-tokenomics.md#adr-026-tokenomics) | Yes (within the `deposit` transaction only) | USDC (rebate, buyback, and treasury legs transfer in the same transaction) | `AccessControl`, `ReentrancyGuard`, `Pausable` (`deposit` pulls USDC from any caller, splits it into rebate / buyback / treasury per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split), and keeps the served-bytes ledger) |
-| CctpSweepReceiver | Governance chain | [016](#bridge-adapters) | Yes (within the receive transaction only) | USDC | `ReentrancyGuard` (stateless CCTP V2 adapter: `receiveSweep(message, attestation)` receives one sweep and calls `FeeRouter.deposit`; no roles, no setters) |
+| CctpSweepReceiver | Governance chain | [016](#bridge-adapters) | Yes (within the receive transaction only) | USDC | `ReentrancyGuard` (stateless CCTP V2 adapter: `receiveSweep(message, attestation)` receives one sweep and calls `FeeRouter.deposit` once per operator in it; no roles, no setters) |
 | SlashAppeal | Governance chain | [026](026-tokenomics.md#adr-026-tokenomics), [028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) | Yes (TOKEN appeal bonds only) | TOKEN (appeal bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable` (slash-appeal state machine per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation): `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `grantAppeal` / `upholdAppeal` / `cleanupExpiredAppeal`; drives `CapacityBond`'s escrow-on-slash settle hooks) |
 | BuybackBurner (abstract) + GuardedBuybackBurner (abstract) + BuybackBurnerUniswapV3 | Governance chain | [018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` via the shared `SunsettingPausable` base (swap-and-burn path; receives the `buybackBps` share of every sweep. `BuybackBurner` is the venue-neutral abstract base and owns the shared surface, the abstract `GuardedBuybackBurner` adds the MEV-defense stack once for every venue, and the concrete `BuybackBurnerUniswapV3` binds the live venue per [ADR 018 § Venue-neutral burner selection](018-liquidity-strategy.md#venue-neutral-burner-selection)) |
 | ContentBlacklist | Governance chain | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` — not `Pausable`, because the unlawful-content-removal duty is permanent and must survive the pause sunset ([§ Emergency Multisig](#emergency-multisig-production)) (full surface: hash-level — global + regional — operator-level — `addOperator` / `removeOperator` — origin-level — `isOriginBlacklisted` / `setOriginBlacklist` — plus the enumeration views `getScopeRegions` / `blacklistedHashCount` / `blacklistedHashes` / `blacklistedAddressCount` / `blacklistedAddresses` that let the compliance layer build blacklist state without replaying takedown events, and the append-only mutation ledger views `mutationCount` / `getMutations` (one record per state change an authorised caller makes) that a node polls by `eth_call` to follow every later change; see [ADR 011 § Following the mutation ledger](011-content-takedown.md#following-the-mutation-ledger)) |
@@ -75,7 +79,7 @@ classDiagram
     class PaymentPool {
         +openPool(deposit)
         +redeemMany(batches) : voucher + optional chain preimage
-        +sweep(operator)
+        +sweep(operators)
         +closePool(poolId)
         +reclaim(poolId)
         immutables : usdc, tokenMessenger, sweepRecipient, sweepDomain, disputeWindow, operatorBps, minSweep, minDeposit, pauser
@@ -267,7 +271,7 @@ interface IFeeRouter {
 - **Epoch length is immutable** (1 week, constructor-set, the one `EPOCH_LENGTH` shared with `CapacityBond` on the same chain; [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). `bytesPerEpoch` and `totalBytesPerEpoch` are governance-canonical because `DecdnGovernor` derives served-bytes vote weight from them per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). A `FeeRouter` migration resets the vote-weight history until traffic refills the trailing window ([ADR 036 § Consequences > Negative](036-served-bytes-voting-weight.md#negative)).
 - **`bytesPerEpoch` and `totalBytesPerEpoch` are the governance vote-weight source.** `DecdnGovernor._getVotes` calls `bytesInWindow(operator, endEpoch, windowEpochs)` and `totalBytesInWindow(endEpoch, windowEpochs)` for the per-operator weight and the cap denominator. `DecdnGovernor` takes the `FeeRouter` address as its constructor argument and reads the same interface as before.
 - **Wash-trading defense.** The credit is priced on USDC that stays with the protocol. A pool with a low or zero protocol share earns little or no weight, and forged weight costs real USDC at a price set on the governance chain. The credit never exceeds `bytes`, so an over-declared tier does not translate into governance influence. Because `deposit` is open, any party can also fill an operator's capacity clamp for an epoch with bytes it pays for. That empties the operator's remaining weight credit for that epoch. Its cost is the clamp times `deliveryFloor`, plus the rebate it gives the operator. Governance prices this through `deliveryFloor`.
-- **`CctpSweepReceiver`.** The CCTP V2 adapter ([§ Bridge adapters](#bridge-adapters)). `receiveSweep(message, attestation)` is permissionless. Each sweep sets the receiver as `mintRecipient` and `destinationCaller`, so only the receiver can call `MessageTransmitterV2.receiveMessage` for it. The receiver accepts a message only if the outer `recipient` is the local `TokenMessengerV2` and the burn body's `mintRecipient` is the receiver. These checks reject a generic CCTP message that only names the receiver as `destinationCaller`. The messenger itself accepts a burn message only from its `remoteTokenMessengers(sourceDomain)`. `U` is the rise in the receiver's USDC balance across `receiveMessage`, so a burn of any other token mints no USDC and credits nothing. The receiver decodes `hookData = abi.encode(operator, bytes)` and calls `FeeRouter.deposit(operator, bytes, U)`. A standard-transfer message carries no expiration block, and CCTP nonce tracking makes each sweep land once. While `FeeRouter` is paused, `receiveSweep` reverts and the message stays valid. The receiver emits `SweepReceived(sourceDomain, pool, operator, amount)`, where `pool` is the burn body's `messageSender`.
+- **`CctpSweepReceiver`.** The CCTP V2 adapter ([§ Bridge adapters](#bridge-adapters)). `receiveSweep(message, attestation)` is permissionless. Each sweep sets the receiver as `mintRecipient` and `destinationCaller`, so only the receiver can call `MessageTransmitterV2.receiveMessage` for it. The receiver accepts a message only if the outer `recipient` is the local `TokenMessengerV2` and the burn body's `mintRecipient` is the receiver. These checks reject a generic CCTP message that only names the receiver as `destinationCaller`. The messenger itself accepts a burn message only from its `remoteTokenMessengers(sourceDomain)`. `U` is the rise in the receiver's USDC balance across `receiveMessage`, so a burn of any other token mints no USDC and credits nothing. The receiver decodes `hookData = abi.encode(SweepShare[])` and calls `FeeRouter.deposit(operator, bytes, share)` for each entry, with `U` split pro rata ([§ Bridge adapters](#bridge-adapters)). A standard-transfer message carries no expiration block, and CCTP nonce tracking makes each sweep land once. While `FeeRouter` is paused, `receiveSweep` reverts and the message stays valid. The receiver emits `SweepReceived(sourceDomain, pool, operator, amount)` for each deposited entry, where `pool` is the burn body's `messageSender`.
 - **No `initialize(...)` helper.** Proxies are forbidden ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)). The constructor plus post-deploy setters from `TimelockController` suffice.
 
 ##### Interface: PaymentPool (payment chain)
@@ -279,15 +283,19 @@ interface IPaymentPool {
     // `(bytes, usdc)`. The pool does not clamp bytes.
     function redeemMany(Batch[] calldata batches) external;
 
-    // Permissionless. Needs `pending[operator].usdc >= minSweep`. Resets
-    // `pending[operator]`, then calls CCTP V2 `depositForBurnWithHook`
-    // (`minFinalityThreshold` 2000) with `mintRecipient` and
-    // `destinationCaller` set to `sweepRecipient` (the governance-chain
-    // `CctpSweepReceiver`), `maxFee = getMinFeeAmount(amount)` (0 when the
-    // messenger has no such function), and
-    // `hookData = abi.encode(operator, bytes)`. The operator has its own
-    // reason to sweep: the sweep carries its rebate and its vote weight.
-    function sweep(address operator) external;
+    // Permissionless. Takes 1 to MAX_SWEEP_BATCH (32) operators, each with
+    // a non-zero `pending[operator].usdc`; a repeated operator reads zero
+    // after its first entry and reverts. Needs the batch total to be at
+    // least `minSweep`. Resets each `pending[operator]` and emits
+    // `Swept(operator, bytes, usdc)` per operator, then calls CCTP V2
+    // `depositForBurnWithHook` once for the total (`minFinalityThreshold`
+    // 2000) with `mintRecipient` and `destinationCaller` set to
+    // `sweepRecipient` (the governance-chain `CctpSweepReceiver`),
+    // `maxFee = getMinFeeAmount(total)` (0 when the messenger has no such
+    // function), and `hookData = abi.encode(SweepShare[])`. Emits
+    // `SweepSent(total, maxFee)`. The operator has its own reason to
+    // sweep: the sweep carries its rebate and its vote weight.
+    function sweep(address[] calldata operators) external;
 
     function pending(address operator) external view returns (uint256 bytes_, uint256 usdc);
 
@@ -532,7 +540,7 @@ graph LR
 | --- | --- | --- | --- | --- |
 | PaymentPool | IERC20 (USDC) | `safeTransferFrom()` | Caller must have allowance | Yes |
 | PaymentPool | IERC20 (USDC) | `safeTransfer()` | Caller holds balance | Yes |
-| PaymentPool | CCTP `TokenMessengerV2` (payment chain) | `depositForBurnWithHook(...)` in `sweep(operator)`; the message mints USDC to `CctpSweepReceiver` on the governance chain, which deposits it into FeeRouter, with `hookData = abi.encode(operator, bytes)` ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) | Permissionless; `pending[operator].usdc >= minSweep` | Yes |
+| PaymentPool | CCTP `TokenMessengerV2` (payment chain) | `depositForBurnWithHook(...)` in `sweep(operators[])`; the message mints the batch total to `CctpSweepReceiver` on the governance chain, which deposits each operator's share into FeeRouter, with `hookData = abi.encode(SweepShare[])` ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) | Permissionless; batch total `>= minSweep` | Yes |
 | FeeRouter | CapacityBond | `isActive(operator)` (rebate and weight-credit gate) | Public (read-only) | No |
 | FeeRouter | BuybackBurner | `safeTransfer()` (`buybackBps` of `U`, same-tx) | Caller holds balance | Yes |
 | FeeRouter | Treasury wallet | `safeTransfer()` (remainder of `U`, same-tx) | Caller holds balance | Yes |
@@ -621,7 +629,7 @@ flowchart TD
     Client -->|"openPool() / topUp()<br/>deposit USDC (one pool)"| PC
     PC -->|"redeemMany(): operatorBps same-tx"| Provider
     PC -->|"reclaim(): unspent remainder"| Client
-    PC -->|"sweep(operator): CCTP burn + hook<br/>(protocol share + bytes feed)<br/>via CctpSweepReceiver.deposit"| FR
+    PC -->|"sweep(operators): CCTP burn + hook<br/>(protocol share + bytes feed)<br/>via CctpSweepReceiver.deposit"| FR
     FR -->|"rebateBps"| Provider
     FR -->|"buybackBps"| BB
     FR -->|"remainder"| Treasury
@@ -747,7 +755,7 @@ Every state-mutating function that makes an external call is listed below with i
 | `openPool(deposit)` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions. Names no provider — node-active gating is off-chain at node selection, not at open. The credited deposit must meet the immutable `minDeposit` (dormant at 0 — [ADR 003 § Minimum deposit](003-payments.md#minimum-deposit)). |
 | `topUp()` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions |
 | `redeemMany(batches[])` | `IERC20.safeTransfer()` (`operatorBps` of the paid total to `msg.sender`); the rest accrues in `pending[msg.sender]` as `(bytes, usdc)`. Each voucher contributes `paid = min(desired, capRoom, remaining)` (`desired = claimed − lane.paid`, and `claimed = cumulative + chainIndex × chunkPrice` once the packed `chainMeter` word yields `chunkPrice`/`chainIndex` and a bounded walk of at most `MAX_CHAIN_LENGTH` keccaks verifies `preimage` against the voucher's `chainRoot` — see [ADR 003 § Chain walk and redemption cost](003-payments.md#chain-walk-and-redemption-cost)) and the bytes accrued are paid-proportional (`mulDiv(bytesDelta, paid, desired)`); the pool does not clamp them. Every voucher is redeemed for `msg.sender`, which is what lets one call settle the batch. The pool reads no `CapacityBond` state, so any address can be a payee. Each `{poolId, capabilities[], vouchers[]}` group gates its pool's status once and advances its `totalRedeemed` in one write. The lane watermark advances by `paid`, not to `claimed`, so a partially-drained draw is retriable; a voucher paying `0` is skipped with no state written, while `BadPreimage` and `ChainIndexZero` are caller errors that revert the whole call | `nonReentrant`, checks-effects-interactions across the whole batch |
-| `sweep(operator)` | CCTP `TokenMessengerV2.depositForBurnWithHook()` (burns the operator's `pending` USDC; hook data carries `(operator, bytes)`) | `nonReentrant`, checks-effects-interactions (`pending[operator]` resets before the call); permissionless; `pending[operator].usdc >= minSweep`; never pauses |
+| `sweep(operators[])` | CCTP `TokenMessengerV2.depositForBurnWithHook()` (burns the batch total of the listed operators' `pending` USDC in one call; hook data carries one `(operator, bytes, usdc)` entry per operator) | `nonReentrant`, checks-effects-interactions (each `pending[operator]` resets before the call); permissionless; 1 to `MAX_SWEEP_BATCH` operators, each with a non-zero pending share; batch total `>= minSweep`; never pauses |
 | `reclaim()` | `IERC20.safeTransfer()` (remainder to owner) | `nonReentrant`, checks-effects-interactions |
 
 #### CapacityBond
@@ -787,7 +795,7 @@ Every state-mutating function that makes an external call is listed below with i
 | Function | External Calls | Guards |
 | --- | --- | --- |
 | `deposit(operator, bytes, amount)` | `IERC20.safeTransferFrom()` (pulls `amount` from the caller), `CapacityBond.isActive(operator)` and `CapacityBond.declaredMbps(operator)` (reads), `IERC20` transfer × up to 3 (operator rebate, BuybackBurner, Treasury; all legs same-tx). Derives `epoch = uint64(block.timestamp / EPOCH_LENGTH)` at arrival and increments both `bytesPerEpoch[operator][epoch]` and `totalBytesPerEpoch[epoch]` by the USDC-backed credit, clamped to the operator's declared capacity for the epoch — the governance-canonical served-bytes vote-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Emits `Deposited`. | `nonReentrant`, checks-effects-interactions; permissionless; reverts if paused |
-| `CctpSweepReceiver.receiveSweep(message, attestation)` | `MessageTransmitterV2.receiveMessage()` (mints USDC to the receiver), then `FeeRouter.deposit(operator, bytes, U)`. Emits `SweepReceived`. | `nonReentrant`; permissionless; holds no state |
+| `CctpSweepReceiver.receiveSweep(message, attestation)` | `MessageTransmitterV2.receiveMessage()` (mints USDC to the receiver), then `FeeRouter.deposit(operator, bytes, share)` per entry, with `U` split pro rata to the entry amounts. Emits `SweepReceived` per deposited entry. | `nonReentrant`; permissionless; holds no state |
 | `setSplit(...)`, `setBuybackBurner(addr)`, `setTreasury(addr)`, `setWindowEpochs(n)`, `setDeliveryFloor(n)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); cross-validated against destination addresses ([§ Tunable Economics](#tunable-economics)); `setDeliveryFloor` bounded `[1, 1000]`. `setWindowEpochs` bounded `[4, 26]` per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds) |
 
 > **Operator guarantee.** The operator share `operatorBps` is paid on the payment chain at redemption and is immutable. Governance cannot lower it.

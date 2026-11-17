@@ -11,14 +11,21 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
+/// @dev Most operators one sweep carries, shared by the pool and the bridge
+///      adapters. A full batch's CCTP burn body is 3364 bytes, under the
+///      8192-byte `maxMessageBodySize` of the deployed V2 transmitters, and its
+///      governance-chain receive stays a small fraction of a block (ADR 016 §
+///      Bridge adapters).
+uint256 constant SWEEP_BATCH_LIMIT = 32;
+
 /// @title PaymentPoolBase
 /// @notice The payment-chain pool shared by every bridge variant (ADR 003 §
 ///         PaymentPool, ADR 016 § Bridge adapters). One funded USDC pool backs
 ///         payments from many capped signers to many nodes. A redemption pays
 ///         `operatorBps` to the redeemer in the same transaction and accrues
 ///         the rest, with the paid-proportional served bytes, in `pending`.
-///         `sweep` sends an operator's `pending` to the governance chain
-///         through the variant's bridge.
+///         `sweep` sends a batch of operators' `pending` to the governance
+///         chain in one bridge transfer through the variant's bridge.
 /// @dev    No governance, no roles, no setters: every parameter is a
 ///         constructor immutable. The pool reads no `CapacityBond` state. The
 ///         immutable `pauser` can block `openPool` and `topUp` until the
@@ -53,6 +60,9 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     ///      Chunk Cadence). A change here invalidates every signature made
     ///      against a live chain, so it is a protocol-version change.
     uint256 internal constant CHUNK_BYTES = 1_048_576;
+
+    /// @notice Most operators one `sweep` carries (`SWEEP_BATCH_LIMIT`).
+    uint256 public constant MAX_SWEEP_BATCH = SWEEP_BATCH_LIMIT;
 
     // -----------------------------------------------------------------
     // EIP-712 typing (ADR 003 § EIP-712 Voucher Signature)
@@ -96,8 +106,9 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     uint256 public immutable operatorBps;
 
-    /// @notice Smallest pending protocol share `sweep` sends, in USDC base
-    ///         units. Keeps dust sweeps uneconomic.
+    /// @notice Smallest batch total `sweep` sends, in USDC base units. Each
+    ///         sweep costs one receive on the governance chain, so the batch
+    ///         total, not each operator's share, must cover it.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     uint64 public immutable minSweep;
 
@@ -148,6 +159,14 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
         uint64 usdc;
     }
 
+    /// @notice One operator's entry in a sweep. The bridge payload is
+    ///         `abi.encode(SweepShare[])`, in `sweep` input order.
+    struct SweepShare {
+        address operator;
+        uint256 servedBytes;
+        uint256 amount;
+    }
+
     mapping(bytes32 poolId => Pool) internal pools;
 
     /// @notice Per-signer authorization, set once on the signer's first
@@ -191,8 +210,12 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     event PoolReclaimed(bytes32 indexed poolId, address indexed owner, uint256 ownerRefund);
 
     /// @notice `sweep` sent `amount` and `servedBytes` for `operator` to the
-    ///         governance chain. `maxFee` is the bridge fee the sweep allowed.
-    event Swept(address indexed operator, uint256 servedBytes, uint256 amount, uint256 maxFee);
+    ///         governance chain. Emitted once per operator in the batch.
+    event Swept(address indexed operator, uint256 servedBytes, uint256 amount);
+
+    /// @notice `sweep` handed one batch total `amount` to the bridge. `maxFee`
+    ///         is the bridge fee the sweep allowed.
+    event SweepSent(uint256 amount, uint256 maxFee);
 
     // -----------------------------------------------------------------
     // Errors
@@ -230,8 +253,13 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     error ChainMeterReservedNonZero();
     /// @dev The chain-extended claim does not fit `uint64`.
     error ClaimOverflow();
-    /// @notice The operator's pending protocol share is below `minSweep`.
-    error BelowMinSweep(uint256 pending, uint256 minSweep);
+    /// @notice The batch total is below `minSweep`.
+    error BelowMinSweep(uint256 total, uint256 minSweep);
+    /// @notice A sweep batch is empty or longer than `MAX_SWEEP_BATCH`.
+    error BadSweepBatch(uint256 length);
+    /// @notice A sweep entry has no pending protocol share. A repeated entry
+    ///         reads zero, since its first occurrence cleared it.
+    error NothingPending(address operator);
     /// @notice `pause` or `unpause` from an address other than `pauser`.
     error NotPauser();
 
@@ -242,7 +270,7 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     /// @param usdc_          Native USDC on this chain.
     /// @param disputeWindow_ Grace window in seconds.
     /// @param operatorBps_   Same-transaction operator share (at most 10000).
-    /// @param minSweep_      Smallest sweep in USDC base units.
+    /// @param minSweep_      Smallest sweep batch total in USDC base units.
     /// @param minDeposit_    Minimum credited `openPool` deposit (`0` is dormant).
     /// @param pauser_        The address that may pause inflows.
     constructor(
@@ -457,18 +485,32 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     // Sweep
     // -----------------------------------------------------------------
 
-    /// @notice Send `operator`'s pending protocol share and served bytes to the
-    ///         governance chain. Permissionless. Needs the pending share to be
-    ///         at least `minSweep`. Resets `pending[operator]` before the
-    ///         bridge call.
-    function sweep(address operator) external nonReentrant {
-        Pending memory p = _pending[operator];
-        // slither-disable-next-line incorrect-equality
-        if (p.usdc < minSweep || p.usdc == 0) revert BelowMinSweep(p.usdc, minSweep);
-        delete _pending[operator];
-        uint256 fee = _sweepFee(p.usdc);
-        emit Swept(operator, p.servedBytes, p.usdc, fee);
-        _sendSweep(operator, p.servedBytes, p.usdc, fee);
+    /// @notice Send each listed operator's pending protocol share and served
+    ///         bytes to the governance chain in one bridge transfer.
+    ///         Permissionless. Takes 1 to `MAX_SWEEP_BATCH` operators, each
+    ///         with a non-zero pending share, so every entry carries USDC and
+    ///         a repeated entry is rejected by the same check. Needs the batch
+    ///         total to be at least `minSweep`. Resets every listed `pending`
+    ///         before the bridge call.
+    function sweep(address[] calldata operators) external nonReentrant {
+        uint256 n = operators.length;
+        if (n == 0 || n > MAX_SWEEP_BATCH) revert BadSweepBatch(n);
+        SweepShare[] memory shares = new SweepShare[](n);
+        uint256 total = 0;
+        for (uint256 i = 0; i < n; i++) {
+            address operator = operators[i];
+            Pending memory p = _pending[operator];
+            // slither-disable-next-line incorrect-equality
+            if (p.usdc == 0) revert NothingPending(operator);
+            delete _pending[operator];
+            shares[i] = SweepShare({ operator: operator, servedBytes: p.servedBytes, amount: p.usdc });
+            total += p.usdc;
+            emit Swept(operator, p.servedBytes, p.usdc);
+        }
+        if (total < minSweep) revert BelowMinSweep(total, minSweep);
+        uint256 fee = _sweepFee(total);
+        emit SweepSent(total, fee);
+        _sendSweep(shares, total, fee);
     }
 
     /// @notice An operator's unswept protocol share and the served bytes that
@@ -481,8 +523,9 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     /// @dev The bridge fee a sweep of `amount` allows.
     function _sweepFee(uint256 amount) internal view virtual returns (uint256);
 
-    /// @dev Hand `amount` USDC and `(operator, servedBytes)` to the bridge.
-    function _sendSweep(address operator, uint256 servedBytes, uint256 amount, uint256 fee) internal virtual;
+    /// @dev Hand `amount` USDC, the sum of `shares`, and the shares themselves
+    ///      to the bridge.
+    function _sendSweep(SweepShare[] memory shares, uint256 amount, uint256 fee) internal virtual;
 
     // -----------------------------------------------------------------
     // Views
