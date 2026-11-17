@@ -50,6 +50,11 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     /// @dev Bytes per second carried by one Mbps (1e6 bits / 8).
     uint256 internal constant BYTES_PER_MBPS_SECOND = 125_000;
 
+    /// @dev Rebate ceiling. Buyback plus treasury keep at least 1% of each
+    ///      deposit, so weight credit always has a net to back it and an
+    ///      empty window never locks governance out (ADR 036).
+    uint256 internal constant MAX_REBATE_BPS = 9900;
+
     // Window bounds (ADR 036 § Governable parameters with safety bounds).
     uint64 internal constant WINDOW_EPOCHS_FLOOR = 4;
     uint64 internal constant WINDOW_EPOCHS_CEILING = 26;
@@ -134,6 +139,8 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     error ZeroAmount();
     /// @notice `rebateBps + buybackBps` exceeds 10000.
     error SplitExceedsWhole(uint256 rebateBps, uint256 buybackBps);
+    /// @notice `rebateBps` exceeds 9900, which leaves less than 1% net.
+    error RebateAboveCeiling(uint256 rebateBps);
     /// @notice A non-zero `buybackBps` needs a non-zero `buybackBurner`.
     error BuybackNeedsBurner();
     /// @notice `deliveryFloor` is outside [1, 1000].
@@ -287,8 +294,8 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     // Governance
     // -----------------------------------------------------------------
 
-    /// @notice Set the rebate and buyback shares. Their sum is at most 10000;
-    ///         the treasury takes the remainder.
+    /// @notice Set the rebate and buyback shares. The rebate is at most 9900
+    ///         and their sum is at most 10000; the treasury takes the remainder.
     function setSplit(uint256 newRebateBps, uint256 newBuybackBps) external onlyRole(GOVERNANCE_ROLE) {
         _setSplit(newRebateBps, newBuybackBps);
     }
@@ -371,6 +378,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     }
 
     function _setSplit(uint256 newRebateBps, uint256 newBuybackBps) internal {
+        if (newRebateBps > MAX_REBATE_BPS) revert RebateAboveCeiling(newRebateBps);
         if (newRebateBps + newBuybackBps > BPS_DENOMINATOR) revert SplitExceedsWhole(newRebateBps, newBuybackBps);
         if (newBuybackBps != 0 && buybackBurner == address(0)) revert BuybackNeedsBurner();
         rebateBps = newRebateBps;

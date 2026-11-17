@@ -240,13 +240,14 @@ contract FeeRouterTest is Test {
         assertEq(router.bytesPerEpoch(operator, _epoch()), 25 * MIB);
     }
 
-    /// The rebate does not back credit: at a 100% rebate there is no net.
-    function test_deposit_fullRebateCreditsNothing() public {
+    /// The rebate does not back credit: at the rebate ceiling only the 1% net does.
+    function test_deposit_maxRebateCreditsFromTheNetFloor() public {
         vm.prank(admin);
-        router.setSplit(10_000, 0);
-        _deposit(1_000_000, 1000e6);
-        assertEq(router.bytesPerEpoch(operator, _epoch()), 0);
-        assertEq(usdc.balanceOf(operator), 1000e6);
+        router.setSplit(9900, 0);
+        _deposit(1000 * MIB, 100e6);
+        // Net 1e6 at floor 1 backs 1e6 MiB, above the claimed bytes.
+        assertEq(router.bytesPerEpoch(operator, _epoch()), 1000 * MIB);
+        assertEq(usdc.balanceOf(operator), 99e6);
     }
 
     function test_deposit_floorPricesCredit() public {
@@ -328,8 +329,21 @@ contract FeeRouterTest is Test {
 
     function test_setSplit_rejectsAboveWhole() public {
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(FeeRouter.SplitExceedsWhole.selector, uint256(10_000), uint256(1)));
-        router.setSplit(10_000, 1);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.SplitExceedsWhole.selector, uint256(9900), uint256(101)));
+        router.setSplit(9900, 101);
+    }
+
+    /// A rebate above 99% would leave no net to back weight, so a quiet window
+    /// could empty the electorate for good.
+    function test_setSplit_keepsANetShare() public {
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.RebateAboveCeiling.selector, uint256(9901)));
+        router.setSplit(9901, 0);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.RebateAboveCeiling.selector, uint256(10_000)));
+        router.setSplit(10_000, 0);
+        router.setSplit(9900, 0);
+        vm.stopPrank();
+        assertEq(router.rebateBps(), 9900);
     }
 
     function test_setSplit_buybackNeedsBurner() public {

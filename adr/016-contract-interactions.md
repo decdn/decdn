@@ -154,13 +154,13 @@ Every knob is a governance-chain parameter on `FeeRouter`, under `GOVERNANCE_ROL
 | `windowEpochs` | Trailing-window length of the served-bytes vote weight. Bounds 4-26 per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds). |
 | `deliveryFloor` | Net USDC micro-units per MB of weight credit. Bounds 1-1000, launch value 1. |
 
-The split has no bounds beyond two checks. A non-zero `buybackBps` needs a non-zero burner address. A non-zero treasury remainder needs a non-zero treasury address. `setSplit` and the address setters apply the same checks.
+The split has one bound and two checks. `rebateBps` is at most 9900, so buyback plus treasury keep at least 1% of each deposit (see **Net share floor** below). A non-zero `buybackBps` needs a non-zero burner address. A non-zero treasury remainder needs a non-zero treasury address. `setSplit` and the address setters apply the same checks.
 
 **Buyback is a setting.** Governance deploys the `BuybackBurner` stack when it wants one. It then sets `buybackBps` above 0 and the burner address. It can set `buybackBps` back to 0 at any time. The standard 48h timelock makes each change observable in advance. Buyback inflow arrives in lumps, one per sweep. The per-epoch spend cap and the keeper cadence in [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol) are sized for lumpy inflow.
 
 **Operator share.** The operator receives `operatorBps` (immutable on the payment chain, 6000 in the reference deployment) at redemption, plus the rebate part of the protocol share. Example values, not defaults in code: `rebateBps` 7500 and `buybackBps` 0 give the operator 60% + 30% = 90% and the treasury 10%. `rebateBps` 0 and `buybackBps` 7500 give the operator 60%, the buyback 30%, and the treasury 10%.
 
-**Net share zero.** With `buybackBps` and the treasury remainder both zero, the router mints no new weight. When the trailing window empties, quorum and proposal threshold reach 0. This is a governance decision that the same governance can reverse.
+**Net share floor.** Weight credit is backed only by `net`, the buyback and treasury part of a deposit. With a zero `net`, no deposit credits weight. The trailing window then empties, and no one holds the votes to change the split back. So `setSplit` rejects a `rebateBps` above 9900 (`RebateAboveCeiling`). Every deposit keeps at least 1% `net`, and a direct deposit can always restore weight ([ADR 036 § Behaviors that follow from the formula](036-served-bytes-voting-weight.md#behaviors-that-follow-from-the-formula)).
 
 `PaymentPool` has no tunable. Its `minDeposit` (dormant at 0, see [ADR 003 § Minimum deposit](003-payments.md#minimum-deposit)) is an immutable.
 
@@ -732,7 +732,7 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 | **`currentTermsHash`** (operator-terms version) | **any non-zero `bytes32`** | | **CapacityBond (`setCurrentTermsHash`, genesis value set in the constructor) — see [§ Operator-terms acceptance](#operator-terms-acceptance)** |
 | **`deliveryFloor`** (net USDC micro-units per MB of weight credit) | **1** | **1000** | **FeeRouter (launch 1)** |
 
-`rebateBps` and `buybackBps` carry no bounds beyond the cross-validation in [§ Tunable Economics](#tunable-economics). `PaymentPool` parameters (`disputeWindow`, `operatorBps`, `minSweep`, `minDeposit`) are immutables with no governance bound.
+`rebateBps` is bounded `[0, 9900]`. `buybackBps` carries no bound beyond the cross-validation in [§ Tunable Economics](#tunable-economics). `PaymentPool` parameters (`disputeWindow`, `operatorBps`, `minSweep`, `minDeposit`) are immutables with no governance bound.
 
 #### Emergency Multisig (Production)
 
@@ -796,7 +796,7 @@ Every state-mutating function that makes an external call is listed below with i
 | --- | --- | --- |
 | `deposit(operator, bytes, amount)` | `IERC20.safeTransferFrom()` (pulls `amount` from the caller), `CapacityBond.isActive(operator)` and `CapacityBond.declaredMbps(operator)` (reads), `IERC20` transfer × up to 3 (operator rebate, BuybackBurner, Treasury; all legs same-tx). Derives `epoch = uint64(block.timestamp / EPOCH_LENGTH)` at arrival and increments both `bytesPerEpoch[operator][epoch]` and `totalBytesPerEpoch[epoch]` by the USDC-backed credit, clamped to the operator's declared capacity for the epoch — the governance-canonical served-bytes vote-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Emits `Deposited`. | `nonReentrant`, checks-effects-interactions; permissionless; reverts if paused |
 | `CctpSweepReceiver.receiveSweep(message, attestation)` | `MessageTransmitterV2.receiveMessage()` (mints USDC to the receiver), then `FeeRouter.deposit(operator, bytes, share)` per entry, with `U` split pro rata to the entry amounts. Emits `SweepReceived` per deposited entry. | `nonReentrant`; permissionless; holds no state |
-| `setSplit(...)`, `setBuybackBurner(addr)`, `setTreasury(addr)`, `setWindowEpochs(n)`, `setDeliveryFloor(n)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); cross-validated against destination addresses ([§ Tunable Economics](#tunable-economics)); `setDeliveryFloor` bounded `[1, 1000]`. `setWindowEpochs` bounded `[4, 26]` per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds) |
+| `setSplit(...)`, `setBuybackBurner(addr)`, `setTreasury(addr)`, `setWindowEpochs(n)`, `setDeliveryFloor(n)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); cross-validated against destination addresses ([§ Tunable Economics](#tunable-economics)); `setSplit` rebate bounded `[0, 9900]`; `setDeliveryFloor` bounded `[1, 1000]`. `setWindowEpochs` bounded `[4, 26]` per [ADR 036 § Governable parameters](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds) |
 
 > **Operator guarantee.** The operator share `operatorBps` is paid on the payment chain at redemption and is immutable. Governance cannot lower it.
 

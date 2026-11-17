@@ -197,7 +197,7 @@ Each redemption splits in two steps. The split runs on two chains ([ADR 016 § D
 1. **Operator share, payment chain.** `PaymentPool.redeemMany` pays `operatorBps` of the paid amount to the operator in the same transaction. The reference deployment sets `operatorBps` to 6000 (60%). `operatorBps` is an immutable of each pool, so governance cannot lower it.
 2. **Protocol share, governance chain.** The rest of the redemption accrues in the pool. A permissionless `sweep` sends it to the governance-chain `FeeRouter` over CCTP, together with the operator's served bytes ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
 
-`FeeRouter` splits each swept amount by three governable values. `rebateBps` goes to the operator. `buybackBps` goes to `BuybackBurner` ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)). The treasury (the Timelock) receives the remainder. The split has no bounds. A non-zero `buybackBps` needs a non-zero burner address, and a non-zero treasury remainder needs a non-zero treasury address.
+`FeeRouter` splits each swept amount by three governable values. `rebateBps` goes to the operator. `buybackBps` goes to `BuybackBurner` ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)). The treasury (the Timelock) receives the remainder. `rebateBps` is at most 9900, so buyback plus treasury keep at least 1% and vote weight stays earnable ([ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)). A non-zero `buybackBps` needs a non-zero burner address, and a non-zero treasury remainder needs a non-zero treasury address.
 
 The operator's total share is `operatorBps` plus the rebate part of the protocol share. The operator is paid on the payment chain where the redemption lands. The rebate arrives on the governance chain.
 
@@ -380,7 +380,7 @@ Approximate use of pre-seed USDC:
 
 ### Governable parameters with safety bounds
 
-Capacity-curve parameters and the `FeeRouter` split are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model). The split (`rebateBps`, `buybackBps`, treasury remainder) has no bounds. The parameters below carry bounds.
+Capacity-curve parameters and the `FeeRouter` split are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model). The split (`rebateBps`, `buybackBps`, treasury remainder) has one bound: `rebateBps` is at most 9900. The parameters below carry bounds.
 
 | Parameter | Default | Min | Max |
 |---|---:|---:|---:|
