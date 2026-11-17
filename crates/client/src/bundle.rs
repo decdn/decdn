@@ -45,18 +45,18 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
-use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
 use crate::pool_route::{PoolPasses, PoolRoute};
 use crate::receipt::ReceiptEvidence;
 use crate::session::{
-    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PoolOpen, PullSite,
+    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PaymentPoolChain, PinnedNode,
+    PoolOpen, PullSite,
 };
 use crate::stream_cap::LaneStreamCap;
 use crate::uri::DecdnUri;
 use crate::{
-    Connections, CredentialSlot, FundingNeeded, LaneLedgers, PeerHealth, PoolReplaced,
-    ProgressClock, RecoveryGate, RunDemand, StopPolicy,
+    Connections, CredentialSlot, FundingNeeded, PeerHealth, PoolReplaced, ProgressClock, RunDemand,
+    StopPolicy,
 };
 
 mod engine;
@@ -927,8 +927,8 @@ pub struct EntryFailure {
     pub error: String,
 }
 
-/// Pulls bundles into a directory over one paid run: one pool, one
-/// connection per node, one progress clock.
+/// Pulls bundles into a directory over one paid run: one pass per payment
+/// pool a holder is routed to, one connection per node, one progress clock.
 ///
 /// Build it with [`Self::builder`]. One puller serves one run: a manifest
 /// fetch and one [`Self::pull`], or several pulls that share the run's lanes.
@@ -1026,7 +1026,7 @@ impl BundlePuller {
     ///
     /// The fetch fails, or the bytes are not a manifest.
     pub async fn fetch_manifest(
-        &self,
+        &mut self,
         hash: [u8; 32],
         out_dir: &Path,
         use_cache: bool,
@@ -1064,14 +1064,15 @@ impl BundlePuller {
     /// ended a manifest fetch is in no [`BundleOutcome`].
     #[must_use]
     pub fn replacements(&self) -> Vec<PoolReplaced> {
-        self.ctx.recovery.replacements()
+        self.ctx.replacements()
     }
 
-    /// The warning for a wallet seen to hold too little USDC to top the pool
-    /// up during this run, if one was.
+    /// The warning for a wallet seen to hold too little USDC to top a pool up
+    /// during this run, if one was: one line per pool that saw one.
     #[must_use]
     pub fn funding_shortfall(&self) -> Option<String> {
-        self.ctx.funding.shortfall()
+        let shortfalls = self.ctx.funding_shortfalls();
+        (!shortfalls.is_empty()).then(|| shortfalls.join("\n"))
     }
 
     /// The handle that holds each `openPool` and `topUp` of the puller that no
@@ -1080,7 +1081,7 @@ impl BundlePuller {
     /// [`BundlePullerBuilder::unconfirmed_escrows`], or the puller's own.
     #[must_use]
     pub const fn unconfirmed_escrows(&self) -> &UnconfirmedEscrows {
-        self.ctx.funding.escrows()
+        &self.ctx.escrows
     }
 
     /// The rates the run's nodes signed, nearest first: from the probes this
@@ -1222,8 +1223,10 @@ impl BundlePullerBuilder {
                 )
             }
         };
-        // The run pays through one pool, the first of the buyer's route, and
-        // pays only the nodes routed to it.
+        let self_address = signer.address();
+        // The first pass pays through the first pool of the buyer's route,
+        // and pays only the nodes routed to it; each later pass pays through
+        // the next pool a node is routed to (ADR 005 § Payment pool routing).
         let owner = match &payer {
             engine::RunPayer::Owned(payer) => Some(payer.owner().address()),
             engine::RunPayer::Delegated(_) => None,
@@ -1240,9 +1243,11 @@ impl BundlePullerBuilder {
             .ok_or_else(|| anyhow::anyhow!("no payment pool configured"))?;
         let passes = PoolPasses::new(route);
         passes.start(deployment);
-        let rpc = crate::provider::build_provider(&pool.rpc_url, &signer)?.erased();
-        let contract = PaymentPool::new(deployment.payment_pool, rpc.clone());
-        let token = contract
+        let connect = move |pool: &PaymentPoolChain| {
+            Ok(crate::provider::build_provider(&pool.rpc_url, &signer)?.erased())
+        };
+        let rpc = connect(&pool)?;
+        let token = PaymentPool::new(deployment.payment_pool, rpc.clone())
             .usdc()
             .call()
             .await
@@ -1250,18 +1255,17 @@ impl BundlePullerBuilder {
         let discovery = self.nodes.applied_to(self.discovery);
         let governance = &self.chain.governance;
         let ctx = engine::PullCtx {
-            voucher_dom: deployment.voucher_domain(),
             slash_dom: slash_judge_domain(governance.chain_id, governance.slash_judge),
-            pool,
+            pass: engine::PassPool::new(pool, rpc, token, &self.escrows),
+            parked: std::collections::HashMap::new(),
+            connect: Box::new(connect),
+            escrows: self.escrows,
             passes,
             connections: Connections::new(self.endpoint.clone()),
-            self_address: signer.address(),
+            self_address,
             endpoint: self.endpoint,
             store: self.store,
-            contract,
-            rpc,
             payer,
-            token,
             chain: self.chain,
             site: self.site,
             relays: self.relays,
@@ -1271,9 +1275,6 @@ impl BundlePullerBuilder {
             max_blob_bytes: self.max_blob_bytes,
             deposit,
             namespace_id: namespace_id(self.namespace),
-            ledgers: LaneLedgers::new(),
-            funding: RunFunding::reporting_escrows_to(self.escrows),
-            recovery: Arc::new(RecoveryGate::new()),
             dedup_stats: engine::DedupStats::default(),
             open_lock: tokio::sync::Mutex::new(()),
             gate: engine::JobGate::new(self.jobs.max(1)),

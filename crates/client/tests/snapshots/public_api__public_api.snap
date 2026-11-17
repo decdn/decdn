@@ -38,7 +38,7 @@ pub decdn_client::bundle::BundleOutcome::report: decdn_client::bundle::BundleRep
 pub struct decdn_client::bundle::BundlePuller
 impl decdn_client::bundle::BundlePuller
 pub fn decdn_client::bundle::BundlePuller::builder(decdn_client::session::ChainConfig, decdn_client::session::PullSite, iroh::endpoint::Endpoint, alloc::sync::Arc<dyn decdn_incentive::buyer_pool::BuyerPoolStore>, decdn_client::bundle::Funding, decdn_client::session::DiscoveryOptions, decdn_client::bundle::NodeSelection) -> decdn_client::bundle::BundlePullerBuilder
-pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&self, [u8; 32], &std::path::Path, bool) -> anyhow::Result<decdn_client::bundle::BundleManifest>
+pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&mut self, [u8; 32], &std::path::Path, bool) -> anyhow::Result<decdn_client::bundle::BundleManifest>
 pub async fn decdn_client::bundle::BundlePuller::finish(self)
 pub fn decdn_client::bundle::BundlePuller::funding_shortfall(&self) -> core::option::Option<alloc::string::String>
 pub async fn decdn_client::bundle::BundlePuller::pull(&mut self, &decdn_client::bundle::BundleManifest, &std::path::Path, bool, &tokio_util::sync::cancellation_token::CancellationToken) -> decdn_client::bundle::BundleOutcome
@@ -210,8 +210,9 @@ pub fn decdn_client::buyer_pool::TopUpUnconfirmed::fmt(&self, &mut core::fmt::Fo
 #[non_exhaustive] pub struct decdn_client::buyer_pool::ToppedUpPool
 pub decdn_client::buyer_pool::ToppedUpPool::credited: alloy_primitives::aliases::U256
 pub decdn_client::buyer_pool::ToppedUpPool::tx: alloy_primitives::aliases::TxHash
-pub struct decdn_client::buyer_pool::UnconfirmedEscrows(_)
+pub struct decdn_client::buyer_pool::UnconfirmedEscrows
 impl decdn_client::buyer_pool::UnconfirmedEscrows
+pub fn decdn_client::buyer_pool::UnconfirmedEscrows::for_pool(&self, decdn_incentive::deployment::Deployment) -> Self
 pub fn decdn_client::buyer_pool::UnconfirmedEscrows::pending(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::EscrowUnconfirmed>
 pub fn decdn_client::buyer_pool::UnconfirmedEscrows::untracked(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::UntrackedEscrow>
 pub struct decdn_client::buyer_pool::UnrecordedEscrow

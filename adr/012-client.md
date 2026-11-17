@@ -241,9 +241,13 @@ in current schema terms:
   where it already holds a pool, and it gives a node with no hint the first contract in its list.
   A node that refuses the contract lists its accepted contracts in the refusal, and the client
   retries that node once on a listed contract in its own list. A fetch pays through one contract
-  per pass, so the nodes routed to another contract are paid in that contract's pass. A
-  delegated client pays only through the first contract in its list, where its capability's pool
-  lives.
+  per pass, so the nodes routed to another contract are paid in that contract's pass. A bundle
+  pull runs the same passes, and a pass does not fetch a file again that an earlier pass
+  completed. A delegated client pays only through the contract of its capability's pool. The
+  EIP-712 domain of a capability binds one contract. Under the domain of that contract only, the
+  owner signature recovers to the on-chain owner of the pool. The gateway checks the signature
+  against each contract in its list and keeps the contract where it matches. `decdn get
+  --capability` pays through the first contract in its list.
   The RPC URLs and keystore live here, **not** under `[network]`/`[keys]`.
 - `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
   probing to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull

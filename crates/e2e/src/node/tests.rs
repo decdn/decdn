@@ -19,6 +19,7 @@ fn render_config_emits_parseable_toml() {
         origin_assignment: Address::from([0xAA; 20]),
         manual_vetting_policy: Address::from([0xAB; 20]),
         content_blacklist: Address::from([0xBB; 20]),
+        cctp_sweep_receiver: Address::from([0xBC; 20]),
     };
     let discovery_peers = [(iroh::SecretKey::from_bytes(&[0xCC; 32]).public(), 4434)];
     let rendered = render_config(&RenderConfig {
@@ -85,6 +86,7 @@ fn sample_rendered_config() -> String {
         origin_assignment: Address::from([0xAA; 20]),
         manual_vetting_policy: Address::from([0xAB; 20]),
         content_blacklist: Address::from([0xBB; 20]),
+        cctp_sweep_receiver: Address::from([0xBC; 20]),
     };
     render_config(&RenderConfig {
         data_dir: PathBuf::from("/var/lib/decdn"),

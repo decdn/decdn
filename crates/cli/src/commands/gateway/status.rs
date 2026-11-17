@@ -41,7 +41,8 @@ pub(super) struct Status {
     listen: SocketAddr,
     /// The payment chain of `payment_pool`.
     chain_id: u64,
-    /// The first configured payment pool: the one a capability draws from.
+    /// The first configured payment pool. A capability draws from whichever
+    /// configured pool its owner signature names.
     #[serde(serialize_with = "super::eip55")]
     payment_pool: Address,
     counters: Counters,
@@ -69,7 +70,7 @@ impl Gateway {
             .await
             .values()
             .filter_map(|d| d.capability.as_ref())
-            .map(|r| (r.grant.pool_id, r.grant.signer))
+            .map(|r| (r.pool, r.grant.pool_id, r.grant.signer))
             .collect();
         let (pools, pool_error) =
             match tokio::time::timeout(POOL_QUERY_TIMEOUT, self.pulls.pools(delegates)).await {

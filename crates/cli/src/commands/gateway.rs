@@ -147,11 +147,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::Eip712Domain;
 use anyhow::Context as _;
 use bytes::Bytes;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
-use decdn_client::session::ChainConfig;
+use decdn_client::session::{ChainConfig, PaymentPoolChain};
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::address::parse_nonzero_address;
 use decdn_common::cli::{self, ClientFetchArgs, GatewayArgs};
@@ -159,7 +158,7 @@ use decdn_common::config::{FileConfig, load_file_config};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::publisher_registry::PublisherRegistry;
-use decdn_incentive::{CapabilityGrant, PoolId};
+use decdn_incentive::{CapabilityGrant, Deployment, PoolId};
 use http_body_util::{BodyExt as _, Limited, StreamBody};
 use hyper::body::{Body as HttpBody, Frame};
 use hyper::service::service_fn;
@@ -345,8 +344,6 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     let (store_dir, temp_store) = store_dir(&root, public_url.is_some())?;
     common.data_dir = Some(store_dir);
     let (sites, public) = mode(args, &root, chain.governance.chain_id, &file)?;
-    // A capability names a pool on the first configured payment pool.
-    let capability_pool = chain.first_pool()?.deployment;
 
     let listener = TcpListener::bind(args.listen)
         .await
@@ -364,7 +361,6 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     let gateway = Arc::new(Gateway {
         common,
         token,
-        domain: capability_pool.voucher_domain(),
         chain,
         delegates: Mutex::new(HashMap::new()),
         pulls,
@@ -849,6 +845,65 @@ fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Resu
     }
 }
 
+/// The configured `PaymentPool` contract `grant` spends from. A capability's
+/// EIP-712 domain binds one contract (its payment chain id and address), so
+/// its signature recovers to the pool's owner under that contract's domain
+/// only. Each configured pool is tried in order: the signer the grant
+/// recovers to under its domain, against `read_owner`'s on-chain owner of
+/// `grant.pool_id` there. The first pool where they match is the
+/// capability's.
+///
+/// # Errors
+///
+/// The status and text to answer with: 422 when the signature is malformed,
+/// or when every pool was read and none matches; 502 when no pool matches and
+/// a read failed.
+async fn capability_pool<F, Fut>(
+    grant: &CapabilityGrant,
+    pools: &[PaymentPoolChain],
+    read_owner: F,
+) -> Result<Deployment, (StatusCode, String)>
+where
+    F: Fn(&PaymentPoolChain, PoolId) -> Fut,
+    Fut: std::future::Future<Output = Result<Address, String>>,
+{
+    let unprocessable = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
+    let mut owners = Vec::with_capacity(pools.len());
+    let mut unread = None;
+    for pool in pools {
+        let signed_by = grant
+            .owner(&pool.deployment.voucher_domain())
+            .map_err(|e| unprocessable(format!("{e}\n")))?;
+        match read_owner(pool, grant.pool_id).await {
+            Ok(on_chain) if owner_matches(on_chain, signed_by, grant.pool_id).is_ok() => {
+                return Ok(pool.deployment);
+            }
+            Ok(on_chain) => owners.push((on_chain, signed_by)),
+            Err(e) => {
+                unread.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = unread {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("could not read the capability's pool on-chain: {e}\n"),
+        ));
+    }
+    // A pool that exists on some contract is named as not signed by its
+    // owner; one that exists on none, as missing.
+    let (on_chain, signed_by) = owners
+        .iter()
+        .copied()
+        .find(|(on_chain, _)| !on_chain.is_zero())
+        .unwrap_or_default();
+    Err(unprocessable(
+        owner_matches(on_chain, signed_by, grant.pool_id)
+            .err()
+            .unwrap_or_default(),
+    ))
+}
+
 /// A delegate key and the capability registered to it, if any.
 struct Delegate {
     signer: Arc<PrivateKeySigner>,
@@ -903,6 +958,9 @@ struct Capability {
 
 struct Registered {
     grant: CapabilityGrant,
+    /// The configured `PaymentPool` contract the capability's pool lives in
+    /// ([`capability_pool`]): every pull it pays for pays through it.
+    pool: Deployment,
     scope: Scope,
     /// The origin that registered it, or `None` for the token holder.
     origin: Option<String>,
@@ -936,10 +994,9 @@ struct Gateway {
     /// The gateway token a loopback gateway's content requests carry;
     /// `None` on a public gateway, which takes no token.
     token: Option<String>,
-    /// The chain a registered capability's pool must live on.
+    /// The chains a registered capability's pool must live on: one of the
+    /// configured payment pools.
     chain: ChainConfig,
-    /// The EIP-712 domain a capability's owner signs under.
-    domain: Eip712Domain,
     delegates: Mutex<HashMap<Address, Delegate>>,
     /// Runs every pull, on one endpoint and one buyer-pool store.
     pulls: PullWorker,
@@ -1830,9 +1887,10 @@ impl Gateway {
                 "the capability has expired\n",
             );
         }
-        if let Err((status, e)) = self.verify_owner(&grant).await {
-            return text(status, &e);
-        }
+        let pool = match self.verify_owner(&grant).await {
+            Ok(pool) => pool,
+            Err((status, e)) => return text(status, &e),
+        };
         let mut delegates = self.delegates.lock().await;
         Self::prune(&mut delegates);
         let Some(delegate) = delegates.get_mut(&grant.signer) else {
@@ -1855,6 +1913,7 @@ impl Gateway {
         });
         delegate.capability = Some(Registered {
             grant,
+            pool,
             scope,
             origin: caller.origin().map(str::to_owned),
             since: Instant::now(),
@@ -1863,32 +1922,28 @@ impl Gateway {
         json(StatusCode::CREATED, &response)
     }
 
-    /// Check that `grant` is signed by the on-chain owner of its pool on this
-    /// gateway's deployment. Whether the pool can pay shows only when a pull
-    /// draws on it: a funding stop retires the capability.
-    async fn verify_owner(&self, grant: &CapabilityGrant) -> Result<(), (StatusCode, String)> {
-        let unprocessable = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
-        let signed_by = grant
-            .owner(&self.domain)
-            .map_err(|e| unprocessable(format!("{e}\n")))?;
-        let unreachable = |e: String| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("could not read the capability's pool on-chain: {e}\n"),
-            )
-        };
-        let capability_pool = self
-            .chain
-            .first_pool()
-            .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
-        let rpc = decdn_client::provider::build_read_provider(&capability_pool.rpc_url)
-            .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
-        let pool = PaymentPool::new(capability_pool.deployment.payment_pool, rpc)
-            .getPool(grant.pool_id)
-            .call()
-            .await
-            .map_err(|e| unreachable(sanitize_error_sources(&e)))?;
-        owner_matches(pool.owner, signed_by, grant.pool_id).map_err(unprocessable)
+    /// The configured `PaymentPool` contract whose on-chain owner of `grant`'s
+    /// pool signed it ([`capability_pool`]). Whether the pool can pay shows
+    /// only when a pull draws on it: a funding stop retires the capability.
+    async fn verify_owner(
+        &self,
+        grant: &CapabilityGrant,
+    ) -> Result<Deployment, (StatusCode, String)> {
+        capability_pool(grant, &self.chain.payment_pools, |pool, pool_id| {
+            let rpc_url = pool.rpc_url.clone();
+            let contract = pool.deployment.payment_pool;
+            async move {
+                let rpc = decdn_client::provider::build_read_provider(&rpc_url)
+                    .map_err(|e| sanitize_err_chain(&e))?;
+                PaymentPool::new(contract, rpc)
+                    .getPool(pool_id)
+                    .call()
+                    .await
+                    .map(|pool| pool.owner)
+                    .map_err(|e| sanitize_error_sources(&e))
+            }
+        })
+        .await
     }
 
     async fn list(&self) -> Response<Body> {
@@ -1968,6 +2023,7 @@ impl Gateway {
                 Payment::Held(Credential {
                     signer: Arc::clone(&d.signer),
                     grant: r.grant.clone(),
+                    pool: r.pool,
                 })
             })
     }

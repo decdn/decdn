@@ -15,7 +15,7 @@
 //!      and the serve handler registers a lane from that capability and persists a
 //!      genuine client-signed voucher. The seller redeemer then submits `redeem`;
 //!      the contract's `ECDSA.recover` accepts the normalized voucher signature,
-//!      `getWatermark` advances, and `FeeRouter.bytesPerEpoch` increments.
+//!      `getWatermark` advances, and the operator's `pending` sweep grows.
 //!   2. **Live receipt decode.** The [`PoolSettlementService`] redeemer decodes
 //!      its own `redeemMany` receipt against a live RPC (`PoolRedeemed` drives
 //!      the paid watermark that gates redemption).
@@ -26,9 +26,11 @@
 //!
 //! ## Shape
 //!
-//! 1. Spawn a local `anvil`, deploy a mintable mock USDC, then deploy the full
-//!    protocol via the production `forge script DeployProtocol.s.sol` (reading the
-//!    deployed addresses from the `deployments/<chainId>.json` manifest).
+//! 1. Spawn a local `anvil`, deploy a mintable mock USDC and a `LoopbackCctp`,
+//!    then the governance suite via the production `forge script
+//!    DeployProtocol.s.sol` and the `PaymentPool` via `DeployPaymentPool.s.sol`
+//!    (reading the deployed addresses from the `deployments/<chainId>.json` and
+//!    `deployments/<chainId>-payment.json` manifests).
 //! 2. Activate the node operator on-chain: `stake` + `registerNode` (the iroh
 //!    ed25519 node key signs the ownership proof the production `Ed25519Verifier`
 //!    checks; the eth key signs the EIP-712 binding).
@@ -39,8 +41,8 @@
 //!    pointed at the anvil RPC.
 //! 4. Seller path — a buyer opens a pool on-chain, runs a real iroh paid-delivery
 //!    roundtrip carrying its self-capability so a genuine voucher is produced, and
-//!    the redeemer's `redeem` lands: `getWatermark` advances and
-//!    `FeeRouter.bytesPerEpoch` increments.
+//!    the redeemer's `redeem` lands: `getWatermark` advances and the operator's
+//!    `pending` sweep grows.
 //! 5. Buyer path — a [`BuyerPoolService`] opens a pool, delivers over the
 //!    service-produced context, tops the pool up, then closes + reclaims after the
 //!    grace window, asserting the full deposit refunds and the record drops.
@@ -96,6 +98,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod anvil_deploy;
 mod support;
 use support::{
     HandlerDomains, build_handler_full_configured, cache_with_blob, fresh_key, local_endpoint,
@@ -123,7 +126,6 @@ const DEPLOYER_ADDR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 // it would desync alloy's cached nonce ("nonce too low").
 const ADMIN_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
-const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60; // FeeRouter/CapacityBond constant
 const RATE_PER_MB: u64 = 10; // µUSDC per MiB (within deliveryFloor/ceiling)
 const MIB: usize = 1024 * 1024;
 
@@ -276,15 +278,17 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReconcileFailureLa
 /// process.
 struct AnvilGuard {
     child: Child,
-    manifest: PathBuf,
+    manifests: [PathBuf; 2],
 }
 
 impl Drop for AnvilGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // Manifest is gitignored, but remove it so re-runs start clean.
-        let _ = std::fs::remove_file(&self.manifest);
+        // The manifests are gitignored, but remove them so re-runs start clean.
+        for manifest in &self.manifests {
+            let _ = std::fs::remove_file(manifest);
+        }
     }
 }
 
@@ -416,7 +420,7 @@ fn empty_output_is_not_retryable() {
 // `topUp`, `closePool`, `reclaim`, `getPool`, `getWatermark`, and every event) is
 // reused from `decdn_incentive::payment_pool::PaymentPool` — the same ABI the
 // runtime decodes — so there is a single source of truth for the pool layout.
-// Only the ERC-20, operator-registration, and FeeRouter views are declared here.
+// Only the ERC-20 and operator-registration calls are declared here.
 alloy::sol! {
     #[sol(rpc)]
     contract Erc20 {
@@ -438,11 +442,6 @@ alloy::sol! {
             bytes ed25519Signature
         ) external;
         function isActive(address operator) external view returns (bool);
-    }
-
-    #[sol(rpc)]
-    contract FeeRouterView {
-        function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
     }
 }
 
@@ -548,9 +547,10 @@ async fn run_e2e() -> anyhow::Result<()> {
         .spawn()
         .expect("spawn anvil (is foundry installed?)");
     let manifest = contracts.join(format!("deployments/{CHAIN_ID}.json"));
+    let payment_manifest = contracts.join(format!("deployments/{CHAIN_ID}-payment.json"));
     let _anvil = AnvilGuard {
         child,
-        manifest: manifest.clone(),
+        manifests: [manifest.clone(), payment_manifest.clone()],
     };
 
     let url: reqwest::Url = rpc_url.parse()?;
@@ -592,11 +592,22 @@ async fn run_e2e() -> anyhow::Result<()> {
             .await?;
     }
 
-    // ---- 3. Deploy mock USDC (mintable) from its compiled bytecode, then run
-    // the production deploy script with USDC_ADDRESS pointed at it.
+    // ---- 3. Deploy mock USDC (mintable) from its compiled bytecode and the
+    // loopback CCTP, then run the production deploy scripts with USDC_ADDRESS
+    // pointed at it: the governance suite, then the payment pool.
     let usdc_addr = deploy_mock_usdc(&admin, &contracts).await?;
-    run_deploy_script(&contracts, &rpc_url, usdc_addr, node_addr).await?;
-    let (capacity_bond, payment_pool, fee_router, token, slash_judge) = read_manifest(&manifest)?;
+    let cctp = anvil_deploy::deploy_loopback_cctp(&admin, &contracts).await?;
+    run_deploy_script(&contracts, &rpc_url, (usdc_addr, cctp), node_addr).await?;
+    let (capacity_bond, token, slash_judge) = read_manifest(&manifest)?;
+    let receiver = anvil_deploy::manifest_contract(&manifest, "CctpSweepReceiver")?;
+    let payment_pool = anvil_deploy::deploy_payment_pool(
+        &contracts,
+        &rpc_url,
+        (DEPLOYER_KEY, DEPLOYER_ADDR),
+        (usdc_addr, cctp, receiver),
+        &payment_manifest,
+    )
+    .await?;
 
     // Build the per-role providers + contract handles.
     // Simple nonce management mirrors production (`runtime::mod`, #904): a send
@@ -616,7 +627,6 @@ async fn run_e2e() -> anyhow::Result<()> {
     let usdc_admin = Erc20::new(usdc_addr, admin.clone());
     let pool_client = PaymentPool::new(payment_pool, client_provider.clone());
     let pool_read = PaymentPool::new(payment_pool, node_provider.clone());
-    let fee_view = FeeRouterView::new(fee_router, node_provider.clone());
 
     // ---- 4. Activate the node operator: bond + registerNode → isActive.
     let min_bond: U256 = "50000000000000000000000".parse()?; // 50_000e18 (deploy default)
@@ -795,7 +805,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // SELLER PATH — the `client` account opens a pool, delivers one paid stream
     // carrying its self-capability (producing a genuine voucher), and the
     // redeemer redeems it. Assert the on-chain watermark advances and the byte
-    // delta is routed into the operator's FeeRouter epoch counter.
+    // delta is credited to the operator's pending sweep.
     // ============================================================
     // `openPool` takes the pool's own `uint64` USDC width.
     let deposit = DEPOSIT_MICRO_USDC;
@@ -897,14 +907,16 @@ async fn run_e2e() -> anyhow::Result<()> {
         "on-chain redeem never landed (normalized v-byte not accepted, or capability lane not registered)"
     );
 
-    // FeeRouter routing: the redeem routed its byte delta into the operator's
-    // per-epoch counter. Which voucher the single redeem lands on is
-    // timing-dependent, so assert it incremented, not an exact value.
-    let epoch = current_epoch(&node_provider).await?;
-    let routed = fee_view.bytesPerEpoch(node_addr, epoch).call().await?;
+    // Protocol share: the redeem credited its byte delta and the protocol's
+    // USDC share to the operator's pending sweep (`pending(operator)`), which
+    // a sweep carries to the governance chain's `FeeRouter`. Which voucher the
+    // single redeem lands on is timing-dependent, so assert it grew, not an
+    // exact value.
+    let pending = pool_read.pending(node_addr).call().await?;
     anyhow::ensure!(
-        routed > U256::ZERO,
-        "FeeRouter.bytesPerEpoch did not increment (settlement not routed): {routed}"
+        pending.servedBytes > U256::ZERO,
+        "PaymentPool.pending did not credit the operator's served bytes: {}",
+        pending.servedBytes
     );
 
     // ------------------------------------------------------------
@@ -1534,16 +1546,6 @@ fn cap_count_for_tx(
         .ok_or_else(|| anyhow::anyhow!("no captured cap_count log line for redeem tx {tx_hash}"))
 }
 
-/// Current `FeeRouter` epoch = `block.timestamp / epochLength`.
-async fn current_epoch<P: Provider>(provider: &P) -> anyhow::Result<u64> {
-    let block: serde_json::Value = provider
-        .raw_request("eth_getBlockByNumber".into(), ("latest", false))
-        .await?;
-    let ts_hex = block["timestamp"].as_str().expect("block timestamp");
-    let ts = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)?;
-    Ok(ts / EPOCH_LENGTH_SECS)
-}
-
 /// Deploy the mintable mock USDC from its compiled artifact bytecode.
 async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow::Result<Address> {
     let artifact = contracts.join("out/MintableUSDC.sol/MintableUSDC.json");
@@ -1583,7 +1585,7 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
 async fn run_deploy_script(
     contracts: &Path,
     rpc_url: &str,
-    usdc: Address,
+    (usdc, cctp): (Address, Address),
     initial_token_holder: Address,
 ) -> anyhow::Result<()> {
     for attempt in 1..=DEPLOY_ATTEMPTS {
@@ -1601,6 +1603,8 @@ async fn run_deploy_script(
                 DEPLOYER_ADDR,
             ])
             .env("USDC_ADDRESS", usdc.to_string())
+            .env("CCTP_MESSAGE_TRANSMITTER", cctp.to_string())
+            .env("CCTP_TOKEN_MESSENGER", cctp.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
             // DeployProtocol.s.sol requires a genesis VETTER_ROLE holder (a deploy
@@ -1660,22 +1664,9 @@ async fn run_deploy_script(
     anyhow::bail!("DEPLOY_ATTEMPTS must be >= 1 (was {DEPLOY_ATTEMPTS})")
 }
 
-/// Read `(CapacityBond, PaymentPool, FeeRouter, Token, SlashJudge)` from the
-/// deploy manifest.
-fn read_manifest(path: &Path) -> anyhow::Result<(Address, Address, Address, Address, Address)> {
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    let c = &json["contracts"];
-    let get = |k: &str| -> anyhow::Result<Address> {
-        Ok(c[k]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing {k}"))?
-            .parse()?)
-    };
-    Ok((
-        get("CapacityBond")?,
-        get("PaymentPool")?,
-        get("FeeRouter")?,
-        get("Token")?,
-        get("SlashJudge")?,
-    ))
+/// Read `(CapacityBond, Token, SlashJudge)` from the governance deploy
+/// manifest.
+fn read_manifest(path: &Path) -> anyhow::Result<(Address, Address, Address)> {
+    let get = |k: &str| anvil_deploy::manifest_contract(path, k);
+    Ok((get("CapacityBond")?, get("Token")?, get("SlashJudge")?))
 }

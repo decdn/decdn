@@ -116,17 +116,23 @@ async fn run() -> anyhow::Result<()> {
     // zeroed by the slash regardless. Declared here, before the age warp and
     // the serve below, so the `declareMbps` checkpoint precedes the served
     // epoch's end (the cap samples `declaredMbpsAtEpoch` at that boundary).
+    //
+    // A declares too: a received sweep credits `FeeRouter`'s epoch counter
+    // only up to the operator's declared capacity, and B's vote cap is sized
+    // from A's credited bytes.
     let declare_target = chain
         .min_bond()
         .await?
         .max(chain.bond_required(FLOOR_MBPS).await?);
-    let active = chain.active_bond(node_b.operator_addr()).await?;
-    if declare_target > active {
-        chain
-            .transfer_token(node_b.operator_addr(), declare_target - active)
-            .await?;
+    for node in [&node_a, &node_b] {
+        let active = chain.active_bond(node.operator_addr()).await?;
+        if declare_target > active {
+            chain
+                .transfer_token(node.operator_addr(), declare_target - active)
+                .await?;
+        }
+        run_node_cli(node, &["bond", "--mbps", &FLOOR_MBPS.to_string()])?;
     }
-    run_node_cli(&node_b, &["bond", "--mbps", &FLOOR_MBPS.to_string()])?;
 
     // ---- Age the chain past the ~180-day vote-weight ramp so B's weight is at
     // full strength once it has served bytes.
@@ -143,26 +149,27 @@ async fn run() -> anyhow::Result<()> {
         let b = chain.served_bytes(node_b.operator_addr()).await?;
         Ok((b > U256::ZERO).then_some(b))
     })
-    .await?;
-    assert!(served.is_some(), "B's on-chain served-bytes never advanced");
+    .await?
+    .context("B's on-chain served-bytes never advanced")?;
+    // Vote weight reads `FeeRouter`'s epoch counter, which only a received
+    // sweep credits, so B's pending share is swept now, at what it holds.
+    chain.sweep(node_b.operator_addr()).await?;
 
     // ---- A serves bytes too. The per-operator vote cap is sized from the
     // OTHER operators' bytes in the window (ADR 036), so B's weight needs bytes
-    // from someone else; a lone serving operator has a zero cap.
+    // from someone else; a lone serving operator has a zero cap. A's credit at
+    // least matches B's, so B's capped weight clears the 4% quorum.
     let outcome = client
         .fetch(&chain, &node_a, hash_a, alloy::primitives::U256::ZERO)
         .await?;
     assert_eq!(outcome.bytes, payload, "A must deliver the blob");
-    let served_a = poll(Duration::from_secs(120), || async {
+    poll(Duration::from_secs(120), || async {
         let a = chain.served_bytes(node_a.operator_addr()).await?;
-        Ok((a > U256::ZERO).then_some(a))
+        Ok((a >= served).then_some(a))
     })
-    .await?;
-    assert!(
-        served_a.is_some(),
-        "A's on-chain served-bytes never advanced"
-    );
-
+    .await?
+    .context("A's on-chain served-bytes never reached B's")?;
+    chain.sweep(node_a.operator_addr()).await?;
     // ---- Cross an epoch boundary so those bytes sit in a fully-elapsed epoch
     // inside the trailing window at the proposal snapshot.
     time::increase_time(chain.admin(), 8 * DAY).await?;

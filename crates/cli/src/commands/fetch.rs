@@ -788,6 +788,9 @@ pub(crate) struct Credential {
     pub(crate) signer: Arc<alloy::signers::local::PrivateKeySigner>,
     /// The capability the pool owner issued to `signer`.
     pub(crate) grant: CapabilityGrant,
+    /// The configured `PaymentPool` contract of the capability's pool: its
+    /// fetches pay through it only.
+    pub(crate) pool: decdn_incentive::Deployment,
 }
 
 /// Where a fetch's verified bytes go.
@@ -985,8 +988,8 @@ impl FetchHost {
         Arc::clone(&self.store)
     }
 
-    /// The first configured payment pool: the one a delegated capability
-    /// draws from.
+    /// The first configured payment pool: the one a `--capability`
+    /// delegation draws from.
     ///
     /// # Errors
     ///
@@ -1041,10 +1044,12 @@ enum PayerKey {
         grant: Option<CapabilityGrant>,
         loaded: tokio::sync::OnceCell<(Arc<alloy::signers::local::PrivateKeySigner>, PayerKeys)>,
     },
-    /// A key in hand and the capability issued to it.
+    /// A key in hand, the capability issued to it, and the contract of the
+    /// capability's pool.
     Held {
         signer: Arc<alloy::signers::local::PrivateKeySigner>,
         slot: CredentialSlot,
+        pool: decdn_incentive::Deployment,
     },
 }
 
@@ -1124,7 +1129,7 @@ impl Payer {
         host: &FetchHost,
     ) -> anyhow::Result<(Arc<alloy::signers::local::PrivateKeySigner>, PayerKeys)> {
         match &self.key {
-            PayerKey::Held { signer, slot } => {
+            PayerKey::Held { signer, slot, .. } => {
                 Ok((Arc::clone(signer), PayerKeys::Delegated(slot.clone())))
             }
             PayerKey::Keystore { grant, loaded } => loaded
@@ -1166,6 +1171,7 @@ impl Payer {
             key: PayerKey::Held {
                 signer: credential.signer,
                 slot,
+                pool: credential.pool,
             },
             ledgers: Some(PerPool::default()),
             funding: None,
@@ -1198,6 +1204,24 @@ impl Payer {
                 .flat_map(|ledgers| ledgers.committed_lanes())
                 .collect()
         })
+    }
+
+    /// The route of a fetch this payer pays for. A keystore payer on its own
+    /// pools prefers each contract `host`'s store records a pool of `owner`
+    /// in ([`PoolRoute::for_buyer`]). A delegated payer pays through its
+    /// capability's contract only: a held credential names it, and a
+    /// `--capability` delegation draws from the first configured pool.
+    fn route(
+        &self,
+        host: &FetchHost,
+        owner: Option<alloy::primitives::Address>,
+    ) -> anyhow::Result<PoolRoute> {
+        match &self.key {
+            PayerKey::Held { pool, .. } => Ok(PoolRoute::single(*pool)),
+            PayerKey::Keystore { .. } => {
+                PoolRoute::for_buyer(&host.chain.config, host.store.as_ref(), owner)
+            }
+        }
     }
 
     /// Whether the fetch pays from a pool another owner funds.
@@ -1328,7 +1352,7 @@ pub(crate) async fn fetch_on(
         PayerKeys::Owned(payer) => Some(payer.owner().address()),
         PayerKeys::Delegated(_) => None,
     };
-    let passes = PoolPasses::new(PoolRoute::for_buyer(config, store.as_ref(), owner)?);
+    let passes = PoolPasses::new(payer.route(host, owner)?);
     let mut pass_pool = resolved.first_pass(&passes);
     // Set once a funding recovery step's replacement ended the first pass of a
     // file fetch on a pool: the next pass then runs the remaining work against
@@ -1380,12 +1404,16 @@ pub(crate) async fn fetch_on(
             recovery.leave_carried();
         }
         // Per pass: the funding facts, the lanes and their handles all name the
-        // pool the pass pays from.
+        // pool the pass pays from. The escrow handle guards this pool's
+        // contract only, so a pending `topUp` on another pool refuses nothing
+        // here.
         let funding = match &payer.funding {
             Some((per_pool, shared)) => per_pool.get(pass_pool, || {
-                RunFunding::reporting_escrows_to(shared.clone())
+                RunFunding::reporting_escrows_to(shared.for_pool(pass_pool))
             }),
-            None => Arc::new(RunFunding::reporting_escrows_to(escrows.clone())),
+            None => Arc::new(RunFunding::reporting_escrows_to(
+                escrows.for_pool(pass_pool),
+            )),
         };
         let ledgers = payer
             .ledgers

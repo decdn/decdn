@@ -902,6 +902,41 @@ fn a_landed_entry_survives_a_second_pass_that_did_not_run_it() {
     );
 }
 
+/// A pool's pass leaves work for the next pool's pass when an entry failed or
+/// did not run, or a fault ended it; a pass that landed every entry, or that
+/// its caller interrupted, leaves none.
+#[test]
+fn a_pass_leaves_work_for_the_next_pool_only_when_an_entry_is_left() {
+    let pass = |outcomes, stopped: Option<anyhow::Error>, interrupted| PullRun {
+        outcomes,
+        warnings: Vec::new(),
+        transfer: Transfer::default(),
+        interrupted,
+        stopped,
+    };
+    let landed = || vec![EntryOutcome::Fetched(5), EntryOutcome::Skipped];
+    assert!(!leaves_work(&pass(landed(), None, false)));
+    assert!(leaves_work(&pass(
+        vec![
+            EntryOutcome::Fetched(5),
+            EntryOutcome::failed("b.bin", &anyhow!("no holder takes this pool")),
+        ],
+        None,
+        false
+    )));
+    assert!(leaves_work(&pass(
+        vec![EntryOutcome::Fetched(5), EntryOutcome::NotRun],
+        None,
+        false
+    )));
+    assert!(leaves_work(&pass(landed(), Some(give_up()), false)));
+    assert!(!leaves_work(&pass(
+        vec![EntryOutcome::NotRun],
+        Some(give_up()),
+        true
+    )));
+}
+
 /// A first pass's run that ended on `stopped`.
 fn ended_on(stopped: Option<anyhow::Error>, interrupted: bool) -> PullRun {
     PullRun {

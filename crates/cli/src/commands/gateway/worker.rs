@@ -163,6 +163,10 @@ impl DelegateLanes {
     }
 }
 
+/// One delegate key's lanes in one pool: the `PaymentPool` contract, the pool
+/// on it, and the key.
+pub(super) type DelegateKey = (Deployment, PoolId, Address);
+
 /// Narrow a ledger's `U256` to the snapshot's `u64`, saturating.
 fn narrow(value: U256) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
@@ -172,9 +176,10 @@ fn narrow(value: U256) -> u64 {
 enum Request {
     /// A pull to run.
     Pull(Box<Job>),
-    /// Read the store: its pools, and the lanes of each `(pool, signer)`.
+    /// Read the store: its pools, and the lanes of each `(contract, pool,
+    /// signer)`.
     Pools {
-        delegates: Vec<(PoolId, Address)>,
+        delegates: Vec<DelegateKey>,
         reply: oneshot::Sender<anyhow::Result<PoolSnapshot>>,
     },
     /// The size a pull verified for a blob.
@@ -233,12 +238,12 @@ pub(super) trait Backend: Send + 'static {
     }
 
     /// What `host`'s store holds: its pools, and the lanes of each
-    /// `(pool, signer)` in `delegates`. A backend without a store holds
-    /// nothing.
+    /// `(contract, pool, signer)` in `delegates`. A backend without a store
+    /// holds nothing.
     async fn pools(
         &self,
         host: &Self::Host,
-        delegates: &[(PoolId, Address)],
+        delegates: &[DelegateKey],
     ) -> anyhow::Result<PoolSnapshot> {
         let _ = (host, delegates);
         Ok(PoolSnapshot::default())
@@ -309,18 +314,20 @@ impl Backend for FetchBackend {
 
     /// Read off the async thread, so a slow store read never stalls the
     /// pulls running on it. The `--capability` grant a public gateway pays
-    /// under signs delegate lanes too, so its key is read beside the
-    /// registered capabilities'.
+    /// under signs delegate lanes too, on the first configured pool, so its
+    /// key is read beside the registered capabilities'.
     async fn pools(
         &self,
         (host, grant): &Self::Host,
-        delegates: &[(PoolId, Address)],
+        delegates: &[DelegateKey],
     ) -> anyhow::Result<PoolSnapshot> {
         let store = host.store();
-        let deployment = host.deployment()?;
-        let queries = lane_queries(grant.as_ref(), delegates);
-        tokio::task::spawn_blocking(move || read_pools(store.as_ref(), deployment, &queries))
-            .await?
+        let grant = grant
+            .as_ref()
+            .map(|grant| anyhow::Ok((host.deployment()?, grant)))
+            .transpose()?;
+        let queries = lane_queries(grant, delegates);
+        tokio::task::spawn_blocking(move || read_pools(store.as_ref(), &queries)).await?
     }
 
     fn live_lanes(&self, payer: &Payer) -> Vec<(LaneKey, Cumulative)> {
@@ -332,37 +339,37 @@ impl Backend for FetchBackend {
     }
 }
 
-/// The `(pool, signer)` keys whose delegate lanes a store read lists: each
-/// registered capability's, and the `--capability` grant's when the gateway
-/// pays under one, once.
+/// The `(contract, pool, signer)` keys whose delegate lanes a store read
+/// lists: each registered capability's, and the `--capability` grant's on its
+/// contract when the gateway pays under one, once.
 pub(super) fn lane_queries(
-    grant: Option<&CapabilityGrant>,
-    delegates: &[(PoolId, Address)],
-) -> Vec<(PoolId, Address)> {
+    grant: Option<(Deployment, &CapabilityGrant)>,
+    delegates: &[DelegateKey],
+) -> Vec<DelegateKey> {
     let mut queries = delegates.to_vec();
-    if let Some(grant) = grant
-        && !queries.contains(&(grant.pool_id, grant.signer))
-    {
-        queries.push((grant.pool_id, grant.signer));
+    if let Some((deployment, grant)) = grant {
+        let key = (deployment, grant.pool_id, grant.signer);
+        if !queries.contains(&key) {
+            queries.push(key);
+        }
     }
     queries
 }
 
-/// What `store` holds on `deployment`: its pool rows, and the delegate lanes
-/// of each `(pool, signer)` in `queries`.
+/// What `store` holds: its pool rows on every contract, and the delegate
+/// lanes of each `(contract, pool, signer)` in `queries`.
 ///
 /// # Errors
 ///
 /// The store cannot be read, or a record does not decode.
 pub(super) fn read_pools(
     store: &dyn BuyerPoolStore,
-    deployment: Deployment,
-    queries: &[(PoolId, Address)],
+    queries: &[DelegateKey],
 ) -> anyhow::Result<PoolSnapshot> {
     let pools = BuyerPoolsResponse::from(store.load_all()?);
     let delegate_lanes = queries
         .iter()
-        .map(|&(pool_id, signer)| {
+        .map(|&(deployment, pool_id, signer)| {
             let lanes = store
                 .delegate_lanes(deployment, pool_id, signer)?
                 .into_iter()
@@ -443,15 +450,13 @@ impl PullWorker {
     }
 
     /// What the store holds: its pools, and the lanes of each
-    /// `(pool, signer)` in `delegates`. Answered beside the pulls in flight.
+    /// `(contract, pool, signer)` in `delegates`. Answered beside the pulls
+    /// in flight.
     ///
     /// # Errors
     ///
     /// The worker has stopped, or the store cannot be read.
-    pub(super) async fn pools(
-        &self,
-        delegates: Vec<(PoolId, Address)>,
-    ) -> anyhow::Result<PoolSnapshot> {
+    pub(super) async fn pools(&self, delegates: Vec<DelegateKey>) -> anyhow::Result<PoolSnapshot> {
         let (reply, answer) = oneshot::channel();
         self.jobs
             .send(Request::Pools { delegates, reply })

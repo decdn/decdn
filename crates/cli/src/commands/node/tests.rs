@@ -20,6 +20,23 @@ fn health_response_with_registry(
     }
 }
 
+/// `node earnings --pool` without `--address` is refused, and with no `--pool`
+/// the daemon is asked for every pool.
+#[test]
+fn earnings_refuses_pool_in_daemon_mode() {
+    let picked = cli::PoolSelectArgs {
+        pool: Some(format!("eip155:1:{}", alloy::primitives::Address::ZERO)),
+        pool_rpc_url: None,
+    };
+    let err = refuse_pool_in_daemon_mode(&picked).unwrap_err();
+    assert!(err.to_string().contains("--address"), "{err:#}");
+    let every = cli::PoolSelectArgs {
+        pool: None,
+        pool_rpc_url: None,
+    };
+    assert!(refuse_pool_in_daemon_mode(&every).is_ok());
+}
+
 fn health_lines(resp: &HealthResponse) -> String {
     let mut buf = Vec::new();
     write_health(&mut buf, resp).expect("write to a Vec cannot fail");

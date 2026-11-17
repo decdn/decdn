@@ -12,10 +12,12 @@
 //!
 //! ## Shape
 //!
-//! 1. Spawn a local `anvil`, deploy a mintable mock USDC, then deploy the full
-//!    protocol via the production `forge script DeployProtocol.s.sol` (reading
-//!    the deployed addresses from the `deployments/<chainId>.json` manifest) —
-//!    mirroring `anvil_settlement_e2e.rs`.
+//! 1. Spawn a local `anvil`, deploy a mintable mock USDC and a `LoopbackCctp`,
+//!    then the governance suite via the production `forge script
+//!    DeployProtocol.s.sol` and the `PaymentPool` via `DeployPaymentPool.s.sol`
+//!    (reading the deployed addresses from the `deployments/<chainId>.json` and
+//!    `deployments/<chainId>-payment.json` manifests) — mirroring
+//!    `anvil_settlement_e2e.rs`.
 //! 2. Generate a node Ethereum keystore, build a `ResolvedConfig` pointed at the
 //!    anvil RPC and the deployed contract addresses, with data dirs under
 //!    `TempDir`s and explicit free TCP ports for the admin + metrics listeners.
@@ -104,18 +106,23 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 // while still failing fast on a genuinely wedged teardown.
 const SHUTDOWN_AWAIT: Duration = Duration::from_secs(90);
 
+mod anvil_deploy;
+
 /// Kills the spawned `anvil` on drop so a panicking assertion never leaks the
-/// process, and removes the (gitignored) deploy manifest so re-runs start clean.
+/// process, and removes the (gitignored) deploy manifests so re-runs start
+/// clean.
 struct AnvilGuard {
     child: Child,
-    manifest: PathBuf,
+    manifests: [PathBuf; 2],
 }
 
 impl Drop for AnvilGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.manifest);
+        for manifest in &self.manifests {
+            let _ = std::fs::remove_file(manifest);
+        }
     }
 }
 
@@ -228,7 +235,7 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
 async fn run_deploy_script(
     contracts: &Path,
     rpc_url: &str,
-    usdc: Address,
+    (usdc, cctp): (Address, Address),
     initial_token_holder: Address,
 ) -> anyhow::Result<()> {
     for attempt in 1..=DEPLOY_ATTEMPTS {
@@ -246,6 +253,8 @@ async fn run_deploy_script(
                 DEPLOYER_ADDR,
             ])
             .env("USDC_ADDRESS", usdc.to_string())
+            .env("CCTP_MESSAGE_TRANSMITTER", cctp.to_string())
+            .env("CCTP_TOKEN_MESSENGER", cctp.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
             // DeployProtocol requires a genesis VETTER_ROLE holder (a deploy with
@@ -300,19 +309,13 @@ struct DeployedAddrs {
     content_blacklist: Address,
 }
 
-/// Read the four contract addresses the node runtime needs from the deploy
-/// manifest (`deployments/<chainId>.json`, `contracts` map).
-fn read_manifest(path: &Path) -> anyhow::Result<DeployedAddrs> {
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    let c = &json["contracts"];
-    let get = |k: &str| -> anyhow::Result<Address> {
-        Ok(c[k]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("manifest missing contracts.{k}"))?
-            .parse()?)
-    };
+/// Read the three governance contract addresses the node runtime needs from
+/// the deploy manifest (`deployments/<chainId>.json`, `contracts` map), beside
+/// the `payment_pool` the payment-chain deploy returned.
+fn read_manifest(path: &Path, payment_pool: Address) -> anyhow::Result<DeployedAddrs> {
+    let get = |k: &str| anvil_deploy::manifest_contract(path, k);
     Ok(DeployedAddrs {
-        payment_pool: get("PaymentPool")?,
+        payment_pool,
         capacity_bond: get("CapacityBond")?,
         slash_judge: get("SlashJudge")?,
         content_blacklist: get("ContentBlacklist")?,
@@ -504,14 +507,20 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
             &anvil_port.to_string(),
             "--chain-id",
             &CHAIN_ID.to_string(),
+            // Zero slots per epoch makes anvil's `safe` block the head, so the
+            // runtime's `ContentBlacklist` boot snapshot, pinned to `safe`,
+            // reads a block that holds the deployment.
+            "--slots-in-an-epoch",
+            "0",
             "--silent",
         ])
         .spawn()
         .expect("spawn anvil (is foundry installed?)");
     let manifest = contracts.join(format!("deployments/{CHAIN_ID}.json"));
+    let payment_manifest = contracts.join(format!("deployments/{CHAIN_ID}-payment.json"));
     let _anvil = AnvilGuard {
         child,
-        manifest: manifest.clone(),
+        manifests: [manifest.clone(), payment_manifest.clone()],
     };
 
     let url: reqwest::Url = rpc_url.parse()?;
@@ -559,10 +568,21 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
         )
         .await?;
 
-    // ---- 3. Deploy mock USDC then the production protocol.
+    // ---- 3. Deploy mock USDC and the loopback CCTP, then the production
+    // governance suite and the payment pool.
     let usdc_addr = deploy_mock_usdc(&admin, &contracts).await?;
-    run_deploy_script(&contracts, &rpc_url, usdc_addr, eth_addr).await?;
-    let addrs = read_manifest(&manifest)?;
+    let cctp = anvil_deploy::deploy_loopback_cctp(&admin, &contracts).await?;
+    run_deploy_script(&contracts, &rpc_url, (usdc_addr, cctp), eth_addr).await?;
+    let receiver = anvil_deploy::manifest_contract(&manifest, "CctpSweepReceiver")?;
+    let payment_pool = anvil_deploy::deploy_payment_pool(
+        &contracts,
+        &rpc_url,
+        (DEPLOYER_KEY, DEPLOYER_ADDR),
+        (usdc_addr, cctp, receiver),
+        &payment_manifest,
+    )
+    .await?;
+    let addrs = read_manifest(&manifest, payment_pool)?;
 
     // ---- 4. Build the resolved config with explicit free listener ports.
     let (_admin_port_hold, admin_port) = reserve_port();

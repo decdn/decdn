@@ -7,43 +7,29 @@
 //! a byte-identical id on every deployment, so a buyer row the node wrote
 //! against deployment #1 names a pool that deployment #2 also mints.
 //!
-//! The node tags each buyer row with the deployment it was written against: the
-//! chain id and the `PaymentPool` address.
-//! At bootstrap it drops a row from another deployment before it enumerates the
-//! configured one, and it logs that drop at WARN:
+//! The node keys each buyer row, and each seller lane, by the deployment it
+//! was written against: the chain id and the `PaymentPool` address. A row on
+//! #1 and a row on #2 at the same pool id are two rows, and a repoint touches
+//! neither. The unit tests in the stores cover the keying. This file runs it
+//! against two real deployments of the same contract, so the `sol!` bindings,
+//! the config repoint, and the on-chain enumeration all take part:
 //!
-//! > the tracked buyer pool belongs to a different PaymentPool deployment;
-//! > dropping the stale row
-//!
-//! with `pool_id`, `foreign_payment_pool`, `foreign_chain_id`,
-//! `configured_payment_pool` and `configured_chain_id` fields.
-//! The unit tests in `crates/node/src/buyer_pool.rs` cover that decision
-//! against a mocked transport. This file runs it against two real deployments of
-//! the same contract, so the `sol!` bindings, the config repoint, and the
-//! on-chain enumeration all take part:
-//!
-//!   1. **An empty redeploy.** The node drops the #1 row, opens nothing at boot,
-//!      and its first cache-miss pull opens a fresh pool on #2 at the #1 id. The
-//!      store holds that pool at the fresh #2 deposit, not the #1 row.
+//!   1. **An empty redeploy.** The node keeps its #1 row on #1, opens nothing at
+//!      boot, and its first cache-miss pull opens a fresh pool on #2 at the #1
+//!      id. The store holds that pool on #2 at the fresh #2 deposit, beside the
+//!      #1 row.
 //!   2. **A redeploy that reissued the tracked id.** The node's key already owns
-//!      an open pool on #2 at the tracked id. The node adopts it with the #2
-//!      deposit and no lanes; the #1 row, with the #1 deposit and its lane to
-//!      PROVIDER #1, is gone.
-//!
+//!      an open pool on #2 at the tracked id. The node adopts it on #2 with the
+//!      #2 deposit and no lanes; the #1 row, with the #1 deposit and its lane to
+//!      PROVIDER #1, stays on #1.
 //!   3. **A redeploy served by the repointed provider.** PROVIDER #1 is repointed
-//!      at #2 with its data dir intact, and serves leg 2 itself. Its lane store
-//!      binds to one deployment, so it drops the #1 lane at boot and logs that
-//!      drop at WARN:
+//!      at #2 with its data dir intact, and serves leg 2 itself. Leg 2 reuses the
+//!      exact leg-1 lane key — the same pool id, signer, and provider on another
+//!      deployment. The #2 lane starts from zero: a #1 frontier on it would
+//!      reject the SERVER's first #2 voucher, and the provider would redeem #1
+//!      signatures against #2.
 //!
-//!      > dropping seller lane state, pending settles and watcher checkpoints
-//!      > written against another PaymentPool deployment
-//!
-//!      Leg 2 then reuses the exact leg-1 lane key — the same pool id, signer,
-//!      and provider on another deployment. Kept, the #1 frontier would reject
-//!      the SERVER's first #2 voucher, and the provider would redeem #1 signatures
-//!      against #2.
-//!
-//! In every journey the store assertions are what pin the guard. The #2 pull
+//! In every journey the store assertions are what pin the keying. The #2 pull
 //! then proves the repointed node buys and settles on #2 at the leg-2 price.
 //!
 //! Topology: a pull-through SERVER that holds nothing buys each client miss from
@@ -54,11 +40,8 @@
 //! a leg-2 miss to PROVIDER #1. In journey 3, PROVIDER #1 holds both blobs and seats
 //! both namespaces, and there is no PROVIDER #2.
 //!
-//! The drop assertions read the SERVER's — and, in journey 3, PROVIDER #1's —
-//! captured logs, so `DECDN_NODE_LOG` must
-//! keep `decdn_node` at `warn` or more verbose. Run with
-//! `DECDN_NODE_LOG="warn,decdn_node=debug"` to see the daemons' debug logs
-//! through the harness.
+//! Run with `DECDN_NODE_LOG="warn,decdn_node=debug"` to see the daemons' debug
+//! logs through the harness.
 
 #![cfg(feature = "anvil-e2e")]
 
@@ -74,7 +57,7 @@ use decdn_e2e::bindings::Erc20;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::ensure_decdn_cli_built;
 use decdn_e2e::client::ClientFixture;
-use decdn_e2e::node::{FOREIGN_LANE_DROPPED, FOREIGN_LANES_DROPPED, NodeFixture};
+use decdn_e2e::node::NodeFixture;
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 
 /// Overall ceiling so an unbounded await fails fast. Each journey stands up
@@ -116,16 +99,6 @@ const SERVER_BUYER_USDC: u64 = 1_000_000_000;
 /// How long a daemon gets to reach a post-restart state or redeem a voucher.
 const SETTLE: Duration = Duration::from_mins(1);
 
-/// The WARN the SERVER logs when bootstrap drops a row from another deployment.
-const FOREIGN_ROW_DROPPED: &str =
-    "the tracked buyer pool belongs to a different PaymentPool deployment";
-
-/// The WARN the SERVER logs when a pull meets a foreign row that bootstrap
-/// failed to drop. Never expected here: bootstrap's drop removes the row before
-/// any pull runs.
-const FOREIGN_ROW_IGNORED: &str =
-    "ignoring a tracked buyer pool from another PaymentPool deployment";
-
 /// Deterministic pseudo-random blob spanning many chunk groups.
 fn make_blob(len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
@@ -156,10 +129,10 @@ fn price_micro_usdc(wire: u64) -> anyhow::Result<u64> {
         .context("price overflows u64")
 }
 
-/// A node repointed at an empty redeploy drops its #1 row, opens nothing at
-/// boot, and opens a fresh pool on #2 at its first cache miss.
+/// A node repointed at an empty redeploy keeps its #1 row on #1, opens nothing
+/// at boot, and opens a fresh pool on #2 at its first cache miss.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_node_repointed_at_an_empty_redeploy_drops_its_stale_row_and_opens_fresh()
+async fn a_node_repointed_at_an_empty_redeploy_keeps_its_first_row_and_opens_fresh()
 -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_empty_redeploy()))
@@ -181,10 +154,10 @@ async fn a_node_repointed_at_a_redeploy_that_reissued_its_pool_id_adopts_it_with
     Ok(())
 }
 
-/// A provider repointed at the redeploy with its data dir intact drops its #1
-/// lane and serves the SERVER's #2 pull on the same lane key, from zero.
+/// A provider repointed at the redeploy with its data dir intact serves the
+/// SERVER's #2 pull on the same lane key, from zero.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_provider_repointed_at_a_redeploy_drops_its_stale_lane_and_serves_the_reissued_pool()
+async fn a_provider_repointed_at_a_redeploy_serves_the_reissued_pool_from_zero()
 -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_repointed_provider()))
@@ -200,16 +173,13 @@ async fn run_empty_redeploy() -> anyhow::Result<()> {
     r.server
         .repoint_payment_pool(r.pool2, &[r.leg_two_provider()])
         .await?;
-    r.assert_foreign_row_dropped().await?;
     wait_buyer_bootstrap(&r.server).await?;
 
-    // The drop deletes the row outright, so the store reads empty — not merely
-    // filtered — once bootstrap is through.
-    let admin = r.server.admin_client()?;
-    let store = admin.pools().await.context("admin pools")?;
+    // The #1 row stays on #1, and #2 holds no row yet.
+    r.assert_first_row_kept().await?;
     anyhow::ensure!(
-        store.pools.is_empty() && store.skipped.is_empty(),
-        "the SERVER's buyer store must be empty after the foreign row is dropped, got {store:?}"
+        r.rows_on(r.pool2).await?.is_empty(),
+        "the SERVER must hold no #2 row before its first #2 pull"
     );
 
     // The node opens lazily on a miss, so #2 has nothing for this owner yet.
@@ -268,8 +238,7 @@ async fn run_empty_redeploy() -> anyhow::Result<()> {
         is_open(&on_1),
         on_1.deposit
     );
-
-    r.assert_no_foreign_row_reached_the_pull_path()
+    r.assert_first_row_kept().await
 }
 
 async fn run_reissued_id() -> anyhow::Result<()> {
@@ -330,11 +299,11 @@ async fn run_reissued_id() -> anyhow::Result<()> {
     r.server
         .repoint_payment_pool(r.pool2, &[r.leg_two_provider()])
         .await?;
-    r.assert_foreign_row_dropped().await?;
     wait_buyer_bootstrap(&r.server).await?;
+    r.assert_first_row_kept().await?;
 
     // The node adopts the #2 pool at the tracked id as a fresh row: the #2
-    // deposit, no lanes. Keeping the #1 row would show `FIRST_WORKING_DEPOSIT`
+    // deposit, no lanes. Resuming the #1 row would show `FIRST_WORKING_DEPOSIT`
     // and the lane to PROVIDER #1 — the stale-row resume this journey guards
     // against.
     let adopted = r.sole_pool_on_redeploy().await?;
@@ -356,8 +325,7 @@ async fn run_reissued_id() -> anyhow::Result<()> {
         owner_pool_nonce(&pool2, r.owner).await? == nonce_before_repoint,
         "the pull must reuse the adopted pool, not open another"
     );
-    r.assert_paid_for_second_only().await?;
-    r.assert_no_foreign_row_reached_the_pull_path()
+    r.assert_paid_for_second_only().await
 }
 
 async fn run_repointed_provider() -> anyhow::Result<()> {
@@ -368,41 +336,14 @@ async fn run_repointed_provider() -> anyhow::Result<()> {
 
     // The operator's side of the redeploy, on the seller: same data dir, new
     // `PaymentPool`. Its #1 lane — the leg-1 lane key, which leg 2 reissues —
-    // is dropped at boot, before the provider reads it.
+    // stays keyed to #1, so the #2 lane on that key starts from zero.
     r.provider1.repoint_payment_pool(r.pool2, &[]).await?;
-    let foreign = format!("foreign_payment_pool={}", r.pool1);
-    let configured = format!("configured_payment_pool={}", r.pool2);
-    r.provider1
-        .wait_for_log_line(
-            &[
-                FOREIGN_LANES_DROPPED,
-                &foreign,
-                &configured,
-                "dropped_lanes=1",
-                // The lane decoded, so the forfeited sum is exact, not a
-                // lower bound.
-                "undecodable_lanes=0",
-            ],
-            SETTLE,
-        )
-        .await
-        .context("the repointed PROVIDER #1 never logged dropping its #1 lane")?;
-    // The per-lane last-record line names the dropped lane. Its exact
-    // unredeemed value is not asserted here: it depends on whether the
-    // provider's paid watermark flushed before the restart killed it, which
-    // races. The value math is pinned by the `forfeited_value` unit test.
-    anyhow::ensure!(
-        r.provider1
-            .log_line(&[FOREIGN_LANE_DROPPED, &foreign])
-            .is_some(),
-        "the repointed PROVIDER #1 must log the per-lane last-record line"
-    );
 
     r.server
         .repoint_payment_pool(r.pool2, &[r.leg_two_provider()])
         .await?;
-    r.assert_foreign_row_dropped().await?;
     wait_buyer_bootstrap(&r.server).await?;
+    r.assert_first_row_kept().await?;
 
     r.pull_second().await?;
 
@@ -415,8 +356,7 @@ async fn run_repointed_provider() -> anyhow::Result<()> {
         "the #2 pull must open the reissued tracked id {}",
         r.tracked
     );
-    r.assert_paid_for_second_only().await?;
-    r.assert_no_foreign_row_reached_the_pull_path()
+    r.assert_paid_for_second_only().await
 }
 
 /// Which provider serves leg 2 on #2.
@@ -568,10 +508,6 @@ async fn stale_row_from_first_deployment(leg_two: LegTwoProvider) -> anyhow::Res
         .set_buyer_working_deposit(REDEPLOY_WORKING_DEPOSIT)
         .await?;
     wait_buyer_bootstrap(&server).await?;
-    anyhow::ensure!(
-        server.log_line(&[FOREIGN_ROW_DROPPED]).is_none(),
-        "a node still on #1 must not drop its #1 row"
-    );
     server.stop()?;
 
     Ok(Redeploy {
@@ -638,26 +574,8 @@ impl Redeploy {
         PaymentPool::new(at, self.chain.admin().clone())
     }
 
-    /// Wait for the repointed SERVER's bootstrap to log the drop of its #1 row,
-    /// naming the tracked id, #1 as `foreign_payment_pool`, and #2 as configured.
-    async fn assert_foreign_row_dropped(&self) -> anyhow::Result<()> {
-        let pool_id = format!("pool_id={}", self.tracked);
-        let foreign = format!("foreign_payment_pool={}", self.pool1);
-        let configured = format!("configured_payment_pool={}", self.pool2);
-        self.server
-            .wait_for_log_line(
-                &[FOREIGN_ROW_DROPPED, &pool_id, &foreign, &configured],
-                SETTLE,
-            )
-            .await
-            .context("the repointed SERVER never logged dropping its #1 row")?;
-        Ok(())
-    }
-
-    /// The SERVER's buyer store holds exactly one row, and that row is the
-    /// tracked id on #2. Read once bootstrap is through
-    /// ([`wait_buyer_bootstrap`]), so a single read is the settled state.
-    async fn sole_pool_on_redeploy(&self) -> anyhow::Result<BuyerPoolSnapshot> {
+    /// The SERVER's buyer rows on the `PaymentPool` at `at`.
+    async fn rows_on(&self, at: Address) -> anyhow::Result<Vec<BuyerPoolSnapshot>> {
         let pools = self
             .server
             .admin_client()?
@@ -665,13 +583,43 @@ impl Redeploy {
             .await
             .context("admin pools")?
             .pools;
-        let [row] = pools.as_slice() else {
-            anyhow::bail!("the SERVER must track exactly one pool, got {pools:?}");
+        pools
+            .into_iter()
+            .filter_map(|row| match parse_address(&row.payment_pool) {
+                Ok(pool) if pool == at => Some(Ok(row)),
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect()
+    }
+
+    /// The repointed SERVER still holds its #1 row on #1: the tracked id at
+    /// the #1 working deposit.
+    async fn assert_first_row_kept(&self) -> anyhow::Result<()> {
+        let rows = self.rows_on(self.pool1).await?;
+        let [row] = rows.as_slice() else {
+            anyhow::bail!("the SERVER must keep exactly one #1 row, got {rows:?}");
         };
         anyhow::ensure!(
-            parse_address(&row.payment_pool)? == self.pool2
-                && parse_b256(&row.pool_id)? == self.tracked,
-            "the SERVER's row must be the tracked id {} on #2 {}, got {row:?}",
+            parse_b256(&row.pool_id)? == self.tracked
+                && row.deposit_micro_usdc == FIRST_WORKING_DEPOSIT,
+            "the #1 row must stay the tracked id {} at {FIRST_WORKING_DEPOSIT}, got {row:?}",
+            self.tracked
+        );
+        Ok(())
+    }
+
+    /// The SERVER's buyer store holds exactly one row on #2, and that row is
+    /// the tracked id. Read once bootstrap is through
+    /// ([`wait_buyer_bootstrap`]), so a single read is the settled state.
+    async fn sole_pool_on_redeploy(&self) -> anyhow::Result<BuyerPoolSnapshot> {
+        let rows = self.rows_on(self.pool2).await?;
+        let [row] = rows.as_slice() else {
+            anyhow::bail!("the SERVER must track exactly one #2 pool, got {rows:?}");
+        };
+        anyhow::ensure!(
+            parse_b256(&row.pool_id)? == self.tracked,
+            "the SERVER's #2 row must be the tracked id {} on #2 {}, got {row:?}",
             self.tracked,
             self.pool2
         );
@@ -718,16 +666,6 @@ impl Redeploy {
         .await
         .context("the leg-2 provider redeeming the SERVER's leg-2 voucher")
     }
-
-    /// The pull path never met the #1 row: bootstrap's drop is what removed it,
-    /// not the per-pull filter behind it.
-    fn assert_no_foreign_row_reached_the_pull_path(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.server.log_line(&[FOREIGN_ROW_IGNORED]).is_none(),
-            "a pull met the #1 row after bootstrap should have dropped it"
-        );
-        Ok(())
-    }
 }
 
 /// `owner`'s `ownerPoolNonce` on `pool` — how many pools it has ever opened there.
@@ -751,7 +689,7 @@ const fn is_open(pool: &PaymentPool::Pool) -> bool {
 /// Wait until `node`'s buyer leg has finished bootstrap in its current process.
 ///
 /// `restart` returns once the admin RPC answers, but the buyer bootstrap —
-/// the foreign-row drop, the on-chain enumeration, and adoption — runs later on
+/// the on-chain enumeration and adoption — runs later on
 /// its own task. It publishes `decdn_buyer_wallet_usdc` last, and the gauge is
 /// per process, so a non-zero read means this spawn's bootstrap is through. The
 /// SERVER holds [`SERVER_BUYER_USDC`], so the wallet is never empty.
@@ -763,7 +701,7 @@ async fn wait_buyer_bootstrap(node: &NodeFixture) -> anyhow::Result<()> {
     .context("the node's buyer bootstrap never published its wallet balance")
 }
 
-/// Wait until `node`'s buyer store holds exactly one row, on `payment_pool`,
+/// Wait until `node`'s buyer store holds exactly one row on `payment_pool`,
 /// whose lane to `provider` has metered at least `bytes`, and return that row.
 /// Waiting on the byte count rather than the first non-zero voucher keeps the
 /// exact-amount checks after it free of a mid-pull read.
@@ -781,12 +719,16 @@ async fn wait_lane(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone_from(&rows);
-        let [row] = rows.as_slice() else {
+        let mut on_pool = Vec::new();
+        for row in &rows {
+            if parse_address(&row.payment_pool)? == payment_pool {
+                on_pool.push(row);
+            }
+        }
+        let [row] = on_pool.as_slice() else {
             return Ok(None);
         };
-        if parse_address(&row.payment_pool)? != payment_pool {
-            return Ok(None);
-        }
+        let row = *row;
         Ok(lane_to(row, provider)?
             .is_some_and(|l| l.last_bytes_delivered >= bytes)
             .then(|| row.clone()))

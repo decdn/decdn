@@ -395,7 +395,8 @@ pub struct EarningsArgs {
     pub address: Option<String>,
 
     /// `--address` mode: the pools to read. Every configured pool without
-    /// `--pool`.
+    /// `--pool`. Daemon mode refuses `--pool`: the node reports every pool
+    /// it serves.
     #[command(flatten)]
     pub payment: super::common::PoolSelectArgs,
 

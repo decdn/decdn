@@ -17,8 +17,9 @@
 //! end of the test, with no restart in between.
 //!
 //! The no-restart property is the load-bearing one. It is what proves the
-//! daemon's registry projection is live — that a `NodeRegistered` event reaches
-//! a running node — rather than a value sampled once at bring-up. `decdn node
+//! daemon's registry projection is live — that a registration reaches a
+//! running node through its registry re-read — rather than a value sampled
+//! once at bring-up. `decdn node
 //! health`'s `registry_active` is the observable.
 //!
 //! # This journey asserts no serve-side enforcement, deliberately
@@ -306,11 +307,18 @@ async fn run_journey() -> anyhow::Result<()> {
 
     // ---- 5. The load-bearing assertion. No restart anywhere in this test: the
     // daemon has been the same process since step 1. `registry_active` flipping
-    // proves the registration reached the running node's registry projection off
-    // the `NodeRegistered` event, rather than being a value sampled once at
+    // proves the registration reached the running node's registry projection
+    // through a snapshot re-read, rather than being a value sampled once at
     // bring-up. That projection is what feeds DHT admission, so a stale one is a
     // real defect — this is the cheapest end-to-end proof that it is live.
-    poll(Duration::from_secs(60), || async {
+    //
+    // A registry snapshot pins its reads `SNAPSHOT_LAG_MARGIN_BLOCKS` below
+    // the head, so the chain mines past that margin first. A health read that
+    // misses the node pulls the next re-read forward, at most once per
+    // `UNKNOWN_NODE_REFRESH_GAP` (one minute) after the previous read, so the
+    // poll allows for one gap that started before the mining.
+    decdn_e2e::time::mine_past_snapshot_margin(chain.admin()).await?;
+    poll(Duration::from_secs(150), || async {
         let h = admin.health().await.context("admin health after setup")?;
         Ok(h.registry_active.then_some(()))
     })

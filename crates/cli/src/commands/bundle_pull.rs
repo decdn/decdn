@@ -1072,7 +1072,7 @@ pub(crate) async fn fetch_manifest_paid(
     // No bars: a manifest fetch reports no run totals. Warnings and pool
     // notes still print.
     let observer = Arc::new(PullObserver::new(true, run_label(out), None));
-    let puller = open_puller(
+    let mut puller = open_puller(
         common,
         (chain, grant.as_ref(), &store),
         (endpoint, relays),
@@ -1205,7 +1205,7 @@ async fn until_interrupted<T>(
 /// `--overwrite`. [`Planned::Nothing`] means the manifest is empty after
 /// filtering.
 async fn obtain_manifest(
-    puller: &BundlePuller,
+    puller: &mut BundlePuller,
     (args, out): (&GetArgs, &Path),
     uri: &DecdnUri,
     filter: &EntryFilter,

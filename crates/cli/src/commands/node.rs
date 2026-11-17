@@ -600,6 +600,7 @@ pub async fn earnings(
         let operator = chain_ctx::parse_nonzero_address(address, "--address")?;
         earnings_chain::run(args, operator, since_unix, global_config).await?
     } else {
+        refuse_pool_in_daemon_mode(&args.payment)?;
         anyhow::ensure!(
             args.timeout_ms > 0,
             "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
@@ -625,6 +626,18 @@ pub async fn earnings(
         let mut stdout = io::stdout().lock();
         write_earnings(&mut stdout, &resp, unix_now()).context("failed to write earnings")?;
     }
+    Ok(())
+}
+
+/// Refuse `--pool` without `--address`: the daemon's periods add up every
+/// pool it serves, and it prints one line per pool after them, so a pool
+/// filter there would leave its totals naming pools it hides.
+pub(crate) fn refuse_pool_in_daemon_mode(payment: &cli::PoolSelectArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        payment.pool.is_none(),
+        "--pool selects the pools of a chain scan and needs --address; the running node \
+         reports every pool it serves, one line per pool"
+    );
     Ok(())
 }
 
