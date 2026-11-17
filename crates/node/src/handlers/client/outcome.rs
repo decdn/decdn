@@ -91,7 +91,6 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
         ServeRejectReason::PoolClosing { .. } => "pool_closing",
         ServeRejectReason::SignerCapExhausted => "signer_cap_exhausted",
         ServeRejectReason::CapabilityExpired => "capability_expired",
-        ServeRejectReason::SignerFloorAtCap => "signer_floor_at_cap",
         ServeRejectReason::PullLoopGuard => "pull_loop_guard",
         ServeRejectReason::LoadShedHit => "load_shed_hit",
         ServeRejectReason::LoadShedMiss => "load_shed_miss",
@@ -110,7 +109,8 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
 pub(super) enum ServeStop {
     /// The client sent a voucher the node rejected.
     VoucherRejected,
-    /// The pool can no longer fund the floor credit (`PoolExhausted`).
+    /// The pool's remaining deposit fell to the refundable floor `M`
+    /// (`PoolExhausted`).
     PoolExhausted,
     /// The pool closed under the stream, or it is `Closing` and its dispute
     /// deadline falls inside the node's redeem margin. The wire reason is
@@ -234,9 +234,6 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
         }
         ServeRejectReason::CapabilityExpired => {
             metrics.serve_stream_rejected_capability_expired();
-        }
-        ServeRejectReason::SignerFloorAtCap => {
-            metrics.serve_stream_rejected_signer_floor_at_cap();
         }
         ServeRejectReason::PullLoopGuard => metrics.serve_stream_rejected_pull_loop_guard(),
         ServeRejectReason::LoadShedHit => metrics.serve_stream_rejected_load_shed_hit(),

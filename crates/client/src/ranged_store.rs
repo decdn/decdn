@@ -40,7 +40,7 @@ use bao_tree::{BaoTree, ChunkNum, ChunkRanges};
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, RangedStoreError};
 
-use crate::sink::{StashedFault, classify_decode_error};
+use crate::sink::{StashedFault, decode_failure};
 use crate::source::IngestEnd;
 
 /// A checkpoint-slot wait at least this long is logged at `debug`: ingest does
@@ -867,10 +867,7 @@ impl ClientRangedStore {
                     if let Err(flush_err) = flusher.finish(batch, received_end).await {
                         warn_flush_failed_on_fault(&flush_err, range, received_end);
                     }
-                    if let Some(fault) = r.take_fault() {
-                        return Err(fault);
-                    }
-                    return Err(classify_decode_error(decode_err));
+                    return Err(decode_failure(&mut r, decode_err));
                 }
                 ResponseDecoderNext::Done(mut r) => {
                     let flush_result = flusher.finish(batch, received_end).await;

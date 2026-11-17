@@ -45,6 +45,7 @@ fn bad_signature_length_rejected() -> anyhow::Result<()> {
         bytes_delivered: 0u64,
         chain_root: [0u8; 32],
         chunk_price: 0u64,
+        stream_bytes: 0u64,
     };
     let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER)
         .err()
@@ -68,6 +69,7 @@ fn valid_length_invalid_parity_rejected() -> anyhow::Result<()> {
         bytes_delivered: 0u64,
         chain_root: [0u8; 32],
         chunk_price: 0u64,
+        stream_bytes: 0u64,
     };
     let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER)
         .err()

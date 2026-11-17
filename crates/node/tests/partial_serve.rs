@@ -166,37 +166,43 @@ async fn ranged_paid_pull(
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
-    let mut unvouchered: u64 = 0;
+    // The node sends only against the stream's credit (ADR 003 § Credit Window),
+    // so the client pays one interval ahead and tops the credit up each time
+    // delivery reaches it. The last voucher pays exactly `expected_wire`. Each
+    // voucher assigns its new bytes to this stream (`stream_bytes`).
+    let pay = |paid: u64, share: u64| -> anyhow::Result<ClientMessage> {
+        let amount = U256::from(paid)
+            .saturating_mul(U256::from(rate))
+            .div_ceil(U256::from(MB_BYTES));
+        let signed = Voucher {
+            pool_id,
+            signer: client_eth.address(),
+            provider,
+            amount,
+            bytes_delivered: U256::from(paid),
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
+        }
+        .sign(client_eth.as_ref(), &voucher_dom())
+        .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+        let mut wire = signed_to_wire_voucher(&signed)?;
+        wire.stream_bytes = share;
+        Ok(ClientMessage::Voucher(wire))
+    };
+    let mut paid = interval_bytes.min(expected_wire);
+    if paid > 0 {
+        write_client_msg(&mut send, &pay(paid, paid)?).await?;
+    }
     loop {
         match read_client_msg(&mut recv).await? {
             ClientMessage::ChunkData(chunk) => {
                 buf.extend_from_slice(chunk.bytes());
                 let len = u64::try_from(chunk.bytes().len()).unwrap_or(u64::MAX);
                 cumulative = cumulative.saturating_add(len);
-                unvouchered = unvouchered.saturating_add(len);
-                let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;
-                let closing = cumulative >= expected_wire && unvouchered > 0;
-                if boundary || closing {
-                    let amount = U256::from(cumulative)
-                        .saturating_mul(U256::from(rate))
-                        .div_ceil(U256::from(MB_BYTES));
-                    let signed = Voucher {
-                        pool_id,
-                        signer: client_eth.address(),
-                        provider,
-                        amount,
-                        bytes_delivered: U256::from(cumulative),
-                        chain_root: B256::ZERO,
-                        chunk_price: U256::ZERO,
-                    }
-                    .sign(client_eth.as_ref(), &voucher_dom())
-                    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-                    write_client_msg(
-                        &mut send,
-                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
-                    )
-                    .await?;
-                    unvouchered = 0;
+                if cumulative >= paid && paid < expected_wire {
+                    let before = paid;
+                    paid = paid.saturating_add(interval_bytes).min(expected_wire);
+                    write_client_msg(&mut send, &pay(paid, paid - before)?).await?;
                 }
             }
             ClientMessage::StreamEnd => break,

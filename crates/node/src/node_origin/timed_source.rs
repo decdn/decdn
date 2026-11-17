@@ -151,6 +151,10 @@ impl<R: StashedFault> StashedFault for TimedReader<R> {
     fn take_fault(&mut self) -> Option<anyhow::Error> {
         self.inner.take_fault()
     }
+
+    fn note_failed_delivery(&mut self) {
+        self.inner.note_failed_delivery();
+    }
 }
 
 #[cfg(test)]

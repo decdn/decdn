@@ -1301,7 +1301,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
                 info!(pool_id = %pool_id, signer = %key.signer, "pool reclaimed; dropped tracked lane");
             }
         }
-        self.handler.forget_pool_floor(pool_id);
     }
 }
 

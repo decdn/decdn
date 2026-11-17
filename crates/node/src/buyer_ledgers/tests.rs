@@ -149,3 +149,19 @@ fn pool_committed_sums_every_providers_lane_in_the_pool() {
         "a pool with no live lanes has spent nothing",
     );
 }
+
+/// Every lane at one upstream operator reads one track record, so the per-node
+/// pay-ahead cap and the window ramp span this node's pools there.
+#[test]
+fn lanes_at_one_operator_share_its_track_record() {
+    let ledgers = BuyerLedgers::default();
+    let a = ledgers.get_or_seed(lane(9, 0xd1), seed_at(0));
+    let b = ledgers.get_or_seed(lane(10, 0xd1), seed_at(0));
+    let other = ledgers.get_or_seed(lane(9, 0xd2), seed_at(0));
+    assert!(Arc::ptr_eq(a.trust(), b.trust()));
+    assert!(Arc::ptr_eq(
+        a.trust(),
+        &PayerWindows::process().node(Address::from([0xd1; 20]))
+    ));
+    assert!(!Arc::ptr_eq(a.trust(), other.trust()));
+}

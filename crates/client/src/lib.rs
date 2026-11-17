@@ -230,6 +230,7 @@ pub mod ordered_writes;
 /// draw / wait / done / refuse for the gap-driven driver, with no I/O.
 #[doc(hidden)]
 pub mod pacer;
+pub mod payer_window;
 /// Persisted per-peer knowledge base: registry-fed identity plus interaction-fed
 /// latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
 #[doc(hidden)]
@@ -335,8 +336,8 @@ pub use ledger::{ChainCommit, EpochAction, Metered, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
 #[doc(hidden)]
 pub use pacer::{
-    BudgetPacer, DownstreamFrontier, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer,
-    VERIFY_LAG_BYTES, WindowPacer,
+    BudgetPacer, CreditPacer, DownstreamFrontier, PULL_AHEAD_BYTES, PULL_WINDOW_FLOOR,
+    PaceDecision, PaceState, Pacer, VERIFY_LAG_BYTES, WindowPacer,
 };
 #[doc(hidden)]
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
@@ -814,8 +815,9 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
 #[derive(Debug)]
 #[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct BlobTooLarge {
-    /// The byte count past `ceiling` — wire bytes one stream received (receive
-    /// loop), or content bytes the store holds or would hold for the blob
+    /// The byte count past `ceiling` — wire bytes one stream would carry (open,
+    /// from the proven size) or received (receive loop), or content bytes the
+    /// store holds or would hold for the blob
     /// (driver, [`acquire`]). Same unit as `ceiling` (see the type's **Units**
     /// note).
     pub reached: u64,
@@ -2419,10 +2421,7 @@ where
             ResponseDecoderNext::More((rest, Ok(BaoContentItem::Parent(_)))) => decoder = rest,
             ResponseDecoderNext::More((rest, Err(decode_err))) => {
                 let mut r = rest.finish();
-                if let Some(fault) = r.take_fault() {
-                    return Err(fault);
-                }
-                return Err(sink::classify_decode_error(decode_err));
+                return Err(sink::decode_failure(&mut r, decode_err));
             }
             ResponseDecoderNext::Done(mut r) => {
                 if let Some(fault) = r.take_fault() {
@@ -2683,9 +2682,11 @@ async fn heal_bytes_regression(
 /// node refused to adopt. The second state follows an `UnderFold` on a fresh
 /// root: the stream released reveals under it before the rejection landed, and
 /// only the last one rewound. A retry would re-anchor under that root and draw
-/// the same rejection, so an `UnderFold` retires it
+/// the same rejection, so the heal retires it
 /// ([`PoolLedger::retire_unadopted_chain`]), unless a heal has already taken
-/// this bundle.
+/// this bundle. An `AmountRegression` on a reveal is the same state: a
+/// restarted payer anchored a fresh root below the node's signed anchor and
+/// paid ahead under it.
 async fn already_covered(
     reason: VoucherRejectReason,
     watermark: Cumulative,
@@ -2703,7 +2704,10 @@ async fn already_covered(
         );
         return None;
     }
-    let retired = if reason == VoucherRejectReason::UnderFold {
+    let retired = if matches!(
+        reason,
+        VoucherRejectReason::UnderFold | VoucherRejectReason::AmountRegression
+    ) {
         ledger.retire_unadopted_chain(watermark).await
     } else {
         None
@@ -2897,14 +2901,14 @@ const PROOF_STALL_DEBUG_AFTER: Duration = Duration::from_secs(5);
 /// writing the proof), `first_frame` (a fresh leg waited from its open for
 /// its first frame, any time before the caller's first read included), or
 /// `read` (the leg waited for bytes). A `read` stall
-/// with `unproved > 0` can be the node waiting for a proof this leg does not
-/// yet owe; with `unproved == 0` the leg owes nothing and the node is slow to
-/// send. `unpolled` and `pay` are logged when the phase ends; `first_frame`
+/// with `held == 0` can be the node waiting for a proof this leg has not
+/// sent; with `held > 0` the leg has paid ahead and the node is slow to send.
+/// `unpolled` and `pay` are logged when the phase ends; `first_frame`
 /// and `read` are logged while the leg still waits.
 fn log_proof_stall(
     pull: (&dyn std::fmt::Display, [u8; 32], u64),
     cumulative: u64,
-    unproved: u64,
+    held: u64,
     phase: &'static str,
     elapsed: Duration,
 ) {
@@ -2917,7 +2921,7 @@ fn log_proof_stall(
         hash = %blake3::Hash::from_bytes(hash).to_hex(),
         byte_offset,
         cumulative,
-        unproved,
+        held,
         phase,
         elapsed_ms = elapsed.as_millis(),
         "a leg phase ran past {PROOF_STALL_DEBUG_AFTER:?}"
@@ -3055,10 +3059,18 @@ pub struct UpstreamPull {
     /// Wire bytes received so far on this stream.
     cumulative: u64,
     /// Wire bytes the caller's decoder has verified against the root, never
-    /// above `cumulative`. Payment follows this count, not `cumulative`.
+    /// above `cumulative`. This count sizes the payer window toward the node;
+    /// payment runs ahead of delivery up to that window.
     verified: u64,
-    /// Verified wire bytes not yet covered by a proof.
-    unproved: u64,
+    /// Wire bytes this stream has paid for (ADR 003 § Credit Window). Credit
+    /// belongs to the stream, so `paid − cumulative` is all the credit the
+    /// payer counts on at the node for it, and nothing carries to another
+    /// stream.
+    paid: u64,
+    /// The node failed this stream's delivery ([`Self::note_node_failure`]).
+    node_failed: bool,
+    /// [`Self::settle`] has booked the stream's end.
+    settled: bool,
     /// `StreamEnd` seen — `next_chunk` returns `None` and `finish` skips the
     /// drain.
     ended: bool,
@@ -3331,6 +3343,15 @@ async fn open_progressive_pull_impl(
         } else {
             aligned_wire_len(byte_offset, max_blob_size_bytes, total_bytes)?
         };
+        // The size is proven, so a stream whose wire runs past the cap can never
+        // complete. Refuse it before paying anything, rather than pay ahead for
+        // bytes the cap would refuse.
+        if max_received_wire > 0 && expected_wire_bytes > max_received_wire {
+            return Err(anyhow::Error::new(BlobTooLarge {
+                reached: expected_wire_bytes,
+                ceiling: max_received_wire,
+            }));
+        }
         let header = UpstreamPullHeader {
             total_bytes,
             size_proof: resp_ext.size_proof().cloned(),
@@ -3349,6 +3370,7 @@ async fn open_progressive_pull_impl(
         );
         let mut sampler = tokio::time::interval(stall_sample_period(window));
         sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ledger.note_rate(rate_per_mb);
         let pull = UpstreamPull {
             window,
             progress_counter,
@@ -3369,7 +3391,9 @@ async fn open_progressive_pull_impl(
             max_received_wire,
             cumulative: 0,
             verified: 0,
-            unproved: 0,
+            paid: 0,
+            node_failed: false,
+            settled: false,
             ended: false,
             returned_at: None,
             opened_at: tokio::time::Instant::now(),
@@ -3410,73 +3434,137 @@ impl UpstreamPull {
     /// ([`PoolLedger::note_wire`]), so the received total keeps meaning what
     /// the stream took in.
     fn take_in(&mut self, len: u64) {
+        // The bytes that arrive spend the stream's held credit, so the node's
+        // outstanding total falls by what this stream had paid for them.
+        let held = self.paid.saturating_sub(self.cumulative);
+        self.ledger.trust().note_spent(len.min(held));
         self.cumulative = self.cumulative.saturating_add(len);
         self.ledger.note_wire(len);
     }
 
+    /// The bytes this stream has paid for and not received.
+    const fn held(&self) -> u64 {
+        self.paid.saturating_sub(self.cumulative)
+    }
+
+    /// Record that the node failed this stream's delivery: an error the node or
+    /// the transport caused, or bytes the decoder proved corrupt. The stream's
+    /// end then writes off what it paid and did not receive verified
+    /// ([`Self::settle`]). The node's own account of why does not count: a
+    /// refusal, a rejected proof and a stall all fail delivery alike.
+    pub(crate) const fn note_node_failure(&mut self) {
+        self.node_failed = true;
+    }
+
+    /// Book the stream's end, once (ADR 003 § Credit Window). Its held credit
+    /// leaves the node's outstanding total. When the node failed the stream,
+    /// what the stream paid and did not receive verified is a write-off,
+    /// which shrinks the node's window. A completed stream, or one the payer
+    /// chose to stop or drop, writes off nothing: the payer left, and the node
+    /// keeps what it was paid.
+    fn settle(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let trust = self.ledger.trust();
+        trust.note_spent(self.held());
+        let lost = self.paid.saturating_sub(self.verified);
+        if self.node_failed && lost > 0 {
+            trust.write_off(lost);
+            tracing::warn!(
+                peer = %self.conn.remote_id(),
+                hash = %blake3::Hash::from_bytes(self.hash).to_hex(),
+                written_off_bytes = lost,
+                "the node failed a stream's delivery; wrote off what it paid and \
+                 did not receive verified"
+            );
+        }
+    }
+
     /// Record that the caller's decoder has verified the first `wire` bytes of
     /// this stream against the root. The count only moves forward and never
-    /// passes the bytes received. The newly verified bytes become payable: the
-    /// next [`Self::next_chunk`], [`Self::finish`] or [`Self::stop`] pays for
-    /// them, and a byte that never verifies is never paid for.
+    /// passes the bytes received. The newly verified bytes feed the node's
+    /// verified count, which sizes its credit window.
     pub(crate) fn mark_verified(&mut self, wire: u64) {
         let wire = wire.min(self.cumulative);
         if wire > self.verified {
-            self.unproved = self.unproved.saturating_add(wire - self.verified);
+            self.ledger.note_verified(wire - self.verified);
             self.verified = wire;
         }
     }
 
-    /// Pay for the verified bytes no proof covers yet: one reveal per whole
-    /// chunk, plus one closing signature for the residual once every promised
-    /// byte has verified. The sends commit optimistically; only a rejection
-    /// comes back, on a later read.
+    /// What payment this stream owes the node before it can send more, as
+    /// `(whole chunks, closing residual bytes)`: the payer window toward the
+    /// node ([`payer_window::PayAheadPolicy::window_bytes`]) against the bytes
+    /// this stream has left to receive and what it has paid and not received
+    /// ([`payer_window::due`]).
+    ///
+    /// A capability near its expiry drains: the payer stops paying ahead, so
+    /// nothing is signed past the node's expiry margin.
+    fn pay_ahead_due(&self) -> (u64, u64) {
+        if let Some(signed) = &self.ctx.capability
+            && decdn_common::config::inside_capability_expiry_margin(
+                signed.capability.expiry,
+                credential::NODE_EXPIRY_MARGIN_SECS,
+                credential::unix_now(),
+            )
+        {
+            return (0, 0);
+        }
+        let trust = self.ledger.trust();
+        let held = self.held();
+        payer_window::due(
+            trust.window_bytes(self.rate_per_mb),
+            self.expected_wire_bytes.saturating_sub(self.cumulative),
+            held,
+            payer_window::room(trust.cap_room_bytes(self.rate_per_mb), held),
+        )
+    }
+
+    /// Pay ahead of delivery up to the payer window ([`Self::pay_ahead_due`]):
+    /// one reveal per whole chunk, plus a closing signature for a residual that
+    /// covers the end of the stream. The sends commit optimistically; only a
+    /// rejection comes back, on a later read.
     ///
     /// A write failure may only mean the node stopped our send after it
     /// finished, or is rejecting us, so the terminal signal it left wins over
     /// the opaque write failure ([`Self::terminal_after_write_failure`]).
     async fn pay_verified(&mut self) -> anyhow::Result<()> {
-        let complete = self.verified >= self.expected_wire_bytes;
-        if self.unproved < CHUNK_BYTES && !(complete && self.unproved > 0) {
+        let (chunks, residual) = self.pay_ahead_due();
+        if chunks == 0 && residual == 0 {
             return Ok(());
         }
-        let unproved = self.unproved;
         // Gate the floor across our own payment: while we owe the covering proof
         // the upstream legitimately pauses (ADR 005 §Payment pacing), so that
         // pause is self-inflicted, not a sender stall (#1797).
         let pay_started = tokio::time::Instant::now();
         self.floor.pause(pay_started);
-        let paid = self.pay_one(unproved, complete).await;
+        let paid = self.pay_one(chunks, residual).await;
         let paid_at = tokio::time::Instant::now();
         self.floor.resume(paid_at);
         log_proof_stall(
             (&self.conn.remote_id(), self.hash, self.byte_offset),
             self.cumulative,
-            unproved,
+            self.held(),
             "pay",
             paid_at.saturating_duration_since(pay_started),
         );
-        match paid {
-            Ok(remaining) => self.unproved = remaining,
+        if let Err(write_err) = paid {
             // Boxed so this cold error-path future does not enlarge the steady
             // receive loop's future (`clippy::large_futures`); the allocation
-            // only happens on the failure path. A confirmed voucher covers every
-            // byte this stream verified, so nothing stays unproved.
-            Err(write_err) => {
-                if Box::pin(self.terminal_after_write_failure(write_err)).await? {
-                    self.unproved = 0;
-                }
-            }
+            // only happens on the failure path.
+            Box::pin(self.terminal_after_write_failure(write_err)).await?;
         }
         Ok(())
     }
 
-    /// Send one voucher for `delta_bytes` newly verified since the last voucher,
-    /// through the LANE's ledger — shared with every other concurrent pull on it, so
-    /// their vouchers are serialized into strict cumulative-amount order rather than
-    /// colliding. Sends optimistically (#1484): the ack is
-    /// read back by [`Self::next_chunk`] / [`Self::finish`], not awaited here.
-    async fn pay_one(&mut self, unproved: u64, complete: bool) -> anyhow::Result<u64> {
+    /// Send `chunks` reveals and then a closing voucher for `residual` bytes
+    /// through the LANE's ledger, shared with every other concurrent pull on it,
+    /// so proofs are serialized into strict cumulative order rather than
+    /// colliding. Sends optimistically (#1484): the ack is read back by
+    /// [`Self::next_chunk`] / [`Self::finish`], not awaited here.
+    async fn pay_one(&mut self, chunks: u64, residual: u64) -> anyhow::Result<()> {
         let ledger = Arc::clone(&self.ledger);
         self.meter
             .pay(
@@ -3484,8 +3572,9 @@ impl UpstreamPull {
                 &self.ctx,
                 &ledger,
                 self.rate_per_mb,
-                unproved,
-                complete,
+                chunks,
+                residual,
+                &mut self.paid,
             )
             .await
     }
@@ -3508,14 +3597,19 @@ impl UpstreamPull {
     }
 
     /// [`Self::read_under_floor`] before a transport fault unpins the connection.
+    // One read raced against the floor's sampling tick. The select arms each
+    // justify a timing verdict inline (what a lost race means before and after
+    // the first byte); splitting them out would separate those from the race
+    // they judge.
+    #[allow(clippy::too_many_lines)]
     async fn read_under_floor_once(&mut self) -> anyhow::Result<ClientMessage> {
         let cumulative = self.cumulative;
+        let held = self.held();
         let window = self.window;
         let recv = &mut self.recv;
         let sampler = &mut self.sampler;
         let floor = &mut self.floor;
         let (peer, hash, byte_offset) = (self.conn.remote_id(), self.hash, self.byte_offset);
-        let unproved = self.unproved;
         // A fresh leg's wait runs from its open, any time before the caller's
         // first read included, so a first frame that never comes is named
         // once, as `first_frame` (#2230).
@@ -3576,7 +3670,7 @@ impl UpstreamPull {
                     read_stall_logged = true;
                     let waited = read_started.elapsed();
                     let pull = (&peer as &dyn std::fmt::Display, hash, byte_offset);
-                    log_proof_stall(pull, cumulative, unproved, phase, waited);
+                    log_proof_stall(pull, cumulative, held, phase, waited);
                 }
             }
         }
@@ -3592,8 +3686,7 @@ impl UpstreamPull {
     /// # Errors
     ///
     /// More bytes than promised, received bytes crossing the cap's worth of content
-    /// from this stream's offset ([`BlobTooLarge`], raised before the crossing chunk is
-    /// paid), a mid-stream `StreamError`
+    /// from this stream's offset ([`BlobTooLarge`]), a mid-stream `StreamError`
     /// (typed [`UpstreamRefused`]), an unexpected message, a [`UpstreamVoucherRejected`] /
     /// transport error while paying, or —
     /// on the throughput floor — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
@@ -3601,7 +3694,21 @@ impl UpstreamPull {
     /// not raised here: an empty payload is rejected at decode by `ChunkData`'s
     /// `serde(try_from)` (#1088) and an oversized frame by the framing layer's
     /// `MAX_CHUNK_FRAME` before it allocates, so both surface out of `read_client_message`.
+    ///
+    /// Any error but our own [`LocalPullFault`] fails the node's delivery
+    /// ([`Self::note_node_failure`]).
     pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
+        let got = Box::pin(self.next_chunk_inner()).await;
+        if let Err(e) = &got
+            && !e.is::<LocalPullFault>()
+        {
+            self.note_node_failure();
+        }
+        got
+    }
+
+    /// The body of [`Self::next_chunk`].
+    async fn next_chunk_inner(&mut self) -> anyhow::Result<Option<Bytes>> {
         if self.ended {
             return Ok(None);
         }
@@ -3609,7 +3716,7 @@ impl UpstreamPull {
             log_proof_stall(
                 (&self.conn.remote_id(), self.hash, self.byte_offset),
                 self.cumulative,
-                self.unproved,
+                self.held(),
                 "unpolled",
                 returned_at.elapsed(),
             );
@@ -3650,10 +3757,10 @@ impl UpstreamPull {
                     // bytes that ACTUALLY arrive. `max_received_wire` is the wire size of the
                     // cap's worth of content from this stream's offset, so this is the
                     // wire form of "this stream carried more content than the cap" —
-                    // distinct from the claim-derived `expected_wire_bytes` overrun
-                    // guard above. Abort BEFORE paying for the chunk that crosses it,
-                    // so one stream's spend stays bounded to the cap's worth.
-                    // `0` = unlimited.
+                    // distinct from the size-derived `expected_wire_bytes` overrun
+                    // guard above. The open refuses a stream whose proven wire runs
+                    // past the cap, so this trips only on a node that sends more
+                    // than it proved. `0` = unlimited.
                     if self.max_received_wire > 0 && self.cumulative > self.max_received_wire {
                         return Err(anyhow::Error::new(BlobTooLarge {
                             reached: self.cumulative,
@@ -3665,8 +3772,10 @@ impl UpstreamPull {
                     // (`admit_bao_stream`), the ranged store's, or the in-memory
                     // test wrapper's — which checks every chunk group against the
                     // root as it lands (ADR 038) and reports what it verified
-                    // through `mark_verified`. Only verified bytes are paid for, so
-                    // a peer that sends a bad group bills nothing for it.
+                    // through `mark_verified`. Verified bytes size the payer
+                    // window, and a bad group fails the node's delivery
+                    // (`note_node_failure`), so the loss is bounded by the
+                    // window this stream paid.
                     self.returned_at = Some(tokio::time::Instant::now());
                     Ok(Some(Bytes::from(chunk.into_bytes())))
                 }
@@ -3828,8 +3937,21 @@ impl UpstreamPull {
     ///
     /// A short delivery (fewer wire bytes than promised before `StreamEnd`), a stream/protocol
     /// error while paying or draining, or — on the same inactivity bound as `next_chunk` —
-    /// [`PullStalled`] if the upstream goes silent before `StreamEnd`.
+    /// [`PullStalled`] if the upstream goes silent before `StreamEnd`. Any error
+    /// but our own [`LocalPullFault`] fails the node's delivery.
     pub async fn finish(mut self) -> anyhow::Result<VoucherProgress> {
+        let finished = Box::pin(self.finish_inner()).await;
+        if let Err(e) = &finished
+            && !e.is::<LocalPullFault>()
+        {
+            self.note_node_failure();
+        }
+        self.settle();
+        finished
+    }
+
+    /// The body of [`Self::finish`].
+    async fn finish_inner(&mut self) -> anyhow::Result<VoucherProgress> {
         if !self.ended {
             self.pay_verified().await?;
         }
@@ -3874,62 +3996,49 @@ impl UpstreamPull {
 
     /// Abandon the pull (e.g. the downstream client dropped, so we stop pulling
     /// and paying). Closes the connection and returns the acked watermark so the
-    /// caller can still persist what it paid (#852).
+    /// caller can still persist what it paid (#852). The payer chose to leave,
+    /// so nothing is written off.
     #[must_use]
     pub fn abort(mut self) -> VoucherProgress {
+        self.settle();
         self.close_transport(0, b"client-abandoned");
         self.progress()
     }
 
-    /// Stop the pull before its promised end, after paying for every wire byte
-    /// the caller's decoder verified. A steal that takes the tail of this pull's
-    /// range stops the pull at the split on its open stream, so the stolen tail
-    /// goes to one source and this one opens no new stream for the part it
-    /// keeps. Frames past the split that the stream already carried are not
-    /// verified, so they are not paid for, and the stolen tail is paid once.
+    /// Stop the pull before its promised end. The pull pays ahead and never
+    /// owes a verified byte, so a stop pays nothing more. The payer chose to
+    /// stop, so what the stream paid and did not receive is its own loss, not
+    /// a write-off. A steal that takes the tail of this pull's range stops the
+    /// pull at the split on its open stream, so the stolen tail goes to one
+    /// source and this one opens no new stream for the part it keeps.
     ///
     /// A rejection the node already sent waits behind the `ChunkData` it sent
     /// first, so the stop first reads what has arrived, without waiting: a
     /// `VoucherRejected` there rewinds the rejected proof when its reason refuses
     /// it, and surfaces as the
     /// typed rejection, as it does at [`Self::finish`]. A rejection still in
-    /// flight reaches the lane's next leg instead. The closing voucher then
-    /// settles the verified residual, the send half is finished, and the
-    /// transport is torn down (this stream, or the whole connection when the
-    /// pull owns it), so the node sees its sending stopped. A node that stops
-    /// sending before it reads that voucher does not redeem it, and the lane's
-    /// next cumulative voucher covers the same bytes.
-    ///
-    /// A closing voucher that fails to send stays armed in the ledger:
-    /// [`PoolLedger::settlement`] counts it, and the lane's next voucher builds
-    /// on it. The caller's paid frontier, which reads
-    /// [`PoolLedger::committed`], stays behind the verified bytes, so its next
-    /// leg re-delivers and pays for them once more.
+    /// flight reaches the lane's next leg instead. The send half is finished
+    /// and the transport is torn down (this stream, or the whole connection
+    /// when the pull owns it), so the node sees its sending stopped.
     ///
     /// # Errors
     ///
-    /// The typed rejection of a `StreamError` that had already arrived, or a
-    /// closing voucher that fails on our side ([`LocalPullFault`]). Any other
-    /// send failure is logged and leaves the residual as above.
+    /// The typed rejection of a `StreamError` that had already arrived.
+    #[allow(
+        clippy::unused_async,
+        reason = "the stop contract stays async for every caller, and a stop that pays ahead has nothing to await"
+    )]
     pub async fn stop(mut self) -> anyhow::Result<VoucherProgress> {
         if let Some(rejection) = self.arrived_rejection() {
+            // The node ended delivery before the payer stopped.
+            self.note_node_failure();
+            self.settle();
             self.close_transport(0, b"stopped-at-split");
             return Err(rejection);
         }
-        let paid = self.pay_one(self.unproved, true).await;
+        self.settle();
         let _ = self.send.finish();
         self.close_transport(0, b"stopped-at-split");
-        match paid {
-            Ok(remaining) => self.unproved = remaining,
-            Err(err) if err.is::<LocalPullFault>() => return Err(err),
-            Err(err) => tracing::warn!(
-                peer = %self.conn.remote_id(),
-                cumulative = self.cumulative,
-                unproved = self.unproved,
-                error = %format_args!("{err:#}"),
-                "the closing voucher of a pull stopped at a split did not send"
-            ),
-        }
         Ok(self.progress())
     }
 
@@ -4003,7 +4112,12 @@ impl Drop for UpstreamPull {
     /// this struct. A dropped pull's caller reads it with [`PoolLedger::settlement`]
     /// and persists it — `node_origin` does exactly that from its own `Drop` guard
     /// (#1145 review).
+    ///
+    /// It also books the stream's end ([`Self::settle`]) when no terminal method
+    /// did: a write-off when a read or a decode already failed the node's
+    /// delivery, and otherwise a payer that left.
     fn drop(&mut self) {
+        self.settle();
         self.close_transport(0, b"upstream-pull-dropped");
     }
 }
@@ -4055,7 +4169,8 @@ async fn send_voucher(
         .issue_stamped(delta_bytes, rate_per_mb, epoch, |next, chain| {
             attempted = Some(next.amount);
             signed_root = chain.chain_root;
-            sign_and_write_voucher(send, ctx, ledger.evidence(), next, chain)
+            // The voucher's new bytes are the share it pays this stream.
+            sign_and_write_voucher(send, ctx, ledger.evidence(), next, chain, delta_bytes)
         })
         .await;
     issued
@@ -4099,6 +4214,9 @@ impl std::error::Error for UnconfirmedVoucher {}
 /// Sign one voucher over `next`/`chain` with the pool context's key and write it
 /// to `send` — the body both [`send_voucher`] and [`PoolLedger::reanchor`] hand to
 /// the ledger, so the two differ only in which cumulative the ledger hands back.
+/// `stream_bytes` is the unsigned share of the payment the voucher assigns to
+/// this stream (ADR 003 § Credit Window): its new bytes, or `0` for a voucher
+/// that pays nothing new.
 ///
 /// The signed voucher goes into the lane's receipt `evidence` before the write:
 /// a voucher whose write fails can still become the lane's anchor once a
@@ -4111,6 +4229,7 @@ async fn sign_and_write_voucher(
     evidence: Option<&receipt::LaneEvidence>,
     next: Cumulative,
     chain: ChainCommit,
+    stream_bytes: u64,
 ) -> anyhow::Result<()> {
     let signed = Voucher {
         pool_id: ctx.pool_id,
@@ -4123,8 +4242,9 @@ async fn sign_and_write_voucher(
     }
     .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
     .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}").context(LocalPullFault))?;
-    let wire_voucher = signed_to_wire_voucher(&signed)
+    let mut wire_voucher = signed_to_wire_voucher(&signed)
         .map_err(|e| anyhow::anyhow!("voucher exceeds wire width: {e}").context(LocalPullFault))?;
+    wire_voucher.stream_bytes = stream_bytes;
     if let Some(evidence) = evidence {
         evidence.note_voucher(&wire_voucher);
     }
@@ -4206,7 +4326,7 @@ impl StreamMeter {
             // every chunk.
             self.anchored_root = ledger
                 .reanchor(|anchor, chain| {
-                    sign_and_write_voucher(send, ctx, ledger.evidence(), anchor, chain)
+                    sign_and_write_voucher(send, ctx, ledger.evidence(), anchor, chain, 0)
                 })
                 .await?;
         }
@@ -4322,30 +4442,33 @@ impl StreamMeter {
         Ok(())
     }
 
-    /// Emit the proofs `delivered` new bytes have earned: one reveal per whole
-    /// chunk, plus a closing signature for any residual once the transfer is
-    /// complete.
-    ///
-    /// Returns the bytes still unproved — always below one chunk.
+    /// Pay ahead of delivery: one reveal per chunk of `chunks`, then a closing
+    /// signature for `residual` bytes. Each proof adds what it pays this stream
+    /// to `paid`, and to the node's outstanding total, the moment its send
+    /// succeeds.
+    #[allow(clippy::too_many_arguments)]
     async fn pay(
         &mut self,
         send: &mut SendStream,
         ctx: &PoolContext,
         ledger: &PoolLedger,
         rate_per_mb: u64,
-        mut unproved: u64,
-        complete: bool,
-    ) -> anyhow::Result<u64> {
-        while unproved >= CHUNK_BYTES {
+        chunks: u64,
+        residual: u64,
+        paid: &mut u64,
+    ) -> anyhow::Result<()> {
+        for _ in 0..chunks {
             self.release_chunk(send, ctx, ledger, rate_per_mb).await?;
-            unproved -= CHUNK_BYTES;
+            *paid = paid.saturating_add(CHUNK_BYTES);
+            ledger.trust().note_prepaid(CHUNK_BYTES);
         }
-        if complete && unproved > 0 {
-            self.settle_residual(send, ctx, ledger, rate_per_mb, unproved)
+        if residual > 0 {
+            self.settle_residual(send, ctx, ledger, rate_per_mb, residual)
                 .await?;
-            unproved = 0;
+            *paid = paid.saturating_add(residual);
+            ledger.trust().note_prepaid(residual);
         }
-        Ok(unproved)
+        Ok(())
     }
 }
 

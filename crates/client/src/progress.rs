@@ -83,8 +83,8 @@ pub(crate) enum FloorVerdict {
 /// signal is frame-size-independent. The window must warm — a full `window` of streaming
 /// must elapse — before the floor can fire, which gives the first-byte stage its own time
 /// budget: for the first window no byte is required to have arrived. [`Self::pause`] /
-/// [`Self::resume`] exclude a self-inflicted credit-window payment pause, so the payer's
-/// own unpaid balance is never read as a sender stall.
+/// [`Self::resume`] exclude a self-inflicted payment pause, so time the payer spends
+/// sending its own pay-ahead proofs is never read as a sender stall.
 pub(crate) struct ThroughputFloor {
     cfg: FloorConfig,
     counter: Arc<AtomicU64>,

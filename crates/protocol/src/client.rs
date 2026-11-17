@@ -1034,6 +1034,15 @@ pub struct Voucher {
     /// chunk and MUST carry `0`. The node rejects otherwise with
     /// [`VoucherRejectReason::ChunkPriceMismatch`] (ADR 003 §Chunk Cadence).
     pub chunk_price: u64,
+    /// The bytes of the lane's payment the payer assigns to the stream that
+    /// carries this voucher (ADR 003 § Credit Window). Unsigned: the node
+    /// credits the stream at most what the lane has paid and no stream has
+    /// claimed, so a false value only moves the payer's own payment between
+    /// its streams. A closing voucher carries the residual it pays; a voucher
+    /// that pays no new bytes for this stream carries `0`. A
+    /// [`ChunkPreimage`] needs no such field: each one pays one chunk to the
+    /// stream that carries it.
+    pub stream_bytes: u64,
 }
 
 impl Voucher {
@@ -1054,8 +1063,10 @@ impl Voucher {
 /// chunk with no signature (ADR 003 §Hash-chain metering (`PayWord`), ADR 005
 /// §Payment quantum and credit window).
 ///
-/// Released after the payer has received and verified the chunk it pays for, so
-/// the payer's exposure stays at zero. Preimage resistance makes the value
+/// Released ahead of delivery, within the payer's credit window toward the
+/// node (ADR 003 § Credit Window). Each one pays one chunk to the stream that
+/// carries it, whatever order sibling streams' proofs arrive in. Preimage
+/// resistance makes the value
 /// self-proving: nobody derives `keccak^(N−k−1)(s)` from `keccak^(N−k)(s)`
 /// without the seed, so a deeper preimage **is** the receipt for every chunk
 /// below it.
@@ -1290,9 +1301,9 @@ pub enum VoucherRejectReason {
     /// `cdn/client/v1` handler (the node holds the clock), not via the `PoolError`
     /// bridge.
     CapabilityExpired,
-    /// The pool's on-chain remaining deposit, minus the refundable floor `M` and
-    /// the pool's already-committed concurrent floor credit, can no longer fund
-    /// further credit for this stream (ADR 003 §Pool solvency). The node also
+    /// The pool's on-chain remaining deposit, minus the refundable floor `M`,
+    /// can no longer fund this stream's next chunk (ADR 003 §Pool solvency).
+    /// The node also
     /// sends it when the pool closed under the stream, or is `Closing` with its
     /// dispute deadline inside the node's redeem margin. A pool-wide condition,
     /// not this signer's. Recovery: the pool **owner tops up the deposit**, or

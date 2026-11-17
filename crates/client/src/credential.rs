@@ -429,7 +429,10 @@ pub(crate) struct CredentialView {
     pub(crate) headroom: U256,
     /// The remaining work at the highest quoted rate.
     pub(crate) projected_need: U256,
-    /// One credit window (one voucher interval) at the highest quoted rate.
+    /// The credit the payer holds ahead of delivery at one node, at its cap
+    /// (ADR 003 § Credit Window): payment signed under the capability that no
+    /// delivered byte covers yet. The payer pays this far ahead of the work it
+    /// has received, so the capability must cover it beyond the remaining work.
     pub(crate) window: U256,
     /// The capability's expiry, in Unix seconds.
     pub(crate) expires_at: u64,
@@ -453,7 +456,12 @@ impl CredentialView {
         Self {
             headroom: U256::from(capability.spending_cap).saturating_sub(signed),
             projected_need: cost(remaining_bytes, rate),
-            window: cost(quotes.interval_bytes(), rate),
+            window: U256::from(
+                crate::payer_window::PayerWindows::process()
+                    .policy()
+                    .cap_micro_usdc,
+            )
+            .max(cost(quotes.interval_bytes(), rate)),
             expires_at: capability.expiry,
             expiring: decdn_common::config::inside_capability_expiry_margin(
                 capability.expiry,

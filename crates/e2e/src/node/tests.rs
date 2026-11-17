@@ -149,29 +149,6 @@ fn set_buyer_working_deposit_round_trips_through_toml() {
     assert_eq!(doc["payment"]["rate_per_mb"].as_integer(), Some(10));
 }
 
-/// `set_pool_floor_signer`'s parse → mutate → serialize step
-/// (`rewrite_pool_floor_signer`) must round-trip: the `[blockchain]` knob
-/// lands and every other section — notably the `[cache]`
-/// scalar-after-subtable that trips the serializer hazard — survives.
-#[test]
-fn set_pool_floor_signer_round_trips_through_toml() {
-    let rewritten = rewrite_pool_floor_signer(&sample_rendered_config(), 8)
-        .expect("rewrite_pool_floor_signer must succeed");
-    let doc: toml::Value = toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
-
-    assert_eq!(
-        doc["blockchain"]["pool_floor_signer_live_windows"].as_integer(),
-        Some(8)
-    );
-    // Everything around the mutation is intact.
-    assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
-    assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
-    assert_eq!(
-        doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
-        Some(true)
-    );
-}
-
 /// `set_pool_min_remaining_deposit`'s parse → mutate → serialize step
 /// (`rewrite_pool_min_remaining_deposit`) must round-trip: the `[blockchain]`
 /// knob lands and every other section — notably the `[cache]`

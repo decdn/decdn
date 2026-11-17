@@ -70,6 +70,7 @@ proptest! {
             bytes_delivered: 0u64,
             chain_root: [0u8; 32],
             chunk_price: 0u64,
+            stream_bytes: 0u64,
         };
         let result = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER);
         if signature.len() != decdn_protocol::VOUCHER_SIG_LEN {

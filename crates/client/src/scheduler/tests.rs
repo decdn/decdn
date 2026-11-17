@@ -3747,213 +3747,6 @@ async fn verified_bytes_since_the_last_step_allow_another() -> anyhow::Result<()
     Ok(())
 }
 
-/// A fetch that completes on other lanes, without the refused lane running
-/// again, leaves that lane's owed span unpaid: the node's credit-window loss,
-/// as for any client that ends mid-stream. No pass runs only to bill it.
-#[tokio::test(start_paused = true)]
-async fn a_fetch_finished_by_other_lanes_leaves_the_owed_span_unpaid() -> anyhow::Result<()> {
-    let data = blob(1024 * 1024);
-    let (la, lb) = (
-        Arc::new(PoolLedger::new(Cumulative::default())),
-        Arc::new(PoolLedger::new(Cumulative::default())),
-    );
-    let a = ScriptedSource::new(data.clone())?
-        .paying(Arc::clone(&la))
-        .with_fault_after(128 * 1024, || {
-            anyhow::Error::new(UpstreamVoucherRejected {
-                reason: decdn_protocol::client::VoucherRejectReason::PoolExhausted,
-                bundle: None,
-                proof_generation: None,
-            })
-        });
-    let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
-    let (root, total) = (a.root(), a.total_bytes());
-    let (store, dir) = fresh_store(root, total);
-    let provider = StaticSources::new(vec![
-        candidate(a.clone(), Arc::clone(&la), 0xA1, None),
-        candidate(b, lb, 0xB2, None),
-    ])?;
-    acquire_under(&store, &provider, root, &no_funding(), &RecoveryGate::new()).await?;
-    store.finalize().await?;
-    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-    assert_eq!(a.opened_ranges().len(), 1, "no pass runs only to bill");
-    assert!(
-        !la.take_unpaid(root).is_empty(),
-        "the refused lane's span stays unpaid"
-    );
-    Ok(())
-}
-
-/// An owed span whose bill fails on a delivery fault (not a funding one) stays
-/// owed: the lane bills it when its worker starts again.
-#[tokio::test(start_paused = true)]
-async fn an_owed_span_whose_bill_faults_stays_owed() -> anyhow::Result<()> {
-    let data = blob(1024 * 1024);
-    let half = 512 * 1024;
-    let la = Arc::new(PoolLedger::new(Cumulative::default()));
-    let a = ScriptedSource::new(data.clone())?
-        .paying(Arc::clone(&la))
-        .refusing_open(0, || anyhow::anyhow!("connection reset"));
-    let (root, total) = (a.root(), a.total_bytes());
-    let (store, dir) = fresh_store(root, total);
-    // The first half is present and owed: an earlier worker delivered it
-    // unpaid before a funding refusal ended it.
-    {
-        let once = ScriptedSource::new(data.clone())?;
-        let range = decdn_bao_range::align_range(0, half, total)?;
-        let (_header, reader) = once.open(root, range.clone()).await?;
-        store.ingest_stream(&range, reader, None, total).await?;
-    }
-    la.note_unpaid(root, 0, half);
-    let provider = StaticSources::new(vec![candidate(a.clone(), Arc::clone(&la), 0xA1, None)])?;
-    acquire_under(&store, &provider, root, &no_funding(), &RecoveryGate::new()).await?;
-    store.finalize().await?;
-    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-    let opened = a.opened_ranges();
-    assert_eq!(
-        opened.iter().filter(|&&(start, _)| start == 0).count(),
-        2,
-        "the faulted bill and the bill on the restart: {opened:?}"
-    );
-    assert!(la.take_unpaid(root).is_empty(), "the span is billed");
-    Ok(())
-}
-
-/// A leg that faults leaves its delivered bytes owed, so the next leg opens
-/// at the same start and re-delivers them. When that leg faults at the same
-/// point, it made no byte present: its fault line says `landed=0` though its
-/// unit verified the whole re-delivered span, and it re-queues what the first
-/// fault re-queued.
-#[tokio::test(start_paused = true)]
-async fn a_leg_that_only_re_delivers_lands_nothing() -> anyhow::Result<()> {
-    let data = blob(1024 * 1024);
-    let la = Arc::new(PoolLedger::new(Cumulative::default()));
-    // Two readers fault at the same wire offset; the third finishes the blob.
-    let a = ScriptedSource::new(data.clone())?
-        .paying(Arc::clone(&la))
-        .fault_times_after(2, 256 * 1024, || anyhow::anyhow!("connection reset"));
-    let (root, total) = (a.root(), a.total_bytes());
-    let (store, dir) = fresh_store(root, total);
-    let provider = StaticSources::new(vec![candidate(a.clone(), Arc::clone(&la), 0xA1, None)])?;
-    let log = CapturedLog::default();
-    let sink = log.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(move || sink.clone())
-        .finish();
-    // `set_default` is per-thread: `acquire` polls every worker on this one.
-    let guard = tracing::subscriber::set_default(subscriber);
-    acquire_under(&store, &provider, root, &no_funding(), &RecoveryGate::new()).await?;
-    drop(guard);
-    store.finalize().await?;
-    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-
-    let text = log.text();
-    let num = |fault: &str, key: &str| -> anyhow::Result<u64> {
-        fault
-            .split_whitespace()
-            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
-            .ok_or_else(|| anyhow::anyhow!("no {key} in {fault}"))?
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{key} in {fault}: {e}"))
-    };
-    let faults: Vec<&str> = text
-        .lines()
-        .filter_map(|l| Some(l.split_once("a lane faulted; its remainder")?.1))
-        .collect();
-    let [first, second] = faults.as_slice() else {
-        anyhow::bail!("two lane faults: {text}");
-    };
-    assert_eq!(
-        (num(first, "offset")?, num(second, "offset")?),
-        (0, 0),
-        "the second leg opens where the first did: {text}"
-    );
-    assert!(
-        num(first, "landed")? > 0,
-        "the first leg landed bytes: {text}"
-    );
-    assert_eq!(
-        num(second, "landed")?,
-        0,
-        "the second leg only re-delivered: {text}"
-    );
-    assert_eq!(
-        num(second, "requeued")?,
-        num(first, "requeued")?,
-        "the second leg leaves the store as the first left it: {text}"
-    );
-    Ok(())
-}
-
-/// A leg that a lost connection ends after the credit window let it deliver
-/// verified bytes unpaid leaves the lane owing them (#2718, #2722). The lane's
-/// restart reopens at the paid frontier, not the delivered one, and bills the
-/// owed bytes in the same leg as the missing bytes after them. So the lane
-/// pays every wire byte of the blob exactly once: a restart at the delivered
-/// frontier skips the owed bytes, and a separate leg for them pays the proof
-/// path at the seam a second time.
-#[tokio::test(start_paused = true)]
-async fn a_lost_connection_bills_the_delivered_tail_in_one_leg() -> anyhow::Result<()> {
-    let data = blob(1024 * 1024);
-    let la = Arc::new(PoolLedger::new(Cumulative::default()));
-    let a = ScriptedSource::new(data.clone())?
-        .paying(Arc::clone(&la))
-        .fault_once_after(256 * 1024, || {
-            anyhow::anyhow!("frame I/O error: connection lost")
-        });
-    let (root, total) = (a.root(), a.total_bytes());
-    let (store, dir) = fresh_store(root, total);
-    let provider = StaticSources::new(vec![candidate(a.clone(), Arc::clone(&la), 0xA1, None)])?;
-    acquire_under(&store, &provider, root, &no_funding(), &RecoveryGate::new()).await?;
-    store.finalize().await?;
-    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-    let opened = a.opened_ranges();
-    assert_eq!(
-        opened,
-        vec![(0, total), (0, total)],
-        "the restart reopens the whole range at the paid frontier: {opened:?}"
-    );
-    let whole_wire = decdn_bao_range::align_range(0, 0, total)?.wire_len();
-    assert_eq!(
-        la.committed().bytes,
-        U256::from(whole_wire),
-        "the lane pays every wire byte of the blob once"
-    );
-    assert!(la.take_unpaid(root).is_empty(), "nothing stays owed");
-    Ok(())
-}
-
-/// Which unit ends re-queue the remainder from the paid frontier
-/// ([`super::requeues_from_paid`]): a delivery fault or a dropped leg does; a
-/// funding refusal does not, nor does a leg that re-billed an owed span and
-/// paid nothing past it.
-#[test]
-fn only_a_delivery_end_requeues_from_the_paid_frontier() {
-    use super::{UnitOutcome, requeues_from_paid};
-    let lost = || UnitOutcome::Faulted(Some(anyhow::anyhow!("connection lost")));
-    let dry = || UnitOutcome::Faulted(Some(dry_lane()));
-    assert!(requeues_from_paid(&lost(), &[], 0, 0), "a lost connection");
-    assert!(
-        requeues_from_paid(&UnitOutcome::Faulted(None), &[], 0, 0),
-        "a stall"
-    );
-    assert!(
-        requeues_from_paid(&UnitOutcome::Cancelled, &[], 0, 0),
-        "a cancel"
-    );
-    assert!(!requeues_from_paid(&dry(), &[], 0, 0), "a funding refusal");
-    assert!(
-        !requeues_from_paid(&lost(), &[64], 64, 64),
-        "a re-bill that paid nothing past its start"
-    );
-    assert!(
-        requeues_from_paid(&lost(), &[64], 64, 128),
-        "a re-bill that paid past its start"
-    );
-}
-
 /// A step that settles (the pool already holds its deposit, and the sources
 /// have not seen it yet) leaves the deposit where it is, and still asks the
 /// priced-out source again: its refusal was its stale view of the pool.
@@ -8026,13 +7819,13 @@ fn extra_stream_fault_level_follows_landed_and_class() {
 #[tokio::test(start_paused = true)]
 async fn the_running_low_signal_prices_the_runs_outstanding_work() -> anyhow::Result<()> {
     let data = blob(4 * 1024 * 1024);
-    // A cap of 100 covers this 4 MiB entry at 1 per MB, plus a window. The
-    // throttle keeps the fetch running past the loop's 5 s periodic view.
+    // A cap of 1000 covers this 4 MiB entry at 1 per MB, plus a window of 640.
+    // The throttle keeps the fetch running past the loop's 5 s periodic view.
     for (outstanding, signalled) in [(None, false), (Some(1000 * MIB), true)] {
         let source = ScriptedSource::new(data.clone())?.throttled(Duration::from_millis(50));
         let (root, total) = (source.root(), source.total_bytes());
         let (store, dir) = fresh_store(root, total);
-        let credential = delegate(100);
+        let credential = delegate(1000);
         let slot = slot_for(&credential, Duration::ZERO);
         let events = slot.funding_events();
         let provider = SlotSources::new(&slot, source);
@@ -8063,13 +7856,13 @@ async fn the_running_low_signal_prices_the_runs_outstanding_work() -> anyhow::Re
 #[tokio::test(start_paused = true)]
 async fn the_running_low_signal_prices_the_runs_highest_quote() -> anyhow::Result<()> {
     let data = blob(4 * 1024 * 1024);
-    // At this fetch's own 1 per MB, a cap of 100 covers the run's 50 MiB of
-    // planned work; at a sibling's 10 per MB it does not.
+    // At this fetch's own 1 per MB, a cap of 1000 covers the run's 50 MiB of
+    // planned work plus a window of 640; at a sibling's 10 per MB it does not.
     for (sibling_rate, signalled) in [(0, false), (10, true)] {
         let source = ScriptedSource::new(data.clone())?.throttled(Duration::from_millis(50));
         let (root, total) = (source.root(), source.total_bytes());
         let (store, _dir) = fresh_store(root, total);
-        let slot = slot_for(&delegate(100), Duration::ZERO);
+        let slot = slot_for(&delegate(1000), Duration::ZERO);
         let events = slot.funding_events();
         let provider = SlotSources::new(&slot, source);
         let run = crate::RunDemand::default();

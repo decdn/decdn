@@ -246,30 +246,6 @@ impl NodeFixture {
         Ok(micro_usdc)
     }
 
-    /// Rewrite the `[blockchain]` per-signer floor knob
-    /// (`pool_floor_signer_live_windows`) in the daemon's config and restart the
-    /// daemon so the new value takes effect.
-    ///
-    /// This sizes the per-signer LIVE concurrency cap `k` in ramp-start credit
-    /// windows (ADR 003 § Pool solvency, per-signer floor isolation): the most live
-    /// un-vouchered floor reservation one capability signer may hold underneath the
-    /// per-pool `remaining − M` ceiling. A journey shrinks it so one signer
-    /// deterministically fills its own share while the pool stays solvent, without
-    /// touching a co-tenant's.
-    ///
-    /// Restart-required for the same reason as [`Self::set_rate_per_mb`]: the
-    /// handler reads it once at runtime bring-up, so a running node only picks it up
-    /// by rewriting the config and bouncing the process ([`Self::restart`]).
-    pub async fn set_pool_floor_signer(&self, live_windows: u64) -> anyhow::Result<()> {
-        let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
-        let rewritten = rewrite_pool_floor_signer(&config, live_windows)?;
-        std::fs::write(&self.config_path, rewritten).context("write node config")?;
-
-        self.restart()
-            .await
-            .context("restart after pool-floor-signer rewrite")
-    }
-
     /// Rewrite the `[blockchain]` refundable-floor knob
     /// (`pool_min_remaining_deposit_micro_usdc`) in the daemon's config and restart
     /// the daemon so the new value takes effect.
@@ -1181,32 +1157,11 @@ fn rewrite_buyer_working_deposit(config: &str, micro_usdc: u64) -> anyhow::Resul
     toml::to_string(&doc).context("render node config")
 }
 
-/// Rewrite the `[blockchain]` per-signer floor knob (`pool_floor_signer_live_windows`)
-/// in a node TOML config, preserving every other key. Separate from
-/// [`NodeFixture::set_pool_floor_signer`] so its parse → mutate →
-/// `toml::to_string` round-trip is testable without a live daemon, mirroring
-/// [`rewrite_buyer_working_deposit`]. The `[blockchain]` table holds only
-/// scalars, so it is free of the `[cache]` `ValueAfterTable` serializer hazard.
-fn rewrite_pool_floor_signer(config: &str, live_windows: u64) -> anyhow::Result<String> {
-    let mut doc: toml::Table = config.parse().context("parse node config")?;
-    let blockchain = doc
-        .get_mut("blockchain")
-        .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("node config has no [blockchain] table"))?;
-    blockchain.insert(
-        "pool_floor_signer_live_windows".to_string(),
-        toml::Value::Integer(
-            i64::try_from(live_windows).context("pool_floor_signer_live_windows overflows i64")?,
-        ),
-    );
-    toml::to_string(&doc).context("render node config")
-}
-
 /// Rewrite the `[blockchain]` refundable-floor knob
 /// (`pool_min_remaining_deposit_micro_usdc`) in a node TOML config, preserving
 /// every other key. Separate from [`NodeFixture::set_pool_min_remaining_deposit`]
 /// so its parse → mutate → `toml::to_string` round-trip is testable without a live
-/// daemon, mirroring [`rewrite_pool_floor_signer`]. The `[blockchain]` table holds
+/// daemon, mirroring [`rewrite_buyer_working_deposit`]. The `[blockchain]` table holds
 /// only scalars, so it is free of the `[cache]` `ValueAfterTable` serializer hazard.
 fn rewrite_pool_min_remaining_deposit(config: &str, micro_usdc: u64) -> anyhow::Result<String> {
     let mut doc: toml::Table = config.parse().context("parse node config")?;

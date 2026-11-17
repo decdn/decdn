@@ -107,15 +107,6 @@ pub fn min_payment(bytes: u64, rate_per_mb: u64) -> U256 {
         .div_ceil(U256::from(BYTES_PER_MB))
 }
 
-/// Stateful-B pool solvency: the pool's remaining deposit minus the refundable
-/// floor `M` must cover its already-committed concurrent floor credit plus this
-/// stream's new reservation. Saturating (a `remaining` below `M` yields no
-/// headroom rather than underflowing).
-#[must_use]
-pub fn pool_budget_covers(remaining: U256, m: U256, committed: U256, new_reserve: U256) -> bool {
-    remaining.saturating_sub(m) >= committed.saturating_add(new_reserve)
-}
-
 /// Failure modes for [`verify_rate`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RateError {

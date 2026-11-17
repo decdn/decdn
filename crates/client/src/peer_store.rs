@@ -98,9 +98,28 @@ pub struct PeerRecord {
     pub sample_count: u32,
     /// Seconds since the Unix epoch of the most recent failure, if any.
     pub last_failure_at_secs: Option<u64>,
+    /// Bytes this payer has verified from the node operator at
+    /// [`Self::eth_address`]. It sizes the payer's credit window toward that
+    /// operator ([`crate::payer_window`]). The count follows the bonded operator
+    /// address, not the iroh endpoint id, and never ages out: a record that
+    /// holds it is exempt from identity pruning. Required: a record without it
+    /// fails to decode rather than silently resetting the operator's history.
+    pub verified_bytes: u64,
+    /// Paid bytes this payer has written off at the operator at
+    /// [`Self::eth_address`]. Each one cancels `loss_weight` verified bytes when
+    /// the window is sized. Exempt from pruning, and required, like
+    /// [`Self::verified_bytes`].
+    pub lost_bytes: u64,
 }
 
 impl PeerRecord {
+    /// A record that holds a payer track record is kept: the window it earned,
+    /// or the loss it recorded, outlives the registry identity's age.
+    #[must_use]
+    pub const fn holds_pay_ahead_history(&self) -> bool {
+        self.verified_bytes > 0 || self.lost_bytes > 0
+    }
+
     /// A latency sample exists and is younger than the TTL.
     #[must_use]
     pub(crate) const fn latency_fresh(&self, now_secs: u64, cfg: &StoreConfig) -> bool {
@@ -122,7 +141,8 @@ impl PeerRecord {
     /// Identity has not been seen in the registry for longer than the prune horizon.
     #[must_use]
     pub const fn identity_prunable(&self, now_secs: u64, cfg: &StoreConfig) -> bool {
-        now_secs.saturating_sub(self.identity_seen_at_secs) > cfg.identity_prune_secs
+        !self.holds_pay_ahead_history()
+            && now_secs.saturating_sub(self.identity_seen_at_secs) > cfg.identity_prune_secs
     }
 
     /// Identity was confirmed against the registry within the refresh horizon, so
@@ -304,6 +324,8 @@ impl PeerStore {
             rate_per_mb: None,
             sample_count: 0,
             last_failure_at_secs: None,
+            verified_bytes: 0,
+            lost_bytes: 0,
         });
         rec.eth_address = cand.eth_address;
         rec.region_hint = cand.region_hint;
@@ -335,6 +357,8 @@ impl PeerStore {
             rate_per_mb: None,
             sample_count: 0,
             last_failure_at_secs: None,
+            verified_bytes: 0,
+            lost_bytes: 0,
         });
         rec.fold_latency(latency_ms, cfg.ewma_alpha);
         rec.rate_per_mb = Some(rate_per_mb);
@@ -367,6 +391,96 @@ impl PeerStore {
         };
         rec.last_failure_at_secs = Some(now_secs);
         self.write(&rec)
+    }
+
+    /// Seed `windows` with every operator's persisted track record. Records that
+    /// share one operator address add up: the track record follows the bonded
+    /// address, not the endpoint id.
+    pub fn seed_windows(&self, windows: &crate::payer_window::PayerWindows) {
+        let mut by_operator: std::collections::HashMap<Address, (u64, u64)> =
+            std::collections::HashMap::new();
+        for rec in self.load_all() {
+            if rec.eth_address.is_zero() || !rec.holds_pay_ahead_history() {
+                continue;
+            }
+            let entry = by_operator.entry(rec.eth_address).or_default();
+            entry.0 = entry.0.saturating_add(rec.verified_bytes);
+            entry.1 = entry.1.saturating_add(rec.lost_bytes);
+        }
+        for (address, (verified, lost)) in by_operator {
+            windows.seed(address, verified, lost);
+        }
+    }
+
+    /// Add the progress `windows` has not saved to the stored track records of
+    /// the operators it names. Each process adds only its own progress to what
+    /// the store holds now, so concurrent fetches never overwrite each other's
+    /// counts. An operator with no peer record keeps its progress in memory for
+    /// a later save: a record with no identity is never selectable.
+    ///
+    /// # Errors
+    ///
+    /// A record write failure. The progress not stored stays unsaved in
+    /// `windows`.
+    pub fn save_windows(&self, windows: &crate::payer_window::PayerWindows) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
+        let records = self.load_all();
+        let mut unsaved = windows.take_unsaved().into_iter();
+        while let Some((address, verified, lost)) = unsaved.next() {
+            if address.is_zero() {
+                continue;
+            }
+            if let Err(e) = self.add_track_record(&records, address, verified, lost) {
+                windows.return_unsaved(address, verified, lost);
+                for (address, verified, lost) in unsaved {
+                    windows.return_unsaved(address, verified, lost);
+                }
+                return Err(e);
+            }
+            if !records.iter().any(|r| r.eth_address == address) {
+                windows.return_unsaved(address, verified, lost);
+            }
+        }
+        Ok(())
+    }
+
+    /// Add `verified` and `lost` to the stored track record of the operator at
+    /// `address`. The operator's first record by node id holds the whole count;
+    /// any further record of the same operator is folded into it and zeroed.
+    fn add_track_record(
+        &self,
+        records: &[PeerRecord],
+        address: Address,
+        verified: u64,
+        lost: u64,
+    ) -> anyhow::Result<()> {
+        let mut matching: Vec<&PeerRecord> = records
+            .iter()
+            .filter(|r| r.eth_address == address)
+            .collect();
+        matching.sort_by_key(|r| r.node_id.to_string());
+        let Some(first) = matching.first() else {
+            return Ok(());
+        };
+        let (stored_verified, stored_lost) = matching.iter().fold((0u64, 0u64), |(v, l), r| {
+            (
+                v.saturating_add(r.verified_bytes),
+                l.saturating_add(r.lost_bytes),
+            )
+        });
+        let mut rec = (*first).clone();
+        rec.verified_bytes = stored_verified.saturating_add(verified);
+        rec.lost_bytes = stored_lost.saturating_add(lost);
+        self.write(&rec)?;
+        for other in matching.iter().skip(1) {
+            if other.holds_pay_ahead_history() {
+                let mut other = (*other).clone();
+                other.verified_bytes = 0;
+                other.lost_bytes = 0;
+                self.write(&other)?;
+            }
+        }
+        Ok(())
     }
 
     fn delete(&self, node_id: &PublicKey) -> anyhow::Result<()> {
@@ -414,4 +528,5 @@ impl PeerStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests;

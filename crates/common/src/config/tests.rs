@@ -1709,8 +1709,6 @@ fn resolve_payment_rejects_zero_from_file() -> anyhow::Result<()> {
     let cli = crate::cli::run::PaymentArgs { rate_per_mb: None };
     let file = types::PaymentConfig {
         rate_per_mb: Some(0),
-        credit_max: None,
-        credit_ramp_divisor: None,
         frame_target_bytes: None,
         voucher_commit_interval_ms: None,
     };
@@ -1756,8 +1754,6 @@ fn resolve_payment_cli_overrides_file_and_passes_nonzero() -> anyhow::Result<()>
     };
     let file = types::PaymentConfig {
         rate_per_mb: Some(0),
-        credit_max: None,
-        credit_ramp_divisor: None,
         frame_target_bytes: None,
         voucher_commit_interval_ms: None,
     };
@@ -1776,16 +1772,6 @@ fn resolve_payment_defaults_when_unset() -> anyhow::Result<()> {
         resolved.rate_per_mb
     );
     anyhow::ensure!(
-        resolved.credit_max == DEFAULT_CREDIT_MAX,
-        "credit_max default, got: {}",
-        resolved.credit_max
-    );
-    anyhow::ensure!(
-        resolved.credit_ramp_divisor == DEFAULT_CREDIT_RAMP_DIVISOR,
-        "credit_ramp_divisor default, got: {}",
-        resolved.credit_ramp_divisor
-    );
-    anyhow::ensure!(
         resolved.voucher_commit_interval_ms == DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
         "voucher_commit_interval_ms default, got: {}",
         resolved.voucher_commit_interval_ms
@@ -1800,8 +1786,6 @@ fn resolve_payment_threads_explicit_commit_interval() -> anyhow::Result<()> {
     for set in [Some(20u64), Some(1_000)] {
         let file = types::PaymentConfig {
             rate_per_mb: Some(10),
-            credit_max: None,
-            credit_ramp_divisor: None,
             frame_target_bytes: None,
             voucher_commit_interval_ms: set,
         };
@@ -1824,45 +1808,6 @@ fn resolve_payment_rejects_zero_commit_interval() -> anyhow::Result<()> {
     let err = resolve_payment(&empty_payment_args(), Some(&file))
         .expect_err("zero flush interval must be rejected");
     anyhow::ensure!(err.to_string().contains("voucher_commit_interval_ms"));
-    Ok(())
-}
-
-#[test]
-fn resolve_payment_defaults_credit_max_and_ramp_divisor() -> anyhow::Result<()> {
-    let resolved = resolve_payment(&empty_payment_args(), None)?;
-    anyhow::ensure!(
-        resolved.credit_max == DEFAULT_CREDIT_MAX,
-        "got: {}",
-        resolved.credit_max
-    );
-    anyhow::ensure!(
-        resolved.credit_ramp_divisor == DEFAULT_CREDIT_RAMP_DIVISOR,
-        "got: {}",
-        resolved.credit_ramp_divisor
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_payment_threads_explicit_credit_max_and_ramp_divisor() -> anyhow::Result<()> {
-    let file = types::PaymentConfig {
-        rate_per_mb: Some(10),
-        credit_max: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
-        credit_ramp_divisor: Some(5),
-        frame_target_bytes: None,
-        voucher_commit_interval_ms: None,
-    };
-    let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
-    anyhow::ensure!(
-        resolved.credit_max == 32 * 1024 * 1024,
-        "credit_max threaded, got: {}",
-        resolved.credit_max
-    );
-    anyhow::ensure!(
-        resolved.credit_ramp_divisor == 5,
-        "credit_ramp_divisor threaded, got: {}",
-        resolved.credit_ramp_divisor
-    );
     Ok(())
 }
 
@@ -6088,42 +6033,6 @@ fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The per-signer floor knob (ADR 003 § Pool solvency) defaults to `8` live
-/// windows and threads an explicit value through. No value is rejected: it is
-/// lower-clamped at use, so there is nothing for the resolver to bound.
-#[test]
-fn pool_floor_signer_knobs_default_and_thread() -> anyhow::Result<()> {
-    let dir = data_dir_with_keystore()?;
-    let cli = BlockchainArgs {
-        origin_assignment_address: None,
-        publisher_registry_address: None,
-        rpc_url: Some("https://example/rpc".to_string()),
-        eth_keystore: None,
-        keystore_password_file: None,
-        payment_pool_address: Some(GOOD_ADDR.to_string()),
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        content_blacklist_address: Some(GOOD_ADDR.to_string()),
-        chain_id: None,
-    };
-    let resolved = resolve_blockchain(&cli, None, dir.path())?;
-    // Literals, not the constants: asserting a value against the constant it
-    // came from passes whatever the constant says, and the shipped defaults are
-    // documented in several places that have to agree with it.
-    assert_eq!(resolved.pool_floor_signer_live_windows, 8);
-    assert_eq!(DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS, 8);
-
-    let explicit = types::BlockchainConfig {
-        pool_floor_signer_live_windows: Some(16),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        content_blacklist_address: Some(GOOD_ADDR.to_string()),
-        ..Default::default()
-    };
-    let resolved = resolve_blockchain(&cli, Some(&explicit), dir.path())?;
-    assert_eq!(resolved.pool_floor_signer_live_windows, 16);
-    Ok(())
-}
-
 #[test]
 fn buyer_working_deposit_defaults_when_absent() -> anyhow::Result<()> {
     let dir = data_dir_with_keystore()?;
@@ -6438,8 +6347,6 @@ fn resolve_payment_cli_rate_overrides_file_rate() -> anyhow::Result<()> {
     };
     let file = types::PaymentConfig {
         rate_per_mb: Some(1),
-        credit_max: None,
-        credit_ramp_divisor: None,
         frame_target_bytes: None,
         voucher_commit_interval_ms: None,
     };
@@ -6453,8 +6360,6 @@ fn resolve_payment_uses_file_when_cli_absent() -> anyhow::Result<()> {
     let cli = empty_payment_args();
     let file = types::PaymentConfig {
         rate_per_mb: Some(50),
-        credit_max: None,
-        credit_ramp_divisor: None,
         frame_target_bytes: None,
         voucher_commit_interval_ms: None,
     };

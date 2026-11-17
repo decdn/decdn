@@ -574,6 +574,9 @@ impl ReceiptVoucher {
             bytes_delivered: self.bytes_delivered,
             chain_root: self.chain_root.into(),
             chunk_price: self.chunk_price,
+            // The stream share is an unsigned delivery hint, not part of the
+            // signed voucher a receipt proves.
+            stream_bytes: 0,
         }
     }
 

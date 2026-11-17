@@ -216,30 +216,3 @@ fn one_chunk_is_exactly_the_per_mb_rate() {
     let f = min_payment(decdn_protocol::client::CHUNK_BYTES, 100);
     assert_eq!(f, U256::from(100u64));
 }
-
-#[test]
-fn pool_budget_covers_saturates_and_reserves_m() {
-    let m = U256::from(1_000_000u64);
-    let remaining = U256::from(1_000_400u64); // M + 400
-    // committed 0, reserve 400 → exactly covered.
-    assert!(pool_budget_covers(
-        remaining,
-        m,
-        U256::ZERO,
-        U256::from(400u64)
-    ));
-    // committed 400, another 1 → over budget.
-    assert!(!pool_budget_covers(
-        remaining,
-        m,
-        U256::from(400u64),
-        U256::from(1u64)
-    ));
-    // remaining below M saturates to zero headroom, never panics.
-    assert!(!pool_budget_covers(
-        U256::from(500_000u64),
-        m,
-        U256::ZERO,
-        U256::from(1u64)
-    ));
-}
