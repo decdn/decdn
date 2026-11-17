@@ -89,7 +89,54 @@ impl PoolOwner {
     ///
     /// `decdn pool assign` fails or prints no capability.
     pub async fn assign(&self, chain: &ChainFixture, signer: &str) -> anyhow::Result<String> {
-        let assigned = decdn_ok(
+        let assigned = self.pool_assign(chain, signer, &[]).await?;
+        assigned
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("dcap1:"))
+            .map(str::to_owned)
+            .with_context(|| format!("the dcap1: token in `pool assign` output for {signer}"))
+    }
+
+    /// The `PUT /_capability` body that registers a capability this owner
+    /// issues `signer`, as `decdn pool assign` prints it: scoped to
+    /// `namespaces`, or for any content when `namespaces` is empty.
+    ///
+    /// # Errors
+    ///
+    /// `decdn pool assign` fails or prints no registration body.
+    pub async fn registration(
+        &self,
+        chain: &ChainFixture,
+        signer: &str,
+        namespaces: &[u64],
+    ) -> anyhow::Result<String> {
+        let scope = if namespaces.is_empty() {
+            vec!["--any-namespace".to_owned()]
+        } else {
+            namespaces
+                .iter()
+                .flat_map(|ns| ["--namespace".to_owned(), ns.to_string()])
+                .collect()
+        };
+        let assigned = self.pool_assign(chain, signer, &scope).await?;
+        assigned
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with('{'))
+            .map(str::to_owned)
+            .with_context(|| format!("the registration body in `pool assign` output for {signer}"))
+    }
+
+    /// `decdn pool assign` from this owner's pool to `signer`, with `extra`
+    /// flags: its stdout.
+    async fn pool_assign(
+        &self,
+        chain: &ChainFixture,
+        signer: &str,
+        extra: &[String],
+    ) -> anyhow::Result<String> {
+        decdn_ok(
             self.dir.path(),
             &[
                 strs(&[
@@ -104,18 +151,13 @@ impl PoolOwner {
                     "--expiry-secs",
                     "3600",
                 ]),
+                extra.to_vec(),
                 chain_flags(chain),
                 owner_flags(&self.keystore, self.dir.path()),
             ]
             .concat(),
         )
-        .await?;
-        assigned
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("dcap1:"))
-            .map(str::to_owned)
-            .with_context(|| format!("the dcap1: token in `pool assign` output for {signer}"))
+        .await
     }
 
     /// The owner's own `decdn get` of `hash`, retried until the node serves
@@ -163,8 +205,9 @@ impl PoolOwner {
 /// Register a capability from `owner`'s pool on the gateway at `base`, as an
 /// operator's controller does: read the pending key from `GET /_delegate`
 /// once the gateway answers, have `owner` issue it a capability, and
-/// `PUT /_capability`. Every request carries `host` as its `Host`. Returns
-/// the key the capability claimed.
+/// `PUT /_capability`. The capability pays for the content of `namespaces`,
+/// or for any content when `namespaces` is empty. Every request carries
+/// `host` as its `Host`. Returns the key the capability claimed.
 ///
 /// # Errors
 ///
@@ -176,6 +219,7 @@ pub async fn register_capability(
     host: &str,
     chain: &ChainFixture,
     owner: &PoolOwner,
+    namespaces: &[u64],
 ) -> anyhow::Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let pending = loop {
@@ -200,11 +244,12 @@ pub async fn register_capability(
         .and_then(serde_json::Value::as_str)
         .context("the pending key's address")?
         .to_owned();
-    let capability = owner.assign(chain, &delegate).await?;
+    let body = owner.registration(chain, &delegate, namespaces).await?;
     let registered = http
         .put(format!("{base}/_capability"))
         .header("host", host)
-        .json(&serde_json::json!({ "capability": capability }))
+        .header("content-type", "application/json")
+        .body(body)
         .send()
         .await
         .context("register the capability")?;

@@ -629,7 +629,7 @@ async fn public<S: Suite>(suite: &S) -> anyhow::Result<()> {
     let base = format!("http://{listen}");
     let http = http_client()?;
     still_running(&mut gateway, "start-up")?;
-    register_capability(&http, &base, DOMAIN, &chain, &owner).await?;
+    register_capability(&http, &base, DOMAIN, &chain, &owner, &[]).await?;
     // The capability's first pull opens its lanes: the suite starts once a
     // pull has gone through.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);

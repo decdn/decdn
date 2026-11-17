@@ -230,15 +230,55 @@ fn own(host: &str) -> bool {
     host == "localhost:8484" || host == "abc.localhost:8484"
 }
 
+fn browser_gate(
+    headers: &HeaderMap,
+    own: impl Fn(&str) -> bool,
+) -> Result<(), (StatusCode, &'static str)> {
+    super::browser_gate(&Method::GET, headers, own)
+}
+
 #[test]
 fn the_browser_gate_refuses_another_site() {
-    let refused = headers(&[("sec-fetch-site", "cross-site"), ("user-agent", "curl/8.0")]);
+    for refused in [
+        headers(&[("sec-fetch-site", "cross-site"), ("user-agent", "curl/8.0")]),
+        headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "iframe"),
+        ]),
+        headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-dest", "image"),
+        ]),
+    ] {
+        assert_eq!(
+            browser_gate(&refused, own).unwrap_err(),
+            (
+                StatusCode::FORBIDDEN,
+                "a page on another site may not use the gateway\n"
+            ),
+            "{refused:?}"
+        );
+    }
+}
+
+#[test]
+fn the_browser_gate_passes_a_top_level_get_navigation_from_anywhere() {
+    let navigation = headers(&[
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+        ("user-agent", "Mozilla/5.0 (X11)"),
+    ]);
+    assert!(super::browser_gate(&Method::GET, &navigation, own).is_ok());
+    let mut form = navigation.clone();
+    form.insert("origin", "http://evil.test".parse().unwrap());
     assert_eq!(
-        browser_gate(&refused, own).unwrap_err(),
-        (
-            StatusCode::FORBIDDEN,
-            "a page on another site may not use the gateway\n"
-        )
+        super::browser_gate(&Method::POST, &form, own)
+            .unwrap_err()
+            .0,
+        StatusCode::FORBIDDEN
     );
 }
 

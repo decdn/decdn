@@ -6,9 +6,9 @@
 //! capability claimed holds at most one capability per pool. A capability is
 //! scoped to a list of namespaces, or unscoped. The gateway pays with the
 //! capabilities in the order they were registered ([`Delegates::paying`]):
-//! for a request a namespace pointer serves, the capabilities scoped to that
-//! namespace first, then the unscoped ones; for any other request, the
-//! unscoped ones alone. It skips one a funding stop retired
+//! for a request of a namespace, the capabilities scoped to that namespace
+//! first, then the unscoped ones; for any other request, the unscoped ones
+//! alone. The gateway decides which namespace a request is of. It skips one a funding stop retired
 //! ([`Delegates::retire`]) and one inside the expiry margin nodes apply.
 
 use std::collections::HashMap;

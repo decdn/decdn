@@ -324,9 +324,9 @@ async fn the_pending_key_answers_anyone_until_a_capability_claims_it() {
     assert_eq!(pending_address(&gateway).await, next);
 }
 
-/// `PUT /_capability` with `grant`: the status and the body.
+/// `PUT /_capability` with `grant` for any request: the status and the body.
 async fn put_capability(gateway: &Arc<Gateway>, grant: &CapabilityGrant) -> (StatusCode, String) {
-    let body = serde_json::json!({ "capability": grant.to_token() }).to_string();
+    let body = serde_json::json!({ "capability": grant.to_token(), "scope": "any" }).to_string();
     let (status, _, body) = exchange(gateway, Method::PUT, "/_capability", &[], &body).await;
     (status, body)
 }
@@ -339,17 +339,32 @@ async fn a_capability_that_cannot_register_is_refused_before_the_chain_is_read()
     let far = now_secs() + 86_400;
     let pending = pending_address(&gateway).await;
 
-    let scoped =
-        serde_json::json!({ "capability": grant(pending, 1, far).to_token(), "scope": "*" });
-    let (status, _, body) = exchange(
-        &gateway,
-        Method::PUT,
-        "/_capability",
-        &[],
-        &scoped.to_string(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let token = grant(pending, 1, far).to_token();
+    for (body, why) in [
+        (
+            serde_json::json!({ "capability": token }),
+            "missing field `scope`",
+        ),
+        (
+            serde_json::json!({ "capability": token, "scope": "*" }),
+            "a scope is \"any\"",
+        ),
+        (
+            serde_json::json!({ "capability": token, "scope": "all" }),
+            "a scope is \"any\"",
+        ),
+    ] {
+        let (status, _, answer) = exchange(
+            &gateway,
+            Method::PUT,
+            "/_capability",
+            &[],
+            &body.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}: {answer}");
+        assert!(answer.contains(why), "{body}: {answer}");
+    }
 
     let mut zero = grant(pending, 1, far);
     zero.spending_cap = 0;
@@ -3843,6 +3858,59 @@ async fn a_scoped_capability_pays_only_on_its_namespace_host() {
             refused.body
         );
     }
+}
+
+/// On a loopback gateway, the namespace a request's `decdn:` URI names
+/// selects a capability scoped to it: `?ns=` on the bare host. A request that
+/// names another namespace, or none, finds nothing that can pay.
+#[tokio::test]
+async fn a_loopback_scoped_capability_pays_for_the_namespace_its_uri_names() {
+    let (gateway, _) = site_gateway().await;
+    {
+        let mut delegates = gateway.delegates();
+        for (pool, signer) in delegates.lanes() {
+            delegates.retire(signer, pool);
+        }
+        let signer = delegates.pending();
+        delegates
+            .register(grant(signer, 1, u64::MAX), Some(vec![7]))
+            .unwrap();
+    }
+    let other = alloy::hex::encode(OTHER);
+    let served = request(&gateway, "127.0.0.1:8484", &format!("/{other}?ns=7"), &[]).await;
+    assert_eq!(
+        (served.status, served.body.as_str()),
+        (StatusCode::OK, "other bytes")
+    );
+    for path in [format!("/{other}?ns=8"), format!("/{other}")] {
+        let refused = request(&gateway, "127.0.0.1:8484", &path, &[]).await;
+        assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED, "{path}");
+    }
+}
+
+/// A link on another site opens content on a loopback gateway: a top-level
+/// navigation passes the browser gate from anywhere.
+#[tokio::test]
+async fn a_link_on_another_site_opens_loopback_content() {
+    let (gateway, _) = site_gateway().await;
+    let other = alloy::hex::encode(OTHER);
+    let navigation = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+        ("user-agent", "Mozilla/5.0 (X11; Linux x86_64)"),
+    ];
+    let opened = request(
+        &gateway,
+        "127.0.0.1:8484",
+        &format!("/{other}"),
+        &navigation,
+    )
+    .await;
+    assert_eq!(
+        (opened.status, opened.body.as_str()),
+        (StatusCode::OK, "other bytes")
+    );
 }
 
 /// A capability signed by a pool owner, issued to the gateway's pending key.

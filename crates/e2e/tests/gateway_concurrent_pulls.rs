@@ -204,7 +204,7 @@ async fn run() -> anyhow::Result<()> {
         .context("the dcap1: token in `pool assign` output")?;
     let registered = http
         .put(format!("{base}/_capability"))
-        .json(&serde_json::json!({ "capability": capability }))
+        .json(&serde_json::json!({ "capability": capability, "scope": "any" }))
         .send()
         .await?;
     anyhow::ensure!(

@@ -187,7 +187,7 @@ async fn run() -> anyhow::Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     wait_for_gateway(&http, &base).await?;
-    let delegate = register_capability(&http, &base, DOMAIN, &chain, &owner).await?;
+    let delegate = register_capability(&http, &base, DOMAIN, &chain, &owner, &[]).await?;
     let served_before = node.scrape_metric(SERVED).await?;
     let get = |host: &str, path: &str| {
         let request = http.get(format!("{base}{path}")).header("host", host);
@@ -688,7 +688,7 @@ async fn run_cached() -> anyhow::Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     wait_for_gateway(&http, &base).await?;
-    register_capability(&http, &base, DOMAIN, &chain, &owner).await?;
+    register_capability(&http, &base, DOMAIN, &chain, &owner, &[]).await?;
     let get = |range: Option<&str>| {
         let mut request = http.get(format!("{base}{path}")).header("host", DOMAIN);
         if let Some(range) = range {

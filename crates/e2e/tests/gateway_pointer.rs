@@ -3,13 +3,16 @@
 //! Shape: a node serves a 2 MiB blob and a bundle manifest naming it, a
 //! publisher creates a namespace on-chain, and a public gateway pinned to the
 //! node runs as a subprocess, paying with a capability a pool owner
-//! registers to its pending key.
+//! registers to its pending key, scoped to the namespace
+//! (`decdn pool assign --namespace`).
 //!
+//!   0. Before a pointer, the scoped capability pays for nothing.
 //!   1. `decdn publish point <ns> decdn:<manifest>/ --gateway …` signs a
 //!      pointer with the publisher's keystore; the gateway verifies it against
 //!      `PublisherRegistry.ownerOf` and stores it.
-//!   2. `Host: <ns>.decdn.test` serves the entry byte-exact.
-//!   3. The bundle's own site serves the same entry.
+//!   2. `Host: <ns>.decdn.test` serves the entry byte-exact, paid by the
+//!      scoped capability.
+//!   3. The bundle's own site serves the same entry from the cache.
 //!   4. The same `seq` again is `409`; a pointer signed by a key that does not
 //!      own the namespace is `403`.
 //!
@@ -181,7 +184,8 @@ async fn run() -> anyhow::Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     wait_for_gateway(&http, &base).await?;
-    register_capability(&http, &base, DOMAIN, &chain, &owner).await?;
+    // The pool owner funds this namespace's content only.
+    register_capability(&http, &base, DOMAIN, &chain, &owner, &[namespace]).await?;
     let get = |host: &str, path: &str| {
         let request = http.get(format!("{base}{path}")).header("host", host);
         async move {
@@ -194,11 +198,17 @@ async fn run() -> anyhow::Result<()> {
     };
     let ns_host = format!("{namespace}.{DOMAIN}");
 
-    // ---- (0) Before the pointer, the namespace host is not found ----
+    // ---- (0) Before the pointer, the namespace host is not found, and the
+    // scoped capability pays for nothing on the bare host ----
     let (status, _, _) = get(&ns_host, "/a.bin").await?;
     anyhow::ensure!(
         status == StatusCode::NOT_FOUND,
         "before the pointer: {status}"
+    );
+    let (status, _, _) = get(DOMAIN, &format!("/{hash_a_hex}")).await?;
+    anyhow::ensure!(
+        status == StatusCode::SERVICE_UNAVAILABLE,
+        "a blob on the bare host, which the scoped capability does not pay for: {status}"
     );
 
     // ---- (1) `decdn publish point` stores the pointer ----
@@ -262,7 +272,8 @@ async fn run() -> anyhow::Result<()> {
         got.len()
     );
 
-    // ---- (3) The bundle's own site serves the same entry ----
+    // ---- (3) The bundle's own site serves the same entry, from the cache
+    // the namespace host's pull filled ----
     let (status, headers, _) = get(DOMAIN, &format!("/{hash_manifest}/a.bin")).await?;
     anyhow::ensure!(
         status == StatusCode::FOUND,

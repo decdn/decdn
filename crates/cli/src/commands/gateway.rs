@@ -30,7 +30,9 @@
 //! address until a capability claims the key. `PUT /_capability` takes a
 //! `dcap1:` capability issued to a key the gateway holds, and its owner
 //! signature must recover the on-chain owner of its pool on the gateway's
-//! deployment. A key holds at most one capability per pool: a key the
+//! deployment. It also takes the capability's scope, always stated: `"any"`
+//! pays for any request, and a namespace scope its pool owner signs pays
+//! only for those namespaces' content (`scope`). A key holds at most one capability per pool: a key the
 //! gateway does not hold, or a second capability from one pool, answers 409.
 //! A zero cap, or an expiry already inside the expiry margin nodes apply
 //! ([`EXPIRY_MARGIN_SECS`]), is refused before the chain is read.
@@ -46,13 +48,15 @@
 //! only: a restart drops every one, and the operator provisions them again.
 //!
 //! **Boundaries.** A loopback gateway takes no token. Every request passes
-//! a browser-header check instead (`site::browser_gate`): a page on another
-//! site (`Sec-Fetch-Site: cross-site`), a page whose `Origin` is none of the
-//! gateway's own origins, and a browser that sends no `Sec-Fetch-Site` (one
-//! with an `Origin`, or a `User-Agent` that starts `Mozilla/`) get 403. A
-//! client outside a browser sends none of these and passes, so no page the
-//! user visits can make the gateway pay. It answers nothing cross-origin, so
-//! a page reads no response. The gateway listens on loopback only and checks
+//! a browser-header check instead (`site::browser_gate`). A top-level `GET`
+//! navigation passes from anywhere, so a link on any page opens content.
+//! Every other request from a page on another site (`Sec-Fetch-Site:
+//! cross-site`), from a page whose `Origin` is none of the gateway's own
+//! origins, or from a browser that sends no `Sec-Fetch-Site` (one with an
+//! `Origin`, or a `User-Agent` that starts `Mozilla/`) gets 403. A client
+//! outside a browser sends none of these and passes. So another page can
+//! make the gateway pay only for content the browser opens as a whole page.
+//! It answers nothing cross-origin, so a page reads no response. The gateway listens on loopback only and checks
 //! `Host` against DNS rebinding: it answers its own loopback names and
 //! well-formed site names on its port, nothing else.
 //!
@@ -200,7 +204,7 @@ use delegates::{Capability, Delegates};
 use metrics::Metrics;
 use pointer::{Pointers, SetError, SignedPointer, pointer_domain};
 use rewrite::Rewrite;
-use scope::{SignedScope, scope_domain};
+use scope::{Scope, SignedScope, scope_domain};
 use site::{Route, Site, SiteDomain};
 use worker::{FetchBackend, Job, PullWorker};
 
@@ -719,10 +723,9 @@ fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Resu
 struct RegisterRequest {
     /// The `dcap1:` capability.
     capability: String,
-    /// The pool owner's scope: the namespaces the capability pays for. A
-    /// capability with none pays for any request.
-    #[serde(default)]
-    scope: Option<SignedScope>,
+    /// What the capability pays for: `"any"`, or the pool owner's signed
+    /// namespace scope.
+    scope: Scope,
 }
 
 struct Gateway {
@@ -1107,7 +1110,7 @@ impl Gateway {
             return text(StatusCode::FORBIDDEN, "unknown Host\n");
         }
         if !self.public()
-            && let Err((status, why)) = site::browser_gate(req.headers(), |origin| {
+            && let Err((status, why)) = site::browser_gate(req.method(), req.headers(), |origin| {
                 self.hosts.iter().any(|own| own == origin) || self.sites.route(origin).is_some()
             })
         {
@@ -1457,12 +1460,15 @@ impl Gateway {
             Err(e) => {
                 return text(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    &format!("expected {{\"capability\", \"scope\"?}}: {e}\n"),
+                    &format!("expected {{\"capability\", \"scope\"}}: {e}\n"),
                 );
             }
         };
-        if request
-            .scope
+        let signed_scope = match request.scope {
+            Scope::Any => None,
+            Scope::Namespaces(scope) => Some(scope),
+        };
+        if signed_scope
             .as_ref()
             .is_some_and(|scope| scope.namespaces.is_empty())
         {
@@ -1493,10 +1499,10 @@ impl Gateway {
         if let Err(refusal) = self.delegates().admits(&grant) {
             return text(StatusCode::CONFLICT, refusal.text());
         }
-        if let Err((status, e)) = self.verify_owner(&grant, request.scope.as_ref()).await {
+        if let Err((status, e)) = self.verify_owner(&grant, signed_scope.as_ref()).await {
             return text(status, &e);
         }
-        let namespaces = request.scope.map(|scope| scope.namespaces);
+        let namespaces = signed_scope.map(|scope| scope.namespaces);
         let mut response = serde_json::json!({
             "expiry": grant.expiry,
             "pool": grant.pool_id.to_string(),
@@ -1602,13 +1608,13 @@ impl Gateway {
         Ok(owner)
     }
 
-    /// The capability the next pull pays with, for a request the pointer of
-    /// namespace `pointer` serves or, with `None`, for any other request: the
-    /// first one the gateway holds that can pay ([`Delegates::paying`]), or
-    /// `None`.
-    fn paying(&self, pointer: Option<u64>) -> Option<Credential> {
+    /// The capability the next pull pays with, for a request of `namespace`
+    /// (as [`Self::paid`] selects it) or, with `None`, for any other
+    /// request: the first one the gateway holds that can pay
+    /// ([`Delegates::paying`]), or `None`.
+    fn paying(&self, namespace: Option<u64>) -> Option<Credential> {
         self.delegates()
-            .paying(now_secs(), EXPIRY_MARGIN_SECS, pointer)
+            .paying(now_secs(), EXPIRY_MARGIN_SECS, namespace)
     }
 
     /// Retire the capability `credential` pays with after a funding stop. It
@@ -1639,9 +1645,12 @@ impl Gateway {
             .await
     }
 
-    /// Serve `uri` as `present` says, paid by [`Self::paying`] for a request
-    /// the pointer of namespace `pointer` serves, or for any other request
-    /// with `None`.
+    /// Serve `uri` as `present` says, paid by [`Self::paying`]. On a public
+    /// gateway, a capability scoped to a namespace pays only for a request
+    /// the pointer of namespace `pointer` serves (`None` for any other
+    /// request). A loopback gateway answers only the user's own clients, so
+    /// there the namespace `uri` names (`?ns=`, or a site's label) selects
+    /// it.
     async fn paid(
         self: &Arc<Self>,
         pointer: Option<u64>,
@@ -1649,12 +1658,17 @@ impl Gateway {
         present: Present,
         ask: Ask<'_>,
     ) -> Response<Body> {
+        let namespace = if self.public() {
+            pointer
+        } else {
+            uri.namespace
+        };
         // A funding stop retires the capability and the next one takes the
         // request, so a capability that cannot pay costs a retry, never a
         // failed load. Each pass retires one, so the loop ends. With nothing
         // left that can pay, a response the cache holds whole is still served.
         loop {
-            let Some(paying) = self.paying(pointer) else {
+            let Some(paying) = self.paying(namespace) else {
                 if let Some(response) = self.cached_only(uri, present, ask).await {
                     return response;
                 }

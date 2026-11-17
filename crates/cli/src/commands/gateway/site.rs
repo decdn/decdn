@@ -24,7 +24,7 @@
 use std::net::SocketAddr;
 
 use data_encoding::BASE32_NOPAD;
-use hyper::{HeaderMap, StatusCode};
+use hyper::{HeaderMap, Method, StatusCode};
 use url::Url;
 
 /// A `<hash32>` label's length.
@@ -173,17 +173,28 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// Whether a request may use a loopback gateway, from its browser headers:
-/// no page on another site (`Sec-Fetch-Site: cross-site`), no page whose
-/// `Origin` is not one of the gateway's own (`own` says which are), and no
-/// browser that sends no `Sec-Fetch-Site` (one with an `Origin`, or a
-/// `User-Agent` that starts `Mozilla/`). A client outside a browser sends
-/// none of these and passes, so no page the user visits can make the
-/// gateway pay, and the gateway needs no token.
+/// Whether a request may use a loopback gateway, from its method and its
+/// browser headers. A top-level `GET` navigation passes from anywhere
+/// (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`), so a link on
+/// any page opens content on the gateway. Every other request passes only
+/// when it comes from no page on another site (`Sec-Fetch-Site:
+/// cross-site`), from no page whose `Origin` is not one of the gateway's own
+/// (`own` says which are), and from no browser that sends no
+/// `Sec-Fetch-Site` (one with an `Origin`, or a `User-Agent` that starts
+/// `Mozilla/`). A client outside a browser sends none of these and passes.
+/// So another page can make the gateway pay only for content the user's
+/// browser opens as a whole page, and reads no response, and the gateway
+/// needs no token.
 pub(super) fn browser_gate(
+    method: &Method,
     headers: &HeaderMap,
     own: impl Fn(&str) -> bool,
 ) -> Result<(), (StatusCode, &'static str)> {
+    let top_level = header(headers, "sec-fetch-mode") == Some("navigate")
+        && header(headers, "sec-fetch-dest") == Some("document");
+    if top_level && method == Method::GET {
+        return Ok(());
+    }
     let fetch_site = header(headers, "sec-fetch-site");
     if fetch_site == Some("cross-site") {
         return Err((

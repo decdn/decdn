@@ -52,6 +52,24 @@ fn a_malformed_signature_is_refused() {
 }
 
 #[test]
+fn a_registration_scope_is_any_or_a_signed_scope() {
+    assert_eq!(
+        serde_json::from_str::<Scope>(r#""any""#).unwrap(),
+        Scope::Any
+    );
+    let signed: Scope = serde_json::from_str(r#"{"namespaces":[7],"signature":"0x01"}"#).unwrap();
+    assert!(matches!(signed, Scope::Namespaces(ref s) if s.namespaces == [7]));
+    for refused in [r#""all""#, r#""*""#, "null", "[]", r#"{"namespaces":[7]}"#] {
+        assert!(serde_json::from_str::<Scope>(refused).is_err(), "{refused}");
+    }
+    assert_eq!(serde_json::to_string(&Scope::Any).unwrap(), r#""any""#);
+    assert_eq!(
+        serde_json::to_value(&signed).unwrap(),
+        serde_json::json!({"namespaces": [7], "signature": "0x01"})
+    );
+}
+
+#[test]
 fn a_scope_reads_its_json_shape() {
     let scope: SignedScope =
         serde_json::from_str(r#"{"namespaces":[7,9],"signature":"0x01"}"#).unwrap();

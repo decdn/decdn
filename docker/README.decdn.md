@@ -47,21 +47,11 @@ docker run -d --name decdn-gateway -p 127.0.0.1:8080:8080 \
 ```
 
 Fund it from the pool owner's machine: read the gateway's pending key, issue it a
-capability, and register that:
+capability scoped to your namespaces, and register that. `--namespace` (repeatable) signs
+the scope with the pool owner's key and prints the whole request body:
 
 ```bash
 KEY=$(curl -s https://decdn.link/_delegate | jq -r .address)
-CAP=$(decdn pool assign --pool <pool-id> --signer "$KEY" --cap-micro-usdc 5000000 \
-  --expiry-secs 86400 | grep '^dcap1:')
-curl -X PUT https://decdn.link/_capability -H 'content-type: application/json' \
-  -d "{\"capability\": \"$CAP\"}"
-```
-
-To pay only for your own content on a shared gateway, scope the capability to your
-namespaces. `--namespace` (repeatable) signs the scope with the pool owner's key and
-prints the whole request body:
-
-```bash
 BODY=$(decdn pool assign --pool <pool-id> --signer "$KEY" --cap-micro-usdc 5000000 \
   --expiry-secs 86400 --namespace 7 | grep '^{')
 curl -X PUT https://decdn.link/_capability -H 'content-type: application/json' -d "$BODY"
@@ -69,6 +59,8 @@ curl -X PUT https://decdn.link/_capability -H 'content-type: application/json' -
 
 A scoped capability pays only for requests on `<namespace>.decdn.link` for the bundle that
 your signed pointer names. The gateway cache serves repeated requests with no new spend.
+Every registration states its scope. To fund any content anyone asks this gateway for, use
+`--any-namespace` instead, which registers the capability with `"scope": "any"`.
 
 `GET /_capability` and `GET /_status` show each capability's cap, expiry and spend.
 Register the next capability before the current one runs low or nears its expiry: the

@@ -32,17 +32,19 @@ key yet. `GET /_delegate` returns the address of the pending key, and makes
 the key when there is none. Thus two calls return the same address until a
 capability claims the key. The next call then makes a new pending key.
 
-`PUT /_capability` takes `{"capability": "dcap1:…", "scope": {…}}`. The
-`scope` is optional. The capability names a key that the gateway holds. Its
-owner signature must recover the on-chain owner of its pool on the gateway's
-deployment. A key holds at most one capability per pool. The gateway
-answers:
+`PUT /_capability` takes `{"capability": "dcap1:…", "scope": …}`. The
+`scope` is required. It is `"any"` for a capability that pays for any
+content, or a signed [namespace scope](#scope). Thus a capability pays for
+any content only when its registrant says so. The capability names a key
+that the gateway holds. Its owner signature must recover the on-chain owner
+of its pool on the gateway's deployment. A key holds at most one capability
+per pool. The gateway answers:
 
 | Status | When |
 |--------|------|
 | 201 | The capability is registered. The body names `expiry`, `pool` and `signer`, and `namespaces` for a scoped capability. |
 | 409 | The gateway does not hold the key, or the key holds a capability from this pool. |
-| 422 | The body is not `{"capability", "scope"?}`, the scope names no namespace, the cap is zero, the expiry is inside the expiry margin, or a signature does not recover the pool's owner. |
+| 422 | The body is not `{"capability", "scope"}`, the scope is not `"any"` or a namespace scope, the scope names no namespace, the cap is zero, the expiry is inside the expiry margin, or a signature does not recover the pool's owner. |
 | 502 | The pool could not be read on-chain. |
 
 The gateway makes all checks that need no chain read before it reads the
@@ -88,21 +90,25 @@ the capability, so a scope does not move to another capability. The scope
 signature must recover the pool's on-chain owner. `PUT /_capability` carries
 it as `"scope": {"namespaces": [7, 9], "signature": "0x…"}`.
 `decdn pool assign --namespace <id>` signs one, and prints the whole
-`PUT /_capability` body.
+`PUT /_capability` body. `decdn pool assign --any-namespace` prints the body
+with `"scope": "any"`.
 
-A scoped capability pays only for a request that a namespace pointer serves:
-a request on `<ns>.<host>` for the bundle that the pointer names, with `ns`
-in the scope. The namespace's owner signs the pointer. Thus another client
-can make the capability pay only for content that the owner chose to serve.
-A request names a namespace in two more ways: a `?ns=` query and a
-`<ns>.<hash32>.` label. Anyone can write these, so they select no scoped
-capability.
+On a public gateway, a scoped capability pays only for a request that a
+namespace pointer serves: a request on `<ns>.<host>` for the bundle that the
+pointer names, with `ns` in the scope. The namespace's owner signs the
+pointer. Thus another client can make the capability pay only for content
+that the owner chose to serve. A request names a namespace in two more ways:
+a `?ns=` query and a `<ns>.<hash32>.` label. Anyone can write these, so on a
+public gateway they select no scoped capability.
 
-For a request that a pointer serves, the gateway pays with a capability
-scoped to that namespace first, and then with an unscoped one. For every
-other request, it pays with an unscoped capability. An unscoped capability
-pays for any request. A request can make a scoped capability pay only for
-its own namespace's content. The gateway cache serves a repeated request
+A loopback gateway holds no pointers. Only the clients of the user and the
+pages that the [browser check](#cross-origin-reads) lets through reach it. There, the
+namespace that a request's `decdn:` URI names (`?ns=`, or the site label)
+selects a scoped capability.
+
+For a request of a namespace, the gateway pays with a capability scoped to
+that namespace first, and then with an `"any"` capability. For every other
+request, it pays with an `"any"` capability. The gateway cache serves a repeated request
 with no pull, so repeated requests spend no more of the cap.
 
 The scope controls which content a capability pays for. It does not control
@@ -301,8 +307,12 @@ path of a site or namespace host answers 404.
 A site page has the policy `connect-src 'self'`. A page on another origin can
 read a site. A site page cannot read another origin.
 
-A loopback gateway takes no token. It checks the browser headers of every
-request, on every route, after the `Host` check:
+A loopback gateway takes no token. It checks the method and the browser
+headers of every request, on every route, after the `Host` check. A
+top-level `GET` navigation (`Sec-Fetch-Mode: navigate` and
+`Sec-Fetch-Dest: document`) passes from any site, so a link on any page
+opens content on the gateway. The gateway refuses every other request that
+matches a row:
 
 | Request | Answer |
 |---------|--------|
@@ -312,8 +322,9 @@ request, on every route, after the `Host` check:
 
 A client outside a browser (the SDKs, the CLI, `curl`) sends none of these
 headers, and the gateway serves it. A browser sends them, and a page script
-cannot change them. Thus no page that the user visits can make the gateway
-pay. A browser that sends no `Sec-Fetch-Site` is refused. On a site origin,
+cannot change them. Thus a page that the user visits can make the gateway
+pay only for content that the browser opens as a whole page, and the page
+reads no answer. A browser that sends no `Sec-Fetch-Site` is refused. On a site origin,
 a request from a page also must be the site's own (`same-origin`), the
 user's (`none`), or a top-level navigation. On the bare host, a browser's
 navigation (`Sec-Fetch-Mode: navigate`) to a bundle or an entry redirects to
