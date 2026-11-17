@@ -370,7 +370,8 @@ pub(crate) type Sample = (PublicKey, f64, u64);
 /// One asked candidate, verified and classified ([`classify_open`],
 /// [`classify_probe`]).
 pub(crate) enum OpenOutcome {
-    /// A verified answer that serves the span, with its peer-store sample.
+    /// A verified answer that serves the span, or a signed `NotFound` with
+    /// the blocks a partial holder holds, with its peer-store sample.
     Holder(discovery::Probed, Sample),
     /// A verified answer that does not hold the blob (a signed `NotFound`),
     /// with its peer-store sample: a proxy-warming or pull-through candidate.
@@ -798,9 +799,12 @@ pub(crate) async fn open_candidate(
 /// before `res` holds it (ADR 014 §1); a verification fault is
 /// [`OpenOutcome::Unverifiable`], requester-local policy with no reputation
 /// effect, because an answer that does not verify attributes nothing to
-/// anyone. A served answer above `max_rate_per_mb` (`0` for no ceiling) is
-/// [`OpenOutcome::OverCeiling`]. Returns the outcome and, for a holder, its
-/// stream, still open; every other stream is cancelled here.
+/// anyone. A signed `NotFound` with a non-empty coverage is a partial holder
+/// of those blocks, with no stream; with an empty one, a non-holder. A holder
+/// above `max_rate_per_mb` (`0` for no ceiling) is
+/// [`OpenOutcome::OverCeiling`]. Returns the outcome and, for a holder that
+/// serves the span, its stream, still open; every other stream is cancelled
+/// here.
 pub(crate) fn classify_open(
     cand: &NodeCandidate,
     res: anyhow::Result<OpenedStream>,
@@ -833,10 +837,28 @@ pub(crate) fn classify_open(
     };
     let rate_per_mb = opened.rate_per_mb();
     let sample = (cand.node_id, rtt_ms, rate_per_mb);
+    let over_ceiling = max_rate_per_mb > 0 && rate_per_mb > max_rate_per_mb;
     if !opened.served() {
         let error = opened.ext().error().cloned();
+        let coverage = opened.coverage().clone();
         opened.cancel();
         return match error {
+            // A partial holder that does not cover the span refuses it with
+            // the blocks it holds: a holder of those blocks, with no stream.
+            // Its lane opens its own ranges with pull-through.
+            Some(decdn_protocol::client::StreamError::NotFound) if !coverage.is_empty() => {
+                if over_ceiling {
+                    return (OpenOutcome::OverCeiling, None);
+                }
+                let holder = discovery::Probed {
+                    candidate: cand.clone(),
+                    rtt_ms,
+                    rate_per_mb,
+                    total_bytes: None,
+                    coverage,
+                };
+                (OpenOutcome::Holder(holder, sample), None)
+            }
             // `Unfunded` speaks of the payer's funding, not the blob: the node
             // is a serve target, and the lane's open meets the refusal again
             // with a funding recovery behind it.
@@ -853,7 +875,7 @@ pub(crate) fn classify_open(
             }
         };
     }
-    if max_rate_per_mb > 0 && rate_per_mb > max_rate_per_mb {
+    if over_ceiling {
         tracing::info!(
             node = %cand.node_id,
             rate_per_mb,
@@ -941,11 +963,14 @@ pub async fn open_and_order(
             (cand.node_id, outcome, opened)
         }
     });
+    // The round settles on a holder that serves the span, whose stream the
+    // fetch can adopt. A partial holder that does not cover the span is an
+    // answer: it opens the cold window, as a non-holder does.
     let (answers, tail) = settle_opens(
         opens,
         round.grace(),
         round.cold_grace(),
-        |(_, outcome, _)| outcome.is_holder(),
+        |(_, _, stream)| stream.is_some(),
         |(_, outcome, _)| outcome.is_answer(),
     )
     .await;

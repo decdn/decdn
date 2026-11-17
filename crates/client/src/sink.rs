@@ -62,6 +62,11 @@ pub struct PullReader {
 }
 
 impl PullReader {
+    /// Let the pull serve a prefix of its range alone ([`UpstreamPull::narrow`]).
+    pub(crate) const fn narrow(&mut self) {
+        self.pull.narrow();
+    }
+
     pub(crate) fn new(pull: UpstreamPull) -> Self {
         Self {
             pull,

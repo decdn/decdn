@@ -1063,14 +1063,15 @@ async fn losers_are_cancelled_with_their_connections_kept() -> anyhow::Result<()
     Ok(())
 }
 
-/// A download with two holders takes the winner's proven size, cancels
-/// both streams and builds no lane, so the drive stripes the blob across
-/// both holders from the start.
+/// A download with two holders adopts the winner's whole-blob stream as its
+/// first leg, with no second open, and resets the other: the drive narrows
+/// the pull to the winner's stripe and plans the other holder's at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_multi_holder_download_takes_the_size_and_cancels_every_stream() -> anyhow::Result<()> {
+async fn a_multi_holder_download_adopts_the_winners_stream() -> anyhow::Result<()> {
+    use crate::SourceProvider as _;
     use crate::opened::fake_node::{Answer, FakeNode, Seen};
 
-    let fx = LaneFixture::delegated(0).await?;
+    let fx = LaneFixture::delegated(1).await?;
     let deps = fx.deps(0)?;
     let sources = fx.sources(&deps);
     let blob = served_blob();
@@ -1079,12 +1080,12 @@ async fn a_multi_holder_download_takes_the_size_and_cancels_every_stream() -> an
         blob: blob.clone(),
         rate,
     };
-    let a = FakeNode::spawn(serve(5), fx.slash_dom.clone()).await?;
-    let b = FakeNode::spawn(serve(9), fx.slash_dom.clone()).await?;
+    let cheap = FakeNode::spawn(serve(5), fx.slash_dom.clone()).await?;
+    let dear = FakeNode::spawn(serve(9), fx.slash_dom.clone()).await?;
     let targets = discover_on(
         &sources,
         &fx,
-        &[&a, &b],
+        &[&dear, &cheap],
         hash,
         crate::targets::OpenRound::Settle,
         super::FirstLeg::Whole,
@@ -1102,26 +1103,76 @@ async fn a_multi_holder_download_takes_the_size_and_cancels_every_stream() -> an
         )
         .await?;
     anyhow::ensure!(claim.total_bytes.get() == u64::try_from(blob.len())?);
-    anyhow::ensure!(claim.holders.len() == 2);
-    eventually("both streams reset", || {
-        Seen::count(&a.seen.resets) == 1 && Seen::count(&b.seen.resets) == 1
+    anyhow::ensure!(claim.holders.len() == 2, "both holders stay for the drive");
+    anyhow::ensure!(Seen::count(&cheap.seen.opens) == 1, "no second open");
+    anyhow::ensure!(
+        Seen::count(&cheap.seen.resets) == 0,
+        "the winner is adopted"
+    );
+    eventually("the loser's stream reset", || {
+        Seen::count(&dear.seen.resets) == 1
     })
     .await?;
+    anyhow::ensure!(
+        sources.built(cheap.operator_address()).is_some(),
+        "the winner's lane is parked with the primed pull"
+    );
     drop(sources);
     fx.ep.close().await;
     Ok(())
 }
 
-/// A streamed fetch always adopts; a download adopts only with one holder.
-#[test]
-fn a_download_adopts_only_a_sole_holders_stream() {
-    let streamed = super::FirstLeg::Streamed {
-        window: (0, 0),
-        read_ahead: 1,
-    };
-    assert!(super::adopts_the_winner(streamed, 3));
-    assert!(super::adopts_the_winner(super::FirstLeg::Whole, 1));
-    assert!(!super::adopts_the_winner(super::FirstLeg::Whole, 2));
+/// A size lookup takes the size the winner's answer proves with no lane and
+/// no open: the chain sees no read, and every stream is reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_size_lookup_takes_the_answers_size_with_no_lane() -> anyhow::Result<()> {
+    use crate::SourceProvider as _;
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+
+    // No lane build: the mocked chain answers no read.
+    let fx = LaneFixture::delegated(0).await?;
+    let deps = fx.deps(0)?;
+    let sources = fx.sources(&deps);
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 5,
+        },
+        fx.slash_dom.clone(),
+    )
+    .await?;
+    let targets = discover_on(
+        &sources,
+        &fx,
+        &[&node],
+        hash,
+        crate::targets::OpenRound::Stream,
+        super::FirstLeg::Size,
+    )
+    .await?;
+    let holders = sources.holders_from(&targets);
+    let health = std::sync::Arc::new(crate::PeerHealth::default());
+    let claim = sources
+        .first_claim(
+            hash,
+            holders,
+            super::FirstLeg::Size,
+            &health,
+            &minute_stop(),
+        )
+        .await?;
+    anyhow::ensure!(claim.total_bytes.get() == u64::try_from(blob.len())?);
+    anyhow::ensure!(
+        sources.built(node.operator_address()).is_none(),
+        "a size lookup builds no lane"
+    );
+    eventually("the stream reset", || Seen::count(&node.seen.resets) == 1).await?;
+    anyhow::ensure!(Seen::count(&node.seen.opens) == 1, "no second open");
+    drop(sources);
+    fx.ep.close().await;
+    Ok(())
 }
 
 /// A late holder joins the running fetch as a probed holder with its

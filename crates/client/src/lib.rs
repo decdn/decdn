@@ -2927,6 +2927,11 @@ impl UpstreamPullHeader {
 /// large transfer or be too loose to catch a dead one. A byte-throughput floor is
 /// indifferent to size and link speed, and frame-size-independent.
 #[doc(hidden)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact of the stream's end: failed, settled, ended, \
+              narrowed"
+)]
 pub struct UpstreamPull {
     conn: iroh::endpoint::Connection,
     /// What this pull owns of its connection: a one-shot dial it closes on its
@@ -2994,6 +2999,9 @@ pub struct UpstreamPull {
     /// When the open returned, so a fresh leg's wait for its first frame is
     /// timed from there ([`log_proof_stall`]).
     opened_at: tokio::time::Instant,
+    /// The pull serves a prefix of its range alone ([`Self::narrow`]):
+    /// [`Self::finish`] stops it instead of draining it.
+    narrowed: bool,
 }
 
 impl std::fmt::Debug for UpstreamPull {
@@ -3228,6 +3236,15 @@ async fn open_progressive_pull_impl(
 }
 
 impl UpstreamPull {
+    /// Serve a prefix of this pull's range alone: a caller that decodes a
+    /// shorter range from the same start reads its encoding from this stream,
+    /// and [`Self::finish`] then stops the pull ([`Self::stop`]) instead of
+    /// draining it to its own end. What the pull paid ahead past the prefix is
+    /// the payer's loss, at most one credit window.
+    pub(crate) const fn narrow(&mut self) {
+        self.narrowed = true;
+    }
+
     /// Wire bytes this stream will deliver: the bao-encoded size of the
     /// chunk-group-aligned range (content plus interleaved proof, ADR 038). The
     /// window serve loop uses it as the pull budget `total` — it must be wire
@@ -3762,6 +3779,9 @@ impl UpstreamPull {
     /// [`PullStalled`] if the upstream goes silent before `StreamEnd`. Any error
     /// but our own [`LocalPullFault`] fails the node's delivery.
     pub async fn finish(mut self) -> anyhow::Result<VoucherProgress> {
+        if self.narrowed {
+            return self.stop().await;
+        }
         let finished = Box::pin(self.finish_inner()).await;
         if let Err(e) = &finished
             && !e.is::<LocalPullFault>()

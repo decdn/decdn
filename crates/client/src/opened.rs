@@ -311,6 +311,7 @@ impl OpenedStream {
             ended: false,
             returned_at: None,
             opened_at: tokio::time::Instant::now(),
+            narrowed: false,
         };
         Ok((header, pull))
     }

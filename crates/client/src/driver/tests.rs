@@ -525,7 +525,7 @@ impl BlobSource for CountedOpens {
 }
 
 /// A pull primed for the next open alone is closed before an open of another
-/// range reaches the wrapped source, so a peer that reserves funds per open
+/// range (one that starts elsewhere) reaches the wrapped source, so a peer that reserves funds per open
 /// stream never holds it beside the leg that replaces it (#2633). A pull
 /// primed with `prime` stays open beside that leg.
 #[tokio::test]
@@ -533,7 +533,7 @@ async fn a_pull_primed_for_the_next_open_closes_before_another_range_opens() {
     let total = 4 * GROUP;
     let (root, plaintext, _) = synth_blob(total as usize);
     let whole = align_range(0, 0, total).expect("align");
-    let window = align_range(0, GROUP, total).expect("align");
+    let window = align_range(GROUP, GROUP, total).expect("align");
     for next_only in [true, false] {
         let (gate, rx) = tokio::sync::watch::channel(true);
         let source = PrimedSource::new(CountedOpens {
@@ -3089,7 +3089,9 @@ async fn streamed_first_leg_is_the_range_a_streamed_drive_opens_first() {
 /// A streamed drive adopts a pull primed at [`super::streamed_first_leg`]
 /// (#2644): on a blob longer than the read-ahead window, the drive's first leg
 /// is the primed pull, so no leg opens offset `0` a second time. A pull primed
-/// at the whole blob is not that leg, and the drive reopens it.
+/// at the whole blob starts where that leg starts, so the drive narrows it to
+/// the leg ([`crate::BlobSource::narrow`]) and opens offset `0` no second time
+/// either.
 #[tokio::test]
 async fn a_streamed_drive_adopts_a_pull_primed_at_its_first_leg() {
     let pacer = crate::streamer::stream_pacer(0);
@@ -3100,7 +3102,7 @@ async fn a_streamed_drive_adopts_a_pull_primed_at_its_first_leg() {
             super::streamed_first_leg(&pacer, (0, 0), 0, total).expect("a leg"),
             1,
         ),
-        (align_range(0, 0, total).expect("align"), 2),
+        (align_range(0, 0, total).expect("align"), 1),
     ] {
         let store = fresh_store(root, total);
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
@@ -3202,5 +3204,56 @@ async fn an_amount_regression_bundle_behind_the_ledger_retires_the_unadopted_cha
         ledger.chain_root(),
         None,
         "the unadopted chain is retired, so the retry opens a fresh one"
+    );
+}
+
+/// A pull primed for a longer range answers an open of a shorter range from
+/// the same start, narrowed: the drive reads the shorter range's encoding as
+/// the pull's prefix and stops the pull at its end, with no second open.
+#[tokio::test]
+async fn a_primed_pull_narrows_to_a_shorter_range_from_its_start() {
+    let total = 4 * GROUP;
+    let (root, plaintext, _) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let primed = PrimedSource::new(
+        ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger)),
+    );
+    let whole = align_range(0, 0, total).expect("align");
+    let (header, reader) = primed
+        .inner()
+        .open(root, whole.clone())
+        .await
+        .expect("priming open");
+    primed.prime_next(root, whole, header, reader, tokio::time::Instant::now());
+    let pacer = BudgetPacer::new();
+    let half = 2 * GROUP;
+    drive(
+        &store,
+        &primed,
+        &pacer,
+        &Arc::new(Mutex::new(healthy_ctx())),
+        &ledger,
+        root,
+        0,
+        half,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("drive");
+    assert_eq!(
+        primed.inner().opened_ranges(),
+        vec![(0, total)],
+        "the primed pull serves the half with no second open"
+    );
+    assert_eq!(primed.inner().stopped_pulls(), 1, "the narrowed pull stops");
+    assert_eq!(
+        store.read(0, half).await.expect("read").as_ref(),
+        plaintext.get(..half as usize).expect("half")
     );
 }

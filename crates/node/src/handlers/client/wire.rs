@@ -89,13 +89,16 @@ impl ClientHandler {
         self.sign_response(body, StreamOutcome::Served(size_proof), coverage)
     }
 
-    /// Sign an `ok: false` refusal of `req` with `error` at `rate_per_mb`. A
-    /// refusal advertises no coverage.
+    /// Sign an `ok: false` refusal of `req` with `error` at `rate_per_mb`,
+    /// advertising `coverage`: no block, or the blocks a partial holder holds
+    /// ([`Self::miss_coverage`]). The coverage never covers the requested
+    /// span, or the payer drops the answer.
     pub(super) fn sign_refusal(
         &self,
         req: &StreamRequest,
         rate_per_mb: u64,
         error: StreamError,
+        coverage: Coverage,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
         let body = StreamResponseBody {
             hash: req.hash,
@@ -103,7 +106,7 @@ impl ClientHandler {
             rate_per_mb,
             timestamp_us: req.timestamp_us,
         };
-        self.sign_response(body, StreamOutcome::Refused(error), Coverage::empty())
+        self.sign_response(body, StreamOutcome::Refused(error), coverage)
     }
 
     /// Sign a `StreamResponse` body and assemble the frozen base plus its
@@ -192,8 +195,23 @@ impl ClientHandler {
         reason: ServeRejectReason,
         rate_per_mb: u64,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
+        self.respond_refusal(send, req, reason, rate_per_mb, Coverage::empty())
+            .await
+    }
+
+    /// [`Self::respond_error`] advertising `coverage` in the refusal: the
+    /// blocks a partial holder holds, on a miss that asks for no
+    /// pull-through.
+    pub(super) async fn respond_refusal(
+        &self,
+        send: &mut SendStream,
+        req: &StreamRequest,
+        reason: ServeRejectReason,
+        rate_per_mb: u64,
+        coverage: Coverage,
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
         let (resp, resp_ext) = self
-            .sign_refusal(req, rate_per_mb, reason.wire_error())
+            .sign_refusal(req, rate_per_mb, reason.wire_error(), coverage)
             .with_context(|| format!("sign the {reason:?} refusal"))?;
         tolerate_departed_peer(
             self.write_stream_response(send, &resp, &resp_ext).await,

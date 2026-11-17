@@ -1250,13 +1250,11 @@ pub(crate) async fn fetch_on(
             alloy::primitives::U256::from(n).to_be_bytes()
         });
     // The drive's first leg: a size lookup's is the blob's first byte, so its
-    // open pays for one chunk group at most. Discovery opens ask for this
-    // span, so the winner's stream is the first leg.
+    // open pays for one chunk group at most, and a size an answer proves
+    // needs no open at all. Discovery opens ask for this span, so the
+    // winner's stream is the first leg.
     let first_leg = if args.size_only {
-        FirstLeg::Streamed {
-            window: (0, 1),
-            read_ahead: 0,
-        }
+        FirstLeg::Size
     } else if streams {
         FirstLeg::Streamed {
             window: args.range.unwrap_or((0, 0)),

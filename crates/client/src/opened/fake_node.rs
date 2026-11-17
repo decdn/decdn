@@ -36,6 +36,14 @@ pub(crate) enum Answer {
         /// The per-MiB rate it signs.
         rate: u64,
     },
+    /// A signed `NotFound` with `coverage`: a partial holder that does not
+    /// cover the span.
+    Partial {
+        /// The blocks the node holds.
+        coverage: Coverage,
+        /// The per-MiB rate it signs.
+        rate: u64,
+    },
     /// `ok` with no coverage: an answer whose coverage disagrees with it.
     Inconsistent {
         /// The blob the node holds.
@@ -214,6 +222,11 @@ async fn answer_stream(
             false,
             rate,
             StreamResponseExt::refused(error, Coverage::empty()),
+        ),
+        Answer::Partial { coverage, rate } => (
+            false,
+            rate,
+            StreamResponseExt::refused(StreamError::NotFound, coverage),
         ),
         Answer::Inconsistent { blob } => (true, 10, served(&blob, false)?),
     };

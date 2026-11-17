@@ -7934,10 +7934,10 @@ impl crate::SourceProvider for KeptLane<'_> {
 
 /// The lane that answered a size open, with a whole-blob pull primed on it,
 /// takes that pull as its first leg although another holder's lane builds at
-/// once. It starts before any build is polled, so the first plan is made for
-/// it alone and gives it the whole blob. Planned beside the other lane, its
-/// first leg is half the blob, the primed pull closes, and the holder serves
-/// the first half twice.
+/// once. The first plan stripes the blob across both lanes, so the kept
+/// lane's leg is its own stripe from the blob's start: the primed pull is
+/// narrowed to it and stops there, with no second open, and the other lane
+/// fetches the rest.
 #[tokio::test]
 async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_once()
 -> anyhow::Result<()> {
@@ -7978,18 +7978,24 @@ async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_o
     store.finalize().await?;
 
     assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    let a_opens = a_probe.opened_ranges();
     assert_eq!(
-        a_probe.opened_ranges(),
-        vec![(0, total)],
-        "the kept lane's first leg adopts the primed pull and opens nothing itself"
+        a_opens.first(),
+        Some(&(0, total)),
+        "the kept lane's first leg adopts the primed pull: {a_opens:?}"
     );
     assert!(
-        b_probe
-            .opened_ranges()
-            .iter()
-            .all(|&(offset, _)| offset > 0),
-        "the other lane never opens the blob's start: {:?}",
-        b_probe.opened_ranges()
+        a_opens.iter().skip(1).all(|&(offset, _)| offset > 0),
+        "the kept lane never opens the blob's start a second time: {a_opens:?}"
+    );
+    assert!(
+        a_probe.stopped_pulls() >= 1,
+        "the narrowed pull stops at the end of its stripe"
+    );
+    let b_opens = b_probe.opened_ranges();
+    assert!(
+        !b_opens.is_empty() && b_opens.iter().all(|&(offset, _)| offset > 0),
+        "the other lane fetches its own stripe, past the blob's start: {b_opens:?}"
     );
     Ok(())
 }
@@ -8010,4 +8016,42 @@ fn whole_blob_coverage_stops_at_the_requested_reach() {
     // A tail runs to the end of the blob, so it covers every block.
     let tail = super::Want::new(&[(0, 0)], 3 * MIB);
     assert_eq!(tail.reach(), 3 * MIB);
+}
+
+/// A partial holder's coverage, as discovery reads it off a `NotFound`
+/// refusal, steers the plan: its lane takes the run it covers, and the full
+/// holder's lane takes the rest.
+#[test]
+fn a_partial_holders_coverage_steers_its_lanes_pick() -> anyhow::Result<()> {
+    let total = 4 * DISCOVERY_BLOCK_BYTES;
+    let partial = Coverage::from_block_indices(4, [0, 1].into_iter());
+    let full = Coverage::full(4);
+    let mut work = super::Work::new(std::collections::VecDeque::new(), [0; 32], false);
+    work.set_coverage_reach(total);
+    let all = decdn_bao_range::align_range(0, 0, total)?
+        .chunk_ranges()
+        .clone();
+    let slots = work.seed(&all, total, &[None, Some(partial.clone())])?;
+    let (Some(&full_slot), Some(&partial_slot)) = (slots.first(), slots.get(1)) else {
+        anyhow::bail!("two slots");
+    };
+    let missing = [(0, total)];
+    let picked = work
+        .pick(partial_slot, total, &partial, true, &missing)?
+        .ok_or_else(|| anyhow::anyhow!("the partial lane takes its run"))?;
+    assert!(!picked.uncovered, "the partial lane takes a run it covers");
+    assert!(
+        picked.range.fetch_end() <= 2 * DISCOVERY_BLOCK_BYTES,
+        "the partial lane's pick stays inside its blocks: {:?}",
+        (picked.range.fetch_start(), picked.range.fetch_len())
+    );
+    let rest = work
+        .pick(full_slot, total, &full, true, &missing)?
+        .ok_or_else(|| anyhow::anyhow!("the full lane takes the rest"))?;
+    assert!(
+        rest.range.fetch_start() >= picked.range.fetch_end()
+            || rest.range.fetch_end() <= picked.range.fetch_start(),
+        "the two picks do not overlap"
+    );
+    Ok(())
 }

@@ -1638,3 +1638,80 @@ fn holders_rank_by_rtt_band_then_quote_then_coverage() {
         "band 0 by quote then coverage, then band 2"
     );
 }
+
+/// A node that holds part of the blob and does not cover the span refuses it
+/// `NotFound` with the blocks it holds: discovery reads it as a holder of
+/// those blocks, with no stream, so the multi-source plan stripes across it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_not_found_with_held_blocks_is_a_partial_holder() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let held = decdn_protocol::Coverage::from_block_indices(4, [0, 1].into_iter());
+    let full = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 4,
+        },
+        open_domain(),
+    )
+    .await?;
+    let partial = FakeNode::spawn(
+        Answer::Partial {
+            coverage: held.clone(),
+            rate: 4,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let (full_cand, partial_cand) = (full.candidate()?, partial.candidate()?);
+    let res = open_candidate(
+        &partial_cand,
+        None,
+        spec(&conns, &ctx, 0),
+        &open_domain(),
+        hash,
+        false,
+    )
+    .await;
+    match classify_open(&partial_cand, res, 0) {
+        (OpenOutcome::Holder(probed, _), None) => {
+            assert_eq!(probed.coverage, held);
+            assert!(probed.total_bytes.is_none(), "a refusal proves no size");
+        }
+        _ => anyhow::bail!("a NotFound with held blocks is a partial holder with no stream"),
+    }
+    let targets = open_and_order(
+        &[full_cand.clone(), partial_cand.clone()],
+        None,
+        hash,
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await?;
+    assert_eq!(targets.candidates.len(), 2, "both holders are ordered");
+    assert_eq!(
+        targets.coverage_by_node.get(&partial_cand.node_id),
+        Some(&held)
+    );
+    assert_eq!(
+        targets.opened.len(),
+        1,
+        "only the serving holder's stream is kept"
+    );
+    let holders =
+        crate::lane_sources::holders_from(&targets, &mut std::collections::HashMap::new());
+    let partial_holder = holders
+        .iter()
+        .find(|h| h.provider == partial_cand.eth_address)
+        .ok_or_else(|| anyhow::anyhow!("the partial holder is a holder"))?;
+    assert!(partial_holder.probed_holder);
+    assert_eq!(partial_holder.coverage.as_ref(), Some(&held));
+    client.close().await;
+    Ok(())
+}

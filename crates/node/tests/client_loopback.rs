@@ -15961,8 +15961,9 @@ async fn admit_span(
 }
 
 /// A partial holder answers an open by the span it is asked for: `ok: true`
-/// with its own blocks for a span it covers, and `NotFound` with no coverage,
-/// at once, for a span it lacks when the request does not pull through.
+/// with its own blocks for a span it covers, and, at once, `NotFound` with the
+/// blocks it holds for a span it lacks when the request does not pull
+/// through: a part of the blob, or the whole blob.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_open_on_a_partial_answers_by_whether_it_covers_the_span() -> anyhow::Result<()> {
     let cache_dir = tempfile::tempdir()?;
@@ -16025,10 +16026,23 @@ async fn an_open_on_a_partial_answers_by_whether_it_covers_the_span() -> anyhow:
         resp_ext.error()
     );
     anyhow::ensure!(
-        resp_ext.coverage.is_empty(),
-        "a refusal advertises no coverage"
+        resp_ext.coverage.covers(0) && !resp_ext.coverage.covers(1),
+        "the refusal advertises the blocks the store holds, got {:?}",
+        resp_ext.coverage
     );
     anyhow::ensure!(resp_ext.consistent_with(&resp.body, block, group));
+
+    // The whole blob, which the partial does not cover, refuses the same way.
+    let (_s3, _r3, resp, resp_ext) =
+        open_and_read_answer(&conn, &whole_blob_request(root), Some(&ext)).await?;
+    anyhow::ensure!(!resp.body.ok);
+    anyhow::ensure!(resp_ext.error() == Some(&StreamError::NotFound));
+    anyhow::ensure!(
+        resp_ext.coverage.covers(0) && !resp_ext.coverage.covers(1),
+        "a whole-blob refusal advertises the held blocks, got {:?}",
+        resp_ext.coverage
+    );
+    anyhow::ensure!(resp_ext.consistent_with(&resp.body, 0, 0));
 
     conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;

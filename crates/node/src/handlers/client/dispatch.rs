@@ -836,13 +836,22 @@ impl ClientHandler {
             }
 
             // A miss whose request does not ask for pull-through answers
-            // `NotFound` at once, with empty coverage and no pool, chain or
-            // upstream work: the requester asked what this node holds, not for
-            // a fill. An own-origin probe fault above is logged and metered
-            // there; it does not change this answer.
+            // `NotFound` at once, with no pool, chain or upstream work: the
+            // requester asked what this node holds, not for a fill. The
+            // refusal advertises the blocks the store holds whole, so a
+            // partial holder that does not cover the span still reads as a
+            // holder of its blocks. An own-origin probe fault above is logged
+            // and metered there; it does not change this answer.
             if !ext.pull_through {
+                let coverage = self.miss_coverage(hash, &req).await;
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::CacheMiss, rate_per_mb)
+                    .respond_refusal(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::CacheMiss,
+                        rate_per_mb,
+                        coverage,
+                    )
                     .await;
             }
 

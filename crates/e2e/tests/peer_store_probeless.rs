@@ -39,11 +39,12 @@
 //!    the transfer or during it.
 //!    The fast path knows no size, so fetch #2 takes its first size claim
 //!    from a whole-blob open whose pull the download adopts as its first leg
-//!    (#2633): the holders write the blob's wire bytes once, not once for
-//!    the claim and again for the download. The lane that answered the open
-//!    starts with no build, before the download polls any other lane's
-//!    build, so the download plans its first leg for that lane alone, and
-//!    that plan gives it the whole blob.
+//!    (#2633): no leg the client opens starts at offset 0. The lane that
+//!    answered the open starts with no build, and the download plans a stripe
+//!    for it and for every lane it builds in the same pass, so the adopted
+//!    pull narrows to that lane's stripe and stops there. The node wrote past
+//!    the stripe what the pull paid ahead, so the holders write the blob's
+//!    wire bytes plus at most one credit window, never the whole blob twice.
 //! 2. **Cross-process persistence.** The two `decdn get` invocations above
 //!    are separate OS processes sharing only `data_dir` on disk — a passing
 //!    fetch #2 that reused the store already demonstrates this, and this
@@ -126,11 +127,6 @@ const SERVED: &str = "decdn_bytes_served_total";
 /// A node's count of `cdn/client/v1` streams that ended before the payer sent
 /// anything after its request: a discovery open the fetch did not adopt.
 const UNCLAIMED: &str = "decdn_serve_stream_unclaimed_total";
-/// What the holders may write past the wire bytes of the pull: a few parent
-/// nodes a later leg repeats. Far below the blob's own wire bytes, which a
-/// stream opened for the size and then dropped unread would cost at this
-/// size.
-const LEG_OVERHEAD_SLACK: u64 = 16 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_store_probeless_second_fetch_and_cross_process_persistence() -> anyhow::Result<()> {
@@ -331,14 +327,27 @@ async fn run() -> anyhow::Result<()> {
         unclaimed == 0,
         "fetch #2 left {unclaimed} stream(s) unclaimed at the holders:\n{log}"
     );
+    // The adopted first leg opens nothing itself: no leg the client opens
+    // starts at the blob's start.
+    let legs: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("opening a paid leg"))
+        .collect();
+    anyhow::ensure!(
+        !legs.iter().any(|line| line.contains("byte_offset=0 ")),
+        "fetch #2 opened offset 0 itself instead of adopting the size open's pull:\n{}",
+        legs.join("\n")
+    );
+    // The narrowed pull stops at its stripe, after the node wrote what it was
+    // paid ahead past it: less than the whole blob a second time.
     let wire = decdn_bao_range::align_range_clamped(0, 0, blob.len() as u64)?.wire_len();
     let served = sum_metric(&holders, SERVED)
         .await?
         .saturating_sub(served_before);
     anyhow::ensure!(
-        (wire..=wire + LEG_OVERHEAD_SLACK).contains(&served),
-        "the holders wrote {served} bytes for a {wire}-byte pull: the first size claim's \
-         stream was not the download's first leg"
+        (wire..2 * wire).contains(&served),
+        "the holders wrote {served} bytes for a {wire}-byte pull: the size open's stream \
+         was not the download's first leg"
     );
 
     // ---- Journey 3: a round-less streamed fetch (#2644) ----

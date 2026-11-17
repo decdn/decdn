@@ -124,6 +124,17 @@ pub trait BlobSource: Send + Sync {
     fn max_blob_size_bytes(&self) -> u64 {
         0
     }
+
+    /// Let `reader`, opened for a range that starts where a shorter range
+    /// starts, serve the shorter range alone: once the decoder has read that
+    /// range, [`Self::finish`] stops the pull as [`Self::stop`] does instead of
+    /// draining it to its own end. The range's encoding is a prefix of the
+    /// longer range's, so the decoder reads it from the same stream. What the
+    /// pull paid ahead past the shorter range's end is lost. `false` when the
+    /// reader cannot, and the caller closes it.
+    fn narrow(&self, _reader: &mut Self::Reader) -> bool {
+        false
+    }
 }
 
 /// The current pool no longer accepts funds, and the funding recovery step
@@ -567,6 +578,11 @@ impl BlobSource for PeerSource<'_> {
     fn max_blob_size_bytes(&self) -> u64 {
         self.max_blob_size_bytes
     }
+
+    fn narrow(&self, reader: &mut Self::Reader) -> bool {
+        reader.narrow();
+        true
+    }
 }
 
 /// How long a primed pull may wait for its adopting open. A pull opened ahead of
@@ -601,10 +617,11 @@ struct Primed<R> {
 /// it. Any other open, and an open that finds the primed pull opened longer than
 /// [`PRIMED_MAX_IDLE`] ago, goes to the wrapped source.
 ///
-/// Adoption is by exact [`AlignedRange`] equality, never by containment: a
-/// pull's [`finish`](BlobSource::finish) drains and pays to its stream end, so a
-/// longer pull in place of a shorter leg would pay for bytes the leg never asked
-/// for. Call [`clear`](Self::clear) once the drive returns, so a pull no open
+/// Adoption is by exact [`AlignedRange`] equality, or by a pull of a longer
+/// range from the same start that the wrapped source narrows to the open's
+/// range ([`BlobSource::narrow`]): a narrowed pull stops at the open's end
+/// instead of draining to its own, so it pays for at most the credit it paid
+/// ahead past that end. A source that cannot narrow adopts by equality alone. Call [`clear`](Self::clear) once the drive returns, so a pull no open
 /// took is closed at once rather than left idle. A pull parked with
 /// [`prime_next`](Self::prime_next) is the next open's alone: an open of another
 /// range closes it before the wrapped source opens, so the peer never holds it
@@ -726,6 +743,25 @@ impl<S: BlobSource> PrimedSource<S> {
         if parked.hash == hash && parked.range == *range {
             return Some((parked.header, parked.reader));
         }
+        // A pull of a longer range from the same start serves the open's
+        // range as its prefix, narrowed to end there.
+        if parked.hash == hash
+            && parked.range.fetch_start() == range.fetch_start()
+            && parked.range.fetch_end() >= range.fetch_end()
+        {
+            let Primed {
+                header, mut reader, ..
+            } = parked;
+            if self.inner.narrow(&mut reader) {
+                tracing::debug!(
+                    byte_offset = range.fetch_start(),
+                    byte_len = range.fetch_len(),
+                    "a primed pull of a longer range is narrowed to the open's range"
+                );
+                return Some((header, reader));
+            }
+            return None;
+        }
         if parked.next_only {
             tracing::debug!("a primed pull the next open did not take is closed");
             return None;
@@ -759,6 +795,10 @@ impl<S: BlobSource> BlobSource for PrimedSource<S> {
 
     fn max_blob_size_bytes(&self) -> u64 {
         self.inner.max_blob_size_bytes()
+    }
+
+    fn narrow(&self, reader: &mut Self::Reader) -> bool {
+        self.inner.narrow(reader)
     }
 }
 
@@ -1344,12 +1384,17 @@ mod doubles {
                         stall_after: self.stall_after,
                         read_so_far: 0,
                         read_delay: self.read_delay,
+                        narrowed: false,
                     },
                 ))
             })
         }
 
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            // A narrowed reader served a prefix of its range: it stops there.
+            if reader.narrowed {
+                return self.stop(reader);
+            }
             Box::pin(async move {
                 // Hold the completed-but-unpaid range open (delivered, `fill_gap`
                 // not yet returned) so a peer can steal it while it is present.
@@ -1372,6 +1417,11 @@ mod doubles {
 
         fn max_blob_size_bytes(&self) -> u64 {
             self.max_blob_size
+        }
+
+        fn narrow(&self, reader: &mut Self::Reader) -> bool {
+            reader.narrowed = true;
+            true
         }
     }
 
@@ -1410,6 +1460,9 @@ mod doubles {
         read_so_far: u64,
         /// See `ScriptedSource::throttled`.
         read_delay: Option<Duration>,
+        /// The reader serves a prefix of its range alone
+        /// ([`BlobSource::narrow`](crate::BlobSource::narrow)): `finish` stops it.
+        narrowed: bool,
     }
 
     impl ScriptedReader {

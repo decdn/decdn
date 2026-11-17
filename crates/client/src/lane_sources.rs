@@ -56,6 +56,22 @@ pub enum FirstLeg {
         /// The streamer's read-ahead ([`crate::PullConfig::read_ahead_bytes`]).
         read_ahead: u64,
     },
+    /// A size lookup: the blob's first byte, read for the size alone. It
+    /// never adopts a discovery stream, and takes a size an answer proved
+    /// with no lane and no open.
+    Size,
+}
+
+impl FirstLeg {
+    /// The streamed window and read-ahead this leg pulls: a size lookup's
+    /// is the first byte with no read-ahead. `None` for a download.
+    const fn streamed(self) -> Option<((u64, u64), u64)> {
+        match self {
+            Self::Whole => None,
+            Self::Streamed { window, read_ahead } => Some((window, read_ahead)),
+            Self::Size => Some(((0, 1), 0)),
+        }
+    }
 }
 
 /// A size no blob reaches, for the leg a streamed size open pulls before it
@@ -113,9 +129,7 @@ pub(crate) fn size_open_span(
     first_leg: FirstLeg,
     max_blob_bytes: u64,
 ) -> Option<AlignedRange> {
-    let FirstLeg::Streamed { window, read_ahead } = first_leg else {
-        return None;
-    };
+    let (window, read_ahead) = first_leg.streamed()?;
     if hash == decdn_protocol::EMPTY_ROOT {
         return None;
     }
@@ -150,9 +164,7 @@ pub(crate) fn primed_first_leg(
     span: &AlignedRange,
     total_bytes: u64,
 ) -> Option<AlignedRange> {
-    let FirstLeg::Streamed { window, read_ahead } = first_leg else {
-        return None;
-    };
+    let (window, read_ahead) = first_leg.streamed()?;
     streamed_first_leg(
         &stream_pacer(read_ahead),
         window,
@@ -189,19 +201,6 @@ type AdoptedLeg = anyhow::Result<(
     Option<AlignedRange>,
     tokio::time::Instant,
 )>;
-
-/// Whether a fetch adopts the winner's discovery stream as its first leg.
-///
-/// A streamed drive's first leg is one read-ahead window, so the winner
-/// serves it while the other lanes build, and adopting it saves the round
-/// trip. A download's first leg is the whole blob: the lane that adopts it is
-/// started alone and the drive plans the whole blob for it, so a download
-/// adopts only when one holder is known. With more, it takes the answer's
-/// size, cancels the streams, and stripes the blob across the holders from
-/// the start.
-pub(crate) const fn adopts_the_winner(first_leg: FirstLeg, holders: usize) -> bool {
-    matches!(first_leg, FirstLeg::Streamed { .. }) || holders <= 1
-}
 
 /// What a failed fetch's lanes saw, for explaining the failure to the user
 /// ([`LaneSources::fault_context`]).
@@ -463,7 +462,7 @@ where
     /// discovery opened on the winning holder.
     ///
     /// With holders' streams open ([`Self::holders_from`]) and a first leg
-    /// the winner's stream can be ([`adopts_the_winner`]), an open of
+    /// that is not a size lookup ([`FirstLeg::Size`]), an open of
     /// `first_leg` on one of `holders` learns the size one holder signs, with
     /// the acquire loop's recovery ([`first_open`]): a holder that faults cools
     /// and another is tried until one answers, a fault only the user can fix
@@ -481,15 +480,16 @@ where
     /// above runs with no stream to adopt.
     ///
     /// The open's pull is primed on the lane for its next open alone
-    /// ([`PrimedSource::prime_next`]) once its header is read: the drive's
-    /// first leg on the lane is the range the open pulled ([`FirstLeg`]), so
-    /// it adopts the pull within two seconds of the answer, and any other
-    /// first leg closes it before opening its own, so the node never holds
-    /// the floor it reserved for the pull beside the leg's. A lane that opens
-    /// nothing closes it when it drops. The lane that answered is parked for
-    /// the fetch, which starts it with no build ([`SourceProvider::built`])
-    /// before any other lane builds, so the fetch plans the first leg for
-    /// that lane alone; every other lane the open built drops, and with it any
+    /// ([`PrimedSource::prime_next`]) once its header is read. The lane that
+    /// answered is parked for the fetch, which starts it with no build
+    /// ([`SourceProvider::built`]) and plans the first legs for it and for
+    /// every lane it starts building in the same pass. The parked lane's
+    /// first leg adopts the pull within two seconds of the answer: the leg the
+    /// open pulled, or the start of it, narrowed to the leg's own range. Any
+    /// other first leg closes the pull before it opens its own, so the node
+    /// never holds the floor it reserved for the pull beside the leg's. A lane
+    /// that opens nothing closes it when it drops. Every other lane the open
+    /// built drops, and with it any
     /// stream permit it held. Returns the size and every holder known, those
     /// the open's discovery found included.
     ///
@@ -508,7 +508,9 @@ where
             .size_hint
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let adopting = self.opened.len() > 0 && adopts_the_winner(first_leg, holders.len());
+        // A size lookup never adopts: it wants the size alone, which an
+        // answer proves with no lane and no open.
+        let adopting = self.opened.len() > 0 && first_leg != FirstLeg::Size;
         let claim = if adopting {
             self.open_for_header(hash, holders, first_leg, health, stop)
                 .await

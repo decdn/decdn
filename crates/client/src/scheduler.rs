@@ -3673,17 +3673,23 @@ where
                 }
                 lanes_to_start(sources, &w, total_bytes, now, deposit, busy, room)
             };
+            // The holders this pass starts building, with their coverage: a
+            // first plan beside a built lane plans their ranges too.
+            let mut building: Vec<(Address, Option<Coverage>)> = Vec::new();
+            let mut built_started = false;
             for holder in starts {
                 if let Some(lane) = sources.cached_lane(holder.provider) {
                     ready.push((holder.provider, lane));
                 } else if let Some(lane) = sources.take_built(holder.provider) {
-                    // Started in this pass, before any build below is polled:
-                    // the first batch plans for it alone, so the size open's
-                    // lane takes the first leg its pull is primed for.
+                    // Started in this pass, before any build below is polled,
+                    // so its lane takes the first leg its pull is primed for,
+                    // narrowed to the range the plan gives it.
                     raise_to_lane(&raise, &lane);
                     ready.push((holder.provider, lane));
                     growth.wanted = true;
+                    built_started = true;
                 } else {
+                    building.push((holder.provider, holder.coverage.clone()));
                     connecting_set.insert(holder.provider);
                     connecting.push(connect_future(sources.provider(), holder, &ended));
                 }
@@ -3695,15 +3701,32 @@ where
                 let mut w = work.lock().await;
                 if !seeded {
                     seeded = true;
+                    // A built lane starts before the lanes this pass builds,
+                    // so the plan reserves a range for each of those as well:
+                    // the built lane's primed pull narrows to its own range,
+                    // and the blob stripes across every holder from the start.
+                    // A reserved lane stays parked until its build lands.
+                    let reserved = if built_started {
+                        std::mem::take(&mut building)
+                    } else {
+                        Vec::new()
+                    };
                     let coverages: Vec<Option<Coverage>> = batch
                         .iter()
                         .map(|(_, lane)| lane.coverage.clone())
+                        .chain(reserved.iter().map(|(_, coverage)| coverage.clone()))
                         .collect();
                     let missing = missing_chunks(store, &want.ranges).await?;
-                    for ((provider, _), slot) in
-                        batch.iter().zip(w.seed(&missing, total_bytes, &coverages)?)
-                    {
-                        slots.insert(*provider, slot);
+                    let planned = w.seed(&missing, total_bytes, &coverages)?;
+                    let providers = batch
+                        .iter()
+                        .map(|(provider, _)| *provider)
+                        .chain(reserved.iter().map(|(provider, _)| *provider));
+                    for (at, (provider, slot)) in providers.zip(planned).enumerate() {
+                        if at >= batch.len() {
+                            w.park(slot);
+                        }
+                        slots.insert(provider, slot);
                     }
                     tracing::debug!(
                         hash = %blake3::Hash::from_bytes(hash).to_hex(),

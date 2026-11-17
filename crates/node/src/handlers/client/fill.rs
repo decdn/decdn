@@ -251,6 +251,45 @@ impl ClientHandler {
         missing.is_empty().then_some(size)
     }
 
+    /// The coverage a miss of `req` that asks for no pull-through refuses
+    /// with: the discovery blocks the store holds whole, so a partial holder
+    /// still reads as a holder of those blocks. The span the request asked
+    /// for is a miss, so the held blocks do not cover it; a coverage that
+    /// would ([`decdn_protocol::client::StreamResponseExt::consistent_with`])
+    /// is left out, and so is one a store read fails to give.
+    pub(super) async fn miss_coverage(&self, hash: Hash, req: &StreamRequest) -> Coverage {
+        let (held, size) = match self.cache.coverage_sized(hash).await {
+            Ok(sized) => sized,
+            Err(e) => {
+                tracing::debug!(
+                    %hash,
+                    error = %decdn_cache::ErrorChain::new(&e),
+                    "miss: the store coverage read failed; refusing with no coverage"
+                );
+                return Coverage::empty();
+            }
+        };
+        let Some(size) = size else {
+            return Coverage::empty();
+        };
+        let coverage = Coverage::for_wire(num_blocks(size), held.covered_blocks());
+        let refusal = decdn_protocol::client::StreamResponseExt::refused(
+            decdn_protocol::client::StreamError::NotFound,
+            coverage.clone(),
+        );
+        let body = decdn_protocol::client::StreamResponseBody {
+            hash: req.hash,
+            ok: false,
+            rate_per_mb: 0,
+            timestamp_us: req.timestamp_us,
+        };
+        if refusal.consistent_with(&body, req.byte_offset, req.byte_len) {
+            coverage
+        } else {
+            Coverage::empty()
+        }
+    }
+
     /// The coverage a covering partial hit of `req` answers with: the
     /// discovery blocks the store holds whole, plus every block the requested
     /// span touches.
