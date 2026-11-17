@@ -4070,3 +4070,239 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
     shutdown([server_task], [&server_ep]).await?;
     Ok(())
 }
+
+/// A bound ext for `client_eth` on the connection of `client_node_id`, with
+/// `pull_through` as given.
+fn bound_ext(
+    client_eth: &PrivateKeySigner,
+    client_node_id: B256,
+    pull_through: bool,
+) -> anyhow::Result<StreamRequestExt> {
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    Ok(StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature: client_eth
+                .sign_hash_sync(&binding_hash)?
+                .as_bytes()
+                .to_vec(),
+        }),
+        capability: None,
+        pull_through,
+    })
+}
+
+/// The own-origin probe that runs before admission goes through the probe
+/// memo: two opens for the same hash the origin lacks reach the origin with one
+/// `HEAD`, and both answer `NotFound`.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeat_opens_for_an_absent_hash_probe_the_origin_once() -> anyhow::Result<()> {
+    let hash = Hash::new(b"a blob no origin holds");
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x7A);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, _cache, _metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            ALPN_CLIENT,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = bound_ext(&client_eth, client_node_id, false)?;
+
+    for _ in 0..2 {
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = StreamRequest {
+            hash: *hash.as_bytes(),
+            namespace_id: decdn_protocol::client::NO_NAMESPACE,
+            pool_id: pool_id.into(),
+            byte_offset: 0,
+            byte_len: 0,
+            timestamp_us: now_us(),
+        };
+        write_frame_to(&mut send, &encode_stream_request(&req, Some(&ext))?).await?;
+        let (resp, resp_ext) = read_stream_response(&mut recv).await?;
+        anyhow::ensure!(
+            !resp.body.ok
+                && resp_ext.error() == Some(&decdn_protocol::client::StreamError::NotFound),
+            "an absent hash answers NotFound"
+        );
+    }
+    let heads = count_requests(&server, |r| r.method.as_str() == "HEAD").await?;
+    anyhow::ensure!(
+        heads == 1,
+        "two opens must cost one origin HEAD, saw {heads}"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// An own-origin open on a pool that cannot cover the span answers before
+/// admission, and its admission refuses `Unfunded` at the first proof, before
+/// any `ChunkData`. The fill never starts: no origin range read follows the
+/// serviceability probe.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn an_underfunded_own_origin_open_is_refused_at_admission_and_reads_no_range()
+-> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+        .mount(&server)
+        .await;
+    mount_range_probe(&server, &hex, &blob).await;
+
+    let pool_id = B256::repeat_byte(0x7B);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id,
+        client_eth.address(),
+        provider,
+        U256::from(10_000_000u64),
+        u64::MAX,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+    let metrics = Arc::new(Metrics::new());
+    // The whole 200 KiB blob costs 2 at the harness rate; the pool holds 1.
+    let mut status = std::collections::HashMap::new();
+    status.insert(
+        pool_id,
+        decdn_node::pool_view::PoolStatus {
+            owner: client_eth.address(),
+            remaining: U256::from(1u64),
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        },
+    );
+    let pool_view =
+        Arc::new(StatusMapPoolView { status }) as Arc<dyn decdn_node::pool_view::PoolView>;
+    let store_dyn: Arc<dyn PoolStateStore> = store;
+    let handler = build_handler_full_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache.clone(),
+        store_dyn,
+        RATE_PER_MB,
+        &domains(),
+        16,
+        |deps| deps.pool_view = Some(pool_view),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            ALPN_CLIENT,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: now_us(),
+    };
+    let ext = bound_ext(&client_eth, client_node_id, true)?;
+    write_frame_to(&mut send, &encode_stream_request(&req, Some(&ext))?).await?;
+    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "the own-origin open answers before admission");
+    let ranged = |r: &Request| r.method.as_str() == "GET" && r.headers.contains_key("range");
+    let probed = count_requests(&server, ranged).await?;
+
+    let first_proof = Voucher {
+        pool_id,
+        signer: client_eth.address(),
+        provider,
+        amount: U256::from(1u64),
+        bytes_delivered: U256::from(64 * 1024u64),
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
+    }
+    .sign(client_eth.as_ref(), &voucher_dom())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client_msg(
+        &mut send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&first_proof)?),
+    )
+    .await?;
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::Unfunded) => {}
+        other => anyhow::bail!("expected Unfunded before any ChunkData, got {other:?}"),
+    }
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_insufficient_deposit_total")? == 1,
+        "the refusal counts as insufficient deposit"
+    );
+    anyhow::ensure!(
+        count_requests(&server, ranged).await? == probed,
+        "no origin range read follows the probe"
+    );
+    anyhow::ensure!(
+        cache.in_flight_total(hash).is_none() && !cache.has(hash).await?,
+        "the refused open starts no fill"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}

@@ -94,9 +94,9 @@ pub(crate) use proof_wait::PROOF_WAIT_CEILING;
 /// explicit and testable.
 pub const MAX_CLIENT_STREAMS: usize = 100;
 
-/// Per-connection cap on streams that answered an open but have not yet
-/// passed funding admission. An open beyond it resets with `RATE_LIMITED`
-/// before its request is read. Without it, one peer pins many blobs with
+/// Per-connection cap on streams that have not yet passed funding admission,
+/// counted from the moment a stream is accepted. An open beyond it resets with
+/// `RATE_LIMITED` before its request is read. Without it, one peer pins many blobs with
 /// unpaid opens and blocks capacity eviction for paid fills. Twice the
 /// client's `SELECT_K` (5), so a payer that opens one stream per candidate
 /// stays well inside it.

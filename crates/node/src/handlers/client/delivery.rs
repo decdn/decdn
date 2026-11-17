@@ -301,8 +301,9 @@ impl ClientHandler {
         // An open that answered before admission waits for the payer's first
         // proof here, beside the export's setup, so the store read overlaps the
         // payer's round trip. Admission then runs once, before the first frame.
-        // The empty blob carries no wire, so its payer owes no proof: it admits
-        // at once.
+        // The empty blob sells no byte, so an open of it that answered before
+        // admission skips admission: no load-shed slot, no chain read. It ends
+        // with `StreamEnd` at once.
         let mut waits = ServeWaits::start(conn);
         let export = async {
             waits
@@ -316,14 +317,15 @@ impl ClientHandler {
         };
         let (data, admitted) = match admission {
             Admission::Admitted(admitted) => (export.await?, admitted),
+            Admission::OnFirstProof(_) if total_bytes == 0 => {
+                drop(export);
+                return self
+                    .complete_delivery(send, recv, &mut waits, hash, 0)
+                    .await;
+            }
             Admission::OnFirstProof(adm) => {
-                let data = if total_bytes == 0 {
-                    export.await?
-                } else {
-                    let (data, ()) =
-                        tokio::try_join!(export, self.await_first_proof(conn, recv, reader))?;
-                    data
-                };
+                let (data, ()) =
+                    tokio::try_join!(export, self.await_first_proof(conn, recv, reader))?;
                 match self.admit_on_first_proof(adm).await {
                     Ok(admitted) => (data, admitted),
                     Err(reason) => return self.refuse_admission(send, reason).await,
@@ -334,6 +336,7 @@ impl ClientHandler {
             lane_key,
             lane,
             mut guards,
+            shed: _shed,
         } = admitted;
         let lane = &lane;
 
@@ -417,8 +420,21 @@ impl ClientHandler {
             self.metrics.bytes_served(len);
         }
 
-        // Clean completion: the whole request is on the wire and every byte was
-        // paid for before it was sent.
+        self.complete_delivery(send, recv, &mut waits, hash, delivered)
+            .await
+    }
+
+    /// End a delivery cleanly: the whole request is on the wire and every byte
+    /// was paid for before it was sent. Writes `StreamEnd`, finishes the
+    /// stream, and records the served request.
+    async fn complete_delivery(
+        &self,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        waits: &mut ServeWaits,
+        hash: Hash,
+        delivered: u64,
+    ) -> anyhow::Result<ServeEnd> {
         waits
             .time(
                 Wait::Send,

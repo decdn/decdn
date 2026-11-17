@@ -2125,9 +2125,9 @@ pub struct DecdnMetrics {
     pub serve_stream_rejected_stream_cap_full: Counter,
     /// `decdn_serve_stream_rejected_unadmitted_cap_full_total`:
     /// `cdn/client/v1` streams reset with `RATE_LIMITED` because the connection
-    /// already held `MAX_UNADMITTED_STREAMS_PER_CONNECTION` streams that
-    /// answered an open and have not passed admission. The node reads no
-    /// request and sends no signed response. A peer that opens streams and
+    /// already held `MAX_UNADMITTED_STREAMS_PER_CONNECTION` streams that have
+    /// not passed admission. The node reads no request and sends no signed
+    /// response. A peer that opens streams and
     /// does not pay on them drives it.
     pub serve_stream_rejected_unadmitted_cap_full: Counter,
     /// `decdn_serve_stream_request_unreadable_total`: `cdn/client/v1` streams
@@ -3629,7 +3629,7 @@ recorders! {
     serve_stream_rejected_stream_cap_full => serve_stream_rejected_stream_cap_full.inc();
 
     /// Record a `cdn/client/v1` stream reset because the connection held its cap
-    /// of streams that answered and have not passed admission.
+    /// of streams that have not passed admission.
     serve_stream_rejected_unadmitted_cap_full => serve_stream_rejected_unadmitted_cap_full.inc();
 
     /// Record a `cdn/client/v1` stream reset because its first request could not

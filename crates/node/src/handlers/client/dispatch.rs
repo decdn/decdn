@@ -3,7 +3,7 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
+    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, Connection, FillOutcome,
     FirstMessage, Hash, LaneKey, MissPath, MissRefusal, OwnedSemaphorePermit, PublicKey,
     RecvStream, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest, U256,
     VarInt, read_first_message, reset_stream, verify_binding,
@@ -15,7 +15,7 @@ use tokio::task::{JoinError, JoinSet};
 use futures_util::FutureExt as _;
 use tracing::Instrument as _;
 
-use super::admission::{Admission, Admitted, DeferredAdmission, UnadmittedStreams};
+use super::admission::{Admission, Admitted, DeferredAdmission, UnadmittedSlot, UnadmittedStreams};
 use super::outcome::{ErrEnd, ResetCause, ServeEnd};
 use crate::load_shed::RequestClass;
 use crate::metrics::FirstByteClock;
@@ -138,8 +138,8 @@ impl ClientHandler {
         // the fallback for its own unbound streams — no lane it cannot already
         // sign for.
         let bound_addr: Arc<ArcSwapOption<Address>> = Arc::new(ArcSwapOption::empty());
-        // The connection's streams that answered an open and have not passed
-        // admission (`MAX_UNADMITTED_STREAMS_PER_CONNECTION`).
+        // The connection's streams that have not passed admission
+        // (`MAX_UNADMITTED_STREAMS_PER_CONNECTION`).
         let unadmitted = Arc::new(UnadmittedStreams::default());
         let peer = conn.remote_id();
 
@@ -152,7 +152,11 @@ impl ClientHandler {
                     Ok((send, recv)) => {
                         let permit = Arc::clone(&stream_sem).try_acquire_owned().ok();
                         let bound = Arc::clone(&bound_addr);
-                        let unadmitted = Arc::clone(&unadmitted);
+                        // Reserved before the request is read, so a burst of
+                        // opens cannot pass the cap. A stream the stream cap
+                        // resets reserves none.
+                        let unadmitted_slot =
+                            permit.as_ref().and_then(|_| unadmitted.try_take());
                         let this = Arc::clone(&self);
                         // Boxed: the serve future is large (clippy::large_futures),
                         // and spawning the boxed future keeps it off the accept
@@ -164,7 +168,7 @@ impl ClientHandler {
                             recv,
                             permit,
                             bound,
-                            unadmitted,
+                            unadmitted_slot,
                             peer,
                         ));
                         inflight.spawn(
@@ -336,7 +340,7 @@ impl ClientHandler {
         mut recv: RecvStream,
         permit: Option<OwnedSemaphorePermit>,
         bound_addr: Arc<ArcSwapOption<Address>>,
-        unadmitted: Arc<UnadmittedStreams>,
+        unadmitted_slot: Option<UnadmittedSlot>,
         peer: PublicKey,
     ) -> anyhow::Result<ServeEnd> {
         // Stream-cap exhausted: reset the stream before reading anything and with
@@ -350,13 +354,17 @@ impl ClientHandler {
             return Ok(ServeEnd::Reset(ResetCause::StreamCapFull));
         }
         // Unadmitted cap, on the same footing as the stream cap: a connection
-        // whose answered opens wait unpaid at the cap gets no more of them.
-        // Each such open pins its blob, so without the cap one peer could hold
-        // many blobs against capacity eviction for free.
-        if unadmitted.at_cap() {
+        // that holds its cap of streams not yet admitted gets no more of them.
+        // An open that answers before admission pins its blob, so without the
+        // cap one peer could hold many blobs against capacity eviction for
+        // free. The slot was reserved at accept; it moves into the stream's
+        // deferred admission, or drops once the stream is admitted at open or
+        // ends.
+        let Some(unadmitted_slot) = unadmitted_slot else {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(ServeEnd::Reset(ResetCause::UnadmittedCapFull));
-        }
+        };
+        let mut unadmitted_slot = Some(unadmitted_slot);
         // Per-request limiter (ADR 005 §Request rate limiting), on the same
         // footing as the stream cap: refuse before the request is read, with no
         // signed response. Most refusals after the request is read sign a
@@ -674,42 +682,22 @@ impl ClientHandler {
         // stream is admitted before its fill tiers; every other stream that
         // reaches the response is admitted at its first proof.
         let mut admitted_at_open: Option<super::admission::Funding> = None;
-        // The initial `None` is unread on every live path (every branch below
-        // either sheds and returns or overwrites it) — kept anyway so the
-        // slot's declared type and its `Drop`-at-fn-scope binding stay
-        // explicit.
-        #[allow(unused_assignments)]
+        // The load-shed slot of a miss that pulls through, held at fn scope.
+        // An open that answers before admission takes its slot at admission
+        // (`super::admission`), so an unpaid open holds none.
         let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
-        // The gate's class. The shed gate admits under it and the first-byte clock
+        // The serve tier. The shed gate admits under it and the first-byte clock
         // records under it. The class is fixed here, because a buffered fill below
         // serves a miss through the cache-hit `deliver`, and that loop cannot tell.
-        // The admit instant ends the clock's admission phase.
+        // The tier pick ends the clock's admission phase.
         let request_class;
-        let admitted_at;
+        let admitted_at = std::time::Instant::now();
         if audit.is_serveable() {
             request_class = RequestClass::CacheHit;
             // Serve-path hit rate (see `Metrics::serve_cache_hit`). Metered on the
-            // availability decision itself, ahead of the shed gate below, so the
-            // ratio stays a property of the store rather than of current pressure.
+            // availability decision itself, ahead of the shed gate, so the ratio
+            // stays a property of the store rather than of current pressure.
             self.metrics.serve_cache_hit();
-            match self.shed.try_admit(request_class, client_node_id) {
-                Ok(slot) => {
-                    shed_slot = Some(slot);
-                    admitted_at = std::time::Instant::now();
-                }
-                Err(reason) => {
-                    self.metrics.load_shed_refused(reason);
-                    tracing::debug!(
-                        ?reason,
-                        %hash,
-                        class = "hit",
-                        "load-shed refusing new serve"
-                    );
-                    return self
-                        .respond_error(&mut send, &req, ServeRejectReason::LoadShedHit, rate_per_mb)
-                        .await;
-                }
-            }
         } else if let Some(size) = self
             .partial_hit_size(hash, req.byte_offset, req.byte_len)
             .await
@@ -728,24 +716,6 @@ impl ClientHandler {
             // `Metrics::serve_cache_partial_hit`).
             self.metrics.serve_cache_partial_hit();
             request_class = RequestClass::CacheHit;
-            match self.shed.try_admit(request_class, client_node_id) {
-                Ok(slot) => {
-                    shed_slot = Some(slot);
-                    admitted_at = std::time::Instant::now();
-                }
-                Err(reason) => {
-                    self.metrics.load_shed_refused(reason);
-                    tracing::debug!(
-                        ?reason,
-                        %hash,
-                        class = "hit",
-                        "load-shed refusing new serve"
-                    );
-                    return self
-                        .respond_error(&mut send, &req, ServeRejectReason::LoadShedHit, rate_per_mb)
-                        .await;
-                }
-            }
             hit_size = Some(size);
             partial_hit = true;
         } else {
@@ -754,34 +724,11 @@ impl ClientHandler {
             drop(pin.take());
             // The miss sibling of the two hit counters above, on the same
             // pre-shed footing: the gate cannot satisfy this request from held
-            // bytes. It records that classification only — the shed gate below,
-            // the pull-through flag, the funding gates and `pull_authorized` can
+            // bytes. It records that classification only — the pull-through
+            // flag, the shed gate, the funding gates and `pull_authorized` can
             // each end the request before any fill tier runs.
             self.metrics.serve_cache_miss();
             request_class = RequestClass::CacheMiss;
-            match self.shed.try_admit(request_class, client_node_id) {
-                Ok(slot) => {
-                    shed_slot = Some(slot);
-                    admitted_at = std::time::Instant::now();
-                }
-                Err(reason) => {
-                    self.metrics.load_shed_refused(reason);
-                    tracing::debug!(
-                        ?reason,
-                        %hash,
-                        class = "miss",
-                        "load-shed refusing new serve"
-                    );
-                    return self
-                        .respond_error(
-                            &mut send,
-                            &req,
-                            ServeRejectReason::LoadShedMiss,
-                            rate_per_mb,
-                        )
-                        .await;
-                }
-            }
 
             // The fault latch (#1129): declared before the first tier so every
             // tier's `CacheError::Store` lands in it.
@@ -804,9 +751,12 @@ impl ClientHandler {
             // in origin egress.
             //
             // Serviceability is confirmed before the response is signed, by
-            // `origin_size` (a live probe of the data object), the origin's
+            // `origin_probe_presence` (a probe of the data object, memoised per
+            // hash, so repeats of a hash reach the origin once per TTL), the
+            // origin's
             // `{H}.sizeproof` (ADR 005 § Bounded byte ranges: the node serves an
-            // origin blob only under a size its origin proves), and
+            // origin blob only under a size its origin proves; the engine keeps
+            // a proof it read and remembers an origin that serves none), and
             // `origin_range_serviceable` (an origin publishes the outboard AND
             // serves ranged reads of the data). The range half reads one chunk
             // group until the origin has served a clean range window once, then
@@ -823,9 +773,10 @@ impl ClientHandler {
             // and streams the same filling cache to its own client (no double
             // origin egress).
             let mut origin_proven = false;
-            match self.cache.origin_size(hash).await {
-                Ok(Some(total)) if self.cache.size_proof(hash, total).await.is_none() => {}
-                Ok(Some(total)) => {
+            match self.cache.origin_probe_presence(hash).await {
+                decdn_cache::OriginPresence::Present(total)
+                    if self.cache.size_proof(hash, total).await.is_none() => {}
+                decdn_cache::OriginPresence::Present(total) => {
                     origin_proven = true;
                     match self.cache.origin_range_serviceable(hash, total).await {
                         Ok(true) => {
@@ -837,7 +788,9 @@ impl ClientHandler {
                                 peer,
                                 rate_per_mb,
                                 total,
-                                unadmitted.take(),
+                                request_class,
+                                client_node_id,
+                                unadmitted_slot.take(),
                             );
                             // Boxed: the serve future is large
                             // (clippy::large_futures).
@@ -870,16 +823,14 @@ impl ClientHandler {
                         }
                     }
                 }
-                // No origin states a size, or no origin is configured at all:
-                // nothing is served from the origin. `origin_size` returns
-                // Ok(None) only for clean declines; a probe that ends on a
-                // transport fault reaches the Err arm below.
-                Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
-                // Any other origin fault latches `fault_seen` (#1129) so a
-                // later-tier miss reports InternalError not NotFound.
-                Err(e) => {
+                // No origin holds the blob, or no origin is configured at all:
+                // nothing is served from the origin.
+                decdn_cache::OriginPresence::Absent => {}
+                // An origin fault latches `fault_seen` (#1129) so a later-tier
+                // miss reports InternalError not NotFound. The probe logs the
+                // cause when it memoises the fault.
+                decdn_cache::OriginPresence::Fault => {
                     self.metrics.node_pull_through_error();
-                    tracing::warn!(%hash, error = %e.display_chain(), "own-origin size probe faulted; falling through");
                     fault_seen = true;
                 }
             }
@@ -895,8 +846,30 @@ impl ClientHandler {
                     .await;
             }
 
-            // The funding gates run before any fill tier, so no tier fronts
-            // origin egress or upstream USDC for a request they refuse.
+            // A miss that pulls through is admitted at open: the shed gate,
+            // then the funding gates, before any fill tier, so no tier fronts
+            // origin egress or upstream USDC for a request they refuse. The shed
+            // slot is held for the rest of the stream.
+            match self.shed.try_admit(request_class, client_node_id) {
+                Ok(slot) => shed_slot = Some(slot),
+                Err(reason) => {
+                    self.metrics.load_shed_refused(reason);
+                    tracing::debug!(
+                        ?reason,
+                        %hash,
+                        class = "miss",
+                        "load-shed refusing new serve"
+                    );
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::LoadShedMiss,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
+            }
             let funding = match self
                 .funding_gates(&req, &ext, verified_client, lane_key, rate_per_mb)
                 .await
@@ -908,6 +881,8 @@ impl ClientHandler {
                         .await;
                 }
             };
+            // Admitted at open: the stream no longer counts as unadmitted.
+            drop(unadmitted_slot.take());
             let pool_status = funding.pool_status;
 
             // Node-to-node cache-miss pull-through (#831). Fronting upstream
@@ -1234,6 +1209,8 @@ impl ClientHandler {
                     lane_key,
                     lane,
                     guards,
+                    // The fn-scope `_shed_slot` holds this stream's slot.
+                    shed: None,
                 })
             }
             // An open that does no fill work answers before admission, which
@@ -1246,7 +1223,9 @@ impl ClientHandler {
                 peer,
                 rate_per_mb,
                 total_bytes,
-                unadmitted.take(),
+                request_class,
+                client_node_id,
+                unadmitted_slot.take(),
             )),
         };
 

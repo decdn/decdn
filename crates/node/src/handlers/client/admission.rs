@@ -16,9 +16,13 @@
 //!   ([`ClientHandler::funding_gates`]) before any upstream work, and refuses
 //!   with a signed `ok: false`.
 //!
+//! An open that answers before admission holds no load-shed slot: it takes
+//! the node-wide and per-client slots at admission, so unpaid opens cannot shed
+//! paid serves. The empty blob sells no byte and skips admission.
+//!
 //! The node holds the blob (`InUse`) for the whole stream, so an open that
 //! waits for its first proof keeps its blob. [`UnadmittedStreams`] bounds how
-//! many such opens one connection holds.
+//! many streams one connection holds before admission.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -30,6 +34,7 @@ use super::{
     LaneDeliveryState, LaneKey, MAX_UNADMITTED_STREAMS_PER_CONNECTION, Mutex, PublicKey,
     RecvStream, SendStream, ServeRejectReason, StreamRequest, StreamRequestExt,
 };
+use crate::load_shed::{RequestClass, ShedSlot};
 use crate::pool_view::{Lifecycle, PoolStatus};
 use decdn_incentive::payment_pool::SignerAuthorization;
 
@@ -42,9 +47,9 @@ pub(super) struct Funding {
     pub(super) known_lane: Option<Arc<Mutex<LaneDeliveryState>>>,
 }
 
-/// An open that answered before admission: what its funding gates need when
-/// the payer's first proof arrives. It holds one of its connection's
-/// [`UnadmittedStreams`] slots until admission consumes it or the stream ends.
+/// An open that answered before admission: what its load-shed and funding
+/// gates need when the payer's first proof arrives. It holds its stream's
+/// [`UnadmittedSlot`] until admission consumes it or the stream ends.
 pub(super) struct DeferredAdmission {
     /// The stream's request.
     req: StreamRequest,
@@ -60,8 +65,12 @@ pub(super) struct DeferredAdmission {
     rate_per_mb: u64,
     /// The blob size the answer states, for the deposit gate's price.
     total_bytes: u64,
+    /// The serve tier the load-shed gate admits the stream under.
+    class: RequestClass,
+    /// The requesting peer's node id, the load-shed gate's per-client key.
+    client_node_id: B256,
     /// The connection's slot for this unadmitted stream.
-    _slot: UnadmittedSlot,
+    _slot: Option<UnadmittedSlot>,
 }
 
 impl DeferredAdmission {
@@ -76,7 +85,9 @@ impl DeferredAdmission {
         peer: PublicKey,
         rate_per_mb: u64,
         total_bytes: u64,
-        slot: UnadmittedSlot,
+        class: RequestClass,
+        client_node_id: B256,
+        slot: Option<UnadmittedSlot>,
     ) -> Self {
         Self {
             req,
@@ -86,6 +97,8 @@ impl DeferredAdmission {
             peer,
             rate_per_mb,
             total_bytes,
+            class,
+            client_node_id,
             _slot: slot,
         }
     }
@@ -100,6 +113,9 @@ pub(super) struct Admitted {
     pub(super) lane: Arc<Mutex<LaneDeliveryState>>,
     /// The takedown, pool and signer checks that run before each send.
     pub(super) guards: SendGuards,
+    /// The load-shed slot admission took, held for the rest of the stream, or
+    /// `None` when the stream holds its slot elsewhere.
+    pub(super) shed: Option<ShedSlot>,
 }
 
 /// Where a serve loop's stream stands on admission.
@@ -110,11 +126,12 @@ pub(super) enum Admission {
     OnFirstProof(DeferredAdmission),
 }
 
-/// The count of one connection's streams that answered an open and have not
-/// yet passed admission. The accept path resets a new stream while the count
-/// is at [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]. The bound is soft by the
-/// streams already past that check and not yet answered, which the
-/// per-connection stream cap bounds.
+/// The count of one connection's streams that have not yet passed admission.
+/// The accept path reserves a slot for every stream before it reads the
+/// request, and resets the stream when the count is at
+/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]. A stream frees its slot when it
+/// is admitted (at open, or at its first proof) or ends. The bound is exact: a
+/// burst of opens cannot pass it.
 #[derive(Debug, Default)]
 pub(super) struct UnadmittedStreams {
     /// Live [`UnadmittedSlot`]s.
@@ -122,17 +139,17 @@ pub(super) struct UnadmittedStreams {
 }
 
 impl UnadmittedStreams {
-    /// Whether the connection holds its cap of unadmitted streams.
-    pub(super) fn at_cap(&self) -> bool {
-        self.count.load(Ordering::Acquire) >= MAX_UNADMITTED_STREAMS_PER_CONNECTION
-    }
-
-    /// Count one more unadmitted stream until the returned slot drops.
-    pub(super) fn take(self: &Arc<Self>) -> UnadmittedSlot {
-        self.count.fetch_add(1, Ordering::AcqRel);
-        UnadmittedSlot {
+    /// Reserve a slot for one more unadmitted stream, held until the returned
+    /// slot drops, or `None` when the connection holds its cap.
+    pub(super) fn try_take(self: &Arc<Self>) -> Option<UnadmittedSlot> {
+        self.count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_UNADMITTED_STREAMS_PER_CONNECTION).then(|| count.saturating_add(1))
+            })
+            .ok()?;
+        Some(UnadmittedSlot {
             streams: Arc::clone(self),
-        }
+        })
     }
 }
 
@@ -263,17 +280,36 @@ impl ClientHandler {
     }
 
     /// Admit an open that answered before admission, once its payer's first
-    /// proof is on the stream: the funding gates, then the lane the stream
-    /// pays on, then the deposit gate. Returns the admitted lane and the
-    /// stream's send checks, or the refusal.
+    /// proof is on the stream: the load-shed gate, the funding gates, then the
+    /// lane the stream pays on, then the deposit gate. Returns the admitted
+    /// lane, the stream's send checks and its load-shed slot, or the refusal.
     ///
-    /// A request with no verified binding names no lane and refuses
-    /// `OwnerMismatch`; a bound request with no lane refuses `UnknownLane`.
-    /// Both sign `NotFound`, so a requester cannot map lane existence.
+    /// The load-shed gate runs first, so a loaded node reads no chain state
+    /// for a stream it sheds. It refuses `LoadShedHit` or `LoadShedMiss` by the
+    /// open's tier; both sign `NotFound`. A request with no verified binding
+    /// names no lane and refuses `OwnerMismatch`; a bound request with no lane
+    /// refuses `UnknownLane`. Both sign `NotFound`, so a requester cannot map
+    /// lane existence.
     pub(super) async fn admit_on_first_proof(
         &self,
         adm: DeferredAdmission,
     ) -> Result<Admitted, ServeRejectReason> {
+        let shed = match self.shed.try_admit(adm.class, adm.client_node_id) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                self.metrics.load_shed_refused(reason);
+                tracing::debug!(
+                    ?reason,
+                    hash = %Hash::from_bytes(adm.req.hash),
+                    class = ?adm.class,
+                    "load-shed refusing a stream at admission"
+                );
+                return Err(match adm.class {
+                    RequestClass::CacheHit => ServeRejectReason::LoadShedHit,
+                    RequestClass::CacheMiss => ServeRejectReason::LoadShedMiss,
+                });
+            }
+        };
         let funding = self
             .funding_gates(
                 &adm.req,
@@ -325,6 +361,7 @@ impl ClientHandler {
             lane_key,
             lane,
             guards,
+            shed: Some(shed),
         })
     }
 

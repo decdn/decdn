@@ -12732,11 +12732,13 @@ async fn cache_miss_refused_under_concurrency_pressure() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A hash the node already has cached: the request lands on the cache-hit
-/// admission call. Concurrency never trips (the high/low water marks are far
-/// above anything this test does); only the egress ceiling is saturated, which
+/// A hash the node already has cached: the open answers before admission, and
+/// the load-shed gate runs at admission, at the payer's first proof.
+/// Concurrency never trips (the high/low water marks are far above anything
+/// this test does); only the egress ceiling is saturated, which
 /// `ResourcePressure` sheds regardless of the pressure latch (it also sheds
-/// hits, unlike the concurrency gate above).
+/// hits, unlike the concurrency gate above). The shed refusal rides in a
+/// `StreamError` before any `ChunkData`.
 #[tokio::test(flavor = "multi_thread")]
 async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
     let payload = b"load-shed test: a blob the node already has cached".to_vec();
@@ -12796,19 +12798,17 @@ async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
     let ext = binding_ext(&signer, client_node_id)?;
 
-    let (refusal, refusal_ext) =
-        open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    let refusal = request_refused_at_first_proof(
+        &conn,
+        &whole_blob_request(*hash.as_bytes()),
+        Some(&ext),
+        &signer,
+    )
+    .await?;
     anyhow::ensure!(
-        !refusal.body.ok,
-        "a cache-hit request must be shed while measured egress is at the configured ceiling"
-    );
-    anyhow::ensure!(
-        matches!(
-            refusal_ext.error(),
-            Some(decdn_protocol::client::StreamError::NotFound)
-        ),
-        "expected the collapsed NotFound wire code, got {:?}",
-        refusal_ext.error()
+        refusal == StreamError::NotFound,
+        "a cache-hit request must be shed while measured egress is at the configured ceiling \
+         with the collapsed NotFound wire code, got {refusal:?}"
     );
 
     // The availability gate counts ahead of the shed gate, so a serve the shed
@@ -16383,6 +16383,195 @@ async fn the_unadmitted_cap_resets_the_open_past_it() -> anyhow::Result<()> {
         .await?;
     let _next =
         stall_delivery_at_closing_voucher(&conn, *hash.as_bytes(), wire, Some(&ext)).await?;
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The unadmitted cap is reserved when a stream is accepted, so a burst of
+/// opens cannot pass it: of `cap + 1` opens written at once on one connection,
+/// exactly one resets with `RATE_LIMITED` and the rest answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_of_opens_cannot_pass_the_unadmitted_cap() -> anyhow::Result<()> {
+    let cap = decdn_node::handlers::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION;
+    let payload = vec![0x77u8; 64 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_open_server(cache, store, None, 4 * cap).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+    let req = whole_blob_request(*hash.as_bytes());
+
+    let opens = (0..=cap).map(|_| {
+        let (conn, req, ext) = (&conn, &req, &ext);
+        async move {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+            let payload = encode_stream_request(req, Some(ext))?;
+            if write_frame(&mut send, &payload).await.is_err() {
+                return Ok::<_, anyhow::Error>(None);
+            }
+            Ok(read_stream_response(&mut recv)
+                .await
+                .ok()
+                .map(|answer| (send, recv, answer)))
+        }
+    });
+    let mut answered = Vec::new();
+    for open in futures_util::future::join_all(opens).await {
+        if let Some(open) = open? {
+            answered.push(open);
+        }
+    }
+    anyhow::ensure!(
+        answered.len() == cap && answered.iter().all(|(_, _, (resp, _))| resp.body.ok),
+        "{cap} opens answer ok: true, got {} answers",
+        answered.len()
+    );
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_rejected_unadmitted_cap_full_total"
+        )? == 1,
+        "exactly the open past the cap resets"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The empty blob sells no byte, so an open of it skips admission: the node
+/// answers `ok: true` and ends the stream with `StreamEnd`, with no proof from
+/// the payer and no pool or signer read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_blob_open_ends_without_admission() -> anyhow::Result<()> {
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let view = Arc::new(ReadCountingPoolView::new(operator_addr()));
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_open_server(cache, store, Some(Arc::clone(&view) as _), 16).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+    let empty = Hash::new([]);
+    let (_send, mut recv, resp, resp_ext) =
+        open_and_read_answer(&conn, &whole_blob_request(*empty.as_bytes()), Some(&ext)).await?;
+    anyhow::ensure!(resp.body.ok, "the empty blob answers ok: true");
+    anyhow::ensure!(
+        resp_ext.size_proof().map(decdn_protocol::SizeProof::size) == Some(0),
+        "the answer proves the empty size"
+    );
+    match tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv)).await?? {
+        ClientMessage::StreamEnd => {}
+        other => anyhow::bail!("expected StreamEnd with no proof, got {other:?}"),
+    }
+    anyhow::ensure!(view.reads() == 0, "an empty-blob open reads no chain state");
+    conn.close(0u32.into(), b"done");
+    anyhow::ensure!(
+        eventually(Duration::from_secs(5), || {
+            counter(
+                &metrics,
+                "decdn_streams_completed_total{direction=\"inbound\"}",
+            )
+            .is_ok_and(|n| n == 1)
+        })
+        .await,
+        "the empty-blob open completes"
+    );
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// An open that waits for its first proof holds no load-shed slot. A client's
+/// parked opens therefore neither pressure the node nor count against its own
+/// fair share, and its paid hit is served rather than shed.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpaid_opens_take_no_shed_slot() -> anyhow::Result<()> {
+    let payload = vec![0x78u8; 64 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    // Two serves in flight pressure the node, and a pressured client holds at
+    // most one.
+    let shed = decdn_node::load_shed::LoadShedController::from_config(
+        &decdn_common::config::ResolvedLoadShed {
+            policy: decdn_common::config::LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: 0,
+            max_concurrent_serves_high: 2,
+            max_concurrent_serves_low: 1,
+            per_client_serve_cap: 1,
+        },
+    );
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let shed_dep = Arc::clone(&shed);
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+        store,
+        RATE_PER_MB,
+        16,
+        |deps| deps.shed = shed_dep,
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // One connection carries the parked opens and the paid fetch.
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let warm = WarmConnection::connect(&client_ep, target, Duration::from_secs(20), None).await?;
+    let conn = warm.connection();
+    let ext = binding_ext(&signer, client_node_id)?;
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
+    let _first =
+        stall_delivery_at_closing_voucher(conn, *hash.as_bytes(), wire, Some(&ext)).await?;
+    let _second =
+        stall_delivery_at_closing_voucher(conn, *hash.as_bytes(), wire, Some(&ext)).await?;
+    anyhow::ensure!(
+        shed.node_in_flight() == 0,
+        "unpaid opens hold no shed slot, got {}",
+        shed.node_in_flight()
+    );
+
+    let ctx = pool_context(&client_ep, signer, deposit);
+    let got = stream_fetch_on(
+        &warm,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        now_us(),
+        Duration::from_secs(10),
+    )
+    .await?;
+    anyhow::ensure!(got.as_ref() == payload.as_slice(), "the paid hit is served");
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_rejected_load_shed_hit_total")? == 0,
+        "no stream is shed"
+    );
 
     conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;

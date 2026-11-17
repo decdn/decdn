@@ -47,8 +47,8 @@ pub(super) enum ServeEnd {
 pub(super) enum ResetCause {
     /// The per-connection stream cap was full (`RATE_LIMITED`).
     StreamCapFull,
-    /// The connection held its cap of streams that answered and have not
-    /// passed admission (`RATE_LIMITED`,
+    /// The connection held its cap of streams that have not passed admission
+    /// (`RATE_LIMITED`,
     /// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`](super::MAX_UNADMITTED_STREAMS_PER_CONNECTION)).
     UnadmittedCapFull,
     /// The `[serve.rate_limit]` limiter refused the stream at this layer
