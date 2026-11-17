@@ -560,6 +560,12 @@ impl StreamResponseExt {
     ///   span. A refusal states no size, so a span to the end has no known
     ///   end, and no coverage covers it.
     ///
+    /// The coverage names at most [`crate::coverage::MAX_COVERAGE_BLOCKS`]
+    /// blocks ([`crate::Coverage::for_wire`]). The rule judges only the part
+    /// of the span inside that bound: a span wholly past it agrees with any
+    /// coverage, so a node serves a blob past
+    /// [`crate::coverage::MAX_DISCOVERABLE_BLOB_BYTES`] at any offset.
+    ///
     /// The empty blob ([`EMPTY_ROOT`]) spans zero blocks, so its coverage is
     /// empty on a holder and a non-holder alike. For that hash the coverage
     /// must be empty, and `body.ok` alone says whether the node serves it. The
@@ -587,7 +593,21 @@ impl StreamResponseExt {
             let end = byte_offset.saturating_add(byte_len);
             Some(proven_size.map_or(end, |size| end.min(size)))
         };
-        let covered = end.is_some_and(|end| self.coverage.covers_byte_range(byte_offset, end));
+        let Some(end) = end else {
+            return !body.ok;
+        };
+        // A wire coverage names only the blocks below `MAX_COVERAGE_BLOCKS`
+        // (`Coverage::for_wire`). The rule judges the part of the span inside
+        // that bound, and a span wholly past it is unknown, so any coverage
+        // agrees with it.
+        let wire_end = u64::from(crate::coverage::MAX_COVERAGE_BLOCKS)
+            .saturating_mul(crate::discovery_block_bytes());
+        if byte_offset < end && byte_offset >= wire_end {
+            return true;
+        }
+        let covered = self
+            .coverage
+            .covers_byte_range(byte_offset, end.min(wire_end));
         body.ok == covered
     }
 

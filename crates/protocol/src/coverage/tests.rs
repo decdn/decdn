@@ -147,3 +147,19 @@ fn covers_byte_range_is_false_past_the_bitmap() {
         "a huge range ends at the bitmap bound"
     );
 }
+
+#[test]
+fn for_wire_cuts_the_bitmap_at_the_wire_bound() -> Result<(), postcard::Error> {
+    let blocks = MAX_COVERAGE_BLOCKS * 2;
+    let cov = Coverage::for_wire(blocks, 0..blocks);
+    assert!(cov.covers(MAX_COVERAGE_BLOCKS - 1));
+    assert!(!cov.covers(MAX_COVERAGE_BLOCKS), "past the wire bound");
+    let decoded: Coverage = postcard::from_bytes(&postcard::to_allocvec(&cov)?)?;
+    assert_eq!(decoded, cov, "a receiver decodes it");
+    assert_eq!(
+        Coverage::for_wire(3, [0, 2].into_iter()),
+        Coverage::from_block_indices(3, [0, 2].into_iter()),
+        "a blob inside the bound is unchanged"
+    );
+    Ok(())
+}

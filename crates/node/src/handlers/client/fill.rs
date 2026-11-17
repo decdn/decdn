@@ -281,7 +281,7 @@ impl ClientHandler {
                 .min(total_bytes)
         };
         let span = byte_range_blocks(req.byte_offset, end).filter_map(|i| u32::try_from(i).ok());
-        Coverage::from_block_indices(num_blocks(total_bytes), held.covered_blocks().chain(span))
+        Coverage::for_wire(num_blocks(total_bytes), held.covered_blocks().chain(span))
     }
 
     /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
@@ -346,4 +346,13 @@ fn fill_span(tier: &'static str, hash: Hash) -> tracing::Span {
         %hash,
         outcome = tracing::field::Empty,
     )
+}
+
+/// The coverage a node answers with when it serves every block of a
+/// `total_bytes`-byte blob: a complete hit, an own-origin fill or a
+/// pull-through. Cut at the wire bound ([`Coverage::for_wire`]), so a blob
+/// past `MAX_DISCOVERABLE_BLOB_BYTES` still gets an answer the payer decodes.
+pub(super) fn full_coverage(total_bytes: u64) -> Coverage {
+    let blocks = num_blocks(total_bytes);
+    Coverage::for_wire(blocks, 0..blocks)
 }

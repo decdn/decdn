@@ -1369,7 +1369,7 @@ impl ClientHandler {
         let coverage = if partial_hit {
             self.partial_hit_coverage(hash, &req, total_bytes).await
         } else {
-            decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes))
+            super::fill::full_coverage(total_bytes)
         };
         let (resp, resp_ext) = self
             .sign_served(&req, rate_per_mb, total_bytes, coverage)

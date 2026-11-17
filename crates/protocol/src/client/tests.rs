@@ -1322,6 +1322,55 @@ fn consistent_with_reads_ok_alone_for_the_empty_root() {
     assert!(!claimed.consistent_with(&body_for(EMPTY_ROOT, false), 0, 0));
 }
 
+/// A served answer for a blob past `MAX_DISCOVERABLE_BLOB_BYTES` carries the
+/// wire-cut coverage: it encodes, decodes, and agrees with the signed body for
+/// a span at the start, a span across the wire bound and a span wholly past
+/// it.
+#[test]
+fn a_blob_past_the_coverage_bound_answers_with_a_decodable_coverage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let size = 2 * crate::coverage::MAX_DISCOVERABLE_BLOB_BYTES;
+    let blocks = crate::num_blocks(size);
+    assert!(blocks > crate::coverage::MAX_COVERAGE_BLOCKS);
+    let ext = StreamResponseExt::served(
+        crate::SizeProof::new(size, Vec::new())?,
+        None,
+        Coverage::for_wire(blocks, 0..blocks),
+    );
+    let buf = encode_stream_response(&sample_response(), Some(&ext))?;
+    let (_, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+    let decoded = parse_stream_response_ext(remainder)?;
+    assert_eq!(decoded, ext);
+
+    let body = sample_body();
+    let wire_end = u64::from(crate::coverage::MAX_COVERAGE_BLOCKS) * crate::discovery_block_bytes();
+    assert!(decoded.consistent_with(&body, 0, 0), "the whole blob");
+    assert!(decoded.consistent_with(&body, 0, 1), "the first byte");
+    assert!(
+        decoded.consistent_with(&body, wire_end - 1, 2),
+        "across the bound"
+    );
+    assert!(
+        decoded.consistent_with(&body, wire_end, 0),
+        "the tail past the bound"
+    );
+    assert!(decoded.consistent_with(&body, size - 1, 1), "the last byte");
+    assert!(
+        !decoded.consistent_with(&body, size, 0),
+        "a span with no byte of the blob"
+    );
+
+    // Inside the bound the rule still binds: a served answer that does not
+    // cover a span there disagrees.
+    let thin = StreamResponseExt::served(
+        crate::SizeProof::new(size, Vec::new())?,
+        None,
+        Coverage::for_wire(blocks, 1..blocks),
+    );
+    assert!(!thin.consistent_with(&body, 0, 1), "block 0 is not covered");
+    Ok(())
+}
+
 // --- ClientMessage dispatcher + StreamError domain split -----------------
 
 #[test]

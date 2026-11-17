@@ -59,6 +59,19 @@ pub const MAX_COVERAGE_BYTES: usize = MAX_DISCOVERABLE_BLOB_BYTES
     .div_ceil(DISCOVERY_BLOCK_BYTES)
     .div_ceil(8) as usize;
 
+/// The most discovery blocks a [`Coverage`] names on the wire: the
+/// [`MAX_COVERAGE_BYTES`] bitmap at 8 blocks per byte, 1,600 blocks.
+///
+/// A blob with more blocks (past [`MAX_DISCOVERABLE_BLOB_BYTES`] at the fixed
+/// 64 MiB block) can still be served. Its coverage on the wire names only
+/// this prefix of its blocks ([`Coverage::for_wire`]), and a receiver reads
+/// a block at or past this index as unknown, never as absent.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_COVERAGE_BYTES is 200, so 1,600 blocks fit in u32"
+)]
+pub const MAX_COVERAGE_BLOCKS: u32 = (MAX_COVERAGE_BYTES * 8) as u32;
+
 /// The active discovery-block size in bytes.
 ///
 /// Production reads the fixed [`DISCOVERY_BLOCK_BYTES`] constant — this
@@ -248,6 +261,18 @@ impl Coverage {
             }
         }
         Self { blocks }
+    }
+
+    /// The coverage a sender puts on the wire for a blob of `num_blocks`
+    /// blocks with the indices from `set` covered: [`Self::from_block_indices`]
+    /// cut at [`MAX_COVERAGE_BLOCKS`], so a receiver always decodes it.
+    ///
+    /// A blob past [`MAX_DISCOVERABLE_BLOB_BYTES`] loses its blocks past the
+    /// bound from the bitmap. The receiver reads those blocks as unknown
+    /// ([`MAX_COVERAGE_BLOCKS`]).
+    #[must_use]
+    pub fn for_wire(num_blocks: u32, set: impl Iterator<Item = u32>) -> Self {
+        Self::from_block_indices(num_blocks.min(MAX_COVERAGE_BLOCKS), set)
     }
 
     /// Is `block` covered?

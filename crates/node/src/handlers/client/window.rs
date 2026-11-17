@@ -470,7 +470,7 @@ impl ClientHandler {
                 req,
                 rate_per_mb,
                 total_bytes,
-                decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes)),
+                super::fill::full_coverage(total_bytes),
             )
             .await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
@@ -742,7 +742,7 @@ impl ClientHandler {
                 req,
                 rate_per_mb,
                 total_bytes,
-                decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes)),
+                super::fill::full_coverage(total_bytes),
             )
             .await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)

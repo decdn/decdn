@@ -2091,3 +2091,39 @@ fn a_zero_share_claims_nothing() {
     assert_eq!(lane.claim(0), 0);
     assert_eq!(lane.unclaimed(), MIB);
 }
+
+/// A blob past `MAX_DISCOVERABLE_BLOB_BYTES` is served with a coverage the
+/// payer decodes: `full_coverage` cuts the bitmap at the wire bound, and the
+/// served answer still agrees with the signed body for any span.
+#[test]
+fn full_coverage_of_a_blob_past_the_wire_bound_decodes() -> anyhow::Result<()> {
+    use decdn_protocol::coverage::{MAX_COVERAGE_BYTES, MAX_DISCOVERABLE_BLOB_BYTES};
+
+    let size = 10 * MAX_DISCOVERABLE_BLOB_BYTES;
+    let coverage = super::fill::full_coverage(size);
+    let encoded = postcard::to_allocvec(&coverage)?;
+    anyhow::ensure!(
+        encoded.len() <= MAX_COVERAGE_BYTES + 2,
+        "{} B",
+        encoded.len()
+    );
+    let decoded: decdn_protocol::Coverage = postcard::from_bytes(&encoded)?;
+    let ext = decdn_protocol::client::StreamResponseExt::served(
+        decdn_protocol::SizeProof::new(size, Vec::new())?,
+        None,
+        decoded,
+    );
+    let body = decdn_protocol::client::StreamResponseBody {
+        hash: [7; 32],
+        ok: true,
+        rate_per_mb: 1,
+        timestamp_us: 0,
+    };
+    anyhow::ensure!(ext.consistent_with(&body, 0, 0));
+    anyhow::ensure!(ext.consistent_with(&body, size - 1, 0));
+    anyhow::ensure!(
+        super::fill::full_coverage(1) == decdn_protocol::Coverage::full(1),
+        "a small blob covers its one block"
+    );
+    Ok(())
+}

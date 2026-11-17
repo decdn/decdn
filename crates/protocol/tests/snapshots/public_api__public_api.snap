@@ -148,6 +148,7 @@ pub fn decdn_protocol::coverage::Coverage::covered_blocks(&self) -> impl core::i
 pub fn decdn_protocol::coverage::Coverage::covers(&self, u32) -> bool
 pub fn decdn_protocol::coverage::Coverage::covers_byte_range(&self, u64, u64) -> bool
 pub fn decdn_protocol::coverage::Coverage::empty() -> Self
+pub fn decdn_protocol::coverage::Coverage::for_wire(u32, impl core::iter::traits::iterator::Iterator<Item = u32>) -> Self
 pub fn decdn_protocol::coverage::Coverage::from_block_indices(u32, impl core::iter::traits::iterator::Iterator<Item = u32>) -> Self
 pub fn decdn_protocol::coverage::Coverage::full(u32) -> Self
 pub fn decdn_protocol::coverage::Coverage::is_empty(&self) -> bool
@@ -155,6 +156,7 @@ pub struct decdn_protocol::coverage::TestBlockSizeGuard
 impl core::ops::drop::Drop for decdn_protocol::coverage::TestBlockSizeGuard
 pub fn decdn_protocol::coverage::TestBlockSizeGuard::drop(&mut self)
 pub const decdn_protocol::coverage::DISCOVERY_BLOCK_BYTES: u64
+pub const decdn_protocol::coverage::MAX_COVERAGE_BLOCKS: u32
 pub const decdn_protocol::coverage::MAX_COVERAGE_BYTES: usize
 pub const decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES: u64
 pub fn decdn_protocol::coverage::byte_range_blocks(u64, u64) -> core::ops::range::Range<u64>
@@ -497,6 +499,7 @@ pub fn decdn_protocol::coverage::Coverage::covered_blocks(&self) -> impl core::i
 pub fn decdn_protocol::coverage::Coverage::covers(&self, u32) -> bool
 pub fn decdn_protocol::coverage::Coverage::covers_byte_range(&self, u64, u64) -> bool
 pub fn decdn_protocol::coverage::Coverage::empty() -> Self
+pub fn decdn_protocol::coverage::Coverage::for_wire(u32, impl core::iter::traits::iterator::Iterator<Item = u32>) -> Self
 pub fn decdn_protocol::coverage::Coverage::from_block_indices(u32, impl core::iter::traits::iterator::Iterator<Item = u32>) -> Self
 pub fn decdn_protocol::coverage::Coverage::full(u32) -> Self
 pub fn decdn_protocol::coverage::Coverage::is_empty(&self) -> bool
