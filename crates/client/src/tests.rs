@@ -1288,6 +1288,48 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `Declined` refusal of the request's payment pool hands the caller the
+/// pools the node accepts; any other refusal hands none.
+#[test]
+fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
+    use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
+    use decdn_protocol::{PoolAccount, StreamResponseExt};
+
+    use super::UpstreamRefused;
+
+    let response = StreamResponse {
+        body: StreamResponseBody {
+            hash: [0x5Au8; 32],
+            ok: false,
+            rate_per_mb: 10,
+            timestamp_us: 1_700_000_000_000_000,
+        },
+        slash_sig: vec![0; 65],
+    };
+    let accepted = vec![PoolAccount::eip155(8_453, [0xb1; 20])];
+    let declined = UpstreamRefused::open(
+        response.clone(),
+        &StreamResponseExt::pool_declined(accepted.clone()),
+    );
+    let refused = declined
+        .downcast_ref::<UpstreamRefused>()
+        .ok_or_else(|| anyhow::anyhow!("a typed refusal: {declined:#}"))?;
+    anyhow::ensure!(*refused.error() == StreamError::Declined);
+    anyhow::ensure!(refused.accepted_pools() == Some(accepted.as_slice()));
+
+    let plain = UpstreamRefused::open(response, &StreamResponseExt::refused(StreamError::Declined));
+    let refused = plain
+        .downcast_ref::<UpstreamRefused>()
+        .ok_or_else(|| anyhow::anyhow!("a typed refusal: {plain:#}"))?;
+    anyhow::ensure!(refused.accepted_pools().is_none());
+    anyhow::ensure!(
+        UpstreamRefused::mid_stream(StreamError::Declined)
+            .accepted_pools()
+            .is_none()
+    );
+    Ok(())
+}
+
 #[test]
 fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;

@@ -21,29 +21,25 @@ use decdn_client::{Funder, LocalPullFault, Recovery};
 use crate::buyer_pool::PoolOpener;
 
 /// One step of the settle wait after a funding recovery step's top-up. Small
-/// enough that the common case (the upstream's watcher was already close to
-/// its next poll) costs little.
+/// enough that the common case (the upstream was already close to its next
+/// pool read) costs little.
 pub(crate) const SETTLE_POLL_STEP: Duration = Duration::from_millis(500);
 
 /// How many [`SETTLE_POLL_STEP`]s a fill waits, after its funding recovery
-/// step topped the pool up, for the UPSTREAM's chain watcher to observe the
-/// new deposit before treating its refusal as real.
+/// step topped the pool up, for the UPSTREAM to read the new deposit before
+/// treating its refusal as real.
 ///
-/// The upstream gates serving on the deposit it has observed, so between our
-/// receipt and its next poll it correctly refuses a stream for a pool it still
-/// believes is short. Waiting that out is money-safe: an open sends no voucher.
+/// The upstream gates serving on the deposit it has read, so between our
+/// receipt and its next `getPool` it correctly refuses a stream for a pool it
+/// still believes is short. Waiting that out is money-safe: an open sends no
+/// voucher. An upstream re-reads a pool with a live lane once per
+/// `upstream_pool_refresh` and an idle pool on the next admission, so one
+/// interval covers the worst case.
 ///
-/// Sized at **two poll intervals** (14 s at the 7 s default), not a hard-coded
-/// constant. One interval is the bare minimum and leaves no room for the
-/// watcher's own head TTL, and anything derived from our own timeouts would
-/// drift the moment an operator retunes the chain lane. Two clears a full poll
-/// plus the head cache in the ordinary case.
-///
-/// Then capped at [`MAX_SETTLE_WAITS`], because `event_poll_interval_ms` has a
-/// config floor but NO ceiling: at a 60 s chain lane the derived budget would
-/// be 240 steps: two minutes of a foreground client's pull spent waiting.
-pub(crate) fn settle_wait_budget(event_poll_interval: Duration) -> u32 {
-    let budget = event_poll_interval.saturating_mul(2).as_millis();
+/// Then capped at [`MAX_SETTLE_WAITS`], so a foreground client's pull never
+/// spends more than that waiting.
+pub(crate) fn settle_wait_budget(upstream_pool_refresh: Duration) -> u32 {
+    let budget = upstream_pool_refresh.as_millis();
     let step = SETTLE_POLL_STEP.as_millis().max(1);
     u32::try_from(budget / step)
         .unwrap_or(u32::MAX)
@@ -53,12 +49,11 @@ pub(crate) fn settle_wait_budget(event_poll_interval: Duration) -> u32 {
 /// The settle window ([`decdn_client::RecoveryGate::with_settle`]) a fill's
 /// funding recovery gate keeps after a top-up: [`settle_wait_budget`] steps of
 /// [`SETTLE_POLL_STEP`].
-pub(crate) fn settle_window(event_poll_interval: Duration) -> Duration {
-    SETTLE_POLL_STEP.saturating_mul(settle_wait_budget(event_poll_interval))
+pub(crate) fn settle_window(upstream_pool_refresh: Duration) -> Duration {
+    SETTLE_POLL_STEP.saturating_mul(settle_wait_budget(upstream_pool_refresh))
 }
 
-/// Hard ceiling on the settle wait, whatever the configured chain cadence: 30 s
-/// of waits. Past this the top-up is better treated as not-yet-visible and the
+/// Hard ceiling on the settle wait: 30 s of waits. Past this the top-up is better treated as not-yet-visible and the
 /// fill ended, than kept alive on a client's clock.
 const MAX_SETTLE_WAITS: u32 = 60;
 

@@ -25,6 +25,7 @@ fn fixture(
                 decdn_protocol::Coverage::empty()
             },
             size_proof: total_bytes.map(|size| decdn_protocol::SizeProof::new(size, []).unwrap()),
+            payment_pools: None,
         },
     )
 }
@@ -171,6 +172,7 @@ fn a_stated_size_must_carry_its_proof() {
     let ext = |size_proof| decdn_protocol::ProbeResponseExt {
         coverage: decdn_protocol::Coverage::empty(),
         size_proof,
+        payment_pools: None,
     };
     assert!(check_stated_size(hash, &ext(Some(proof(size)))).is_ok());
     assert!(check_stated_size(hash, &ext(None)).is_ok());

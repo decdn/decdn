@@ -57,11 +57,27 @@ pub enum NodeCommand {
     /// Print what the node has earned (#2598): settled USDC, bytes and
     /// settlement counts over the last 24 hours, the last 7 days and the
     /// whole settlement ledger, the most recent settlement, and what the
-    /// lanes still owe with the time of the next redeem sweep. Reads
+    /// lanes still owe with the time of the next redeem sweep, and per pool
+    /// the protocol share waiting for `decdn node sweep`. Reads
     /// `admin_v1_earnings` on the running node; with `--address` it reads
-    /// the chain alone (no daemon, no pending section), scanning
-    /// `FeeRouter.Settled` for that operator.
+    /// the chain alone (no daemon, no pending redeem line), scanning each
+    /// pool's USDC transfers to that operator.
     Earnings(EarningsArgs),
+    /// Send the operator's pending protocol share to the governance chain
+    /// (ADR 003 § Redemption-path interface). For each payment pool it reads
+    /// `pending` for the operator and every `--with` operator, and
+    /// `minSweep()`, and calls `sweep(operators)` with the operators that
+    /// have a share once the batch total reaches `minSweep`. The sweep burns
+    /// the USDC over CCTP; `decdn node receive-sweeps` completes it on the
+    /// governance chain.
+    Sweep(SweepArgs),
+    /// Complete the operator's sweeps on the governance chain. For each sweep
+    /// transaction that carried the operator's share it fetches the CCTP
+    /// message and attestation from Circle's attestation service (Iris) once,
+    /// waits while the attestation is pending, and calls
+    /// `CctpSweepReceiver.receiveSweep` once per message. A sweep already
+    /// received, by this operator or another one in the batch, is skipped.
+    ReceiveSweeps(ReceiveSweepsArgs),
     /// Print every slash the node's watcher has detected against its own
     /// operator via `admin_v1_slashes` (#1032, G-NODE-05): per slash the
     /// `slashId`, offense type, amount, evidence digest, block, and the
@@ -349,8 +365,7 @@ pub struct EarningsArgs {
 
     /// Path to the TOML config file. In daemon mode it derives the admin
     /// URL when `--admin-url` / `DECDN_ADMIN_URL` are unset; in `--address`
-    /// mode it supplies `blockchain.rpc_url`,
-    /// `blockchain.payment_pool_address`, `blockchain.chain_id` and
+    /// mode it supplies the `[[blockchain.payment_chains]]` pools and
     /// `blockchain.get_logs_max_block_span`. Takes precedence over the
     /// top-level `decdn --config`; if neither is set, resolution falls
     /// through to `~/.decdn/node.toml`.
@@ -372,31 +387,122 @@ pub struct EarningsArgs {
     pub since: Option<String>,
 
     /// Read the chain instead of the daemon, for this operator address
-    /// (`0x…`). Scans `FeeRouter.Settled` from the deployment's first block
-    /// (or `--from-block`) to head, so it needs no running node and works for
-    /// any operator, but
-    /// it sees no lane state: the pending line is omitted. Slow on an RPC
-    /// that caps `eth_getLogs` windows (the free tiers do); progress prints
-    /// to stderr.
+    /// (`0x…`). For each payment pool it scans the USDC transfers from the
+    /// pool to the operator from the deployment's first block (or
+    /// `--from-block`) to head, reads each one's redemption receipt, and reads
+    /// the operator's pending protocol share. It needs no running node and
+    /// works for any operator, but it sees no lane state: the pending redeem
+    /// line is omitted. Slow on an RPC that caps `eth_getLogs` windows (the
+    /// free tiers do); progress prints to stderr.
     #[arg(long, value_name = "ADDRESS")]
     pub address: Option<String>,
 
-    /// `--address` mode: JSON-RPC endpoint. Overrides `blockchain.rpc_url`;
-    /// falls back to the known chain's public endpoint.
-    #[arg(long, value_name = "URL", requires = "address")]
-    pub rpc_url: Option<String>,
+    /// `--address` mode: the pools to read. Every configured pool without
+    /// `--pool`. Daemon mode refuses `--pool`: the node reports every pool
+    /// it serves.
+    #[command(flatten)]
+    pub payment: super::common::PoolSelectArgs,
 
-    /// `--address` mode: `PaymentPool` address, from which the `FeeRouter` is
-    /// read. Overrides `blockchain.payment_pool_address`; falls back to the
-    /// known chain's deployment manifest.
-    #[arg(long, value_name = "ADDRESS", requires = "address")]
-    pub payment_pool_address: Option<String>,
-
-    /// `--address` mode: first L2 block to scan. Defaults to the known
-    /// chain's deployment block. Raise it to shorten the scan when the
-    /// earlier history does not matter.
+    /// `--address` mode: first block to scan on each payment chain. Defaults
+    /// to the known payment chain's deployment block. Raise it to shorten the
+    /// scan when the earlier history does not matter.
     #[arg(long, value_name = "BLOCK", requires = "address")]
     pub from_block: Option<u64>,
+}
+
+/// `decdn node sweep` — send the operator's pending protocol share to the
+/// governance chain (`PaymentPool.sweep`).
+#[derive(Args, Debug)]
+pub struct SweepArgs {
+    /// The pools to sweep. Every configured pool without `--pool`.
+    #[command(flatten)]
+    pub payment: super::common::PoolSelectArgs,
+
+    /// Another operator to sweep in the same batch, so the operators share
+    /// one CCTP transfer and one receive on the governance chain. Repeat for
+    /// several (one batch holds at most `MAX_SWEEP_BATCH()` operators,
+    /// including this one). An operator with nothing pending is left out.
+    #[arg(long = "with", value_name = "ADDRESS")]
+    pub with: Vec<String>,
+
+    /// The operator keystore, data dir, config file and output flags. The
+    /// keystore pays the gas and names the operator whose share is swept.
+    #[command(flatten)]
+    pub operator: OperatorKeyArgs,
+}
+
+/// `decdn node receive-sweeps` — complete the operator's sweeps on the
+/// governance chain (`CctpSweepReceiver.receiveSweep`).
+#[derive(Args, Debug)]
+pub struct ReceiveSweepsArgs {
+    /// The pools whose sweeps to complete. Every configured pool without
+    /// `--pool`.
+    #[command(flatten)]
+    pub payment: super::common::PoolSelectArgs,
+
+    /// The governance chain the sweeps land on.
+    #[command(flatten)]
+    pub governance: super::common::GovernanceChainArgs,
+
+    /// `CctpSweepReceiver` address on the governance chain. Overrides
+    /// `blockchain.cctp_sweep_receiver_address`.
+    #[arg(long, value_name = "ADDRESS")]
+    pub cctp_sweep_receiver_address: Option<String>,
+
+    /// A sweep transaction on `--pool`'s payment chain to complete. Repeat
+    /// for several. Without it, the command scans the payment chains for the
+    /// operator's `Swept` events.
+    #[arg(long = "tx", value_name = "HASH", requires = "pool")]
+    pub txs: Vec<String>,
+
+    /// Circle attestation service (Iris) base URL. Overrides
+    /// `blockchain.cctp_iris_url`; defaults to the known chain's.
+    #[arg(long, value_name = "URL")]
+    pub iris: Option<String>,
+
+    /// First block of the `Swept` scan on each payment chain. Defaults to the
+    /// known payment chain's deployment block.
+    #[arg(long, value_name = "BLOCK", conflicts_with = "txs")]
+    pub from_block: Option<u64>,
+
+    /// The operator keystore, data dir, config file and output flags. The
+    /// keystore pays the governance-chain gas and names the operator.
+    #[command(flatten)]
+    pub operator: OperatorKeyArgs,
+}
+
+/// The operator key and output flags of `decdn node sweep` and
+/// `decdn node receive-sweeps`.
+#[derive(Args, Debug)]
+pub struct OperatorKeyArgs {
+    /// Path to the TOML config file supplying `[blockchain]` / `[identity]`
+    /// fields not passed as flags. Takes precedence over the top-level
+    /// `decdn --config`; falls through to `~/.decdn/node.toml`.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Ethereum keystore file. Overrides `blockchain.eth_keystore`; defaults
+    /// to `<data_dir>/keystore.json`.
+    #[arg(long, value_name = "PATH")]
+    pub keystore: Option<PathBuf>,
+
+    /// Data directory. Overrides `identity.data_dir`; defaults to `~/.decdn`.
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: Option<PathBuf>,
+
+    /// File whose contents are the keystore password. Consulted after the
+    /// `DECDN_KEYSTORE_PASSWORD` env var and before an interactive prompt on a
+    /// TTY.
+    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
+    pub keystore_password_file: Option<PathBuf>,
+
+    /// Print what the command would send without sending any transaction.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit the result as JSON instead of human-readable lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `decdn node slashes` — list detected slashes against this node's

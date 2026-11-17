@@ -88,7 +88,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 
 #### FeeRouter split (per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split))
 
-The governance-chain `FeeRouter` splits each swept protocol share. Governance sets the split through the Timelock. The split has no bounds.
+The governance-chain `FeeRouter` splits each swept protocol share. Governance sets the split through the Timelock. The rebate is at most 99%, so buyback plus treasury keep at least 1% and vote weight stays earnable ([ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)).
 
 | Parameter | Meaning |
 | --- | --- |

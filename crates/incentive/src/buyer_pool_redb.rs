@@ -99,8 +99,13 @@ impl RedbBuyerPoolStore {
     ///
     /// Returns [`StoreError`] if the raw row cannot be committed durably.
     #[cfg(feature = "test-util")]
-    pub fn insert_raw_buyer_record(&self, pool_id: PoolId, bytes: &[u8]) -> Result<(), StoreError> {
-        self.table().insert_raw(pool_id, bytes)
+    pub fn insert_raw_buyer_record(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        self.table().insert_raw(deployment, pool_id, bytes)
     }
 }
 
@@ -213,24 +218,38 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
         self.table().record(state)
     }
 
-    fn forget(&self, owner: Address) -> Result<(), StoreError> {
-        self.table().forget(owner)
+    fn forget(&self, deployment: Deployment, owner: Address) -> Result<(), StoreError> {
+        self.table().forget(deployment, owner)
     }
 
-    fn forget_if_pool(&self, owner: Address, pool_id: PoolId) -> Result<bool, StoreError> {
-        self.table().forget_if_pool(owner, pool_id)
+    fn forget_if_pool(
+        &self,
+        deployment: Deployment,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<bool, StoreError> {
+        self.table().forget_if_pool(deployment, owner, pool_id)
     }
 
-    fn get_by_pool_id(&self, pool_id: PoolId) -> Result<Option<BuyerPoolState>, StoreError> {
-        self.table().get_by_pool_id(pool_id)
+    fn get_by_pool_id(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+    ) -> Result<Option<BuyerPoolState>, StoreError> {
+        self.table().get_by_pool_id(deployment, pool_id)
     }
 
-    fn get_by_owner(&self, owner: Address) -> Result<Option<BuyerPoolState>, StoreError> {
-        self.table().get_by_owner(owner)
+    fn get_by_owner(
+        &self,
+        deployment: Deployment,
+        owner: Address,
+    ) -> Result<Option<BuyerPoolState>, StoreError> {
+        self.table().get_by_owner(deployment, owner)
     }
 
     fn advance_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -238,11 +257,12 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError> {
         self.table()
-            .advance_progress(owner, pool_id, lane, bytes, amount)
+            .advance_progress(deployment, owner, pool_id, lane, bytes, amount)
     }
 
     fn rebase_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -250,11 +270,12 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
         totals: BuyerLaneProgress,
     ) -> Result<AdvanceOutcome, StoreError> {
         self.table()
-            .rebase_progress(owner, pool_id, lane, anchor, totals)
+            .rebase_progress(deployment, owner, pool_id, lane, anchor, totals)
     }
 
     fn seed_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -262,16 +283,18 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError> {
         self.table()
-            .seed_progress(owner, pool_id, lane, bytes, amount)
+            .seed_progress(deployment, owner, pool_id, lane, bytes, amount)
     }
 
     fn add_deposit(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         additional: U256,
     ) -> Result<DepositOutcome, StoreError> {
-        self.table().add_deposit(owner, pool_id, additional)
+        self.table()
+            .add_deposit(deployment, owner, pool_id, additional)
     }
 
     fn delegate_lanes(

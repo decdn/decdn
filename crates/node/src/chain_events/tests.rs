@@ -27,7 +27,7 @@ async fn timed_bounds_a_hanging_call_at_the_default() {
 async fn timed_honours_an_explicit_timeout() {
     let hang = std::future::pending::<std::result::Result<u64, std::io::Error>>();
     let started = tokio::time::Instant::now();
-    let _ = timed(Some(Duration::from_millis(50)), "get_logs", hang).await;
+    let _ = timed(Some(Duration::from_millis(50)), "getPool", hang).await;
     assert!(
         started.elapsed() < DEFAULT_RPC_CALL_TIMEOUT,
         "explicit timeout must win over the 10s default"

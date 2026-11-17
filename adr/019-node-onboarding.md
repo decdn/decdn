@@ -121,17 +121,17 @@ The node process MUST complete all of the following steps before opening any QUI
 
 #### Step 3.1 — Sync content blacklist
 
-Enumerate the full current deny-set from the `ContentBlacklist` contract at a single pinned block — the blacklisted address union (`blacklistedAddresses`, kept to the live members of `isOriginBlacklisted || isOperatorBlacklisted`) and the node's in-scope hashes (`getScopeRegions` then `blacklistedHashes` per region, liveness-filtered by `isHashBlacklistedForOperator`). The node MUST NOT accept connections until this enumeration completes successfully ([ADR 011](011-content-takedown.md#enumerating-the-deny-set)).
+Enumerate the full current deny-set from the `ContentBlacklist` contract at the governance chain's `safe` block — the ledger cursor (`mutationCount`), the blacklisted address union (`blacklistedAddresses`, kept to the live members of `isOriginBlacklisted || isOperatorBlacklisted`) and the node's in-scope hashes (`getScopeRegions` then `blacklistedHashes` per region, liveness-filtered by `isHashBlacklistedForOperator`). The node MUST NOT accept connections until this enumeration completes successfully ([ADR 011](011-content-takedown.md#enumerating-the-deny-set)).
 
 The enumeration and its enforcement pass retry on a transient RPC failure. See [Boot-time chain reads](#boot-time-chain-reads) below.
 
-After the initial enumeration, the node follows the contract's blacklist events for live updates and periodically re-enumerates as the backstop. There is no version checkpoint to record: every boot rebuilds the complete deny-set, so a node returning from any downtime is immediately current.
+After the initial enumeration, the node polls the contract's mutation ledger at the `safe` block and applies the new records in order ([ADR 011 § Following the mutation ledger](011-content-takedown.md#following-the-mutation-ledger)). The node keeps its cursor in memory only: every boot rebuilds the complete deny-set, so a node returning from any downtime is immediately current.
 
 #### Step 3.2 — Build initial node view from on-chain registry
 
 Query `CapacityBond.getRegisteredNodes(offset=0, limit=100)` to bootstrap the local node view. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
 
-This registry snapshot is the initial node view. The node subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to keep the view fresh ([ADR 001 § Node Discovery (Registry)](001-network.md#node-discovery-registry)).
+This registry snapshot is the initial node view. The node keeps the view fresh by reading the snapshot again ([§ Chain state reads](#chain-state-reads)).
 
 If the read fails, the node retries it as [Boot-time chain reads](#boot-time-chain-reads) describes. If the retries do not succeed, the node cannot start: without a node view it cannot take part in DHT lookups or probing.
 
@@ -143,10 +143,27 @@ Four boot reads must succeed before the node serves: the registry snapshot (Step
 - One boot deadline applies to all four reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
 - A deterministic failure stops the node at once. Examples are no contract at the configured address, an ABI mismatch, a revert, a JSON-RPC invalid request, method or params error, and an HTTP 4xx other than 408 and 429 that has no `Retry-After` header.
 - A retry delays readiness. It does not open the node to connections: Step 3.1 still gates them.
-- The registry, slash, and blacklist enumerations read at one snapshot block. The snapshot block is 256 blocks below the head that the RPC reports. A load-balanced RPC reports the head of its newest upstream. An upstream that is behind that head cannot serve it, but all upstreams can serve an older block. If the contract has no code at the snapshot block, the contract is newer than the margin, and the node reads at the head.
-- Each event tail starts at its snapshot block. The first poll applies the events between the snapshot block and the head again. Each watcher ignores an event that it already has.
+- The registry, slash, and origin-seat snapshots read at one snapshot block. The snapshot block is 256 blocks below the head that the RPC reports. A load-balanced RPC reports the head of its newest upstream. An upstream that is behind that head cannot serve it, but all upstreams can serve an older block. If the contract has no code at the snapshot block, the contract is newer than the margin, and the node reads at the head.
+- The blacklist enumeration reads at the `safe` block ([ADR 011 § Enumerating the deny-set](011-content-takedown.md#enumerating-the-deny-set)).
 
 The operator-share read (the payment chain pool's immutable `operatorBps`) uses the same retry. It retries for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after it. When it fails, the node does not stop. It holds no operator share and makes no upstream purchase until a later read of `operatorBps` succeeds ([ADR 041](041-refuse-to-serve.md#adr-041-refuse-to-serve-economics)).
+
+#### Chain state reads
+
+The node reads all chain state by `eth_call`. It reads no event log. After boot, each piece of state has its own refresh loop:
+
+| State | Interval | Read | Block |
+|-------|----------|------|-------|
+| Registry: active set, `NodeId → operator` bindings, regions, multiaddrs | 5 minutes | `getRegisteredNodes`, paged | Snapshot block |
+| Seated origins | 10 minutes | The full seat set | Snapshot block |
+| This operator's slashes | 15 minutes | `operatorSlashCount(self)` at the head; the slash list, at the snapshot block, only when the count changes | Head, then snapshot block |
+| `ContentBlacklist` deny index | `content_blacklist_poll_interval_sec`, at most 5 minutes | `mutationCount`, then `getMutations` for new records | `safe` |
+| Payment pools with a live lane | 30 seconds | `getPool` and `getAuthorizations` | Head |
+
+- A peer `NodeId` that the registry view does not hold triggers a registry read before the interval ends. A seat lookup that misses triggers a seat read in the same way. Each trigger runs at most once a minute.
+- A failed refresh keeps the state that the node already holds. The next interval tries again.
+- A payment pool that the node sees for the first time at admission costs one `getPool` read. A read stays valid for 30 seconds. A pool with no live lane is not read again until a request names it.
+- The node learns its own redemptions from the receipts of its own `redeemMany` transactions. It reads `getWatermarks` before each redemption. It reads `getPool` before each redemption to learn whether the pool is closing. It records each sent transaction hash and reads the receipt again after a restart ([ADR 003 § Off-chain voucher state persistence](003-payments.md#off-chain-voucher-state-persistence)).
 
 #### Step 3.3 — Configure local rate
 
@@ -163,7 +180,7 @@ After Phase 3, the node can accept connections immediately, even before every pe
 |---|-------|---------------|
 | 1 | Node is active in the on-chain registry | `CapacityBond.isActiveNode(nodeId)` returns `true` |
 | 2 | Rate floor loaded | Node has `deliveryFloor` in memory |
-| 3 | Blacklist synced | Local blacklist is at the current `blacklistVersion` |
+| 3 | Blacklist synced | The initial deny-set enumeration and its enforcement pass completed |
 | 4 | QUIC listener open | `iroh::Endpoint` bound and listening on configured port(s) |
 | 5 | Reachability known | The bring-up reachability log line reports the public address as registered, or reports the node as behind NAT. `decdn_node_public_address` carries the same result. |
 

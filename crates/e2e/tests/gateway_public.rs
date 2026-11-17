@@ -642,12 +642,18 @@ fn private_tempdir(role: &str) -> anyhow::Result<tempfile::TempDir> {
 /// The chain coordinates as flags, so no config file is needed.
 fn chain_flags(chain: &ChainFixture) -> Vec<String> {
     vec![
-        "--rpc-url".into(),
+        "--governance-rpc-url".into(),
         chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
-        "--chain-id".into(),
+        "--governance-chain-id".into(),
         chain.chain_id().to_string(),
+        "--pool".into(),
+        format!(
+            "eip155:{}:{:#x}",
+            chain.chain_id(),
+            chain.addrs().payment_pool
+        ),
+        "--pool-rpc-url".into(),
+        chain.rpc_url(),
     ]
 }
 

@@ -96,29 +96,33 @@ fn resolve_data_dir(data_dir: Option<PathBuf>, file: &FileConfig) -> anyhow::Res
         })
 }
 
-fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
+/// Every pool the command may act on: `--pool`, else every configured pool.
+fn resolve_pools(
+    args: &cli::PoolChainArgs,
+    file: &FileConfig,
+) -> anyhow::Result<Vec<decdn_client::session::PaymentPoolChain>> {
     let bc = file.blockchain.as_ref();
-    let rpc_url = args
-        .rpc_url
-        .clone()
-        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
-        .ok_or_else(|| anyhow::anyhow!("rpc_url not set (--rpc-url or blockchain.rpc_url)"))?;
-    let payment_pool_raw = args
-        .payment_pool_address
-        .clone()
-        .or_else(|| bc.and_then(|b| b.payment_pool_address.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "payment_pool_address not set (--payment-pool-address or \
-                 blockchain.payment_pool_address)"
-            )
-        })?;
-    let payment_pool =
-        super::chain_ctx::parse_nonzero_address(&payment_pool_raw, "payment_pool_address")?;
-    let chain_id = args
-        .chain_id
-        .or_else(|| bc.and_then(|b| b.chain_id))
-        .unwrap_or(DEFAULT_CHAIN_ID);
+    super::pool_select::resolve_pools(
+        &args.payment,
+        bc.map(|b| b.payment_chains.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(Into::into),
+        bc.and_then(|b| b.chain_id).unwrap_or(DEFAULT_CHAIN_ID),
+    )
+}
+
+/// The command's coordinates on one `pool`: the keystore and data dir resolve
+/// as for every pool.
+fn resolve_chain_for(
+    args: &cli::PoolChainArgs,
+    file: &FileConfig,
+    pool: &decdn_client::session::PaymentPoolChain,
+) -> anyhow::Result<Resolved> {
+    let bc = file.blockchain.as_ref();
+    let rpc_url = pool.rpc_url.clone();
+    let payment_pool = pool.deployment.payment_pool;
+    let chain_id = pool.deployment.chain_id;
     let data_dir = resolve_data_dir(args.data_dir.clone(), file)?;
     let keystore = args
         .keystore
@@ -138,6 +142,16 @@ fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result
     })
 }
 
+/// The command's coordinates on one pool: `--pool`, else the first
+/// configured.
+fn resolve_chain(args: &cli::PoolChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
+    let pools = resolve_pools(args, file)?;
+    let first = pools
+        .first()
+        .context("no payment pool configured (pass --pool)")?;
+    resolve_chain_for(args, file, first)
+}
+
 /// Buyer signer for the on-chain `pool` commands (vouchers +
 /// open/top-up/close/reclaim txs). Password from `KEYSTORE_PASSWORD_ENV`, else
 /// `--keystore-password-file`, else TTY.
@@ -153,21 +167,21 @@ fn load_buyer_signer(chain: &Resolved) -> anyhow::Result<PrivateKeySigner> {
     load_signer(&chain.keystore, &password)
 }
 
-/// Parse a user-supplied `--pool`: 64 hex chars, optionally `0x`-prefixed (the
-/// on-chain `poolId` is `keccak256(owner, ownerPoolNonce)`, a `bytes32`).
+/// Parse a user-supplied `--pool-id`: 64 hex chars, optionally `0x`-prefixed
+/// (the on-chain `poolId` is `keccak256(owner, ownerPoolNonce)`, a `bytes32`).
 fn parse_pool_id(s: &str) -> anyhow::Result<PoolId> {
     B256::from_str(s)
-        .map_err(|e| anyhow::anyhow!("invalid --pool {s:?}: expected a 32-byte hex hash: {e}"))
+        .map_err(|e| anyhow::anyhow!("invalid --pool-id {s:?}: expected a 32-byte hex hash: {e}"))
 }
 
 /// Reject a `getPool` read whose on-chain `owner` isn't this keystore — a wrong
-/// keystore/contract or a stale `--pool` id (a zero `owner` means the pool was
+/// keystore/contract or a stale `--pool-id` (a zero `owner` means the pool was
 /// never opened on this contract).
 fn ensure_owned(on_chain_owner: Address, ours: Address, pool_id: PoolId) -> anyhow::Result<()> {
     anyhow::ensure!(
         on_chain_owner == ours,
         "pool {pool_id} on-chain owner {on_chain_owner} is not this keystore's address {ours} \
-         — wrong keystore/contract, or a mistyped --pool"
+         — wrong keystore/contract, or a mistyped --pool-id"
     );
     Ok(())
 }
@@ -279,7 +293,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     let data_dir = resolve_data_dir(args.chain.data_dir.clone(), &file)?;
     let store = open_client_store_for_escrow(&data_dir, "top up a pool")?;
     let chain = resolve_chain(&args.chain, &file)?;
-    let pool_id = parse_pool_id(&args.pool)?;
+    let pool_id = parse_pool_id(&args.pool_id)?;
     let signer = Arc::new(load_buyer_signer(&chain)?);
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
@@ -306,7 +320,15 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     // `topUp`, so the command names it rather than dying with no hash.
     let escrows = UnconfirmedEscrows::default();
     let mut interrupt = Interrupt::watch(escrows.clone());
-    let topped_up = top_up_and_credit(&contract, &store, owner, pool_id, additional, &escrows);
+    let topped_up = top_up_and_credit(
+        &contract,
+        &store,
+        chain.deployment(),
+        owner,
+        pool_id,
+        additional,
+        &escrows,
+    );
     let result = tokio::select! {
         result = topped_up => result,
         () = interrupt.wait() => Err(Interrupted.into()),
@@ -328,6 +350,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
 async fn top_up_and_credit<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &dyn BuyerPoolStore,
+    deployment: Deployment,
     owner: Address,
     pool_id: PoolId,
     additional: U256,
@@ -353,14 +376,17 @@ where
     // low-water check re-fires on every later fetch, and re-running this
     // command escrows again.
     let effect = topped_up_effect(pool_id, credited);
-    let new_deposit =
-        match grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx) {
-            Ok(deposit) => {
-                unrecorded.recorded();
-                deposit
-            }
-            Err(err) => return Err(unrecorded.untracked(err)),
-        };
+    let new_deposit = match grade_deposit_credit(
+        store.add_deposit(deployment, owner, pool_id, credited),
+        &effect,
+        tx,
+    ) {
+        Ok(deposit) => {
+            unrecorded.recorded();
+            deposit
+        }
+        Err(err) => return Err(unrecorded.untracked(err)),
+    };
     Ok((credited, new_deposit))
 }
 
@@ -477,7 +503,7 @@ impl LocalBookkeeping<'_> {
                 // at a pool that is now `Closed`, whose `deposit` field still
                 // reads healthy, so a later fetch reuses it and signs vouchers
                 // `redeemMany` rejects outright. Warn rather than fail: the
-                // refund itself landed, and a re-run of `reclaim --pool` reads
+                // refund itself landed, and a re-run of `reclaim --pool-id` reads
                 // the pool as `Closed` and clears the row on that refusal (see
                 // `forget_not_open`).
                 if let Err(e) = forget_on(store, deployment, owner, pool_id) {
@@ -485,7 +511,7 @@ impl LocalBookkeeping<'_> {
                         "warning: pool {pool_id} reclaimed on-chain but clearing it from the \
                          local store failed: {e}; if the row survived, a later fetch reuses this \
                          closed pool and its vouchers are rejected — re-run `decdn pool reclaim \
-                         --pool {pool_id}` to clear it"
+                         --pool-id {pool_id}` to clear it"
                     );
                 }
             }
@@ -547,22 +573,17 @@ impl LocalBookkeeping<'_> {
     }
 }
 
-/// Compare-and-delete `owner`'s row for `pool_id`, but only when the store's
-/// row for that id is on `deployment`. A pool id is `keccak256(owner, nonce)`,
-/// so it repeats on every `PaymentPool` deployment, and `forget_if_pool` alone
-/// cannot tell the pools apart. The read and the delete are two transactions;
-/// the client store is held exclusively by this process, so nothing writes in
-/// between. Returns whether a row was deleted.
+/// Compare-and-delete `owner`'s row for `pool_id` on `deployment`. A pool id is
+/// `keccak256(owner, nonce)`, so it repeats on every `PaymentPool` deployment;
+/// the store keys rows by deployment, so a same-numbered pool elsewhere is
+/// another row and is left alone. Returns whether a row was deleted.
 fn forget_on(
     store: &dyn BuyerPoolStore,
     deployment: Deployment,
     owner: Address,
     pool_id: PoolId,
 ) -> Result<bool, decdn_incentive::StoreError> {
-    match store.get_by_pool_id(pool_id)? {
-        Some(state) if state.is_on(deployment) => store.forget_if_pool(owner, pool_id),
-        _ => Ok(false),
-    }
+    store.forget_if_pool(deployment, owner, pool_id)
 }
 
 /// True for the statuses that mean a pool is winding down or done: `Closing`
@@ -655,7 +676,7 @@ impl std::fmt::Display for CloseUnrecorded {
             "pool {pool_id} closed on-chain (tx {tx}) but clearing it from the local store \
              failed: {cause}; the row may survive and send a later fetch back to this closing \
              pool, whose vouchers stop being redeemable at the dispute deadline — re-run `decdn \
-             pool close --pool {pool_id}` to clear it, or {reclaim_note}, which also clears the \
+             pool close --pool-id {pool_id}` to clear it, or {reclaim_note}, which also clears the \
              row"
         )
     }
@@ -694,7 +715,7 @@ enum ClosePlan {
 
 /// What `reclaim` does with one pool, decided from its status and dispute
 /// deadline against the chain's head time. It drives the `--all` sweep, the
-/// `--pool` pre-check (`single_reclaim_gate`), and the `pool list` Reclaimable
+/// `--pool-id` pre-check (`single_reclaim_gate`), and the `pool list` Reclaimable
 /// column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReclaimPlan {
@@ -841,7 +862,7 @@ const fn plan_reclaim(status: PaymentPool::Status, dispute_deadline: u64, now: u
 }
 
 /// Decide from one `getPool` read and the chain's head time whether `reclaim
-/// --pool` may send. Each status or deadline condition that makes `reclaim`
+/// --pool-id` may send. Each status or deadline condition that makes `reclaim`
 /// revert is refused here with its own cause, so the operator learns what to
 /// do (and, in the dispute window, when) without a transaction or a keystore
 /// unlock.
@@ -861,13 +882,13 @@ fn single_reclaim_gate(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         owner != Address::ZERO,
-        "pool {pool_id} does not exist on this PaymentPool contract — a mistyped --pool, or \
+        "pool {pool_id} does not exist on this PaymentPool contract — a mistyped --pool-id, or \
          the wrong payment_pool address"
     );
     match plan_reclaim(status, dispute_deadline, now) {
         ReclaimPlan::Reclaim => Ok(()),
         ReclaimPlan::SkipOpen => anyhow::bail!(
-            "pool {pool_id} is still Open — run `decdn pool close --pool {pool_id}` first"
+            "pool {pool_id} is still Open — run `decdn pool close --pool-id {pool_id}` first"
         ),
         ReclaimPlan::SkipInWindow(deadline) => anyhow::bail!(
             "pool {pool_id} is still in its dispute window; reclaimable after {}",
@@ -975,7 +996,8 @@ where
             };
             // One note for both the success line and the failure, so the two
             // cannot drift into different instructions for the same deadline.
-            let reclaim_note = format!("run `decdn pool reclaim --pool {pool_id}` {deadline_note}");
+            let reclaim_note =
+                format!("run `decdn pool reclaim --pool-id {pool_id}` {deadline_note}");
             store.forget_after_close(owner, pool_id, tx, &reclaim_note)?;
             Ok(reclaim_note)
         }
@@ -1121,13 +1143,13 @@ fn send_failed(err: alloy::contract::Error, label: &'static str) -> anyhow::Erro
 /// `decdn pool close`: start the grace-window close on a pool the caller owns
 /// (`closePool`). Redemptions stay valid until the dispute deadline; `pool
 /// reclaim` refunds the residual after it elapses. `--all` closes every `Open`
-/// pool this keystore owns; `--pool` closes exactly one.
+/// pool this keystore owns; `--pool-id` closes exactly one.
 async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
     // Parse the target id before any store/keystore/provider work, so a
-    // malformed `--pool` fails fast without touching the chain. `None` is the
-    // `--all` sweep (clap's arg group guarantees exactly one of the two).
-    let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
+    // malformed `--pool-id` fails fast without touching the chain. `None` is
+    // the `--all` sweep (clap's arg group guarantees exactly one of the two).
+    let target = args.pool_id.as_deref().map(parse_pool_id).transpose()?;
 
     let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?)?;
     if target.is_none() {
@@ -1163,7 +1185,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
     Ok(())
 }
 
-/// The refusal for `close --pool` on a pool that is not `Open`. A `Closing` or
+/// The refusal for `close --pool-id` on a pool that is not `Open`. A `Closing` or
 /// `Closed` pool first has its local row cleared (see
 /// `LocalBookkeeping::forget_not_open`), so a re-run repairs a row that a
 /// landed close or reclaim could not clear.
@@ -1247,15 +1269,15 @@ where
 /// `decdn pool reclaim`: refund the residual deposit of a pool once its grace
 /// window has elapsed (`reclaim`; permissionless — callable by anyone, but only
 /// the owner receives funds). `--all` reclaims every pool this keystore owns
-/// whose window has elapsed; `--pool` reclaims exactly one, after a chain-read
+/// whose window has elapsed; `--pool-id` reclaims exactly one, after a chain-read
 /// pre-check of its status and deadline that runs before the keystore unlock.
 /// A refusal for a `Closing` or `Closed` pool also clears its local row.
 async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
     // Parse the target id before any store/keystore/provider work, so a
-    // malformed `--pool` fails fast without touching the chain. `None` is the
-    // `--all` sweep (clap's arg group guarantees exactly one of the two).
-    let target = args.pool.as_deref().map(parse_pool_id).transpose()?;
+    // malformed `--pool-id` fails fast without touching the chain. `None` is
+    // the `--all` sweep (clap's arg group guarantees exactly one of the two).
+    let target = args.pool_id.as_deref().map(parse_pool_id).transpose()?;
 
     let store_owner = classify_buyer_store(&resolve_data_dir(args.chain.data_dir.clone(), &file)?)?;
     if target.is_none() {
@@ -1316,7 +1338,7 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
     Ok(())
 }
 
-/// Finish a `reclaim --pool` refusal for a `Closing` or `Closed` pool: clear its
+/// Finish a `reclaim --pool-id` refusal for a `Closing` or `Closed` pool: clear its
 /// local row (see `LocalBookkeeping::forget_not_open`) and name the clear in the
 /// refusal. `owner` is the on-chain owner, so the clear needs no keystore
 /// unlock; compare-and-delete leaves a row for any other pool alone.
@@ -1555,7 +1577,7 @@ fn format_expiry(expiry: u64, now: u64) -> String {
 async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
     let chain = resolve_chain(&args.chain, &file)?;
-    let pool_id = parse_pool_id(&args.pool)?;
+    let pool_id = parse_pool_id(&args.pool_id)?;
     let signer_addr = super::chain_ctx::parse_nonzero_address(&args.signer, "--signer")?;
 
     let now = issuance_now(&chain.rpc_url, HEAD_READ_TIMEOUT).await?;
@@ -1693,7 +1715,7 @@ impl OwnerVerdict {
     /// Refuse to issue a capability this verdict has proven dead.
     ///
     /// Both failing arms name what the operator has to change, and they name
-    /// different things: a wrong keystore is not a wrong `--pool`.
+    /// different things: a wrong keystore is not a wrong `--pool-id`.
     ///
     /// # Errors
     ///
@@ -1704,12 +1726,12 @@ impl OwnerVerdict {
             Self::NoSuchPool => anyhow::bail!(
                 "pool {pool_id} does not exist on this PaymentPool contract; a capability for a \
                  pool that was never opened is rejected at redemption, so no token was issued — \
-                 check --pool, --payment-pool-address, and --chain-id"
+                 check --pool-id and --pool"
             ),
             Self::OwnedByOther(on_chain) => anyhow::bail!(
                 "pool {pool_id} on-chain owner {on_chain} is not this keystore's address \
                  {expected}; a capability signed by a non-owner is rejected at redemption, so no \
-                 token was issued — sign with the owner keystore, or check --pool"
+                 token was issued — sign with the owner keystore, or check --pool-id"
             ),
         }
     }
@@ -1766,29 +1788,40 @@ async fn list_all(
     data_dir: &Path,
 ) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
-    let chain = resolve_chain(&args.chain, &file)?;
-    let signer = Arc::new(load_buyer_signer(&chain)?);
+    let targets = resolve_pools(&args.chain, &file)?;
+    let first = targets
+        .first()
+        .context("no payment pool configured (pass --pool)")?;
+    let signer = Arc::new(load_buyer_signer(&resolve_chain_for(
+        &args.chain,
+        &file,
+        first,
+    )?)?);
     let owner = signer.address();
-    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-    let contract = PaymentPool::new(chain.payment_pool, rpc);
-
-    let ids = enumerate_owned_pools(&contract, owner).await?;
     let tracked = tracked_pool_ids(args, config_path, data_dir).await;
-    let now = chain_ctx::head_timestamp(contract.provider()).await?;
 
-    let mut rows = Vec::with_capacity(ids.len());
-    for pool_id in ids {
-        let pool = contract.getPool(pool_id).call().await.map_err(|e| {
-            anyhow::anyhow!("getPool({pool_id}) failed: {}", sanitize_error_sources(&e))
-        })?;
-        rows.push(ChainPoolRow {
-            pool_id,
-            status: pool.status,
-            deposit: U256::from(pool.deposit),
-            total_redeemed: U256::from(pool.totalRedeemed),
-            dispute_deadline: pool.disputeDeadline,
-            tracked: tracked.as_ref().and_then(|local| local.verdict(pool_id)),
-        });
+    // One block per `PaymentPool` contract, in configured order.
+    let mut blocks = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let rpc = provider::build_provider(&target.rpc_url, &signer)?;
+        let contract = PaymentPool::new(target.deployment.payment_pool, rpc);
+        let ids = enumerate_owned_pools(&contract, owner).await?;
+        let now = chain_ctx::head_timestamp(contract.provider()).await?;
+        let mut rows = Vec::with_capacity(ids.len());
+        for pool_id in ids {
+            let pool = contract.getPool(pool_id).call().await.map_err(|e| {
+                anyhow::anyhow!("getPool({pool_id}) failed: {}", sanitize_error_sources(&e))
+            })?;
+            rows.push(ChainPoolRow {
+                pool_id,
+                status: pool.status,
+                deposit: U256::from(pool.deposit),
+                total_redeemed: U256::from(pool.totalRedeemed),
+                dispute_deadline: pool.disputeDeadline,
+                tracked: tracked.as_ref().and_then(|local| local.verdict(pool_id)),
+            });
+        }
+        blocks.push((target.deployment.pool_account().to_string(), rows, now));
     }
 
     // The corrupt rows are named on stderr here too, so `--all` is not the one
@@ -1803,22 +1836,20 @@ async fn list_all(
         let view = PoolListAllJson {
             source: SOURCE_CHAIN,
             owner: format!("{owner:#x}"),
-            chain_id: chain.chain_id,
-            payment_pool: format!("{:#x}", chain.payment_pool),
             local_store_read: tracked.is_some(),
-            pools: rows.iter().map(|r| ChainPoolJson::at(r, now)).collect(),
+            pools: blocks
+                .iter()
+                .flat_map(|(contract, rows, now)| {
+                    rows.iter().map(|r| ChainPoolJson::at(contract, r, *now))
+                })
+                .collect(),
         };
         serde_json::to_writer_pretty(&mut out, &view)?;
         writeln!(out)?;
     } else {
-        write_chain_pools(
-            &mut out,
-            owner,
-            chain.chain_id,
-            &rows,
-            now,
-            tracked.is_some(),
-        )?;
+        for (contract, rows, now) in &blocks {
+            write_chain_pools(&mut out, owner, contract, rows, *now, tracked.is_some())?;
+        }
     }
     Ok(())
 }
@@ -2341,7 +2372,7 @@ const fn tracked_label(tracked: Option<bool>) -> &'static str {
 fn write_chain_pools(
     w: &mut impl Write,
     owner: Address,
-    chain_id: u64,
+    contract: &str,
     rows: &[ChainPoolRow],
     now: u64,
     local_store_read: bool,
@@ -2352,7 +2383,7 @@ fn write_chain_pools(
     // surface, and only `--json` carries the distinction.
     writeln!(
         w,
-        "owner={owner:#x} chain_id={chain_id} pools={} local_store={}",
+        "owner={owner:#x} contract={contract} pools={} local_store={}",
         rows.len(),
         if local_store_read {
             "read"
@@ -2395,21 +2426,20 @@ struct PoolListAllJson {
     source: &'static str,
     /// The keystore address the pools were enumerated by.
     owner: String,
-    /// Chain id the contract was read on.
-    chain_id: u64,
-    /// `PaymentPool` address the pools live in.
-    payment_pool: String,
     /// Whether the local record could be read at all. When `false`, every
     /// pool's `tracked` is `null` and says nothing about the pool. When `true`,
     /// a `null` `tracked` is specific to that pool: its row will not decode.
     local_store_read: bool,
-    /// Every pool the owner holds, in the order the contract enumerates them.
+    /// Every pool the owner holds, contract by contract in configured order,
+    /// and in the order each contract enumerates them.
     pools: Vec<ChainPoolJson>,
 }
 
 /// One `--all` pool.
 #[derive(Serialize)]
 struct ChainPoolJson {
+    /// The `PaymentPool` contract that holds it, as a CAIP-10 account.
+    contract: String,
     /// On-chain `poolId`, `0x`-prefixed hex.
     pool_id: String,
     /// `open`, `closing`, `closed`, or `?`.
@@ -2432,8 +2462,9 @@ struct ChainPoolJson {
 impl ChainPoolJson {
     /// Project a row as of `now`, so the time-dependent field is computed once
     /// against the same clock the table uses.
-    fn at(row: &ChainPoolRow, now: u64) -> Self {
+    fn at(contract: &str, row: &ChainPoolRow, now: u64) -> Self {
         Self {
+            contract: contract.to_owned(),
             pool_id: format!("{:#x}", row.pool_id),
             status: status_label(row.status),
             deposit_micro_usdc: row.deposit.to_string(),

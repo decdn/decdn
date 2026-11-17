@@ -522,9 +522,9 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 # NOT `panic = "abort"`: production code recovers from panics via unwinding —
-# `chain_events::resumable_watcher` wraps hook dispatch in `catch_unwind` so a
-# panicking hook cannot kill the daemon, `dht::chain_projection` does the same
-# for lock poisoning, and the runtime / admin / buyer-pool layers branch on
+# the client serve dispatch wraps each stream in `catch_unwind` so a panicking
+# serve cannot kill the daemon, `dht::chain_projection` recovers from lock
+# poisoning, and the runtime / admin / buyer-pool layers branch on
 # `JoinError::is_panic`. `abort` turns every one of those into a dead process.
 #
 # `strip = "debuginfo"`, not `"symbols"`: the symbol table stays in the shipped

@@ -28,9 +28,9 @@ The ADRs hold the rule, not a list of chains. Pool constants are set per deploym
 
 ## Sweep cost
 
-Each redemption on a payment chain adds the writes that accrue the protocol share to `pending[operator]`. Whoever calls `sweep` pays the sweep gas. `minSweep` keeps dust sweeps uneconomic.
+Each redemption on a payment chain adds the writes that accrue the protocol share to `pending[operator]`. Whoever calls `sweep` pays the sweep gas on the payment chain. Whoever calls `receiveSweep` pays the receive gas on the governance chain. The operator usually does both, because the sweep carries its rebate and its vote weight. One sweep carries up to 32 operators, so operators with small shares share one governance-chain receive. `minSweep` keeps dust sweeps uneconomic. It bounds the batch total, because each sweep costs one receive. Set it so that the batch total of one sweep covers the governance-chain receive gas.
 
-A standard CCTP transfer from an L2 reaches Ethereum in about 15 to 20 minutes. The attestation expires about 24 hours after Circle signs it, and `receiveSweep` is permissionless, so any party can receive a pending sweep in time. Circle can pause message receipt. That is the same trust root as USDC itself.
+A standard CCTP transfer from an L2 reaches Ethereum in about 15 to 20 minutes. Circle encodes no expiration block in a standard-transfer message (`expirationBlock` is 0), so an attested sweep stays valid until something receives it. Circle does not re-attest a finalized message, and a standard message needs no re-attestation. `CctpSweepReceiver.receiveSweep` is permissionless, so any party can receive a pending sweep at any later time. CCTP nonce tracking makes each sweep credit once. Circle can pause message receipt. That is the same trust root as USDC itself.
 
 [ADR 026](026-tokenomics.md#adr-026-tokenomics) adds three gates. Measure each one in integration testing before mainnet.
 

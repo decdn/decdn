@@ -9,7 +9,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 /// @title BuybackBurner
-/// @notice Receives the 30% USDC bucket from `FeeRouter.routeSettlement`, swaps
+/// @notice Receives the `buybackBps` share of each `FeeRouter.deposit`, swaps
 ///         it for TOKEN, and burns the proceeds (ADR 026 § FeeRouter split →
 ///         § Slashing and burn). The swap venue is NOT fixed here: this base is
 ///         venue-neutral and owns only the parts every burner shares — the

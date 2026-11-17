@@ -146,22 +146,20 @@ async fn a_failed_step_is_a_local_fault() {
     );
 }
 
-/// Two poll intervals of 500 ms steps, so the upstream clears a full poll plus
-/// its head cache — 28 steps (14 s) at the 7 s default.
+/// One upstream refresh interval of 500 ms steps — 60 steps (30 s) at the
+/// production refresh interval.
 #[test]
-fn settle_budget_tracks_the_chain_poll_cadence() {
-    assert_eq!(settle_wait_budget(Duration::from_secs(7)), 28);
+fn settle_budget_tracks_the_upstream_refresh() {
+    assert_eq!(
+        settle_wait_budget(crate::pool_view::POOL_REFRESH_INTERVAL),
+        60
+    );
     assert_eq!(
         settle_window(Duration::from_secs(7)),
-        Duration::from_secs(14)
+        Duration::from_secs(7)
     );
-    assert_eq!(settle_wait_budget(Duration::from_secs(1)), 4);
-    // A chain lane tuned faster than one step still gets a real, if tiny, budget
-    // rather than zero — a zero budget would make the top-up a coin flip.
-    assert_eq!(settle_wait_budget(Duration::from_millis(250)), 1);
-    // ...and a SLOW chain lane cannot buy unbounded foreground waiting.
-    // `event_poll_interval_ms` has a config floor but no ceiling, so without
-    // the cap a 60 s lane would hold a client's pull for two minutes.
+    assert_eq!(settle_wait_budget(Duration::from_secs(1)), 2);
+    // A slow refresh cannot buy unbounded foreground waiting.
     assert_eq!(
         settle_wait_budget(Duration::from_secs(60)),
         MAX_SETTLE_WAITS

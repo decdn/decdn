@@ -234,6 +234,10 @@ fn registered(scope: &str, origin: Option<&str>, registered: Instant) -> Registe
             expiry: u64::MAX,
             owner_signature: vec![0; 65],
         },
+        pool: decdn_incentive::Deployment {
+            chain_id: 421_614,
+            payment_pool: Address::repeat_byte(1),
+        },
         scope: Scope::parse(scope).unwrap(),
         origin: origin.map(str::to_owned),
         since: registered,
@@ -331,16 +335,6 @@ fn pages_stop_at_the_global_bound_and_the_token_holder_does_not() {
     assert!(may_mint(&delegates, None).is_ok());
 }
 
-#[test]
-fn a_capability_must_be_signed_by_its_pools_on_chain_owner() {
-    let owner = PrivateKeySigner::random().address();
-    let other = PrivateKeySigner::random().address();
-    let pool = alloy::primitives::B256::ZERO;
-    assert!(owner_matches(owner, owner, pool).is_ok());
-    assert!(owner_matches(owner, other, pool).is_err());
-    assert!(owner_matches(Address::ZERO, owner, pool).is_err());
-}
-
 const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// A pull backend for gateways whose requests all stop before a pull.
@@ -422,18 +416,27 @@ async fn test_gateway_in(
 ) -> Arc<Gateway> {
     let token = matches!(sites, SiteDomain::Loopback { .. }).then(|| TEST_TOKEN.to_owned());
     assert_eq!(matches!(sites, SiteDomain::Public { .. }), public.is_some());
-    let chain = ChainConfig {
-        // Nothing here reaches the chain: every request below stops first.
-        rpc_url: "http://127.0.0.1:1".to_owned(),
+    let pool = decdn_incentive::Deployment {
         chain_id: 421_614,
         payment_pool: Address::repeat_byte(1),
-        slash_judge: Address::repeat_byte(2),
-        capacity_bond: None,
     };
+    // Nothing here reaches the chain: every request below stops first.
+    let chain = ChainConfig::new(
+        decdn_client::session::GovernanceChain {
+            rpc_url: "http://127.0.0.1:1".to_owned(),
+            chain_id: 421_614,
+            slash_judge: Address::repeat_byte(2),
+            capacity_bond: None,
+        },
+        vec![decdn_client::session::PaymentPoolChain {
+            rpc_url: "http://127.0.0.1:1".to_owned(),
+            deployment: pool,
+        }],
+    )
+    .unwrap();
     Arc::new(Gateway {
         common,
         token,
-        domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: Mutex::new(HashMap::new()),
         pulls: PullWorker::start(backend, worker_slots).await.unwrap(),
@@ -1870,7 +1873,7 @@ fn hold(gateway: &Gateway, pointer: SignedPointer, signer: Address) {
 #[tokio::test]
 async fn a_known_signer_has_its_own_lookup_budget_per_namespace() {
     let (gateway, _logs, _) = public_gateway().await;
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
     let owner = PrivateKeySigner::random();
     let public = gateway.public.as_ref().unwrap();
     hold(&gateway, unsigned_pointer(7, BLOB, 1), owner.address());
@@ -1996,7 +1999,7 @@ async fn put_pointer_refuses_a_bad_body_before_the_chain() {
 async fn put_pointer_refuses_a_stale_seq_from_the_same_signer_before_the_chain() {
     let (gateway, _logs, _) = public_gateway().await;
     let owner = PrivateKeySigner::random();
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
     hold(&gateway, unsigned_pointer(7, BLOB, 5), owner.address());
     for seq in [5, 4] {
         let pointer = SignedPointer::sign(&owner, 7, OTHER, seq, &domain).unwrap();
@@ -2021,7 +2024,7 @@ async fn put_pointer_refuses_a_stale_seq_from_the_same_signer_before_the_chain()
 #[tokio::test]
 async fn put_pointer_owner_lookups_are_budgeted() {
     let (gateway, _logs, _) = public_gateway().await;
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
     let signer = PrivateKeySigner::random();
     let public = gateway.public.as_ref().unwrap();
     // One lookup reaches the chain; the rest of the minute's budget is
@@ -2063,7 +2066,7 @@ async fn put_pointer_owner_lookups_are_budgeted() {
 async fn put_pointer_with_a_valid_signature_asks_the_chain() {
     let (gateway, _logs, _) = public_gateway().await;
     let owner = PrivateKeySigner::random();
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
     let pointer = SignedPointer::sign(&owner, 7, BLOB, 1, &domain).unwrap();
     let body = serde_json::to_string(&pointer).unwrap();
     // On the bare host, and on the gateway's own listen address.
@@ -3802,7 +3805,7 @@ impl worker::Backend for Pools {
     async fn pools(
         &self,
         (): &(),
-        _delegates: &[(PoolId, Address)],
+        _delegates: &[worker::DelegateKey],
     ) -> anyhow::Result<worker::PoolSnapshot> {
         anyhow::ensure!(
             !self.fail,
@@ -3908,7 +3911,13 @@ async fn status_spells_addresses_eip55_and_hashes_bare() {
     assert_eq!(status["pointers"][0]["root"], alloy::hex::encode(BLOB));
     assert_eq!(
         status["payment_pool"],
-        gateway.chain.payment_pool.to_string()
+        gateway
+            .chain
+            .first_pool()
+            .unwrap()
+            .deployment
+            .payment_pool
+            .to_string()
     );
 }
 

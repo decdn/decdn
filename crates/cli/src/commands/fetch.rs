@@ -45,10 +45,11 @@ use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
+use decdn_client::pool_route::{PoolPasses, PoolRoute};
 use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::session::{
-    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PoolOpen,
-    ProxyWarmingParams, PullSite,
+    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, GovernanceChain, PinnedNode,
+    PoolOpen, ProxyWarmingParams, PullSite,
 };
 use decdn_client::targets::{
     ProbeOpts, ProbeRound, ResolveConfigFault, holders_or_none, resolve_target_node,
@@ -65,7 +66,7 @@ use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::rate::min_payment;
-use decdn_incentive::{CapabilityGrant, PoolId, slash_judge_domain, voucher_domain};
+use decdn_incentive::{CapabilityGrant, PoolId, slash_judge_domain};
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, PublicKey, RelayUrl};
 
@@ -118,9 +119,10 @@ fn new_progress_bar() -> indicatif::ProgressBar {
 /// default. Pure (parse-only) so the precedence is unit-testable.
 #[derive(Debug)]
 pub(crate) struct ResolvedChain {
-    /// The chain the command pays on. Its `capacity_bond` is `None` when
-    /// neither the flag nor `blockchain.capacity_bond_address` is set — only
-    /// an error on the discovery path, never on the explicit-node path.
+    /// The governance chain and the payment pools the command can pay
+    /// through. The governance `capacity_bond` is `None` when neither the flag
+    /// nor `blockchain.capacity_bond_address` is set — only an error on the
+    /// discovery path, never on the explicit-node path.
     pub(crate) config: ChainConfig,
     /// Where the command keeps its state, and the client's region. The data
     /// dir holds the buyer-pool redb store and (by default) the keystore. It
@@ -202,28 +204,46 @@ fn parse_region_allowlist(file: &FileConfig) -> Vec<decdn_protocol::Region> {
         .collect()
 }
 
+/// The governance chain's id and RPC endpoint: the flag, else
+/// `[blockchain]`. The id defaults to the initial network's; the endpoint is
+/// required, because the registry and the signature domains live there.
+///
+/// # Errors
+///
+/// No governance RPC endpoint is named.
+pub(crate) fn resolve_governance(
+    args: &cli::GovernanceChainArgs,
+    bc: Option<&decdn_common::config::types::BlockchainConfig>,
+) -> anyhow::Result<(u64, String)> {
+    let chain_id = args
+        .governance_chain_id
+        .or_else(|| bc.and_then(|b| b.chain_id))
+        .unwrap_or(DEFAULT_CHAIN_ID);
+    let rpc_url = args
+        .governance_rpc_url
+        .clone()
+        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
+        .context(
+            "governance rpc_url not set (--governance-rpc-url or blockchain.rpc_url): the \
+             node registry and the signature domains live on the governance chain",
+        )?;
+    Ok((chain_id, rpc_url))
+}
+
 pub(crate) fn resolve_chain(
     args: &cli::ClientFetchArgs,
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedChain> {
     let bc = file.blockchain.as_ref();
-    let rpc_url = args
-        .rpc_url
-        .clone()
-        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
-        .ok_or_else(|| anyhow::anyhow!("rpc_url not set (--rpc-url or blockchain.rpc_url)"))?;
-
-    let pp_raw = args
-        .payment_pool_address
-        .clone()
-        .or_else(|| bc.and_then(|b| b.payment_pool_address.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "payment_pool_address not set (--payment-pool-address or \
-                 blockchain.payment_pool_address)"
-            )
-        })?;
-    let payment_pool = super::chain_ctx::parse_nonzero_address(&pp_raw, "payment_pool_address")?;
+    let (governance_chain_id, governance_rpc_url) = resolve_governance(&args.governance, bc)?;
+    let payment_pools = super::pool_select::resolve_pools(
+        &args.payment,
+        bc.map(|b| b.payment_chains.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(Into::into),
+        governance_chain_id,
+    )?;
 
     let sj_raw = args
         .slash_judge_address
@@ -253,11 +273,6 @@ pub(crate) fn resolve_chain(
 
     // The `[client] region_allowlist` pre-filters discovery/probing.
     let region_allowlist = parse_region_allowlist(file);
-
-    let chain_id = args
-        .chain_id
-        .or_else(|| bc.and_then(|b| b.chain_id))
-        .unwrap_or(DEFAULT_CHAIN_ID);
 
     // Client data dir: an explicit `--data-dir`/`identity.data_dir` wins,
     // otherwise the client-scoped `~/.decdn/client` (not the node-shaped
@@ -316,13 +331,15 @@ pub(crate) fn resolve_chain(
     let max_approve = bc.and_then(|b| b.buyer_max_approve).unwrap_or(false);
 
     Ok(ResolvedChain {
-        config: ChainConfig {
-            rpc_url,
-            chain_id,
-            payment_pool,
-            slash_judge,
-            capacity_bond,
-        },
+        config: ChainConfig::new(
+            GovernanceChain {
+                rpc_url: governance_rpc_url,
+                chain_id: governance_chain_id,
+                slash_judge,
+                capacity_bond,
+            },
+            payment_pools,
+        )?,
         site: PullSite {
             data_dir,
             region,
@@ -548,9 +565,9 @@ pub(crate) async fn fetch(
     activity: Option<&Arc<ActivityRecorder>>,
 ) -> anyhow::Result<()> {
     let timings = FetchTimings::start();
-    let (host, grant) = FetchHost::open(&args.common, config_path, false).await?;
+    let (host, delegation) = FetchHost::open(&args.common, config_path, false).await?;
     timings.mark(Mark::Endpoint);
-    let payer = Payer::keystore(grant).with_receipt(Arc::clone(evidence));
+    let payer = Payer::keystore(delegation).with_receipt(Arc::clone(evidence));
     // A Ctrl-C drops the fetch mid-transfer: each drive's drop guard queues
     // what it paid for recording, and the `.partial` is the next run's resume
     // prefix. The handle outlives the fetch, so an `openPool` or `topUp` that a
@@ -562,7 +579,7 @@ pub(crate) async fn fetch(
     };
     // On every exit, a Ctrl-C's included: the gate lists a replacement whose
     // fetch was dropped too.
-    print_reclaim_notes(&payer.recovery.replacements());
+    print_reclaim_notes(&payer.replacements());
     let result = name_held_escrows(result, &host.escrows);
     let output = if wants_stdout(output) {
         "stdout"
@@ -771,6 +788,9 @@ pub(crate) struct Credential {
     pub(crate) signer: Arc<alloy::signers::local::PrivateKeySigner>,
     /// The capability the pool owner issued to `signer`.
     pub(crate) grant: CapabilityGrant,
+    /// The configured `PaymentPool` contract of the capability's pool: its
+    /// fetches pay through it only.
+    pub(crate) pool: decdn_incentive::Deployment,
 }
 
 /// Where a fetch's verified bytes go.
@@ -811,8 +831,8 @@ pub(crate) struct FetchHost {
     /// Each `openPool` and `topUp` no local record credits yet, and each that
     /// escrowed with no local record crediting it, across every fetch.
     pub(crate) escrows: UnconfirmedEscrows,
-    /// The pool's settlement token, `PaymentPool.usdc()`, read once.
-    token: tokio::sync::OnceCell<alloy::primitives::Address>,
+    /// Each payment pool's settlement token, `PaymentPool.usdc()`, read once.
+    tokens: PerPool<tokio::sync::OnceCell<alloy::primitives::Address>>,
     /// The proven sizes of blobs fetches on this host learned, up to
     /// [`MAX_SIZE_HINTS`].
     sizes: Mutex<SizeHints>,
@@ -820,6 +840,35 @@ pub(crate) struct FetchHost {
 
 /// The most blob sizes a [`FetchHost`] remembers.
 const MAX_SIZE_HINTS: usize = 4096;
+
+/// One `T` per payment pool, made on first use. A pool id is unique only
+/// inside one `PaymentPool` contract, so funding facts, recovery gates and
+/// lane ledgers never cross pools.
+pub(crate) struct PerPool<T>(Mutex<std::collections::HashMap<decdn_incentive::Deployment, Arc<T>>>);
+
+impl<T> Default for PerPool<T> {
+    fn default() -> Self {
+        Self(Mutex::new(std::collections::HashMap::new()))
+    }
+}
+
+impl<T> PerPool<T> {
+    /// The `T` of `deployment`, made by `make` on first use.
+    fn get(&self, deployment: decdn_incentive::Deployment, make: impl FnOnce() -> T) -> Arc<T> {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(map.entry(deployment).or_insert_with(|| Arc::new(make())))
+    }
+
+    /// Every `T` made so far.
+    fn all(&self) -> Vec<Arc<T>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+}
 
 /// Blob sizes by hash, each one a size a holder proved or a whole fetch
 /// verified ([`BlobFetch::size_only`]), oldest first out
@@ -869,19 +918,21 @@ impl FetchHost {
     /// Resolve `common` and the config at `config_path`, open the buyer-pool
     /// store and bind the endpoint. With `held_key`, every fetch pays with a
     /// key it is handed ([`Payer::held`]), so the capability flags are not
-    /// read and no pool is funded; otherwise the returned grant is the
-    /// `--capability`/`--capability-file` delegation, if any.
+    /// read and no pool is funded; otherwise the returned delegation is the
+    /// `--capability`/`--capability-file` one, if any, with its pool
+    /// resolved.
     ///
     /// # Errors
     ///
     /// A flag combination clap cannot express, unresolvable chain
-    /// coordinates or relays, an unreadable capability, a refused data dir,
-    /// or an endpoint that cannot bind.
+    /// coordinates or relays, an unreadable capability or one no configured
+    /// pool's owner signed, a refused data dir, or an endpoint that cannot
+    /// bind.
     pub(crate) async fn open(
         common: &cli::ClientFetchArgs,
         config_path: Option<&Path>,
         held_key: bool,
-    ) -> anyhow::Result<(Self, Option<CapabilityGrant>)> {
+    ) -> anyhow::Result<(Self, Option<Delegation>)> {
         // Before any network or keystore work, reject a flag combination clap
         // cannot express, naming the flags the user actually typed.
         common.validate()?;
@@ -899,11 +950,11 @@ impl FetchHost {
         // spend against it. `None` => the unchanged self-owned pool path. Zeroes
         // the working deposit in `chain` (a delegate cannot fund an owner's pool).
         // A held key is the same delegation, with its key in hand.
-        let grant = if held_key {
+        let delegation = if held_key {
             chain.working_deposit = U256::ZERO;
             None
         } else {
-            resolve_delegation_grant(common, &mut chain)?
+            resolve_delegation(common, &mut chain).await?
         };
 
         // The buyer-pool store, opened once and recorded into by open-or-reuse.
@@ -928,20 +979,15 @@ impl FetchHost {
             health: Arc::new(PeerHealth::default()),
             writes: OrderedWrites::default(),
             escrows: UnconfirmedEscrows::default(),
-            token: tokio::sync::OnceCell::new(),
+            tokens: PerPool::default(),
             sizes: Mutex::new(SizeHints::default()),
         };
-        Ok((host, grant))
+        Ok((host, delegation))
     }
 
     /// The buyer-pool store every fetch on this host records into.
     pub(crate) fn store(&self) -> Arc<dyn BuyerPoolStore> {
         Arc::clone(&self.store)
-    }
-
-    /// The chain and `PaymentPool` this host pays on.
-    pub(crate) const fn deployment(&self) -> decdn_incentive::Deployment {
-        self.chain.config.deployment()
     }
 
     /// The size of `hash` a whole fetch on this host verified, or a size
@@ -965,16 +1011,17 @@ impl FetchHost {
 /// advance each lane's cumulative voucher through one issuer.
 pub(crate) struct Payer {
     key: PayerKey,
-    /// The lane ledgers concurrent fetches share; `None` for a keystore payer,
-    /// whose fetches run one at a time, each lane starting from its persisted
-    /// watermark.
-    ledgers: Option<LaneLedgers>,
-    /// The funding facts concurrent fetches share, so their `topUp`s run one
-    /// at a time (a `RunFunding` serializes only its own): a gateway's pool
-    /// payer. `None` for a payer whose fetches run one at a time, each pass
-    /// with its own.
-    funding: Option<Arc<RunFunding>>,
-    recovery: Arc<RecoveryGate>,
+    /// The lane ledgers concurrent fetches share, one registry per payment
+    /// pool; `None` for a keystore payer, whose fetches run one at a time,
+    /// each lane starting from its persisted watermark.
+    ledgers: Option<PerPool<LaneLedgers>>,
+    /// The funding facts concurrent fetches share, one per payment pool, so
+    /// their `topUp`s run one at a time (a `RunFunding` serializes only its
+    /// own): a gateway's pool payer, reporting to `escrows`. `None` for a
+    /// payer whose fetches run one at a time, each pass with its own.
+    funding: Option<(PerPool<RunFunding>, UnconfirmedEscrows)>,
+    /// The funding recovery gate of each payment pool.
+    recovery: PerPool<RecoveryGate>,
     open_lock: tokio::sync::Mutex<()>,
     /// Where every lane keeps the signed messages a pull receipt holds, and
     /// every fetch records the blob it landed; `None` keeps nothing.
@@ -986,13 +1033,15 @@ enum PayerKey {
     /// there is one. The first fetch under the payer loads it once its holder
     /// resolution ends, and every later fetch under the payer reuses it.
     Keystore {
-        grant: Option<CapabilityGrant>,
+        delegation: Option<Delegation>,
         loaded: tokio::sync::OnceCell<(Arc<alloy::signers::local::PrivateKeySigner>, PayerKeys)>,
     },
-    /// A key in hand and the capability issued to it.
+    /// A key in hand, the capability issued to it, and the contract of the
+    /// capability's pool.
     Held {
         signer: Arc<alloy::signers::local::PrivateKeySigner>,
         slot: CredentialSlot,
+        pool: decdn_incentive::Deployment,
     },
 }
 
@@ -1017,16 +1066,16 @@ impl PayerKeys {
 
 impl Payer {
     /// The fetches of one `decdn get` run, paying from the keystore the flags
-    /// name, under `grant` when it is delegated.
-    pub(crate) fn keystore(grant: Option<CapabilityGrant>) -> Self {
+    /// name, under `delegation` when it is delegated.
+    pub(crate) fn keystore(delegation: Option<Delegation>) -> Self {
         Self {
             key: PayerKey::Keystore {
-                grant,
+                delegation,
                 loaded: tokio::sync::OnceCell::new(),
             },
             ledgers: None,
             funding: None,
-            recovery: Arc::new(RecoveryGate::new()),
+            recovery: PerPool::default(),
             open_lock: tokio::sync::Mutex::new(()),
             evidence: None,
         }
@@ -1040,14 +1089,14 @@ impl Payer {
     }
 
     /// The fetches of a gateway paying from the keystore's own pool, under
-    /// `grant` when it is delegated. Fetches that overlap share each lane's
-    /// voucher ledger and one set of funding facts on `escrows`, as a bundle
-    /// pull's entries do, so no two of them send a `topUp` at once.
-    pub(crate) fn pool(grant: Option<CapabilityGrant>, escrows: UnconfirmedEscrows) -> Self {
+    /// `delegation` when it is delegated. Fetches that overlap share each
+    /// lane's voucher ledger and one set of funding facts on `escrows`, as a
+    /// bundle pull's entries do, so no two of them send a `topUp` at once.
+    pub(crate) fn pool(delegation: Option<Delegation>, escrows: UnconfirmedEscrows) -> Self {
         Self {
-            ledgers: Some(LaneLedgers::new()),
-            funding: Some(Arc::new(RunFunding::reporting_escrows_to(escrows))),
-            ..Self::keystore(grant)
+            ledgers: Some(PerPool::default()),
+            funding: Some((PerPool::default(), escrows)),
+            ..Self::keystore(delegation)
         }
     }
 
@@ -1072,10 +1121,10 @@ impl Payer {
         host: &FetchHost,
     ) -> anyhow::Result<(Arc<alloy::signers::local::PrivateKeySigner>, PayerKeys)> {
         match &self.key {
-            PayerKey::Held { signer, slot } => {
+            PayerKey::Held { signer, slot, .. } => {
                 Ok((Arc::clone(signer), PayerKeys::Delegated(slot.clone())))
             }
-            PayerKey::Keystore { grant, loaded } => loaded
+            PayerKey::Keystore { delegation, loaded } => loaded
                 .get_or_try_init(|| async {
                     let password = super::chain_ctx::read_keystore_password(
                         &super::chain_ctx::password_sources(
@@ -1086,10 +1135,11 @@ impl Payer {
                     )?
                     .into_secret();
                     let signer = Arc::new(load_signer(&host.chain.keystore, &password)?);
-                    let keys = match grant {
-                        Some(grant) => {
-                            PayerKeys::Delegated(delegated_slot(grant, Arc::clone(&signer))?)
-                        }
+                    let keys = match delegation {
+                        Some(delegation) => PayerKeys::Delegated(delegated_slot(
+                            &delegation.grant,
+                            Arc::clone(&signer),
+                        )?),
                         None => PayerKeys::Owned(OwnedPayer::for_store(
                             Arc::clone(&signer),
                             host.store.as_ref(),
@@ -1114,13 +1164,24 @@ impl Payer {
             key: PayerKey::Held {
                 signer: credential.signer,
                 slot,
+                pool: credential.pool,
             },
-            ledgers: Some(LaneLedgers::new()),
+            ledgers: Some(PerPool::default()),
             funding: None,
-            recovery: Arc::new(RecoveryGate::new()),
+            recovery: PerPool::default(),
             open_lock: tokio::sync::Mutex::new(()),
             evidence: None,
         })
+    }
+
+    /// Every pool replacement a funding recovery step of this payer made, on
+    /// any payment pool ([`RecoveryGate::replacements`]).
+    pub(crate) fn replacements(&self) -> Vec<PoolReplaced> {
+        self.recovery
+            .all()
+            .iter()
+            .flat_map(|gate| gate.replacements())
+            .collect()
     }
 
     /// Each lane the payer's fetches share a ledger on, with what it has
@@ -1129,15 +1190,41 @@ impl Payer {
     pub(crate) fn committed_lanes(
         &self,
     ) -> Vec<(decdn_incentive::LaneKey, decdn_client::Cumulative)> {
-        self.ledgers
-            .as_ref()
-            .map_or_else(Vec::new, LaneLedgers::committed_lanes)
+        self.ledgers.as_ref().map_or_else(Vec::new, |ledgers| {
+            ledgers
+                .all()
+                .iter()
+                .flat_map(|ledgers| ledgers.committed_lanes())
+                .collect()
+        })
+    }
+
+    /// The route of a fetch this payer pays for. A keystore payer on its own
+    /// pools prefers each contract `host`'s store records a pool of `owner`
+    /// in ([`PoolRoute::for_buyer`]). A delegated payer pays through its
+    /// capability's contract only: a held credential names it, and a
+    /// `--capability` delegation resolved it ([`resolve_delegation`]).
+    fn route(
+        &self,
+        host: &FetchHost,
+        owner: Option<alloy::primitives::Address>,
+    ) -> anyhow::Result<PoolRoute> {
+        match &self.key {
+            PayerKey::Held { pool, .. }
+            | PayerKey::Keystore {
+                delegation: Some(Delegation { pool, .. }),
+                ..
+            } => Ok(PoolRoute::single(*pool)),
+            PayerKey::Keystore {
+                delegation: None, ..
+            } => PoolRoute::for_buyer(&host.chain.config, host.store.as_ref(), owner),
+        }
     }
 
     /// Whether the fetch pays from a pool another owner funds.
     const fn delegated(&self) -> bool {
         match &self.key {
-            PayerKey::Keystore { grant, .. } => grant.is_some(),
+            PayerKey::Keystore { delegation, .. } => delegation.is_some(),
             PayerKey::Held { .. } => true,
         }
     }
@@ -1174,7 +1261,7 @@ pub(crate) async fn fetch_on(
         health,
         writes,
         escrows,
-        token,
+        tokens,
         sizes,
     } = host;
     let hash = args.hash;
@@ -1227,28 +1314,8 @@ pub(crate) async fn fetch_on(
     let self_address = signer.address();
 
     let config = &chain.config;
-    let rpc = provider::build_provider(&config.rpc_url, &signer)?;
-    let contract = PaymentPool::new(config.payment_pool, rpc.clone());
-    let voucher_dom = voucher_domain(config.chain_id, config.payment_pool);
-    let slash_dom = slash_judge_domain(config.chain_id, config.slash_judge);
-    // The pool's token is `PaymentPool.usdc()`, immutable per contract, so the
-    // host reads it once. A repeat fetch already holds it in the persisted pool
-    // row, so read it there and skip the eth_call; only a first-ever pool (no
-    // row) pays the `usdc()` round-trip. The reuse branch of
-    // `open_or_reuse_pool` already trusts this same `state.token`, so this only
-    // makes the top-level value consistent with it.
-    let token = *token
-        .get_or_try_init(|| async {
-            match cached_pool_token(store.as_ref(), self_address, config.deployment())? {
-                Some(token) => anyhow::Ok(token),
-                None => contract
-                    .usdc()
-                    .call()
-                    .await
-                    .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()")),
-            }
-        })
-        .await?;
+    // Every probe answer and stream response verifies on the governance chain.
+    let slash_dom = slash_judge_domain(config.governance.chain_id, config.governance.slash_judge);
 
     let max_blob_bytes = held_cap(common.max_blob_mb, args.size_cap);
     // The namespace routing hint (ADR 005 § Namespace routing): the URI's
@@ -1274,31 +1341,81 @@ pub(crate) async fn fetch_on(
         clock,
     );
     let deposit = chain.deposit_policy(payer.delegated())?;
-    // One funding recovery state for everything the payer pays for, both passes
-    // included.
-    let recovery = &payer.recovery;
-    // A replacement the gate carries from an earlier fetch under this payer (an
-    // entry URI's manifest fetch) names the pool this fetch's lanes reuse; the
-    // gate still lists it for the command to name. A keystore payer runs its
-    // fetches one after another, so no fetch is still on the closed pool. A
-    // held payer funds nothing, so its gate never holds one.
-    // Only a payer whose fetches run one after another clears a carried
-    // replacement: a fetch of a shared payer may still be in its pass on the
-    // closed pool, and would open yet another one.
-    if payer.ledgers.is_none() {
-        recovery.leave_carried();
-    }
+    // Which payment pool pays each node (ADR 005 § Payment pool routing): a
+    // pass pays through one pool, and pays only the nodes routed to it. The
+    // first pass is the first pool of the buyer's route that a holder is
+    // routed to.
+    let owner = match &keys {
+        PayerKeys::Owned(payer) => Some(payer.owner().address()),
+        PayerKeys::Delegated(_) => None,
+    };
+    let passes = PoolPasses::new(payer.route(host, owner)?);
+    let mut pass_pool = resolved.first_pass(&passes);
     // Set once a funding recovery step's replacement ended the first pass of a
-    // file fetch: the second pass then runs the remaining work against the new
-    // pool, and resumes the `.partial`.
+    // file fetch on a pool: the next pass then runs the remaining work against
+    // the new pool, and resumes the `.partial`.
     let mut replaced: Option<PoolReplaced> = None;
+    let mut first = true;
     loop {
+        let pool = config.pool(pass_pool).with_context(|| {
+            format!(
+                "payment pool {} is not configured",
+                pass_pool.pool_account()
+            )
+        })?;
+        let rpc = provider::build_provider(&pool.rpc_url, &signer)?;
+        let contract = PaymentPool::new(pass_pool.payment_pool, rpc.clone());
+        let voucher_dom = pass_pool.voucher_domain();
+        // The pool's token is `PaymentPool.usdc()`, immutable per contract, so
+        // the host reads it once per pool. A repeat fetch already holds it in
+        // the persisted pool row, so read it there and skip the eth_call; only
+        // a first-ever pool (no row) pays the `usdc()` round-trip. The reuse
+        // branch of `open_or_reuse_pool` already trusts this same
+        // `state.token`, so this only makes the top-level value consistent
+        // with it.
+        let token = *tokens
+            .get(pass_pool, tokio::sync::OnceCell::new)
+            .get_or_try_init(|| async {
+                match cached_pool_token(store.as_ref(), self_address, pass_pool)? {
+                    Some(token) => anyhow::Ok(token),
+                    None => contract
+                        .usdc()
+                        .call()
+                        .await
+                        .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()")),
+                }
+            })
+            .await?;
+        // One funding recovery state per pool for everything the payer pays
+        // for, every pass on the pool included.
+        let recovery = payer.recovery.get(pass_pool, RecoveryGate::new);
+        // A replacement the gate carries from an earlier fetch under this
+        // payer (an entry URI's manifest fetch) names the pool this pass's
+        // lanes reuse; the gate still lists it for the command to name. A
+        // keystore payer runs its fetches one after another, so no fetch is
+        // still on the closed pool. A held payer funds nothing, so its gate
+        // never holds one. Only a payer whose fetches run one after another
+        // clears a carried replacement: a fetch of a shared payer may still
+        // be in its pass on the closed pool, and would open yet another one.
+        if payer.ledgers.is_none() && replaced.is_none() {
+            recovery.leave_carried();
+        }
         // Per pass: the funding facts, the lanes and their handles all name the
-        // pool the pass pays from.
-        let funding = payer
-            .funding
-            .clone()
-            .unwrap_or_else(|| Arc::new(RunFunding::reporting_escrows_to(escrows.clone())));
+        // pool the pass pays from. The escrow handle guards this pool's
+        // contract only, so a pending `topUp` on another pool refuses nothing
+        // here.
+        let funding = match &payer.funding {
+            Some((per_pool, shared)) => per_pool.get(pass_pool, || {
+                RunFunding::reporting_escrows_to(shared.for_pool(pass_pool))
+            }),
+            None => Arc::new(RunFunding::reporting_escrows_to(
+                escrows.for_pool(pass_pool),
+            )),
+        };
+        let ledgers = payer
+            .ledgers
+            .as_ref()
+            .map(|ledgers| ledgers.get(pass_pool, LaneLedgers::new));
         // The shared pull/funding deps every lane borrows for the whole pass.
         let deps = LaneDeps {
             endpoint,
@@ -1309,6 +1426,8 @@ pub(crate) async fn fetch_on(
             self_address,
             token,
             chain: config,
+            pool,
+            passes: &passes,
             site: &chain.site,
             deposit,
             namespace_id,
@@ -1332,14 +1451,18 @@ pub(crate) async fn fetch_on(
             keys.lane_payer(),
             &voucher_dom,
             Some(&payer.open_lock),
-            payer.ledgers.as_ref(),
+            ledgers.as_deref(),
             None,
-            recovery,
+            &recovery,
         );
+        passes.start(pass_pool);
         let holders = sources.holders_from(&resolved);
-        if replaced.is_none() {
+        if first {
             timings.set_holders_start(holders.len());
         }
+        // Set once the pass writes to a stream: a stream cannot run again
+        // on another pool, because the bytes it wrote cannot be taken back.
+        let streamed = std::cell::Cell::new(false);
         // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
@@ -1363,7 +1486,8 @@ pub(crate) async fn fetch_on(
             let claim = sources
                 .first_claim(hash, holders, first_leg, health, &stop)
                 .await?;
-            if replaced.is_none()
+            if first
+                && replaced.is_none()
                 && let Some(hints) = &rate_hints
             {
                 // A whole blob is one range, so its wire bytes follow from
@@ -1385,6 +1509,7 @@ pub(crate) async fn fetch_on(
                 return Ok(());
             }
             let landed = if streams {
+                streamed.set(true);
                 stream_out(
                     &deps,
                     &sources,
@@ -1434,9 +1559,27 @@ pub(crate) async fn fetch_on(
         }
         let result = result.map_err(|err| annotate(err, &sources.fault_context()));
         match next_pass(result, &mut replaced, streams) {
+            Some(Err(err)) if !streamed.get() => match passes.next() {
+                // The nodes routed to another pool, and those that refused
+                // this one and named another, are paid in that pool's pass.
+                // A file pass resumes the `.partial`.
+                Some(next) => {
+                    tracing::info!(
+                        failed_pool = %pass_pool.pool_account(),
+                        next_pool = %next.pool_account(),
+                        error = %decdn_common::redact::sanitize_err_chain(&err),
+                        "the pass on this payment pool ended; the fetch goes on with the \
+                         nodes that take payment through the next pool"
+                    );
+                    pass_pool = next;
+                    replaced = None;
+                }
+                None => return Err(err),
+            },
             Some(pass_result) => return pass_result,
             None => recovery.start_next_pass(),
         }
+        first = false;
     }
 }
 
@@ -1502,7 +1645,7 @@ pub(crate) fn print_reclaim_notes(replacements: &[PoolReplaced]) {
     for replaced in replacements {
         eprintln!(
             "note: pool {} accepts no more funds and may still hold a balance; once its \
-             dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
+             dispute window ends, reclaim it with: decdn pool reclaim --pool-id {}",
             replaced.closed, replaced.closed
         );
     }
@@ -1590,7 +1733,7 @@ pub(crate) fn with_top_up_hint(err: anyhow::Error, pool_id: Option<PoolId>) -> a
     }
     let pool = pool_id.map_or_else(|| "<pool id>".to_string(), |id| id.to_string());
     err.context(format!(
-        "top up with: decdn pool top-up --pool {pool} --amount-micro-usdc <MICRO_USDC>"
+        "top up with: decdn pool top-up --pool-id {pool} --amount-micro-usdc <MICRO_USDC>"
     ))
 }
 
@@ -2099,28 +2242,65 @@ pub(crate) fn delegated_slot(
     Ok(slot.with_swap_wait(std::time::Duration::ZERO))
 }
 
+/// A `--capability` delegation: the grant, and the configured `PaymentPool`
+/// contract of its pool.
+#[derive(Debug, Clone)]
+pub(crate) struct Delegation {
+    /// The capability the pool owner issued to the delegate key.
+    pub(crate) grant: CapabilityGrant,
+    /// The configured contract whose on-chain owner of the grant's pool
+    /// signed it ([`super::capability_pool::capability_pool`]). Every fetch
+    /// under the delegation pays through it.
+    pub(crate) pool: decdn_incentive::Deployment,
+}
+
 /// Resolve the delegated `--capability`/`--capability-file` token into a
-/// [`CapabilityGrant`], and, when one is present, zero the working deposit
-/// in `chain`: a delegate owns no pool it could `topUp`, so its funding
-/// recovery step has nothing to add ([`decdn_client::funding::PoolFunder`]). `None` selects the
-/// unchanged self-owned pool path. Shared by the blob and bundle routes of `decdn get`.
+/// [`Delegation`], and, when one is present, zero the working deposit in
+/// `chain`: a delegate owns no pool it could `topUp`, so its funding
+/// recovery step has nothing to add ([`decdn_client::funding::PoolFunder`]).
+/// The grant's pool is the first configured contract under whose EIP-712
+/// domain its owner signature recovers to the pool's on-chain owner, as the
+/// gateway resolves a registered capability. `None` selects the unchanged
+/// self-owned pool path. Shared by the blob and bundle routes of `decdn get`.
 ///
 /// # Errors
 ///
-/// When `--capability-file` cannot be read, or the token fails to decode.
-pub(crate) fn resolve_delegation_grant(
+/// When `--capability-file` cannot be read, the token fails to decode, or no
+/// configured pool's owner signed it.
+pub(crate) async fn resolve_delegation(
     common: &cli::ClientFetchArgs,
     chain: &mut ResolvedChain,
-) -> anyhow::Result<Option<CapabilityGrant>> {
-    let grant = common
+) -> anyhow::Result<Option<Delegation>> {
+    let Some(grant) = common
         .resolve_capability_token()?
         .map(|token| CapabilityGrant::from_token(&token))
         .transpose()
-        .map_err(|e| anyhow::anyhow!("invalid --capability token: {e}"))?;
-    if grant.is_some() {
-        chain.working_deposit = U256::ZERO;
-    }
-    Ok(grant)
+        .map_err(|e| anyhow::anyhow!("invalid --capability token: {e}"))?
+    else {
+        return Ok(None);
+    };
+    chain.working_deposit = U256::ZERO;
+    let pool = super::capability_pool::capability_pool(
+        &grant,
+        &chain.config.payment_pools,
+        |pool, pool_id| {
+            let pool = pool.clone();
+            async move {
+                super::capability_pool::read_pool_owner(&pool, pool_id)
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            }
+        },
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "the --capability pool is on no configured payment pool: {e}. Configure the \
+             payment pool the capability's owner signed it for (--pool, or \
+             blockchain.payment_chains)"
+        )
+    })?;
+    Ok(Some(Delegation { grant, pool }))
 }
 
 #[cfg(test)]

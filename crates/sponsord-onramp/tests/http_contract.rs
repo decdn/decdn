@@ -254,7 +254,7 @@ async fn installer(path: &str, config: sponsord_onramp::config::OnrampConfig) ->
 
 /// The values each installer carries (`test_config` and `test_info`): this
 /// onramp, the pinned decdn release, and the download profile.
-fn expected(slash_judge: &str) -> [(&'static str, String); 10] {
+fn expected(slash_judge: &str) -> [(&'static str, String); 12] {
     let pool = Address::repeat_byte(0x22).to_string();
     let bond = Address::repeat_byte(0x33).to_string();
     [
@@ -263,11 +263,16 @@ fn expected(slash_judge: &str) -> [(&'static str, String); 10] {
         ("DECDN_RELEASE", "v0.3.0".into()),
         ("DECDN_VERSION", "0.3.0".into()),
         ("DECDN_SUMS_SHA256", "ab".repeat(32)),
-        ("CHAIN_ID", "421614".into()),
-        ("RPC_URL", "https://rpc.example".into()),
-        ("PAYMENT_POOL", pool),
+        ("GOVERNANCE_CHAIN_ID", "11155111".into()),
+        (
+            "GOVERNANCE_RPC_URL",
+            "https://governance-rpc.example".into(),
+        ),
         ("CAPACITY_BOND", bond),
         ("SLASH_JUDGE", slash_judge.into()),
+        ("POOL_CHAIN_ID", "421614".into()),
+        ("POOL_RPC_URL", "https://rpc.example".into()),
+        ("PAYMENT_POOL", pool),
     ]
 }
 

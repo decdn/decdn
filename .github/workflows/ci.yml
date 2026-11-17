@@ -936,7 +936,7 @@ jobs:
       # `testnet/TestnetFaucet.sol` and is wired only from
       # `script/TestnetFaucet.s.sol` + the test suite — any reference from
       # `src/` or from any other `script/*.s.sol` fails CI.
-      - name: Verify TestnetFaucet stays in testnet boundary
+      - name: Verify testnet contracts stay in the testnet boundary
         run: |
           set -euo pipefail
           # Explicit dir-existence check so a future refactor that renames /
@@ -958,6 +958,15 @@ jobs:
                    | grep -v '^script/TestnetFaucet\.s\.sol:' || true)
           if [[ -n "$leak" ]]; then
             echo "::error::TestnetFaucet must not appear outside contracts/testnet/ or contracts/script/TestnetFaucet.s.sol"
+            echo "$leak"
+            exit 1
+          fi
+          # `LoopbackCctp` checks no attestation, so no production source or
+          # deploy script may name it. Local deploys reach it from
+          # `dev-deploy.sh` and the Rust e2e only.
+          leak=$(grep -rnw 'LoopbackCctp' src/ script/ || true)
+          if [[ -n "$leak" ]]; then
+            echo "::error::LoopbackCctp must not appear in contracts/src/ or contracts/script/"
             echo "$leak"
             exit 1
           fi

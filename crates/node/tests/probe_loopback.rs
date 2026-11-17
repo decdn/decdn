@@ -480,7 +480,80 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
     let limiter = permissive_limiter(&metrics);
     let (cache, _cache_tmp) = empty_cache().await?;
     let (handler, signer, domain) = build_handler(server_id, rate_per_mb, &metrics, limiter, cache);
+    let req = ProbeRequest {
+        hash: [0x5au8; 32],
+        timestamp_us: now_us(),
+    };
+    let (resp, resp_ext) = probe_round_trip(handler, server_sk, req).await?;
 
+    assert_eq!(resp.body.timestamp_us, req.timestamp_us, "timestamp echoed");
+    assert_eq!(resp.body.hash, req.hash, "hash echoed");
+    assert_eq!(resp.body.rate_per_mb, rate_per_mb, "rate (unclamped)");
+    assert!(
+        !resp.body.has_blob,
+        "empty cache must report has_blob=false"
+    );
+    assert_eq!(stated_size(&resp_ext), None, "no size when blob absent");
+    assert_eq!(
+        resp_ext.payment_pools, None,
+        "a handler with no accepted pools advertises none"
+    );
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// The probe extension advertises the accepted payment pools, the first
+/// `MAX_PAYMENT_POOLS` of them, so a client can pick one it holds before it
+/// streams (ADR 005 § Payment pool routing).
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_advertises_the_accepted_payment_pools() -> anyhow::Result<()> {
+    let server_sk = fresh_key();
+    let metrics = Arc::new(Metrics::new());
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let pools: Vec<decdn_protocol::PoolAccount> = (0u8..10)
+        .map(|i| decdn_protocol::PoolAccount::eip155(1 + u64::from(i % 2), [i; 20]))
+        .collect();
+    let handler = Arc::new(
+        ProbeHandler::new(
+            server_sk.public(),
+            42,
+            Arc::clone(&metrics),
+            permissive_limiter(&metrics),
+            permissive_probe_rate_limiter(&metrics),
+            cache,
+            Arc::new(PrivateKeySigner::random()),
+            test_slash_domain(),
+            None,
+            true,
+            None,
+        )
+        .with_payment_pools(pools.clone()),
+    );
+    let req = ProbeRequest {
+        hash: [0x5au8; 32],
+        timestamp_us: now_us(),
+    };
+    let (_, resp_ext) = probe_round_trip(handler, server_sk, req).await?;
+    let advertised = resp_ext
+        .payment_pools
+        .ok_or_else(|| anyhow::anyhow!("the probe advertised no payment pools"))?;
+    anyhow::ensure!(
+        advertised.as_slice()
+            == pools
+                .get(..decdn_protocol::MAX_PAYMENT_POOLS)
+                .unwrap_or(&[]),
+        "the probe advertises the first MAX_PAYMENT_POOLS pools in order: {advertised:?}"
+    );
+    Ok(())
+}
+
+/// Serve one probe on `handler` and return its decoded response and extension.
+async fn probe_round_trip(
+    handler: Arc<ProbeHandler>,
+    server_sk: SecretKey,
+    req: ProbeRequest,
+) -> anyhow::Result<(ProbeResponse, ProbeResponseExt)> {
+    let server_id = server_sk.public();
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
 
     let server_ep_bg = server_ep.clone();
@@ -514,10 +587,6 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
 
-    let req = ProbeRequest {
-        hash: [0x5au8; 32],
-        timestamp_us: now_us(),
-    };
     let payload = encode_message(&ProbeMessage::Request(req))?;
     write_frame(&mut send, &payload)
         .await
@@ -533,23 +602,13 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         ProbeMessage::Request(_) => anyhow::bail!("unexpected request variant on client"),
     };
 
-    assert_eq!(resp.body.timestamp_us, req.timestamp_us, "timestamp echoed");
-    assert_eq!(resp.body.hash, req.hash, "hash echoed");
-    assert_eq!(resp.body.rate_per_mb, rate_per_mb, "rate (unclamped)");
-    assert!(
-        !resp.body.has_blob,
-        "empty cache must report has_blob=false"
-    );
-    assert_eq!(stated_size(&resp_ext), None, "no size when blob absent");
-    assert_slash_sig_valid(&resp, &signer, &domain)?;
-
     conn.close(0u32.into(), b"bye");
     shutdown([], [&client_ep]).await?;
 
     // Allow the server task to finish handling before closing its endpoint.
     support::reap("accept", accept_task).await??;
     shutdown([], [&server_ep]).await?;
-    Ok(())
+    Ok((resp, resp_ext))
 }
 
 /// Spin up a probe server and return the client's connected [`Connection`]

@@ -18,16 +18,12 @@
 //! Startup stays fail-closed. A retry delays readiness; it never opens the ALPN
 //! router before the deny-set is loaded and enforced.
 //!
-//! Three boot-time facts shape the loop:
+//! Two boot-time facts shape the loop:
 //!
 //! - No signal handler exists yet, so SIGTERM or SIGINT ends a retrying boot at
 //!   once. The only durable writes a boot attempt makes are sticky, idempotent
 //!   cache evictions; everything else it sets is in memory. An abrupt exit
 //!   therefore needs no teardown.
-//! - [`SharedHead`](super::shared_head::SharedHead) caches a failed head read
-//!   for half the poll interval. Retries inside that window replay the cached
-//!   error — the first two at the default 7 s poll interval — so the cost is at
-//!   most one cache TTL of the budget.
 //! - The metrics listener serves before bring-up starts, and so before
 //!   these reads, so `decdn_chain_boot_read_retries_total` rises while they
 //!   retry. `decdn_node_boot_ready` stays `0` until bring-up finishes. The
@@ -187,9 +183,9 @@ impl BootRetry {
 /// - a [`BootFault`] is permanent;
 /// - an `alloy::contract::Error` or a `TransportError` is classified by the
 ///   classifier the client's registry discovery shares
-///   ([`is_permanent_contract_error`], [`is_permanent_rpc_error`]). The head
-///   read keeps its typed cause through the `SharedHead` cache, so this covers
-///   the head read that opens the registry, slash and blacklist bootstraps.
+///   ([`is_permanent_contract_error`], [`is_permanent_rpc_error`]). The block
+///   read that opens the registry, slash, seat and blacklist bootstraps keeps
+///   its typed cause, so this covers it too.
 ///
 /// An error with no typed cause is transient. That covers a
 /// `chain_events::timed` timeout and the blacklist enumeration's count checks,

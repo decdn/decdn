@@ -66,18 +66,16 @@
 //! `resolve_bootstrap` correctly fell back to `Bootstrap::Cached` first
 //! (confirmed empirically: the fallback warning prints, then delivery fails
 //! against every cached candidate with `stream reset by peer: error 3`).
-//! `--rpc-url` cannot be broken instead: `fetch()` unconditionally calls
-//! `contract.usdc().call().await` right after target resolution
-//! (`crates/cli/src/commands/fetch.rs::fetch`), before any pool-reuse check,
-//! so an unreachable RPC aborts the whole command even when the buyer's
-//! existing pool has ample deposit and would otherwise need no on-chain read
-//! to be reused. Simulating the outage by pausing the fixture's own anvil
-//! process hits the same wall — that same unconditional `usdc()` read would
-//! also fail. Covering the fallback needs either a way to point discovery's registry read at
-//! a different RPC/contract than the payment path uses, or a fixture seam
-//! that fails `CapacityBond.getRegisteredNodes` in isolation (e.g. a
-//! `NodeFixture`/`ChainFixture` hook to revert just that call) — neither
-//! exists today. Items 1 and 2 are exercised in full below.
+//! The pool RPC (`--pool-rpc-url`) cannot be broken instead: `fetch()`
+//! unconditionally calls `contract.usdc().call().await` right after target
+//! resolution (`crates/cli/src/commands/fetch.rs::fetch`), before any
+//! pool-reuse check, so an unreachable payment RPC aborts the whole command
+//! even when the buyer's existing pool has ample deposit. Pausing the
+//! fixture's own anvil hits the same wall, because one anvil serves both
+//! chains. Covering the fallback needs a governance RPC (`--governance-rpc-url`)
+//! that fails while the payment RPC answers, or a fixture seam that fails
+//! `CapacityBond.getRegisteredNodes` in isolation; the fixture has neither.
+//! Items 1 and 2 are exercised in full below.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a prior build of both `decdn` and `decdn-node`:
@@ -507,14 +505,20 @@ fn fetch_argv(
         out.display().to_string(),
         "--capacity-bond-address".into(),
         format!("{}", chain.addrs().capacity_bond),
-        "--rpc-url".into(),
+        "--governance-rpc-url".into(),
         chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
+        "--governance-chain-id".into(),
+        chain.chain_id().to_string(),
+        "--pool".into(),
+        format!(
+            "eip155:{}:{:#x}",
+            chain.chain_id(),
+            chain.addrs().payment_pool
+        ),
+        "--pool-rpc-url".into(),
+        chain.rpc_url(),
         "--slash-judge-address".into(),
         format!("{}", chain.addrs().slash_judge),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
         "--data-dir".into(),
         data_dir.display().to_string(),
         "--keystore".into(),

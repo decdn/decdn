@@ -34,18 +34,6 @@ use crate::ports::{PortReservation, UdpPortClaim};
 /// via `DECDN_KEYSTORE_PASSWORD` (#1032).
 pub const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
 
-/// The summary WARN a daemon logs when its lane store opens against another
-/// `PaymentPool` deployment and drops the seller lane state, the pending
-/// settles and the watcher checkpoints. Shared so a journey that asserts the
-/// drop and one that asserts its absence match the same text.
-pub const FOREIGN_LANES_DROPPED: &str = "dropping seller lane state, pending settles and watcher \
-                                         checkpoints written against another PaymentPool \
-                                         deployment";
-
-/// The per-lane WARN a daemon logs for each decodable seller lane that a
-/// deployment rebind drops, before the [`FOREIGN_LANES_DROPPED`] summary.
-pub const FOREIGN_LANE_DROPPED: &str = "dropping this seller lane with the deployment rebind";
-
 /// Kills the spawned `decdn-node` on drop so a panicking assertion never leaks
 /// the daemon process. The `Child` is behind a `Mutex` so [`NodeFixture::wait_healthy`]
 /// can `try_wait` it through a shared `&self` reference.
@@ -75,6 +63,9 @@ impl Drop for NodeGuard {
 #[derive(Debug)]
 pub struct NodeFixture {
     child: NodeGuard,
+    /// The fixture chain's admin provider: a restart mines past the daemon's
+    /// snapshot lag margin through it first.
+    chain: alloy::providers::DynProvider,
     // TempDirs kept alive for the daemon's lifetime. The data dir is also read
     // back by `data_dir()` as an isolated `HOME` for CLI subprocesses.
     data_dir: tempfile::TempDir,
@@ -594,10 +585,15 @@ impl NodeFixture {
             warm.shutdown().await.context("flush warm cache")?;
         }
 
+        // The daemon's boot snapshots pin their reads below the head, so mine
+        // past that margin: it sees this operator's onboarding and every seat,
+        // registration and slash the journey made before it.
+        crate::time::mine_past_snapshot_margin(chain.admin()).await?;
         let log = DaemonLog::default();
         let child = spawn_daemon(&config_path, data_dir.path(), &log)?;
 
         let fixture = Self {
+            chain: chain.admin().clone(),
             child: NodeGuard(std::sync::Mutex::new(child)),
             data_dir,
             origin_dir,
@@ -626,6 +622,7 @@ impl NodeFixture {
     /// `Mutex`, so the swap needs no exclusive borrow. A daemon halted by
     /// [`Self::stop`] is respawned.
     pub async fn restart(&self) -> anyhow::Result<()> {
+        crate::time::mine_past_snapshot_margin(&self.chain).await?;
         self.respawn_child()?;
         self.wait_healthy(Duration::from_secs(30))
             .await
@@ -723,6 +720,7 @@ impl NodeFixture {
         &self,
         timeout: Duration,
     ) -> anyhow::Result<std::process::ExitStatus> {
+        crate::time::mine_past_snapshot_margin(&self.chain).await?;
         self.respawn_child()?;
         let (status, _) = self.wait_for_exit(timeout, "its respawn").await?;
         Ok(status)
@@ -1048,8 +1046,8 @@ struct RenderConfig<'a> {
 }
 
 /// Render the daemon TOML config. Emits only the keys the fixture sets; the
-/// daemon fills the rest from defaults. `event_poll_interval_ms` is dropped to
-/// 500ms so chain watchers react quickly against the local anvil.
+/// daemon fills the rest from defaults. `receipt_poll_interval_ms` is dropped
+/// to 500ms so redemptions land quickly against the local anvil.
 fn render_config(c: &RenderConfig<'_>) -> String {
     let a = &c.addrs;
     // Path fields use single-quoted TOML *literal* strings so backslashes in a
@@ -1068,17 +1066,17 @@ bind_port = {bind_port}
 rpc_url = "{rpc_url}"
 eth_keystore = '{keystore}'
 chain_id = {chain_id}
-payment_pool_address = "{payment_pool}"
+payment_chains = [{{ rpc_url = "{rpc_url}", chain_id = {chain_id}, payment_pools = ["{payment_pool}"] }}]
 capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
 slash_appeal_address = "{slash_appeal}"
 content_blacklist_address = "{content_blacklist}"
-# Small so a scope transition with no on-chain event (region/ripening, appeal
-# reversal) is re-scoped within the test budget rather than the 10-min default.
+# Small so a ledger mutation, or a scope transition with no ledger record
+# (region ripening), is enforced within the test budget.
 content_blacklist_poll_interval_sec = 2
 publisher_registry_address = "{publisher_registry}"
 origin_assignment_address = "{origin_assignment}"
-event_poll_interval_ms = 500
+receipt_poll_interval_ms = 500
 redeem_threshold_micro_usdc = 10
 
 [cache]
@@ -1224,24 +1222,29 @@ fn rewrite_pool_min_remaining_deposit(config: &str, micro_usdc: u64) -> anyhow::
     toml::to_string(&doc).context("render node config")
 }
 
-/// Rewrite `blockchain.payment_pool_address` in a node TOML config, preserving
-/// every other key. Separate from [`NodeFixture::set_payment_pool_address`] so
-/// its parse → mutate → `toml::to_string` round-trip is testable without a live
-/// daemon, mirroring [`rewrite_rate_per_mb`].
+/// Rewrite the first payment chain's pool list in a node TOML config to
+/// `[payment_pool]`, preserving every other key. Separate from
+/// [`NodeFixture::set_payment_pool_address`] so its parse → mutate →
+/// `toml::to_string` round-trip is testable without a live daemon, mirroring
+/// [`rewrite_rate_per_mb`].
 fn rewrite_payment_pool_address(config: &str, payment_pool: Address) -> anyhow::Result<String> {
     let mut doc: toml::Table = config.parse().context("parse node config")?;
-    let blockchain = doc
+    let chain = doc
         .get_mut("blockchain")
         .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("node config has no [blockchain] table"))?;
-    blockchain.insert(
-        "payment_pool_address".to_string(),
-        toml::Value::String(payment_pool.to_string()),
+        .and_then(|blockchain| blockchain.get_mut("payment_chains"))
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|chains| chains.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("node config names no payment chain"))?;
+    chain.insert(
+        "payment_pools".to_string(),
+        toml::Value::Array(vec![toml::Value::String(payment_pool.to_string())]),
     );
     toml::to_string(&doc).context("render node config")
 }
 
-/// Rewrite `blockchain.payment_pool_address` (through
+/// Rewrite the first payment chain's pool list (through
 /// [`rewrite_payment_pool_address`]) and replace `[network.discovery.peers]`
 /// with `discovery_peers` in a node TOML config, preserving every other key.
 /// Separate from [`NodeFixture::repoint_payment_pool`] so its parse → mutate →

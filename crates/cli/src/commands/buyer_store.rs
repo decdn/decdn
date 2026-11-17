@@ -178,7 +178,7 @@ impl BuyerStoreOwner {
     /// `close --all` / `reclaim --all` enumerate from chain by keystore
     /// address, not from the local store, so on a node host they would close
     /// the pool the daemon is actively paying from while the local forget
-    /// silently no-ops. A single `--pool <id>` is the stranded-pool recovery
+    /// silently no-ops. A single `--pool-id <id>` is the stranded-pool recovery
     /// path and stays available. `list --all` sends no transaction and writes
     /// no pool record, so it is not refused.
     ///
@@ -193,7 +193,7 @@ impl BuyerStoreOwner {
             "refusing to {verb} --all: this data dir belongs to a decdn-node daemon ({}), and \
              --all enumerates every pool this keystore owns ON CHAIN — including the one the \
              daemon is paying from right now. Run `decdn node pools` to see which pool that is, \
-             then {verb} the stranded ones individually with --pool <poolId>.",
+             then {verb} the stranded ones individually with --pool-id <poolId>.",
             node_buyer_db(data_dir).display(),
         )
     }

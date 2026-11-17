@@ -10,6 +10,8 @@ import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { INonfungiblePositionManager } from "../script/interfaces/IUniswapV3PoolCreation.sol";
 import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
+import { IMessageTransmitterV2 } from "../src/interfaces/ICctpV2.sol";
+import { LoopbackCctp } from "../testnet/LoopbackCctp.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 
 // -----------------------------------------------------------------
@@ -125,12 +127,13 @@ contract MockPositionManager {
 /// @notice Runs the `_runFullDeploy(cfg, act)` pipeline under the test contract's
 ///         own context (like `DeployProtocolTest`) so state is assertable without a
 ///         fork. Proves: (1) the OFF path reproduces the dormant launch exactly;
-///         (2) the ON Uniswap path lands the steady-state `[6000, 3000, 1000]`
-///         split with the burner wired, keeper set, pool seeded, and every role
+///         (2) the ON Uniswap path lands the steady-state (rebate 0, buyback
+///         7500) split with the burner wired, keeper set, pool seeded, and every role
 ///         handed to the Timelock; (3) the activation guards revert.
 contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     MockUSDC internal usdc;
     MockEd25519Verifier internal ed;
+    LoopbackCctp internal cctp;
 
     address internal emergencyMultisig = address(0xC0DE);
     address internal keeper = address(0xCAFE);
@@ -146,6 +149,7 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     function setUp() public {
         usdc = new MockUSDC();
         ed = new MockEd25519Verifier();
+        cctp = new LoopbackCctp(0);
         // The deployer (this contract) is the initial TOKEN holder and is funded
         // with USDC so the in-script seed pull has both legs.
         usdc.mint(address(this), 100_000_000e6);
@@ -170,8 +174,12 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
             currentTermsHash: keccak256("decdn operator terms v1"),
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
-            feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
+            feeRouterRebateBps: 7500,
+            feeRouterBuybackBps: 0,
+            feeRouterDeliveryFloor: 1,
             buybackBurner: address(0),
+            cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
+            cctpTokenMessenger: address(cctp),
             slashAppealBond: 1000e18
         });
     }
@@ -205,10 +213,8 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     function test_off_reproducesDormantLaunch() public {
         Deployment memory d = _runFullDeploy(_config(), _noBuybackActivation());
 
-        uint256[3] memory shares = d.router.getShares();
-        assertEq(shares[0], 9000, "operator 9000");
-        assertEq(shares[1], 0, "buyback dormant");
-        assertEq(shares[2], 1000, "treasury 1000");
+        assertEq(d.router.rebateBps(), 7500, "rebate 7500");
+        assertEq(d.router.buybackBps(), 0, "buyback dormant");
         assertEq(d.router.buybackBurner(), address(0), "burner unwired");
         assertEq(address(d.buybackBurner), address(0), "no burner deployed");
     }
@@ -216,7 +222,7 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     function test_off_singleArgMatchesExplicitOff() public {
         // The single-arg entry point must be exactly the all-off activation.
         Deployment memory a = _runFullDeploy(_config());
-        assertEq(a.router.getShares()[1], 0, "single-arg dormant");
+        assertEq(a.router.buybackBps(), 0, "single-arg dormant");
         assertEq(address(a.buybackBurner), address(0), "single-arg no burner");
     }
 
@@ -232,10 +238,10 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         Deployment memory d = _runFullDeploy(_config(), _uniswapActivation(address(npm)));
 
         // FeeRouter flipped to steady-state split with the burner + timelock wired.
-        uint256[3] memory shares = d.router.getShares();
-        assertEq(shares[0], 6000, "operator 6000");
-        assertEq(shares[1], 3000, "buyback 3000");
-        assertEq(shares[2], 1000, "treasury 1000");
+        (uint256 steadyRebate, uint256 steadyBuyback) = BuybackVenueLib.steadySplit();
+        assertEq(d.router.rebateBps(), steadyRebate, "rebate 0");
+        assertEq(d.router.buybackBps(), steadyBuyback, "buyback 7500");
+        assertEq(steadyBuyback, 7500, "steady buyback share");
         assertEq(d.router.buybackBurner(), address(d.buybackBurner), "burner wired into router");
         assertEq(d.router.treasury(), address(d.timelock), "treasury is timelock");
 
@@ -294,7 +300,7 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     }
 
     /// @notice A required Uniswap field left zero ships a burner that can never
-    ///         swap while already receiving 30% of protocol revenue, so the deploy
+    ///         swap while already receiving the buyback leg of every sweep, so the deploy
     ///         must fail fast.
     function test_revertsWhenUniswapFieldsUnwired() public {
         BuybackActivation memory act = _uniswapActivation(address(0xdead));

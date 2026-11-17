@@ -375,12 +375,9 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
     // the refusal reason to the sticky eviction (`undeny_hash`).
     chain.remove_hash_global(hash_key).await?;
 
-    // Mine across the poll. The log poller only sees the `HashRemoved` event once
-    // the chain head has advanced past its block (the add→evict path got that for
-    // free from its `increase_time`; a lone removal tx does not), and mining each
-    // round also keeps the watcher's periodic re-scope ticking. `180s` covers the
-    // `10s` `isHashBlacklistedForOperator` RPC timeout plus `eth_getLogs` poll
-    // jitter under `--test-threads 2` contention (#1826).
+    // Mine across the poll, so the `safe` block the ledger poll pins moves past
+    // the removal. `180s` covers the `10s` RPC timeout plus poll jitter under
+    // `--test-threads 2` contention (#1826).
     let reverted = poll_refusal_reason(
         &client,
         &mut session,

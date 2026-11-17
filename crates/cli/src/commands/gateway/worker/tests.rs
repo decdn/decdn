@@ -126,7 +126,7 @@ impl Backend for Fake {
     async fn pools(
         &self,
         (): &(),
-        delegates: &[(PoolId, Address)],
+        delegates: &[super::DelegateKey],
     ) -> anyhow::Result<PoolSnapshot> {
         if self.log.lock().unwrap().end_pulls_in_store_read {
             self.release.notify_waiters();
@@ -138,7 +138,7 @@ impl Backend for Fake {
         Ok(PoolSnapshot {
             delegate_lanes: delegates
                 .iter()
-                .map(|&(pool_id, signer)| DelegateLanes::new(signer, pool_id, Vec::new()))
+                .map(|&(_, pool_id, signer)| DelegateLanes::new(signer, pool_id, Vec::new()))
                 .collect(),
             ..PoolSnapshot::default()
         })
@@ -186,6 +186,7 @@ fn credential(signer: &Arc<PrivateKeySigner>) -> Credential {
             expiry: u64::MAX,
             owner_signature: vec![0; 65],
         },
+        pool: DEPLOYMENT,
     }
 }
 
@@ -546,14 +547,14 @@ async fn a_pools_query_is_answered_beside_running_pulls() {
     let (worker, _log, release) = start(1).await;
     let signer = Arc::new(PrivateKeySigner::random());
     let (_held, held_done) = send(&worker, HOLD, &signer, 1024);
-    let delegate = (PoolId::repeat_byte(7), signer.address());
+    let delegate = (DEPLOYMENT, PoolId::repeat_byte(7), signer.address());
     let snapshot = tokio::time::timeout(Duration::from_secs(10), worker.pools(vec![delegate]))
         .await
         .expect("the query is answered while the only slot is held")
         .expect("the fake answers");
     assert_eq!(snapshot.delegate_lanes.len(), 1);
-    assert_eq!(snapshot.delegate_lanes[0].pool_id, delegate.0);
-    assert_eq!(snapshot.delegate_lanes[0].signer, delegate.1);
+    assert_eq!(snapshot.delegate_lanes[0].pool_id, delegate.1);
+    assert_eq!(snapshot.delegate_lanes[0].signer, delegate.2);
     release.notify_one();
     held_done.await.unwrap().unwrap();
     worker.stop().await;
@@ -568,8 +569,8 @@ async fn a_pools_query_counts_the_pulls_in_flight() {
     let bob = Arc::new(PrivateKeySigner::random());
     let (_held, held_done) = send(&worker, HOLD, &alice, 1024);
     let delegates = vec![
-        (PoolId::ZERO, alice.address()),
-        (PoolId::ZERO, bob.address()),
+        (DEPLOYMENT, PoolId::ZERO, alice.address()),
+        (DEPLOYMENT, PoolId::ZERO, bob.address()),
     ];
     let spend = |snapshot: &PoolSnapshot| {
         snapshot
@@ -682,7 +683,7 @@ async fn a_pull_that_ends_during_the_store_read_still_counts() {
     .expect("the held pull starts");
     log.lock().unwrap().end_pulls_in_store_read = true;
     let snapshot = worker
-        .pools(vec![(PoolId::ZERO, alice.address())])
+        .pools(vec![(DEPLOYMENT, PoolId::ZERO, alice.address())])
         .await
         .unwrap();
     held_done.await.unwrap().unwrap();
@@ -705,7 +706,7 @@ async fn a_pools_query_counts_the_pool_payers_live_lanes() {
     assert_eq!(read_all(reader).await, b"hello");
     done.await.unwrap().unwrap();
     let snapshot = worker
-        .pools(vec![(PoolId::ZERO, POOL_SIGNER)])
+        .pools(vec![(DEPLOYMENT, PoolId::ZERO, POOL_SIGNER)])
         .await
         .unwrap();
     assert_eq!(
@@ -735,17 +736,23 @@ const DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
     payment_pool: Address::repeat_byte(0x9c),
 };
 
-/// A delegate lane of `signer` on `pool`, to node `0xb2`, at `amount`.
+/// A second `PaymentPool` contract, on another payment chain.
+const OTHER_DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
+    chain_id: 84_532,
+    payment_pool: Address::repeat_byte(0x9d),
+};
+
+/// A delegate lane of `signer` on `pool` of `deployment`, to node `0xb2`, at
+/// `amount`.
 fn seed_delegate_lane(
     store: &decdn_incentive::MemoryBuyerPoolStore,
-    pool: PoolId,
-    signer: Address,
+    (deployment, pool, signer): super::DelegateKey,
     amount: u64,
 ) {
     use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerLaneProgress, BuyerPoolStore as _};
     let outcome = store
         .advance_delegate_progress(
-            DEPLOYMENT,
+            deployment,
             decdn_incentive::lane::LaneKey {
                 pool_id: pool,
                 signer,
@@ -760,25 +767,34 @@ fn seed_delegate_lane(
     assert_eq!(outcome, AdvanceOutcome::Advanced);
 }
 
-/// The store read lists each queried key's delegate lanes on its pool: a
-/// capability a page registered, and the `--capability` grant a public
-/// gateway pays under, whose lanes are delegate lanes too.
+/// The store read lists each queried key's delegate lanes on its pool and
+/// contract: a capability a page registered on a second configured contract,
+/// and the `--capability` grant a public gateway pays under, whose lanes are
+/// delegate lanes too.
 #[test]
 fn the_store_read_lists_every_queried_keys_lanes() {
     let store = decdn_incentive::MemoryBuyerPoolStore::new();
-    let registered = (PoolId::repeat_byte(1), Address::repeat_byte(0x11));
-    let granted = (PoolId::repeat_byte(2), Address::repeat_byte(0x22));
-    seed_delegate_lane(&store, registered.0, registered.1, 100);
-    seed_delegate_lane(&store, granted.0, granted.1, 250);
+    let registered = (
+        OTHER_DEPLOYMENT,
+        PoolId::repeat_byte(1),
+        Address::repeat_byte(0x11),
+    );
+    let granted = (
+        DEPLOYMENT,
+        PoolId::repeat_byte(2),
+        Address::repeat_byte(0x22),
+    );
+    seed_delegate_lane(&store, registered, 100);
+    seed_delegate_lane(&store, granted, 250);
     let grant = CapabilityGrant {
-        pool_id: granted.0,
-        signer: granted.1,
+        pool_id: granted.1,
+        signer: granted.2,
         spending_cap: 1_000,
         expiry: u64::MAX,
         owner_signature: vec![0; 65],
     };
-    let queries = lane_queries(Some(&grant), &[registered]);
-    let snapshot = read_pools(&store, DEPLOYMENT, &queries).unwrap();
+    let queries = lane_queries(Some((DEPLOYMENT, &grant)), &[registered]);
+    let snapshot = read_pools(&store, &queries).unwrap();
     let mut listed: Vec<_> = snapshot
         .delegate_lanes
         .iter()
@@ -791,25 +807,32 @@ fn the_store_read_lists_every_queried_keys_lanes() {
     assert_eq!(
         listed,
         vec![
-            (registered.0, registered.1, 100),
-            (granted.0, granted.1, 250)
+            (registered.1, registered.2, 100),
+            (granted.1, granted.2, 250)
         ]
     );
     assert!(snapshot.pools.pools.is_empty());
+    // The same pool and key on the other contract holds no lane.
+    let elsewhere = read_pools(&store, &[(DEPLOYMENT, registered.1, registered.2)]).unwrap();
+    assert!(elsewhere.delegate_lanes[0].lanes.is_empty());
 }
 
 /// The grant's key is asked once, even when a capability names it too.
 #[test]
 fn lane_queries_add_the_grant_once() {
-    let key = (PoolId::repeat_byte(3), Address::repeat_byte(0x33));
+    let key = (
+        DEPLOYMENT,
+        PoolId::repeat_byte(3),
+        Address::repeat_byte(0x33),
+    );
     let grant = CapabilityGrant {
-        pool_id: key.0,
-        signer: key.1,
+        pool_id: key.1,
+        signer: key.2,
         spending_cap: 1,
         expiry: u64::MAX,
         owner_signature: vec![0; 65],
     };
-    assert_eq!(lane_queries(Some(&grant), &[key]), vec![key]);
+    assert_eq!(lane_queries(Some((DEPLOYMENT, &grant)), &[key]), vec![key]);
     assert_eq!(lane_queries(None, &[key]), vec![key]);
-    assert_eq!(lane_queries(Some(&grant), &[]), vec![key]);
+    assert_eq!(lane_queries(Some((DEPLOYMENT, &grant)), &[]), vec![key]);
 }

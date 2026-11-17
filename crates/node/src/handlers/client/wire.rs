@@ -139,6 +139,7 @@ impl ClientHandler {
             StreamResponseExt {
                 outcome,
                 origin_attestation,
+                payment_pools: None,
             },
         ))
     }
@@ -183,9 +184,14 @@ impl ClientHandler {
         reason: ServeRejectReason,
         rate_per_mb: u64,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
-        let (resp, resp_ext) = self
+        let (resp, mut resp_ext) = self
             .sign_refusal(req, rate_per_mb, reason.wire_error())
             .with_context(|| format!("sign the {reason:?} refusal"))?;
+        // An unaccepted pool's refusal names the pools this node does accept
+        // (ADR 005 § Payment pool routing).
+        if reason == ServeRejectReason::UnacceptedPool {
+            resp_ext = StreamResponseExt::pool_declined(self.accepted_pools());
+        }
         tolerate_departed_peer(
             self.write_stream_response(send, &resp, &resp_ext).await,
             "refusal",

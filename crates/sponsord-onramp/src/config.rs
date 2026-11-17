@@ -150,13 +150,23 @@ pub struct Args {
     #[arg(long, env = "ONRAMP_DAEMON_TOKEN_FILE")]
     pub daemon_token_file: Option<PathBuf>,
 
-    /// Public JSON-RPC endpoint end users' `decdn` reads the chain through.
-    #[arg(long, env = "ONRAMP_RPC_URL")]
-    pub rpc_url: String,
-    /// `CapacityBond` contract address, for node discovery.
+    /// Public JSON-RPC endpoint end users' `decdn` reads the governance
+    /// chain through: the chain of the `CapacityBond` and the `SlashJudge`.
+    #[arg(long, env = "ONRAMP_GOVERNANCE_RPC_URL")]
+    pub governance_rpc_url: String,
+    /// EIP-155 id of the governance chain.
+    #[arg(long, env = "ONRAMP_GOVERNANCE_CHAIN_ID")]
+    pub governance_chain_id: u64,
+    /// Public JSON-RPC endpoint end users' `decdn` reads and pays the
+    /// payment pool through: the chain of the daemon's `PaymentPool`.
+    #[arg(long, env = "ONRAMP_POOL_RPC_URL")]
+    pub pool_rpc_url: String,
+    /// `CapacityBond` contract address on the governance chain, for node
+    /// discovery.
     #[arg(long, env = "ONRAMP_CAPACITY_BOND_ADDR")]
     pub capacity_bond: Address,
-    /// `SlashJudge` contract address, handed to `decdn` when set.
+    /// `SlashJudge` contract address on the governance chain, handed to
+    /// `decdn` when set.
     #[arg(long, env = "ONRAMP_SLASH_JUDGE_ADDR")]
     pub slash_judge: Option<Address>,
 
@@ -261,8 +271,14 @@ pub struct OnrampConfig {
     /// Bearer token for the daemon's API, from `ONRAMP_DAEMON_TOKEN` or
     /// `ONRAMP_DAEMON_TOKEN_FILE`.
     pub daemon_token: Secret,
-    /// Public RPC URL handed to end users.
-    pub rpc_url: String,
+    /// Public governance-chain RPC URL handed to end users
+    /// (`ONRAMP_GOVERNANCE_RPC_URL`).
+    pub governance_rpc_url: String,
+    /// EIP-155 id of the governance chain (`ONRAMP_GOVERNANCE_CHAIN_ID`).
+    pub governance_chain_id: u64,
+    /// Public payment-chain RPC URL handed to end users
+    /// (`ONRAMP_POOL_RPC_URL`).
+    pub pool_rpc_url: String,
     /// `CapacityBond` contract address handed to end users for node
     /// discovery (`ONRAMP_CAPACITY_BOND_ADDR`).
     pub capacity_bond: Address,
@@ -376,7 +392,12 @@ impl OnrampConfig {
                 args.daemon_token,
                 args.daemon_token_file.as_deref(),
             )?,
-            rpc_url: script_safe_url("ONRAMP_RPC_URL", &args.rpc_url)?,
+            governance_rpc_url: script_safe_url(
+                "ONRAMP_GOVERNANCE_RPC_URL",
+                &args.governance_rpc_url,
+            )?,
+            governance_chain_id: args.governance_chain_id,
+            pool_rpc_url: script_safe_url("ONRAMP_POOL_RPC_URL", &args.pool_rpc_url)?,
             capacity_bond: args.capacity_bond,
             slash_judge: args.slash_judge,
             spending_cap: args.spending_cap,

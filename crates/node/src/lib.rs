@@ -16,7 +16,7 @@
 //! | Serving | [`handlers`] (one handler per ALPN), [`dispatch`] and [`rate_limit`] (the connection cap and the per-peer and global request limits), [`load_shed`] (overload shedding), [`serve_economics`] and [`warming_allowance`] (when a cache-miss relay pays) |
 //! | Cache misses | [`node_origin`] (the paid node-to-node pull-through origin), [`selection`] (provider choice), [`dht`] (the content DHT) |
 //! | Payment | [`payment_settlement`] (seller-side redemption), [`buyer_pool`] and [`buyer_ledgers`] (buyer-side pools and lanes), [`pool_store`] and [`pool_view`] (lane state), [`onchain_tx`] (transaction submission) |
-//! | Chain watchers | [`chain_events`], [`blacklist_watcher`], [`slash_watcher`], [`fee_shares_watcher`], [`chain_freshness`], [`binding_check`] |
+//! | Chain watchers | [`chain_events`], [`blacklist_watcher`], [`slash_watcher`], [`chain_freshness`], [`binding_check`] |
 //! | Compliance | [`content_deny`] (the origin deny-set) |
 //! | Operations | [`admin`] (the loopback admin JSON-RPC server, [Local Admin HTTP]), [`metrics`], [`receipt_log`], [`systemd_watchdog`] |
 //!
@@ -41,7 +41,6 @@ pub mod content_deny;
 pub mod dht;
 pub mod dispatch;
 pub mod fee_shares;
-pub mod fee_shares_watcher;
 pub mod handlers;
 pub mod load_shed;
 pub mod metrics;

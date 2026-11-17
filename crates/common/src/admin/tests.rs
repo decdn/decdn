@@ -125,6 +125,7 @@ fn lanes_response_round_trips() {
         redeem_threshold_micro_usdc: 1_000_000,
         lanes: vec![
             LaneSnapshot {
+                pool: "eip155:84532:0x00000000000000000000000000000000000000b0".to_string(),
                 pool_id: "0xabcd".to_string(),
                 counterparty: Some("0x00aa".to_string()),
                 voucher_signer: "0x00cc".to_string(),
@@ -136,6 +137,7 @@ fn lanes_response_round_trips() {
                 settlement_eligible: true,
             },
             LaneSnapshot {
+                pool: "eip155:84532:0x00000000000000000000000000000000000000b0".to_string(),
                 pool_id: "0xbeef".to_string(),
                 // The node has not seen this pool, so the owner is unknown.
                 counterparty: None,
@@ -154,6 +156,10 @@ fn lanes_response_round_trips() {
     assert_eq!(back.redeem_threshold_micro_usdc, 1_000_000);
     assert_eq!(back.lanes.len(), 2);
     let first = back.lanes.first().expect("first lane");
+    assert_eq!(
+        first.pool,
+        "eip155:84532:0x00000000000000000000000000000000000000b0"
+    );
     assert_eq!(first.pool_id, "0xabcd");
     assert_eq!(first.counterparty.as_deref(), Some("0x00aa"));
     assert_eq!(

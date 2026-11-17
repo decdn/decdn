@@ -1,5 +1,7 @@
 use alloy::primitives::{Address, B256, U256};
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolError, SolEvent};
+
+use alloy::sol_types::SolCall;
 
 use super::{PaymentPool, to_pool_u64};
 
@@ -25,8 +27,8 @@ fn pool_redeemed_signature_matches_contract() {
 /// carrying `signer` per entry rather than as a topic. The
 /// signature-string pin above is blind to this split, so a future edit
 /// that moved `indexed` onto the wrong param would pass that test while
-/// silently breaking a node's `provider`-topic filter for its settlement
-/// watcher. This test builds the event with distinct sentinel values and
+/// silently breaking the `provider`-topic filter of `decdn node earnings
+/// --address` and the node's receipt decode. This test builds the event with distinct sentinel values and
 /// checks each one landed where the ABI encoding puts it.
 #[test]
 fn pool_redeemed_indexed_layout_matches_contract() {
@@ -70,7 +72,7 @@ fn pool_redeemed_indexed_layout_matches_contract() {
     assert_eq!(log.data.len(), 32 * (2 + 3 * 2));
 
     // Round-trip through the decoder recovers the same lanes, proving the
-    // topic/data split above is exactly what a real watcher decodes.
+    // topic/data split above is exactly what a receipt decoder reads.
     let decoded = PaymentPool::PoolRedeemed::decode_log_data(&log).unwrap();
     assert_eq!(decoded.poolId, pool_id);
     assert_eq!(decoded.provider, provider);
@@ -293,8 +295,8 @@ fn redeem_call_struct_layouts_match_contract() {
     );
 }
 
-/// Same pin for the other four ABI-tuple-carrying events consumed by
-/// the node's watchers.
+/// Same pin for the other four ABI-tuple-carrying events that receipt
+/// decoders and indexers consume.
 #[test]
 fn lifecycle_event_signatures_match_contract() {
     assert_eq!(
@@ -312,10 +314,6 @@ fn lifecycle_event_signatures_match_contract() {
     assert_eq!(
         PaymentPool::PoolReclaimed::SIGNATURE,
         "PoolReclaimed(bytes32,address,uint256)"
-    );
-    assert_eq!(
-        PaymentPool::RateBoundsUpdated::SIGNATURE,
-        "RateBoundsUpdated(uint256)"
     );
 }
 
@@ -377,14 +375,52 @@ fn signer_authorization_covers_a_floor_within_headroom_and_expiry() {
     assert!(SignerAuthorization::Unregistered.covers(U256::MAX, u64::MAX));
 }
 
-/// Pins the `FeeRouter.Settled` event signature to
-/// `contracts/src/FeeRouter.sol`, so a drift fails here instead of silently
-/// mis-decoding the settlement ledger's receipts and the earnings scan.
+/// Pins the sweep and deposit events to `contracts/src/PaymentPoolBase.sol`,
+/// `FeeRouter.sol` and `CctpSweepReceiver.sol`, so a drift fails here instead
+/// of matching no logs.
 #[test]
-fn fee_router_settled_signature_matches_contract() {
+fn sweep_event_signatures_match_contracts() {
     assert_eq!(
-        super::FeeRouter::Settled::SIGNATURE,
-        "Settled(address,uint256,uint256,uint64)"
+        PaymentPool::Swept::SIGNATURE,
+        "Swept(address,uint256,uint256)"
+    );
+    assert_eq!(
+        PaymentPool::SweepSent::SIGNATURE,
+        "SweepSent(uint256,uint256)"
+    );
+    assert_eq!(
+        PaymentPool::BelowMinSweep::SIGNATURE,
+        "BelowMinSweep(uint256,uint256)"
+    );
+    assert_eq!(
+        PaymentPool::BadSweepBatch::SIGNATURE,
+        "BadSweepBatch(uint256)"
+    );
+    assert_eq!(
+        super::FeeRouter::Deposited::SIGNATURE,
+        "Deposited(address,address,uint256,uint256,uint256,uint64)"
+    );
+    assert_eq!(
+        super::CctpSweepReceiver::SweepReceived::SIGNATURE,
+        "SweepReceived(uint32,address,address,uint256)"
+    );
+}
+
+/// Pins the immutables a node reads to tell a `PaymentPool` from another
+/// contract and to size its sweep.
+#[test]
+fn pool_immutable_selectors_match_contract() {
+    assert_eq!(PaymentPool::operatorBpsCall::SIGNATURE, "operatorBps()");
+    assert_eq!(PaymentPool::sweepDomainCall::SIGNATURE, "sweepDomain()");
+    assert_eq!(PaymentPool::pendingCall::SIGNATURE, "pending(address)");
+    assert_eq!(PaymentPool::sweepCall::SIGNATURE, "sweep(address[])");
+    assert_eq!(
+        PaymentPool::MAX_SWEEP_BATCHCall::SIGNATURE,
+        "MAX_SWEEP_BATCH()"
+    );
+    assert_eq!(
+        super::CctpSweepReceiver::receiveSweepCall::SIGNATURE,
+        "receiveSweep(bytes,bytes)"
     );
 }
 

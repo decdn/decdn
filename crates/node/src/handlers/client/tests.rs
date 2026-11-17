@@ -1,5 +1,33 @@
 use super::*;
 
+/// `key` on the test pool, as the handler keys its lane registry.
+const fn tid(key: LaneKey) -> LaneId {
+    LaneId {
+        deployment: TEST_DEPLOYMENT,
+        key,
+    }
+}
+
+/// `pool_id` on the test pool, as the floor accounting keys it.
+const fn tpool(pool_id: B256) -> PoolKey {
+    (TEST_DEPLOYMENT, pool_id)
+}
+
+/// The lane store of the handler's test pool.
+fn test_store(handler: &ClientHandler) -> Arc<dyn PoolStateStore> {
+    Arc::clone(
+        &handler
+            .pool_route(TEST_DEPLOYMENT)
+            .expect("the test pool is routed")
+            .store,
+    )
+}
+
+/// The test pool whose id repeats `byte`.
+const fn tpool_byte(byte: u8) -> PoolKey {
+    tpool(B256::repeat_byte(byte))
+}
+
 /// The credit-window floor (one chunk plus the verify lag) priced in `µUSDC` at
 /// `rate_per_mb`: the credit a fresh stream reserves before its first proof.
 fn floor_micro(rate_per_mb: u64) -> U256 {
@@ -41,7 +69,7 @@ async fn a_loaded_lane_counts_its_proved_frontier_as_credited() {
 
     let loaded = handler
         .lanes
-        .get(&lane.key())
+        .get(&tid(lane.key()))
         .map(|e| Arc::clone(e.value()))
         .expect("the handler loads the stored lane");
     let guard = loaded.lock().await;
@@ -276,9 +304,12 @@ async fn handler_for_tests_with_signer_policy(
         cache,
         Arc::new(alloy::signers::local::PrivateKeySigner::random()),
         domain.clone(),
-        domain.clone(),
         domain,
-        Arc::new(decdn_incentive::store::MemoryPoolStateStore::new()) as Arc<dyn PoolStateStore>,
+        PoolRoute::new(
+            TEST_DEPLOYMENT,
+            Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+                as Arc<dyn PoolStateStore>,
+        ),
         Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
             crate::receipt_log::NoopReceiptLog,
         ))) as Arc<dyn ReceiptSink>,
@@ -365,7 +396,9 @@ async fn distinct_lanes_register_resolve_and_forget_concurrently() {
             None,
             decdn_incentive::LaneChain::NONE,
         );
-        register.push(tokio::spawn(async move { handler.register_lane(state) }));
+        register.push(tokio::spawn(async move {
+            handler.register_lane(TEST_DEPLOYMENT, state)
+        }));
     }
     for task in register {
         task.await.expect("join").expect("register_lane");
@@ -378,7 +411,7 @@ async fn distinct_lanes_register_resolve_and_forget_concurrently() {
         let handler = Arc::clone(&handler);
         let key = *key;
         resolve.push(tokio::spawn(async move {
-            match handler.lanes.get(&key).map(|e| Arc::clone(e.value())) {
+            match handler.lanes.get(&tid(key)).map(|e| Arc::clone(e.value())) {
                 Some(entry) => Some(entry.lock().await.state.key()),
                 None => None,
             }
@@ -397,7 +430,9 @@ async fn distinct_lanes_register_resolve_and_forget_concurrently() {
     for key in &keys {
         let handler = Arc::clone(&handler);
         let key = *key;
-        forget.push(tokio::spawn(async move { handler.forget_lane(key).await }));
+        forget.push(tokio::spawn(
+            async move { handler.forget_lane(tid(key)).await },
+        ));
     }
     for task in forget {
         task.await.expect("join").expect("forget_lane");
@@ -468,14 +503,18 @@ async fn lane_count_gauge_tracks_the_live_map() {
         decdn_incentive::LaneChain::NONE,
     );
     // A duplicate registration is a no-op and must not double-count.
-    handler.register_lane(state.clone()).expect("register");
-    handler.register_lane(state).expect("register twice");
+    handler
+        .register_lane(TEST_DEPLOYMENT, state.clone())
+        .expect("register");
+    handler
+        .register_lane(TEST_DEPLOYMENT, state)
+        .expect("register twice");
     let encoded = metrics.encode().expect("metrics encode");
     assert!(
         encoded.lines().any(|line| line == "decdn_lanes_open 1"),
         "an idempotent register must not double count"
     );
-    handler.forget_lane(lane).await.expect("forget");
+    handler.forget_lane(tid(lane)).await.expect("forget");
     let encoded = metrics.encode().expect("metrics encode");
     assert!(
         encoded.lines().any(|line| line == "decdn_lanes_open 0"),
@@ -516,7 +555,9 @@ async fn lane_gauge_matches_live_count_after_concurrent_register_and_remove() {
                 None,
                 decdn_incentive::LaneChain::NONE,
             );
-            handler.register_lane(state).expect("register");
+            handler
+                .register_lane(TEST_DEPLOYMENT, state)
+                .expect("register");
         }));
     }
     for handle in join {
@@ -529,11 +570,11 @@ async fn lane_gauge_matches_live_count_after_concurrent_register_and_remove() {
         let handler = Arc::clone(&handler);
         join.push(tokio::spawn(async move {
             handler
-                .forget_lane(LaneKey {
+                .forget_lane(tid(LaneKey {
                     pool_id: B256::repeat_byte(i + 0xA0),
                     signer: Address::repeat_byte(i + 0x01),
                     provider,
-                })
+                }))
                 .await
                 .expect("forget");
         }));
@@ -578,7 +619,9 @@ async fn concurrent_first_streams_on_one_lane_count_it_once() {
                 None,
                 decdn_incentive::LaneChain::NONE,
             );
-            handler.register_lane(state).expect("register");
+            handler
+                .register_lane(TEST_DEPLOYMENT, state)
+                .expect("register");
         }));
     }
     for handle in join {
@@ -655,7 +698,9 @@ async fn racing_first_streams_record_the_fresh_lane_once() {
                 decdn_incentive::LaneChain::NONE,
             );
             barrier.wait().await;
-            handler.register_lane(state).expect("register");
+            handler
+                .register_lane(TEST_DEPLOYMENT, state)
+                .expect("register");
         }));
     }
     for handle in join {
@@ -769,7 +814,11 @@ fn the_funding_refusals_are_unfunded() {
 /// handler's live map — the field the redeemer builds its `CapabilityReg`
 /// from. `None` when the lane is absent OR present without a captured grant.
 async fn lane_owner_sig(handler: &ClientHandler, key: &LaneKey) -> Option<[u8; 65]> {
-    let lane = handler.lanes.get(key).map(|e| Arc::clone(e.value()))?;
+    let id = LaneId {
+        deployment: TEST_DEPLOYMENT,
+        key: *key,
+    };
+    let lane = handler.lanes.get(&id).map(|e| Arc::clone(e.value()))?;
     // `owner_sig` is `Copy`, so it copies out as the guard's temporary drops.
     lane.lock().await.state.owner_sig
 }
@@ -817,9 +866,12 @@ async fn handler_with_capability_intake(
         cache,
         Arc::new(alloy::signers::local::PrivateKeySigner::random()),
         domain.clone(),
-        domain.clone(),
         domain,
-        Arc::new(decdn_incentive::store::MemoryPoolStateStore::new()) as Arc<dyn PoolStateStore>,
+        PoolRoute::new(
+            TEST_DEPLOYMENT,
+            Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+                as Arc<dyn PoolStateStore>,
+        ),
         Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
             crate::receipt_log::NoopReceiptLog,
         ))) as Arc<dyn ReceiptSink>,
@@ -829,7 +881,9 @@ async fn handler_with_capability_intake(
         U256::ZERO,
         always_admit_shed(),
     );
-    deps.pool_view = Some(Arc::new(FixedPoolView { owner }));
+    for pool in &mut deps.pools {
+        pool.pool_view = Some(Arc::new(FixedPoolView { owner }));
+    }
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
 }
@@ -881,9 +935,12 @@ async fn handler_with_pool_view_and_freshness(
         cache,
         Arc::new(alloy::signers::local::PrivateKeySigner::random()),
         domain.clone(),
-        domain.clone(),
         domain,
-        Arc::new(decdn_incentive::store::MemoryPoolStateStore::new()) as Arc<dyn PoolStateStore>,
+        PoolRoute::new(
+            TEST_DEPLOYMENT,
+            Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+                as Arc<dyn PoolStateStore>,
+        ),
         Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
             crate::receipt_log::NoopReceiptLog,
         ))) as Arc<dyn ReceiptSink>,
@@ -893,7 +950,9 @@ async fn handler_with_pool_view_and_freshness(
         U256::ZERO,
         always_admit_shed(),
     );
-    deps.pool_view = view;
+    if let Some(pool) = deps.pools.first_mut() {
+        pool.pool_view = view;
+    }
     deps.chain_freshness = freshness;
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
@@ -909,7 +968,7 @@ async fn intake_rejects_wrong_owner_capability() {
     let metrics = Arc::new(Metrics::new());
     let owner = PrivateKeySigner::random();
     let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
-    let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+    let domain = TEST_DEPLOYMENT.voucher_domain();
     let pool_id = B256::repeat_byte(0x77);
     let signer = Address::repeat_byte(0x11);
     let spending_cap = 1_000_000u64;
@@ -939,9 +998,9 @@ async fn intake_rejects_wrong_owner_capability() {
 
     // A capability signed by a NON-owner is dropped: no lane, no material.
     let bad = make_wire(&PrivateKeySigner::random());
-    handler.intake_capability(pool_id, signer, owner.address(), &bad);
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &bad);
     assert!(
-        !handler.lanes.contains_key(&lane_key),
+        !handler.lanes.contains_key(&tid(lane_key)),
         "a forged-owner capability must not register a lane"
     );
     assert_eq!(
@@ -954,9 +1013,9 @@ async fn intake_rejects_wrong_owner_capability() {
     let good = make_wire(&owner);
     let expected_sig =
         <[u8; 65]>::try_from(good.owner_signature.as_slice()).expect("65-byte owner sig");
-    handler.intake_capability(pool_id, signer, owner.address(), &good);
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &good);
     assert!(
-        handler.lanes.contains_key(&lane_key),
+        handler.lanes.contains_key(&tid(lane_key)),
         "a correct-owner capability registers its lane so vouchers can be served"
     );
     assert_eq!(
@@ -976,7 +1035,7 @@ async fn intake_rejects_zero_expiry_capability() {
     let metrics = Arc::new(Metrics::new());
     let owner = PrivateKeySigner::random();
     let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
-    let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+    let domain = TEST_DEPLOYMENT.voucher_domain();
     let pool_id = B256::repeat_byte(0x66);
     let signer = Address::repeat_byte(0x22);
     let spending_cap = 1_000_000u64;
@@ -1005,20 +1064,32 @@ async fn intake_rejects_zero_expiry_capability() {
 
     // A validly-signed capability with `expiry == 0` is dropped: no lane in the
     // map or the store, so the voucher path keeps refusing the lane as unknown.
-    handler.intake_capability(pool_id, signer, owner.address(), &make_wire(0));
+    handler.intake_capability(
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &make_wire(0),
+    );
     assert!(
-        !handler.lanes.contains_key(&lane_key),
+        !handler.lanes.contains_key(&tid(lane_key)),
         "a zero-expiry capability must not register a lane"
     );
     assert!(
-        matches!(handler.pool_state_store.get(lane_key), Ok(None)),
+        matches!(test_store(&handler).get(lane_key), Ok(None)),
         "a zero-expiry capability never reaches the lane store"
     );
 
     // The same grant with a far-future expiry registers the lane.
-    handler.intake_capability(pool_id, signer, owner.address(), &make_wire(u64::MAX));
+    handler.intake_capability(
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &make_wire(u64::MAX),
+    );
     assert!(
-        handler.lanes.contains_key(&lane_key),
+        handler.lanes.contains_key(&tid(lane_key)),
         "a future-expiry capability registers its lane"
     );
 }
@@ -1037,7 +1108,7 @@ fn signed_wire(
     key: &PrivateKeySigner,
     capability: Capability,
 ) -> decdn_protocol::client::WireCapability {
-    let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+    let domain = TEST_DEPLOYMENT.voucher_domain();
     let signed = capability.sign(key, &domain).expect("sign capability");
     decdn_protocol::client::WireCapability {
         spending_cap: signed.capability.spending_cap,
@@ -1067,7 +1138,7 @@ async fn assert_intake_drop(
             expiry: 1_900_000_000,
         },
     );
-    handler.intake_capability(pool_id, signer, owner.address(), &wire);
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
 
     let lane_key = LaneKey {
         pool_id,
@@ -1075,11 +1146,18 @@ async fn assert_intake_drop(
         provider: handler.eth_signer.address(),
     };
     assert!(
-        !handler.lanes.contains_key(&lane_key),
+        !handler.lanes.contains_key(&LaneId {
+            deployment: TEST_DEPLOYMENT,
+            key: lane_key,
+        }),
         "a {label} drop registers no lane"
     );
+    let store = &handler
+        .pool_route(TEST_DEPLOYMENT)
+        .expect("the test pool is routed")
+        .store;
     assert!(
-        matches!(handler.pool_state_store.get(lane_key), Ok(None)),
+        matches!(store.get(lane_key), Ok(None)),
         "a {label} drop never reaches the lane store"
     );
     let text = metrics.encode().expect("metrics encode");
@@ -1191,7 +1269,7 @@ async fn intake_stores_a_raw_parity_owner_signature_canonicalized() {
         .expect("a non-empty signature");
     *v = canonical_v - 27; // the raw-parity (0/1) wire form an off-spec client sends
 
-    handler.intake_capability(pool_id, signer, owner.address(), &wire);
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
 
     let lane_key = LaneKey {
         pool_id,
@@ -1282,7 +1360,7 @@ async fn high_s_capability_is_dropped_and_cached_as_invalid() {
     let metrics = Arc::new(Metrics::new());
     let owner = PrivateKeySigner::random();
     let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
-    let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+    let domain = TEST_DEPLOYMENT.voucher_domain();
     let pool_id = B256::repeat_byte(0x12);
     let signer = Address::repeat_byte(0x34);
     let lane_key = LaneKey {
@@ -1310,11 +1388,11 @@ async fn high_s_capability_is_dropped_and_cached_as_invalid() {
         expiry: signed.capability.expiry,
         owner_signature: bytes.to_vec(),
     };
-    handler.intake_capability(pool_id, signer, owner.address(), &wire);
-    handler.intake_capability(pool_id, signer, owner.address(), &wire);
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
 
     assert!(
-        !handler.lanes.contains_key(&lane_key),
+        !handler.lanes.contains_key(&tid(lane_key)),
         "a malformed capability never registers a lane (nor captures material)"
     );
     assert_eq!(
@@ -1346,7 +1424,7 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
     let metrics = Arc::new(Metrics::new());
     let owner = PrivateKeySigner::random();
     let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
-    let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+    let domain = TEST_DEPLOYMENT.voucher_domain();
     let pool_id = B256::repeat_byte(0x12);
     let signer = Address::repeat_byte(0x34);
     let lane_key = LaneKey {
@@ -1369,8 +1447,8 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
         owner_signature: genuine_sig.to_vec(),
     };
 
-    handler.intake_capability(pool_id, signer, owner.address(), &wire);
-    handler.intake_capability(pool_id, signer, owner.address(), &wire);
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
     let cache_len = handler
         .capability_verify_cache
         .lock()
@@ -1405,7 +1483,13 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
         expiry: forged.capability.expiry,
         owner_signature: forged.signature.as_bytes().to_vec(),
     };
-    handler.intake_capability(pool_id, signer, owner.address(), &forged_wire);
+    handler.intake_capability(
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &forged_wire,
+    );
     assert_eq!(
         handler
             .capability_verify_cache
@@ -1434,8 +1518,8 @@ const TEST_SIGNER_B: Address = Address::new([0xb2u8; 20]);
 const TEST_RATE: u64 = 1_000;
 
 fn lock_floor(
-    map: &Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
-) -> anyhow::Result<std::sync::MutexGuard<'_, HashMap<B256, PoolFloorState>>> {
+    map: &Arc<std::sync::Mutex<HashMap<PoolKey, PoolFloorState>>>,
+) -> anyhow::Result<std::sync::MutexGuard<'_, HashMap<PoolKey, PoolFloorState>>> {
     map.lock()
         .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))
 }
@@ -1447,9 +1531,9 @@ fn lock_floor(
 /// fully restored and the signer row is pruned.
 #[test]
 fn floor_reservation_refused_unspent_releases_the_live_floor() -> anyhow::Result<()> {
-    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+    let map: Arc<std::sync::Mutex<HashMap<PoolKey, PoolFloorState>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pool = B256::repeat_byte(0x5C);
+    let pool = tpool_byte(0x5C);
     let floor = floor_micro(1000);
     {
         let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor);
@@ -1477,7 +1561,7 @@ fn floor_reservation_refused_unspent_releases_the_live_floor() -> anyhow::Result
 async fn pool_budget_covers_reserve_accounts_committed_floor() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
-    let pool = B256::repeat_byte(0x11);
+    let pool = tpool_byte(0x11);
     let floor = floor_micro(1_000_000);
     // Empty pool, M = 0: remaining must cover the new reserve exactly.
     anyhow::ensure!(
@@ -1515,7 +1599,7 @@ async fn pool_funds_committed_stops_at_floor_with_empty_ledger() -> anyhow::Resu
     let metrics = Arc::new(Metrics::new());
     let m = U256::from(5_000_000u64);
     let (handler, _dir) = handler_for_tests_with_floor(&metrics, m).await;
-    let pool = B256::repeat_byte(0x33);
+    let pool = tpool_byte(0x33);
     // No floor row exists for the pool: committed == 0.
     anyhow::ensure!(
         !handler.pool_funds_committed(pool, U256::ZERO),
@@ -1556,7 +1640,7 @@ async fn pool_funds_committed_stops_at_floor_with_empty_ledger() -> anyhow::Resu
 async fn try_reserve_floor_charges_only_when_budget_covers() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
-    let pool = B256::repeat_byte(0x22);
+    let pool = tpool_byte(0x22);
     let floor = floor_micro(1_000_000);
     // Budget covers exactly one floor: the first reserve succeeds.
     let first = handler.try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor);
@@ -1591,7 +1675,7 @@ async fn signer_live_cap_refuses_one_signer_and_admits_a_co_tenant() -> anyhow::
     let metrics = Arc::new(Metrics::new());
     // k = 1 window each, a bottomless bucket, M = 0.
     let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1).await;
-    let pool = B256::repeat_byte(0x31);
+    let pool = tpool_byte(0x31);
     let window = handler.one_window(TEST_RATE);
     let remaining = window.saturating_mul(U256::from(4u64));
     anyhow::ensure!(
@@ -1627,7 +1711,7 @@ async fn signer_live_cap_refuses_one_signer_and_admits_a_co_tenant() -> anyhow::
 async fn pool_ceiling_still_bounds_the_aggregate_across_signers() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1).await;
-    let pool = B256::repeat_byte(0x32);
+    let pool = tpool_byte(0x32);
     let window = handler.one_window(TEST_RATE);
     let remaining = window.saturating_mul(U256::from(4u64));
     let mut held = Vec::new();
@@ -1658,7 +1742,7 @@ async fn pool_ceiling_still_bounds_the_aggregate_across_signers() -> anyhow::Res
 async fn a_refused_admission_leaves_no_row_at_either_level() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 1).await;
-    let pool = B256::repeat_byte(0x38);
+    let pool = tpool_byte(0x38);
     let window = handler.one_window(TEST_RATE);
     let floor = window;
     let remaining = window.saturating_mul(U256::from(4u64));
@@ -1727,9 +1811,9 @@ async fn a_refused_admission_leaves_no_row_at_either_level() -> anyhow::Result<(
 /// the direction that over-admits.
 #[test]
 fn a_stale_guard_does_not_reconcile_against_a_re_entered_pool() -> anyhow::Result<()> {
-    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+    let map: Arc<std::sync::Mutex<HashMap<PoolKey, PoolFloorState>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pool = B256::repeat_byte(0x39);
+    let pool = tpool_byte(0x39);
     let floor = floor_micro(1000);
 
     let stale = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor);
@@ -1775,7 +1859,7 @@ async fn signer_floor_cap_is_k_windows_lower_clamped_to_one() -> anyhow::Result<
         clamped.signer_floor_cap(TEST_RATE) == one_window,
         "k = 0 clamps the live cap up to one window"
     );
-    let pool = B256::repeat_byte(0x34);
+    let pool = tpool_byte(0x34);
     let remaining = one_window.saturating_mul(U256::from(2u64));
     anyhow::ensure!(
         clamped
@@ -1803,7 +1887,7 @@ async fn pool_ceiling_refuses_below_one_window_whatever_the_cap() -> anyhow::Res
     let metrics = Arc::new(Metrics::new());
     for k in [0u64, 1, 8] {
         let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, k).await;
-        let pool = B256::repeat_byte(0x36);
+        let pool = tpool_byte(0x36);
         let one_window =
             decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
         let remaining = one_window.saturating_sub(U256::from(1u64));
@@ -1833,7 +1917,7 @@ async fn pool_ceiling_refuses_below_one_window_whatever_the_cap() -> anyhow::Res
 async fn a_paid_out_signer_leaves_no_row_behind() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
-    let pool = B256::repeat_byte(0x37);
+    let pool = tpool_byte(0x37);
     let floor = floor_micro(1_000_000);
     let guard = handler
         .try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor)
@@ -1895,18 +1979,6 @@ async fn signer_cap_is_a_window_count_not_a_slice_of_the_deposit() -> anyhow::Re
     Ok(())
 }
 
-/// A `PoolRedeemed` lane entry for the projection, at `cumulative` `µUSDC`.
-fn lane_settled(
-    signer: Address,
-    cumulative: u64,
-) -> decdn_incentive::payment_pool::PaymentPool::LaneSettled {
-    decdn_incentive::payment_pool::PaymentPool::LaneSettled {
-        signer,
-        newPaidCumulative: cumulative,
-        bytesPaid: 0,
-    }
-}
-
 /// A live lane registered from a wider capability narrows to the signer's
 /// on-chain registration, and the store persists the clamped terms (#2265).
 #[tokio::test]
@@ -1925,23 +1997,22 @@ async fn clamp_lane_to_registration_narrows_the_live_lane_and_persists() -> anyh
         decdn_incentive::LaneChain::NONE,
     );
     let key = lane.key();
-    handler.register_lane(lane)?;
+    handler.register_lane(TEST_DEPLOYMENT, lane)?;
     let live = handler
         .lanes
-        .get(&key)
+        .get(&tid(key))
         .map(|e| Arc::clone(e.value()))
         .ok_or_else(|| anyhow::anyhow!("the lane is live"))?;
 
     handler
-        .clamp_lane_to_registration(&live, 40, 1_900_000_000)
+        .clamp_lane_to_registration(TEST_DEPLOYMENT, &live, 40, 1_900_000_000)
         .await;
 
     let held = live.lock().await.state.clone();
     assert_eq!(held.cap, U256::from(40u64));
     assert_eq!(held.expiry, 1_900_000_000);
     assert_eq!(held.registered_until, 1_900_000_000);
-    let stored = handler
-        .pool_state_store
+    let stored = test_store(&handler)
         .get(key)?
         .ok_or_else(|| anyhow::anyhow!("the lane row exists"))?;
     assert_eq!((stored.cap, stored.expiry), (held.cap, held.expiry));
@@ -1962,11 +2033,14 @@ fn counter_total(metrics: &Metrics, name: &str) -> anyhow::Result<u64> {
 }
 
 /// The lane and blob a pool re-check unit test names.
-fn recheck_stream() -> (LaneKey, Hash) {
-    let lane = LaneKey {
-        pool_id: B256::repeat_byte(0x52),
-        signer: Address::repeat_byte(0x11),
-        provider: Address::repeat_byte(0x22),
+fn recheck_stream() -> (LaneId, Hash) {
+    let lane = LaneId {
+        deployment: TEST_DEPLOYMENT,
+        key: LaneKey {
+            pool_id: B256::repeat_byte(0x52),
+            signer: Address::repeat_byte(0x11),
+            provider: Address::repeat_byte(0x22),
+        },
     };
     (lane, Hash::new(b"pool re-check"))
 }
@@ -2185,70 +2259,20 @@ async fn pool_recheck_stale_with_no_view_wired_counts_nothing() -> anyhow::Resul
 /// The mid-stream signer cap-headroom re-check stops a live stream once the
 /// signer drains its shared `cap` at OTHER providers since admission — the drain
 /// the pool-solvency re-check cannot see, because the pool's `remaining` stays
-/// healthy on other signers' budgets.
+/// healthy on other signers' budgets. The admit-path `getAuthorization` read
+/// carries the spend before admission; the settlement service's live refresh
+/// (`getPool` + `getAuthorizations`) carries the drain since.
 #[tokio::test]
-async fn midstream_signer_recheck_trips_when_signer_drains_at_other_nodes() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, projection, _dir) = handler_with_projection_view(&metrics).await;
-    let pool = B256::repeat_byte(0x51);
-    let signer = Address::new([0xa1; 20]);
-    let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
-    let ow = u64::try_from(one_window).expect("one window fits u64");
-    // The signer holds a cap of ten windows on this lane; the pool is richly
-    // funded, so only per-signer cap headroom can bind here.
-    let held_cap = U256::from(ow.saturating_mul(10));
-    projection.record_opened(pool, Address::new([0x07; 20]), U256::MAX);
-
-    // At admit the signer has spent one window across providers — nine windows of
-    // headroom remain, above the one-window floor, so the stream keeps serving.
-    projection.record_redeemed(
-        pool,
-        Address::new([0xc0; 20]),
-        &[lane_settled(signer, ow)],
-        None,
-    );
-    anyhow::ensure!(
-        !handler
-            .signer_cap_drained_midstream(pool, signer, held_cap, TEST_RATE)
-            .await,
-        "nine windows of headroom must keep the stream serving"
-    );
-
-    // Mid-stream the signer drains the rest of its cap at a DIFFERENT provider,
-    // taking the cross-provider total to the full cap — headroom falls below one
-    // floor, so the re-check stops the stream.
-    projection.record_redeemed(
-        pool,
-        Address::new([0xc1; 20]),
-        &[lane_settled(signer, ow.saturating_mul(9))],
-        None,
-    );
-    anyhow::ensure!(
-        handler
-            .signer_cap_drained_midstream(pool, signer, held_cap, TEST_RATE)
-            .await,
-        "a signer drained to its full cap across providers must stop the stream"
-    );
-    Ok(())
-}
-
-/// #2711: after a restart the projection seeds a pool from one `getPool` and
-/// counts only what the signer redeems after the seed. The mid-stream re-check
-/// still sees the spend the admit-path `getAuthorization` read held, so a signer
-/// that spent most of its cap before the restart stops the stream once other
-/// nodes drain the rest.
-#[tokio::test]
-async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() -> anyhow::Result<()>
-{
+async fn midstream_signer_recheck_trips_when_the_refresh_reads_a_drain() -> anyhow::Result<()> {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
-    use alloy::sol_types::SolValue;
+    use alloy::sol_types::{SolCall, SolValue};
     use decdn_incentive::payment_pool::PaymentPool;
 
     use crate::pool_view::PoolView;
 
     let metrics = Arc::new(Metrics::new());
-    let pool = B256::repeat_byte(0x52);
+    let pool = tpool_byte(0x52);
     let signer = Address::new([0xa2; 20]);
     let projection = crate::pool_view::PoolProjection::new();
     let asserter = Asserter::new();
@@ -2264,28 +2288,17 @@ async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() ->
     let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
     let ow = u64::try_from(one_window).expect("one window fits u64");
     let cap = ow.saturating_mul(10);
+    let authorization = |spent: u64| PaymentPool::Authorization {
+        cap,
+        expiry: u64::MAX,
+        spent,
+    };
 
-    // Before the restart the signer spent eight windows at other nodes. The
-    // seed carries that spend in the pool's `totalRedeemed` only.
-    projection.record_resolved(
-        Address::new([0x07; 20]),
-        crate::pool_view::PoolRead {
-            pool_id: pool,
-            deposit: u64::MAX,
-            total_redeemed: ow.saturating_mul(8),
-            lifecycle: crate::pool_view::Lifecycle::Open,
-        },
-    );
+    // At admission the signer has spent eight windows at other nodes.
     asserter.push_success(&alloy::primitives::Bytes::from(
-        PaymentPool::Authorization {
-            cap,
-            expiry: u64::MAX,
-            spent: ow.saturating_mul(8),
-        }
-        .abi_encode(),
+        authorization(ow.saturating_mul(8)).abi_encode(),
     ));
-    // Admission reads the authorization: two windows of headroom remain.
-    anyhow::ensure!(view.signer_authorization(pool, signer).await.is_some());
+    anyhow::ensure!(view.signer_authorization(pool.1, signer).await.is_some());
     anyhow::ensure!(
         !handler
             .signer_cap_drained_midstream(pool, signer, U256::from(cap), TEST_RATE)
@@ -2293,18 +2306,32 @@ async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() ->
         "two windows of headroom keep the stream serving"
     );
 
-    // Another node redeems the signer's last two windows.
-    projection.record_redeemed(
-        pool,
-        Address::new([0xc2; 20]),
-        &[lane_settled(signer, ow.saturating_mul(2))],
-        None,
-    );
+    // Another node redeems the signer's last two windows; the next live refresh
+    // reads the pool and the signer again.
+    asserter.push_success(&alloy::primitives::Bytes::from(
+        PaymentPool::Pool {
+            owner: Address::new([0x07; 20]),
+            status: PaymentPool::Status::Open,
+            disputeDeadline: 0,
+            deposit: u64::MAX,
+            totalRedeemed: ow.saturating_mul(10),
+        }
+        .abi_encode(),
+    ));
+    asserter.push_success(&alloy::primitives::Bytes::from(
+        PaymentPool::getAuthorizationsCall::abi_encode_returns(&vec![authorization(cap)]),
+    ));
+    view.refresh_live(&std::collections::HashMap::from([(
+        pool.1,
+        std::collections::HashSet::from([signer]),
+    )]))
+    .await;
+    anyhow::ensure!(asserter.read_q().is_empty(), "the refresh read both");
     anyhow::ensure!(
         handler
             .signer_cap_drained_midstream(pool, signer, U256::from(cap), TEST_RATE)
             .await,
-        "the pre-restart spend plus the drain since admission stops the stream"
+        "the drain the refresh read stops the stream"
     );
     Ok(())
 }
@@ -2317,7 +2344,7 @@ async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() ->
 #[tokio::test]
 async fn midstream_signer_recheck_fails_toward_serving_on_projection_gap() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
-    let pool = B256::repeat_byte(0x52);
+    let pool = tpool_byte(0x52);
     let signer = Address::new([0xa2; 20]);
 
     // Pool-view wired, but the pool is ABSENT from the projection (opened before
@@ -2352,7 +2379,7 @@ async fn midstream_signer_recheck_fails_toward_serving_on_projection_gap() -> an
 async fn live_cap_scales_the_signers_needed_to_strand_the_floor() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 16).await;
-    let pool = B256::repeat_byte(0x38);
+    let pool = tpool_byte(0x38);
     let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
     let remaining = one_window.saturating_mul(U256::from(144u64));
     let ceiling = one_window.saturating_mul(U256::from(16u64));
@@ -2419,7 +2446,7 @@ async fn wide_live_cap_reproduces_the_pool_only_bound() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) =
         handler_for_tests_with_signer_policy(&metrics, U256::ZERO, u64::MAX).await;
-    let pool = B256::repeat_byte(0x35);
+    let pool = tpool_byte(0x35);
     let floor = floor_micro(1_000_000);
     let remaining = floor.saturating_mul(U256::from(3u64));
     // ONE signer draws the pool's entire headroom, three floors, unrefused.
@@ -2449,9 +2476,9 @@ async fn wide_live_cap_reproduces_the_pool_only_bound() -> anyhow::Result<()> {
 /// process lifetime.
 #[test]
 fn repaid_release_after_forget_does_not_resurrect_entry() -> anyhow::Result<()> {
-    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+    let map: Arc<std::sync::Mutex<HashMap<PoolKey, PoolFloorState>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pool = B256::repeat_byte(0x5F);
+    let pool = tpool_byte(0x5F);
     let floor = floor_micro(1000);
     let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor);
     // The pool closes mid-stream: the same in-memory remove
@@ -2544,20 +2571,20 @@ async fn lane_activity_clock_ages_reports_stamped_and_omits_unstamped() {
         }))
     };
     let map = DashMap::new();
-    map.insert(stamped, mk(stamped, unix_millis()));
-    map.insert(unstamped, mk(unstamped, 0));
+    map.insert(tid(stamped), mk(stamped, unix_millis()));
+    map.insert(tid(unstamped), mk(unstamped, 0));
     let clock = LaneActivityClock {
         lanes: Arc::new(map),
     };
 
     let ages = clock.ages().await;
     assert!(
-        ages.get(&stamped).is_some_and(|age| *age < 5),
+        ages.get(&tid(stamped)).is_some_and(|age| *age < 5),
         "a freshly stamped lane reports a near-zero age, got {:?}",
-        ages.get(&stamped)
+        ages.get(&tid(stamped))
     );
     assert!(
-        !ages.contains_key(&unstamped),
+        !ages.contains_key(&tid(unstamped)),
         "an unstamped lane (stamp == 0) must be omitted, read back as never"
     );
 }
@@ -2586,6 +2613,7 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
     let req = decdn_protocol::client::StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: [0; 32],
+        payment_pool: decdn_protocol::PoolAccount::eip155(421_614, [0x34; 20]),
         pool_id: [0; 32],
         byte_offset: 0,
         byte_len: 0,
@@ -2615,6 +2643,7 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
     let req = |hash: [u8; 32]| decdn_protocol::client::StreamRequest {
         hash,
         namespace_id: [0; 32],
+        payment_pool: decdn_protocol::PoolAccount::eip155(421_614, [0x34; 20]),
         pool_id: [0; 32],
         byte_offset: 0,
         byte_len: 0,

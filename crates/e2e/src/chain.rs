@@ -37,12 +37,12 @@ use decdn_incentive::{
     bind_node_id_domain, binding_signing_hash, node_register, register_node_signing_hash,
     slash_judge_domain,
 };
-use decdn_node::chain_events::shared_head::SNAPSHOT_LAG_MARGIN_BLOCKS;
+use decdn_node::chain_events::snapshot::SNAPSHOT_LAG_MARGIN_BLOCKS;
 
 use crate::bindings::{
     AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, DecdnGovernor, Erc20,
-    FeeRouterParams, ManualVettingPolicy, OriginAssignment, PaymentPoolParams, PublisherRegistry,
-    SlashAppeal, SlashJudge, TimelockController,
+    ManualVettingPolicy, OriginAssignment, PaymentPoolParams, PublisherRegistry, SlashAppeal,
+    SlashJudge, TimelockController,
 };
 
 /// The single chain id every anvil-e2e chain runs on: the one-time protocol
@@ -228,24 +228,27 @@ pub struct ContractAddrs {
     pub manual_vetting_policy: Address,
     /// `ContentBlacklist` — the on-chain takedown set the deny gate reads.
     pub content_blacklist: Address,
+    /// `CctpSweepReceiver` — receives each `PaymentPool` sweep and deposits it
+    /// into `FeeRouter` (see [`ChainFixture::sweep`]).
+    pub cctp_sweep_receiver: Address,
 }
 
 /// Kills the spawned `anvil` on drop — a panicking assertion never leaks the
-/// process. `manifest` is `Some` only for the throwaway anvil the one-time
-/// deploy runs in: dropping it removes the (gitignored) `deployments/*.json` the
-/// forge script wrote. Per-journey anvils load a state snapshot instead of
-/// deploying, so they write no manifest and carry `None`.
+/// process. `manifests` is non-empty only for the throwaway anvil the one-time
+/// deploy runs in: dropping it removes the (gitignored) `deployments/*.json`
+/// files the forge scripts wrote. Per-journey anvils load a state snapshot
+/// instead of deploying, so they write no manifest and carry none.
 #[derive(Debug)]
 struct AnvilGuard {
     child: Child,
-    manifest: Option<PathBuf>,
+    manifests: Vec<PathBuf>,
 }
 
 impl Drop for AnvilGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(manifest) = &self.manifest {
+        for manifest in &self.manifests {
             let _ = std::fs::remove_file(manifest);
         }
     }
@@ -264,13 +267,22 @@ struct AnvilProcess {
 /// Bring up an `anvil` at [`E2E_CHAIN_ID`] on a port it picks itself (see
 /// [`spawn_anvil_child`]) and wait for its RPC.
 ///
-/// `manifest` is the `deployments/*.json` path whose cleanup the guard owns —
-/// `Some` for the throwaway anvil the one-time deploy writes a manifest into,
-/// `None` for a per-journey anvil that loads a snapshot and writes none.
-async fn spawn_anvil(manifest: Option<PathBuf>) -> anyhow::Result<AnvilProcess> {
+/// `manifests` are the `deployments/*.json` paths whose cleanup the guard owns:
+/// the governance and payment manifests for the throwaway anvil the one-time
+/// deploy writes into, none for a per-journey anvil that loads a snapshot.
+async fn spawn_anvil(manifests: Vec<PathBuf>) -> anyhow::Result<AnvilProcess> {
     let admin_signer: PrivateKeySigner = ADMIN_KEY.parse().context("parse admin key")?;
-    let (child, port) = spawn_anvil_child(&["--chain-id", &E2E_CHAIN_ID.to_string()]).await?;
-    let mut guard = AnvilGuard { child, manifest };
+    // Zero slots per epoch makes anvil's `safe` block the head, so a node's
+    // `ContentBlacklist` ledger read (pinned to `safe`) sees a mutation as soon
+    // as it mines.
+    let (child, port) = spawn_anvil_child(&[
+        "--chain-id",
+        &E2E_CHAIN_ID.to_string(),
+        "--slots-in-an-epoch",
+        "0",
+    ])
+    .await?;
+    let mut guard = AnvilGuard { child, manifests };
     let rpc_url = format!("http://127.0.0.1:{port}");
 
     // Every provider this fixture hands out builds a reqwest client.
@@ -412,7 +424,7 @@ impl ChainFixture {
         // replays the resulting state snapshot into its own isolated anvil.
         let shared = ensure_shared_deployment(&contracts).await?;
 
-        let anvil = spawn_anvil(None).await?;
+        let anvil = spawn_anvil(Vec::new()).await?;
         load_state_snapshot(&anvil.admin, &shared.state_path).await?;
         // A node pins its enumerations `SNAPSHOT_LAG_MARGIN_BLOCKS` below head.
         // Anvil keeps no state at or below the loaded head and answers a read
@@ -457,6 +469,15 @@ impl ChainFixture {
         self.addrs
     }
 
+    /// The fixture's `PaymentPool` deployment: this chain and its pool.
+    #[must_use]
+    pub const fn deployment(&self) -> decdn_incentive::Deployment {
+        decdn_incentive::Deployment {
+            chain_id: self.chain_id,
+            payment_pool: self.addrs.payment_pool,
+        }
+    }
+
     /// Mock USDC (mintable) the settlement token points at.
     #[must_use]
     pub const fn usdc(&self) -> Address {
@@ -486,134 +507,71 @@ impl ChainFixture {
     }
 
     /// Deploy a second `PaymentPool` beside the snapshot's — the chain an
-    /// operator sees after a `PaymentPool` redeploy — and return its address.
+    /// operator sees after a `PaymentPool` redeploy, or a second pool contract
+    /// on the same payment chain — and return its address.
     ///
-    /// The new pool shares the snapshot's USDC and `CapacityBond`, and copies
-    /// the snapshot pool's dispute window, delivery floor, and minimum deposit,
-    /// so a node bonded on the snapshot serves and redeems against it unchanged.
-    /// It settles through a fresh `FeeRouter` that copies the snapshot router's
-    /// window and split: the deployer renounced its `DEFAULT_ADMIN_ROLE` on the
-    /// snapshot router, which pins `ROUTER_CALLER_ROLE` to the snapshot pool
-    /// alone. The fixture admin EOA holds both new contracts' admin roles; no
-    /// role moves to the Timelock. [`Self::served_bytes`] reads the snapshot
-    /// router, so it does not see bytes settled through the new pool.
+    /// The new pool copies every constructor parameter of the snapshot pool:
+    /// its USDC, its CCTP messenger and sweep recipient, its dispute window,
+    /// operator share, minimum sweep, minimum deposit and pauser. A node that
+    /// accepts it serves and redeems against it as against the snapshot pool.
     ///
     /// `ownerPoolNonce` starts at zero on the new pool, so every owner's Nth pool
     /// here has the same id as its Nth pool on [`ContractAddrs::payment_pool`].
     pub async fn redeploy_payment_pool(&self) -> anyhow::Result<Address> {
         let contracts = contracts_dir()?;
-        let snapshot_router = FeeRouterParams::new(self.addrs.fee_router, &self.admin);
-        let window_epochs = snapshot_router
-            .windowEpochs()
-            .call()
-            .await
-            .context("snapshot FeeRouter.windowEpochs")?;
-        let shares = snapshot_router
-            .getShares()
-            .call()
-            .await
-            .context("snapshot FeeRouter.getShares")?;
-        // The fresh router takes no burner, which `_setShares` accepts only while
-        // the buyback bucket is dormant.
-        anyhow::ensure!(
-            shares.get(1).is_some_and(U256::is_zero),
-            "the snapshot FeeRouter has an active buyback share {shares:?}; the redeployed \
-             router has no burner to route it to"
-        );
-        // FeeRouter(usdc, capacityBond, treasury, epochLength, windowEpochs,
-        //           admin, initialShares, buybackBurner)
-        let router_args = (
-            self.usdc,
-            self.addrs.capacity_bond,
-            self.addrs.timelock,
-            EPOCH_LENGTH_SECS,
-            window_epochs,
-            self.admin_addr,
-            shares,
-            Address::ZERO,
-        )
-            .abi_encode_params();
-        let router = deploy_artifact(&self.admin, &contracts, "FeeRouter", &router_args).await?;
-        let snapshot_pool = PaymentPoolParams::new(self.addrs.payment_pool, &self.admin);
-        let dispute_window = snapshot_pool
-            .disputeWindow()
-            .call()
-            .await
-            .context("snapshot PaymentPool.disputeWindow")?;
-        let delivery_floor = snapshot_pool
-            .getRateBounds()
-            .call()
-            .await
-            .context("snapshot PaymentPool.getRateBounds")?;
-        let min_deposit = snapshot_pool
-            .minDeposit()
-            .call()
-            .await
-            .context("snapshot PaymentPool.minDeposit")?;
-        // PaymentPool(usdc, capacityBond, feeRouter, disputeWindow,
-        //             deliveryFloor, minDeposit, admin)
+        let snapshot = PaymentPoolParams::new(self.addrs.payment_pool, &self.admin);
+        let read = |what: &str| format!("snapshot PaymentPool.{what}");
+        // PaymentPool(usdc, tokenMessenger, sweepRecipient, sweepDomain,
+        //             disputeWindow, operatorBps, minSweep, minDeposit, pauser)
         let pool_args = (
-            self.usdc,
-            self.addrs.capacity_bond,
-            router,
-            dispute_window,
-            delivery_floor,
-            min_deposit,
-            self.admin_addr,
-        )
-            .abi_encode_params();
-        let pool = deploy_artifact(&self.admin, &contracts, "PaymentPool", &pool_args).await?;
-
-        let caller_role = keccak256("ROUTER_CALLER_ROLE");
-        let router_roles = AccessControl::new(router, &self.admin);
-        let receipt = router_roles
-            .grantRole(caller_role, pool)
-            .send()
-            .await
-            .context("FeeRouter.grantRole(ROUTER_CALLER_ROLE) send")?
-            .get_receipt()
-            .await
-            .context("FeeRouter.grantRole(ROUTER_CALLER_ROLE) receipt")?;
-        crate::ensure_mined(&receipt, "FeeRouter.grantRole(ROUTER_CALLER_ROLE)")?;
-        anyhow::ensure!(
-            router_roles
-                .hasRole(caller_role, pool)
+            snapshot.usdc().call().await.context(read("usdc"))?,
+            snapshot
+                .tokenMessenger()
                 .call()
                 .await
-                .context("FeeRouter.hasRole")?,
-            "the redeployed PaymentPool {pool} does not hold ROUTER_CALLER_ROLE on {router}"
+                .context(read("tokenMessenger"))?,
+            snapshot
+                .sweepRecipient()
+                .call()
+                .await
+                .context(read("sweepRecipient"))?,
+            snapshot
+                .sweepDomain()
+                .call()
+                .await
+                .context(read("sweepDomain"))?,
+            snapshot
+                .disputeWindow()
+                .call()
+                .await
+                .context(read("disputeWindow"))?,
+            snapshot
+                .operatorBps()
+                .call()
+                .await
+                .context(read("operatorBps"))?,
+            snapshot.minSweep().call().await.context(read("minSweep"))?,
+            snapshot
+                .minDeposit()
+                .call()
+                .await
+                .context(read("minDeposit"))?,
+            snapshot.pauser().call().await.context(read("pauser"))?,
         );
-        self.ensure_redeploy_wiring(pool, router).await?;
-        Ok(pool)
-    }
-
-    /// Read the redeployed pool's wiring back: it settles in the fixture USDC,
-    /// routes through `router`, and gates on the snapshot `CapacityBond`.
-    async fn ensure_redeploy_wiring(&self, pool: Address, router: Address) -> anyhow::Result<()> {
-        let settles_in = crate::bindings::PaymentPool::new(pool, &self.admin)
-            .usdc()
-            .call()
-            .await
-            .context("redeployed PaymentPool.usdc")?;
-        let redeployed = PaymentPoolParams::new(pool, &self.admin);
-        let routes_to = redeployed
-            .feeRouter()
-            .call()
-            .await
-            .context("redeployed PaymentPool.feeRouter")?;
-        let bonded_by = redeployed
-            .capacityBond()
-            .call()
-            .await
-            .context("redeployed PaymentPool.capacityBond")?;
         anyhow::ensure!(
-            settles_in == self.usdc && routes_to == router && bonded_by == self.addrs.capacity_bond,
-            "the redeployed PaymentPool is miswired: usdc {settles_in} (want {}), feeRouter \
-             {routes_to} (want {router}), capacityBond {bonded_by} (want {})",
-            self.usdc,
-            self.addrs.capacity_bond
+            pool_args.0 == self.usdc,
+            "the snapshot PaymentPool settles in {} (want {})",
+            pool_args.0,
+            self.usdc
         );
-        Ok(())
+        let pool = deploy_artifact(
+            &self.admin,
+            &contracts,
+            "PaymentPool",
+            &pool_args.abi_encode_params(),
+        )
+        .await?;
+        Ok(pool)
     }
 
     /// Build a wallet-filled provider for `signer` (simple nonce management
@@ -1104,8 +1062,11 @@ impl ChainFixture {
         crate::ensure_mined(&receipt, "setVetted")
     }
 
-    /// Current `FeeRouter.bytesPerEpoch(operator)` for the epoch at the chain's
-    /// head timestamp — the governance-canonical served-bytes counter (ADR 036).
+    /// The bytes `operator` was paid for: the served bytes the fixture
+    /// `PaymentPool` holds for its next sweep (`pending(operator)`), plus
+    /// `FeeRouter.bytesPerEpoch(operator)` for the epoch at the chain's head
+    /// timestamp, the governance-canonical counter a received sweep credits
+    /// (ADR 036). A redemption raises the first at once.
     pub async fn served_bytes(&self, operator: Address) -> anyhow::Result<U256> {
         let block = self
             .admin
@@ -1115,10 +1076,65 @@ impl ChainFixture {
             .ok_or_else(|| anyhow::anyhow!("no latest block"))?;
         let epoch = block.header.timestamp / EPOCH_LENGTH_SECS;
         let fee = crate::bindings::FeeRouter::new(self.addrs.fee_router, &self.admin);
-        fee.bytesPerEpoch(operator, epoch)
+        let swept = fee
+            .bytesPerEpoch(operator, epoch)
             .call()
             .await
-            .context("read bytesPerEpoch")
+            .context("read bytesPerEpoch")?;
+        let pending = crate::bindings::PaymentPool::new(self.addrs.payment_pool, &self.admin)
+            .pending(operator)
+            .call()
+            .await
+            .context("read PaymentPool.pending")?;
+        Ok(swept.saturating_add(pending.servedBytes))
+    }
+
+    /// Carry the listed operators' pending protocol shares and served bytes
+    /// to `FeeRouter` in one batch, as `decdn node sweep` and
+    /// `decdn node receive-sweeps` do: `PaymentPool.sweep(operators)` burns
+    /// through the loopback CCTP, and [`Self::receive_sweep`] delivers its
+    /// message. The served bytes then count in `FeeRouter`'s epoch counter,
+    /// which governance vote weight reads.
+    pub async fn sweep(&self, operators: &[Address]) -> anyhow::Result<()> {
+        let receipt = crate::bindings::PaymentPool::new(self.addrs.payment_pool, &self.admin)
+            .sweep(operators.to_vec())
+            .send()
+            .await
+            .context("PaymentPool.sweep send")?
+            .get_receipt()
+            .await
+            .context("PaymentPool.sweep receipt")?;
+        crate::ensure_mined(&receipt, "PaymentPool.sweep")?;
+        self.receive_sweep(receipt.transaction_hash).await
+    }
+
+    /// Deliver the CCTP message of the sweep transaction `sweep_tx` with
+    /// `CctpSweepReceiver.receiveSweep` (the loopback accepts any non-empty
+    /// attestation), as `decdn node receive-sweeps` does after Circle
+    /// attests it.
+    pub async fn receive_sweep(&self, sweep_tx: B256) -> anyhow::Result<()> {
+        use decdn_incentive::payment_pool::{CctpSweepReceiver, MessageTransmitterV2};
+        let receipt = self
+            .admin
+            .get_transaction_receipt(sweep_tx)
+            .await
+            .context("the sweep receipt")?
+            .with_context(|| format!("sweep {sweep_tx:#x} has no receipt"))?;
+        let message = receipt
+            .logs()
+            .iter()
+            .find_map(|log| log.log_decode::<MessageTransmitterV2::MessageSent>().ok())
+            .map(|log| log.inner.data.message)
+            .context("the sweep carries no CCTP MessageSent")?;
+        let receipt = CctpSweepReceiver::new(self.addrs.cctp_sweep_receiver, &self.admin)
+            .receiveSweep(message, Bytes::from_static(&[1]))
+            .send()
+            .await
+            .context("CctpSweepReceiver.receiveSweep send")?
+            .get_receipt()
+            .await
+            .context("CctpSweepReceiver.receiveSweep receipt")?;
+        crate::ensure_mined(&receipt, "CctpSweepReceiver.receiveSweep")
     }
 
     /// Current chain head `block.timestamp` (seconds). Also used to stamp
@@ -2252,10 +2268,13 @@ async fn ensure_shared_deployment(contracts: &Path) -> anyhow::Result<SharedDepl
     let dir = cache_dir(contracts);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create e2e chain cache dir {}", dir.display()))?;
-    let state_path = dir.join(format!("state-{key}.json"));
-    let manifest_path = dir.join(format!("manifest-{key}.json"));
+    let paths = CachePaths {
+        state: dir.join(format!("state-{key}.json")),
+        payment: dir.join(format!("payment-{key}.json")),
+        manifest: dir.join(format!("manifest-{key}.json")),
+    };
 
-    if let Some(shared) = load_cached_deployment(&state_path, &manifest_path)? {
+    if let Some(shared) = load_cached_deployment(&paths)? {
         return Ok(shared);
     }
 
@@ -2275,32 +2294,64 @@ async fn ensure_shared_deployment(contracts: &Path) -> anyhow::Result<SharedDepl
 
     // Re-check under the lock: a sibling that held it before us has already
     // populated the cache, so we load rather than redeploy.
-    let shared = match load_cached_deployment(&state_path, &manifest_path)? {
+    let shared = match load_cached_deployment(&paths)? {
         Some(shared) => shared,
-        None => deploy_and_snapshot(contracts, &state_path, &manifest_path).await?,
+        None => deploy_and_snapshot(contracts, &paths).await?,
     };
     drop(lock);
     Ok(shared)
 }
 
+/// Where the shared deployment's cache files live: the anvil state snapshot,
+/// the payment-chain manifest, and the governance manifest, written in that
+/// order so the governance manifest marks a complete commit.
+struct CachePaths {
+    state: PathBuf,
+    payment: PathBuf,
+    manifest: PathBuf,
+}
+
 /// Run the one-time deploy in a throwaway anvil and commit its state snapshot +
-/// manifest to the cache. The caller holds the bootstrap lock for the duration.
+/// manifests to the cache. The caller holds the bootstrap lock for the
+/// duration.
+///
+/// The fixture chain is both the governance chain and the payment chain, as
+/// `contracts/dev-deploy.sh` sets it up: one `LoopbackCctp` plays CCTP V2 on
+/// both sides (domain 0), `DeployProtocol` deploys the governance suite, and
+/// `DeployPaymentPool` deploys the `PaymentPool` that sweeps to the suite's
+/// `CctpSweepReceiver`.
 async fn deploy_and_snapshot(
     contracts: &Path,
-    state_path: &Path,
-    manifest_path: &Path,
+    paths: &CachePaths,
 ) -> anyhow::Result<SharedDeployment> {
     let forge_manifest = contracts.join(format!("deployments/{E2E_CHAIN_ID}.json"));
-    // The guard removes the forge manifest on drop; the cache keeps its own copy.
-    let anvil = spawn_anvil(Some(forge_manifest.clone())).await?;
+    let forge_payment = contracts.join(format!("deployments/{E2E_CHAIN_ID}-payment.json"));
+    // The guard removes the forge manifests on drop; the cache keeps its own
+    // copies.
+    let anvil = spawn_anvil(vec![forge_manifest.clone(), forge_payment.clone()]).await?;
 
-    // Mock USDC first, then the protocol with the initial TOKEN supply held by
-    // the admin EOA so it can distribute bond stake to N operators.
+    // Mock USDC and the loopback CCTP first, then the protocol with the
+    // initial TOKEN supply held by the admin EOA so it can distribute bond
+    // stake to N operators.
     let usdc = deploy_mock_usdc(&anvil.admin, contracts).await?;
+    let cctp = deploy_artifact(
+        &anvil.admin,
+        contracts,
+        "LoopbackCctp",
+        &(0u32,).abi_encode_params(),
+    )
+    .await?;
     let token_holder = admin_address()?;
-    run_deploy_script(&anvil.admin, contracts, &anvil.rpc_url, usdc, token_holder).await?;
+    let deps = DeployDeps {
+        usdc,
+        cctp,
+        initial_token_holder: token_holder,
+    };
+    run_deploy_script(&anvil.admin, contracts, &anvil.rpc_url, &deps).await?;
+    let receiver = manifest_contract(&forge_manifest, "CctpSweepReceiver")?;
+    run_payment_pool_script(contracts, &anvil.rpc_url, &deps, receiver).await?;
 
-    let manifest = read_manifest(&forge_manifest)?;
+    let manifest = read_manifest(&forge_manifest, &forge_payment)?;
     anyhow::ensure!(
         manifest.usdc == usdc,
         "manifest externalDeps.usdc {} disagrees with deployed mock USDC {usdc}",
@@ -2320,30 +2371,33 @@ async fn deploy_and_snapshot(
     // so any reader that observes the manifest is guaranteed a complete snapshot
     // beside it. Each write is an atomic rename, so neither file is ever seen
     // half-written.
-    write_atomic(state_path, state_hex.as_bytes())?;
+    write_atomic(&paths.state, state_hex.as_bytes())?;
+    let payment_bytes = std::fs::read(&forge_payment)
+        .with_context(|| format!("re-read forge manifest {}", forge_payment.display()))?;
+    write_atomic(&paths.payment, &payment_bytes)?;
     let manifest_bytes = std::fs::read(&forge_manifest)
         .with_context(|| format!("re-read forge manifest {}", forge_manifest.display()))?;
-    write_atomic(manifest_path, &manifest_bytes)?;
+    write_atomic(&paths.manifest, &manifest_bytes)?;
 
     Ok(SharedDeployment {
-        state_path: state_path.to_path_buf(),
+        state_path: paths.state.clone(),
         manifest,
     })
 }
 
 /// Load a previously committed deployment, or `None` if the cache is absent or
-/// incomplete (the manifest is the commit marker, but require both files so a
-/// torn write is never mistaken for a hit).
-fn load_cached_deployment(
-    state_path: &Path,
-    manifest_path: &Path,
-) -> anyhow::Result<Option<SharedDeployment>> {
-    if !nonempty_file(state_path) || !nonempty_file(manifest_path) {
+/// incomplete (the governance manifest is the commit marker, but require every
+/// file so a torn write is never mistaken for a hit).
+fn load_cached_deployment(paths: &CachePaths) -> anyhow::Result<Option<SharedDeployment>> {
+    if !nonempty_file(&paths.state)
+        || !nonempty_file(&paths.payment)
+        || !nonempty_file(&paths.manifest)
+    {
         return Ok(None);
     }
     Ok(Some(SharedDeployment {
-        state_path: state_path.to_path_buf(),
-        manifest: read_manifest(manifest_path)?,
+        state_path: paths.state.clone(),
+        manifest: read_manifest(&paths.manifest, &paths.payment)?,
     }))
 }
 
@@ -2392,15 +2446,20 @@ fn cache_dir(contracts: &Path) -> PathBuf {
 /// environment. `SCHEMA` is bumped by hand when the snapshot encoding or this
 /// fixture's deploy wiring changes in a way the bytecode alone does not capture.
 fn artifact_cache_key(contracts: &Path) -> anyhow::Result<String> {
-    const SCHEMA: &str = "v1";
+    const SCHEMA: &str = "v3";
     let usdc_bc = artifact_bytecode(&contracts.join("out/MintableUSDC.sol/MintableUSDC.json"))?;
+    let cctp_bc = artifact_bytecode(&contracts.join("out/LoopbackCctp.sol/LoopbackCctp.json"))?;
     let deploy_bc =
         artifact_bytecode(&contracts.join("out/DeployProtocol.s.sol/DeployProtocol.json"))?;
+    let pool_bc =
+        artifact_bytecode(&contracts.join("out/DeployPaymentPool.s.sol/DeployPaymentPool.json"))?;
     let mut buf = Vec::new();
     buf.extend_from_slice(SCHEMA.as_bytes());
     buf.extend_from_slice(&E2E_CHAIN_ID.to_le_bytes());
     buf.extend_from_slice(usdc_bc.as_bytes());
+    buf.extend_from_slice(cctp_bc.as_bytes());
     buf.extend_from_slice(deploy_bc.as_bytes());
+    buf.extend_from_slice(pool_bc.as_bytes());
     buf.extend_from_slice(terms_hash().as_slice());
     buf.extend_from_slice(admin_address()?.as_slice());
     buf.extend_from_slice(DEPLOYER_ADDR.as_bytes());
@@ -2430,9 +2489,13 @@ async fn run_deploy_script(
     admin: &DynProvider,
     contracts: &Path,
     rpc_url: &str,
-    usdc: Address,
-    initial_token_holder: Address,
+    deps: &DeployDeps,
 ) -> anyhow::Result<()> {
+    let DeployDeps {
+        usdc,
+        cctp,
+        initial_token_holder,
+    } = *deps;
     let mut snapshot = evm_snapshot(admin).await?;
     for attempt in 1..=DEPLOY_ATTEMPTS {
         let mut cmd = tokio::process::Command::new("forge");
@@ -2449,6 +2512,8 @@ async fn run_deploy_script(
                 DEPLOYER_ADDR,
             ])
             .env("USDC_ADDRESS", usdc.to_string())
+            .env("CCTP_MESSAGE_TRANSMITTER", cctp.to_string())
+            .env("CCTP_TOKEN_MESSENGER", cctp.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
             // DeployProtocol.s.sol requires a genesis VETTER_ROLE holder (a deploy
@@ -2514,6 +2579,63 @@ async fn run_deploy_script(
         tokio::time::sleep(DEPLOY_RETRY_BACKOFF * u32::try_from(attempt).unwrap_or(u32::MAX)).await;
     }
     anyhow::bail!("DEPLOY_ATTEMPTS must be >= 1 (was {DEPLOY_ATTEMPTS})")
+}
+
+/// What the deploy scripts take from the fixture: the mock USDC, the
+/// `LoopbackCctp` that plays both CCTP V2 sides, and the initial TOKEN holder.
+#[derive(Debug, Clone, Copy)]
+struct DeployDeps {
+    usdc: Address,
+    cctp: Address,
+    initial_token_holder: Address,
+}
+
+/// Run `forge script DeployPaymentPool.s.sol` against the anvil RPC: one
+/// `PaymentPool` on the fixture chain, sweeping through the loopback CCTP to
+/// `receiver`, the governance suite's `CctpSweepReceiver`. It writes
+/// `deployments/<chainId>-payment.json`.
+async fn run_payment_pool_script(
+    contracts: &Path,
+    rpc_url: &str,
+    deps: &DeployDeps,
+    receiver: Address,
+) -> anyhow::Result<()> {
+    let mut cmd = tokio::process::Command::new("forge");
+    cmd.current_dir(contracts)
+        .args([
+            "script",
+            "script/DeployPaymentPool.s.sol:DeployPaymentPool",
+            "--rpc-url",
+            rpc_url,
+            "--broadcast",
+            "--private-key",
+            DEPLOYER_KEY,
+            "--sender",
+            DEPLOYER_ADDR,
+        ])
+        .env("USDC_ADDRESS", deps.usdc.to_string())
+        .env("CCTP_TOKEN_MESSENGER", deps.cctp.to_string())
+        .env("SWEEP_RECIPIENT", receiver.to_string())
+        .env("PAUSER", DEPLOYER_ADDR)
+        // A journey's operators earn a few µUSDC, so any pending share sweeps
+        // ([`ChainFixture::sweep`]).
+        .env("MIN_SWEEP", "1")
+        .env("FORCE_OVERWRITE_MANIFEST", "true");
+    match forge_output(
+        cmd,
+        ci_scaled(DEPLOY_TIMEOUT),
+        "forge script DeployPaymentPool",
+    )
+    .await?
+    {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => anyhow::bail!(
+            "forge script DeployPaymentPool failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(timeout) => anyhow::bail!("forge script DeployPaymentPool timed out after {timeout:?}"),
+    }
 }
 
 /// Give the next deploy attempt a genuinely clean broadcast lane: drain anvil's
@@ -2660,10 +2782,24 @@ fn emergency_multisig_role() -> B256 {
     keccak256(b"EMERGENCY_MULTISIG_ROLE")
 }
 
-/// Read the protocol contract addresses and the settlement USDC from the deploy
-/// manifest. The mock USDC is recorded under `externalDeps.usdc` — the same
-/// address the fixture deployed and fed to the script as `USDC_ADDRESS`.
-fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
+/// The `contracts.<name>` address the manifest at `path` records.
+fn manifest_contract(path: &Path, name: &str) -> anyhow::Result<Address> {
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    json.get("contracts")
+        .and_then(|contracts| contracts.get(name))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("manifest {} missing contracts.{name}", path.display()))?
+        .parse()
+        .with_context(|| format!("parse manifest address contracts.{name}"))
+}
+
+/// Read the protocol contract addresses and the settlement USDC from the
+/// governance deploy manifest at `path`, and the `PaymentPool` from the
+/// payment-chain manifest at `payment`. The mock USDC is recorded under
+/// `externalDeps.usdc` — the same address the fixture deployed and fed to the
+/// script as `USDC_ADDRESS`. The `contracts` list holds both manifests'
+/// entries.
+fn read_manifest(path: &Path, payment: &Path) -> anyhow::Result<Manifest> {
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let contracts = json
         .get("contracts")
@@ -2676,9 +2812,10 @@ fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
             .parse()
             .with_context(|| format!("parse manifest address contracts.{k}"))
     };
+    let payment_pool = manifest_contract(payment, "PaymentPool")?;
     let addrs = ContractAddrs {
         capacity_bond: get("CapacityBond")?,
-        payment_pool: get("PaymentPool")?,
+        payment_pool,
         fee_router: get("FeeRouter")?,
         token: get("Token")?,
         slash_judge: get("SlashJudge")?,
@@ -2689,6 +2826,7 @@ fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
         origin_assignment: get("OriginAssignment")?,
         manual_vetting_policy: get("ManualVettingPolicy")?,
         content_blacklist: get("ContentBlacklist")?,
+        cctp_sweep_receiver: get("CctpSweepReceiver")?,
     };
     let usdc: Address = json
         .get("externalDeps")
@@ -2703,6 +2841,7 @@ fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
         .keys()
         .map(|name| Ok((name.clone(), get(name)?)))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    all.push(("PaymentPool".to_owned(), payment_pool));
     all.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     Ok(Manifest {
         addrs,

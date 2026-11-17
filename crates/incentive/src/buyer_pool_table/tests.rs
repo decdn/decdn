@@ -193,7 +193,7 @@ fn golden_bytes_still_decode() -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<_>>()?;
     let want = golden_state()?;
-    let got = decode_record(want.pool_id.into(), &bytes)?;
+    let got = decode_record(&pool_key(want.deployment, want.pool_id), &bytes)?;
     anyhow::ensure!(
         got == want,
         "frozen bytes no longer decode:\n {got:?}\n {want:?}"
@@ -205,8 +205,12 @@ fn golden_bytes_still_decode() -> anyhow::Result<()> {
 fn open_empty_store_returns_no_entries() -> anyhow::Result<()> {
     let (_d, db) = db()?;
     anyhow::ensure!(tbl(&db).load_all()?.pools.is_empty());
-    anyhow::ensure!(tbl(&db).get_by_owner(state(1).owner)?.is_none());
-    anyhow::ensure!(tbl(&db).get_by_pool_id(state(1).pool_id)?.is_none());
+    anyhow::ensure!(tbl(&db).get_by_owner(DEPLOYMENT, state(1).owner)?.is_none());
+    anyhow::ensure!(
+        tbl(&db)
+            .get_by_pool_id(DEPLOYMENT, state(1).pool_id)?
+            .is_none()
+    );
     Ok(())
 }
 
@@ -234,6 +238,7 @@ fn seed_progress_moves_a_new_lanes_watermark_out_of_the_redeemed_spend() -> anyh
     };
     let seed = |amount: u64| {
         tbl(&db).seed_progress(
+            DEPLOYMENT,
             s.owner,
             s.pool_id,
             lane,
@@ -243,14 +248,14 @@ fn seed_progress_moves_a_new_lanes_watermark_out_of_the_redeemed_spend() -> anyh
     };
     anyhow::ensure!(matches!(seed(60)?, AdvanceOutcome::Advanced));
     let row = tbl(&db)
-        .get_by_pool_id(s.pool_id)?
+        .get_by_pool_id(DEPLOYMENT, s.pool_id)?
         .ok_or_else(|| anyhow::anyhow!("row"))?;
     anyhow::ensure!(row.redeemed_elsewhere() == U256::from(40u64));
     let base = s.committed_amount();
     anyhow::ensure!(row.pool_spend() == base + U256::from(100u64));
     anyhow::ensure!(matches!(seed(70)?, AdvanceOutcome::Advanced));
     let row = tbl(&db)
-        .get_by_pool_id(s.pool_id)?
+        .get_by_pool_id(DEPLOYMENT, s.pool_id)?
         .ok_or_else(|| anyhow::anyhow!("row"))?;
     anyhow::ensure!(row.redeemed_elsewhere() == U256::from(40u64));
     anyhow::ensure!(row.pool_spend() == base + U256::from(110u64));
@@ -264,12 +269,12 @@ fn record_round_trips_and_keys_by_pool_id() -> anyhow::Result<()> {
     tbl(&db).record(&s)?;
 
     let by_id = tbl(&db)
-        .get_by_pool_id(s.pool_id)?
+        .get_by_pool_id(DEPLOYMENT, s.pool_id)?
         .ok_or_else(|| anyhow::anyhow!("missing by pool_id"))?;
     anyhow::ensure!(by_id == s);
 
     let by_owner = tbl(&db)
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("missing by owner"))?;
     anyhow::ensure!(by_owner.pool_id == s.pool_id);
     anyhow::ensure!(by_owner == s);
@@ -287,7 +292,7 @@ fn record_get_and_persist_across_reopen() -> anyhow::Result<()> {
         tbl(&db).record(&a)?;
         tbl(&db).record(&b)?;
         let got = tbl(&db)
-            .get_by_owner(a.owner)?
+            .get_by_owner(DEPLOYMENT, a.owner)?
             .ok_or_else(|| anyhow::anyhow!("missing a"))?;
         anyhow::ensure!(got == a, "get_by_owner must round-trip");
     }
@@ -313,7 +318,7 @@ fn record_overwrites_by_owner() -> anyhow::Result<()> {
         "same owner overwrites"
     );
     let only = tbl(&db)
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("missing"))?;
     anyhow::ensure!(only.deposit == U256::from(20_000_000u64));
     Ok(())
@@ -337,10 +342,13 @@ fn forget_removes_entry_and_is_noop_when_absent() -> anyhow::Result<()> {
     let (_d, db) = db()?;
     let s = state(3);
     tbl(&db).record(&s)?;
-    tbl(&db).forget(s.owner)?;
+    tbl(&db).forget(DEPLOYMENT, s.owner)?;
     anyhow::ensure!(tbl(&db).load_all()?.pools.is_empty());
     // forget on an unknown owner is a no-op.
-    tbl(&db).forget(address!("00000000000000000000000000000000000000ff"))?;
+    tbl(&db).forget(
+        DEPLOYMENT,
+        address!("00000000000000000000000000000000000000ff"),
+    )?;
     Ok(())
 }
 
@@ -359,7 +367,7 @@ fn older_schema_version_is_rejected_not_misdecoded() -> anyhow::Result<()> {
     let mut stored = StoredBuyerPoolState::from(&s);
     stored.schema_version = 0;
     let encoded = postcard::to_allocvec(&stored)?;
-    tbl(&db).insert_raw(s.pool_id, &encoded)?;
+    tbl(&db).insert_raw(DEPLOYMENT, s.pool_id, &encoded)?;
 
     let load = tbl(&db).load_all()?;
     anyhow::ensure!(
@@ -368,7 +376,7 @@ fn older_schema_version_is_rejected_not_misdecoded() -> anyhow::Result<()> {
     );
     anyhow::ensure!(load.skipped == vec![s.pool_id]);
     let err = tbl(&db)
-        .get_by_pool_id(s.pool_id)
+        .get_by_pool_id(DEPLOYMENT, s.pool_id)
         .err()
         .ok_or_else(|| anyhow::anyhow!("an older schema must reject on get_by_pool_id"))?;
     anyhow::ensure!(
@@ -393,7 +401,7 @@ fn future_schema_version_skipped_on_hydration() -> anyhow::Result<()> {
     let mut stored = StoredBuyerPoolState::from(&s);
     stored.schema_version = BUYER_SUPPORTED_SCHEMA_VERSION + 1;
     let encoded = postcard::to_allocvec(&stored)?;
-    tbl(&db).insert_raw(s.pool_id, &encoded)?;
+    tbl(&db).insert_raw(DEPLOYMENT, s.pool_id, &encoded)?;
 
     let load = tbl(&db).load_all()?;
     anyhow::ensure!(
@@ -402,7 +410,7 @@ fn future_schema_version_skipped_on_hydration() -> anyhow::Result<()> {
     );
     anyhow::ensure!(load.skipped == vec![s.pool_id]);
     let err = tbl(&db)
-        .get_by_pool_id(s.pool_id)
+        .get_by_pool_id(DEPLOYMENT, s.pool_id)
         .err()
         .ok_or_else(|| anyhow::anyhow!("future schema must reject on get_by_pool_id"))?;
     anyhow::ensure!(
@@ -425,7 +433,7 @@ fn corrupt_value_bytes_skipped_keeps_healthy() -> anyhow::Result<()> {
     let (_d, db) = db()?;
     let healthy = state(2);
     tbl(&db).record(&healthy)?;
-    tbl(&db).insert_raw(state(3).pool_id, &[0u8; 8])?; // far too short
+    tbl(&db).insert_raw(DEPLOYMENT, state(3).pool_id, &[0u8; 8])?; // far too short
 
     let load = tbl(&db).load_all()?;
     anyhow::ensure!(
@@ -437,7 +445,7 @@ fn corrupt_value_bytes_skipped_keeps_healthy() -> anyhow::Result<()> {
         "the skipped pool_id is the only repair handle, got {load:?}",
     );
     let err = tbl(&db)
-        .get_by_pool_id(state(3).pool_id)
+        .get_by_pool_id(DEPLOYMENT, state(3).pool_id)
         .err()
         .ok_or_else(|| anyhow::anyhow!("garbage value must reject on get_by_pool_id"))?;
     anyhow::ensure!(
@@ -455,7 +463,7 @@ fn pool_id_key_mismatch_skipped_on_hydration() -> anyhow::Result<()> {
     let s_for_a = state(0xAA);
     let encoded = postcard::to_allocvec(&StoredBuyerPoolState::from(&s_for_a))?;
     // Filed under a *different* pool_id's key.
-    tbl(&db).insert_raw(state(0xBB).pool_id, &encoded)?;
+    tbl(&db).insert_raw(DEPLOYMENT, state(0xBB).pool_id, &encoded)?;
 
     let load = tbl(&db).load_all()?;
     anyhow::ensure!(
@@ -464,7 +472,7 @@ fn pool_id_key_mismatch_skipped_on_hydration() -> anyhow::Result<()> {
     );
     anyhow::ensure!(load.skipped == vec![state(0xBB).pool_id]);
     let err = tbl(&db)
-        .get_by_pool_id(state(0xBB).pool_id)
+        .get_by_pool_id(DEPLOYMENT, state(0xBB).pool_id)
         .err()
         .ok_or_else(|| anyhow::anyhow!("pool_id/key mismatch must reject on get_by_pool_id"))?;
     anyhow::ensure!(
@@ -482,7 +490,7 @@ fn extra_trailing_bytes_are_tolerated() -> anyhow::Result<()> {
     let s = state(0x42);
     let mut encoded = postcard::to_allocvec(&StoredBuyerPoolState::from(&s))?;
     encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
-    tbl(&db).insert_raw(s.pool_id, &encoded)?;
+    tbl(&db).insert_raw(DEPLOYMENT, s.pool_id, &encoded)?;
 
     let load = tbl(&db).load_all()?;
     anyhow::ensure!(load.pools.len() == 1);
@@ -500,22 +508,22 @@ fn extra_trailing_bytes_are_tolerated() -> anyhow::Result<()> {
 fn forget_if_pool_is_compare_and_delete() -> anyhow::Result<()> {
     let (_d, db) = db()?;
     // CAS on a never-written store is a no-op (false).
-    anyhow::ensure!(!tbl(&db).forget_if_pool(state(1).owner, state(1).pool_id)?);
+    anyhow::ensure!(!tbl(&db).forget_if_pool(DEPLOYMENT, state(1).owner, state(1).pool_id)?);
 
     let s = state(4);
     tbl(&db).record(&s)?;
     // Wrong pool id → not deleted, row survives.
     anyhow::ensure!(
-        !tbl(&db).forget_if_pool(s.owner, OTHER_POOL)?,
+        !tbl(&db).forget_if_pool(DEPLOYMENT, s.owner, OTHER_POOL)?,
         "mismatched pool must not delete"
     );
     anyhow::ensure!(
-        tbl(&db).get_by_owner(s.owner)?.is_some(),
+        tbl(&db).get_by_owner(DEPLOYMENT, s.owner)?.is_some(),
         "row must survive"
     );
     // Matching pool id → deleted.
-    anyhow::ensure!(tbl(&db).forget_if_pool(s.owner, s.pool_id)?);
-    anyhow::ensure!(tbl(&db).get_by_owner(s.owner)?.is_none());
+    anyhow::ensure!(tbl(&db).forget_if_pool(DEPLOYMENT, s.owner, s.pool_id)?);
+    anyhow::ensure!(tbl(&db).get_by_owner(DEPLOYMENT, s.owner)?.is_none());
     Ok(())
 }
 
@@ -537,6 +545,7 @@ fn advance_progress_cannot_regress_committed_watermark() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing progress"))?;
 
     let outcome = tbl(&db).advance_progress(
+        DEPLOYMENT,
         s.owner,
         s.pool_id,
         lane,
@@ -548,7 +557,7 @@ fn advance_progress_cannot_regress_committed_watermark() -> anyhow::Result<()> {
         "stale progress must be rejected, got {outcome:?}"
     );
     let stored = tbl(&db)
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
     anyhow::ensure!(
         stored.lane_progress(lane) == Some(progress),
@@ -581,13 +590,13 @@ fn rebase_progress_takes_an_anchor_ahead_on_bytes() -> anyhow::Result<()> {
         last_amount: progress.last_amount + U256::from(3u64),
         last_bytes: anchor.last_bytes + U256::from(300u64),
     };
-    let outcome = tbl(&db).rebase_progress(s.owner, s.pool_id, lane, anchor, totals)?;
+    let outcome = tbl(&db).rebase_progress(DEPLOYMENT, s.owner, s.pool_id, lane, anchor, totals)?;
     anyhow::ensure!(
         matches!(outcome, AdvanceOutcome::Advanced),
         "a rebase must write, got {outcome:?}"
     );
     let stored = tbl(&db)
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .and_then(|row| row.lane_progress(lane))
         .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
     anyhow::ensure!(stored == totals, "got {stored:?}");
@@ -620,19 +629,20 @@ fn rebase_progress_overwrites_down_and_guards_the_pool() -> anyhow::Result<()> {
     };
 
     let wrong_pool = PoolId::repeat_byte(0xEE);
-    let outcome = tbl(&db).rebase_progress(s.owner, wrong_pool, lane, anchor, totals)?;
+    let outcome =
+        tbl(&db).rebase_progress(DEPLOYMENT, s.owner, wrong_pool, lane, anchor, totals)?;
     anyhow::ensure!(
         matches!(outcome, AdvanceOutcome::PoolMismatch),
         "a rebase against a replaced pool must not write, got {outcome:?}"
     );
 
-    let outcome = tbl(&db).rebase_progress(s.owner, s.pool_id, lane, anchor, totals)?;
+    let outcome = tbl(&db).rebase_progress(DEPLOYMENT, s.owner, s.pool_id, lane, anchor, totals)?;
     anyhow::ensure!(
         matches!(outcome, AdvanceOutcome::Advanced),
         "a rebase must write, got {outcome:?}"
     );
     let stored = tbl(&db)
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .and_then(|row| row.lane_progress(lane))
         .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
     anyhow::ensure!(
@@ -646,13 +656,13 @@ fn rebase_progress_overwrites_down_and_guards_the_pool() -> anyhow::Result<()> {
         last_amount: anchor.last_amount - U256::from(1u64),
         last_bytes: anchor.last_bytes,
     };
-    let outcome = tbl(&db).rebase_progress(s.owner, s.pool_id, lane, anchor, low)?;
+    let outcome = tbl(&db).rebase_progress(DEPLOYMENT, s.owner, s.pool_id, lane, anchor, low)?;
     anyhow::ensure!(
         matches!(outcome, AdvanceOutcome::Advanced),
         "got {outcome:?}"
     );
     let stored = tbl(&db)
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .and_then(|row| row.lane_progress(lane))
         .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
     anyhow::ensure!(stored == anchor, "got {stored:?}");
@@ -673,6 +683,7 @@ fn advance_and_deposit_guard_on_pool_and_owner() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("fixture has no lane"))?;
     anyhow::ensure!(
         tbl(&db).advance_progress(
+            DEPLOYMENT,
             ghost.owner,
             ghost.pool_id,
             ghost_lane,
@@ -681,7 +692,7 @@ fn advance_and_deposit_guard_on_pool_and_owner() -> anyhow::Result<()> {
         )? == AdvanceOutcome::UnknownPool
     );
     anyhow::ensure!(
-        tbl(&db).add_deposit(ghost.owner, ghost.pool_id, U256::from(1u64))?
+        tbl(&db).add_deposit(DEPLOYMENT, ghost.owner, ghost.pool_id, U256::from(1u64))?
             == DepositOutcome::UnknownPool
     );
 
@@ -704,6 +715,7 @@ fn advance_and_deposit_guard_on_pool_and_owner() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("fixture has no lane"))?;
     anyhow::ensure!(
         tbl(&db).advance_progress(
+            DEPLOYMENT,
             absent.owner,
             absent.pool_id,
             absent_lane,
@@ -713,13 +725,14 @@ fn advance_and_deposit_guard_on_pool_and_owner() -> anyhow::Result<()> {
         "advance_progress on an absent row of an existing table"
     );
     anyhow::ensure!(
-        tbl(&db).add_deposit(absent.owner, absent.pool_id, U256::from(1u64))?
+        tbl(&db).add_deposit(DEPLOYMENT, absent.owner, absent.pool_id, U256::from(1u64))?
             == DepositOutcome::UnknownPool,
         "add_deposit on an absent row of an existing table"
     );
 
     anyhow::ensure!(
         tbl(&db).advance_progress(
+            DEPLOYMENT,
             s.owner,
             OTHER_POOL,
             lane,
@@ -728,11 +741,11 @@ fn advance_and_deposit_guard_on_pool_and_owner() -> anyhow::Result<()> {
         )? == AdvanceOutcome::PoolMismatch
     );
     anyhow::ensure!(
-        tbl(&db).add_deposit(s.owner, OTHER_POOL, U256::from(1u64))?
+        tbl(&db).add_deposit(DEPLOYMENT, s.owner, OTHER_POOL, U256::from(1u64))?
             == DepositOutcome::PoolMismatch
     );
     let stored = tbl(&db)
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
     anyhow::ensure!(stored == s, "mismatched calls must not mutate the row");
     Ok(())
@@ -753,20 +766,27 @@ fn no_row_ops_do_not_create_the_table() -> anyhow::Result<()> {
         .map(|(k, _)| k)
         .ok_or_else(|| anyhow::anyhow!("fixture has no lane"))?;
 
-    tbl(&db).forget(s.owner)?;
+    tbl(&db).forget(DEPLOYMENT, s.owner)?;
     anyhow::ensure!(table_absent(&db)?, "forget created the table");
 
-    anyhow::ensure!(!tbl(&db).forget_if_pool(s.owner, s.pool_id)?);
+    anyhow::ensure!(!tbl(&db).forget_if_pool(DEPLOYMENT, s.owner, s.pool_id)?);
     anyhow::ensure!(table_absent(&db)?, "forget_if_pool created the table");
 
     anyhow::ensure!(
-        tbl(&db).advance_progress(s.owner, s.pool_id, lane, U256::from(1u64), U256::from(1u64),)?
-            == AdvanceOutcome::UnknownPool
+        tbl(&db).advance_progress(
+            DEPLOYMENT,
+            s.owner,
+            s.pool_id,
+            lane,
+            U256::from(1u64),
+            U256::from(1u64),
+        )? == AdvanceOutcome::UnknownPool
     );
     anyhow::ensure!(table_absent(&db)?, "advance_progress created the table");
 
     anyhow::ensure!(
-        tbl(&db).add_deposit(s.owner, s.pool_id, U256::from(1u64))? == DepositOutcome::UnknownPool
+        tbl(&db).add_deposit(DEPLOYMENT, s.owner, s.pool_id, U256::from(1u64))?
+            == DepositOutcome::UnknownPool
     );
     anyhow::ensure!(table_absent(&db)?, "add_deposit created the table");
 
@@ -792,15 +812,27 @@ fn forget_deletions_survive_reopen() -> anyhow::Result<()> {
         tbl(&db).record(&compare_deleted)?;
         tbl(&db).record(&retained)?;
 
-        tbl(&db).forget(forgotten.owner)?;
-        anyhow::ensure!(tbl(&db).forget_if_pool(compare_deleted.owner, compare_deleted.pool_id)?);
+        tbl(&db).forget(DEPLOYMENT, forgotten.owner)?;
+        anyhow::ensure!(tbl(&db).forget_if_pool(
+            DEPLOYMENT,
+            compare_deleted.owner,
+            compare_deleted.pool_id
+        )?);
     }
 
     let db = Database::create(&path)?;
-    anyhow::ensure!(tbl(&db).get_by_owner(forgotten.owner)?.is_none());
-    anyhow::ensure!(tbl(&db).get_by_owner(compare_deleted.owner)?.is_none());
     anyhow::ensure!(
-        tbl(&db).get_by_owner(retained.owner)? == Some(retained),
+        tbl(&db)
+            .get_by_owner(DEPLOYMENT, forgotten.owner)?
+            .is_none()
+    );
+    anyhow::ensure!(
+        tbl(&db)
+            .get_by_owner(DEPLOYMENT, compare_deleted.owner)?
+            .is_none()
+    );
+    anyhow::ensure!(
+        tbl(&db).get_by_owner(DEPLOYMENT, retained.owner)? == Some(retained),
         "unrelated row must survive both durable deletions"
     );
     Ok(())
@@ -828,6 +860,7 @@ fn advance_and_deposit_survive_reopen() -> anyhow::Result<()> {
         tbl(&db).record(&s)?;
         anyhow::ensure!(
             tbl(&db).advance_progress(
+                DEPLOYMENT,
                 s.owner,
                 s.pool_id,
                 lane,
@@ -836,19 +869,19 @@ fn advance_and_deposit_survive_reopen() -> anyhow::Result<()> {
             )? == AdvanceOutcome::Advanced
         );
         anyhow::ensure!(
-            tbl(&db).add_deposit(s.owner, s.pool_id, U256::from(40u64))?
+            tbl(&db).add_deposit(DEPLOYMENT, s.owner, s.pool_id, U256::from(40u64))?
                 == DepositOutcome::Added(s.deposit + U256::from(40u64))
         );
         // A mismatched (no-write) call must leave nothing extra to
         // persist.
         anyhow::ensure!(
-            tbl(&db).add_deposit(s.owner, OTHER_POOL, U256::from(1u64))?
+            tbl(&db).add_deposit(DEPLOYMENT, s.owner, OTHER_POOL, U256::from(1u64))?
                 == DepositOutcome::PoolMismatch
         );
     }
     let db = Database::create(&path)?;
     let reopened = tbl(&db)
-        .get_by_owner(s.owner)?
+        .get_by_owner(DEPLOYMENT, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("row vanished across reopen"))?;
     let reopened_progress = reopened
         .lane_progress(lane)
@@ -891,7 +924,8 @@ fn concurrent_top_up_and_progress_preserve_both() -> anyhow::Result<()> {
     let depositor = std::sync::Arc::clone(&db);
     let deposit_thread = std::thread::spawn(move || -> anyhow::Result<()> {
         for _ in 0..N {
-            let outcome = tbl(&depositor).add_deposit(owner, pool_id, U256::from(1u64))?;
+            let outcome =
+                tbl(&depositor).add_deposit(DEPLOYMENT, owner, pool_id, U256::from(1u64))?;
             anyhow::ensure!(
                 matches!(outcome, DepositOutcome::Added(_)),
                 "deposit outcome {outcome:?}"
@@ -903,6 +937,7 @@ fn concurrent_top_up_and_progress_preserve_both() -> anyhow::Result<()> {
     let progress_thread = std::thread::spawn(move || -> anyhow::Result<()> {
         for i in 1..=N {
             let outcome = tbl(&advancer).advance_progress(
+                DEPLOYMENT,
                 owner,
                 pool_id,
                 lane,
@@ -924,7 +959,7 @@ fn concurrent_top_up_and_progress_preserve_both() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("progress thread panicked"))??;
 
     let final_row = tbl(&db)
-        .get_by_owner(owner)?
+        .get_by_owner(DEPLOYMENT, owner)?
         .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
     anyhow::ensure!(
         final_row.deposit == U256::from(1_000u64) + U256::from(N),
@@ -1062,8 +1097,8 @@ fn delegate_advance_creates_then_refuses_a_regression() -> anyhow::Result<()> {
         table_absent(&db)?,
         "a delegate write created the pool table"
     );
-    anyhow::ensure!(tbl(&db).get_by_pool_id(lane.pool_id)?.is_none());
-    anyhow::ensure!(tbl(&db).get_by_owner(lane.signer)?.is_none());
+    anyhow::ensure!(tbl(&db).get_by_pool_id(DEPLOYMENT, lane.pool_id)?.is_none());
+    anyhow::ensure!(tbl(&db).get_by_owner(DEPLOYMENT, lane.signer)?.is_none());
     Ok(())
 }
 
@@ -1098,6 +1133,76 @@ fn delegate_rebase_overwrites_down() -> anyhow::Result<()> {
     anyhow::ensure!(
         tbl(&db).delegate_lanes(DEPLOYMENT, lane.pool_id, lane.signer)?
             == vec![(lane.provider, progress(100, 10))]
+    );
+    Ok(())
+}
+
+/// One owner's same-numbered pool on two deployments is two rows: the
+/// primary key and the owner index both carry the deployment, so recording
+/// the second leaves the first reachable, and forgetting one keeps the other.
+#[test]
+fn same_pool_id_on_two_deployments_does_not_collide() -> anyhow::Result<()> {
+    let (_d, db) = db()?;
+    let other = Deployment {
+        chain_id: 84_532,
+        ..DEPLOYMENT
+    };
+    let here = state(7);
+    let mut there = state(7);
+    there.deployment = other;
+    there.deposit = U256::from(42u64);
+    tbl(&db).record(&here)?;
+    tbl(&db).record(&there)?;
+
+    anyhow::ensure!(tbl(&db).load_all()?.pools.len() == 2);
+    anyhow::ensure!(tbl(&db).get_by_pool_id(DEPLOYMENT, here.pool_id)? == Some(here.clone()));
+    anyhow::ensure!(tbl(&db).get_by_pool_id(other, here.pool_id)? == Some(there.clone()));
+    anyhow::ensure!(tbl(&db).get_by_owner(DEPLOYMENT, here.owner)? == Some(here.clone()));
+    anyhow::ensure!(tbl(&db).get_by_owner(other, here.owner)? == Some(there.clone()));
+
+    let lane = LaneKey {
+        pool_id: here.pool_id,
+        signer: here.owner,
+        provider: Address::repeat_byte(0x5e),
+    };
+    anyhow::ensure!(
+        tbl(&db).advance_progress(
+            other,
+            here.owner,
+            here.pool_id,
+            lane,
+            U256::from(9u64),
+            U256::from(9u64)
+        )? == AdvanceOutcome::Advanced
+    );
+    anyhow::ensure!(
+        tbl(&db).get_by_owner(DEPLOYMENT, here.owner)? == Some(here.clone()),
+        "an advance on one deployment must not touch the other's row"
+    );
+
+    tbl(&db).forget(other, here.owner)?;
+    anyhow::ensure!(tbl(&db).get_by_owner(other, here.owner)?.is_none());
+    anyhow::ensure!(tbl(&db).get_by_owner(DEPLOYMENT, here.owner)? == Some(here));
+    Ok(())
+}
+
+/// A row recorded under one deployment does not answer a lookup that names
+/// another: the deployment is part of the identity, not a tag to check.
+#[test]
+fn a_lookup_on_another_deployment_finds_nothing() -> anyhow::Result<()> {
+    let (_d, db) = db()?;
+    let s = sample_state();
+    tbl(&db).record(&s)?;
+    let other = Deployment {
+        payment_pool: Address::repeat_byte(0x9d),
+        ..DEPLOYMENT
+    };
+    anyhow::ensure!(tbl(&db).get_by_owner(other, s.owner)?.is_none());
+    anyhow::ensure!(tbl(&db).get_by_pool_id(other, s.pool_id)?.is_none());
+    anyhow::ensure!(!tbl(&db).forget_if_pool(other, s.owner, s.pool_id)?);
+    anyhow::ensure!(
+        tbl(&db).add_deposit(other, s.owner, s.pool_id, U256::from(1u64))?
+            == DepositOutcome::UnknownPool
     );
     Ok(())
 }

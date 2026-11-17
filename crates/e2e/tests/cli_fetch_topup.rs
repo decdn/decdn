@@ -174,7 +174,14 @@ async fn run() -> anyhow::Result<()> {
     // advancing the persisted lane watermark.
     let prior_amount = deposit - U256::from(1u64);
     let outcome = store
-        .advance_progress(buyer_addr, pool_id, lane, U256::from(1u64), prior_amount)
+        .advance_progress(
+            deployment,
+            buyer_addr,
+            pool_id,
+            lane,
+            U256::from(1u64),
+            prior_amount,
+        )
         .context("advance watermark")?;
     anyhow::ensure!(
         matches!(
@@ -202,7 +209,7 @@ async fn run() -> anyhow::Result<()> {
     );
     let credited = topped_up.credited;
     let deposit_outcome = store
-        .add_deposit(buyer_addr, pool_id, credited)
+        .add_deposit(deployment, buyer_addr, pool_id, credited)
         .context("credit top-up into the local record")?;
     anyhow::ensure!(
         matches!(
@@ -224,7 +231,7 @@ async fn run() -> anyhow::Result<()> {
         "topUp must raise the on-chain deposit to {expected}, got {onchain}"
     );
     let persisted = store
-        .get_by_pool_id(pool_id)
+        .get_by_pool_id(deployment, pool_id)
         .context("re-read persisted pool")?
         .ok_or_else(|| anyhow::anyhow!("buyer pool vanished after top_up"))?
         .deposit;
@@ -236,7 +243,7 @@ async fn run() -> anyhow::Result<()> {
     // The lane watermark must be untouched by the top-up (a reused pool resumes
     // from the same cumulative bytes/amount, only with more headroom).
     let after = store
-        .get_by_pool_id(pool_id)
+        .get_by_pool_id(deployment, pool_id)
         .context("re-read watermark")?
         .ok_or_else(|| anyhow::anyhow!("buyer pool vanished"))?;
     let progress = after
@@ -298,16 +305,22 @@ fn topup_fetch_argv_with_deposits(
         format!("127.0.0.1:{}", node.bind_port()),
         "--provider-address".into(),
         format!("{}", node.operator_addr()),
-        "--rpc-url".into(),
+        "--governance-rpc-url".into(),
         chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
+        "--governance-chain-id".into(),
+        chain.chain_id().to_string(),
+        "--pool".into(),
+        format!(
+            "eip155:{}:{:#x}",
+            chain.chain_id(),
+            chain.addrs().payment_pool
+        ),
+        "--pool-rpc-url".into(),
+        chain.rpc_url(),
         "--capacity-bond-address".into(),
         format!("{}", chain.addrs().capacity_bond),
         "--slash-judge-address".into(),
         format!("{}", chain.addrs().slash_judge),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
         "--data-dir".into(),
         data_dir.display().to_string(),
         "--keystore".into(),
@@ -643,7 +656,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 
     let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
     let persisted = store
-        .get_by_owner(buyer_addr)
+        .get_by_owner(deployment, buyer_addr)
         .context("read persisted pool")?
         .ok_or_else(|| anyhow::anyhow!("buyer pool not recorded after fetch"))?;
     let settled_amount = persisted
@@ -921,7 +934,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
 
     let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
     let persisted = store
-        .get_by_owner(buyer_addr)
+        .get_by_owner(deployment, buyer_addr)
         .context("read persisted pool")?
         .ok_or_else(|| anyhow::anyhow!("buyer pool not recorded after fetch"))?;
     let settled_amount = persisted

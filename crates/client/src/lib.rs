@@ -234,6 +234,10 @@ pub mod pacer;
 /// latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
 #[doc(hidden)]
 pub mod peer_store;
+// Docs live in `pool_route.rs` as `//!`, for the same reason as `sink` below.
+// An engine seam: the fetch drives it, an SDK caller never does.
+#[doc(hidden)]
+pub mod pool_route;
 /// Reusable `cdn/probe/v1` client.
 pub mod probe;
 /// Sub-frame byte-progress observation (#1797): a `ProgressReader` that tallies bytes
@@ -391,7 +395,8 @@ use decdn_protocol::client::{
     StreamResponseExt, VoucherRejectReason, WatermarkBundle, WireCapability,
 };
 use decdn_protocol::{
-    CHUNK_BYTES, ChunkPreimage, decode_message, encode_message, read_frame, write_frame,
+    CHUNK_BYTES, ChunkPreimage, PoolAccount, decode_message, encode_message, read_frame,
+    write_frame,
 };
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
@@ -1224,6 +1229,10 @@ enum Kind {
         // optional `WatermarkBundle`, which pushed the unboxed variant past
         // clippy's `large_enum_variant` threshold relative to `MidStream`.
         response: Box<StreamResponse>,
+        /// The payment pools the node accepts, which a `Declined` refusal of
+        /// the request's `payment_pool` lists (ADR 005 § Payment pool
+        /// routing). Unsigned.
+        accepted_pools: Option<Vec<PoolAccount>>,
     },
     /// Mid-stream refusal: a bare [`ClientMessage::StreamError`] frame that
     /// arrived after the open stage. It carries no signature (#1042), so there
@@ -1277,6 +1286,7 @@ impl UpstreamRefused {
                 kind: Kind::Open {
                     error,
                     response: Box::new(response),
+                    accepted_pools: ext.payment_pools.clone(),
                 },
             }),
             None => anyhow::anyhow!(
@@ -1338,6 +1348,22 @@ impl UpstreamRefused {
         match &self.kind {
             Kind::Open { response, .. } => Some(response.as_ref()),
             Kind::MidStream { .. } => None,
+        }
+    }
+
+    /// The payment pools the node accepts, when it refused the request's
+    /// `payment_pool` as `Declined` and listed them (ADR 005 § Payment pool
+    /// routing). `None` for any other refusal. The list is unsigned: a wrong
+    /// one costs the requester one more refusal.
+    #[must_use]
+    pub fn accepted_pools(&self) -> Option<&[PoolAccount]> {
+        match &self.kind {
+            Kind::Open {
+                error: StreamError::Declined,
+                accepted_pools: Some(pools),
+                ..
+            } => Some(pools),
+            Kind::Open { .. } | Kind::MidStream { .. } => None,
         }
     }
 }
@@ -2027,6 +2053,25 @@ enum ConnSource<'a> {
     Reuse(&'a iroh::endpoint::Connection),
 }
 
+/// The CAIP-10 account of the `PaymentPool` contract a voucher domain binds:
+/// the contract that holds the pool the vouchers draw from.
+///
+/// # Errors
+///
+/// When the domain names no chain id, one past `u64`, or no verifying
+/// contract.
+fn payment_pool(voucher_domain: &Eip712Domain) -> anyhow::Result<PoolAccount> {
+    let chain_id = voucher_domain
+        .chain_id
+        .ok_or_else(|| anyhow::anyhow!("voucher domain names no chain id"))?;
+    let chain_id = u64::try_from(chain_id)
+        .map_err(|_| anyhow::anyhow!("voucher domain chain id {chain_id} exceeds u64"))?;
+    let contract = voucher_domain
+        .verifying_contract
+        .ok_or_else(|| anyhow::anyhow!("voucher domain names no verifying contract"))?;
+    Ok(PoolAccount::eip155(chain_id, contract.into()))
+}
+
 /// The OPEN stage of a `cdn/client/v1` pull, the single request site behind
 /// [`open_progressive_pull`]: get the connection from `source` (dial a fresh one,
 /// or reuse a warm one), open the bi-stream, send the [`StreamRequest`], then read
@@ -2101,6 +2146,10 @@ async fn open_stream(
             // to a directory-discovered cold origin passes the served namespace so
             // that origin's gate resolves and it can fill from its own backend.
             namespace_id,
+            // The pool lives in the contract its voucher domain binds (ADR 005
+            // § Payment pool routing), so the node routes on that contract.
+            payment_pool: payment_pool(&ctx.voucher_domain)
+                .map_err(|e| e.context(LocalPullFault))?,
             pool_id: ctx.pool_id.into(),
             byte_offset,
             // `0` = whole-tail fetch; a caller requesting a bounded middle gap

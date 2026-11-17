@@ -197,7 +197,7 @@ running-low signal counts the recorded amount as earlier spend of the signer
 signal](039-multi-source-parallel-fetch.md#client-sdk-funding-signal)). `decdn pool`
 reads and writes `buyer-pools.redb`. A `decdn pool` command whose data dir holds any
 of the daemon's stores (`decdn_common::data_dir::DAEMON_STORE_FILES` — `buyer.redb`,
-`lanes.redb`, `settle.redb`, `checkpoint.redb`) is pointed at a node: it reports the
+`lanes.redb`, `settle.redb`) is pointed at a node: it reports the
 node's pools through the admin RPC (`decdn node pools`) and refuses to escrow into a
 store the node never reads. The daemon holds its lock only while it runs, so with the
 daemon stopped `decdn pool list` reads `buyer.redb` directly and marks the listing as
@@ -227,16 +227,27 @@ in current schema terms:
 
 - `[identity]` — `data_dir` (holds the buyer payment-pool store and, by default, the ETH
   keystore) and an optional ISO 3166-1 alpha-2 `region`.
-- `[blockchain]` — `eth_keystore` and two chain coordinate sets. The governance-chain registry
-  set is an RPC endpoint, the chain id, `capacity_bond`, and `slash_judge`. The payment-chain set
-  is an RPC endpoint, the chain id, and `payment_pool`. A client reads the registry from the
-  governance chain and pays on the payment chain ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
-  A client with pools on several payment chains lists one payment-chain set for each. For each
-  candidate node it picks a chain that is in its own list and in the node's `payment_chains` probe
-  hint, and it sets that chain as `chain_id` in the `StreamRequest`
-  ([ADR 005 § Payment chain routing](005-protocol.md#payment-chain-routing)). A node that refuses
-  the chain lists its accepted chains in the refusal, and the client retries that node once on a
-  listed chain where it holds a funded pool.
+- `[blockchain]` — `eth_keystore`, the governance-chain set, and the payment chains. The
+  governance-chain set is the table's own keys: `rpc_url`, `chain_id`, `capacity_bond_address`,
+  and `slash_judge_address`. Each payment chain is one `[[blockchain.payment_chains]]` entry:
+  `rpc_url`, `chain_id`, and `payment_pools`, a list of one or more `PaymentPool` contract
+  addresses. The config names at least one entry, and no pool appears twice. The settlement token
+  is the `usdc()` of each pool, so the config does not name it. A client reads the registry from
+  the governance chain and pays on a payment chain ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
+  A client with pools on several payment chains lists one entry for each. For each
+  candidate node it picks a `PaymentPool` contract that is in its own list and in the node's
+  `payment_pools` probe hint, and it sets that contract as `payment_pool` in the `StreamRequest`
+  ([ADR 005 § Payment pool routing](005-protocol.md#payment-pool-routing)). It prefers a contract
+  where it already holds a pool, and it gives a node with no hint the first contract in its list.
+  A node that refuses the contract lists its accepted contracts in the refusal, and the client
+  retries that node once on a listed contract in its own list. A fetch pays through one contract
+  per pass, so the nodes routed to another contract are paid in that contract's pass. A bundle
+  pull runs the same passes, and a pass does not fetch a file again that an earlier pass
+  completed. A delegated client pays only through the contract of its capability's pool. The
+  EIP-712 domain of a capability binds one contract. Under the domain of that contract only, the
+  owner signature recovers to the on-chain owner of the pool. The gateway and `decdn get
+  --capability` check the signature against each contract in the list and keep the first
+  contract where it matches. A capability that matches no contract in the list is refused.
   The RPC URLs and keystore live here, **not** under `[network]`/`[keys]`.
 - `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
   probing to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull

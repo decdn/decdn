@@ -145,7 +145,9 @@ fn flags_override_config() {
         publisher_registry_address: None,
         origin_assignment_address: None,
         slash_appeal_address: None,
-        payment_pool_address: None,
+        payment_chains: Vec::new(),
+        cctp_sweep_receiver_address: None,
+        cctp_iris_url: None,
         get_logs_max_block_span: None,
         buyer_working_deposit_micro_usdc: None,
     });
@@ -166,7 +168,9 @@ fn config_fills_unset_flags() {
         publisher_registry_address: None,
         origin_assignment_address: None,
         slash_appeal_address: None,
-        payment_pool_address: None,
+        payment_chains: Vec::new(),
+        cctp_sweep_receiver_address: None,
+        cctp_iris_url: None,
         get_logs_max_block_span: None,
         buyer_working_deposit_micro_usdc: None,
     });
@@ -189,7 +193,9 @@ fn keystore_defaults_under_data_dir() {
         publisher_registry_address: None,
         origin_assignment_address: None,
         slash_appeal_address: None,
-        payment_pool_address: None,
+        payment_chains: Vec::new(),
+        cctp_sweep_receiver_address: None,
+        cctp_iris_url: None,
         get_logs_max_block_span: None,
         buyer_working_deposit_micro_usdc: None,
     });
@@ -326,7 +332,9 @@ fn resolve_publish_flag_beats_config() {
         publisher_registry_address: Some(CONFIG_ADDR.to_string()),
         origin_assignment_address: Some(OA_ADDR.to_string()),
         slash_appeal_address: None,
-        payment_pool_address: None,
+        payment_chains: Vec::new(),
+        cctp_sweep_receiver_address: None,
+        cctp_iris_url: None,
         get_logs_max_block_span: None,
         buyer_working_deposit_micro_usdc: None,
     });

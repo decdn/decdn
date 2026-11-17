@@ -322,10 +322,14 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
             "{call}"
         );
         assert!(
-            call.contains(&format!(" --payment-pool-address {pool} ")),
+            call.contains(&format!(" --pool eip155:421614:{pool} ")),
             "{call}"
         );
-        assert!(call.ends_with(" --chain-id 421614"), "{call}");
+        assert!(call.contains(" --governance-chain-id 11155111 "), "{call}");
+        assert!(
+            call.ends_with(" --pool-rpc-url https://rpc.example"),
+            "{call}"
+        );
     }
     assert_eq!(fx.fakes.source.issued_count(), 1);
     assert_eq!(

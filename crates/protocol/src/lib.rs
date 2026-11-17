@@ -20,6 +20,8 @@
 //! | [`coverage`] | The block coverage bitmap a partial holder advertises |
 //! | [`size_proof`] | The [`SizeProof`] that proves a stated blob size |
 //! | [`identity`] | The 32-byte [`NodeId`] and [`ContentHash`] newtypes |
+//! | [`chain_id`] | The CAIP-2 [`ChainId`] of a chain |
+//! | [`pool_account`] | The CAIP-10 [`PoolAccount`] that names a `PaymentPool` contract |
 //! | [`region`] | ISO 3166-1 alpha-2 [`Region`] codes |
 //!
 //! # Frames and extensions
@@ -58,15 +60,18 @@
 //! [ADR 013 § Three Tiers of Evolution]: https://github.com/decdn/decdn/blob/main/adr/013-schema-evolution.md#three-tiers-of-evolution
 //! [`decdn-incentive`]: https://docs.rs/decdn-incentive
 
+pub mod chain_id;
 pub mod client;
 pub mod coverage;
 pub mod dht;
 pub mod framing;
 pub mod identity;
 pub mod message;
+pub mod pool_account;
 pub mod region;
 pub mod size_proof;
 
+pub use chain_id::{ChainId, ChainIdError, MAX_CHAIN_ID_LEN};
 pub use client::{
     BINDING_SIG_LEN, CHUNK_BYTES, ChunkData, ChunkPreimage, ClientBinding, ClientMessage,
     MAX_CHAIN_LENGTH, MAX_CHUNK_FRAME, MAX_CLIENT_CONTROL_FRAME, MAX_STREAM_RESPONSE_FRAME,
@@ -96,6 +101,7 @@ pub use message::{
     ProbeMessage, ProbeRequest, ProbeResponse, ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN,
     encode_probe_response, parse_probe_response_ext,
 };
+pub use pool_account::{MAX_PAYMENT_POOLS, MAX_POOL_ACCOUNT_LEN, PoolAccount, PoolAccountError};
 pub use region::{InvalidRegion, Region, is_valid_region};
 pub use size_proof::{MAX_SIZE_PROOF_BYTES, SizeProof, SizeProofTooLong};
 

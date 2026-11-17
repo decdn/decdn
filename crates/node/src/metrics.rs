@@ -28,7 +28,6 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 
-use crate::chain_events::resumable_watcher::WatcherHook;
 use crate::load_shed::RequestClass;
 
 /// Bucket upper bounds of `decdn_probe_collection_latency_seconds`, per the
@@ -88,6 +87,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_signer_floor_at_cap_total",
     "decdn_serve_stream_rejected_stream_cap_full_total",
     "decdn_serve_stream_rejected_timestamp_skew_total",
+    "decdn_serve_stream_rejected_unaccepted_pool_total",
     "decdn_serve_stream_rejected_unknown_lane_total",
     "decdn_serve_stream_request_unreadable_total",
     "decdn_serve_stream_midstream_pool_exhausted_total",
@@ -287,7 +287,7 @@ struct NodeRegionLabels {
 /// methods the node's reads, fillers and settlement path call; any other
 /// method name counts as [`Self::Other`], so a request never mints a series
 /// from a string it did not choose. Values render as the JSON-RPC method name
-/// (`eth_getLogs`), not in `snake_case`.
+/// (`eth_getCode`), not in `snake_case`.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RpcMethod {
     EthBlockNumber,
@@ -299,7 +299,6 @@ pub(crate) enum RpcMethod {
     EthGetBalance,
     EthGetBlockByNumber,
     EthGetCode,
-    EthGetLogs,
     EthGetTransactionByHash,
     EthGetTransactionCount,
     EthGetTransactionReceipt,
@@ -311,7 +310,7 @@ pub(crate) enum RpcMethod {
 impl RpcMethod {
     /// Every variant. [`Metrics::new`] materializes one child per entry, so
     /// each series exports at zero from startup.
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::EthBlockNumber,
         Self::EthCall,
         Self::EthChainId,
@@ -321,7 +320,6 @@ impl RpcMethod {
         Self::EthGetBalance,
         Self::EthGetBlockByNumber,
         Self::EthGetCode,
-        Self::EthGetLogs,
         Self::EthGetTransactionByHash,
         Self::EthGetTransactionCount,
         Self::EthGetTransactionReceipt,
@@ -342,7 +340,6 @@ impl RpcMethod {
             Self::EthGetBalance => "eth_getBalance",
             Self::EthGetBlockByNumber => "eth_getBlockByNumber",
             Self::EthGetCode => "eth_getCode",
-            Self::EthGetLogs => "eth_getLogs",
             Self::EthGetTransactionByHash => "eth_getTransactionByHash",
             Self::EthGetTransactionCount => "eth_getTransactionCount",
             Self::EthGetTransactionReceipt => "eth_getTransactionReceipt",
@@ -380,7 +377,7 @@ pub(crate) enum RpcOutcome {
     /// failed, so this is not a provider fault.
     Reverted,
     /// The provider answered with any other JSON-RPC error response, such as
-    /// invalid params, a range cap on `eth_getLogs`, or a provider-side
+    /// invalid params, an unsupported block tag, or a provider-side
     /// internal error.
     RpcError,
     /// The provider throttled the request: HTTP 429, an HTTP error with a
@@ -442,19 +439,6 @@ pub enum ServeEconomicsRegime {
     /// The source's warming allowance is spent (or warming is off): the ceiling
     /// was the amortized floor and this node's serve economics are too tight.
     Amortized,
-}
-
-/// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
-/// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
-/// closures each watcher site would otherwise define (#1251). All
-/// six `LogSink` sites route their liveness (`*_tick`) and panic
-/// (`*_task_panicked`) hooks — and their down-family established/backoff edges —
-/// through this helper (blacklist composes it with its readiness-gate closures).
-/// Pass the recorder as a method path,
-/// e.g. `metric_hook(&metrics, Metrics::slash_watcher_cycle_established)`.
-pub(crate) fn metric_hook(metrics: &Arc<Metrics>, record: fn(&Metrics)) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || record(&metrics))
 }
 
 /// deCDN-specific counters and gauges surfaced at `/metrics`.
@@ -1032,13 +1016,6 @@ pub struct DecdnMetrics {
     /// and the buyer contend for the key's nonces. Operator-visible name:
     /// `decdn_buyer_topup_nonce_lost_total`.
     pub buyer_topup_nonce_lost: Counter,
-    /// Lane-store reconciliation the settlement watcher could not apply from a
-    /// poll tick: a `forget_lane` store write that failed while dropping a
-    /// reclaimed pool's lanes on a `PoolReclaimed` event. The failure is
-    /// swallowed (logged, and the cursor advances past it), so a non-zero rate
-    /// flags a struggling lane store or RPC rather than a stuck settlement.
-    /// Operator-visible name: `decdn_watcher_persist_failures_total`.
-    pub watcher_persist_failures: Counter,
     /// Lane-store background flushes that failed (the dirty set is retained and
     /// retried next tick). A sustained non-zero rate means the store cannot be
     /// fsynced — the frontier-only replay surface is widening. Operator-visible
@@ -1051,146 +1028,35 @@ pub struct DecdnMetrics {
     /// Operator-visible name: `decdn_settlement_ledger_write_failures_total`.
     pub settlement_ledger_write_failures: Counter,
     /// Landed redemptions that produced no settlement ledger row (#2598) for a
-    /// reason other than paying nothing: a receipt whose `Settled` does not
-    /// decode or names no log index, a backfill whose block time or receipt
-    /// the RPC could not supply, a ledger read that failed before the guard.
+    /// reason other than paying nothing: a receipt that does not decode or
+    /// names no log index, or a recovered receipt whose block time the RPC
+    /// could not supply.
     /// Each is also a `warn!`. Operator-visible name:
     /// `decdn_settlement_ledger_skipped_rows_total`.
     pub settlement_ledger_skipped_rows: Counter,
-    /// Snapshot-seeded pools the settlement watcher still has to re-read at a
-    /// pinned block (`PoolProjection::pending_rereads`), set at the end of every
-    /// watcher tick. A value that never falls is a pool stuck pending: a seed
-    /// whose open a reorg dropped, a read always skipped as stale, or a read
-    /// that keeps faulting. Each costs one `getPool` per rotation. Operator-visible
-    /// name: `decdn_settlement_reanchor_pending_pools`.
-    pub settlement_reanchor_pending_pools: Gauge,
-    /// Re-anchor ticks whose block-number read failed, so no pool was read.
-    /// Operator-visible name: `decdn_settlement_reanchor_block_read_failures_total`.
-    pub settlement_reanchor_block_read_failures: Counter,
-    /// Re-anchor ticks whose block number was below the highest log block the
-    /// settlement sink applied: a backend behind the watcher, so no pool was
-    /// read. Operator-visible name:
-    /// `decdn_settlement_reanchor_behind_watcher_total`.
-    pub settlement_reanchor_behind_watcher: Counter,
-    /// Re-anchor `getPool` reads that failed; the rest of the tick's batch waits
-    /// for the next tick. A steady rate with no RPC outage points at ABI drift on
-    /// `getPool`. Operator-visible name:
-    /// `decdn_settlement_reanchor_pool_read_failures_total`.
-    pub settlement_reanchor_pool_read_failures: Counter,
-    /// Re-anchor reads that found no pool at the pinned block: a backend behind
-    /// the admit read, or an open a reorg dropped, which stays served from its
-    /// seed. Operator-visible name: `decdn_settlement_reanchor_absent_total`.
-    pub settlement_reanchor_absent: Counter,
-    /// Re-anchor reads skipped because their block is below an event the
-    /// projection already folded for the pool. Operator-visible name:
-    /// `decdn_settlement_reanchor_skipped_below_folded_total`.
-    pub settlement_reanchor_skipped_below_folded: Counter,
-    /// Re-anchor reads skipped because their `totalRedeemed` is below the one
-    /// the projection holds. A steady rate on a quiet pool means a reorg lowered
-    /// it on chain, and the node refuses the pool early. Operator-visible name:
-    /// `decdn_settlement_reanchor_skipped_lower_redeemed_total`.
-    pub settlement_reanchor_skipped_lower_redeemed: Counter,
-    /// Re-anchor reads skipped because their deposit is below the one the
-    /// projection holds. A steady rate means a reorg lowered it on chain, and
-    /// the node serves past the pool's funds. Operator-visible name:
-    /// `decdn_settlement_reanchor_skipped_lower_deposit_total`.
-    pub settlement_reanchor_skipped_lower_deposit: Counter,
-    /// Re-anchor reads that anchored their pool: the denominator for the
-    /// failure and skip rates above. Operator-visible name:
-    /// `decdn_settlement_reanchor_anchored_total`.
-    pub settlement_reanchor_anchored: Counter,
-    /// Slashes detected against this node's operator by the slash watcher
-    /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
-    /// bring-up backfill and the live stream (#1032). A non-zero value means the
-    /// operator was slashed and should consider `decdn appeal slash` within the
-    /// 30-day window. Operator-visible name: `decdn_slashes_detected_total`.
+    /// Slashes detected against this node's operator (`CapacityBond` slash
+    /// records), counting each distinct `slashId` once (#1032). A non-zero
+    /// value means the operator was slashed and should consider `decdn appeal
+    /// slash` within the 30-day window. Operator-visible name:
+    /// `decdn_slashes_detected_total`.
     pub slashes_detected: Counter,
-    /// `decdn_slash_resync_failures_total`: times the slash watcher's periodic
-    /// re-enumeration could not read chain state and kept the detected-slash
-    /// set it already had. The resync reports success upward so the event tail
-    /// keeps running, so a persistently failing repair moves nothing else.
-    /// Pairs with the `warn!` in `slash_watcher`'s `SlashSink::on_tick_complete`.
-    /// Field has no `_total` suffix because the `OpenMetrics` encoder appends it.
+    /// `decdn_slash_resync_failures_total`: slash re-reads that could not read
+    /// chain state and kept the detected-slash set they already had. Pairs with
+    /// the `warn!` in `slash_watcher`. Field has no `_total` suffix because the
+    /// `OpenMetrics` encoder appends it.
     pub slash_resync_failures: Counter,
-    /// `decdn_slash_watcher_restarts_total` (#1032): distinct drift windows the
-    /// slash-detection watcher has entered, bumped once on the edge into the
-    /// error/backoff state. Pairs with `slash_watcher_down_seconds` to tell one
-    /// long outage from repeated flapping. Mirrors `staker_set_watcher_restarts`.
-    pub slash_watcher_restarts: Counter,
-    /// `decdn_slash_watcher_down_seconds` (#1032): seconds the slash-detection
-    /// watcher has been stuck in its per-tick backoff loop (`0` on a healthy
-    /// cycle), recomputed at scrape from `slash_watcher_down_since`. Mirrors the
-    /// other chain watchers — since `admin_v1_slashes` is always wired, this is
-    /// the only signal that a wedged watcher could be silently missing slashes.
-    pub slash_watcher_down_seconds: Gauge,
-    /// `decdn_staker_set_watcher_restarts_total` (#783): distinct drift
-    /// windows the [`crate::dht::chain_staker_set`] watcher has entered —
-    /// bumped once on the *transition* from a healthy cycle into the
-    /// error/backoff state, NOT on every backoff iteration of one continuous
-    /// outage. Each increment therefore brackets exactly one window in which
-    /// the cached active-staker set can drift from chain state — the module's
-    /// documented mid-run degradation. Because the stake-lane probe
-    /// reservation (#757) and the DHT `Store` admission path both read that
-    /// cached set, sustained restarts are revenue-impacting, not just a
-    /// discovery-health blip. The loop-level `tracing::warn!` in
-    /// `multiplexed_poller::run` (`"watcher RPC error; restarting after backoff"`)
-    /// is emitted in the same failed-tick `Err` arm that fires the `on_backoff`
-    /// hook this counter hangs off, and carries the underlying error; this
-    /// counter is the alertable rate. An idle poll tick (head has not advanced /
-    /// no new logs) is NOT an error and does not bump this. Field has no
-    /// `_total` suffix because the `OpenMetrics` encoder appends it.
-    pub staker_set_watcher_restarts: Counter,
-    /// `decdn_staker_set_watcher_resolve_failures_total` (#788): times an
-    /// operator-indexed event (`Reinstated` / `UnbondingRequested`) was
-    /// dropped because the follow-up `nodeIdOf(operator)` RPC failed. A dropped
-    /// resolution leaves the cached active set out of sync with chain state for
-    /// that operator until a later event, or until the watcher's cadence-gated
-    /// `getRegisteredNodes` re-enumeration corrects it — exactly the silent
-    /// drift these #783/#788 metrics exist to surface. That resync shortens the
-    /// window rather than bounding it: it is skipped while the route is errored,
-    /// and a failed read defers another interval.
-    /// Unlike a stream-level error, this does NOT trip a backoff/restart, so it
-    /// would otherwise move no metric at all. Pairs with the per-failure
-    /// `warn!` in [`crate::dht::capacity_bond_registry`]'s
-    /// `RegistrySink::on_operator_change`. Field has no `_total` suffix because
-    /// the `OpenMetrics` encoder appends it.
-    pub staker_set_watcher_resolve_failures: Counter,
-
-    /// `decdn_capacity_bond_registry_resync_failures_total`: times the
-    /// capacity-bond registry's periodic re-enumeration of `getRegisteredNodes`
-    /// could not read chain state and kept the projections it already had.
-    ///
-    /// That re-enumeration is the only systematic repair for an active-staker
-    /// set that has drifted from chain state, and it deliberately reports
-    /// success upward — returning an error would mark the watcher route errored
-    /// and stall event pickup, trading a stale set for no updates at all. So a
-    /// persistently failing resync moves nothing else. Two behaviours compound
-    /// it, both correlated with the RPC fault that caused the drift: the resync
-    /// is skipped entirely while the route is errored, and a failed read stamps
-    /// the cadence clock anyway, deferring the next attempt a further interval.
-    /// Pairs with the liveness gauge below, which is what catches the skipped
-    /// case. Field has no `_total` suffix because the `OpenMetrics` encoder
-    /// appends it.
+    /// `decdn_capacity_bond_registry_resync_failures_total`: registry re-reads
+    /// of `getRegisteredNodes` that could not read chain state and kept the
+    /// projections they already had. The staker set gates DHT `Store`
+    /// admission and the stake-lane probe reservation, so a persistently
+    /// failing re-read leaves it stale. Pairs with the liveness gauge below.
+    /// Field has no `_total` suffix because the `OpenMetrics` encoder appends
+    /// it.
     pub capacity_bond_registry_resync_failures: Counter,
-    /// `decdn_staker_set_watcher_down_seconds` (#783, semantics corrected
-    /// #788): true downtime — seconds the staker-set watcher has been in the
-    /// error/backoff state, i.e. failing its `eth_getLogs` poll tick. Reads `0`
-    /// for the entire life of any established cycle, however long or quiet (a
-    /// healthy poll loop persists indefinitely, so this must NOT measure cycle
-    /// age), and climbs only while the loop is between a failed cycle and the
-    /// next successful re-establishment. Reads `0` until the first cycle is
-    /// established after bootstrap. Recomputed at scrape time from a monotonic
-    /// `down_since` timestamp. A poisoned lock reports `i64::MAX` (not `0`) so
-    /// it trips the alert rather than masking an in-progress outage — the
-    /// conservative direction for a downtime gauge. This is the drift-window
-    /// depth gauge that `decdn_rpc_healthy` (a different watchdog) does not
-    /// cover.
-    pub staker_set_watcher_down_seconds: Gauge,
     /// `decdn_staker_set_active_count` (#783): current cached active-staker
-    /// set size, sampled on every membership change the watcher applies. Pairs
-    /// with `decdn_staker_set_watcher_down_seconds` to spot a collapse —
-    /// e.g. the count holding flat while down-seconds climbs means the cache
-    /// is frozen, not that the network genuinely lost operators.
+    /// set size, set on every registry read. A count holding flat while
+    /// `decdn_capacity_bond_registry_last_resync_timestamp_seconds` stops
+    /// moving means the cache is frozen, not that the network lost operators.
     pub staker_set_active_count: Gauge,
     /// `decdn_staker_set_active_by_region{node_region}`: active-staker set
     /// size per operator-declared region (ADR 030), the source of the
@@ -1856,6 +1722,11 @@ pub struct DecdnMetrics {
     /// pull-through was unavailable or failed to fill it. Visible name:
     /// `decdn_serve_stream_rejected_cache_miss_total`.
     pub serve_stream_rejected_cache_miss: Counter,
+    /// `serve_stream` requests refused because their `payment_pool` names a
+    /// pool this node does not accept (ADR 005 § Payment pool routing). Signed
+    /// `Declined` with the accepted pools listed. Visible name:
+    /// `decdn_serve_stream_rejected_unaccepted_pool_total`.
+    pub serve_stream_rejected_unaccepted_pool: Counter,
     /// `serve_stream` requests refused by a local store fault (`has`/`inspect`
     /// error, or a present blob reporting no size) — signed to the client as
     /// `Declined`, not a signed absence. Visible name:
@@ -2209,106 +2080,19 @@ pub struct DecdnMetrics {
     /// per-source losses; either at zero means warming is unconstrained.
     pub warming_sources_blocked: Gauge,
 
-    // ---- Uniform watcher liveness + panic surface (#1316, #1320) ----
-    //
-    // The `*_down_seconds` family below is edge-triggered off a tick *error*, so
-    // a watcher that panicked while healthy, wedged in an await, or exited
-    // cleanly leaves `down_since == None` and reads a healthy `0` forever — a
-    // dead watcher is byte-identical to a live one. These two families close
-    // that gap for all five chain-event watchers: `*_last_tick_timestamp_seconds`
-    // is a *positive* liveness signal a dead task cannot advance, and
-    // `*_task_panicked_total` makes an otherwise-discarded task panic visible.
-    /// `decdn_slash_watcher_last_tick_timestamp_seconds` (#1316): Unix time of
-    /// the slash watcher's last successful poll tick, stamped every tick (not
-    /// edge-triggered). Alert on staleness — `time() - value > 3 ×
-    /// poll_interval` — to catch a panicked, wedged, or cleanly-exited task that
-    /// `slash_watcher_down_seconds` (error-triggered) cannot. `0` until the
-    /// first successful tick.
-    pub slash_watcher_last_tick_timestamp_seconds: Gauge,
-    /// `decdn_staker_set_watcher_last_tick_timestamp_seconds` (#1316): Unix time
-    /// of the staker-set watcher's last successful poll tick. Staleness
-    /// semantics as `slash_watcher_last_tick_timestamp_seconds`.
-    pub staker_set_watcher_last_tick_timestamp_seconds: Gauge,
+    // ---- Chain-state refresh liveness ----
     /// `decdn_capacity_bond_registry_last_resync_timestamp_seconds`: Unix time
-    /// of the capacity-bond registry's last successful re-enumeration of
-    /// `getRegisteredNodes`.
-    ///
-    /// Distinct from the tick gauge above: a tick is the event tail, this is the
-    /// authoritative re-read that repairs a drifted set. It is the only signal
-    /// that catches a resync being *skipped* — the reconcile does not run at all
-    /// while the route is errored, which emits nothing, not even the failure
-    /// counter. Stamped by the bootstrap enumeration too, which is the same read
-    /// against the same contract; without that a node whose every later resync
-    /// fails would hold the gauge at `0` and never trip a `> 0`-guarded alert.
-    /// The guard is still needed for the window before bootstrap completes, and
-    /// the threshold must exceed `REGISTRY_RESYNC_INTERVAL`.
+    /// of the capacity-bond registry's last successful read of
+    /// `getRegisteredNodes`, the boot snapshot included. A dead or failing
+    /// refresh loop stops advancing it; alert when it trails `time()` by more
+    /// than a few refresh intervals (5 min each).
     pub capacity_bond_registry_last_resync_timestamp_seconds: Gauge,
     /// `decdn_blacklist_watcher_last_tick_timestamp_seconds` (#1316, #1320): Unix
-    /// time of the blacklist watcher's last successful poll tick. This is the
-    /// signal that distinguishes a live blacklist loop from a dead one — a dead
-    /// loop keeps serving content blacklisted after the failure (slashable via
-    /// `SlashJudge.submitBlacklistChallenge`) while `blacklist_watcher_down_seconds`
-    /// reads `0`.
+    /// time of the blacklist sync's last successful ledger poll, the boot
+    /// snapshot included. It is the signal that tells a live blacklist loop from
+    /// a dead one — a dead loop keeps serving content blacklisted after the
+    /// failure (slashable via `SlashJudge.submitBlacklistChallenge`).
     pub blacklist_watcher_last_tick_timestamp_seconds: Gauge,
-    /// `decdn_settlement_watcher_last_tick_timestamp_seconds` (#1316): Unix time
-    /// of the payment-settlement watcher's last successful poll tick.
-    pub settlement_watcher_last_tick_timestamp_seconds: Gauge,
-    /// `decdn_fee_shares_watcher_last_tick_timestamp_seconds`: Unix time of the
-    /// fee-shares watcher's last successful poll tick. Load-bearing: the
-    /// watcher's `getShares()` poll failure and undecodable-log paths both
-    /// return `Ok` by design, so a watcher stuck in RPC backoff — or dead — is
-    /// otherwise indistinguishable from a healthy one while the node keeps
-    /// signing quotes against a stale operator fee share. Alert on this gauge
-    /// going stale.
-    pub fee_shares_watcher_last_tick_timestamp_seconds: Gauge,
-    /// `decdn_slash_watcher_task_panicked_total` (#1316): the slash watcher task
-    /// unwound on a panic. Bumped from a `Drop` guard in `multiplexed_poller::run`
-    /// — the only thing that still runs on the unwind, since nothing awaits the
-    /// detached task. Any non-zero value is a bug in this node.
-    pub slash_watcher_task_panicked: Counter,
-    /// `decdn_staker_set_watcher_task_panicked_total` (#1316): the staker-set
-    /// watcher task unwound on a panic. See `slash_watcher_task_panicked`.
-    pub staker_set_watcher_task_panicked: Counter,
-    /// `decdn_blacklist_watcher_task_panicked_total` (#1316, #1283): the
-    /// blacklist watcher task unwound on a panic.
-    pub blacklist_watcher_task_panicked: Counter,
-    /// `decdn_fee_shares_watcher_task_panicked_total`: the fee-shares watcher
-    /// task unwound on a panic. Any non-zero value is a bug in this node.
-    pub fee_shares_watcher_task_panicked: Counter,
-    /// `decdn_settlement_watcher_task_panicked_total` (#1316): the
-    /// payment-settlement watcher task unwound on a panic.
-    pub settlement_watcher_task_panicked: Counter,
-
-    // ---- Shared chain-event poller: eth_getLogs window span ----
-    /// `decdn_chain_get_logs_span`: block span of the chain-event poller's next
-    /// `eth_getLogs` window. It starts at `blockchain.get_logs_max_block_span`,
-    /// drops to half a window the RPC provider rejects for its range, and
-    /// doubles back after 32 accepted windows, up to the ceiling. A caught-up
-    /// node climbs back to the ceiling after a transient rejection, so a low
-    /// value is a recent rejection, not proof of a cap: read the rejection
-    /// counter for that. The lowest values over a range with rejections show
-    /// the provider's cap.
-    pub chain_get_logs_span: Gauge,
-    /// `decdn_chain_get_logs_range_rejections_total`: `eth_getLogs` windows the
-    /// RPC provider rejected for their block range or result count. Each one
-    /// costs one wasted request. Rejections that keep coming mean the provider
-    /// caps `eth_getLogs`; set `blockchain.get_logs_max_block_span` to the
-    /// lowest span the gauge reaches while they come, and they stop.
-    pub chain_get_logs_range_rejections: Counter,
-    /// `decdn_chain_get_logs_retries_total` (#2161): in-tick retries of
-    /// `eth_getLogs` windows after a transient provider error. One window adds
-    /// up to two, including a window that fails every retry and is deferred
-    /// (`decdn_chain_get_logs_deferred_total`). A retry that succeeds does not
-    /// count as watcher downtime, so a provider that the retries absorb shows
-    /// here and not in the watchers' down-family. Rate limits and permanent
-    /// errors are not retried.
-    pub chain_get_logs_retries: Counter,
-    /// `decdn_chain_get_logs_deferred_total` (#2253): `eth_getLogs` windows
-    /// that failed every in-tick retry, so the poller ended the tick there and
-    /// resumed the window on the next tick. A deferral is not watcher downtime;
-    /// the tick fails, and the watchers go down, only when no tick has reached
-    /// head for the stall budget (2 min).
-    pub chain_get_logs_deferred: Counter,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
     /// chain read (the `PaymentPool` deployment preflight, the registry, slash,
     /// `usdc()` self-check and blacklist bootstraps, and the best-effort
@@ -2318,43 +2102,18 @@ pub struct DecdnMetrics {
     /// provider.
     pub chain_boot_read_retries: Counter,
 
-    // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
-    /// `decdn_blacklist_watcher_restarts_total` (#1283): distinct drift windows
-    /// the blacklist watcher entered, bumped once on the edge into the
-    /// error/backoff state. Mirrors `slash_watcher_restarts`.
-    pub blacklist_watcher_restarts: Counter,
-    /// `decdn_blacklist_watcher_down_seconds` (#1283): seconds the blacklist
-    /// watcher has been failing its chain read (`0` on a healthy cycle),
-    /// recomputed at scrape from `blacklist_watcher_down_since`. Tracks
-    /// chain-read outages only — an enforcement failure that leaves a blacklisted
-    /// blob servable is a separate signal (`blacklist_enforcement_failures`).
-    pub blacklist_watcher_down_seconds: Gauge,
-    /// `decdn_settlement_watcher_restarts_total` (#1316): distinct drift windows
-    /// the payment-settlement watcher entered. Mirrors `slash_watcher_restarts`.
-    pub settlement_watcher_restarts: Counter,
-    /// `decdn_settlement_watcher_down_seconds` (#1316): seconds the settlement
-    /// watcher has been failing its chain read, recomputed at scrape from
-    /// `settlement_watcher_down_since`.
-    pub settlement_watcher_down_seconds: Gauge,
-
-    /// `decdn_blacklist_enforcement_failures_total` (#1319): distinct hashes a
-    /// batched re-scope could NOT re-verify or evict this pass (`Recheck::Failed`
-    /// — a disk error or a scope `eth_call` failure). An increase means a pass
-    /// did not fully enforce the deny-set, so a blacklisted blob may still be
-    /// servable and slashable, even while `blacklist_watcher_down_seconds` reads
-    /// `0`. Answers a different question than the down-family, which tracks
-    /// chain-read outages only. A boot that retries its enforcement pass also
-    /// adds to it; the node serves only after a clean pass, so that increase does
-    /// not mean a served blob. Pairs with the aggregate `warn!` in `rescan`.
+    /// `decdn_blacklist_enforcement_failures_total` (#1319): distinct hashes an
+    /// enforcement pass could NOT evict (a disk error). They stay refused
+    /// through the governance deny and the next pass retries them. A boot whose
+    /// pass fails also adds to it; the node serves only after a clean pass, so
+    /// that increase does not mean a served blob.
     pub blacklist_enforcement_failures: Counter,
-    /// `decdn_blacklist_reenumeration_failures_total`: times the blacklist
-    /// watcher's periodic re-enumeration could not read chain state and kept the
-    /// deny-set it already had. That re-enumeration is the backstop for a lost
-    /// tail event and for a region/ripening transition, which emits no event.
-    /// It reports success upward so the event tail keeps running, so a
-    /// persistently failing backstop moves nothing else. Pairs with the `warn!`
-    /// in `blacklist_watcher`'s `BlacklistSink::on_tick_complete`.
-    pub blacklist_reenumeration_failures: Counter,
+    /// `decdn_blacklist_ledger_poll_failures_total`: blacklist ledger polls that
+    /// could not read the chain and kept the deny index they already had. A
+    /// rising count with a stale `decdn_blacklist_watcher_last_tick_timestamp_seconds`
+    /// is an RPC outage; past `chain_staleness_grace_sec` the node stops
+    /// serving. Pairs with the `warn!` in `blacklist_watcher`.
+    pub blacklist_ledger_poll_failures: Counter,
 
     // ---- Stream outcomes and volume ----
     /// `decdn_streams_completed_total{direction}`: paid streams that delivered
@@ -2405,12 +2164,6 @@ pub struct DecdnMetrics {
     /// redeemer, so this rate bounds the redeemer's hint rate beside
     /// `decdn_vouchers_received_total`.
     pub preimage_reveals_received: Counter,
-    /// `decdn_pool_grace_closes_total`: pools that entered the owner-close grace
-    /// window while this node still held unredeemed vouchers on them, read from
-    /// the flushed lane store when the close event arrives. Each one is revenue
-    /// that must redeem before the grace window ends. A pool already closing at
-    /// startup is not counted.
-    pub pool_grace_closes: Counter,
     /// `decdn_onchain_tx_landed_total`: settlement transactions (`redeemMany`)
     /// mined and succeeded. The outcome family — `landed`, `reverted`,
     /// `send_failed`, `maybe_broadcast`, `receipt_failed`, `timeout` — counts
@@ -2479,26 +2232,6 @@ pub struct DecdnMetrics {
     /// `decdn_dht_bootstrap_find_node_failures_total`: bootstrap `FIND_NODE`
     /// RPCs against a seed that failed.
     pub dht_bootstrap_find_node_failures: Counter,
-
-    // ---- Fee-shares watcher parity ----
-    /// `decdn_fee_shares_watcher_unregistered`: `1` when the startup
-    /// `PaymentPool.feeRouter()` read failed, so the fee-shares watcher is not
-    /// running and the operator share stays at the floor for the life of the
-    /// process; `0` otherwise. The watcher's own down gauges read healthy in
-    /// that state, since it never started.
-    pub fee_shares_watcher_unregistered: Gauge,
-    /// `decdn_fee_shares_watcher_poll_failures_total`: authoritative
-    /// `getShares()` re-reads that failed. The watcher keeps the current share and
-    /// its tick still succeeds, so this is the only signal that the safety-net
-    /// re-read is not landing.
-    pub fee_shares_watcher_poll_failures: Counter,
-    /// `decdn_fee_shares_watcher_restarts_total`: distinct drift windows the
-    /// fee-shares watcher entered. Mirrors `slash_watcher_restarts`.
-    pub fee_shares_watcher_restarts: Counter,
-    /// `decdn_fee_shares_watcher_down_seconds`: seconds the fee-shares watcher
-    /// has been failing its chain read, recomputed at scrape from
-    /// `fee_shares_watcher_down_since`.
-    pub fee_shares_watcher_down_seconds: Gauge,
 
     // ---- Operator-path failures ----
     /// `decdn_config_reload_failures_total`: SIGHUP or admin config reloads that
@@ -2587,37 +2320,6 @@ pub struct Metrics {
     /// [`Self::staker_set_active_by_region`] which ones to remove.
     published_regions: Mutex<BTreeSet<Region>>,
     started_at: Instant,
-    /// Monotonic instant at which the staker-set watcher entered its current
-    /// error/backoff window (#783, downtime semantics #788). `None` whenever a
-    /// cycle is established (healthy) — including from bootstrap until the
-    /// first cycle and after every successful re-establishment. `Some(t)` only
-    /// while the loop is between a failed cycle and the next success. Backs the
-    /// `staker_set_watcher_down_seconds` gauge, recomputed from this at scrape
-    /// time so the value reads exactly `0` across an arbitrarily long healthy
-    /// cycle and climbs only through an actual outage. A poisoned lock reports
-    /// `i64::MAX` down-seconds (the conservative, alerting direction for a
-    /// downtime gauge — reporting `0` would mask an in-progress outage).
-    staker_set_watcher_down_since: Mutex<Option<Instant>>,
-    /// `Instant` the slash-detection watcher entered its current error/backoff
-    /// window (#1032). `None` whenever a cycle is established. Backs the
-    /// `slash_watcher_down_seconds` gauge, recomputed at scrape time. Mirrors
-    /// `staker_set_watcher_down_since`.
-    slash_watcher_down_since: Mutex<Option<Instant>>,
-    /// `Instant` the blacklist watcher entered its current error/backoff window
-    /// (#1283). `None` whenever a cycle is established. Backs the
-    /// `blacklist_watcher_down_seconds` gauge, recomputed at scrape time. Mirrors
-    /// `staker_set_watcher_down_since`.
-    blacklist_watcher_down_since: Mutex<Option<Instant>>,
-    /// `Instant` the payment-settlement watcher entered its current error/backoff
-    /// window (#1316). `None` whenever a cycle is established. Backs the
-    /// `settlement_watcher_down_seconds` gauge. Mirrors
-    /// `staker_set_watcher_down_since`.
-    settlement_watcher_down_since: Mutex<Option<Instant>>,
-    /// `Instant` the fee-shares watcher entered its current error/backoff
-    /// window. `None` whenever a cycle is established. Backs the
-    /// `fee_shares_watcher_down_seconds` gauge. Mirrors
-    /// `staker_set_watcher_down_since`.
-    fee_shares_watcher_down_since: Mutex<Option<Instant>>,
     /// Cache engine whose live probe-hold count backs the
     /// `probe_hold_slots_used` gauge, sampled once per scrape in
     /// [`Self::encode`]. Unset until runtime bring-up attaches the cache
@@ -2637,11 +2339,6 @@ impl Default for Metrics {
 /// keeps the workspace `unwrap_used` deny satisfied without pushing a
 /// `Result` onto every recorder signature.
 fn sat(n: usize) -> i64 {
-    i64::try_from(n).unwrap_or(i64::MAX)
-}
-
-/// Saturating `u64` → `i64` for gauge values; see [`sat`].
-fn sat_u64(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
@@ -2744,11 +2441,6 @@ impl Metrics {
             probe_hold_stake_lane_reserved,
             published_regions: Mutex::new(BTreeSet::new()),
             started_at: Instant::now(),
-            staker_set_watcher_down_since: Mutex::new(None),
-            slash_watcher_down_since: Mutex::new(None),
-            blacklist_watcher_down_since: Mutex::new(None),
-            settlement_watcher_down_since: Mutex::new(None),
-            fee_shares_watcher_down_since: Mutex::new(None),
             probe_holds: OnceLock::new(),
         }
     }
@@ -3088,12 +2780,6 @@ impl Metrics {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.decdn.node_uptime_seconds.set(uptime);
 
-        // Recompute the per-watcher down-seconds gauges from their `down_since`,
-        // mirroring `uptime_seconds` above (staker_set #783, slash #1032). See
-        // `refresh_watcher_down_seconds` for the healthy-vs-outage and
-        // poisoned-lock semantics.
-        self.refresh_watcher_down_seconds();
-
         if let Some(cache) = self.probe_holds.get() {
             self.decdn
                 .probe_hold_slots_used
@@ -3152,91 +2838,6 @@ macro_rules! recorders {
                     self.decdn.$field.$op($($val)?);
                 }
             )*
-        }
-    };
-}
-
-/// Generate the per-watcher downtime recorders on [`Metrics`].
-///
-/// The chain watchers (`slash`, `staker_set`, `blacklist`, `settlement`) share
-/// one downtime state machine: a `*_backoff_started` recorder that, on the
-/// `None -> Some` edge into an error window, stamps the watcher's
-/// `Mutex<Option<Instant>>` `down_since` field and bumps its `*_restarts`
-/// counter exactly once per drift window; and a `*_cycle_established` recorder
-/// that clears `down_since` on recovery. A poisoned lock skips the update; the
-/// scrape-time recompute then reports the `*_down_seconds` gauge as `i64::MAX`
-/// — the safe alerting direction, never `0` (which would mask an outage).
-///
-/// These cannot live in `recorders!` because their bodies branch and touch
-/// `Metrics`'s own `Mutex` state rather than a single `self.decdn.field.op(v)`.
-/// Each row spells out both method names (production hooks call them by exact
-/// name, and this crate adds no `paste`) and labels the three backing field
-/// idents (`down_since` on `Metrics`; `restarts`/`down_seconds` on `self.decdn`)
-/// so positions aren't counted. Docs pass through as `$meta`, so each
-/// recorder's rationale stays byte-identical and keeps its call-site span for
-/// `clippy` and `rustdoc`.
-///
-/// Note that `rustfmt` does not format macro-invocation bodies, so the table
-/// below is hand-maintained: keep the multi-line docs tidy and the field lines
-/// within the 100-column limit — `cargo fmt` will neither help nor complain.
-macro_rules! watcher_downtime_recorders {
-    ($(
-        $(#[$backoff_meta:meta])*
-        $backoff:ident,
-        $(#[$established_meta:meta])*
-        $established:ident,
-        down_since: $down_since:ident,
-        restarts: $restarts:ident,
-        down_seconds: $down_seconds:ident;
-    )*) => {
-        impl Metrics {
-            $(
-                $(#[$backoff_meta])*
-                // Poison note: on a poisoned `down_since` lock the whole block is
-                // skipped (anti-panic policy), so `*_restarts_total` is NOT
-                // incremented and, because std poison is sticky, stays frozen for
-                // the process's life. The paired `*_down_seconds` gauge covers this
-                // — `refresh_watcher_down_seconds` reports `i64::MAX` on a poisoned
-                // lock — so alert on the gauge for outages. The counter drives only
-                // the flapping rule, which a frozen counter silences while the
-                // stalled rule fires on the `i64::MAX` gauge
-                // (appendix-observability § Watcher Liveness, #1322).
-                pub fn $backoff(&self) {
-                    if let Ok(mut down_since) = self.$down_since.lock()
-                        && down_since.is_none()
-                    {
-                        *down_since = Some(Instant::now());
-                        self.decdn.$restarts.inc();
-                    }
-                }
-
-                $(#[$established_meta])*
-                pub fn $established(&self) {
-                    if let Ok(mut down_since) = self.$down_since.lock() {
-                        *down_since = None;
-                    }
-                }
-            )*
-
-            /// Recompute every watcher's `*_down_seconds` gauge from its
-            /// `down_since` (true downtime), mirroring `uptime_seconds`. Called
-            /// once per scrape from [`Self::encode`]. `None` (healthy cycle,
-            /// including pre-bootstrap) reads `0` regardless of how long the
-            /// cycle has been live; the value climbs once an error window opens
-            /// and until the matching `*_cycle_established` clears `down_since`.
-            /// A poisoned lock reports `i64::MAX` — the conservative, alerting
-            /// direction for a downtime gauge, since reporting `0` would MASK an
-            /// in-progress outage.
-            fn refresh_watcher_down_seconds(&self) {
-                $(
-                    self.decdn.$down_seconds.set(match self.$down_since.lock() {
-                        Ok(down_since) => down_since
-                            .map(|t| t.elapsed().as_secs())
-                            .map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
-                        Err(_) => i64::MAX,
-                    });
-                )*
-            }
         }
     };
 }
@@ -3350,13 +2951,6 @@ recorders! {
     /// `fund_pool`.
     buyer_topup_nonce_lost => buyer_topup_nonce_lost.inc();
 
-    /// The settlement watcher failed to forget a reclaimed pool's lane state
-    /// (`forget_lane`) on a `PoolReclaimed` event, in `PoolSettlementSink`
-    /// (`payment_settlement.rs`). The failure is swallowed — logged with a
-    /// per-site `warn!` ("failed to forget reclaimed lane") and the cursor
-    /// advances — so it is a lane-store health signal, not a stuck settlement.
-    watcher_persist_failure => watcher_persist_failures.inc();
-
     /// A lane-store background flush failed — the dirty in-memory set is
     /// retained and retried on the next timer tick, or a final flush on
     /// shutdown failed. Pairs with the `warn!`s in the background flush task
@@ -3373,50 +2967,12 @@ recorders! {
     /// `warn!`.
     settlement_ledger_skipped_row => settlement_ledger_skipped_rows.inc();
 
-    /// Publish how many snapshot-seeded pools still wait for a re-anchor read
-    /// (`payment_settlement.rs`).
-    settlement_reanchor_pending(pools: usize) => settlement_reanchor_pending_pools.set(sat(pools));
-
-    /// A re-anchor tick's block-number read failed. Pairs with the `warn!`
-    /// "pool re-anchor: block number read failed".
-    settlement_reanchor_block_read_failure => settlement_reanchor_block_read_failures.inc();
-
-    /// A re-anchor tick's block number was behind the settlement watcher.
-    settlement_reanchor_behind_watcher => settlement_reanchor_behind_watcher.inc();
-
-    /// A re-anchor `getPool` read failed. Pairs with the `warn!` "pool
-    /// re-anchor: getPool failed".
-    settlement_reanchor_pool_read_failure => settlement_reanchor_pool_read_failures.inc();
-
-    /// A re-anchor read found no pool at the pinned block.
-    settlement_reanchor_absent => settlement_reanchor_absent.inc();
-
-    /// A re-anchor read was skipped as below a folded event. Pairs with a `warn!`.
-    settlement_reanchor_skipped_below_folded => settlement_reanchor_skipped_below_folded.inc();
-
-    /// A re-anchor read was skipped for a lower `totalRedeemed`. Pairs with a
-    /// `warn!`.
-    settlement_reanchor_skipped_lower_redeemed => settlement_reanchor_skipped_lower_redeemed.inc();
-
-    /// A re-anchor read was skipped for a lower deposit. Pairs with a `warn!`.
-    settlement_reanchor_skipped_lower_deposit => settlement_reanchor_skipped_lower_deposit.inc();
-
-    /// `n` re-anchor reads anchored their pools.
-    settlement_reanchor_anchored_by(n: u64) => settlement_reanchor_anchored.inc_by(n);
-
-    /// A distinct slash against this node's operator was detected by the slash
-    /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).
+    /// A distinct slash against this node's operator was detected (#1032).
+    /// Counts each `slashId` once.
     slash_detected => slashes_detected.inc();
-    /// A slash-watcher resync failed and the current detected-slash set was
-    /// kept. Bumps `slash_resync_failures_total`.
+    /// A slash re-read failed and the current detected-slash set was kept.
+    /// Bumps `slash_resync_failures_total`.
     slash_resync_failure => slash_resync_failures.inc();
-
-    /// A `nodeIdOf(operator)` resolution for an operator-indexed event failed,
-    /// dropping the membership change (#788, [`crate::dht::chain_staker_set`]).
-    /// Bumps `staker_set_watcher_resolve_failures_total`. Pairs with the
-    /// per-failure `warn!` in [`crate::dht::capacity_bond_registry`]'s
-    /// `RegistrySink::on_operator_change`.
-    staker_set_watcher_resolve_failure => staker_set_watcher_resolve_failures.inc();
 
     /// Publish the current cached active-staker set size (#783). Sampled on
     /// every membership change the watcher applies, so the gauge tracks the
@@ -3492,6 +3048,10 @@ recorders! {
     /// Record a `serve_stream` request refused on a cache miss that
     /// pull-through could not fill (#876).
     serve_stream_rejected_cache_miss => serve_stream_rejected_cache_miss.inc();
+
+    /// Record a `serve_stream` request refused for naming a payment pool this
+    /// node does not accept.
+    serve_stream_rejected_unaccepted_pool => serve_stream_rejected_unaccepted_pool.inc();
 
     /// Record a `serve_stream` request refused by a local store fault,
     /// signed as `Declined` (#876).
@@ -3924,60 +3484,27 @@ recorders! {
     dht_republish_seed_origin_probe_failures(count: u64) =>
         dht_republish_seed_origin_probe_failures.inc_by(count);
 
-    /// Stamp the slash watcher's `*_last_tick_timestamp_seconds` liveness gauge
-    /// with the current wall-clock time (#1316). The `on_tick_success` hook,
-    /// fired on EVERY successful poll tick so a dead task's gauge goes stale.
-    slash_watcher_tick => slash_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
-    /// Record the chain-event poller's current `eth_getLogs` window span.
-    chain_get_logs_span(span: u64) => chain_get_logs_span.set(sat_u64(span));
-    /// Count one `eth_getLogs` window the provider rejected for its range.
-    chain_get_logs_range_rejected => chain_get_logs_range_rejections.inc();
-    /// Count one in-tick retry of a transiently failed `eth_getLogs` window.
-    chain_get_logs_retried => chain_get_logs_retries.inc();
-    /// Count one `eth_getLogs` window deferred to the next tick.
-    chain_get_logs_deferred => chain_get_logs_deferred.inc();
     /// Count one boot-time chain read retried after a transient error.
     chain_boot_read_retried => chain_boot_read_retries.inc();
-    /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
-    staker_set_watcher_tick => staker_set_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
-    /// A capacity-bond registry re-enumeration failed and the previous
-    /// projections were kept. Bumps
-    /// `capacity_bond_registry_resync_failures_total`. Pairs with the `warn!` in
-    /// [`crate::dht::capacity_bond_registry`]'s `RegistrySink::on_tick_complete`.
+    /// A capacity-bond registry re-read failed and the previous projections
+    /// were kept. Bumps `capacity_bond_registry_resync_failures_total`. Pairs
+    /// with the `warn!` in [`crate::dht::capacity_bond_registry`].
     capacity_bond_registry_resync_failure => capacity_bond_registry_resync_failures.inc();
-    /// Stamp the capacity-bond registry's re-enumeration liveness gauge on a
-    /// successful resync. Reads `0` until the first one lands, so any alert on
-    /// it needs a `> 0` guard.
+    /// Stamp the capacity-bond registry's liveness gauge on a successful read.
+    /// Reads `0` until the boot snapshot lands, so any alert on it needs a
+    /// `> 0` guard.
     capacity_bond_registry_resync =>
         capacity_bond_registry_last_resync_timestamp_seconds.set(unix_now_secs());
-    /// Stamp the blacklist watcher's liveness gauge (#1316, #1320).
+    /// Stamp the blacklist sync's liveness gauge (#1316, #1320) on a successful
+    /// ledger poll or boot snapshot.
     blacklist_watcher_tick => blacklist_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
-    /// Stamp the payment-settlement watcher's liveness gauge (#1316).
-    settlement_watcher_tick => settlement_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
-    /// Stamp the fee-shares watcher's liveness gauge. See `slash_watcher_tick`;
-    /// this one matters because the fee-shares watcher's failure paths
-    /// deliberately return `Ok`, so this gauge is the only signal that it is
-    /// still polling.
-    fee_shares_watcher_tick => fee_shares_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
 
-    /// Record that the slash watcher task unwound on a panic (#1316). Bumped from
-    /// the `Drop` guard in `multiplexed_poller::run` via the `on_task_panic` hook.
-    slash_watcher_task_panicked => slash_watcher_task_panicked.inc();
-    /// Record that the staker-set watcher task unwound on a panic (#1316).
-    staker_set_watcher_task_panicked => staker_set_watcher_task_panicked.inc();
-    /// Record that the blacklist watcher task unwound on a panic (#1316, #1283).
-    blacklist_watcher_task_panicked => blacklist_watcher_task_panicked.inc();
-    /// Record that the fee-shares watcher task unwound on a panic.
-    fee_shares_watcher_task_panicked => fee_shares_watcher_task_panicked.inc();
-    /// Record that the payment-settlement watcher task unwound on a panic (#1316).
-    settlement_watcher_task_panicked => settlement_watcher_task_panicked.inc();
-
-    /// Record `count` hashes a blacklist re-scope could not enforce this pass
-    /// (#1319 — `Recheck::Failed`). One aggregated bump per pass, not per hash.
+    /// Record `count` hashes a blacklist enforcement pass could not evict
+    /// (#1319). One aggregated bump per pass, not per hash.
     blacklist_enforcement_failure(count: u64) => blacklist_enforcement_failures.inc_by(count);
-    /// A blacklist periodic re-enumeration failed and the current deny-set was
-    /// kept. Bumps `blacklist_reenumeration_failures_total`.
-    blacklist_reenumeration_failure => blacklist_reenumeration_failures.inc();
+    /// A blacklist ledger poll failed and the current deny index was kept.
+    /// Bumps `blacklist_ledger_poll_failures_total`.
+    blacklist_ledger_poll_failure => blacklist_ledger_poll_failures.inc();
 
     /// Count `bytes` of payload written to a client on `cdn/client/v1`.
     bytes_served(bytes: u64) => bytes_served.inc_by(bytes);
@@ -3991,9 +3518,6 @@ recorders! {
     /// An inbound stream accepted a `PayWord` preimage reveal that advanced its
     /// lane's chain frontier.
     preimage_reveal_received => preimage_reveals_received.inc();
-    /// A pool entered the owner-close grace window while this node held
-    /// unredeemed vouchers on it.
-    pool_grace_close => pool_grace_closes.inc();
     /// A node transaction mined and succeeded.
     onchain_tx_landed => onchain_tx_landed.inc();
     /// A node transaction mined and reverted.
@@ -4026,12 +3550,6 @@ recorders! {
     /// `count` bootstrap `FIND_NODE` RPCs against seeds failed.
     dht_bootstrap_find_node_failures(count: u64) => dht_bootstrap_find_node_failures.inc_by(count);
 
-    /// The fee-shares watcher's authoritative `getShares()` re-read failed.
-    fee_shares_watcher_poll_failure => fee_shares_watcher_poll_failures.inc();
-    /// Record whether the fee-shares watcher is unregistered because the startup
-    /// `feeRouter()` read failed.
-    fee_shares_watcher_unregistered(unregistered: bool) => fee_shares_watcher_unregistered.set(i64::from(unregistered));
-
     /// A config reload failed and kept the previous values.
     config_reload_failure => config_reload_failures.inc();
     /// The receipt writer failed to persist one audit record.
@@ -4044,86 +3562,6 @@ recorders! {
     /// A mid-stream pool-solvency re-check read a projection while the chain
     /// reads are stale.
     serve_pool_recheck_stale => serve_pool_recheck_stale.inc();
-}
-
-watcher_downtime_recorders! {
-    /// The slash-detection watcher's cycle errored and the loop is about to back
-    /// off (#1032). Stamps `slash_watcher_down_since` (once per drift window) so
-    /// `slash_watcher_down_seconds` climbs until the next healthy cycle. Mirrors
-    /// [`Self::staker_set_watcher_backoff_started`]; a poisoned lock skips the
-    /// update (the gauge then reads `i64::MAX` at scrape — the safe alerting
-    /// direction).
-    slash_watcher_backoff_started,
-    /// Mark the slash-detection watcher cycle established (#1032): clear
-    /// `slash_watcher_down_since` so `slash_watcher_down_seconds` reads `0` for
-    /// the life of the cycle. Mirrors [`Self::staker_set_watcher_cycle_established`].
-    slash_watcher_cycle_established,
-    down_since: slash_watcher_down_since,
-    restarts: slash_watcher_restarts,
-    down_seconds: slash_watcher_down_seconds;
-
-    /// A staker-set watcher poll tick failed with an error and the loop is
-    /// about to back off (#783, [`crate::dht::chain_staker_set`]).
-    /// Stamps `down_since` so `staker_set_watcher_down_seconds` begins to climb,
-    /// and — on the *transition* from a healthy cycle into the error state
-    /// (`down_since` was `None`) — bumps `staker_set_watcher_restarts_total`
-    /// exactly once per drift window, rather than once per backoff iteration of
-    /// one continuous outage. A poisoned lock is treated as "skip the update"
-    /// rather than panicking (anti-panic policy); the gauge's poison fallback
-    /// (`i64::MAX`) still keeps the alert tripped. This method is the
-    /// `on_backoff` hook wired in [`crate::dht::chain_staker_set`]; it pairs with
-    /// the loop-level `warn!` in `multiplexed_poller::run` (`"watcher RPC error;
-    /// restarting after backoff"`).
-    staker_set_watcher_backoff_started,
-    /// Mark the staker-set watcher's poll cycle as established (#783,
-    /// downtime semantics #788): a poll tick succeeded and logs are flowing
-    /// again (the `on_established` hook). Clears `down_since` to `None` so
-    /// `staker_set_watcher_down_seconds`
-    /// reads `0` for the entire life of this cycle, however long. A poisoned
-    /// lock is treated as "skip the update" rather than panicking (anti-panic
-    /// policy); the gauge's poison fallback (`i64::MAX`) then keeps the alert
-    /// tripped — the safe (alerting) direction.
-    staker_set_watcher_cycle_established,
-    down_since: staker_set_watcher_down_since,
-    restarts: staker_set_watcher_restarts,
-    down_seconds: staker_set_watcher_down_seconds;
-
-    /// The blacklist watcher's poll tick errored and the loop is about to back
-    /// off (#1283). Stamps `blacklist_watcher_down_since` once per drift window so
-    /// `blacklist_watcher_down_seconds` climbs until the next healthy cycle.
-    /// Tracks chain-read outages only; an enforcement failure that leaves a
-    /// blacklisted blob servable is the separate `blacklist_enforcement_failures`
-    /// counter (#1319). Mirrors [`Self::slash_watcher_backoff_started`].
-    blacklist_watcher_backoff_started,
-    /// Mark the blacklist watcher cycle established (#1283): clear
-    /// `blacklist_watcher_down_since` so `blacklist_watcher_down_seconds` reads
-    /// `0` for the life of the cycle. Mirrors [`Self::slash_watcher_cycle_established`].
-    blacklist_watcher_cycle_established,
-    down_since: blacklist_watcher_down_since,
-    restarts: blacklist_watcher_restarts,
-    down_seconds: blacklist_watcher_down_seconds;
-
-    /// The payment-settlement watcher's poll tick errored and the loop is about
-    /// to back off (#1316). Stamps `settlement_watcher_down_since` once per drift
-    /// window. Mirrors [`Self::slash_watcher_backoff_started`].
-    settlement_watcher_backoff_started,
-    /// Mark the payment-settlement watcher cycle established (#1316): clear
-    /// `settlement_watcher_down_since`. Mirrors [`Self::slash_watcher_cycle_established`].
-    settlement_watcher_cycle_established,
-    down_since: settlement_watcher_down_since,
-    restarts: settlement_watcher_restarts,
-    down_seconds: settlement_watcher_down_seconds;
-
-    /// The fee-shares watcher's poll tick errored and the loop is about to back
-    /// off. Stamps `fee_shares_watcher_down_since` once per drift window.
-    /// Mirrors [`Self::slash_watcher_backoff_started`].
-    fee_shares_watcher_backoff_started,
-    /// Mark the fee-shares watcher cycle established: clear
-    /// `fee_shares_watcher_down_since`. Mirrors [`Self::slash_watcher_cycle_established`].
-    fee_shares_watcher_cycle_established,
-    down_since: fee_shares_watcher_down_since,
-    restarts: fee_shares_watcher_restarts,
-    down_seconds: fee_shares_watcher_down_seconds;
 }
 
 /// Bind the `/metrics` HTTP listener synchronously so startup can fail fast

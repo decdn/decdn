@@ -284,6 +284,8 @@ export interface StatusResponse {
 }
 
 export interface LaneSnapshot {
+  /** The PaymentPool contract, as a CAIP-10 account. */
+  pool: string;
   pool_id: string;
   /** The pool owner; null when the node could not name it. */
   counterparty: string | null;
@@ -339,6 +341,22 @@ export interface EarningsResponse {
   since: EarningsPeriod | null;
   last_settlement: LastSettlement | null;
   pending: PendingRedeem | null;
+  pools: PoolEarnings[];
+}
+
+export interface ProtocolShare {
+  pending_micro_usdc: number;
+  pending_bytes: number;
+  min_sweep_micro_usdc: number;
+}
+
+/** Earnings through one PaymentPool contract. */
+export interface PoolEarnings {
+  /** The contract, as a CAIP-10 account. */
+  pool: string;
+  settled: EarningsPeriod;
+  /** Null when the read failed. */
+  protocol_share: ProtocolShare | null;
 }
 
 export interface BuyerLaneSnapshot {

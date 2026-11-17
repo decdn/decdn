@@ -91,6 +91,7 @@
       "value": {
         "lanes": [
           {
+            "pool": "eip155:421614:0x1111111111111111111111111111111111111111",
             "pool_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
             "counterparty": "0xAbaBabaBABaBAbAbABABaBABAbabABAbAbaBabab",
             "voucher_signer": "0xCdCdCdCDCdcDcDCdCdCDCdCDCdcdcDcDcdcDCDcd",
@@ -146,7 +147,8 @@
           "stranded_lanes": 0,
           "last_sweep_at_unix": 1792999000,
           "next_sweep_at_unix": 1793002600
-        }
+        },
+        "pools": []
       }
     },
     "pools": {

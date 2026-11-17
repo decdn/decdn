@@ -241,6 +241,7 @@ fn tally_sorts_outcomes_by_hash() {
             rtt_ms: 12.0,
             total_bytes: Some(ProvenSize::assume_for_tests(99)),
             coverage: decdn_protocol::Coverage::empty(),
+            payment_pools: None,
         },
         (node_key(1), 12.0, 17),
     );
@@ -250,6 +251,7 @@ fn tally_sorts_outcomes_by_hash() {
             eth_address: Address::repeat_byte(2),
             rtt_ms: 8.0,
             multiaddrs: alloy::primitives::Bytes::new(),
+            payment_pools: None,
         },
         (node_key(2), 8.0, 21),
     );

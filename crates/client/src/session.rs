@@ -12,15 +12,18 @@ use alloy::primitives::{Address, U256};
 use decdn_incentive::Deployment;
 use iroh::PublicKey;
 
-/// The chain a pull pays on: its RPC endpoint and the deCDN contracts.
+/// The governance chain a pull reads the node registry from, and whose id and
+/// contracts bind every signature that is not a payment (ADR 016 § Deployment
+/// Tiers).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChainConfig {
-    /// The JSON-RPC endpoint every chain read and transaction goes through.
+pub struct GovernanceChain {
+    /// The JSON-RPC endpoint of the governance chain: every registry read
+    /// goes through it.
     pub rpc_url: String,
-    /// The chain id the EIP-712 domains are built for.
+    /// The governance chain id. The `SlashJudge` domain (probe answers and
+    /// stream responses) and the `CapacityBond` domain (the client identity
+    /// binding) are built for it.
     pub chain_id: u64,
-    /// The `PaymentPool` the pull's pool lives on.
-    pub payment_pool: Address,
     /// The `SlashJudge` whose domain every probe answer and stream response
     /// verifies against.
     pub slash_judge: Address,
@@ -30,15 +33,90 @@ pub struct ChainConfig {
     pub capacity_bond: Option<Address>,
 }
 
+/// One `PaymentPool` contract a pull can pay through, and the RPC endpoint of
+/// its payment chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentPoolChain {
+    /// The JSON-RPC endpoint of the payment chain: every pool read and
+    /// transaction on this contract goes through it.
+    pub rpc_url: String,
+    /// The payment chain id and the `PaymentPool` contract. The voucher and
+    /// capability domains are built for it, and a buyer row is reused only on
+    /// it.
+    pub deployment: Deployment,
+}
+
+/// The chains a pull runs on: the governance chain, and the `PaymentPool`
+/// contracts it can pay through, in the order the configuration lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainConfig {
+    /// The governance chain: the registry and every non-payment domain.
+    pub governance: GovernanceChain,
+    /// The `PaymentPool` contracts the pull can pay through, first configured
+    /// first. A fetch pays each node through one of them
+    /// ([`crate::pool_route::PoolRoute`]).
+    pub payment_pools: Vec<PaymentPoolChain>,
+}
+
 impl ChainConfig {
-    /// The `PaymentPool` deployment this pull runs against: the chain id and
-    /// the contract address. A buyer row is reused only on this deployment.
-    #[must_use]
-    pub const fn deployment(&self) -> Deployment {
-        Deployment {
-            chain_id: self.chain_id,
-            payment_pool: self.payment_pool,
+    /// The chains a pull runs on, with at least one payment pool and no pool
+    /// listed twice.
+    ///
+    /// # Errors
+    ///
+    /// `payment_pools` is empty, or lists one deployment twice.
+    pub fn new(
+        governance: GovernanceChain,
+        payment_pools: Vec<PaymentPoolChain>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !payment_pools.is_empty(),
+            "no payment pool configured: set at least one [[blockchain.payment_chains]] entry"
+        );
+        for (i, pool) in payment_pools.iter().enumerate() {
+            anyhow::ensure!(
+                !payment_pools
+                    .iter()
+                    .skip(i.saturating_add(1))
+                    .any(|other| other.deployment == pool.deployment),
+                "payment pool {} is configured twice",
+                pool.deployment.pool_account()
+            );
         }
+        Ok(Self {
+            governance,
+            payment_pools,
+        })
+    }
+
+    /// The first configured payment pool: the pool a node with no
+    /// `payment_pools` hint is paid through, and the one a delegated
+    /// capability draws from.
+    ///
+    /// # Errors
+    ///
+    /// No payment pool is configured.
+    pub fn first_pool(&self) -> anyhow::Result<&PaymentPoolChain> {
+        self.payment_pools
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no payment pool configured"))
+    }
+
+    /// The configured payment pool on `deployment`, if any.
+    #[must_use]
+    pub fn pool(&self, deployment: Deployment) -> Option<&PaymentPoolChain> {
+        self.payment_pools
+            .iter()
+            .find(|pool| pool.deployment == deployment)
+    }
+
+    /// Every configured deployment, first configured first.
+    #[must_use]
+    pub fn deployments(&self) -> Vec<Deployment> {
+        self.payment_pools
+            .iter()
+            .map(|pool| pool.deployment)
+            .collect()
     }
 }
 
@@ -193,3 +271,6 @@ pub trait FetchMarks: Send + Sync {
     /// A holder joined the running fetch from a probe that answered late.
     fn holder_joined(&self);
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

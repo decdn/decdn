@@ -631,8 +631,10 @@ fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     {
         let concrete = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
         let seller: Arc<dyn PendingSettleStore> = concrete.clone();
-        let buyer: Arc<dyn PendingSettleStore> =
-            Arc::new(BuyerPendingSettleStoreHandle::new(Arc::clone(&concrete)));
+        let buyer: Arc<dyn PendingSettleStore> = Arc::new(BuyerPendingSettleStoreHandle::new(
+            Arc::clone(concrete.files()),
+            concrete.deployment(),
+        ));
 
         seller.record_pending(&PendingSettle {
             pool_id: seller_pool,
@@ -671,8 +673,10 @@ fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     // Reopen: durability + isolation both survive a restart.
     let concrete = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
     let seller: Arc<dyn PendingSettleStore> = concrete.clone();
-    let buyer: Arc<dyn PendingSettleStore> =
-        Arc::new(BuyerPendingSettleStoreHandle::new(Arc::clone(&concrete)));
+    let buyer: Arc<dyn PendingSettleStore> = Arc::new(BuyerPendingSettleStoreHandle::new(
+        Arc::clone(concrete.files()),
+        concrete.deployment(),
+    ));
     anyhow::ensure!(
         seller.load_pending()?.len() == 1 && buyer.load_pending()?.is_empty(),
         "the seller entry persists and the buyer set is still empty after reopen"

@@ -119,6 +119,7 @@ impl HashCensus {
                     rtt_ms: answer.rtt_ms,
                     total_bytes: answer.total_bytes,
                     coverage: answer.coverage.clone(),
+                    payment_pools: None,
                 });
             } else {
                 non_holders.push(discovery::WarmingCandidate {
@@ -126,6 +127,7 @@ impl HashCensus {
                     eth_address: answer.candidate.eth_address,
                     rtt_ms: answer.rtt_ms,
                     multiaddrs: answer.candidate.multiaddrs.clone(),
+                    payment_pools: None,
                 });
             }
         }
@@ -213,7 +215,7 @@ pub async fn census(
             .collect();
         (nodes, outage_fallback)
     };
-    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
     let probes = hashes.iter().enumerate().flat_map(|(at, &hash)| {
         nodes
             .iter()

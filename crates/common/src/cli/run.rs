@@ -65,11 +65,14 @@ pub struct NetworkArgs {
     pub relay_url: Option<String>,
 }
 
-/// Blockchain / EVM connection settings.
+/// Blockchain / EVM connection settings: the governance chain. Payment chains
+/// and their pools come from the config file's `[[blockchain.payment_chains]]`
+/// entries only, because each needs its own RPC endpoint, chain id and pool
+/// list together.
 #[derive(Args, Debug)]
 #[command(next_help_heading = "Blockchain")]
 pub struct BlockchainArgs {
-    /// Arbitrum Sepolia JSON-RPC endpoint URL.
+    /// Governance-chain JSON-RPC endpoint URL.
     #[arg(long, value_name = "URL", env = "DECDN_RPC_URL")]
     pub rpc_url: Option<String>,
 
@@ -85,10 +88,6 @@ pub struct BlockchainArgs {
     /// an error.
     #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
     pub keystore_password_file: Option<PathBuf>,
-
-    /// `PaymentPool` contract address (0x-prefixed hex).
-    #[arg(long, value_name = "ADDR", env = "DECDN_PAYMENT_POOL_ADDRESS")]
-    pub payment_pool_address: Option<String>,
 
     /// `CapacityBond` contract address (0x-prefixed hex).
     #[arg(long, value_name = "ADDR", env = "DECDN_CAPACITY_BOND_ADDRESS")]

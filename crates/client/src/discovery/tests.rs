@@ -486,12 +486,14 @@ fn partial_holders_carry_their_own_coverage_and_are_admitted_like_full_holders()
             rtt_ms: 10.0,
             total_bytes: Some(ProvenSize::assume_for_tests(128 * 1024 * 1024)),
             coverage: Coverage::from_block_indices(2, [0].into_iter()),
+            payment_pools: None,
         },
         Probed {
             candidate: op2.clone(),
             rtt_ms: 12.0,
             total_bytes: Some(ProvenSize::assume_for_tests(128 * 1024 * 1024)),
             coverage: Coverage::from_block_indices(2, [1].into_iter()),
+            payment_pools: None,
         },
     ];
 
@@ -984,6 +986,7 @@ fn warming(seed: u8, rtt_ms: f64) -> WarmingCandidate {
         eth_address: Address::repeat_byte(seed),
         rtt_ms,
         multiaddrs: Bytes::new(),
+        payment_pools: None,
     }
 }
 

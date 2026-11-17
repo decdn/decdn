@@ -32,7 +32,7 @@ graph TD
 
 ### Node Discovery (Registry)
 
-A node discovers its peers from the on-chain `CapacityBond` registry active set. The node reads the active set at startup. It keeps the set fresh by subscribing to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events. The same active set seeds the `cdn/dht/v1` routing table ([ADR 022 § Routing Table](022-content-discovery.md#routing-table)).
+A node discovers its peers from the on-chain `CapacityBond` registry active set. The node reads the active set at startup. It keeps the set fresh by reading `getRegisteredNodes` again on a fixed interval, and early when a peer presents a `NodeId` that the set does not hold ([ADR 019 § Chain state reads](019-node-onboarding.md#chain-state-reads)). The same active set seeds the `cdn/dht/v1` routing table ([ADR 022 § Routing Table](022-content-discovery.md#routing-table)).
 
 A node dials any peer by its iroh `NodeId`. The registry supplies each active peer's `NodeId` and its reachable transport addresses in the `NodeInfo.multiaddrs` field. A node sets those addresses at registration and updates them with `updateMultiaddrs`. Registration defaults them to the host's public addresses on `network.bind_port` ([ADR 019 § Phase 2](019-node-onboarding.md#phase-2--on-chain-setup)). When the field carries addresses, the dialer feeds them to iroh as direct-address hints. The node daemon keeps every registered node's addresses in an address lookup on its iroh endpoint, so each dial by bare `NodeId` gets them.
 
@@ -44,7 +44,7 @@ The active set is the sole membership source. A node checks it before it initiat
 
 ### Node Region Metadata
 
-Each node declares a region — an ISO 3166-1 alpha-2 country code — on-chain as `regionHint` at `CapacityBond.registerNode` ([ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)). The `CapacityBond` registry watcher resolves the active set into a `NodeId → region` map alongside the routing table. Region byte-accounting and the [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation) RTT-vs-claim selection penalty read this map. The region is self-attested and accepted at face value; a pulling node applies a reputation penalty when observed latency contradicts the claimed region.
+Each node declares a region — an ISO 3166-1 alpha-2 country code — on-chain as `regionHint` at `CapacityBond.registerNode` ([ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)). The `CapacityBond` registry refresh resolves the active set into a `NodeId → region` map alongside the routing table. Region byte-accounting and the [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation) RTT-vs-claim selection penalty read this map. The region is self-attested and accepted at face value; a pulling node applies a reputation penalty when observed latency contradicts the claimed region.
 
 ### Content Discovery (DHT + Probe)
 

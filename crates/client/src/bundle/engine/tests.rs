@@ -147,13 +147,13 @@ fn chain_against(
     data_dir: &Path,
     rediscover: bool,
 ) -> anyhow::Result<(ChainConfig, PullSite, DiscoveryOptions)> {
-    let chain = ChainConfig {
-        rpc_url: format!("http://{}", rpc.local_addr()?),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: Some(Address::repeat_byte(0x55)),
-    };
+    let chain = crate::session::test_support::one_chain(
+        format!("http://{}", rpc.local_addr()?),
+        1,
+        Address::repeat_byte(0x33),
+        Address::repeat_byte(0x44),
+        Some(Address::repeat_byte(0x55)),
+    );
     let site = PullSite {
         data_dir: data_dir.to_path_buf(),
         region: None,
@@ -900,6 +900,41 @@ fn a_landed_entry_survives_a_second_pass_that_did_not_run_it() {
             EntryOutcome::Failed { .. }
         ]
     );
+}
+
+/// A pool's pass leaves work for the next pool's pass when an entry failed or
+/// did not run, or a fault ended it; a pass that landed every entry, or that
+/// its caller interrupted, leaves none.
+#[test]
+fn a_pass_leaves_work_for_the_next_pool_only_when_an_entry_is_left() {
+    let pass = |outcomes, stopped: Option<anyhow::Error>, interrupted| PullRun {
+        outcomes,
+        warnings: Vec::new(),
+        transfer: Transfer::default(),
+        interrupted,
+        stopped,
+    };
+    let landed = || vec![EntryOutcome::Fetched(5), EntryOutcome::Skipped];
+    assert!(!leaves_work(&pass(landed(), None, false)));
+    assert!(leaves_work(&pass(
+        vec![
+            EntryOutcome::Fetched(5),
+            EntryOutcome::failed("b.bin", &anyhow!("no holder takes this pool")),
+        ],
+        None,
+        false
+    )));
+    assert!(leaves_work(&pass(
+        vec![EntryOutcome::Fetched(5), EntryOutcome::NotRun],
+        None,
+        false
+    )));
+    assert!(leaves_work(&pass(landed(), Some(give_up()), false)));
+    assert!(!leaves_work(&pass(
+        vec![EntryOutcome::NotRun],
+        Some(give_up()),
+        true
+    )));
 }
 
 /// A first pass's run that ended on `stopped`.

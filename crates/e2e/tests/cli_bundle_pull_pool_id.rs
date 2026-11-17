@@ -184,7 +184,7 @@ async fn run() -> anyhow::Result<()> {
     // salt, not the wallet key itself (#2468).
     let store = RedbBuyerPoolStore::open(client_dir.path()).context("reopen client store")?;
     let state = store
-        .get_by_owner(buyer_addr)
+        .get_by_owner(chain.deployment(), buyer_addr)
         .context("read buyer pool")?
         .ok_or_else(|| anyhow::anyhow!("no pool was recorded for owner {buyer_addr}"))?;
     anyhow::ensure!(
@@ -303,16 +303,22 @@ fn bundle_get_argv(
         format!("127.0.0.1:{}", node.bind_port()),
         "--provider-address".into(),
         format!("{}", node.operator_addr()),
-        "--rpc-url".into(),
+        "--governance-rpc-url".into(),
         chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
+        "--governance-chain-id".into(),
+        chain.chain_id().to_string(),
+        "--pool".into(),
+        format!(
+            "eip155:{}:{:#x}",
+            chain.chain_id(),
+            chain.addrs().payment_pool
+        ),
+        "--pool-rpc-url".into(),
+        chain.rpc_url(),
         "--capacity-bond-address".into(),
         format!("{}", chain.addrs().capacity_bond),
         "--slash-judge-address".into(),
         format!("{}", chain.addrs().slash_judge),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
         "--data-dir".into(),
         data_dir.display().to_string(),
         "--keystore".into(),

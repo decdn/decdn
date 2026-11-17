@@ -59,7 +59,6 @@ fn run_until_identity(root: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
             .arg(root.join("cache"))
             .args(["--rpc-url", "http://127.0.0.1:1"])
             .args(["--log-format", "json", "--log-level", "info"])
-            .args(["--payment-pool-address", ADDR])
             .args(["--capacity-bond-address", ADDR])
             .args(["--slash-judge-address", ADDR])
             .args(["--content-blacklist-address", ADDR])
@@ -126,7 +125,14 @@ fn every_json_event_carries_the_on_disk_node_id() -> anyhow::Result<()> {
     let keystore = data_dir.join("keystore.json");
     std::fs::write(&keystore, "{}")?;
     std::fs::set_permissions(&keystore, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::write(root.path().join("node.toml"), "")?;
+    // Payment chains come from the config file only.
+    std::fs::write(
+        root.path().join("node.toml"),
+        format!(
+            "[[blockchain.payment_chains]]\nrpc_url = \"http://127.0.0.1:1\"\n\
+             chain_id = 421614\npayment_pools = [\"{ADDR}\"]\n"
+        ),
+    )?;
 
     let first = run_until_identity(root.path())?;
     let second = run_until_identity(root.path())?;
