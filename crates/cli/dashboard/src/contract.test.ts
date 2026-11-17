@@ -225,7 +225,6 @@ const GATEWAY_BASE = { url: true, updated_unix_ms: true, state: true } as const;
 const GATEWAY: Variants<GatewaySection> = {
   waiting: GATEWAY_BASE,
   absent: GATEWAY_BASE,
-  unauthorized: GATEWAY_BASE,
   error: { ...GATEWAY_BASE, message: true },
   up: { ...GATEWAY_BASE, status: true },
 };

@@ -55,7 +55,7 @@ describe("session", () => {
 });
 
 describe("TOKEN_KEY", () => {
-  it("is the dashboard's own, apart from a gateway token stored before", () => {
+  it("is the dashboard's own key", () => {
     expect(TOKEN_KEY).toBe("decdn-dashboard-token");
   });
 });

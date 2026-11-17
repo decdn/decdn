@@ -220,7 +220,6 @@ export type GatewaySection = {
 } & (
   | { state: "waiting" }
   | { state: "absent" }
-  | { state: "unauthorized" }
   | { state: "error"; message: string }
   | { state: "up"; status: GatewayStatus }
 );

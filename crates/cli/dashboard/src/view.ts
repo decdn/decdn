@@ -267,8 +267,6 @@ export function gatewayLine(g: GatewaySection): string | null {
       return `Asking the gateway at ${g.url}…`;
     case "absent":
       return `No gateway at ${g.url}.`;
-    case "unauthorized":
-      return `The gateway at ${g.url} asks for a token: pass --gateway-token-file.`;
     case "error":
       return `Could not read the gateway at ${g.url}: ${g.message}`;
     case "up":

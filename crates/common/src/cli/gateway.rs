@@ -41,7 +41,7 @@ pub struct GatewayArgs {
     /// registered to them (`PUT /_capability`), so the keystore and
     /// capability flags are refused. Chain coordinates that neither a flag
     /// nor the config file sets default to the built-in testnet, and
-    /// `--data-dir` (where the gateway token, or a public gateway's namespace
+    /// `--data-dir` (where the cache, and a public gateway's namespace
     /// pointers, live) defaults to `~/.decdn/gateway`.
     #[command(flatten)]
     pub common: ClientFetchArgs,

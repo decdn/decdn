@@ -122,8 +122,6 @@ fn a_capability_must_be_signed_by_its_pools_on_chain_owner() {
     assert!(owner_matches(Address::ZERO, owner, pool).is_err());
 }
 
-const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
 /// A pull backend for gateways whose requests all stop before a pull.
 struct NoPulls;
 
@@ -191,7 +189,7 @@ fn public_with(pointers_dir: &Path) -> Public {
 }
 
 /// A gateway on `backend` whose sites live under `sites`: a loopback gateway
-/// with [`TEST_TOKEN`] and no `public`, or a public one with no token.
+/// with no `public`, or a public one with its `public`.
 async fn test_gateway_in(
     backend: impl worker::Backend,
     common: cli::ClientFetchArgs,
@@ -211,7 +209,6 @@ async fn test_gateway_cached(
     worker_slots: usize,
     cache: Option<CacheEngine>,
 ) -> Arc<Gateway> {
-    let token = matches!(sites, SiteDomain::Loopback { .. }).then(|| TEST_TOKEN.to_owned());
     assert_eq!(matches!(sites, SiteDomain::Public { .. }), public.is_some());
     let chain = ChainConfig {
         // Nothing here reaches the chain: every request below stops first.
@@ -223,7 +220,6 @@ async fn test_gateway_cached(
     };
     Arc::new(Gateway {
         common,
-        token,
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: std::sync::Mutex::default(),
@@ -270,7 +266,7 @@ async fn head_never_starts_a_pull() {
         &gateway,
         Method::HEAD,
         &format!("/{}", "ab".repeat(32)),
-        &[(TOKEN_HEADER, TEST_TOKEN)],
+        &[],
         "",
     )
     .await;
@@ -304,8 +300,7 @@ async fn exchange(
     )
 }
 
-/// The address `GET /_delegate` returns, asked with no token and no
-/// `Origin`.
+/// The address `GET /_delegate` returns, asked with no browser headers.
 async fn pending_address(gateway: &Arc<Gateway>) -> Address {
     let (status, _, body) = exchange(gateway, Method::GET, "/_delegate", &[], "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -387,13 +382,13 @@ async fn a_loopback_gateway_answers_nothing_cross_origin() {
         let (status, _, _) = exchange(&gateway, Method::OPTIONS, path, &page, "").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
     }
-    let (status, headers, _) = exchange(&gateway, Method::GET, "/_delegate", &page, "").await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, headers, body) = exchange(&gateway, Method::GET, "/_delegate", &page, "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
 }
 
 #[tokio::test]
-async fn the_capability_list_and_the_status_need_no_token() {
+async fn a_client_outside_a_browser_lists_the_capabilities_and_the_status() {
     let gateway = test_gateway().await;
     let first = hold_capability(&gateway, 1);
     let second = hold_capability(&gateway, 2);
@@ -553,8 +548,8 @@ impl worker::Backend for Recording {
 /// The blob the single-reply gateways serve.
 const BLOB: [u8; 32] = [0xab; 32];
 
-/// A gateway on [`Recording`] that answers [`BLOB`] with `reply`, whose token
-/// holder pays for every host, and the caps its pulls record.
+/// A gateway on [`Recording`] that answers [`BLOB`] with `reply`, holding a
+/// capability that pays for every host, and the caps its pulls record.
 async fn recording_gateway(
     reply: Reply,
     args: &[&str],
@@ -610,7 +605,6 @@ async fn get(gateway: &Arc<Gateway>, path: &str) -> (StatusCode, String) {
         .method(Method::GET)
         .uri(path)
         .header(header::HOST, "127.0.0.1:8484")
-        .header(TOKEN_HEADER, TEST_TOKEN)
         .body(Full::new(Bytes::new()))
         .unwrap();
     let response = Arc::clone(gateway).handle(req).await;
@@ -810,7 +804,7 @@ impl Answer {
     }
 }
 
-/// `GET path` with `Host: host` and `headers`, and no token.
+/// `GET path` with `Host: host` and `headers`.
 async fn request(
     gateway: &Arc<Gateway>,
     host: &str,
@@ -820,7 +814,7 @@ async fn request(
     send(gateway, Method::GET, host, path, headers).await
 }
 
-/// `method path` with `Host: host` and `headers`, an empty body and no token.
+/// `method path` with `Host: host` and `headers`, and an empty body.
 async fn send(
     gateway: &Arc<Gateway>,
     method: Method,
@@ -1025,12 +1019,17 @@ async fn other_pages_cannot_make_a_site_spend() {
         ("sec-fetch-mode", "navigate"),
         ("sec-fetch-dest", "iframe"),
     ];
-    for headers in [&image[..], &frame[..]] {
+    let sibling = [
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-dest", "empty"),
+    ];
+    for headers in [&image[..], &frame[..], &sibling[..]] {
         let answer = request(&gateway, &host, "/", headers).await;
         assert_eq!(answer.status, StatusCode::FORBIDDEN, "{headers:?}");
     }
     let link = [
-        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-site", "same-site"),
         ("sec-fetch-mode", "navigate"),
         ("sec-fetch-dest", "document"),
     ];
@@ -1040,8 +1039,21 @@ async fn other_pages_cannot_make_a_site_spend() {
         StatusCode::OK,
         "a link opens a site at any path"
     );
-    let script = request(&gateway, &host, "/", &[]).await;
-    assert_eq!(script.status, StatusCode::UNAUTHORIZED);
+}
+
+/// A client outside a browser sends no `Sec-Fetch-Site`, and a site spends
+/// for it.
+#[tokio::test]
+async fn a_client_outside_a_browser_reads_a_site() {
+    let (gateway, host) = site_gateway().await;
+    for headers in [&[][..], &[("user-agent", "curl/8.0")][..]] {
+        let answer = request(&gateway, &host, "/docs/", headers).await;
+        assert_eq!(
+            (answer.status, answer.body.as_str()),
+            (StatusCode::OK, "<p>docs</p>"),
+            "{headers:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1080,7 +1092,7 @@ async fn a_site_without_an_index_lists_its_entries_relatively() {
 }
 
 #[tokio::test]
-async fn the_bare_origin_opens_a_bundle_as_its_site_without_the_token() {
+async fn a_navigation_on_the_bare_origin_opens_a_bundle_as_its_site() {
     let gateway = test_gateway().await;
     let blob = alloy::hex::encode(BLOB);
     let site = gateway.sites.site_host(&Site {
@@ -1096,9 +1108,33 @@ async fn the_bare_origin_opens_a_bundle_as_its_site_without_the_token() {
     let answer = request(&gateway, "127.0.0.1:8484", &format!("/{blob}"), TYPED).await;
     assert_eq!(
         answer.status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::PAYMENT_REQUIRED,
         "a blob has no site"
     );
+}
+
+/// A bundle request that is no navigation is served at the bare origin, as
+/// a listing of the bundle.
+#[tokio::test]
+async fn a_bundle_request_that_is_no_navigation_stays_on_the_bare_origin() {
+    let (gateway, _) = site_gateway().await;
+    let blob = alloy::hex::encode(BLOB);
+    let cors = [
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-dest", "empty"),
+    ];
+    for headers in [&[][..], &cors[..]] {
+        let answer = request(&gateway, "127.0.0.1:8484", &format!("/{blob}/"), headers).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::OK,
+            "{headers:?}: {}",
+            answer.body
+        );
+        assert!(answer.body.contains("index.html"), "{}", answer.body);
+        assert_eq!(answer.header(header::LOCATION), None);
+    }
 }
 
 #[tokio::test]
@@ -1108,7 +1144,6 @@ async fn the_bare_origin_still_serves_markup_as_text() {
         .method(Method::GET)
         .uri(format!("/{}/index.html", alloy::hex::encode(BLOB)))
         .header(header::HOST, "127.0.0.1:8484")
-        .header(TOKEN_HEADER, TEST_TOKEN)
         .body(Full::new(Bytes::new()))
         .unwrap();
     let response = Arc::clone(&gateway).handle(req).await;
@@ -1136,15 +1171,8 @@ async fn the_bare_origin_still_serves_markup_as_text() {
 async fn the_bare_origin_neutralises_and_sandboxes_an_rss_entry() {
     let (gateway, _) = site_gateway().await;
     let blob = alloy::hex::encode(BLOB);
-    let token = &[(TOKEN_HEADER, TEST_TOKEN)];
     for (path, body) in [("feed.rss", RSS), ("empty.rss", "")] {
-        let answer = request(
-            &gateway,
-            "127.0.0.1:8484",
-            &format!("/{blob}/{path}"),
-            token,
-        )
-        .await;
+        let answer = request(&gateway, "127.0.0.1:8484", &format!("/{blob}/{path}"), &[]).await;
         assert_eq!(answer.status, StatusCode::OK, "{path}");
         assert_eq!(
             answer.header(header::CONTENT_TYPE),
@@ -1369,23 +1397,6 @@ fn a_streamed_link_matches_the_entry_link() {
     }
 }
 
-#[test]
-fn the_token_is_created_owner_only_and_read_back() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("token");
-    let token = load_or_create_token(&path).unwrap();
-    assert_eq!(token.len(), 64);
-    assert_eq!(load_or_create_token(&path).unwrap(), token);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
-    std::fs::write(&path, "not a token").unwrap();
-    assert!(load_or_create_token(&path).is_err());
-}
-
 /// The entry blob of the public gateway's bundle.
 const ENTRY: [u8; 32] = [0xe4; 32];
 
@@ -1526,7 +1537,7 @@ async fn public_gateway_unpaid(
     (gateway, logs, host)
 }
 
-/// `method path` with `Host: host` and `body`, and no token.
+/// `method path` with `Host: host` and `body`.
 async fn send_body(
     gateway: &Arc<Gateway>,
     method: Method,
@@ -1753,8 +1764,8 @@ async fn put_pointer_with_a_valid_signature_asks_the_chain() {
     assert_eq!(pointers(&gateway).root(7), None);
 }
 
-/// A public site serves its entries to anyone: no token, no browser
-/// headers, the capability the gateway holds pays.
+/// A public site serves its entries to anyone: with no browser headers,
+/// the capability the gateway holds pays.
 #[tokio::test]
 async fn a_public_site_serves_to_anyone() {
     let (gateway, _logs, host) = public_gateway().await;
@@ -2644,7 +2655,7 @@ async fn the_metrics_listener_serves_the_exposition() {
         exposition.contains("decdn_gateway_bytes_served_total 0"),
         "{exposition}"
     );
-    // The state answers here, with no token; no page does.
+    // The state answers here; no page does.
     for path in ["/", "/_dashboard/app.js"] {
         let page = fetch(path).await;
         assert!(page.starts_with("HTTP/1.1 404"), "{path}: {page}");
@@ -2665,7 +2676,7 @@ async fn the_metrics_listener_serves_the_exposition() {
     let named = fetch_as(format!("localhost:{}", addr.port()), "/metrics").await;
     assert!(named.starts_with("HTTP/1.1 200"), "{named}");
     // A page the operator visits reaches this address with its own Host, so
-    // only the missing CORS grant keeps it from reading the token-free state.
+    // only the missing CORS grant keeps it from reading the state.
     for path in ["/_status", "/metrics"] {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
@@ -2814,16 +2825,15 @@ async fn every_public_answer_is_readable_by_any_origin() {
     }
 }
 
-/// A loopback gateway keeps content same-origin: no CORS header on content
-/// and no preflight, so no page on another origin can send the token header
-/// to content.
+/// A loopback gateway keeps content same-origin: a request from a page on
+/// another origin is refused, with no CORS header and no preflight.
 #[tokio::test]
 async fn a_loopback_gateway_answers_content_to_no_other_origin() {
     let (gateway, host) = site_gateway().await;
     let mut headers = SAME_ORIGIN.to_vec();
     headers.push(("origin", "https://app.example"));
     let site = request(&gateway, &host, "/css/site.css", &headers).await;
-    assert_eq!(site.status, StatusCode::OK);
+    assert_eq!(site.status, StatusCode::FORBIDDEN);
     assert_eq!(site.header(header::ACCESS_CONTROL_ALLOW_ORIGIN), None);
     let preflight = [
         ("origin", "https://app.example"),
@@ -2840,6 +2850,90 @@ async fn a_loopback_gateway_answers_content_to_no_other_origin() {
     .await;
     assert_eq!(bare.status, StatusCode::FORBIDDEN);
     assert_eq!(bare.header(header::ACCESS_CONTROL_ALLOW_ORIGIN), None);
+}
+
+/// Each request a loopback gateway refuses from a browser, with its answer.
+const BROWSER_REFUSALS: &[(&[(&str, &str)], &str)] = &[
+    (
+        &[
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "no-cors"),
+        ],
+        "a page on another site may not use the gateway\n",
+    ),
+    (
+        &[
+            ("sec-fetch-site", "same-site"),
+            ("origin", "http://evil.example"),
+        ],
+        "a page on another origin may not use the gateway\n",
+    ),
+    (
+        &[("user-agent", "Mozilla/5.0 (X11; Linux x86_64)")],
+        "a browser that sends no Sec-Fetch-Site may not use the gateway\n",
+    ),
+    (
+        &[("origin", "http://127.0.0.1:8484")],
+        "a browser that sends no Sec-Fetch-Site may not use the gateway\n",
+    ),
+];
+
+/// A page on another site or origin, and a browser that sends no
+/// `Sec-Fetch-Site`, reach neither content on the bare host nor the API.
+#[tokio::test]
+async fn the_browser_gate_refuses_other_pages_on_content_and_the_api() {
+    let (gateway, _) = site_gateway().await;
+    let content = format!("/{}", alloy::hex::encode(OTHER));
+    for path in [content.as_str(), "/_capability"] {
+        for (headers, why) in BROWSER_REFUSALS {
+            let answer = request(&gateway, "127.0.0.1:8484", path, headers).await;
+            assert_eq!(
+                (answer.status, answer.body.as_str()),
+                (StatusCode::FORBIDDEN, *why),
+                "{path} {headers:?}"
+            );
+        }
+    }
+}
+
+/// A page on the gateway's own origin, the bare host or a site host, uses
+/// the gateway, and so does a client outside a browser.
+#[tokio::test]
+async fn the_browser_gate_passes_own_origins_and_clients_outside_a_browser() {
+    let (gateway, host) = site_gateway().await;
+    let site_origin = format!("http://{host}");
+    let browser = "Mozilla/5.0 (X11; Linux x86_64)";
+    let content = format!("/{}", alloy::hex::encode(OTHER));
+    for headers in [
+        vec![
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-mode", "cors"),
+            ("origin", "http://127.0.0.1:8484"),
+            ("user-agent", browser),
+        ],
+        vec![
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-mode", "cors"),
+            ("origin", site_origin.as_str()),
+            ("user-agent", browser),
+        ],
+        vec![],
+        vec![("user-agent", "curl/8.0")],
+    ] {
+        let answer = request(&gateway, "127.0.0.1:8484", &content, &headers).await;
+        assert_eq!(
+            (answer.status, answer.body.as_str()),
+            (StatusCode::OK, "other bytes"),
+            "{headers:?}"
+        );
+        let answer = request(&gateway, "127.0.0.1:8484", "/_capability", &headers).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::OK,
+            "{headers:?}: {}",
+            answer.body
+        );
+    }
 }
 
 /// `GET /_capability` answers this exact body for one registered capability:
@@ -2914,24 +3008,18 @@ async fn an_active_pull_is_listed_while_it_streams() {
     assert_eq!(gateway.metrics.snapshot().pulls_active, 0);
 }
 
-/// `GET path` on the loopback host, with the token when `token`.
-async fn loopback_get(gateway: &Arc<Gateway>, path: &str, token: bool) -> Answer {
-    let headers: &[(&str, &str)] = if token {
-        &[(TOKEN_HEADER, TEST_TOKEN)]
-    } else {
-        &[]
-    };
-    send(gateway, Method::GET, "127.0.0.1:8484", path, headers).await
+/// `GET path` on the loopback host, with no browser headers.
+async fn loopback_get(gateway: &Arc<Gateway>, path: &str) -> Answer {
+    send(gateway, Method::GET, "127.0.0.1:8484", path, &[]).await
 }
 
-/// `/_status` on a loopback gateway takes no token, as `/_capability` does
-/// not, and lists the same capabilities. A loopback gateway holds no
-/// pointers, so they are null.
+/// `/_status` on a loopback gateway lists the capabilities `/_capability`
+/// lists. A loopback gateway holds no pointers, so they are null.
 #[tokio::test]
-async fn status_needs_no_token_on_loopback() {
+async fn status_on_loopback_lists_the_capabilities() {
     let gateway = test_gateway().await;
     hold_capability(&gateway, 0);
-    let answer = loopback_get(&gateway, "/_status", false).await;
+    let answer = loopback_get(&gateway, "/_status").await;
     assert_eq!(answer.status, StatusCode::OK);
     assert_eq!(
         answer.header(header::CONTENT_TYPE),
@@ -2946,7 +3034,7 @@ async fn status_needs_no_token_on_loopback() {
     assert!(status["pointers"].is_null(), "{status}");
     assert!(status["pool_error"].is_null(), "{status}");
     assert!(status["pools"].is_object(), "{status}");
-    let listed = loopback_get(&gateway, "/_capability", false).await;
+    let listed = loopback_get(&gateway, "/_capability").await;
     let listed: serde_json::Value = serde_json::from_str(&listed.body).unwrap();
     assert_eq!(status["capabilities"], listed);
     assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
@@ -2967,12 +3055,12 @@ async fn status_needs_no_token_on_loopback() {
 #[tokio::test]
 async fn a_loopback_gateway_serves_no_dashboard() {
     let gateway = test_gateway().await;
-    let root = loopback_get(&gateway, "/", false).await;
+    let root = loopback_get(&gateway, "/").await;
     assert_eq!(root.status, StatusCode::OK);
     assert!(root.body.contains("decdn dashboard"), "{}", root.body);
     assert!(root.header(header::CONTENT_SECURITY_POLICY).is_none());
     for path in ["/_dashboard/app.js", "/_dashboard/app.css"] {
-        let asset = loopback_get(&gateway, path, false).await;
+        let asset = loopback_get(&gateway, path).await;
         assert_ne!(asset.status, StatusCode::OK, "{path}");
     }
 }
@@ -3081,10 +3169,10 @@ async fn status_reports_a_pool_snapshot_failure() {
     assert!(!error.contains("secret"), "{error}");
 }
 
-/// A loopback gateway's metrics listener answers `/_status` and `/metrics`
-/// with no token, as the gateway's own host answers `/_status`.
+/// A loopback gateway's metrics listener answers `/_status` and `/metrics`,
+/// as the gateway's own host answers `/_status`.
 #[tokio::test]
-async fn a_loopback_metrics_listener_answers_status_with_no_token() {
+async fn a_loopback_metrics_listener_answers_status() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let gateway = test_gateway().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3114,8 +3202,8 @@ async fn a_loopback_metrics_listener_answers_status_with_no_token() {
 #[tokio::test]
 async fn the_dashboard_does_not_count_itself() {
     let gateway = test_gateway().await;
-    for (path, token) in [("/_status", false), ("/_status", true), ("/_status", true)] {
-        loopback_get(&gateway, path, token).await;
+    for _ in 0..3 {
+        loopback_get(&gateway, "/_status").await;
     }
     assert_eq!(gateway.metrics.snapshot(), metrics::Counters::default());
 }
@@ -3180,7 +3268,6 @@ async fn a_loopback_raw_blob_answers_with_its_proven_length() {
         .method(Method::GET)
         .uri(format!("/{}", alloy::hex::encode(BLOB)))
         .header(header::HOST, "127.0.0.1:8484")
-        .header(TOKEN_HEADER, TEST_TOKEN)
         .body(Full::new(Bytes::new()))
         .unwrap();
     let response = Arc::clone(&gateway).handle(req).await;

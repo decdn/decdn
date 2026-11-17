@@ -161,7 +161,7 @@ async fn run() -> anyhow::Result<()> {
         .spawn()
         .context("spawn decdn gateway")?;
     let base = format!("http://{listen}");
-    let token = wait_for_token(&gateway_dir.path().join("token"), &base).await?;
+    wait_for_gateway(&base).await?;
     let http = reqwest::Client::new();
 
     // ---- The gateway's pending key; the owner issues it a capability ----
@@ -217,9 +217,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- (1) Four pulls under one capability at once ----
     let rejected_before = node.scrape_metric(VOUCHER_REJECTED).await?;
     let get = |hash: Hash| {
-        let request = http
-            .get(format!("{base}/{}", hash.to_hex()))
-            .header("x-decdn-token", &token);
+        let request = http.get(format!("{base}/{}", hash.to_hex()));
         async move {
             let response = request.send().await?;
             let status = response.status();
@@ -260,7 +258,6 @@ async fn run() -> anyhow::Result<()> {
     // ---- (2) A response whose reader stops does not block another ----
     let stalled = http
         .get(format!("{base}/{}", hash_a.to_hex()))
-        .header("x-decdn-token", &token)
         .send()
         .await?;
     anyhow::ensure!(stalled.status().is_success(), "{}", stalled.status());
@@ -388,14 +385,12 @@ async fn warm_up(
     }
 }
 
-/// The gateway token, once the gateway has written it and answers on `base`.
-async fn wait_for_token(path: &Path, base: &str) -> anyhow::Result<String> {
+/// Wait until the gateway answers on `base`.
+async fn wait_for_gateway(base: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        if let Ok(token) = std::fs::read_to_string(path)
-            && reqwest::get(format!("{base}/_capability")).await.is_ok()
-        {
-            return Ok(token.trim().to_owned());
+        if reqwest::get(format!("{base}/_capability")).await.is_ok() {
+            return Ok(());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,

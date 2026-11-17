@@ -168,7 +168,6 @@ fn loopback_fixture_carries_two_capabilities() {
         &Content::new(),
         "http://127.0.0.1:8484",
         "127.0.0.1:8484",
-        "token",
         &grants,
     )
     .unwrap();
@@ -178,7 +177,7 @@ fn loopback_fixture_carries_two_capabilities() {
         Some(&json!("http://127.0.0.1:8484"))
     );
     assert_eq!(fixture.get("connect"), Some(&json!("127.0.0.1:8484")));
-    assert_eq!(fixture.get("token"), Some(&json!("token")));
+    assert!(fixture.get("token").is_none());
     assert_eq!(
         fixture.get("capabilities"),
         Some(&json!([
@@ -205,7 +204,7 @@ fn fixtures_refuse_no_flavour() {
         },
     );
     assert!(public.is_err());
-    let loopback = loopback_fixture(&Content::new(), "http://x", "x", "t", &[]);
+    let loopback = loopback_fixture(&Content::new(), "http://x", "x", &[]);
     assert!(loopback.is_err());
 }
 

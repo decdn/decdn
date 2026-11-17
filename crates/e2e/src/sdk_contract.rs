@@ -20,8 +20,8 @@
 //! fixture names all of them (`pointer.namespaces`, `capabilities`); the
 //! public fixture's `pointer.namespace` names the first.
 //!
-//! The harness writes what the suite needs (URLs, token, hashes, bytes, the
-//! namespace key) to a JSON file and gives its path to [`Suite::run`]. The
+//! The harness writes what the suite needs (URLs, hashes, bytes, the
+//! namespace key, the capabilities) to a JSON file and gives its path to [`Suite::run`]. The
 //! suite connects every request to the gateway's listener and sends the URL's
 //! host as `Host`; on the public run this stands in for the TLS proxy in front
 //! of `http://decdn.test`. A run passes only when every collected test passed,
@@ -512,7 +512,7 @@ fn public_fixture(
 }
 
 /// The loopback run's fixture: `content`'s fields, the gateway at `base` on
-/// `connect` with its `token`, and `capabilities`, one `dcap1:` capability
+/// `connect`, and `capabilities`, one `dcap1:` capability
 /// per client flavour, each from its own pool and all issued to the
 /// gateway's pending key.
 ///
@@ -523,7 +523,6 @@ fn loopback_fixture(
     content: &Content,
     base: &str,
     connect: &str,
-    token: &str,
     capabilities: &[&str],
 ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     anyhow::ensure!(
@@ -538,7 +537,6 @@ fn loopback_fixture(
     fixture.insert("mode".to_owned(), Mode::Loopback.label().into());
     fixture.insert("gatewayUrl".to_owned(), base.into());
     fixture.insert("connect".to_owned(), connect.into());
-    fixture.insert("token".to_owned(), token.into());
     fixture.insert("capabilities".to_owned(), capabilities.into());
     Ok(fixture)
 }
@@ -728,13 +726,7 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
         .context("spawn decdn gateway")?;
     let base = format!("http://{listen}");
     let http = http_client()?;
-    let token = wait_for_token(
-        &mut gateway,
-        &http,
-        &gateway_dir.path().join("token"),
-        &base,
-    )
-    .await?;
+    wait_for_gateway(&mut gateway, &http, &base).await?;
 
     // ---- The gateway's pending key, and one capability for it per owner ----
     let pending: serde_json::Value = http
@@ -756,7 +748,7 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
     }
 
     let grants: Vec<&str> = capabilities.iter().map(String::as_str).collect();
-    let fixture = loopback_fixture(&content, &base, &listen, &token, &grants)?;
+    let fixture = loopback_fixture(&content, &base, &listen, &grants)?;
     run_file(suite, Mode::Loopback, &fixture.into()).await?;
 
     // Only the suite's own `registerCapability` gives the key a capability,
@@ -854,24 +846,17 @@ async fn decdn_ok(home: &Path, args: &[String]) -> anyhow::Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-/// The gateway token, once the gateway has written all of it and answers on
-/// `base`.
-async fn wait_for_token(
+/// Wait until the gateway answers on `base`.
+async fn wait_for_gateway(
     gateway: &mut tokio::process::Child,
     http: &reqwest::Client,
-    path: &Path,
     base: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         still_running(gateway, "start-up")?;
-        let token = std::fs::read_to_string(path).unwrap_or_default();
-        let token = token.trim();
-        if token.len() == 64
-            && token.bytes().all(|b| b.is_ascii_hexdigit())
-            && http.get(format!("{base}/_capability")).send().await.is_ok()
-        {
-            return Ok(token.to_owned());
+        if http.get(format!("{base}/_capability")).send().await.is_ok() {
+            return Ok(());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,

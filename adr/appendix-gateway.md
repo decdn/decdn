@@ -60,9 +60,9 @@ true, until it expires. The gateway holds many capabilities at one time.
 Thus an operator registers the next capability before the current one runs
 low, and the gateway does not stop.
 
-These routes need no token and no `Origin`. Nothing they do spends money
-without a pool owner's signature. An operator who wants authentication puts
-a proxy in front of the gateway. `GET /_capability` and
+These routes need no credential. Nothing they do spends money without a
+pool owner's signature. An operator who wants authentication puts a proxy
+in front of the gateway. `GET /_capability` and
 [`/_status`](#state) carry public data: pools, caps, expiries and the spend
 of each key. An operator's controller reads them to see what is left.
 
@@ -260,10 +260,26 @@ these answers carry `Access-Control-Max-Age: 600`. A preflight on an API
 path of a site or namespace host answers 404.
 
 A site page has the policy `connect-src 'self'`. A page on another origin can
-read a site. A site page cannot read another origin. A loopback gateway sends
-no CORS headers, and every preflight to it answers 403. A page on another
-origin cannot send the token header to content, it cannot read content, and
-it cannot register a capability.
+read a site. A site page cannot read another origin.
+
+A loopback gateway takes no token. It checks the browser headers of every
+request, on every route, after the `Host` check:
+
+| Request | Answer |
+|---------|--------|
+| `Sec-Fetch-Site: cross-site` | 403 `a page on another site may not use the gateway` |
+| An `Origin` that is not the bare host or one of its site origins | 403 `a page on another origin may not use the gateway` |
+| No `Sec-Fetch-Site`, and an `Origin` or a `User-Agent` that starts `Mozilla/` | 403 `a browser that sends no Sec-Fetch-Site may not use the gateway` |
+
+A client outside a browser (the SDKs, the CLI, `curl`) sends none of these
+headers, and the gateway serves it. A browser sends them, and a page script
+cannot change them. Thus no page that the user visits can make the gateway
+pay. A browser that sends no `Sec-Fetch-Site` is refused. On a site origin,
+a request from a page also must be the site's own (`same-origin`), the
+user's (`none`), or a top-level navigation. On the bare host, a browser's
+navigation (`Sec-Fetch-Mode: navigate`) to a bundle or an entry redirects to
+the bundle's site. A loopback gateway sends no CORS headers, so a page on
+another origin reads no answer.
 
 ## Cache
 
@@ -326,7 +342,7 @@ start.
 | `decdn_gateway_bytes_served_total` | counter | Content bytes handed to responses. A node counts bao wire bytes in `decdn_bytes_served_total`, for every requester. For one whole-blob pull, the node counts about 0.4% more than this counter. For a range, the node counts the wire bytes of the chunk-group-aligned span. The node also counts manifest pulls. |
 | `decdn_gateway_requests_ok_total` | counter | Answers with success or a redirect. |
 | `decdn_gateway_requests_not_found_total` | counter | Answers 404. |
-| `decdn_gateway_requests_refused_total` | counter | Answers refused before a pull: an unknown host, a missing token, a bad URI, a method, a range past the end. |
+| `decdn_gateway_requests_refused_total` | counter | Answers refused before a pull: an unknown host, a refused browser request, a bad URI, a method, a range past the end. |
 | `decdn_gateway_requests_payment_required_total` | counter | Answers 402: a loopback gateway holds no capability that can pay. |
 | `decdn_gateway_pull_failures_funding_total` | counter | Answers 503: a public gateway holds no capability that can pay. |
 | `decdn_gateway_pull_failures_other_total` | counter | Answers 502. |
@@ -390,7 +406,8 @@ answers 403. A public gateway's `/_status` is readable by every origin.
   protocol ([ADR 002](002-content-addressing.md#adr-002-content-addressing)).
   Two gateways may hold different pointers for one namespace; the publisher
   points each.
-- A token on the public gateway.
+- A token on a gateway. Browser headers keep pages from spending on a
+  loopback gateway, and a public gateway serves anyone.
 - A keystore, a pool or a daily allowance on the gateway. An operator funds
   a gateway from outside, with capabilities, and the caps bound its spend.
 - A capability chosen per page or per host. The gateway pays every pull with

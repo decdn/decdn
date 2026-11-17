@@ -4,11 +4,10 @@
 //! **Content.** `GET /<hash>[/<path>][?ns=<id>]` serves
 //! `decdn:<hash>[/<path>][?ns=<id>]`. A blob or a bundle entry streams its
 //! verified bytes in order as they arrive; a whole bundle (`/<hash>/`) gets an
-//! HTML index of its entries. A content request carries [`TOKEN_HEADER`], the
-//! gateway token, and the gateway pays for it with the capabilities it holds
-//! (**Capabilities**). `HEAD` gets 405, since answering it would cost a paid
-//! pull. A bundle request without the token redirects to the bundle's site, at
-//! no cost.
+//! HTML index of its entries. The gateway pays for it with the capabilities
+//! it holds (**Capabilities**). `HEAD` gets 405, since answering it would
+//! cost a paid pull. A browser's navigation to a bundle or an entry
+//! redirects to the bundle's site, at no cost.
 //!
 //! **Sites.** Every bundle is also a website on its own browser origin,
 //! `http://[<ns>.]<hash32>.localhost:<port>/` (`site`), so its pages run
@@ -19,9 +18,8 @@
 //! origin. A site's `decdn:` URIs are rewritten as the page streams
 //! (`rewrite`) to `/_decdn/<hash>…` on the site's own origin, which serves
 //! that content to the page's own requests and redirects a navigation to the
-//! other bundle's site. The site origin takes no token: the browser's
-//! `Sec-Fetch-*` headers decide what may spend (`site::may_spend`), and a
-//! site pays with the capabilities the gateway holds, as a content request
+//! other bundle's site. The browser's `Sec-Fetch-*` headers decide what may
+//! spend on a site origin (`site::may_spend`), and a site pays with the capabilities the gateway holds, as a content request
 //! does. The API paths answer on the gateway origin only.
 //!
 //! **Capabilities.** A capability (ADR 003 § Capability delegation) lets a
@@ -42,15 +40,20 @@
 //! margin, and one whose pull stops for funding before its first byte is
 //! retired and the next one takes the request. The gateway holds several at
 //! once, so an operator registers the next capability before the current one
-//! runs low. These routes take no token and no `Origin`: nothing they do
-//! spends money without a pool owner's signature, and an operator who wants
+//! runs low. These routes take no credential: nothing they do spends money
+//! without a pool owner's signature, and an operator who wants
 //! authentication puts a proxy in front. Keys and capabilities live in memory
 //! only: a restart drops every one, and the operator provisions them again.
 //!
-//! **Boundaries.** A loopback gateway answers nothing cross-origin, so a page
-//! can neither read a response nor set the token itself. The token lives in
-//! `<data-dir>/token`, owner-only. The gateway listens on loopback only and
-//! checks `Host` against DNS rebinding: it answers its own loopback names and
+//! **Boundaries.** A loopback gateway takes no token. Every request passes
+//! a browser-header check instead (`site::browser_gate`): a page on another
+//! site (`Sec-Fetch-Site: cross-site`), a page whose `Origin` is none of the
+//! gateway's own origins, and a browser that sends no `Sec-Fetch-Site` (one
+//! with an `Origin`, or a `User-Agent` that starts `Mozilla/`) get 403. A
+//! client outside a browser sends none of these and passes, so no page the
+//! user visits can make the gateway pay. It answers nothing cross-origin, so
+//! a page reads no response. The gateway listens on loopback only and checks
+//! `Host` against DNS rebinding: it answers its own loopback names and
 //! well-formed site names on its port, nothing else.
 //!
 //! **Public.** With `--public-url <origin>` the gateway serves anyone at that
@@ -181,10 +184,7 @@ use super::fetch::{
     BlobFetch, CacheStores, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb,
     resolve_chain,
 };
-use super::local_http::{
-    Body, allowed_hosts, carries_token, full, host_header, json, load_or_create_token, private_dir,
-    text, typed,
-};
+use super::local_http::{Body, allowed_hosts, full, host_header, json, private_dir, text, typed};
 use crate::known_chains;
 
 mod delegates;
@@ -201,9 +201,6 @@ use pointer::{Pointers, SetError, SignedPointer, pointer_domain};
 use rewrite::Rewrite;
 use site::{Route, Site, SiteDomain};
 use worker::{FetchBackend, Job, PullWorker};
-
-/// The request header carrying the gateway token.
-pub const TOKEN_HEADER: &str = super::local_http::TOKEN_HEADER;
 
 /// The capability expiry margin nodes apply at the default redeem interval
 /// (ADR 003 § Revocation): inside it a node accepts no voucher under the
@@ -289,8 +286,8 @@ const PUBLIC_READ_AHEAD_BYTES: u64 = 2 << 20;
 ///
 /// When `--listen` is not a loopback address and `--public-url` is not set,
 /// when the gateway is given keystore or capability flags, when
-/// `--public-url` is not an `http(s)` origin, when the data dir, token or
-/// listener cannot be set up, when the chain coordinates or a public
+/// `--public-url` is not an `http(s)` origin, when the data dir or listener
+/// cannot be set up, when the chain coordinates or a public
 /// gateway's `PublisherRegistry` cannot be resolved, or when a stored pointer
 /// is damaged.
 pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
@@ -320,10 +317,6 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         .clone()
         .unwrap_or_else(|| cli::common::expand_tilde(Path::new("~/.decdn/gateway")));
     private_dir(&root)?;
-    let token = match &public_url {
-        Some(_) => None,
-        None => Some(load_or_create_token(&root.join("token"))?),
-    };
     let temp_store = store_dir(&root)?;
     common.data_dir = Some(temp_store.path().to_path_buf());
     let (sites, public) = mode(args, &root, chain.chain_id, &file)?;
@@ -348,7 +341,6 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     .context("start the gateway's pull worker")?;
     let gateway = Arc::new(Gateway {
         common,
-        token,
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: std::sync::Mutex::default(),
@@ -375,7 +367,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
             .with_context(|| format!("listen for metrics on {metrics}"))?;
         tokio::spawn(serve_metrics(Arc::clone(&gateway), listener));
     }
-    announce(&gateway, &root);
+    announce(&gateway);
     let served = serve(&gateway, &listener).await;
     // The worker's queued lane writes land before the store dir is removed.
     gateway.pulls.stop().await;
@@ -473,23 +465,18 @@ fn start_eviction(
     (stop, sweeping)
 }
 
-/// Print where the gateway serves, and on loopback its token and the
-/// command that shows its state.
-fn announce(gateway: &Gateway, root: &Path) {
-    match (&gateway.sites, &gateway.token) {
-        (SiteDomain::Public { origin }, _) => println!(
+/// Print where the gateway serves, and on loopback the command that shows
+/// its state.
+fn announce(gateway: &Gateway) {
+    match &gateway.sites {
+        SiteDomain::Public { origin } => println!(
             "decdn gateway serving {origin} on {} (Ctrl-C to stop)",
             gateway.listen
         ),
-        (SiteDomain::Loopback { .. }, token) => {
-            let token = token.as_deref().unwrap_or_default();
-            println!(
-                "decdn gateway on http://{}/ (Ctrl-C to stop)\ngateway token: {token} (also in \
-                 {})\nsee it with: decdn dashboard",
-                gateway.listen,
-                root.join("token").display(),
-            );
-        }
+        SiteDomain::Loopback { .. } => println!(
+            "decdn gateway on http://{}/ (Ctrl-C to stop)\nsee it with: decdn dashboard",
+            gateway.listen,
+        ),
     }
 }
 
@@ -734,9 +721,6 @@ struct RegisterRequest {
 
 struct Gateway {
     common: ClientFetchArgs,
-    /// The gateway token a loopback gateway's content requests carry;
-    /// `None` on a public gateway, which takes no token.
-    token: Option<String>,
     /// The chain a registered capability's pool must live on.
     chain: ChainConfig,
     /// The EIP-712 domain a capability's owner signs under.
@@ -1112,10 +1096,16 @@ impl Gateway {
         B::Error: std::error::Error + Send + Sync + 'static,
     {
         let host = host_header(req.headers());
-        let gateway = Arc::clone(&self);
         let route = self.sites.route(host);
         if route.is_none() && !self.hosts.iter().any(|allowed| allowed == host) {
             return text(StatusCode::FORBIDDEN, "unknown Host\n");
+        }
+        if !self.public()
+            && let Err((status, why)) = site::browser_gate(req.headers(), |origin| {
+                self.hosts.iter().any(|own| own == origin) || self.sites.route(origin).is_some()
+            })
+        {
+            return text(status, why);
         }
         if self.public() && req.method() == Method::OPTIONS {
             return public_preflight(
@@ -1125,8 +1115,7 @@ impl Gateway {
         }
         match route {
             Some(Route::Site(site)) => {
-                let response = self.site(req, site).await;
-                return gateway.with_policy(response);
+                return Self::with_policy(self.site(req, site).await);
             }
             Some(Route::Namespace(ns)) => {
                 let Some(root) = self.public.as_ref().and_then(|p| p.pointers.root(ns)) else {
@@ -1139,12 +1128,10 @@ impl Gateway {
                     hash: root,
                     namespace: Some(ns),
                 };
-                let response = self.site(req, site).await;
-                return gateway.with_policy(response);
+                return Self::with_policy(self.site(req, site).await);
             }
             Some(Route::Bare) | None => {}
         }
-        let authorized = self.authorized(req.headers());
         let path = req.uri().path().to_owned();
         let method = req.method().clone();
         let target = req
@@ -1175,7 +1162,7 @@ impl Gateway {
             ),
             (Method::HEAD, _) => head_refused(),
             (Method::GET, _) => {
-                self.content(req.headers(), authorized, target.trim_start_matches('/'))
+                self.content(req.headers(), target.trim_start_matches('/'))
                     .await
             }
             _ => text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
@@ -1222,13 +1209,11 @@ impl Gateway {
     }
 
     /// The site policy on `response`.
-    fn with_policy(&self, mut response: Response<Body>) -> Response<Body> {
-        let policy = site::content_security_policy(&self.sites);
-        if let Ok(policy) = header::HeaderValue::from_str(&policy) {
-            response
-                .headers_mut()
-                .insert(header::CONTENT_SECURITY_POLICY, policy);
-        }
+    fn with_policy(mut response: Response<Body>) -> Response<Body> {
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            header::HeaderValue::from_static(site::CONTENT_SECURITY_POLICY),
+        );
         response
     }
 
@@ -1255,7 +1240,7 @@ impl Gateway {
         // A public gateway serves anyone: the browser's headers decide
         // nothing there, and `curl` sends none.
         if !self.public()
-            && let Err((status, why)) = site::may_spend(headers, self.authorized(headers))
+            && let Err((status, why)) = site::may_spend(headers)
         {
             return text(status, why);
         }
@@ -1408,13 +1393,6 @@ impl Gateway {
             "{}/{path}",
             self.sites.origin(&self.sites.site_host(&site))
         ))
-    }
-
-    fn authorized(&self, headers: &HeaderMap) -> bool {
-        let Some(token) = self.token.as_deref() else {
-            return false;
-        };
-        carries_token(headers, token)
     }
 
     /// The delegate keys, with every capability expired by now dropped. No
@@ -1583,27 +1561,25 @@ impl Gateway {
             .retire(credential.signer.address(), credential.grant.pool_id);
     }
 
-    async fn content(
-        self: &Arc<Self>,
-        headers: &HeaderMap,
-        authorized: bool,
-        rest: &str,
-    ) -> Response<Body> {
+    /// Content on the bare host. A bundle or an entry opens as its site for
+    /// a browser's navigation, and on a public gateway for every request; a
+    /// loopback gateway serves anything else (a client outside a browser) at
+    /// the bare host. A blob streams from the bare host as bytes.
+    async fn content(self: &Arc<Self>, headers: &HeaderMap, rest: &str) -> Response<Body> {
         let uri: DecdnUri = match format!("decdn:{rest}").parse() {
             Ok(uri) => uri,
             Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
-        let range = range_header(headers);
-        if !authorized {
-            // A browser opens a bundle as its site. On a public gateway a
-            // blob streams from the bare host as bytes.
-            return match uri.target {
-                UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
-                _ if self.public() => self.paid(&uri, Present::Bare, Ask::Get(range)).await,
-                _ => text(StatusCode::UNAUTHORIZED, "token required\n"),
-            };
+        let navigation = headers
+            .get("sec-fetch-mode")
+            .is_some_and(|mode| mode == "navigate");
+        if matches!(uri.target, UriTarget::Bundle | UriTarget::BundleEntry(_))
+            && (navigation || self.public())
+        {
+            return self.to_site(&uri);
         }
-        self.paid(&uri, Present::Bare, Ask::Get(range)).await
+        self.paid(&uri, Present::Bare, Ask::Get(range_header(headers)))
+            .await
     }
 
     /// Serve `uri` as `present` says, paid by [`Self::paying`].

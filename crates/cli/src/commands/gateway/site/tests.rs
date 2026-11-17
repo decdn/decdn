@@ -186,7 +186,7 @@ fn a_site_spends_for_its_own_pages_the_user_and_top_level_navigation() {
             ("sec-fetch-dest", "document"),
         ]),
     ] {
-        assert!(may_spend(&allowed, false).is_ok(), "{allowed:?}");
+        assert!(may_spend(&allowed).is_ok(), "{allowed:?}");
     }
 }
 
@@ -210,40 +210,104 @@ fn other_pages_cannot_make_a_site_spend() {
         ]),
     ] {
         assert_eq!(
-            may_spend(&refused, false).unwrap_err().0,
+            may_spend(&refused).unwrap_err().0,
             StatusCode::FORBIDDEN,
             "{refused:?}"
         );
     }
 }
 
+/// A client outside a browser sends no `Sec-Fetch-Site`, and a site spends
+/// for it.
 #[test]
-fn outside_a_browser_a_site_needs_the_token() {
+fn outside_a_browser_a_site_spends() {
+    assert!(may_spend(&HeaderMap::new()).is_ok());
+    assert!(may_spend(&headers(&[("user-agent", "curl/8.0")])).is_ok());
+}
+
+/// The gateway's own hosts in these tests: its bare host and one site host.
+fn own(host: &str) -> bool {
+    host == "localhost:8484" || host == "abc.localhost:8484"
+}
+
+#[test]
+fn the_browser_gate_refuses_another_site() {
+    let refused = headers(&[("sec-fetch-site", "cross-site"), ("user-agent", "curl/8.0")]);
     assert_eq!(
-        may_spend(&HeaderMap::new(), false).unwrap_err().0,
-        StatusCode::UNAUTHORIZED
-    );
-    assert!(may_spend(&HeaderMap::new(), true).is_ok());
-}
-
-#[test]
-fn the_policy_confines_a_page_to_its_origin_and_the_gateway_api() {
-    let csp = content_security_policy(&loopback());
-    assert!(csp.starts_with("default-src 'self' "), "{csp}");
-    assert!(
-        csp.contains("connect-src 'self' http://127.0.0.1:8484"),
-        "{csp}"
+        browser_gate(&refused, own).unwrap_err(),
+        (
+            StatusCode::FORBIDDEN,
+            "a page on another site may not use the gateway\n"
+        )
     );
 }
 
-/// A public gateway has no API a page may call, so its pages reach only
-/// their own origin.
 #[test]
-fn the_public_policy_names_no_other_origin() {
-    let csp = content_security_policy(&public("https://decdn.test"));
-    assert!(csp.starts_with("default-src 'self' "), "{csp}");
-    assert!(csp.ends_with("connect-src 'self'"), "{csp}");
-    assert!(!csp.contains("http"), "{csp}");
+fn the_browser_gate_refuses_another_origin() {
+    for origin in [
+        "http://evil.test",
+        "https://localhost:8484",
+        "http://localhost:9999",
+        "null",
+    ] {
+        let mut refused = headers(&[("sec-fetch-site", "same-site")]);
+        refused.insert("origin", origin.parse().unwrap());
+        assert_eq!(
+            browser_gate(&refused, own).unwrap_err(),
+            (
+                StatusCode::FORBIDDEN,
+                "a page on another origin may not use the gateway\n"
+            ),
+            "{origin}"
+        );
+    }
+}
+
+#[test]
+fn the_browser_gate_refuses_a_browser_with_no_sec_fetch_site() {
+    for refused in [
+        headers(&[("user-agent", "Mozilla/5.0 (X11)")]),
+        headers(&[("origin", "http://localhost:8484")]),
+    ] {
+        assert_eq!(
+            browser_gate(&refused, own).unwrap_err(),
+            (
+                StatusCode::FORBIDDEN,
+                "a browser that sends no Sec-Fetch-Site may not use the gateway\n"
+            ),
+            "{refused:?}"
+        );
+    }
+}
+
+#[test]
+fn the_browser_gate_passes_own_origins_and_clients_outside_a_browser() {
+    for allowed in [
+        HeaderMap::new(),
+        headers(&[("user-agent", "curl/8.0")]),
+        headers(&[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "http://localhost:8484"),
+            ("user-agent", "Mozilla/5.0 (X11)"),
+        ]),
+        headers(&[
+            ("sec-fetch-site", "same-site"),
+            ("origin", "http://abc.localhost:8484"),
+        ]),
+        headers(&[
+            ("sec-fetch-site", "none"),
+            ("user-agent", "Mozilla/5.0 (X11)"),
+        ]),
+    ] {
+        assert!(browser_gate(&allowed, own).is_ok(), "{allowed:?}");
+    }
+}
+
+#[test]
+fn the_policy_confines_a_page_to_its_origin() {
+    assert!(CONTENT_SECURITY_POLICY.starts_with("default-src 'self' "));
+    assert!(CONTENT_SECURITY_POLICY.ends_with("connect-src 'self'"));
+    assert!(!CONTENT_SECURITY_POLICY.contains("http"));
 }
 
 #[test]

@@ -513,9 +513,6 @@ describe("gatewayLine", () => {
     expect(gatewayLine({ ...base, state: "absent" })).toBe(
       `No gateway at ${url}.`,
     );
-    expect(gatewayLine({ ...base, state: "unauthorized" })).toContain(
-      "--gateway-token-file",
-    );
     expect(gatewayLine({ ...base, state: "error", message: "502" })).toContain(
       "502",
     );
