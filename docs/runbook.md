@@ -978,29 +978,123 @@ over CCTP to the governance chain's `CctpSweepReceiver`, which deposits it into
 `FeeRouter`. The sweep carries the operator's rebate and its vote weight. The
 daemon does not sweep: run it by hand, about once per epoch.
 
+One sweep is a batch of 1 to 32 operators (`MAX_SWEEP_BATCH()`): one CCTP
+transfer on the payment chain and one receive on the governance chain, whose
+cost the batch shares. The batch total, not each share, must reach the pool's
+`minSweep`, so operators with small shares reach it together.
+
 1. Check what each pool holds: `decdn node earnings` prints one `pool …` line
    per `PaymentPool` with the pending protocol share and `minSweep`.
-2. Send it: `decdn node sweep` reads `pending(operator)` and `minSweep()` on
-   every configured pool and calls `sweep(operator)` where the share has
-   reached `minSweep`. `--pool eip155:<chainId>:<address>` sweeps one pool;
-   `--dry-run` sends nothing. The operator keystore pays the gas on each
-   payment chain.
+2. Send it: `decdn node sweep` reads the operator's `pending` and `minSweep()`
+   on every configured pool and calls `sweep([operator])` where the share has
+   reached `minSweep`. To share the receive with other operators, list them
+   with `--with <address>` (repeat it for each). The command reads each listed
+   operator's `pending`, leaves out an operator with nothing pending (the
+   pool skips one too), and sends the batch when its total reaches
+   `minSweep`:
+
+   ```bash
+   decdn node sweep --with 0xAbc… --with 0xDef…
+   ```
+
+   For each pool it prints the batch total, and after the sweep the
+   transaction, the `SweepSent` total and bridge fee, and one line per swept
+   operator with its share and served bytes (`--json` for the same as JSON).
+   `--pool eip155:<chainId>:<address>` sweeps one pool; `--dry-run` sends
+   nothing. The operator keystore pays the gas on each payment chain.
 3. Complete it on the governance chain: `decdn node receive-sweeps` scans each
    pool for the operator's `Swept` events (from the known deployment block, or
-   `--from-block`), reads each message and attestation from Circle's
-   attestation service (`blockchain.cctp_iris_url` or `--iris`; the sandbox
-   `https://iris-api-sandbox.circle.com` on testnets), and calls
-   `CctpSweepReceiver.receiveSweep`. A standard transfer waits for
+   `--from-block`). A batch another operator sent is found too, since
+   `Swept` indexes each operator. For each sweep transaction the command reads
+   the message and attestation from Circle's attestation service once
+   (`blockchain.cctp_iris_url` or `--iris`; the sandbox
+   `https://iris-api-sandbox.circle.com` on testnets) and calls
+   `CctpSweepReceiver.receiveSweep` once for the whole batch. Each line names
+   the batch size and the operator's share. A standard transfer waits for
    source-chain finality, so the attestation can stay pending for many
    minutes: the command waits about half an hour, then reports `pending`, and
-   a re-run completes it. A sweep already received reports
-   `already_received`. To complete one known sweep, pass
-   `--pool <caip10> --tx <sweep tx hash>`.
+   a re-run completes it. A sweep already received, by this operator or
+   another one of the batch, reports `already_received`. To complete one
+   known sweep, pass `--pool <caip10> --tx <sweep tx hash>`.
 
 The command needs `blockchain.cctp_sweep_receiver_address` (or
 `--cctp-sweep-receiver-address`). `decdn node doctor` checks that each pool's
 `sweepRecipient()` equals it: a mismatch means the pool belongs to another
 deployment, and its sweeps land where this governance chain never sees them.
+
+### CCTP outage
+
+The protocol share travels from each payment chain to the governance chain
+over CCTP standard transfers. An outage of CCTP delays the protocol share
+only. It does not stop serving, payment or governance.
+
+**What keeps working:**
+
+- Clients pay and nodes serve. Each redemption pays the operator its
+  `operatorBps` share on the payment chain, with no bridge.
+- Nothing is lost. A sweep that already burned waits for its attestation,
+  and standard CCTP messages never expire. A share not yet swept stays in the
+  pool's `pending`.
+- Governance keeps its quorum. Vote weight is the served bytes of the last
+  `windowEpochs` epochs (13 weekly epochs by default), and quorum is a
+  fraction of the same window total. An outage lowers both together.
+
+**Detect:**
+
+1. `decdn node receive-sweeps` reports attestations as `pending` for hours.
+2. Circle's status page confirms the outage.
+3. If Circle has paused the burn side, `decdn node sweep` reverts and the
+   share stays in `pending`. Nothing needs undoing.
+
+**Keep governance working:**
+
+Each week of outage removes about 1/`windowEpochs` of the new weight. Before
+a vote that must pass, or once the outage reaches 4 to 6 weeks, operators
+that need weight deposit USDC directly into `FeeRouter` on the governance
+chain. `$USDC` is the governance chain's USDC, `$FEE_ROUTER` the `FeeRouter`,
+`$OPERATOR` the operator address the weight is for, `$AMOUNT` the deposit in
+micro-USDC and `$BYTES` the served bytes it credits:
+
+```bash
+cast send $USDC "approve(address,uint256)" $FEE_ROUTER $AMOUNT --rpc-url $GOVERNANCE_RPC --account <operator>
+cast send $FEE_ROUTER "deposit(address,uint256,uint256)" $OPERATOR $BYTES $AMOUNT --rpc-url $GOVERNANCE_RPC --account <operator>
+```
+
+- Size `$BYTES` to about one normal epoch of the operator's traffic.
+- Only an operator `CapacityBond` reports as active earns the credit and the
+  rebate.
+- The credit is at most `net × 1 MiB / deliveryFloor`, and the capacity clamp
+  applies. `net` is the part of the deposit that is not rebated; the rebate
+  returns to the operator in the same transaction.
+- At least two active operators must deposit. The share cap sizes each
+  operator's weight from the other operators' bytes, so one depositor alone
+  gets no weight.
+- The credit counts after its arrival epoch fully elapses.
+
+**Recover:**
+
+1. When attestations complete again, list the backlog with
+   `decdn node receive-sweeps --dry-run`.
+2. Receive the backlog about one epoch's worth per epoch, with
+   `decdn node receive-sweeps --pool <caip10> --tx <sweep tx hash>` for the
+   sweeps of that epoch. Bytes count in the epoch they arrive, and the
+   capacity clamp limits each operator's credit per epoch. A backlog of
+   several weeks received in one epoch loses most of its weight credit; the
+   USDC still arrives. Messages never expire, so a later receive costs
+   nothing.
+3. Resume normal batched sweeps (`decdn node sweep`, with `--with` for the
+   operators that share the receive).
+
+**If CCTP leaves a payment chain for good:**
+
+1. Deploy a `PaymentPoolBase` variant on another bridge that authenticates
+   the source pool, and its governance-chain adapter (ADR 016 § Bridge
+   adapters). `FeeRouter` does not change.
+2. Nodes replace the old pool with the new one in
+   `[[blockchain.payment_chains]].payment_pools`. Clients open pools on the
+   new contract.
+3. A share still unswept in the old pool stays there. Frequent batched sweeps
+   keep that amount small.
 
 ## Testnet faucet
 

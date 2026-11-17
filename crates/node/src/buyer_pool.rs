@@ -1423,7 +1423,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// # Errors
     ///
     /// Returns an error if the `usdc()` self-check call fails (a bad
-    /// `payment_pool_address` or an unreachable RPC), if the persisted buyer
+    /// `payment_pools` entry or an unreachable RPC), if the persisted buyer
     /// pools cannot be loaded, or if the one-time approval transaction fails.
     /// The runtime treats the error as non-fatal: the node serves, and only its
     /// paid node-to-node cache-miss leg is off.

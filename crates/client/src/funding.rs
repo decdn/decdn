@@ -985,7 +985,7 @@ where
     anyhow::ensure!(
         pool.owner != Address::ZERO,
         "pool {pool_id} named by the capability does not exist on this PaymentPool contract \
-         ({}) — wrong --payment-pool-address/chain, or a stale token",
+         ({}): a capability for another payment pool (--pool), or a stale token",
         deployment.payment_pool,
     );
 
