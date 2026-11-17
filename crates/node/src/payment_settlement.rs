@@ -8,24 +8,24 @@
 //! lane, `redeemMany` for a batch — plus register-once of each signer's
 //! capability on that signer's first redemption.
 //!
-//! - **Paid-watermark watcher.** The paid side of every lane is driven by
-//!   consuming `PoolRedeemed` events filtered on this node's own `provider`
-//!   address (ADR 003 § Tracking owed vs. paid): each event sets the lane's paid
-//!   cumulative to `newPaidCumulative` and mirrors it onto the durable
-//!   `LaneState::paid_cumulative` row. `PoolToppedUp` re-drives a pool's lanes
-//!   (a dry pool may have left `owed > paid`), and `PoolReclaimed` forgets the
-//!   pool's lanes. The watcher reconciles like every other chain watcher —
-//!   enumerate `PoolRedeemed` from a pinned block, then tail live, resyncing on a
-//!   missed range — so paid is rebuilt from the event log, never guessed. That
-//!   forward rebuild starts at the poller's persisted cursor, so bootstrap first
-//!   rehydrates the paid cache from the durable lane rows: a restart carries
-//!   forward every redemption behind the cursor instead of re-submitting those
-//!   lanes for silent on-chain no-ops (#2052). The same
-//!   scan also folds the serve path's pool solvency/funder projection
-//!   ([`crate::pool_view::PoolProjection`]): `PoolOpened`/`PoolToppedUp` set a
-//!   pool's `{owner, deposit}`, `PoolRedeemed` for every provider draws down its
-//!   pool-wide `totalRedeemed`, and `PoolReclaimed` drops it — so a serve request
-//!   reads `{owner, remaining}` in-memory instead of through a `getPool` `eth_call`.
+//! The node reads every `PaymentPool` quantity by `eth_call`; it reads no event
+//! log (ADR 003 § Tracking owed vs. paid).
+//!
+//! - **Paid watermarks.** The paid side of every lane comes from the node's own
+//!   `redeemMany` receipts: each `PoolRedeemed` the receipt carries for this
+//!   provider sets the lane's paid cumulative to `newPaidCumulative` and mirrors
+//!   it onto the durable `LaneState::paid_cumulative` row, from which bootstrap
+//!   rehydrates the cache (#2052). Before every submit a `getWatermarks` read
+//!   (`reconcile_onchain_watermarks`) raises the cache to the chain's value,
+//!   so a receipt the node missed or another redeemer's landing never costs a
+//!   no-op `redeemMany`.
+//! - **Pool reads.** The serve path's `{owner, remaining, lifecycle}` comes from
+//!   `getPool` reads held in a [`PoolProjection`]: one on an admission that
+//!   holds no fresh read, and a refresh every
+//!   [`crate::pool_view::POOL_REFRESH_INTERVAL`] of every
+//!   pool with a live lane, with a `getAuthorizations` read of that pool's live
+//!   signers. The redeemer reads `getPool` before a submit for a pool it holds
+//!   no fresh read of. A read that finds a pool `Closed` forgets its lanes.
 //! - **Redemption (per-chunk floor + on-shutdown).** On a redeem hint (a
 //!   [`LaneKey`]) emitted by the voucher-accept path, the node reads the lane's
 //!   owed voucher and its cached paid watermark and plans the lane for
@@ -56,54 +56,43 @@
 //!   the per-chunk floor is left for the owner to reclaim — spending more gas than
 //!   it recovers is not worth it — and a node offline for the whole grace window
 //!   forfeits its unredeemed vouchers, a node-ops failure, not a protocol gap.
-//!   The sink does fold `PoolCloseInitiated` into the projection (marking the pool
-//!   `Closing` with its deadline) so the redeemer's solvency gate drops a drained
-//!   lane, or one whose deadline falls within the landing slack, instead of
-//!   submitting a `redeemMany` that reverts `PoolClosed`.
+//!   The pre-submit pool read gives the redeemer the pool's lifecycle, so it
+//!   drops a drained lane, or one whose deadline falls within the landing
+//!   slack, instead of submitting a `redeemMany` that reverts `PoolClosed`.
 //!
 //! Buyer-side `openPool`/`topUp`/`reclaim` (node→node cache-miss pulls) is out of
-//! scope here. The paid-watermark watcher is a [`Route`] the runtime registers on
-//! the shared multiplexed poller (which owns the loop, cursor, and shutdown); the
-//! service itself owns only the redeemer [`JoinHandle`], aborted on shutdown or
-//! drop.
+//! scope here. The service owns the redeemer and the pool refresh as
+//! [`JoinHandle`]s, aborted on shutdown or drop.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy::contract::Error as ContractError;
-use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::Log;
-use alloy::sol_types::SolEvent;
+use alloy::rpc::types::TransactionReceipt;
 use anyhow::{Context, Result};
 use decdn_common::config::{REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
-use decdn_incentive::{
-    CheckpointKey, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore,
-    SettlementLedger, StoreError,
-};
+use decdn_incentive::{Deployment, LaneKey, LaneState, PoolId, PoolStateStore, SettlementLedger};
 use futures_util::StreamExt as _;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{Instrument as _, debug, error, info, warn};
 
 use crate::chain_events::boot_retry::BootRetry;
-use crate::chain_events::multiplexed_poller::{Route, SinkSource};
-use crate::chain_events::resumable_watcher::{Checkpoint, ColdStart, CursorStart, LogSink};
-use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
+use crate::chain_events::timed;
 use crate::handlers::client::ClientHandler;
-use crate::metrics::{Metrics, metric_hook};
+use crate::metrics::Metrics;
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
-use crate::pool_view::{
-    Lifecycle, PoolProjection, PoolRead, PoolStatus, ReanchorSkip, ReanchorStale,
-};
-use crate::settlement_ledger::{LedgerBackfills, SettlementRecorder};
+use crate::pool_view::{Lifecycle, POOL_REFRESH_INTERVAL, PoolProjection, PoolStatus};
+use crate::settlement_ledger::SettlementRecorder;
 use decdn_incentive::payment_pool::SignerAuthorization;
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
@@ -159,27 +148,17 @@ impl NegativeReason {
 /// than growing the cache without limit.
 const RESOLVE_NEGATIVE_CACHE_MAX: usize = 4096;
 
-/// How long an admit-path `Unregistered` read stays fresh in the signer-auth
-/// cache. Any provider's next redemption registers the signer, and a
-/// registration that pays no lane emits no event the projection can fold, so
-/// only a re-read sees it. Inside the window the node admits the signer on its
-/// presented capability; the on-chain `redeemMany` pays `min(desired, cap −
-/// spent)` and never over-cashes. A `Registered` read has no window: see
-/// [`AuthRead`].
-const UNREGISTERED_AUTH_TTL: Duration = Duration::from_mins(1);
-
 /// Cap on the admit-path signer-auth cache, bounding its memory against a flood of
 /// distinct `(pool, signer)` pairs. At the cap an insert first prunes lapsed
-/// `Unregistered` reads, then evicts the oldest read, so the map never grows
-/// without bound and an evicted signer pays one `getAuthorization` on its next
-/// admit.
+/// reads, then evicts the oldest read, so the map never grows without bound and
+/// an evicted signer pays one `getAuthorization` on its next admit.
 const AUTH_CACHE_MAX: usize = 4096;
 
 /// How many admit-path chain reads (`getPool`, `getAuthorization`) may be in
 /// flight at once, across every pool and signer. Each distinct key coalesces to
 /// one read, but a flood of distinct pool ids or signers would otherwise send
 /// one read each at once and spend the operator's RPC quota, and a stalled
-/// watcher then refuses every serve. A read's own timeout starts once it holds
+/// provider then refuses every serve. A read's own timeout starts once it holds
 /// a slot.
 const ADMIT_CHAIN_READ_CONCURRENCY: usize = 16;
 
@@ -190,21 +169,17 @@ const ADMIT_CHAIN_READ_CONCURRENCY: usize = 16;
 /// the 10 s read timeout, so a refused request waits less than one read could.
 const ADMIT_CHAIN_READ_SLOT_WAIT: Duration = Duration::from_secs(5);
 
-/// One admit-path `getAuthorization` read held in the signer-auth cache.
+/// One `getAuthorization` read held in the signer-auth cache.
 ///
-/// A `Registered` read never goes stale. Its `cap` and `expiry` are write-once,
-/// and its `spent` moves only by redemptions, which the projection folds from
-/// every provider's `PoolRedeemed`. The live `spent` is the read's `spent` plus
-/// what the projection folded for the signer since the read. The baseline is
-/// taken before the read is sent, so a redemption folded while the read is in
-/// flight may count twice: the error makes `spent` high, which refuses near the
-/// cap rather than over-admits.
+/// A registered signer's `cap` and `expiry` are write-once, but its `spent`
+/// grows with every provider's redemption, and an unregistered signer may
+/// register on any provider's next redemption. So a read answers admission for
+/// [`POOL_REFRESH_INTERVAL`] only; the settlement service re-reads every live
+/// signer at that cadence.
 #[derive(Clone, Copy, Debug)]
 struct AuthRead {
     /// What the chain answered.
     auth: SignerAuthorization,
-    /// The projection's folded `spent` for the signer when the read was sent.
-    folded_at_read: u64,
     /// When the read landed.
     at: Instant,
 }
@@ -212,53 +187,34 @@ struct AuthRead {
 /// What the signer-auth cache holds for one `(pool, signer)` at an admit.
 #[derive(Debug, PartialEq, Eq)]
 enum CachedAuth {
-    /// A usable answer, with a registered `spent` brought up to the fold.
+    /// A read younger than [`POOL_REFRESH_INTERVAL`].
     Fresh(SignerAuthorization),
-    /// An `Unregistered` read past [`UNREGISTERED_AUTH_TTL`], or one the
-    /// projection has since seen the signer redeem: the signer may be
-    /// registered now.
+    /// An older read: the signer's terms may have moved since.
     Lapsed,
     /// No read is held for the pair.
     Absent,
 }
 
-/// Classify a held read against the projection's current fold for the signer.
-/// Pure, so the freshness rules are unit-testable without a provider.
-fn cached_auth(read: Option<&AuthRead>, folded_now: u64) -> CachedAuth {
-    let Some(read) = read else {
-        return CachedAuth::Absent;
-    };
-    let folded_since = folded_now.saturating_sub(read.folded_at_read);
-    match read.auth {
-        SignerAuthorization::Registered { cap, expiry, spent } => {
-            CachedAuth::Fresh(SignerAuthorization::Registered {
-                cap,
-                expiry,
-                spent: spent.saturating_add(folded_since),
-            })
-        }
-        SignerAuthorization::Unregistered
-            if folded_since == 0 && read.at.elapsed() < UNREGISTERED_AUTH_TTL =>
-        {
-            CachedAuth::Fresh(SignerAuthorization::Unregistered)
-        }
-        SignerAuthorization::Unregistered => CachedAuth::Lapsed,
+/// Classify a held read by its age. Pure, so the freshness rule is
+/// unit-testable without a provider.
+fn cached_auth(read: Option<&AuthRead>) -> CachedAuth {
+    match read {
+        None => CachedAuth::Absent,
+        Some(read) if read.at.elapsed() < POOL_REFRESH_INTERVAL => CachedAuth::Fresh(read.auth),
+        Some(_) => CachedAuth::Lapsed,
     }
 }
 
-/// Store `read` for `key`. At [`AUTH_CACHE_MAX`], prune lapsed `Unregistered`
-/// reads first; if the cache is still full, evict the oldest read. Pure, so the
-/// bound is unit-testable.
+/// Store `read` for `key`. At [`AUTH_CACHE_MAX`], prune lapsed reads first; if
+/// the cache is still full, evict the oldest read. Pure, so the bound is
+/// unit-testable.
 fn remember_auth(
     cache: &mut HashMap<(B256, Address), AuthRead>,
     key: (B256, Address),
     read: AuthRead,
 ) {
     if cache.len() >= AUTH_CACHE_MAX && !cache.contains_key(&key) {
-        cache.retain(|_, r| {
-            matches!(r.auth, SignerAuthorization::Registered { .. })
-                || r.at.elapsed() < UNREGISTERED_AUTH_TTL
-        });
+        cache.retain(|_, r| r.at.elapsed() < POOL_REFRESH_INTERVAL);
         if cache.len() >= AUTH_CACHE_MAX
             && let Some(oldest) = cache.iter().min_by_key(|(_, r)| r.at).map(|(k, _)| *k)
         {
@@ -367,28 +323,14 @@ fn next_sweep_at(next_tick_at: u64, next_cutoff: Option<u64>) -> u64 {
     next_cutoff.map_or(next_tick_at, |cutoff| cutoff.min(next_tick_at))
 }
 
-/// Debounce thresholds for the watcher scan checkpoint (#784). The persisted
-/// checkpoint is only a *floor* for the resume backfill: the resumable watcher's
-/// `resolve_persisted_start` rounds it down by `REORG_MARGIN_BLOCKS` and every
-/// sink is idempotent, so a checkpoint that lags the true scan position by a
-/// bounded amount only ever *widens* the next rescan, never narrows it. `512` is
-/// chosen so a backlog drain fsyncs ~once per 512 blocks instead of per block.
-const CHECKPOINT_FLUSH_BLOCKS: u64 = 512;
-
-/// Time-based companion to [`CHECKPOINT_FLUSH_BLOCKS`]: even a slow trickle of
-/// events persists at least this often, bounding how many blocks a crash
-/// re-scans when block-cadence alone would defer the write indefinitely.
-const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-
 /// In-memory index of every lane's paid-cumulative watermark, keyed by
 /// [`LaneKey`], read by the redeemer to compute `unredeemed = owed − paid`
-/// (ADR 003 § Tracking owed vs. paid). Written by the `PoolRedeemed` watcher,
-/// which mirrors every update onto the durable `LaneState::paid_cumulative` row
-/// in the same breath. The durable field is the source of truth; this cache is
-/// rehydrated from it at bootstrap ([`PoolSettlementService::bootstrap`]) so a
-/// restart carries forward redemptions that landed before the log-poller's
-/// persisted cursor, instead of re-submitting those lanes for silent on-chain
-/// no-ops (#2052).
+/// (ADR 003 § Tracking owed vs. paid), through `lane_paid`, which takes the
+/// higher of this cache and the lane row. The node's own `redeemMany` receipts
+/// and each pre-submit `getWatermarks` read raise the row (`record_paid`);
+/// bootstrap rehydrates this cache from the rows
+/// ([`PoolSettlementService::bootstrap`]) so a restart does not re-plan lanes
+/// already redeemed (#2052).
 ///
 /// A `std::sync::Mutex`: the guard is only ever held to read/insert a single
 /// entry, never across an `.await`.
@@ -410,8 +352,7 @@ impl std::fmt::Debug for PaidWatermarks {
 }
 
 impl PaidWatermarks {
-    /// Set a lane's paid cumulative to the `PoolRedeemed` event's
-    /// `newPaidCumulative`. Monotone on-chain, so this only ever advances.
+    /// Set a lane's paid cumulative in the cache.
     fn set(&self, key: LaneKey, paid: U256) {
         self.inner
             .lock()
@@ -420,10 +361,10 @@ impl PaidWatermarks {
     }
 
     /// A lane's paid cumulative, or `U256::ZERO` if none is cached — no
-    /// `PoolRedeemed` has landed for it this run and the bootstrap rehydration
+    /// redemption has landed for it this run and the bootstrap rehydration
     /// found no durable watermark (a never-redeemed lane). `ZERO` is the safe
-    /// over-estimate of `unredeemed`: the on-chain redeem caps the increment and
-    /// the event then corrects both the cache and the durable row.
+    /// over-estimate of `unredeemed`: the pre-submit `getWatermarks` read
+    /// corrects it before any gas is spent.
     fn get(&self, key: &LaneKey) -> U256 {
         self.inner
             .lock()
@@ -433,12 +374,65 @@ impl PaidWatermarks {
             .unwrap_or(U256::ZERO)
     }
 
-    /// Drop a reclaimed pool's lane from the cache.
+    /// Drop a closed pool's lane from the cache.
     fn forget(&self, key: &LaneKey) {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
+    }
+}
+
+/// Raise a lane's paid watermark on its lane row
+/// (`LaneState::paid_cumulative`, monotone). The write is buffered like
+/// `record`, and the periodic lane flush fsyncs it; planning reads it at once
+/// ([`lane_paid`]). A refused write is logged: the next pre-submit
+/// `getWatermarks` read restores the value.
+fn record_paid(store: &dyn PoolStateStore, key: LaneKey, value: U256) {
+    if let Err(err) = store.set_paid_cumulative(key, value) {
+        warn!(
+            error = %err,
+            pool_id = %key.pool_id,
+            signer = %key.signer,
+            "failed to record a lane paid watermark"
+        );
+    }
+}
+
+/// A lane's paid cumulative: the higher of the boot cache and the lane row,
+/// which the node's own receipts and the pre-submit `getWatermarks` read raise.
+fn lane_paid(paid: &PaidWatermarks, st: &LaneState) -> U256 {
+    paid.get(&st.key()).max(st.paid_cumulative)
+}
+
+/// Raise the paid watermark of every own lane a landed `redeemMany` paid, from
+/// the `PoolRedeemed` logs `pool` emitted in its receipt. A log of another
+/// contract or provider, or one that does not decode, is skipped.
+fn record_receipt_paid(
+    store: &dyn PoolStateStore,
+    pool: Address,
+    self_address: Address,
+    receipt: &TransactionReceipt,
+) {
+    for log in receipt.logs() {
+        if log.address() != pool {
+            continue;
+        }
+        let Ok(event) = log.log_decode::<PaymentPool::PoolRedeemed>() else {
+            continue;
+        };
+        let event = event.inner.data;
+        if event.provider != self_address {
+            continue;
+        }
+        for lane in &event.lanes {
+            let key = LaneKey {
+                pool_id: event.poolId,
+                signer: lane.signer,
+                provider: event.provider,
+            };
+            record_paid(store, key, U256::from(lane.newPaidCumulative));
+        }
     }
 }
 
@@ -456,11 +450,8 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     metrics: Arc<Metrics>,
     pool_view: PoolProjection,
     /// Writes the settlement ledger row for every `redeemMany` that lands
-    /// (#2598); shared with the redeemer task and the `PoolRedeemed` sink.
+    /// (#2598); shared with the redeemer task.
     recorder: SettlementRecorder,
-    /// The ledger backfills the `PoolRedeemed` sink has started; shutdown
-    /// drains them so a stop mid-catch-up does not lose their rows.
-    backfills: LedgerBackfills,
     /// The redeemer's published sweep schedule, read by `admin_v1_earnings`.
     schedule: RedeemSchedule,
     /// The redemption task handle. Held so shutdown can abort+await it before a
@@ -468,6 +459,9 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     /// impl aborts whatever remains. A `std::sync::Mutex` (not `tokio`): the guard
     /// is only ever held to `take()` the handle, never across an `.await`.
     redeemer: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The live-pool refresh task ([`pool_refresh_loop`]), aborted on shutdown
+    /// or drop.
+    refresher: JoinHandle<()>,
 }
 
 /// Startup self-check: a cheap immutable view confirms the configured address
@@ -488,22 +482,21 @@ async fn usdc_self_check<P: Provider + Clone>(
 }
 
 impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
-    /// Bootstrap the service: self-check the contract, spawn the redemption
-    /// task, and return the service alongside the paid-watermark [`Route`] the
-    /// runtime registers on the shared multiplexed poller.
+    /// Bootstrap the service: self-check the contract, recover the receipts of
+    /// `redeemMany`s sent before a crash, forget the lanes of pools closed while
+    /// the node was down, and spawn the redemption and live-pool refresh tasks.
     ///
     /// # Errors
     ///
     /// Returns an error if the `usdc()` self-check fails deterministically — a
-    /// bad `payment_pool_address` is fatal at bring-up — or if `boot`'s budget
+    /// bad payment pool address is fatal at bring-up — or if `boot`'s budget
     /// runs out on transient RPC failures.
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap(
         provider: P,
-        payment_pool_addr: Address,
+        deployment: Deployment,
         self_address: Address,
         store: Arc<dyn PoolStateStore>,
-        checkpoint_store: Arc<dyn KeyedCheckpointStore>,
         ledger: Arc<dyn SettlementLedger>,
         handler: Arc<ClientHandler>,
         redeem_threshold: U256,
@@ -511,17 +504,28 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         redeem_interval: Duration,
         metrics: Arc<Metrics>,
         boot: &BootRetry,
-        pool_view: PoolProjection,
+        view: Arc<ResolvingPoolView<P>>,
         redeem_tx: mpsc::Sender<LaneKey>,
         redeem_rx: mpsc::Receiver<LaneKey>,
-    ) -> Result<(Self, Route)> {
+        operator_bps: u16,
+    ) -> Result<Self> {
+        let payment_pool_addr = deployment.payment_pool;
         let contract = PaymentPool::new(payment_pool_addr, provider);
-        // One recorder for both ledger writers: the redeemer (receipt in hand)
-        // and the `PoolRedeemed` sink (backfill of a landing it never saw).
-        let recorder = SettlementRecorder::new(ledger, self_address, Arc::clone(&metrics));
         let schedule = RedeemSchedule::default();
+        let pool_view = view.projection().clone();
 
         let usdc_token = usdc_self_check(&contract, boot).await?;
+        // It reads the operator's income as the pool's `usdc()` transfer to it.
+        let recorder = SettlementRecorder::new(
+            ledger,
+            self_address,
+            crate::settlement_ledger::LedgerSource {
+                deployment,
+                usdc: usdc_token,
+                operator_bps,
+            },
+            Arc::clone(&metrics),
+        );
         info!(
             %payment_pool_addr,
             %usdc_token,
@@ -530,56 +534,35 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         );
 
         // Rehydrate the cache from the durable lane records BEFORE the redeemer
-        // starts, so a restart does not forget redemptions that landed before the
-        // log-poller's persisted cursor (#2052).
+        // starts, so a restart does not re-plan lanes already redeemed (#2052).
         let paid = rehydrate_paid_watermarks(store.as_ref(), self_address);
 
-        // Paid-watermark watcher on the resumable `eth_getLogs` poller. The
-        // backfill floor and downtime-gap resume are the cursor start's job: a
-        // persisted `PoolRedeemed` checkpoint resumes across restarts; a
-        // first-ever boot (cold store) anchors at head. `PoolRedeemed` is the
-        // single write path for the paid side, so a drained-pool partial pay is
-        // recorded exactly — the node never assumes its voucher cleared.
-        let backfills = LedgerBackfills::new(recorder.clone());
-        let sink = PoolSettlementSink {
+        // A `redeemMany` sent before a crash or a timed-out wait still owes
+        // its ledger row and its paid watermarks.
+        recorder.recover_sent(contract.provider()).await;
+
+        // Forget the lanes of every pool an owner reclaimed while the node was
+        // down; a lane on a pool it holds no fresh read of is read here once.
+        let closed = ClosedPools {
+            deployment,
             self_address,
+            handler: Arc::clone(&handler),
             store: Arc::clone(&store),
-            handler,
             paid: paid.clone(),
-            redeem_tx: redeem_tx.clone(),
-            metrics: Arc::clone(&metrics),
-            pool_view: pool_view.clone(),
-            contract: contract.clone(),
-            backfills: backfills.clone(),
-            reanchor_cursor: None,
-            applied_through: 0,
         };
-        let route = Route {
-            addresses: vec![payment_pool_addr],
-            topic0s: settlement_route_topic0s(),
-            // The durable `PoolOpened` checkpoint resumes across restarts; a
-            // first-ever boot (cold store) anchors at head. The poller flushes
-            // this checkpoint on shutdown (via `CursorStart::flush`).
-            start: cursor_start(Arc::clone(&checkpoint_store)),
-            // This sink observes no shutdown token, so it registers a `Ready`
-            // sink; its own follow-up reads/writes ride the wallet contract it
-            // holds, independent of the poller's read-only get_logs provider.
-            sink: SinkSource::Ready(Box::new(sink)),
-            label: "settlement",
-            on_established: Some(metric_hook(
-                &metrics,
-                Metrics::settlement_watcher_cycle_established,
-            )),
-            on_backoff: Some(metric_hook(
-                &metrics,
-                Metrics::settlement_watcher_backoff_started,
-            )),
-            on_tick_success: Some(metric_hook(&metrics, Metrics::settlement_watcher_tick)),
-            on_task_panic: Some(metric_hook(
-                &metrics,
-                Metrics::settlement_watcher_task_panicked,
-            )),
-        };
+        if let Some(states) = load_lanes(store.as_ref()) {
+            let pools: Vec<PoolId> = states
+                .iter()
+                .filter(|st| st.provider == self_address)
+                .map(|st| st.pool_id)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let _faulted = read_pools(&contract, &pools, &pool_view).await;
+            closed.drain(&pool_view).await;
+        }
+
+        let refresher = tokio::spawn(pool_refresh_loop(view, handler, deployment, closed));
 
         let redeemer = tokio::spawn(redeemer_loop(
             contract.clone(),
@@ -597,24 +580,21 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             schedule.clone(),
         ));
 
-        Ok((
-            Self {
-                contract,
-                redeem_tx,
-                store,
-                paid,
-                self_address,
-                redeem_threshold,
-                redeem_max_vouchers_per_tx,
-                metrics,
-                pool_view,
-                recorder,
-                backfills,
-                schedule,
-                redeemer: std::sync::Mutex::new(Some(redeemer)),
-            },
-            route,
-        ))
+        Ok(Self {
+            contract,
+            redeem_tx,
+            store,
+            paid,
+            self_address,
+            redeem_threshold,
+            redeem_max_vouchers_per_tx,
+            metrics,
+            pool_view,
+            recorder,
+            schedule,
+            redeemer: std::sync::Mutex::new(Some(redeemer)),
+            refresher,
+        })
     }
 
     /// The redeemer's sweep schedule, for `admin_v1_earnings`'s "next sweep
@@ -633,24 +613,13 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         self.redeem_tx.clone()
     }
 
-    /// Graceful shutdown: quiesce the redeemer, run one final best-effort
-    /// redeem sweep bounded by `deadline` so a lane whose chunk has cleared the
-    /// floor is not left un-redeemed across the stop, then wait out the ledger
-    /// backfills still in flight within what is left of `deadline`, so the
-    /// rows the poller's checkpoint has already moved past are not lost with
-    /// the process. One `deadline` bounds both. A pool is owner-closed only,
-    /// so there is nothing to close here — only redeem.
-    ///
-    /// The paid-watermark watcher is now the shared multiplexed poller's route,
-    /// not a service-owned task: the runtime cancels the poller (which triggers an
-    /// async, best-effort flush of this route's `PoolOpened` scan checkpoint via
-    /// `CursorStart::flush`) before calling this, but only cancels the token — it
-    /// does not await the poller's exit — so that flush is not guaranteed to
-    /// complete before the final sweep below runs. This is fine: the scan
-    /// checkpoint is independent of the lane-state redeem sweep and idempotent to
-    /// re-scan, so the two can race without a correctness impact.
+    /// Graceful shutdown: stop the pool refresh, quiesce the redeemer, and run
+    /// one final best-effort redeem sweep bounded by `deadline` so a lane whose
+    /// chunk has cleared the floor is not left un-redeemed across the stop. A
+    /// pool is owner-closed only, so there is nothing to close here — only
+    /// redeem.
     pub async fn shutdown(&self, deadline: Duration) {
-        let started = tokio::time::Instant::now();
+        self.refresher.abort();
         self.quiesce_redeemer().await;
         if tokio::time::timeout(deadline, self.final_redeem_sweep())
             .await
@@ -661,9 +630,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 "shutdown redeem deadline elapsed; some lanes left un-redeemed (redeem later)"
             );
         }
-        self.backfills
-            .drain(deadline.saturating_sub(started.elapsed()))
-            .await;
     }
 
     /// One last pass of `redeemMany` chunks over every lane whose chunk clears the
@@ -721,6 +687,7 @@ impl<P: Provider + Clone + 'static> std::fmt::Debug for PoolSettlementService<P>
 
 impl<P: Provider + Clone + 'static> Drop for PoolSettlementService<P> {
     fn drop(&mut self) {
+        self.refresher.abort();
         if let Some(handle) = self
             .redeemer
             .lock()
@@ -774,517 +741,33 @@ fn compact_voucher_signature(sig: &[u8]) -> Result<(B256, B256)> {
     Ok((r, B256::from(vs)))
 }
 
-/// The settlement watcher's cursor start: resume the durable
-/// [`CheckpointKey::PoolOpened`] floor; a first-ever boot (cold store) anchors at
-/// **head** ([`ColdStart::Head`]) — no `PoolRedeemed` toward this node can
-/// predate the node itself, so there is no history to replay.
-fn cursor_start(store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
-    CursorStart::FromCheckpoint {
-        checkpoint: Checkpoint {
-            store,
-            key: CheckpointKey::PoolOpened,
-        },
-        reorg_margin: REORG_MARGIN_BLOCKS,
-        cold_start: ColdStart::Head,
-    }
-}
+/// How many pre-redeem and refresh `getPool` reads run at once.
+const POOL_READ_CONCURRENCY: usize = 8;
 
-/// The settlement route's demux key: every `PaymentPool` lifecycle event the
-/// paid-watermark cache and pool projection need. Split out from
-/// [`PoolSettlementService::bootstrap`] so the exact topic0 set is
-/// unit-testable without a provider — dropping `PoolOpened` here, for example,
-/// would silently blind the projection to newly opened pools.
-fn settlement_route_topic0s() -> Vec<B256> {
-    vec![
-        PaymentPool::PoolOpened::SIGNATURE_HASH,
-        PaymentPool::PoolRedeemed::SIGNATURE_HASH,
-        PaymentPool::PoolToppedUp::SIGNATURE_HASH,
-        PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
-        PaymentPool::PoolReclaimed::SIGNATURE_HASH,
-    ]
-}
+/// Bound on each pre-redeem and refresh `getPool` read. A hung endpoint costs
+/// one wave of reads, whose first fault stops the batch.
+const POOL_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Applies `PaymentPool` settlement logs to the paid-watermark cache and pool
-/// projection. One per settlement watcher; the resumable `eth_getLogs`
-/// poller feeds it block-ordered logs and advances + persists the scan checkpoint
-/// per window on a clean tick.
-///
-/// Failure policy: paid-watermark updates are in-memory and always `Ok`. A
-/// `PoolReclaimed` forget failure is logged and skipped (`Ok`) — the settled lane
-/// owes nothing and the forget is idempotent. An undecodable log is log-and-skip
-/// so a permanently undecodable log never hot-loops the deterministic re-scan.
-struct PoolSettlementSink<P: Provider + Clone> {
+/// The lanes of a pool a read found `Closed` (the owner reclaimed it), and the
+/// handler state that tracks them. Forgetting them keeps the lane store from
+/// growing with every pool this node ever served.
+struct ClosedPools {
+    deployment: Deployment,
     self_address: Address,
-    store: Arc<dyn PoolStateStore>,
     handler: Arc<ClientHandler>,
+    store: Arc<dyn PoolStateStore>,
     paid: PaidWatermarks,
-    redeem_tx: mpsc::Sender<LaneKey>,
-    metrics: Arc<Metrics>,
-    /// The serve path's pool solvency/funder view. This sink is its single writer:
-    /// it folds `PoolOpened` (owner + deposit), `PoolToppedUp` (new deposit),
-    /// `PoolRedeemed` for EVERY provider (pool-wide `totalRedeemed`),
-    /// `PoolCloseInitiated` (mark `Closing` with its deadline), and `PoolReclaimed`
-    /// (drop) into the projection so a serve request reads `{owner, remaining}`
-    /// in-memory rather than through a `getPool` `eth_call`. At the end of each
-    /// tick it re-reads the snapshot-seeded pools that are pending
-    /// (`reanchor_pools`).
-    pool_view: PoolProjection,
-    /// The `PaymentPool` instance; the backfill's receipt and header reads and
-    /// the end-of-tick re-anchor reads ride its provider.
-    contract: PaymentPool::PaymentPoolInstance<P>,
-    /// Backfills a settlement ledger row (#2598) for an own-provider
-    /// `PoolRedeemed` whose `redeemMany` the redeemer never saw land, each on
-    /// its own task; the service drains them at shutdown.
-    backfills: LedgerBackfills,
-    /// The last pool `reanchor_pools` attempted, so the next tick starts after it
-    /// and every pending pool gets its turn.
-    reanchor_cursor: Option<B256>,
-    /// The highest block of any log this sink has applied, including logs for a
-    /// pool the projection did not hold yet. A re-anchor read pinned below it
-    /// could miss such a log, so `reanchor_pools` skips it.
-    applied_through: u64,
 }
 
-impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
-    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-    async fn apply(&mut self, log: Log) -> Result<()> {
-        if let Some(block) = log.block_number {
-            self.applied_through = self.applied_through.max(block);
-        }
-        match log.topic0().copied() {
-            Some(sig) if sig == PaymentPool::PoolOpened::SIGNATURE_HASH => {
-                // Projection-only: `PoolOpened` seeds the serve path's owner +
-                // deposit. It carries no settlement effect — this node holds no
-                // lane against a freshly-opened pool until a voucher arrives.
-                let event = match PaymentPool::PoolOpened::decode_log_data(&log.inner.data) {
-                    Ok(event) => event,
-                    Err(err) => {
-                        warn!(error = %err, "skipping undecodable PoolOpened log");
-                        return Ok(());
-                    }
-                };
-                self.pool_view
-                    .record_opened(event.poolId, event.owner, event.deposit);
-                debug!(pool_id = %event.poolId, owner = %event.owner, "projected PoolOpened");
-            }
-            Some(sig) if sig == PaymentPool::PoolRedeemed::SIGNATURE_HASH => {
-                let event = match PaymentPool::PoolRedeemed::decode_log_data(&log.inner.data) {
-                    Ok(event) => event,
-                    Err(err) => {
-                        warn!(error = %err, "skipping undecodable PoolRedeemed log");
-                        return Ok(());
-                    }
-                };
-                // Pool-wide `totalRedeemed` folds EVERY provider's lanes, so the
-                // solvency projection records this event before the own-provider
-                // filter below — the serve path's `remaining` must reflect other
-                // nodes' redemptions against the same pool, not just this node's.
-                self.pool_view.record_redeemed(
-                    event.poolId,
-                    event.provider,
-                    &event.lanes,
-                    log.block_number,
-                );
-                // Not enough to filter on the event signature — `provider` is
-                // an indexed topic but the OR-set filter cannot pin it, so
-                // confirm it names this node before recording the paid watermark.
-                if event.provider != self.self_address {
-                    return Ok(());
-                }
-                // One event carries every lane the batch paid on this pool, so
-                // the watermark write is per entry, not per log.
-                for lane in &event.lanes {
-                    let key = LaneKey {
-                        pool_id: event.poolId,
-                        signer: lane.signer,
-                        provider: event.provider,
-                    };
-                    let paid_cumulative = U256::from(lane.newPaidCumulative);
-                    self.paid.set(key, paid_cumulative);
-                    // Mirror the watermark onto the durable lane record so it
-                    // survives a restart (#2052). Buffered like `record`; the
-                    // periodic lane flush fsyncs it. A no-op for a lane already
-                    // forgotten, and the in-memory cache above stays authoritative
-                    // for this run even if the durable write is refused, so a
-                    // failure only lags durability — log it rather than fail the
-                    // poller apply (whose failure policy is in-memory + always Ok).
-                    if let Err(err) = self.store.set_paid_cumulative(key, paid_cumulative) {
-                        self.metrics.watcher_persist_failure();
-                        warn!(
-                            error = %err,
-                            pool_id = %event.poolId,
-                            signer = %lane.signer,
-                            "failed to persist lane paid watermark; in-memory cache updated, \
-                             durable value lags until the next redemption"
-                        );
-                    }
-                    debug!(
-                        pool_id = %event.poolId,
-                        signer = %lane.signer,
-                        paid_cumulative = lane.newPaidCumulative,
-                        "recorded lane paid watermark from PoolRedeemed"
-                    );
-                }
-                // After the watermark writes, and on its own task.
-                self.backfill_ledger(&log, event.poolId);
-            }
-            Some(sig) if sig == PaymentPool::PoolToppedUp::SIGNATURE_HASH => {
-                let event = match PaymentPool::PoolToppedUp::decode_log_data(&log.inner.data) {
-                    Ok(event) => event,
-                    Err(err) => {
-                        warn!(error = %err, "skipping undecodable PoolToppedUp log");
-                        return Ok(());
-                    }
-                };
-                // Raise the serve path's projected deposit so the solvency gate
-                // reserves against the topped-up balance, not the stale one.
-                self.pool_view
-                    .record_topup(event.poolId, event.newDeposit, log.block_number);
-                // A top-up may re-open lanes a dry pool left `owed > paid`.
-                // Re-drive by hinting the redeemer for each of the pool's lanes
-                // this node provides.
-                self.redrive_pool_lanes(event.poolId);
-            }
-            Some(sig) if sig == PaymentPool::PoolCloseInitiated::SIGNATURE_HASH => {
-                let event = match PaymentPool::PoolCloseInitiated::decode_log_data(&log.inner.data)
-                {
-                    Ok(event) => event,
-                    Err(err) => {
-                        warn!(error = %err, "skipping undecodable PoolCloseInitiated log");
-                        return Ok(());
-                    }
-                };
-                // Mark the pool `Closing` in the projection so the redeemer's
-                // solvency gate reads its dispute deadline: a lane whose pool is
-                // drained or already past the deadline is dropped from planning
-                // instead of submitting a `redeemMany` that reverts `PoolClosed`.
-                // The node runs no force-redeem here — the periodic sweep redeems
-                // every lane worth the gas well inside the grace window.
-                self.pool_view.record_closing(
-                    event.poolId,
-                    u64::try_from(event.disputeDeadline).unwrap_or(u64::MAX),
-                );
-                if self.holds_unredeemed_on(event.poolId) {
-                    self.metrics.pool_grace_close();
-                }
-            }
-            Some(sig) if sig == PaymentPool::PoolReclaimed::SIGNATURE_HASH => {
-                let event = match PaymentPool::PoolReclaimed::decode_log_data(&log.inner.data) {
-                    Ok(event) => event,
-                    Err(err) => {
-                        warn!(error = %err, "skipping undecodable PoolReclaimed log");
-                        return Ok(());
-                    }
-                };
-                // The pool is `Closed` and refunded: drop it from the serve
-                // projection, so a later read refuses the pool at admission and
-                // stops any live stream on it, rather than reserving against a
-                // stale remaining.
-                self.pool_view.forget(event.poolId);
-                self.forget_pool_lanes(event.poolId).await;
-            }
-            // Unreachable today (the filter's topic0 OR-set bounds the inputs);
-            // don't panic (anti-panic policy), log so a future OR-set drift leaves
-            // a greppable trail instead of a silently dropped event.
-            _ => {
-                debug!(topic0 = ?log.topic0(), "unmatched PaymentPool event in subscribed OR-set");
-            }
-        }
-        Ok(())
-    }
-
-    /// Re-read the pools the admit path seeded, and the snapshots a redemption
-    /// left stale, at a pinned block. Every log of the tick is folded by now, so
-    /// the read sees every event the projection holds; a read from a backend
-    /// behind them is skipped (see `PoolProjection::reanchor`).
-    async fn on_tick_complete(&mut self) -> Result<()> {
-        reanchor_pools(
-            &self.contract,
-            &self.pool_view,
-            &mut self.reanchor_cursor,
-            self.applied_through,
-            &self.metrics,
-        )
-        .await;
-        Ok(())
-    }
-}
-
-/// Cap on the pools [`reanchor_pools`] reads in one tick, bounding the RPCs and
-/// the time it holds the shared poller. Pools past the cap take their turn on
-/// later ticks, and until then their `remaining` errs toward serving (see
-/// `pool_view::Snapshot`).
-const REANCHOR_POOLS_PER_TICK: usize = 64;
-
-/// How many re-anchor `getPool` reads run at once.
-const REANCHOR_READ_CONCURRENCY: usize = 8;
-
-/// Bound on each re-anchor RPC. The reads run on the poller every watcher
-/// shares. A hung endpoint holds it for two of these per tick: the block
-/// number, then one wave of reads, whose first fault stops the batch. A slow
-/// endpoint that still answers holds it for at most one bound per wave of
-/// [`REANCHOR_READ_CONCURRENCY`] reads.
-const REANCHOR_RPC_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Read the pools `projection` has pending at one block and anchor them there
-/// ([`PoolProjection::reanchor`]); forget a pool the read finds `Closed`.
-///
-/// The turn rotates: the batch starts after `cursor`, the last pool attempted
-/// on an earlier tick. The first fault stops the batch and leaves the rest for
-/// the next tick, so a hung endpoint costs one [`REANCHOR_RPC_TIMEOUT`] wave
-/// and never puts the watcher into backoff. A pool absent at the pinned block
-/// (a backend behind the admit read, or an open a reorg dropped) stays pending.
-///
-/// A block number below `applied_through`, the highest log block the sink has
-/// applied, comes from a backend behind the watcher: a read there could miss a
-/// redemption the watcher dropped while the pool was not yet in the projection.
-/// The tick then reads nothing and every pool stays pending.
-///
-/// Every outcome is counted in `metrics`, and the tick ends by publishing how
-/// many pools are still pending: a pool that stays pending for good shows only
-/// there.
-async fn reanchor_pools<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    projection: &PoolProjection,
-    cursor: &mut Option<B256>,
-    applied_through: u64,
-    metrics: &Metrics,
-) {
-    let pending = projection.pending_rereads();
-    if pending.is_empty() {
-        metrics.settlement_reanchor_pending(0);
-        return;
-    }
-    if let Some(block) = reanchor_block(contract, pending.len(), applied_through, metrics).await {
-        let batch = reanchor_batch(&pending, *cursor);
-        let (reads, closed) = read_reanchor_batch(contract, batch, block, cursor, metrics).await;
-        let report = projection.reanchor(block, &reads);
-        metrics.settlement_reanchor_anchored_by(u64::try_from(report.anchored).unwrap_or(u64::MAX));
-        for skip in &report.skipped {
-            count_reanchor_skip(skip, block, metrics);
-        }
-        for pool_id in closed {
-            debug!(%pool_id, block, "pool re-anchor: pool closed; forgetting");
-            projection.forget(pool_id);
-        }
-    }
-    metrics.settlement_reanchor_pending(projection.pending_rereads().len());
-}
-
-/// Count and log one re-anchor read the projection skipped as stale. Its pool
-/// stays pending; a reorg that lowered the value on chain keeps it so until the
-/// chain passes the held value again.
-fn count_reanchor_skip(skip: &ReanchorSkip, block: u64, metrics: &Metrics) {
-    let ReanchorSkip { read, reason } = skip;
-    let pool_id = read.pool_id;
-    match *reason {
-        ReanchorStale::BelowFolded { folded_through } => {
-            metrics.settlement_reanchor_skipped_below_folded();
-            warn!(
-                %pool_id,
-                block,
-                folded_through,
-                "pool re-anchor: read is below a folded event; pool stays pending"
-            );
-        }
-        ReanchorStale::LowerRedeemed { held } => {
-            metrics.settlement_reanchor_skipped_lower_redeemed();
-            warn!(
-                %pool_id,
-                block,
-                held,
-                read = read.total_redeemed,
-                "pool re-anchor: read totalRedeemed is below the held one; pool stays pending"
-            );
-        }
-        ReanchorStale::LowerDeposit { held } => {
-            metrics.settlement_reanchor_skipped_lower_deposit();
-            warn!(
-                %pool_id,
-                block,
-                held,
-                read = read.deposit,
-                "pool re-anchor: read deposit is below the held one; pool stays pending"
-            );
-        }
-    }
-}
-
-/// The block a re-anchor tick pins its reads at, or `None` when the read faults
-/// or the answer is behind `applied_through`; the pending pools then wait for
-/// the next tick.
-async fn reanchor_block<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    pending: usize,
-    applied_through: u64,
-    metrics: &Metrics,
-) -> Option<u64> {
-    let block = match timed(
-        Some(REANCHOR_RPC_TIMEOUT),
-        "re-anchor block number",
-        contract.provider().get_block_number(),
-    )
-    .await
-    {
-        Ok(block) => block,
-        Err(err) => {
-            metrics.settlement_reanchor_block_read_failure();
-            warn!(
-                error = %sanitize_err_chain(&err),
-                pools = pending,
-                "pool re-anchor: block number read failed; retrying next tick"
-            );
-            return None;
-        }
-    };
-    if block < applied_through {
-        metrics.settlement_reanchor_behind_watcher();
-        debug!(
-            block,
-            applied_through, "pool re-anchor: block number behind the watcher; retrying next tick"
-        );
-        return None;
-    }
-    Some(block)
-}
-
-/// Read `batch` at `block`, at most [`REANCHOR_READ_CONCURRENCY`] at once and in
-/// order, stopping at the first fault. Returns the reads to anchor and the pools
-/// found `Closed`, and moves `cursor` to the last pool attempted.
-async fn read_reanchor_batch<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    batch: Vec<B256>,
-    block: u64,
-    cursor: &mut Option<B256>,
-    metrics: &Metrics,
-) -> (Vec<PoolRead>, Vec<B256>) {
-    let mut reads = futures_util::stream::iter(batch)
-        .map(|pool_id| async move { (pool_id, read_pool_at(contract, pool_id, block).await) })
-        .buffered(REANCHOR_READ_CONCURRENCY);
-    let mut anchored = Vec::new();
-    let mut closed = Vec::new();
-    while let Some((pool_id, read)) = reads.next().await {
-        // A faulted pool moves the cursor too, so a pool whose read keeps
-        // failing cannot hold back the pools behind it.
-        *cursor = Some(pool_id);
-        let pool = match read {
-            Ok(pool) => pool,
-            Err(err) => {
-                metrics.settlement_reanchor_pool_read_failure();
-                warn!(
-                    error = %sanitize_err_chain(&err),
-                    %pool_id,
-                    block,
-                    "pool re-anchor: getPool failed; retrying next tick"
-                );
-                break;
-            }
-        };
-        if matches!(pool.status, PaymentPool::Status::Closed) {
-            closed.push(pool_id);
-        } else if let Some(lifecycle) = resolved_lifecycle(&pool) {
-            anchored.push(PoolRead {
-                pool_id,
-                deposit: pool.deposit,
-                total_redeemed: pool.totalRedeemed,
-                lifecycle,
-            });
-        } else {
-            metrics.settlement_reanchor_absent();
-            debug!(%pool_id, block, "pool re-anchor: pool absent at the pinned block; retrying");
-        }
-    }
-    (anchored, closed)
-}
-
-/// The pools of one re-anchor tick: up to [`REANCHOR_POOLS_PER_TICK`] of the
-/// sorted `pending`, starting after `cursor` and wrapping around.
-fn reanchor_batch(pending: &[B256], cursor: Option<B256>) -> Vec<B256> {
-    let start = cursor.map_or(0, |cursor| pending.partition_point(|id| *id <= cursor));
-    pending
-        .iter()
-        .cycle()
-        .skip(start)
-        .take(pending.len().min(REANCHOR_POOLS_PER_TICK))
-        .copied()
-        .collect()
-}
-
-/// `getPool(pool_id)` pinned at `block`, bounded by [`REANCHOR_RPC_TIMEOUT`].
-async fn read_pool_at<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    pool_id: B256,
-    block: u64,
-) -> Result<PaymentPool::Pool> {
-    let call = contract.getPool(pool_id);
-    timed(
-        Some(REANCHOR_RPC_TIMEOUT),
-        "re-anchor getPool",
-        call.call().block(BlockId::Number(block.into())),
-    )
-    .await
-}
-
-impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
-    /// Ledger backfill (#2598) for an own-provider `PoolRedeemed`: a row for a
-    /// landing the redeemer never saw (a receipt wait that timed out, or a
-    /// landing across a restart). A transaction already in the ledger costs
-    /// one ledger read and no RPC. The backfill runs on its own task
-    /// ([`LedgerBackfills`]): the poller awaits every route's sink in turn,
-    /// and a receipt or header read that waits out its timeout must not hold
-    /// up the paid watermarks, the blacklist or the slash watcher.
-    fn backfill_ledger(&self, log: &Log, pool_id: PoolId) {
-        if let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) {
-            self.backfills
-                .spawn(self.contract.provider().clone(), block, tx);
-        } else {
-            warn!(
-                %pool_id,
-                "PoolRedeemed log names no transaction or block; no settlement ledger backfill"
-            );
-            self.metrics.settlement_ledger_skipped_row();
-        }
-    }
-
-    /// Whether this node provides a lane of `pool_id` that is owed more than the
-    /// chain has paid it — revenue that must redeem inside the grace window. A
-    /// store read failure answers `false`: the counter this feeds is advisory.
-    fn holds_unredeemed_on(&self, pool_id: PoolId) -> bool {
-        match self.store.load_all() {
-            Ok(states) => holds_unredeemed(&states, pool_id, self.self_address),
-            Err(err) => {
-                warn!(error = %err, %pool_id, "grace-close check: failed to load lane state");
-                false
-            }
-        }
-    }
-
-    /// Hint the redeemer for every lane of `pool_id` this node provides, so a
-    /// top-up re-drives lanes a dry pool left `owed > paid`. Best-effort: a full
-    /// hint channel drops the nudge (the self-tick sweep is the backstop).
-    fn redrive_pool_lanes(&self, pool_id: PoolId) {
-        let states = match self.store.load_all() {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(error = %err, %pool_id, "top-up re-drive: failed to load lane state");
-                return;
-            }
-        };
-        for st in states {
-            if st.pool_id == pool_id && st.provider == self.self_address {
-                let _ = self.redeem_tx.try_send(st.key());
-            }
-        }
-    }
-
-    /// Forget every lane of a reclaimed `pool_id` this node provides — the pool is
+impl ClosedPools {
+    /// Forget every lane of `pool_id` this node provides — the pool is
     /// `Closed`, so no further voucher can be redeemed against it.
     #[allow(clippy::cognitive_complexity)]
-    async fn forget_pool_lanes(&self, pool_id: PoolId) {
+    async fn forget(&self, pool_id: PoolId) {
         let states = match self.store.load_all() {
             Ok(s) => s,
             Err(err) => {
-                warn!(error = %err, %pool_id, "reclaim cleanup: failed to load lane state");
+                warn!(error = %err, %pool_id, "closed-pool cleanup: failed to load lane state");
                 return;
             }
         };
@@ -1293,13 +776,24 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
                 continue;
             }
             let key = st.key();
-            if let Err(err) = self.handler.forget_lane(key).await {
-                self.metrics.watcher_persist_failure();
-                warn!(error = %err, pool_id = %pool_id, signer = %key.signer, "failed to forget reclaimed lane");
+            let lane = crate::handlers::client::LaneId {
+                deployment: self.deployment,
+                key,
+            };
+            if let Err(err) = self.handler.forget_lane(lane).await {
+                warn!(error = %err, pool_id = %pool_id, signer = %key.signer, "failed to forget a closed pool's lane");
             } else {
                 self.paid.forget(&key);
-                info!(pool_id = %pool_id, signer = %key.signer, "pool reclaimed; dropped tracked lane");
+                info!(pool_id = %pool_id, signer = %key.signer, "pool closed; dropped tracked lane");
             }
+        }
+    }
+
+    /// Forget the lanes of every pool a read found `Closed` since the last
+    /// call.
+    async fn drain(&self, projection: &PoolProjection) {
+        for pool_id in projection.take_closed() {
+            self.forget(pool_id).await;
         }
     }
 }
@@ -1307,22 +801,15 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
 /// A [`PoolView`](crate::pool_view::PoolView) that confirms a pool on-chain
 /// before a serve is admitted.
 ///
-/// The serve gates read `{owner, remaining}` from the event-fed [`PoolProjection`]
-/// the settlement watcher folds, so the common case costs no `eth_call`. A pool
-/// the projection has not observed is the hard case: a pool opened before the
-/// watcher's scan start (the head on a first boot, the rewound checkpoint after a
-/// restart) never appears in the forward-only `PoolOpened` scan, so its owner is
-/// absent from the projection even though the pool is live.
-/// Rather than fail open on that gap, [`status`](crate::pool_view::PoolView::status) does ONE `getPool` at
-/// admission — a read the admission path tolerates (it may block) — seeds a
-/// servable pool into the projection with its on-chain `totalRedeemed`, and
-/// refuses an absent, closed, or faulted pool. The settlement watcher re-reads
-/// that seed at a pinned block at the end of its tick (`reanchor_pools`).
-/// Every admit-path chain read (`getPool` and the signer's
+/// [`status`](crate::pool_view::PoolView::status) answers from a `getPool` read
+/// younger than [`POOL_REFRESH_INTERVAL`] and otherwise does ONE `getPool` at
+/// admission — a read the admission path tolerates (it may block) — holds a
+/// servable pool's read in the projection, and refuses an absent, closed, or
+/// faulted pool. Every admit-path chain read (`getPool` and the signer's
 /// `getAuthorization`) runs under `chain_events::timed`'s default bound, so a
 /// hung read times out and takes the fault path instead of stalling admission.
-/// The client re-sends its capability on its next request (the documented
-/// lane recovery path), and by then the folded owner registers the lane.
+/// The settlement service re-reads every pool and signer with a live lane each
+/// [`POOL_REFRESH_INTERVAL`] ([`Self::refresh_live`]).
 ///
 /// The mid-stream re-check calls [`cached_status`](crate::pool_view::PoolView::cached_status), which reads the
 /// projection ONLY and never blocks on a `getPool` — a chain read at a voucher
@@ -1338,9 +825,8 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
 /// and takes its answer.
 ///
 /// The signer confirm reads `getAuthorization` once per `(pool, signer)` and
-/// keeps a `Registered` answer for good (see `AuthRead`); only an
-/// `Unregistered` answer is re-read. Those reads are coalesced per pair the same
-/// way.
+/// keeps the answer for [`POOL_REFRESH_INTERVAL`] (see `AuthRead`). Those reads
+/// are coalesced per pair the same way.
 ///
 /// Every read, of either kind, first takes one of
 /// `ADMIT_CHAIN_READ_CONCURRENCY` node-wide slots; a request that finds none
@@ -1349,8 +835,8 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     /// The wallet/RPC-backed `PaymentPool` binding for the admit-path reads
     /// (`getPool`, `getAuthorization`).
     contract: PaymentPool::PaymentPoolInstance<P>,
-    /// The event-fed projection this view reads first and folds a resolved pool
-    /// into. Shared with the settlement watcher's sink (the authoritative writer).
+    /// The held `getPool` reads this view answers from and writes. Shared with
+    /// the redeemer.
     projection: PoolProjection,
     /// Pool id → (why, when) for pools recently found not-servable or whose read
     /// faulted. The reason picks the entry's window ([`NegativeReason::ttl`]).
@@ -1385,8 +871,8 @@ impl<P: Provider + Clone> std::fmt::Debug for ResolvingPoolView<P> {
 }
 
 impl<P: Provider + Clone> ResolvingPoolView<P> {
-    /// Wrap the event-fed `projection` with admit-path `getPool` and
-    /// `getAuthorization` fallbacks against `contract`.
+    /// Wrap `projection` with admit-path `getPool` and `getAuthorization`
+    /// reads against `contract`.
     #[must_use]
     pub fn new(
         contract: PaymentPool::PaymentPoolInstance<P>,
@@ -1421,21 +907,89 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
         slot
     }
 
+    /// The held `getPool` reads this view answers from.
+    #[must_use]
+    pub const fn projection(&self) -> &PoolProjection {
+        &self.projection
+    }
+
     /// What the signer-auth cache holds for `(pool_id, signer)` now.
     fn lookup_auth(&self, pool_id: B256, signer: Address) -> CachedAuth {
-        let folded_now = self.projection.signer_spent(pool_id, signer);
         let guard = self
             .auth_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cached_auth(guard.get(&(pool_id, signer)), folded_now)
+        cached_auth(guard.get(&(pool_id, signer)))
+    }
+
+    /// The held read of `(pool_id, signer)`, whatever its age.
+    fn held_auth(&self, pool_id: B256, signer: Address) -> Option<SignerAuthorization> {
+        self.auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(pool_id, signer))
+            .map(|read| read.auth)
+    }
+
+    /// Hold `auth` as a fresh read of `(pool_id, signer)`.
+    fn hold_auth(&self, pool_id: B256, signer: Address, auth: SignerAuthorization) {
+        let mut guard = self
+            .auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remember_auth(
+            &mut guard,
+            (pool_id, signer),
+            AuthRead {
+                auth,
+                at: Instant::now(),
+            },
+        );
     }
 }
 
 impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
-    /// Read `pool_id` on-chain once and record the result: seed a servable pool
-    /// into the projection as an unanchored snapshot of its `deposit` and
-    /// `totalRedeemed` ([`PoolProjection::record_resolved`]), or negative-cache
+    /// Re-read every pool and signer with a live lane (ADR 003 § Pool
+    /// solvency): one `getPool` per live pool and one `getAuthorizations` batch
+    /// over every live `(pool, signer)`. A pool found `Closed` is dropped and
+    /// queued for lane cleanup; an absent one is dropped. Then drop the old
+    /// reads of every pool with no live lane. A failed read keeps the held one,
+    /// which the mid-stream re-check keeps reading.
+    pub async fn refresh_live(&self, live: &HashMap<PoolId, HashSet<Address>>) {
+        let pools: Vec<PoolId> = live.keys().copied().collect();
+        let _faulted = read_pools(&self.contract, &pools, &self.projection).await;
+        let pairs: Vec<(PoolId, Address)> = live
+            .iter()
+            .flat_map(|(pool, signers)| signers.iter().map(move |signer| (*pool, *signer)))
+            .collect();
+        for chunk in pairs.chunks(WATERMARK_READ_BATCH_MAX) {
+            let pool_ids = chunk.iter().map(|(pool, _)| *pool).collect();
+            let signers = chunk.iter().map(|(_, signer)| *signer).collect();
+            let call = self.contract.getAuthorizations(pool_ids, signers);
+            match timed(None, "refresh getAuthorizations", call.call()).await {
+                Ok(auths) => {
+                    for ((pool, signer), auth) in chunk.iter().zip(&auths) {
+                        self.hold_auth(*pool, *signer, SignerAuthorization::from_onchain(auth));
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        error = %sanitize_err_chain(&err),
+                        signers = chunk.len(),
+                        "live signer refresh failed; keeping the held reads"
+                    );
+                    break;
+                }
+            }
+        }
+        self.projection.prune_idle(&live.keys().copied().collect());
+    }
+}
+
+impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
+    /// Read `pool_id` on-chain once and record the result: hold a servable
+    /// pool's read in the projection ([`PoolProjection::record_read`]), or
+    /// negative-cache
     /// an absent / `Closed` pool as a [`NegativeReason::Verdict`] and a failed
     /// read as a [`NegativeReason::Fault`]. A read that finds no admit-read slot
     /// within [`ADMIT_CHAIN_READ_SLOT_WAIT`] caches nothing and answers `None`.
@@ -1456,42 +1010,43 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
                     suppressed_for = ?RESOLVE_FAULT_TTL,
                     "admit getPool failed; refusing this pool until the negative cache lapses"
                 );
-                let mut guard = self
-                    .negative
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                remember_negative(&mut guard, pool_id, NegativeReason::Fault);
+                remember_negative(&mut self.negative_cache(), pool_id, NegativeReason::Fault);
                 return None;
             }
         };
-        let Some(lifecycle) = resolved_lifecycle(&pool) else {
-            debug!(%pool_id, "admit getPool: pool absent or closed; refusing");
-            let mut guard = self
-                .negative
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            remember_negative(&mut guard, pool_id, NegativeReason::Verdict);
+        let Some(status) = status_of(&pool) else {
+            self.record_unservable(pool_id, &pool);
             return None;
         };
-        self.projection.record_resolved(
-            pool.owner,
-            PoolRead {
-                pool_id,
-                deposit: pool.deposit,
-                total_redeemed: pool.totalRedeemed,
-                lifecycle,
-            },
-        );
+        self.projection.record_read(pool_id, status);
         // The pool resolved: drop its lapsed negative entry. The projection
         // answers for it from here on.
-        {
-            let mut guard = self
-                .negative
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.remove(&pool_id);
+        self.negative_cache().remove(&pool_id);
+        Some(status)
+    }
+}
+
+impl<P: Provider + Clone> ResolvingPoolView<P> {
+    /// The negative cache, recovered from a poisoned lock.
+    fn negative_cache(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<B256, (NegativeReason, Instant)>> {
+        self.negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record an admit read that found the pool absent or closed: queue a
+    /// `Closed` pool for lane cleanup, drop any other from the projection, and
+    /// negative-cache the verdict.
+    fn record_unservable(&self, pool_id: B256, pool: &PaymentPool::Pool) {
+        debug!(%pool_id, "admit getPool: pool absent or closed; refusing");
+        if matches!(pool.status, PaymentPool::Status::Closed) {
+            self.projection.mark_closed(pool_id);
+        } else {
+            self.projection.forget(pool_id);
         }
-        self.projection.snapshot(pool_id)
+        remember_negative(&mut self.negative_cache(), pool_id, NegativeReason::Verdict);
     }
 }
 
@@ -1499,8 +1054,8 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
 impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPoolView<P> {
     async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
         loop {
-            // Fast path: the event fold already knows this pool — no chain call.
-            if let Some(status) = self.projection.snapshot(pool_id) {
+            // Fast path: a read younger than the refresh interval — no chain call.
+            if let Some(status) = self.projection.fresh(pool_id) {
                 return Some(status);
             }
             // A pool recently found not-servable, or whose read faulted, is
@@ -1544,15 +1099,13 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
     }
 
     async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
-        // The mid-stream signer cap-headroom re-check: the admit-path read and the
-        // projection, never a fresh `getAuthorization`. A registered read carries
-        // everything the signer spent before it, which the projection lacks on a
-        // pool it seeded from one `getPool`; the fold since the read adds the
-        // drain at other nodes as the settlement watcher folds their
-        // `PoolRedeemed`. Admission reads the same number.
-        match self.lookup_auth(pool_id, signer) {
-            CachedAuth::Fresh(SignerAuthorization::Registered { spent, .. }) => Some(spent),
-            _ => Some(self.projection.signer_spent(pool_id, signer)),
+        // The mid-stream signer cap-headroom re-check: the held read, whatever
+        // its age, never a fresh `getAuthorization`. The settlement service
+        // re-reads every live signer each refresh interval, so the drain at
+        // other nodes reaches this number within one interval.
+        match self.held_auth(pool_id, signer) {
+            Some(SignerAuthorization::Registered { spent, .. }) => Some(spent),
+            _ => Some(0),
         }
     }
 
@@ -1594,9 +1147,8 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
 impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     /// Read `getAuthorization` for `(pool_id, signer)` and cache the answer. A
     /// fault (an error or a timeout) caches nothing and answers `None`, which
-    /// refuses the signer as unconfirmed. A `Registered` read is cached for
-    /// good, so a fault only ever meets a signer with no usable read. The caller
-    /// holds the pair's [`ReadSlot::Lead`].
+    /// refuses the signer as unconfirmed. The caller holds the pair's
+    /// [`ReadSlot::Lead`].
     async fn read_authorization(
         &self,
         pool_id: B256,
@@ -1606,9 +1158,6 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
             debug!(%pool_id, %signer, "admit getAuthorization: no read slot free; refusing");
             return None;
         };
-        // The baseline is taken once the slot is held, just before the read is
-        // sent; see `AuthRead`.
-        let folded_at_read = self.projection.signer_spent(pool_id, signer);
         // Bounded: a hung read times out here and takes the fault path below.
         let auth = match timed(
             None,
@@ -1628,24 +1177,8 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
                 return None;
             }
         };
-        let read = AuthRead {
-            auth,
-            folded_at_read,
-            at: Instant::now(),
-        };
-        {
-            let mut guard = self
-                .auth_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            remember_auth(&mut guard, (pool_id, signer), read);
-        }
-        // Answer as the next cache hit would, so a fold that landed during the
-        // read already counts. An `Unregistered` read answers as read.
-        match cached_auth(Some(&read), self.projection.signer_spent(pool_id, signer)) {
-            CachedAuth::Fresh(fresh) => Some(fresh),
-            CachedAuth::Lapsed | CachedAuth::Absent => Some(auth),
-        }
+        self.hold_auth(pool_id, signer, auth);
+        Some(auth)
     }
 }
 
@@ -1769,6 +1302,82 @@ fn resolved_lifecycle(pool: &PaymentPool::Pool) -> Option<Lifecycle> {
     }
 }
 
+/// The serve status a `getPool` read maps to, or `None` for an absent or
+/// `Closed` pool ([`resolved_lifecycle`]).
+fn status_of(pool: &PaymentPool::Pool) -> Option<PoolStatus> {
+    resolved_lifecycle(pool).map(|lifecycle| PoolStatus {
+        owner: pool.owner,
+        remaining: U256::from(pool.deposit.saturating_sub(pool.totalRedeemed)),
+        lifecycle,
+    })
+}
+
+/// Read `pools` with `getPool`, at most [`POOL_READ_CONCURRENCY`] at once, and
+/// hold each answer in `projection`: a servable pool's read, a `Closed` pool
+/// dropped and queued for lane cleanup, an absent pool dropped. The first
+/// fault stops the reads, so an RPC outage costs one wave of read timeouts.
+/// Returns whether a read faulted.
+async fn read_pools<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    pools: &[PoolId],
+    projection: &PoolProjection,
+) -> bool {
+    let mut reads = futures_util::stream::iter(pools.iter().copied())
+        .map(|pool_id| async move {
+            let call = contract.getPool(pool_id);
+            let read = timed(Some(POOL_READ_TIMEOUT), "getPool", call.call()).await;
+            (pool_id, read)
+        })
+        .buffer_unordered(POOL_READ_CONCURRENCY);
+    while let Some((pool_id, read)) = reads.next().await {
+        match read {
+            Ok(pool) => match status_of(&pool) {
+                Some(status) => projection.record_read(pool_id, status),
+                None if matches!(pool.status, PaymentPool::Status::Closed) => {
+                    projection.mark_closed(pool_id);
+                }
+                None => projection.forget(pool_id),
+            },
+            Err(err) => {
+                warn!(
+                    error = %sanitize_err_chain(&err),
+                    %pool_id,
+                    "getPool failed; the unread pools wait for the next attempt"
+                );
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// How recently a lane must have accepted a voucher to count as live for the
+/// pool refresh: two refresh intervals, so a lane paying at the voucher cadence
+/// never drops out between two refreshes.
+const LIVE_LANE_WINDOW: Duration = Duration::from_secs(2 * POOL_REFRESH_INTERVAL.as_secs());
+
+/// Re-read every pool and signer with a live lane on `deployment` each
+/// [`POOL_REFRESH_INTERVAL`], and forget the lanes of pools a read found
+/// `Closed`. The loop exists because the serve path's mid-stream solvency and
+/// signer-cap re-checks read only held reads, so a live stream's reads must
+/// stay at most one interval old.
+async fn pool_refresh_loop<P: Provider + Clone + 'static>(
+    view: Arc<ResolvingPoolView<P>>,
+    handler: Arc<ClientHandler>,
+    deployment: Deployment,
+    closed: ClosedPools,
+) {
+    let mut ticker = tokio::time::interval(POOL_REFRESH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let live = handler.live_lanes(deployment, LIVE_LANE_WINDOW).await;
+        view.refresh_live(&live).await;
+        closed.drain(view.projection()).await;
+    }
+}
+
 /// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
 /// its aggregate unredeemed value clears the floor, driven by three sources —
 /// advisory hints ([`LaneKey`]) from the voucher-accept path, a low-frequency
@@ -1863,6 +1472,8 @@ async fn redeemer_loop<P: Provider + Clone>(
             },
             _ = ticker.tick() => {
                 next_tick_at = unix_now().saturating_add(interval_secs);
+                // A receipt a timed-out wait missed lands its ledger row here.
+                recorder.recover_sent(contract.provider()).await;
             }
             () = sleep_until_unix(next_cutoff) => {}
         }
@@ -2120,7 +1731,7 @@ fn lane_cutoff_wake(
     self_address: Address,
     margin_secs: u64,
 ) -> Option<u64> {
-    if st.provider != self_address || st.expiry == 0 || st.owed() <= paid.get(&st.key()) {
+    if st.provider != self_address || st.expiry == 0 || st.owed() <= lane_paid(paid, st) {
         return None;
     }
     Some(st.expiry.saturating_sub(margin_secs).saturating_add(1))
@@ -2196,13 +1807,12 @@ enum RegistrationStatus {
 
 /// Seed a fresh paid-watermark cache from the durable lane rows this node
 /// provides. Bootstrap calls this before the redeemer starts so a restart carries
-/// forward redemptions that landed before the log-poller's persisted cursor,
-/// instead of re-planning those already-redeemed lanes into a `redeemMany` the
-/// contract silently no-ops (#2052).
+/// forward redemptions that landed before it, instead of re-planning those
+/// already-redeemed lanes into a `redeemMany` the contract silently no-ops
+/// (#2052).
 ///
-/// A `load_all` failure is not fatal: the `PoolRedeemed` watcher still rebuilds
-/// `paid` forward from the cursor. It only re-opens the restart-amnesia window for
-/// pre-cursor lanes, so the failure is surfaced loudly rather than aborting
+/// A `load_all` failure is not fatal: the pre-redeem `getWatermarks` read still
+/// skips a settled lane, so the failure is surfaced loudly rather than aborting
 /// bring-up.
 fn rehydrate_paid_watermarks(store: &dyn PoolStateStore, self_address: Address) -> PaidWatermarks {
     let paid = PaidWatermarks::default();
@@ -2224,8 +1834,8 @@ fn rehydrate_paid_watermarks(store: &dyn PoolStateStore, self_address: Address) 
         }
         Err(err) => warn!(
             error = %err,
-            "failed to rehydrate paid-watermark cache from lane store; pre-cursor \
-             redemptions may be re-submitted until re-observed on-chain"
+            "failed to rehydrate paid-watermark cache from lane store; the \
+             pre-redeem watermark read has to catch earlier redemptions"
         ),
     }
     paid
@@ -2271,7 +1881,7 @@ fn plan_lane(
     if owed.is_zero() {
         return Ok(None);
     }
-    let unredeemed = owed.saturating_sub(paid.get(&key));
+    let unredeemed = owed.saturating_sub(lane_paid(paid, st));
     if unredeemed.is_zero() {
         return Ok(None);
     }
@@ -2645,7 +2255,16 @@ async fn submit_chunk<P: Provider + Clone>(
     let voucher_count = lanes.len();
     let pool_count = batches.len();
     let sent = contract.redeemMany(batches).send().await;
+    // Recorded before the receipt wait, so a wait that times out or a crash
+    // before the receipt still finds its ledger row later.
+    let sent_hash = sent.as_ref().ok().map(|pending| *pending.tx_hash());
+    if let Some(tx_hash) = sent_hash {
+        recorder.record_sent(tx_hash).await;
+    }
     let outcome = send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT), metrics).await;
+    if let (Some(tx_hash), TxOutcome::Landed(_) | TxOutcome::Reverted(_)) = (sent_hash, &outcome) {
+        recorder.forget_sent(tx_hash).await;
+    }
     let failed = is_redemption_failure(&outcome);
     let chain_fault = is_chain_fault(&outcome);
     let send_outcome = match &outcome {
@@ -2663,9 +2282,10 @@ async fn submit_chunk<P: Provider + Clone>(
                 tx = %receipt.transaction_hash,
                 "batched lane redemption landed (redeemMany)"
             );
+            record_receipt_paid(store.as_ref(), *contract.address(), signer, &receipt);
             record_landed_chunk(contract, store, &lanes, metrics).await;
             // The ledger row for `decdn node earnings` (#2598): the receipt
-            // carries the router's `Settled` and the operator's USDC transfer.
+            // carries the operator's USDC transfer.
             recorder.record_landed(contract.provider(), &receipt).await;
             return false;
         }
@@ -3075,6 +2695,30 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
     (kept, read_failed)
 }
 
+/// Raise the lane rows to what a clean pre-submit `getWatermarks` read showed:
+/// a kept lane's paid is `owed − unredeemed`, and a dropped lane is paid at
+/// least its `owed`. A failed read records nothing, because its unread tail is
+/// kept unchanged.
+fn record_reconciled_paid(
+    store: &dyn PoolStateStore,
+    owed: &[(LaneKey, U256)],
+    kept: &[PlannedLane],
+    read_failed: bool,
+) {
+    if read_failed {
+        return;
+    }
+    let kept: HashMap<LaneKey, &PlannedLane> = kept.iter().map(|plan| (plan.key, plan)).collect();
+    for (key, owed) in owed {
+        let paid = kept
+            .get(key)
+            .map_or(*owed, |plan| plan.owed.saturating_sub(plan.unredeemed));
+        if !paid.is_zero() {
+            record_paid(store, *key, paid);
+        }
+    }
+}
+
 /// Pure core of [`reconcile_onchain_watermarks`]: given each plan's freshly-read
 /// on-chain paid watermark (parallel to `plans`, same order), drop every lane the
 /// chain already shows settled to its claim value and recompute `unredeemed` for
@@ -3121,34 +2765,19 @@ fn record_tx_failure(span: &tracing::Span, outcome: &'static str, tx: Option<TxH
     span.record("otel.status_code", "ERROR");
 }
 
-/// Whether `provider` has a lane of `pool_id` in `states` that is owed more
-/// than it has been paid.
-fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) -> bool {
-    states.iter().any(|st| {
-        st.pool_id == pool_id && st.provider == provider && st.owed() > st.paid_cumulative
-    })
-}
-
-/// Read every pool of `plans` the projection does not hold, seed the ones that
-/// can still be redeemed ([`PoolProjection::record_resolved`]), and drop each
-/// lane whose pool cannot pay now ([`pool_is_redeemable`]). The projection learns
-/// pools only from the events it folds and the admit path's reads, so after a
-/// restart a pool opened before it is unknown until one of them reads it. A lane
-/// on a pool that is closed or closing past its deadline reverts the whole
-/// `redeemMany` (`PoolClosed`), and would revert again on every sweep.
+/// Read `getPool` for every pool of `plans` the projection holds no fresh read
+/// of ([`PoolProjection::fresh`]), and drop each lane whose pool cannot pay now
+/// ([`pool_is_redeemable`]). A lane on a pool that is closed or closing past its
+/// deadline reverts the whole `redeemMany` (`PoolClosed`), and would revert
+/// again on every sweep. A live pool's read is at most one refresh interval
+/// old, so a submit on it costs no read.
 ///
-/// Fails closed: a lane whose pool is still unknown after the reads (the read
+/// Fails closed: a lane whose pool is unknown after the reads (the read
 /// faulted, was not sent, or the chain shows the pool absent or `Closed`) stays
 /// out of this cycle and counts on `redemption_skipped_pool_unresolved`. A lane
 /// whose pool resolved but cannot pay counts on `redemption_skipped_insolvent`.
-/// Returns the kept lanes and whether a read faulted.
-///
-/// Each pool costs one `getPool`, at most [`REANCHOR_READ_CONCURRENCY`] at once.
-/// The first fault stops the reads, like [`read_reanchor_batch`], so an RPC
-/// outage costs one round of read timeouts, not one per unknown pool, and the
-/// lanes on pools the projection already holds still reach the submit. A seeded
-/// pool is known from then on. An absent or `Closed` pool is not seeded, so its
-/// lanes cost one `getPool` on every cycle that reaches them.
+/// A `Closed` pool is queued for lane cleanup. Returns the kept lanes and
+/// whether a read faulted.
 async fn resolve_unknown_pools<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     plans: Vec<PlannedLane>,
@@ -3158,58 +2787,11 @@ async fn resolve_unknown_pools<P: Provider + Clone>(
     let unknown: Vec<PoolId> = plans
         .iter()
         .map(|plan| plan.pool_id)
-        .filter(|pool_id| pool_view.snapshot(*pool_id).is_none())
+        .filter(|pool_id| pool_view.fresh(*pool_id).is_none())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let mut read_failed = false;
-    let mut reads = futures_util::stream::iter(unknown)
-        .map(|pool_id| async move {
-            let call = contract.getPool(pool_id);
-            let read = timed(
-                Some(REANCHOR_RPC_TIMEOUT),
-                "pre-redeem getPool",
-                call.call(),
-            )
-            .await;
-            (pool_id, read)
-        })
-        .buffer_unordered(REANCHOR_READ_CONCURRENCY);
-    while let Some((pool_id, read)) = reads.next().await {
-        match read {
-            Ok(pool) => {
-                if let Some(lifecycle) = resolved_lifecycle(&pool) {
-                    pool_view.record_resolved(
-                        pool.owner,
-                        PoolRead {
-                            pool_id,
-                            deposit: pool.deposit,
-                            total_redeemed: pool.totalRedeemed,
-                            lifecycle,
-                        },
-                    );
-                } else {
-                    let lanes = plans.iter().filter(|plan| plan.pool_id == pool_id).count();
-                    warn!(
-                        %pool_id,
-                        lanes,
-                        "redeemer: pool absent or closed on-chain; its lanes are not submitted"
-                    );
-                }
-            }
-            Err(err) => {
-                read_failed = true;
-                warn!(
-                    stage = "resolve",
-                    error = %sanitize_err_chain(&err),
-                    %pool_id,
-                    "pre-redeem getPool failed; the unread pools' lanes wait for the next attempt"
-                );
-                break;
-            }
-        }
-    }
-    drop(reads);
+    let read_failed = read_pools(contract, &unknown, pool_view).await;
     let now = unix_now();
     let mut kept = Vec::with_capacity(plans.len());
     let (mut unresolved, mut insolvent) = (0u64, 0u64);
@@ -3286,9 +2868,11 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     // reverts its whole `redeemMany`.
     let (plans, resolve_failed) = resolve_unknown_pools(contract, plans, pool_view, metrics).await;
     // Last check before spending gas: reconcile against the on-chain watermark
-    // and drop lanes the chain already shows settled, so a lagging cache or a
+    // and drop lanes the chain already shows settled, so a missed receipt or a
     // concurrent redeemer can never cost a no-op `redeemMany`.
+    let owed: Vec<(LaneKey, U256)> = plans.iter().map(|plan| (plan.key, plan.owed)).collect();
     let (plans, read_failed) = reconcile_onchain_watermarks(contract, plans, metrics).await;
+    record_reconciled_paid(store.as_ref(), &owed, &plans, read_failed);
     let read_failed = read_failed || resolve_failed;
     let chunks = chunk_redemptions(plans, floor, max_vouchers);
     if chunks.is_empty() {
@@ -3307,194 +2891,6 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     }
     .instrument(span)
     .await
-}
-
-/// Mutable debounce bookkeeping for [`DebouncedCheckpointStore`], guarded by a
-/// single `std::sync::Mutex`. The lock is only ever held for the brief duration
-/// of a `record`/`flush` decision (no `.await` inside), so a sync mutex is the
-/// right primitive.
-struct DebounceState {
-    /// The block last forwarded to a *durable* write on the inner store, or
-    /// `None` if nothing has been persisted in this process yet.
-    last_persisted: Option<u64>,
-    /// Monotonic [`Instant`] of the last durable write, for the time-based
-    /// threshold. Seeded at construction so the first interval is measured from
-    /// service start.
-    last_persist_at: Instant,
-    /// The highest block buffered but not yet durably written. Monotonic. `None`
-    /// once flushed/forwarded — i.e. equal to `last_persisted`.
-    pending: Option<u64>,
-    /// Whether the first in-process `record` has run. Until it does we lazily fold
-    /// the inner store's existing checkpoint into `last_persisted`, and force that
-    /// first record durable so a restart re-anchors the floor promptly.
-    seeded: bool,
-}
-
-/// Debouncing decorator over a [`KeyedCheckpointStore`] (#784, keyed in #1092).
-/// Buffers `record_checkpoint` in memory **per [`CheckpointKey`]** and forwards a
-/// durable write for a key only when its buffered block is at least `flush_blocks`
-/// ahead of that key's last persisted value *or* at least `flush_interval` has
-/// elapsed since that key's last durable write — cutting the per-block fsync
-/// amplification a watcher's live tail would otherwise pay on a backlog drain.
-///
-/// **Durability contract preserved (per key).** The persisted value is only ever
-/// a *floor* for the resume backfill (the resumable watcher rewinds it by
-/// `REORG_MARGIN_BLOCKS` and every sink is idempotent), so a
-/// buffered-but-not-yet-fsynced advance that a crash loses merely widens the next
-/// rescan — never narrows it. `record_checkpoint` only raises a key's `pending`,
-/// so the forwarded value stays monotonic. [`Self::flush_checkpoint`] forces the
-/// buffered value out and is wired into graceful shutdown.
-pub struct DebouncedCheckpointStore {
-    inner: Arc<dyn KeyedCheckpointStore>,
-    flush_blocks: u64,
-    flush_interval: Duration,
-    /// Clock source, injectable so the time-based threshold is unit-testable
-    /// without sleeping. Production uses [`Instant::now`].
-    clock: Box<dyn Fn() -> Instant + Send + Sync>,
-    /// Per-key debounce bookkeeping, created lazily on a key's first record/flush.
-    state: std::sync::Mutex<HashMap<CheckpointKey, DebounceState>>,
-}
-
-impl std::fmt::Debug for DebouncedCheckpointStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let tracked: Vec<(CheckpointKey, Option<u64>, Option<u64>)> = {
-            let map = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.iter()
-                .map(|(k, s)| (*k, s.pending, s.last_persisted))
-                .collect()
-        };
-        f.debug_struct("DebouncedCheckpointStore")
-            .field("flush_blocks", &self.flush_blocks)
-            .field("flush_interval", &self.flush_interval)
-            .field("tracked", &tracked)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DebouncedCheckpointStore {
-    /// Wrap `inner` with the production debounce thresholds
-    /// (`CHECKPOINT_FLUSH_BLOCKS` / `CHECKPOINT_FLUSH_INTERVAL`) and the real wall
-    /// clock.
-    #[must_use]
-    pub fn new(inner: Arc<dyn KeyedCheckpointStore>) -> Self {
-        Self::with_params(
-            inner,
-            CHECKPOINT_FLUSH_BLOCKS,
-            CHECKPOINT_FLUSH_INTERVAL,
-            Box::new(Instant::now),
-        )
-    }
-
-    /// Construct with explicit thresholds and clock — the seam the unit tests
-    /// drive to exercise the block-cadence and time-cadence paths deterministically.
-    fn with_params(
-        inner: Arc<dyn KeyedCheckpointStore>,
-        flush_blocks: u64,
-        flush_interval: Duration,
-        clock: Box<dyn Fn() -> Instant + Send + Sync>,
-    ) -> Self {
-        Self {
-            inner,
-            flush_blocks,
-            flush_interval,
-            clock,
-            state: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Forward `block` to the inner store for `key` and reset that key's debounce
-    /// window. Caller holds `state`. On a durable-write error the buffered
-    /// `pending` is left intact so the next `record`/`flush` retries.
-    fn persist_locked(
-        &self,
-        key: CheckpointKey,
-        state: &mut DebounceState,
-        block: u64,
-    ) -> Result<(), StoreError> {
-        self.inner.record_checkpoint(key, block)?;
-        state.last_persisted = Some(block);
-        state.last_persist_at = (self.clock)();
-        state.pending = None;
-        Ok(())
-    }
-}
-
-impl KeyedCheckpointStore for DebouncedCheckpointStore {
-    fn load_checkpoint(&self, key: CheckpointKey) -> Result<Option<u64>, StoreError> {
-        let persisted = self.inner.load_checkpoint(key)?;
-        let pending = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .and_then(|s| s.pending);
-        Ok(match (persisted, pending) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        })
-    }
-
-    fn record_checkpoint(&self, key: CheckpointKey, block: u64) -> Result<(), StoreError> {
-        let mut map = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let clock = &self.clock;
-        let state = map.entry(key).or_insert_with(|| DebounceState {
-            last_persisted: None,
-            last_persist_at: clock(),
-            pending: None,
-            seeded: false,
-        });
-        // On the first in-process record for this key, fold the inner store's
-        // existing checkpoint into `last_persisted` so a fresh key-state around an
-        // already-populated inner store cannot regress the on-disk floor. `seeded`
-        // flips only after the load *succeeds*.
-        let first_record = !state.seeded;
-        if first_record {
-            state.last_persisted = self.inner.load_checkpoint(key)?;
-            state.seeded = true;
-        }
-        let highest = state
-            .pending
-            .max(state.last_persisted)
-            .unwrap_or(0)
-            .max(block);
-        state.pending = Some(highest);
-
-        if state.last_persisted == Some(highest) {
-            return Ok(());
-        }
-
-        let blocks_ahead = highest.saturating_sub(state.last_persisted.unwrap_or(0));
-        let elapsed = (self.clock)().saturating_duration_since(state.last_persist_at);
-        let due =
-            first_record || blocks_ahead >= self.flush_blocks || elapsed >= self.flush_interval;
-        if due {
-            self.persist_locked(key, state, highest)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn flush_checkpoint(&self, key: CheckpointKey) -> Result<(), StoreError> {
-        let mut map = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(state) = map.get_mut(&key) else {
-            return Ok(());
-        };
-        match state.pending {
-            Some(block) if state.last_persisted != Some(block) => {
-                self.persist_locked(key, state, block)
-            }
-            _ => Ok(()),
-        }
-    }
 }
 
 /// Whether a failed `redeemMany` send was too big to accept: the transport

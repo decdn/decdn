@@ -13,7 +13,7 @@ Companion assets (the four dashboards and the alert rules live in
 - [`dashboard-delivery.json`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/dashboard-delivery.json) —
   serve leg, pull leg, cache and origin. Every refusal and failure reason.
 - [`dashboard-chain.json`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/dashboard-chain.json) —
-  watcher liveness, registries, and both sides of the payment flow.
+  chain refresh liveness, registries, and both sides of the payment flow.
 - [`dashboard-node.json`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/dashboard-node.json) —
   one node at a time: host, transport, DHT, logs and traces.
 - [`prometheus-alerts.yml`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/prometheus-alerts.yml) —
@@ -75,9 +75,9 @@ retrying after backoff` at `WARN` and retries. The daemon exits when the next
 retry could not start before a shared 10-minute boot deadline (`gave up after
 N attempts`), or at once on a deterministic fault (`deterministic failure, not
 retried`: a wrong contract address, an ABI mismatch, a revert, a disk error
-that decides a blacklist enforcement attempt). A best-effort fee-share read
-that gives up logs the same text but falls back to the floor share instead of
-exiting; `decdn_fee_shares_watcher_unregistered` then reads `1`. The node
+that decides a blacklist enforcement attempt). A best-effort
+`PaymentPool.operatorBps()` read that gives up logs the same text but falls
+back to the floor share instead of exiting. The node
 serves nothing until the blacklist enumeration and enforcement complete. The
 metrics listener serves during boot: `decdn_node_boot_ready` reads `0` until
 bring-up finishes, and `decdn_chain_boot_read_retries_total` rises while the
@@ -86,18 +86,18 @@ boot chain reads retry. The RPC preflight's own retries show only in its
 
 **Detect:**
 
-- Existing alerts in `prometheus-alerts.yml`: a dead endpoint stalls
-  every chain-event watcher at once, so expect up to five stalled alerts to
-  fire together — `DecdnBlacklistWatcherStalled`, `DecdnSlashWatcherStalled`,
-  `DecdnStakerSetWatcherStalled`, `DecdnFeeSharesWatcherStalled` (only where
-  the fee-shares watcher is registered), and `DecdnSettlementWatcherStalled`.
-  Several firing together points at the RPC endpoint
-  rather than at any one watcher. Each fires on the *age* of that watcher's last
-  successful tick (guarded against the pre-first-tick sentinel) **or** on
-  `decdn_*_watcher_down_seconds`, which counts from the first failed poll tick —
-  so a watcher that never established at all fires too.
-  `DecdnBlacklistWatcherStalled` is the one carrying slash risk; see
-  [ContentBlacklist compliance](#contentblacklist-compliance).
+- The node reads chain state with `eth_call` refresh loops only; it reads no
+  event logs. A dead governance-chain endpoint stops every refresh on that
+  chain at once: `decdn_blacklist_watcher_last_tick_timestamp_seconds` and
+  `decdn_capacity_bond_registry_last_resync_timestamp_seconds` stop advancing,
+  and `decdn_blacklist_ledger_poll_failures_total`,
+  `decdn_capacity_bond_registry_resync_failures_total` and
+  `decdn_slash_resync_failures_total` rise together. Several rising together
+  points at the RPC endpoint rather than at any one loop. A stale blacklist
+  timestamp is the one carrying slash risk; see
+  [ContentBlacklist compliance](#contentblacklist-compliance). Each failed
+  refresh keeps the projection the node already has and retries on its next
+  interval.
 - `DecdnRpcErrorRatioHigh` fires when more than 10% of the node's JSON-RPC
   requests fail for 15 minutes, which catches a provider that is reachable but
   unreliable. `decdn_rpc_requests_total{method,outcome}` counts every request
@@ -106,7 +106,8 @@ boot chain reads retry. The RPC preflight's own retries show only in its
   latency by method, plus the failures by outcome. `rate_limited` means the
   provider plan is too small for the node's poll cadence; `transport_error`
   and `timeout` mean the provider is unreachable or overloaded; `rpc_error`
-  usually means an `eth_getLogs` range cap (see below).
+  on `eth_call` can mean the provider does not support the `safe` block tag,
+  which the blacklist sync needs.
 - Direct probe:
 
   ```bash
@@ -123,84 +124,20 @@ boot chain reads retry. The RPC preflight's own retries show only in its
 
 - Provider status page.
 
-- `RPC provider rejected the eth_getLogs block range; shrinking the poll
-  window` `warn!` lines mean the provider caps `eth_getLogs` (dRPC
-  `ranges over 10000 blocks are not supported`, Alchemy
-  `up to a 10 block range`, Infura `more than 10000 results`). The poller sets
-  its window to half the rejected window and retries at once, and doubles it
-  back after 32 accepted windows, up to the ceiling. `decdn_chain_get_logs_span`
-  shows the current span and `decdn_chain_get_logs_range_rejections_total` the
-  rejections; the "eth_getLogs window span" panel in
-  `dashboard-chain.json` plots both. One old rejection is a
-  transient: the span climbs back on its own. Rejections that keep coming mean
-  a cap. Then set `blockchain.get_logs_max_block_span` to the lowest span the
-  gauge (or the shrink `warn!`) reaches while they come, **not** to the number
-  in the provider's message — dRPC's free tier says 10 000 but rejects about
-  150. Until you do, each regrow probes the cap again at the cost of one
-  rejected request. A cap below one poll interval of blocks (Arbitrum makes
-  about 4 blocks per second, so about 30 blocks per 7 s tick) still works, but
-  each tick then costs several `eth_getLogs` requests against the provider's
-  quota.
-- `decdn_chain_get_logs_retries_total` counts in-tick retries of `eth_getLogs`
-  windows after a transient provider error (dRPC `Temporary internal error`,
-  `Request timeout on the free plan`, a lagging backend, a per-call timeout).
-  Each window gets two retries, 2 s apart, before the poller defers it to the
-  next tick, so one window adds up to two. A retry that succeeds is not watcher downtime, so a steady
-  retry rate with healthy watchers is an unreliable provider that the poller
-  absorbs. The "eth_getLogs window span" panel plots it beside the rejections.
-  Each retry logs `eth_getLogs window failed; retrying the same window` at
-  `info` with the cause. Read the cause before you act: provider errors mean
-  an unreliable provider (change it, or accept the retries); `get_logs timed
-  out` means the windows are too wide (see below). A rate limit and a
-  permanent error are not retried: they fail the tick into the backoff at
-  once.
-- `decdn_chain_get_logs_deferred_total` counts `eth_getLogs` windows that
-  failed every retry. The poller ends the tick at such a window, keeps the
-  progress before it, and resumes there on the next tick, logging
-  `eth_getLogs window failed on every retry; deferring it to the next tick` at
-  `info`. A deferral is not watcher downtime and loses no event. The tick
-  fails, and the watchers go down, only when no tick reaches head for 2
-  minutes (`no poll tick reached head for 120 s`). A steady deferral rate with
-  healthy watchers is a provider whose failures cluster: the watchers lag head
-  by a few ticks but stay up.
-- `multiplexed poller tick error` `warn!` lines on `get_logs` while
-  `decdn_rpc_healthy` stays 1 mean the watchers cannot read events although
-  the endpoint answers. `rejects even a one-block eth_getLogs window` means the
-  provider cannot serve the watchers at all: change provider. Repeated
-  `get_logs` timeouts, or a range or size error the poller does not recognise
-  (it logs no shrink line), mean the windows are too wide for this provider:
-  lower `blockchain.get_logs_max_block_span` and restart. Timeouts first show
-  in the `info` retry and `deferring it to the next tick` lines; they reach a
-  `multiplexed poller tick error` only after the 2-minute stall. A timed-out
-  window is retried on the same range, so it costs three per-call timeouts plus the
-  retry sleeps (34 s at the 10 s default) before the window is deferred.
-- `DecdnChainWatcherFlapping` means a node's chain watchers fail and recover
-  again and again (four or more failure windows in 30 minutes, held for 45
-  minutes; a single burst does not fire it). Each recovery resets the stalled
-  alerts, so they stay quiet while the watchers lag head. Treat it as an
-  unreliable RPC provider: read the `multiplexed poller tick error` lines for
-  the cause, check `decdn_chain_get_logs_range_rejections_total` for an
-  `eth_getLogs` cap, and check `decdn_chain_get_logs_deferred_total` for a
-  provider whose failures outlast the in-tick retries. A deferred window fails
-  the tick only after 2 minutes with no tick reaching head, so flapping means
-  the provider fails often enough, for minutes at a time, that the watchers
-  cannot catch up to head.
-
-- `decdn_staker_set_watcher_down_seconds` climbing (with
-  `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side
-  symptom of the shared `capacity-bond` watcher (#783, #1226): a mid-run RPC
-  outage stops the watcher following `CapacityBond` events. Since #1226 one loop
-  feeds **both** projections, so this pair is the health of both:
+- A stale `decdn_capacity_bond_registry_last_resync_timestamp_seconds` (with
+  `decdn_capacity_bond_registry_resync_failures_total` advancing) means the
+  5-minute `getRegisteredNodes` refresh fails. One snapshot feeds both the
+  active-staker set and the `NodeId → operator` bindings, so while it fails:
   - The cached active-staker set drifts from chain state and mis-sheds
     stake-lane probes / DHT `Store`s.
-  - Fresh `NodeRegistered` bindings are missed, so those providers become
-    unpayable and are silently skipped — the pull path's reachable-provider set
-    may be capped by stale bindings. (Only on nodes with
+  - New node registrations are missed, so those providers stay unpayable and
+    are skipped — the pull path's reachable-provider set may be capped by
+    stale bindings. (Only on nodes with
     `cache.node_to_node_pull_through_enabled` on; the projection is not built
     otherwise.)
 
-  This watcher is **not** covered by `decdn_rpc_healthy`. See
-  [appendix-observability § Active-Staker Set Watcher Metrics](../adr/appendix-observability.md#active-staker-set-watcher-metrics).
+  This loop is **not** covered by `decdn_rpc_healthy`. See
+  [appendix-observability § Chain Refresh Metrics](../adr/appendix-observability.md#chain-refresh-metrics).
 
 **Remediate:**
 
@@ -210,7 +147,7 @@ boot chain reads retry. The RPC preflight's own retries show only in its
    (`https://sepolia-rollup.arbitrum.io/rpc`) — rate-limited; for production,
    use a paid provider.
 3. After recovery, confirm RPC reachability is restored before considering the
-   incident closed. (Blacklist-watcher liveness is tracked by
+   incident closed. (Blacklist sync liveness is tracked by
    `decdn_blacklist_watcher_last_tick_timestamp_seconds` — see
    [ContentBlacklist compliance](#contentblacklist-compliance).)
 
@@ -303,11 +240,10 @@ slashed by an external adversary.
     present blobs are being advertised without an eviction hold and may be
     evicted before the pull arrives. Budget pressure and lost deliveries,
     not slash evidence; see step 4.
-  - `DecdnBlacklistWatcherStalled` (critical) — the blacklist watcher has
-    not completed a poll tick for several intervals, so the node may be
-    serving content blacklisted since the last successful tick. It fires on
-    the age of `decdn_blacklist_watcher_last_tick_timestamp_seconds`, or on
-    `decdn_blacklist_watcher_down_seconds` when every poll tick fails. See
+  - `DecdnBlacklistWatcherStalled` (critical) — the blacklist sync has
+    not completed a ledger poll for several intervals, so the node may be
+    serving content blacklisted since the last successful poll. It fires on
+    the age of `decdn_blacklist_watcher_last_tick_timestamp_seconds`. See
     [ContentBlacklist compliance](#contentblacklist-compliance).
   - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
     re-verify or evict every known deny-set entry, so a blacklisted hash may
@@ -317,7 +253,7 @@ slashed by an external adversary.
 **Remediate:**
 
 1. **Fix the root cause before anything else.** Each offense has its own:
-   blacklist watcher lag or a stale RPC endpoint (blacklist violation), an
+   blacklist sync lag or a stale RPC endpoint (blacklist violation), an
    upward rate reconfiguration applied less than 90 seconds after the last
    probe answered at the old rate (rate manipulation).
    A slash you appeal while the underlying problem persists will not stop
@@ -389,16 +325,17 @@ offense (see [Slashing risk](#slashing-risk)). Protocol semantics:
 implements what
 [ADR 011 § Node Behavior](../adr/011-content-takedown.md#node-behavior)
 specifies. Absence of `blockchain.content_blacklist_address` is a hard startup
-failure, so every paid-delivery node runs it. It enumerates the whole in-scope
-deny-set from `ContentBlacklist` at one pinned block on boot —
-`getScopeRegions(operator)` for the one-to-three regions in scope, then
-`blacklistedHashes` / `blacklistedHashCount` per region — and follows
-`HashBlacklisted` / `HashRemoved` on the shared log poller as a low-latency tail.
-There is no version-checkpoint delta cursor: enumeration reads the full current
-state on every boot, so a node returning after any downtime rebuilds the complete
-deny-set from one snapshot. A periodic re-scope is the backstop: an operator
-region or ripening change (`CapacityBond.updateRegion`) can bring a hash into
-scope while emitting nothing on `ContentBlacklist` at all.
+failure, so every paid-delivery node runs it. On boot it reads the whole
+in-scope deny-set from `ContentBlacklist` at the `safe` block —
+`getScopeRegions(operator)` for the one-to-three regions in scope, then the
+paged hash and address lists per region — together with the
+`mutationCount` at that block. After boot it polls the mutation ledger every
+`blockchain.content_blacklist_poll_interval_sec` (at most 5 minutes):
+`mutationCount` at the `safe` block, then `getMutations` for the new records,
+applied in ledger order. The cursor is in memory only, so a node returning
+after any downtime rebuilds the complete deny-set from one snapshot. Every
+tick also re-applies local expiry and region ripening, which change scope
+without a new ledger record.
 
 Enforcement is two writes per hash, in order — a governance-sourced *deny*, then
 the *eviction*. `CacheEngine::evict` durably records the takedown in `evicted.log`
@@ -418,17 +355,14 @@ enumeration + enforcement pass completes, so a node refuses to serve rather than
 serve un-enforced.
 
 Manual eviction (Remediate below) is therefore for a takedown notice you received
-out of band, or for confirming the watcher already acted — not the primary
+out of band, or for confirming the sync already acted — not the primary
 mechanism.
 
 Operator-*level* blacklisting runs on a different path, and takes effect in two
 places. When governance calls `ContentBlacklist.addOperator`, the contract calls
-`CapacityBond.ejectNode`, which emits both `EjectedByBlacklist` and a
-nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
-`NodeAutoEjected` and drops the node from its active set live; the
-`EjectedByBlacklist` event is deliberately not subscribed because
-`NodeAutoEjected` already carries the nodeId (see
-`crates/node/src/dht/chain_staker_set.rs`). Separately, the blacklist watcher
+`CapacityBond.ejectNode`, so the ejected node leaves `getRegisteredNodes`. The
+node's 5-minute registry refresh drops it from the active set (see
+`crates/node/src/dht/capacity_bond_registry.rs`). Separately, the blacklist sync
 folds the blacklisted-address union into the node's origin deny-set, so a
 `StreamRequest` on a pool funded by a blacklisted operator is refused at the
 delivery gate with `OriginDenied` and any in-flight stream is cut at the next MB
@@ -438,21 +372,17 @@ action is required.
 **Detect:**
 
 - Alerts in `prometheus-alerts.yml` (verbatim names):
-  - `DecdnBlacklistWatcherStalled` (critical) — no successful poll tick for
+  - `DecdnBlacklistWatcherStalled` (critical) — no successful ledger poll for
     several intervals; fires on the age of
-    `decdn_blacklist_watcher_last_tick_timestamp_seconds`, or on
-    `decdn_blacklist_watcher_down_seconds` when every poll tick fails.
+    `decdn_blacklist_watcher_last_tick_timestamp_seconds`.
   - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
     re-verify or evict every known entry, so a blacklisted hash may still be
-    servable even while `decdn_blacklist_watcher_down_seconds` reads 0. The two
-    answer different questions: deny-set enforced vs chain readable.
-- Grafana: the "Oldest watcher tick" panel in
-  `grafana-dashboard.json`, and the per-watcher "Watcher tick age"
-  table in `dashboard-chain.json`.
-- There is no sync-lag or version-delta coverage: the watcher rebuilds the
-  deny-set by full enumeration and keeps no version cursor
-  (`adr/011-content-takedown.md` § Node Behavior), so no such gauge exists. The
-  tick-age gauge above is the liveness coverage.
+    servable even while the poll timestamp is fresh. The two answer different
+    questions: deny-set enforced vs chain readable.
+- `decdn_blacklist_ledger_poll_failures_total` rising means ledger polls fail;
+  the next poll retries from the same cursor.
+- The tick-age gauge above is the liveness coverage
+  (`adr/011-content-takedown.md` § Node Behavior).
 - Manual on-chain check: query `ContentBlacklist` directly with
   the hash from the takedown notice — `isHashBlacklisted(hash)` for global
   entries, `isHashBlacklistedInRegion(hash, region)` for a regional entry. The
@@ -631,8 +561,8 @@ diagnostic.
    (`buyer pool store read failed before on-chain reconciliation`). Any of the
    three means the answer is unknown, not clean — fix the cause and restart to
    re-run the sweep.
-3. Recover those with `decdn pool close --pool <poolId>`, then
-   `decdn pool reclaim --pool <poolId>` once the pool's `disputeWindow` has
+3. Recover those with `decdn pool close --pool-id <poolId>`, then
+   `decdn pool reclaim --pool-id <poolId>` once the pool's `disputeWindow` has
    elapsed (48-72h, governance-set). Both commands run their on-chain leg
    normally from a node host but leave the daemon's row alone — they cannot
    write a store the daemon holds — and say so.
@@ -730,10 +660,11 @@ alone cannot tell them apart — this is why the log line exists:
 1. **Clients genuinely running dry.** Their remaining deposit, less the
    refundable floor `M`, cannot cover one chunk. Nothing is wrong with this
    node. Expect a low background rate.
-2. **This node's chain watcher is lagging an on-chain top-up.** The seller's view
-   of a pool's deposit is only raised by observing `PoolToppedUp`, so a
-   client that just topped up is refused until the watcher catches up. Funded
-   clients are being turned away and will route elsewhere.
+2. **This node's pool read is older than an on-chain top-up.** The seller's view
+   of a pool's deposit comes from a `getPool` read that lives for 30 seconds,
+   so a client that just topped up can be refused until the next read. A
+   view that stays stale means the reads fail. Funded clients are being turned
+   away and will route elsewhere.
 
 A third, rarer cause: the operator's own
 `blockchain.buyer_working_deposit_micro_usdc` is too small for the *upstream*
@@ -755,10 +686,10 @@ counts; see
    compute `deposit − totalRedeemed − M`. If that exceeds
    `headroom` — typically after a recent `PoolToppedUp` — the node's view is
    stale: cause (2).
-2. For cause (2), check watcher liveness —
-   `decdn_settlement_watcher_last_tick_timestamp_seconds` should advance every
-   `blockchain.event_poll_interval_ms`. A stalled watcher usually means the RPC
-   endpoint is unreachable or rate-limiting; see [RPC unreachable](#rpc-unreachable).
+2. For cause (2), check the payment-chain RPC: `decdn_rpc_requests_total` for
+   `method="eth_call"` with an outcome other than `ok`. Failing reads usually
+   mean the RPC endpoint is unreachable or rate-limiting; see
+   [RPC unreachable](#rpc-unreachable).
 3. For cause (1), no action. If the rate is high because many clients open dust
    pools deliberately, note that the refusal happens *before* any fill
    (#1519), so it costs this node nothing beyond the signature.
@@ -815,29 +746,15 @@ membership.
 `decdn_capacity_bond_registry_last_resync_timestamp_seconds` going stale, with
 `capacity-bond registry resync failed; keeping current projections` at `WARN`.
 
-**What it means:** the re-enumeration of `getRegisteredNodes` is the only
-systematic repair for a drifted set. It deliberately reports success upward — an
-error would mark the watcher route errored and stall event pickup — so the
-counter is the only thing that moves when its read fails. The staleness rule
-covers the other case: while the route is errored the repair is skipped
-entirely, which emits nothing at all, not even the counter.
+**What it means:** the node reads the active-staker set as one
+`getRegisteredNodes` snapshot every 5 minutes, and again (at most once a
+minute) when a peer presents a `NodeId` the projection does not know. A failed
+read keeps the projection the node already has and bumps the counter. A stale
+gauge with a flat counter means the refresh loop itself stopped.
 
-A route recovering from an errored tick forces a re-enumeration on the tick it
-comes back, so a stale gauge on a healthy route means the reads themselves are
-failing. Two limits on that trigger. It covers poll-level outages only: a
-`nodeIdOf` resolution failure is returned as `Ok` and never errors the route, so
-a membership change dropped that way waits for the cadence even while everything
-else looks healthy — watch `decdn_staker_set_watcher_resolve_failures_total` for
-it. And it is floored, so an endpoint that flaps every few seconds does not earn
-a full enumeration per flap.
-
-**Remediate:** check the RPC provider's `eth_call` path — the enumeration is
-paginated `eth_call`s, not `eth_getLogs`, so it can fail while the event tail
-still ticks. Correlate with `decdn_staker_set_watcher_down_seconds` and
-`decdn_staker_set_watcher_resolve_failures_total`: down-seconds climbing means
-the poll is failing too, and the repair will run on its own when the route
-recovers. A restart re-enumerates at bootstrap and is the fallback if the
-provider is healthy and the gauge stays stale.
+**Remediate:** check the RPC provider's `eth_call` path. The refresh runs on
+its own when the provider recovers. A restart reads the snapshot at bootstrap
+and is the fallback if the provider is healthy and the gauge stays stale.
 
 ## Origin rescan probes faulting
 
@@ -972,38 +889,29 @@ identity rotation, host clock skew breaking TLS.
 
 ## Repointing at a redeployed PaymentPool
 
-**Changing `blockchain.payment_pool_address` or `blockchain.chain_id` drops
-seller payment state.** The lane store binds to one `PaymentPool` deployment
-(ADR 003 § Off-chain voucher state persistence): on the first boot against a
-different deployment the node deletes its seller lane frontiers, both
-pending-settle sets, the event-scan checkpoints, and the settlement ledger
-`decdn node earnings` reads, because their pool ids repeat on the new
-deployment. Unredeemed vouchers on the old deployment are forfeit after the
-drop, and the earnings history starts over: the `covered_from=<date>` that
-`decdn node earnings` prints is that boot. The old deployment's settlements
-are still on the chain:
-
-```bash
-decdn node earnings --address <operator> \
-  --payment-pool-address <old PaymentPool> --from-block <old deployment's L2 block>
-```
+Every row of the node's payment stores is keyed by its `PaymentPool`
+deployment: the payment chain id and the pool address (ADR 003 § Off-chain
+voucher state persistence). A pool id repeats across deployments, so the key
+keeps them apart. Changing a `[[blockchain.payment_chains]]` entry's `chain_id`
+or `payment_pools` therefore drops nothing: the node serves the pools now
+configured, and the rows of a pool no longer configured stay in `lanes.redb`,
+`settle.redb` and `buyer.redb` untouched. Put the pool back
+in the list to redeem its unredeemed vouchers before its owner reclaims it.
 
 ## A settlement ledger row that does not decode
 
 `decdn node earnings` and `decdn node status` answer
 `settlement ledger load failed: corrupt record … settlement ledger row at block
-N log M does not decode` when a row in `settle.redb`'s `settlement_ledger_v1`
+N log M does not decode` when a row in `settle.redb`'s `settlement_ledger_v2`
 table is not in this binary's layout. The redeemer keeps landing redemptions
-and the watcher keeps its paid watermarks; only the earnings figures are
-affected, and the watcher's ledger backfill skips that block. The ledger shares
-`settle.redb` with both pending-settle sets, so do not move the file aside
-while a pool this node closed awaits its grace window. Nothing lists the
-pending-settle sets: `decdn_pool_grace_closes_total` counts the closes this
-node holds unredeemed value on, so wait until the dispute deadline of the last
-one has passed. Then stop the node, move `settle.redb` aside and restart: the
-earnings history starts over, and `covered_from` reads that boot or the first
-landing the watcher backfills from the downtime before it. `decdn node
-earnings --address` still has the chain's record.
+and keeps its paid watermarks; only the earnings figures are affected. The
+ledger shares `settle.redb` with both pending-settle sets and the sent
+`redeemMany` hashes the node reads receipts for on boot, so do not move the
+file aside while a pool this node holds unredeemed vouchers on is closing.
+Wait until `decdn_unredeemed_usdc` reads 0. Then stop the node, move
+`settle.redb` aside and restart: the earnings history starts over, and
+`covered_from` reads that boot. `decdn node earnings --address` still has the
+chain's record.
 
 **Before repointing:**
 
@@ -1041,6 +949,132 @@ must hold code that answers `PaymentPool.getRateBounds()`, a view only
 the same deploy manifest — aborts boot instead of triggering the drop. Buyer pool rows are not dropped by this path. Each
 buyer row carries its own chain id and `PaymentPool` address, and the buyer
 ignores a row from another deployment.
+
+## Sweeping the protocol share
+
+Each `redeemMany` pays the operator share on the payment chain at once. The
+pool keeps the protocol share as `pending(operator)` until a sweep sends it
+over CCTP to the governance chain's `CctpSweepReceiver`, which deposits it into
+`FeeRouter`. The sweep carries the operator's rebate and its vote weight. The
+daemon does not sweep: run it by hand, about once per epoch.
+
+One sweep is a batch of 1 to 32 operators (`MAX_SWEEP_BATCH()`): one CCTP
+transfer on the payment chain and one receive on the governance chain, whose
+cost the batch shares. The batch total, not each share, must reach the pool's
+`minSweep`, so operators with small shares reach it together.
+
+1. Check what each pool holds: `decdn node earnings` prints one `pool …` line
+   per `PaymentPool` with the pending protocol share and `minSweep`.
+2. Send it: `decdn node sweep` reads the operator's `pending` and `minSweep()`
+   on every configured pool and calls `sweep([operator])` where the share has
+   reached `minSweep`. To share the receive with other operators, list them
+   with `--with <address>` (repeat it for each). The command reads each listed
+   operator's `pending`, leaves out an operator with nothing pending (the
+   pool skips one too), and sends the batch when its total reaches
+   `minSweep`:
+
+   ```bash
+   decdn node sweep --with 0xAbc… --with 0xDef…
+   ```
+
+   For each pool it prints the batch total, and after the sweep the
+   transaction, the `SweepSent` total and bridge fee, and one line per swept
+   operator with its share and served bytes (`--json` for the same as JSON).
+   `--pool eip155:<chainId>:<address>` sweeps one pool; `--dry-run` sends
+   nothing. The operator keystore pays the gas on each payment chain.
+3. Complete it on the governance chain: `decdn node receive-sweeps` scans each
+   pool for the operator's `Swept` events (from the known deployment block, or
+   `--from-block`). A batch another operator sent is found too, since
+   `Swept` indexes each operator. For each sweep transaction the command reads
+   the message and attestation from Circle's attestation service once
+   (`blockchain.cctp_iris_url` or `--iris`; the sandbox
+   `https://iris-api-sandbox.circle.com` on testnets) and calls
+   `CctpSweepReceiver.receiveSweep` once for the whole batch. Each line names
+   the batch size and the operator's share. A standard transfer waits for
+   source-chain finality, so the attestation can stay pending for many
+   minutes: the command waits about half an hour, then reports `pending`, and
+   a re-run completes it. A sweep already received, by this operator or
+   another one of the batch, reports `already_received`. To complete one
+   known sweep, pass `--pool <caip10> --tx <sweep tx hash>`.
+
+The command needs `blockchain.cctp_sweep_receiver_address` (or
+`--cctp-sweep-receiver-address`). `decdn node doctor` checks that each pool's
+`sweepRecipient()` equals it: a mismatch means the pool belongs to another
+deployment, and its sweeps land where this governance chain never sees them.
+
+### CCTP outage
+
+The protocol share travels from each payment chain to the governance chain
+over CCTP standard transfers. An outage of CCTP delays the protocol share
+only. It does not stop serving, payment or governance.
+
+**What keeps working:**
+
+- Clients pay and nodes serve. Each redemption pays the operator its
+  `operatorBps` share on the payment chain, with no bridge.
+- Nothing is lost. A sweep that already burned waits for its attestation,
+  and standard CCTP messages never expire. A share not yet swept stays in the
+  pool's `pending`.
+- Governance keeps its quorum. Vote weight is the served bytes of the last
+  `windowEpochs` epochs (13 weekly epochs by default), and quorum is a
+  fraction of the same window total. An outage lowers both together.
+
+**Detect:**
+
+1. `decdn node receive-sweeps` reports attestations as `pending` for hours.
+2. Circle's status page confirms the outage.
+3. If Circle has paused the burn side, `decdn node sweep` reverts and the
+   share stays in `pending`. Nothing needs undoing.
+
+**Keep governance working:**
+
+Each week of outage removes about 1/`windowEpochs` of the new weight. Before
+a vote that must pass, or once the outage reaches 4 to 6 weeks, operators
+that need weight deposit USDC directly into `FeeRouter` on the governance
+chain. `$USDC` is the governance chain's USDC, `$FEE_ROUTER` the `FeeRouter`,
+`$OPERATOR` the operator address the weight is for, `$AMOUNT` the deposit in
+micro-USDC and `$BYTES` the served bytes it credits:
+
+```bash
+cast send $USDC "approve(address,uint256)" $FEE_ROUTER $AMOUNT --rpc-url $GOVERNANCE_RPC --account <operator>
+cast send $FEE_ROUTER "deposit(address,uint256,uint256)" $OPERATOR $BYTES $AMOUNT --rpc-url $GOVERNANCE_RPC --account <operator>
+```
+
+- Size `$BYTES` to about one normal epoch of the operator's traffic.
+- Only an operator `CapacityBond` reports as active earns the credit and the
+  rebate.
+- The credit is at most `net × 1 MiB / deliveryFloor`, and the capacity clamp
+  applies. `net` is the part of the deposit that is not rebated; the rebate
+  returns to the operator in the same transaction.
+- At least two active operators must deposit. The share cap sizes each
+  operator's weight from the other operators' bytes, so one depositor alone
+  gets no weight.
+- The credit counts after its arrival epoch fully elapses.
+
+**Recover:**
+
+1. When attestations complete again, list the backlog with
+   `decdn node receive-sweeps --dry-run`.
+2. Receive the backlog about one epoch's worth per epoch, with
+   `decdn node receive-sweeps --pool <caip10> --tx <sweep tx hash>` for the
+   sweeps of that epoch. Bytes count in the epoch they arrive, and the
+   capacity clamp limits each operator's credit per epoch. A backlog of
+   several weeks received in one epoch loses most of its weight credit; the
+   USDC still arrives. Messages never expire, so a later receive costs
+   nothing.
+3. Resume normal batched sweeps (`decdn node sweep`, with `--with` for the
+   operators that share the receive).
+
+**If CCTP leaves a payment chain for good:**
+
+1. Deploy a `PaymentPoolBase` variant on another bridge that authenticates
+   the source pool, and its governance-chain adapter (ADR 016 § Bridge
+   adapters). `FeeRouter` does not change.
+2. Nodes replace the old pool with the new one in
+   `[[blockchain.payment_chains]].payment_pools`. Clients open pools on the
+   new contract.
+3. A share still unswept in the old pool stays there. Frequent batched sweeps
+   keep that amount small.
 
 ## Testnet faucet
 

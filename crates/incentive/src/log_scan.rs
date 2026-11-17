@@ -5,9 +5,8 @@
 //! (dRPC's free plan rejects above about 100 blocks). Every scan here walks `[from, to]`
 //! one window at a time, halves a window the provider rejects as too wide
 //! ([`is_range_rejection`]) and doubles it back after a run of accepted
-//! windows ([`WindowSpan`]). The daemon's chain poller drives the same
-//! primitives inside its tick loop; [`scan_logs`] is the standalone driver for
-//! a one-shot scan such as `decdn node earnings --address`.
+//! windows ([`WindowSpan`]). [`scan_logs`] drives a one-shot scan of the CLI,
+//! such as `decdn node earnings --address`.
 
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -51,10 +50,10 @@ pub const SPAN_REGROW_AFTER_WINDOWS: u32 = 32;
 /// provider. It starts at the configured ceiling. A rejected window sets it to
 /// half that window's length ([`halved_span`]), never above the current span.
 /// After [`SPAN_REGROW_AFTER_WINDOWS`] accepted windows it doubles, up to the
-/// ceiling. Every accepted window counts, short ones too: a caught-up poller
+/// ceiling. Every accepted window counts, short ones too: a long scan
 /// therefore climbs back to the ceiling after a transient or misclassified
-/// rejection, and a real cap shows up as the next backfill's rejections
-/// instead of as a span that stays low for good.
+/// rejection, and a real cap shows up as further rejections instead of as a
+/// span that stays low for good.
 #[derive(Debug, Clone)]
 pub struct WindowSpan {
     current: u64,

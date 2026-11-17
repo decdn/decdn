@@ -23,8 +23,9 @@ use crate::buyer_pool::{OwnedPayer, ProgressWrite, WatermarkRow};
 use crate::discovery::{self, NodeCandidate};
 use crate::funding::{LaneKeys, RunFunding, build_ctx_for_fetch};
 use crate::ordered_writes::OrderedWrites;
+use crate::pool_route::PoolPasses;
 use crate::receipt::ReceiptEvidence;
-use crate::session::{ChainConfig, DepositPolicy, FetchMarks, PullSite};
+use crate::session::{ChainConfig, DepositPolicy, FetchMarks, PaymentPoolChain, PullSite};
 use crate::{
     Connections, CredentialSlot, Cumulative, LaneHandle, LaneLedgers, PeerSource, PoolContext,
     PoolLedger, PullDeadlines, VoucherProgress,
@@ -164,8 +165,15 @@ pub struct LaneDeps<'a, P> {
     /// The pool's settlement token (USDC), read once via `PaymentPool.usdc()`
     /// and threaded through rather than re-read per top-up.
     pub token: Address,
-    /// The chain the pull pays on.
+    /// The chains the pull runs on: the governance chain, and every payment
+    /// pool it can pay through.
     pub chain: &'a ChainConfig,
+    /// The payment pool this pass pays through: `contract` is its
+    /// `PaymentPool`, and every lane's voucher domain is its deployment's.
+    pub pool: &'a PaymentPoolChain,
+    /// Which pass pays each node ([`PoolPasses`]): a lane is built only to a
+    /// node this pass's pool is routed to.
+    pub passes: &'a PoolPasses,
     /// Where the pull keeps its peer store and scratch files.
     pub site: &'a PullSite,
     /// How a self-owned pool is funded.
@@ -377,7 +385,11 @@ where
     // `ledgers` is `Some`, else a fresh pair.
     let (ledger, ctx) = lane_ledger(ledgers, lane, ctx);
     if let Some(evidence) = deps.evidence {
-        evidence.attach(deps.chain, lane, &ledger);
+        evidence.attach(
+            (&deps.chain.governance, deps.pool.deployment),
+            lane,
+            &ledger,
+        );
     }
     // The run's view of the pool's spend counts this lane through its ledger
     // from now on, whether or not the acquire loop ever starts it. A delegated

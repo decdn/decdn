@@ -1,19 +1,18 @@
-//! The node's boot preflight identifies the configured `PaymentPool` by
-//! calling `getRateBounds()` (`check_deployment_preflight` in
+//! The node's boot preflight identifies a configured `PaymentPool` by calling
+//! `operatorBps()` and `sweepDomain()` (`check_deployment_preflight` in
 //! `crates/node/src/runtime/mod.rs`). The probe only works while no other
-//! contract answers that selector: a node configured with such a contract's
-//! address passes the preflight, binds its lane store to the wrong address,
-//! and drops its seller lane state.
+//! contract answers both selectors: a node configured with such a contract's
+//! address passes the preflight and keys its lane store to the wrong address.
 //!
 //! `deployment_preflight_guard` boots a node against every deployed contract,
 //! but a contract the e2e deploy leaves undeployed (the dormant
 //! `BuybackBurner`) is not on chain there, though a live deployment may deploy
 //! it. This test needs no chain: it reads the method identifiers `forge build`
 //! records for every contract compiled from `contracts/src`, and fails if any
-//! contract other than `PaymentPool` exposes the probe's selector. It compares
-//! 4-byte selectors, not names, so a differently named function that collides
-//! with the selector fails it too. The selector comes from the node's own
-//! `PaymentPool` binding, so the test checks the call the node actually makes.
+//! contract other than `PaymentPool` exposes every probe selector. It compares
+//! 4-byte selectors, not names, so differently named functions that collide
+//! with the selectors fail it too. The selectors come from the node's own
+//! `PaymentPool` binding, so the test checks the calls the node actually makes.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default), which marks the tests
 //! that need Foundry. Requires `forge` on `PATH`:
@@ -44,14 +43,17 @@ use decdn_incentive::payment_pool::PaymentPool;
 const PAYMENT_POOL: (&str, &str) = ("src/PaymentPool.sol", "PaymentPool");
 
 /// Contracts the scan must find, so a change in the artifact layout cannot make
-/// it pass on an empty or partial list. `FeeRouter` and `DecdnGovernor` share a
-/// `PaymentPool` view, and `BuybackBurner` is the contract the e2e deploy leaves
-/// undeployed.
-const MUST_SCAN: [&str; 3] = ["FeeRouter", "DecdnGovernor", "BuybackBurner"];
+/// it pass on an empty or partial list. `FeeRouter` and `CctpSweepReceiver`
+/// sit on the sweep path beside the pool, and `BuybackBurner` is the contract
+/// the e2e deploy leaves undeployed.
+const MUST_SCAN: [&str; 3] = ["FeeRouter", "CctpSweepReceiver", "BuybackBurner"];
 
 #[tokio::test]
-async fn only_payment_pool_exposes_the_preflight_probe_selector() -> anyhow::Result<()> {
-    let probe = alloy::hex::encode(PaymentPool::getRateBoundsCall::SELECTOR);
+async fn only_payment_pool_exposes_the_preflight_probe_selectors() -> anyhow::Result<()> {
+    let probe = [
+        alloy::hex::encode(PaymentPool::operatorBpsCall::SELECTOR),
+        alloy::hex::encode(PaymentPool::sweepDomainCall::SELECTOR),
+    ];
     let contracts = decdn_e2e::chain::build_contracts().await?;
     let selectors = src_method_selectors(&contracts.join("out"))?;
 
@@ -62,25 +64,24 @@ async fn only_payment_pool_exposes_the_preflight_probe_selector() -> anyhow::Res
             selectors.keys().collect::<Vec<_>>()
         );
     }
+    let answers_probe = |ids: &Vec<String>| probe.iter().all(|selector| ids.contains(selector));
     let pool_key = (PAYMENT_POOL.0.to_string(), PAYMENT_POOL.1.to_string());
     anyhow::ensure!(
-        selectors
-            .get(&pool_key)
-            .is_some_and(|ids| ids.contains(&probe)),
-        "PaymentPool does not expose the probe selector 0x{probe} the node calls"
+        selectors.get(&pool_key).is_some_and(answers_probe),
+        "PaymentPool does not expose the probe selectors {probe:?} the node calls"
     );
 
     let colliding: Vec<_> = selectors
         .iter()
-        .filter(|(key, ids)| **key != pool_key && ids.contains(&probe))
+        .filter(|(key, ids)| **key != pool_key && answers_probe(ids))
         .map(|(key, _)| key)
         .collect();
     anyhow::ensure!(
         colliding.is_empty(),
-        "these contracts expose 0x{probe}, the selector of PaymentPool.getRateBounds() that \
-         the node's deployment preflight uses as the PaymentPool identity probe; a node \
-         configured with one of their addresses would pass the preflight and drop its \
-         seller lane state: {colliding:?}"
+        "these contracts expose {probe:?}, the selectors of PaymentPool.operatorBps() and \
+         sweepDomain() that the node's deployment preflight uses as the PaymentPool identity \
+         probe; a node configured with one of their addresses would pass the preflight: \
+         {colliding:?}"
     );
     Ok(())
 }

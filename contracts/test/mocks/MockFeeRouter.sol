@@ -38,8 +38,28 @@ contract MockFeeRouter is IFeeRouter {
         _totalBytes[epoch] = amount;
     }
 
-    function routeSettlement(address, uint256, uint256) external pure override {
+    function deposit(address, uint256, uint256) external pure override {
         revert("MockFeeRouter: not implemented");
+    }
+
+    function rebateBps() external pure override returns (uint256) {
+        return 0;
+    }
+
+    function buybackBps() external pure override returns (uint256) {
+        return 0;
+    }
+
+    function buybackBurner() external pure override returns (address) {
+        return address(0);
+    }
+
+    function treasury() external pure override returns (address) {
+        return address(0);
+    }
+
+    function deliveryFloor() external pure override returns (uint256) {
+        return 1;
     }
 
     function bytesPerEpoch(address operator, uint64 epoch) external view override returns (uint256) {

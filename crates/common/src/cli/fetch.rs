@@ -87,16 +87,15 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "0xADDR")]
     pub provider_address: Option<String>,
 
-    /// JSON-RPC endpoint for on-chain pool open. Overrides
-    /// `blockchain.rpc_url` from config.
-    #[arg(long, value_name = "URL")]
-    pub rpc_url: Option<String>,
+    /// The governance chain: its RPC endpoint (registry reads) and chain id
+    /// (the slash and stream signature domains).
+    #[command(flatten)]
+    pub governance: super::common::GovernanceChainArgs,
 
-    /// `PaymentPool` contract address (0x hex) — the voucher EIP-712
-    /// `verifyingContract` and the `openPool` target. Overrides
-    /// `blockchain.payment_pool_address`.
-    #[arg(long, value_name = "0xADDR")]
-    pub payment_pool_address: Option<String>,
+    /// The `PaymentPool` the fetch pays through. Without `--pool` the fetch
+    /// may pay through every configured pool, one node at a time.
+    #[command(flatten)]
+    pub payment: super::common::PoolSelectArgs,
 
     /// `SlashJudge` contract address (0x hex) — the `slash_sig` EIP-712
     /// `verifyingContract`. Overrides `blockchain.slash_judge_address`.
@@ -159,11 +158,6 @@ pub struct ClientFetchArgs {
     /// terminal waits until Ctrl-C and a script stops after 10 minutes.
     #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
     pub give_up_after_secs: Option<u64>,
-
-    /// EIP-712 `chainId` for both domains. Overrides `blockchain.chain_id`;
-    /// defaults to Arbitrum Sepolia.
-    #[arg(long, value_name = "ID")]
-    pub chain_id: Option<u64>,
 
     /// Path to the buyer's Ethereum keystore. On the buyer's own pool this key
     /// owns the pool and signs its transactions, and the vouchers sign under a

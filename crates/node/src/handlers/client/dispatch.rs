@@ -3,10 +3,10 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, Hash, LaneKey, MissPath, MissRefusal, OwnedSemaphorePermit, PublicKey,
-    RecvStream, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest, U256,
-    VarInt, read_first_message, reset_stream, verify_binding,
+    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, Deployment,
+    FillOutcome, FirstMessage, Hash, LaneId, LaneKey, MissPath, MissRefusal, OwnedSemaphorePermit,
+    PublicKey, RecvStream, Semaphore, SendStream, ServeRejectReason, StreamReadError,
+    StreamRequest, U256, VarInt, read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
@@ -396,6 +396,27 @@ impl ClientHandler {
             return Ok(ServeEnd::Reset(ResetCause::TimestampSkew));
         }
 
+        // Payment pool routing (ADR 005 § Payment pool routing). The request
+        // names the pool it pays from; every pool read, voucher domain and lane
+        // below belongs to that pool's route. A pool this node does not accept
+        // is refused `Declined` with the accepted pools listed, before any pool
+        // read or chain call, so the requester can retry on one it holds.
+        let Some(deployment) = Deployment::from_pool_account(&req.payment_pool)
+            .filter(|deployment| self.pool_route(*deployment).is_some())
+        else {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::UnacceptedPool,
+                    self.rate_per_mb,
+                )
+                .await;
+        };
+        let pool_view = self
+            .pool_route(deployment)
+            .and_then(|route| route.pool_view.clone());
+
         // Verify an ephemeral client binding if present (ADR 005 §Client
         // identity binding) and remember the recovered address for the
         // connection's lifetime (a binding may be sent once and omitted on
@@ -449,8 +470,8 @@ impl ClientHandler {
         // The request's price: the node's configured `rate_per_mb`, quoted
         // verbatim and threaded to every refusal and to the window tier. The
         // delivery floor never rewrites it — a sub-floor rate still sells, and
-        // settlement clamps only the vote-weight byte credit (ADR 003
-        // § Rate-floor enforcement).
+        // the floor prices only the vote-weight credit the governance chain's
+        // `FeeRouter` grants on a sweep (ADR 003 § Rate-floor enforcement).
         let rate_per_mb = self.rate_per_mb;
 
         // Chain-staleness gate (ADR 011 §Serving while chain-stale). Every gate
@@ -518,10 +539,13 @@ impl ClientHandler {
         // as "not my business" (it cannot make this node spend, because
         // `pull_authorized` refuses it before every fill tier).
         let self_operator = self.eth_signer.address();
-        let lane_key = verified_client.map(|signer| LaneKey {
-            pool_id: B256::from(req.pool_id),
-            signer,
-            provider: self_operator,
+        let lane_key = verified_client.map(|signer| LaneId {
+            deployment,
+            key: LaneKey {
+                pool_id: B256::from(req.pool_id),
+                signer,
+                provider: self_operator,
+            },
         });
 
         // Backend and chain work only for a request that names a lane. A
@@ -535,7 +559,7 @@ impl ClientHandler {
         // read; the per-request limiter and the admit-read cap bound what bound
         // requests can spend. With no pool-view wired (dev/test) the lane gate
         // below refuses it.
-        if self.pool_view.is_some() && lane_key.is_none() {
+        if pool_view.is_some() && lane_key.is_none() {
             self.warn_unbound_request(&peer);
             return self
                 .respond_error(
@@ -607,7 +631,7 @@ impl ClientHandler {
         // rejection rather than a fail-open serve. With NO pool-view wired
         // (dev/test, no chain) the read is `None` and the downstream gates keep
         // their prior fail-open behavior.
-        let pool_status = match self.pool_view.as_ref() {
+        let pool_status = match pool_view.as_ref() {
             Some(view) => view.status(B256::from(req.pool_id)).await,
             None => None,
         };
@@ -621,7 +645,7 @@ impl ClientHandler {
         // wired, which lets the capability-owner and floor gates below rely on it.
         // With NO pool-view (dev/test, no chain wired) `pool_status` stays `None` and
         // the pre-#-gates keep their prior fail-open behavior.
-        if self.pool_view.is_some() && pool_status.is_none() {
+        if pool_view.is_some() && pool_status.is_none() {
             return self
                 .respond_error(
                     &mut send,
@@ -644,7 +668,7 @@ impl ClientHandler {
         // read of the signer -> None -> refuse as unconfirmed, never as an
         // exhausted cap.
         let mut registered_terms: Option<(u64, u64)> = None;
-        if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
+        if let (Some(view), Some(signer)) = (pool_view.as_ref(), verified_client) {
             // The signer must be able to pay one chunk (ADR 003 § Pool solvency).
             let floor_micro = decdn_incentive::min_payment(CHUNK_BYTES, rate_per_mb);
             let auth = view
@@ -696,7 +720,13 @@ impl ClientHandler {
         if let (Some(signer), Some(capability), Some(status)) =
             (verified_client, ext.capability.as_ref(), pool_status)
         {
-            self.intake_capability(B256::from(req.pool_id), signer, status.owner, capability);
+            self.intake_capability(
+                deployment,
+                B256::from(req.pool_id),
+                signer,
+                status.owner,
+                capability,
+            );
         }
 
         // Resolve the live lane AFTER intake, so a lane just registered from this
@@ -718,7 +748,8 @@ impl ClientHandler {
         // registered from a wider capability, or from one presented before the
         // signer's registration landed elsewhere, narrows here on its next stream.
         if let (Some(lane), Some((cap, expiry))) = (known_lane.as_ref(), registered_terms) {
-            self.clamp_lane_to_registration(lane, cap, expiry).await;
+            self.clamp_lane_to_registration(deployment, lane, cap, expiry)
+                .await;
         }
 
         // Funding gates that need the lane (ADR 003 §Pool solvency, ADR 005

@@ -1,13 +1,13 @@
 # deCDN — Protocol Specification
 
-A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain vouchers backed by a shared on-chain payment pool; bonded operators compete on price and latency, with reputation, slashing, and capacity-bonded incentives keeping the mesh honest.
+A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain vouchers backed by a shared payment pool on a payment chain (any chain that meets the [admission rule](appendix-l2-deployment.md#appendix-governance-chain-and-payment-chain-admission)); bonded operators compete on price and latency, with reputation, slashing, and capacity-bonded incentives keeping the mesh honest.
 
 This directory is the protocol's canonical specification. Each numbered file is an Architecture Decision Record (ADR) covering one component or invariant of the design. [`architecture.md`](architecture.md) is the living overview — system diagram, ADR-by-ADR summaries, key invariants, trust assumptions, and the canonical reading order.
 
 ## Design principles
 
 - **Content-addressed, location-independent.** Every blob is identified by its BLAKE3 hash. Delivery verification is inherent: the receiver hashes received bytes and rejects mismatches. Nodes are interchangeable as long as the hash matches.
-- **Paid byte delivery, end to end.** Every byte transferred — client→node *and* node→node — is paid. There is no free-rider tier and no unpaid relay layer. Off-chain payment-token vouchers, backed by a shared on-chain pool, settle on-chain.
+- **Paid byte delivery, end to end.** Every byte transferred — client→node *and* node→node — is paid. There is no free-rider tier and no unpaid relay layer. Off-chain payment-token vouchers, backed by a shared pool on a payment chain, settle on that chain.
 - **Stake to participate, slash on misbehavior.** Nodes must stake TOKEN before joining the mesh. Misbehavior (rate manipulation, corruption, blacklist violation) is detectable on-chain and slashable. Challenge bonds prevent zero-cost griefing.
 - **Origin storage is opaque.** Origin-backed nodes hold canonical content in S3/R2/B2/NFS/local-disk backends, but no external origin URL is ever exposed. Bypassing the payment layer requires bypassing the network entirely.
 - **Operator return is differentiated by capacity commitment, not raw stake.** The `CapacityBond` lock-to-capacity curve `bond = k × Mbps^α` requires operators to bond TOKEN proportional to declared bandwidth, with super-linear pressure against concentration. No fee discounts, no passive yield to non-operators.
@@ -26,7 +26,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 7. **Operations** — node onboarding.
 8. **Supporting infrastructure** — schema evolution, privacy analysis.
 
-Plus a set of **appendices** documenting reference patterns, operator runbooks, and operational layers built on top of the protocol (observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface, operator key rotation, operator protocol-upgrade runbook, the binary split, and the bundle format).
+Plus a set of **appendices** documenting reference patterns, operator runbooks, and operational layers built on top of the protocol (observability, governance chain and payment chain admission, PoC/production seam architecture, local admin HTTP surface, operator key rotation, operator protocol-upgrade runbook, the binary split, and the bundle format).
 
 The numeric index in [`architecture.md` § Architectural Decisions](architecture.md#architectural-decisions) stays as the canonical per-ADR reference.
 
@@ -39,7 +39,7 @@ Terms used across multiple ADRs are defined in [`glossary.md`](glossary.md), gro
 This directory contains two kinds of documents:
 
 - **Core protocol ADRs** (`NNN-name.md`) — invariants every conforming node, client, or contract must implement the same way for the network to function. These are the canonical specification.
-- **Appendices** (`appendix-name.md`) — patterns, reference implementations, operational guidance, and optional layers built **on top of** the protocol. Alternative implementations are acceptable. Examples: the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, the local admin HTTP surface, the operator key-rotation runbook, and the operator protocol-upgrade runbook.
+- **Appendices** (`appendix-name.md`) — patterns, reference implementations, operational guidance, and optional layers built **on top of** the protocol. Alternative implementations are acceptable. Examples: the recommended observability metric registry, governance chain and payment chain admission, the Rust implementation pattern for PoC/production seams, the local admin HTTP surface, the operator key-rotation runbook, and the operator protocol-upgrade runbook.
 
 Appendices are listed in [`architecture.md` § Appendices — Reference Patterns](architecture.md#appendices--reference-patterns). They are deliberately **not** numbered as ADRs because they document optional patterns rather than core protocol decisions.
 

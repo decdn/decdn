@@ -15,6 +15,9 @@ import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { Token } from "../src/Token.sol";
 
+import { IMessageTransmitterV2 } from "../src/interfaces/ICctpV2.sol";
+import { LoopbackCctp } from "../testnet/LoopbackCctp.sol";
+
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 
 contract LifecycleUSDC is ERC20 {
@@ -44,7 +47,7 @@ contract LifecycleUSDC is ERC20 {
 ///         three test operators (`proposer`, `voter1`, `voter2`) bond at T0,
 ///         then we walk forward 60 epochs (≈ 420 days, past the default 6-month
 ///         age ramp so `age_ramp == 1`). Across the trailing 13 epochs we
-///         call `FeeRouter.routeSettlement` to populate `bytesPerEpoch` for
+///         call the permissionless `FeeRouter.deposit` to populate `bytesPerEpoch` for
 ///         each operator. With `voteCapBps` at its 1000 bps launch value, each
 ///         operator's vote weight saturates at 10% of total — three operators
 ///         voting `For` clear the 4% quorum, and `proposer` alone clears the
@@ -85,9 +88,14 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     // Test accounts
     // -----------------------------------------------------------------
 
-    address internal proposer = address(0xAAAA);
-    address internal voter1 = address(0xBBBB);
-    address internal voter2 = address(0xCCCC);
+    // Operators sign their own `registerNode` binding, so each is a keyed EOA.
+    uint256 internal constant PROPOSER_PK = 0xAAAA;
+    uint256 internal constant VOTER1_PK = 0xBBBB;
+    uint256 internal constant VOTER2_PK = 0xCCCC;
+    address internal proposer = vm.addr(PROPOSER_PK);
+    address internal voter1 = vm.addr(VOTER1_PK);
+    address internal voter2 = vm.addr(VOTER2_PK);
+    bytes32 internal constant TERMS_HASH = keccak256("decdn operator terms v1");
     address internal multisig = address(0xC0DE);
     bytes32 internal constant REGION_DE = bytes32("DE");
 
@@ -102,6 +110,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     function setUp() public {
         usdc = new LifecycleUSDC();
         ed25519 = new MockEd25519Verifier();
+        LoopbackCctp cctp = new LoopbackCctp(0);
 
         DeployConfig memory cfg = DeployConfig({
             usdc: usdc,
@@ -120,14 +129,19 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
-            currentTermsHash: keccak256("decdn operator terms v1"),
+            currentTermsHash: TERMS_HASH,
             feeRouterEpochLength: EPOCH,
             feeRouterWindowEpochs: WINDOW_EPOCHS,
-            // Steady-state shares (60/30/10 from ADR 026 § FeeRouter split) so
-            // the setter / topology exercise covers the production-activated
-            // state, not the launch dormancy that DeployProtocol.s.sol ships.
-            feeRouterShares: [uint256(6000), uint256(3000), uint256(1000)],
+            // Steady-state split (rebate 0, buyback 7500 from ADR 026 §
+            // FeeRouter split) so the setter / topology exercise covers the
+            // production-activated state, not the launch dormancy that
+            // DeployProtocol.s.sol ships.
+            feeRouterRebateBps: 0,
+            feeRouterBuybackBps: 7500,
+            feeRouterDeliveryFloor: 1,
             buybackBurner: address(0xBB),
+            cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
+            cctpTokenMessenger: address(cctp),
             slashAppealBond: SLASH_APPEAL_BOND
         });
 
@@ -144,24 +158,13 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         _bondOperatorsAndSeedVoteWeight();
     }
 
-    /// @dev Override the base hook to grant the test harness
-    ///      `ROUTER_CALLER_ROLE` on FeeRouter so it can call `routeSettlement`
-    ///      to seed served-bytes for vote-weight tests. In production the deploy
-    ///      script grants the role only to `PaymentPool`, and asserts it, so
-    ///      this grant is an extra holder for the harness, not a substitute.
-    ///      (Governance can grant it elsewhere later — the role's admin is
-    ///      `DEFAULT_ADMIN_ROLE`, which the Timelock holds after the handoff.)
-    ///      The hook runs in phase 4 — before the GOVERNANCE_ROLE handoff, which
-    ///      would otherwise put `grantRole` behind the 48h Timelock.
-    function _postWiringHook(DeployConfig memory, Deployment memory dDeploy) internal override {
-        dDeploy.router.grantRole(dDeploy.router.ROUTER_CALLER_ROLE(), address(this));
-    }
-
     function _bondOperatorsAndSeedVoteWeight() internal {
         address[3] memory ops = [proposer, voter1, voter2];
+        uint256[3] memory pks = [PROPOSER_PK, VOTER1_PK, VOTER2_PK];
         uint256 floorMbps = bond.minCapacityMbps();
 
-        // Fund each operator with TOKEN, approve CapacityBond, and bond.
+        // Fund each operator with TOKEN, approve CapacityBond, bond, and
+        // register: `FeeRouter.deposit` credits bytes only to an active operator.
         for (uint256 i = 0; i < ops.length; i++) {
             token.transfer(ops[i], MIN_BOND * 10);
             vm.prank(ops[i]);
@@ -169,11 +172,15 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             vm.prank(ops[i]);
             bond.bond(MIN_BOND);
             // Declare capacity so the ADR 036 per-epoch cap does not bind on
-            // the settlements seeded below: the floor tier's byte ceiling
+            // the deposits seeded below: the floor tier's byte ceiling
             // (10 Mbps × 7-day epoch × 125_000) vastly exceeds the
-            // 1_000_000-byte fixture settlements.
+            // 1_000_000-byte fixture deposits.
             vm.prank(ops[i]);
             bond.declareMbps(floorMbps);
+            bytes32 nodeId = bytes32(uint256(uint160(ops[i])));
+            bytes memory bindingSig = _signRegisterNode(pks[i], ops[i], nodeId);
+            vm.prank(ops[i]);
+            bond.registerNode(nodeId, hex"", "DE", TERMS_HASH, bindingSig, hex"01");
         }
 
         // Fund the test harness with USDC and approve the router. Each epoch
@@ -189,8 +196,8 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             vm.warp(uint256(e) * EPOCH + 1);
             if (e + WINDOW_EPOCHS > FINAL_EPOCH) {
                 for (uint256 k = 0; k < ops.length; k++) {
-                    // 1_000_000 bytes / 1e6 USDC unit per settlement.
-                    router.routeSettlement(ops[k], 1_000_000, 1e6);
+                    // 1_000_000 bytes / 1e6 USDC unit per deposit.
+                    router.deposit(ops[k], 1_000_000, 1e6);
                 }
             }
         }
@@ -205,6 +212,24 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertGt(gov.getVotes(proposer, snap), gov.proposalThreshold(), "proposer below threshold");
         assertGt(gov.getVotes(voter1, snap), 0, "voter1 unseeded");
         assertGt(gov.getVotes(voter2, snap), 0, "voter2 unseeded");
+    }
+
+    /// @dev The EIP-712 `RegisterNode` binding signature `registerNode` checks.
+    function _signRegisterNode(uint256 pk, address op, bytes32 nodeId) internal view returns (bytes memory) {
+        bytes32 structHash =
+            keccak256(abi.encode(bond.REGISTER_NODE_TYPEHASH(), nodeId, bond.bindingNonce(op), TERMS_HASH));
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("CapacityBond")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(bond)
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(pk, keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash)));
+        return abi.encodePacked(r, s, v);
     }
 
     // -----------------------------------------------------------------
@@ -352,53 +377,35 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     }
 
     // =================================================================
-    // FeeRouter (6 setters)
+    // FeeRouter (5 setters)
     // =================================================================
 
-    function test_lifecycle_FeeRouter_setShares_happy() public {
-        uint256[3] memory newShares = [uint256(5000), uint256(3500), uint256(1500)];
-        _runLifecycle(address(router), abi.encodeCall(FeeRouter.setShares, (newShares)));
-        uint256[3] memory got = router.getShares();
-        assertEq(got[0], 5000);
-        assertEq(got[1], 3500);
-        assertEq(got[2], 1500);
+    function test_lifecycle_FeeRouter_setSplit_happy() public {
+        _runLifecycle(address(router), abi.encodeCall(FeeRouter.setSplit, (uint256(2000), uint256(6000))));
+        assertEq(router.rebateBps(), 2000);
+        assertEq(router.buybackBps(), 6000);
     }
 
-    function test_lifecycle_FeeRouter_setShares_outOfBounds() public {
-        // Sum != 10_000 → SharesDoNotSum
-        uint256[3] memory bad = [uint256(5000), uint256(3000), uint256(1500)];
+    function test_lifecycle_FeeRouter_setSplit_outOfBounds() public {
+        // rebate + buyback above 10_000 → SplitExceedsWhole
         _runLifecycleExpectExecuteRevert(
             address(router),
-            abi.encodeCall(FeeRouter.setShares, (bad)),
-            abi.encodeWithSelector(FeeRouter.SharesDoNotSum.selector, uint256(9500))
+            abi.encodeCall(FeeRouter.setSplit, (uint256(5000), uint256(5500))),
+            abi.encodeWithSelector(FeeRouter.SplitExceedsWhole.selector, uint256(5000), uint256(5500))
         );
     }
 
-    function test_lifecycle_FeeRouter_setSharesAndDestinations_happy() public {
-        uint256[3] memory newShares = [uint256(4500), uint256(4000), uint256(1500)];
-        FeeRouter.ShareDestinations memory dests =
-            FeeRouter.ShareDestinations({ buybackBurner: address(0xBEEF), treasury: address(0xFEED) });
-        _runLifecycle(address(router), abi.encodeCall(FeeRouter.setSharesAndDestinations, (newShares, dests)));
-        // Assert both destinations AND every bucket share landed — otherwise a
-        // regression that silently skipped one of the inner setters could pass
-        // with only a subset of fields checked.
-        assertEq(router.buybackBurner(), address(0xBEEF));
-        assertEq(router.treasury(), address(0xFEED));
-        uint256[3] memory got = router.getShares();
-        assertEq(got[0], 4500);
-        assertEq(got[1], 4000);
-        assertEq(got[2], 1500);
+    function test_lifecycle_FeeRouter_setDeliveryFloor_happy() public {
+        _runLifecycle(address(router), abi.encodeCall(FeeRouter.setDeliveryFloor, (uint256(250))));
+        assertEq(router.deliveryFloor(), 250);
     }
 
-    function test_lifecycle_FeeRouter_setSharesAndDestinations_outOfBounds() public {
-        // Treasury == address(0) → ZeroAddress at the top of the setter.
-        uint256[3] memory newShares = [uint256(4500), uint256(4000), uint256(1500)];
-        FeeRouter.ShareDestinations memory dests =
-            FeeRouter.ShareDestinations({ buybackBurner: address(0xBEEF), treasury: address(0) });
+    function test_lifecycle_FeeRouter_setDeliveryFloor_outOfBounds() public {
+        // Ceiling = 1000; one over.
         _runLifecycleExpectExecuteRevert(
             address(router),
-            abi.encodeCall(FeeRouter.setSharesAndDestinations, (newShares, dests)),
-            abi.encodeWithSelector(FeeRouter.ZeroAddress.selector)
+            abi.encodeCall(FeeRouter.setDeliveryFloor, (uint256(1001))),
+            abi.encodeWithSelector(FeeRouter.DeliveryFloorOutOfBounds.selector, uint256(1001))
         );
     }
 
@@ -409,12 +416,12 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     }
 
     function test_lifecycle_FeeRouter_setBuybackBurner_outOfBounds() public {
-        // Buyback share is 3000 bps (non-zero, from setUp), so clearing the
+        // Buyback share is 7500 bps (non-zero, from setUp), so clearing the
         // burner to address(0) must revert.
         _runLifecycleExpectExecuteRevert(
             address(router),
             abi.encodeCall(FeeRouter.setBuybackBurner, (address(0))),
-            abi.encodeWithSelector(FeeRouter.NonZeroShareNeedsDestination.selector, uint256(1))
+            abi.encodeWithSelector(FeeRouter.BuybackNeedsBurner.selector)
         );
     }
 

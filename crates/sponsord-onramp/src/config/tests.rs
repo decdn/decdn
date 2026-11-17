@@ -10,7 +10,9 @@ fn args(overrides: &[&str]) -> Result<Args, clap::Error> {
     let mut flags: Vec<(&str, &str)> = vec![
         ("--public-url", "https://up.example.org/"),
         ("--daemon-token", "tok"),
-        ("--rpc-url", "https://rpc.example"),
+        ("--governance-rpc-url", "https://governance-rpc.example"),
+        ("--governance-chain-id", "11155111"),
+        ("--pool-rpc-url", "https://rpc.example"),
         (
             "--capacity-bond",
             "0x0000000000000000000000000000000000000002",
@@ -42,7 +44,21 @@ fn reads_required_and_defaults() {
     assert_eq!(cfg.ttl_secs, None);
     assert_eq!(cfg.decdn_release.tag, "v0.3.0");
     assert_eq!(cfg.decdn_release.version, "0.3.0");
+    assert_eq!(cfg.governance_rpc_url, "https://governance-rpc.example");
+    assert_eq!(cfg.governance_chain_id, 11_155_111);
+    assert_eq!(cfg.pool_rpc_url, "https://rpc.example");
     assert!(!format!("{cfg:?}").contains("\"tok\""));
+}
+
+#[test]
+fn both_chains_are_required() {
+    for flag in [
+        "--governance-rpc-url",
+        "--governance-chain-id",
+        "--pool-rpc-url",
+    ] {
+        assert!(args(&[flag, UNSET]).is_err(), "{flag}");
+    }
 }
 
 #[test]
@@ -65,7 +81,7 @@ fn urls_the_installers_cant_quote_are_refused() {
     let plain_http = args(&["--releases-base", "http://mirror.example"]).unwrap();
     assert!(OnrampConfig::from_args(plain_http).is_err());
     // Paths are appended to these two, so a query or fragment would
-    // swallow them; the RPC URL may keep its query (an API key).
+    // swallow them; an RPC URL may keep its query (an API key).
     for (flag, bad) in [
         ("--public-url", "https://up.example.org/?x=1"),
         ("--public-url", "https://up.example.org/#x"),
@@ -74,8 +90,12 @@ fn urls_the_installers_cant_quote_are_refused() {
         let parsed = args(&[flag, bad]).unwrap();
         assert!(OnrampConfig::from_args(parsed).is_err(), "{flag} {bad}");
     }
-    let keyed_rpc = args(&["--rpc-url", "https://rpc.example/v2?key=abc"]).unwrap();
-    assert!(OnrampConfig::from_args(keyed_rpc).is_ok());
+    for flag in ["--governance-rpc-url", "--pool-rpc-url"] {
+        let keyed_rpc = args(&[flag, "https://rpc.example/v2?key=abc"]).unwrap();
+        assert!(OnrampConfig::from_args(keyed_rpc).is_ok(), "{flag}");
+        let bad = args(&[flag, "https://rpc.example/'x"]).unwrap();
+        assert!(OnrampConfig::from_args(bad).is_err(), "{flag}");
+    }
 }
 
 #[test]

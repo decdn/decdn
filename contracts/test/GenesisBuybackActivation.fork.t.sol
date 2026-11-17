@@ -8,6 +8,9 @@ import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { IUniswapV3Factory } from "../script/interfaces/IUniswapV3PoolCreation.sol";
 import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
+import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
+import { IMessageTransmitterV2 } from "../src/interfaces/ICctpV2.sol";
+import { LoopbackCctp } from "../testnet/LoopbackCctp.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 
 /// @title GenesisBuybackActivationForkTest — Arbitrum Sepolia acceptance for the
@@ -17,7 +20,7 @@ import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 ///         script creates + seeds a real
 ///         TOKEN/USDC V3 pool via the live `NonfungiblePositionManager`, deploys
 ///         `BuybackBurnerUniswapV3` bound to it and the live `SwapRouter02`, flips
-///         the FeeRouter to the steady-state `[6000, 3000, 1000]` split, and hands
+///         the FeeRouter to the steady-state (rebate 0, buyback 7500) split, and hands
 ///         every role — burner included — to the Timelock. Asserts the full bundle
 ///         landed and that the burner reads a real TWAP spot off the seeded pool.
 /// @dev    GATED: self-skips unless `ARBITRUM_SEPOLIA_RPC_URL` is set, so the
@@ -41,6 +44,7 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
     address internal keeper = address(0xCAFE);
 
     MockEd25519Verifier internal ed;
+    LoopbackCctp internal cctp;
     bool internal forkActive;
 
     function setUp() public {
@@ -48,6 +52,9 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
         vm.createSelectFork(vm.rpcUrl("arbitrum_sepolia"));
         forkActive = true;
         ed = new MockEd25519Verifier();
+        // The sweep receiver only needs a non-zero CCTP binding here; no sweep
+        // runs in this suite.
+        cctp = new LoopbackCctp(0);
         // Fund the deployer (this) with USDC for the pool seed; it already holds
         // the full TOKEN supply as `initialTokenHolder`.
         deal(USDC, address(this), 1_000_000e6);
@@ -80,8 +87,12 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
             currentTermsHash: keccak256("decdn operator terms v1"),
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
-            feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
+            feeRouterRebateBps: 7500,
+            feeRouterBuybackBps: 0,
+            feeRouterDeliveryFloor: 1,
             buybackBurner: address(0),
+            cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
+            cctpTokenMessenger: address(cctp),
             slashAppealBond: 1000e18
         });
     }
@@ -106,10 +117,9 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
     function test_uniswap_genesisActivation_lands_full_bundle() public requiresFork {
         Deployment memory d = _runFullDeploy(_config(), _activation());
 
-        uint256[3] memory shares = d.router.getShares();
-        assertEq(shares[0], 6000, "operator 6000");
-        assertEq(shares[1], 3000, "buyback 3000");
-        assertEq(shares[2], 1000, "treasury 1000");
+        (uint256 steadyRebate, uint256 steadyBuyback) = BuybackVenueLib.steadySplit();
+        assertEq(d.router.rebateBps(), steadyRebate, "rebate 0");
+        assertEq(d.router.buybackBps(), steadyBuyback, "buyback 7500");
         assertEq(d.router.buybackBurner(), address(d.buybackBurner), "burner wired");
         assertEq(d.router.treasury(), address(d.timelock), "treasury is timelock");
 
@@ -130,7 +140,8 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
         Deployment memory d = _runFullDeploy(_config(), _activation());
         address tl = address(d.timelock);
         assertTrue(d.buybackBurner.hasRole(GOVERNANCE_ROLE, tl), "burner gov to timelock");
-        assertTrue(d.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, tl), "burner admin to timelock");
+        // #2028: the handoff renounces DEFAULT_ADMIN_ROLE to no one.
+        assertFalse(d.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, tl), "burner admin master key");
         assertFalse(d.buybackBurner.hasRole(GOVERNANCE_ROLE, address(this)), "no deployer gov back door");
         assertFalse(d.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, address(this)), "no deployer admin back door");
     }

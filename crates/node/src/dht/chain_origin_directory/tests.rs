@@ -314,7 +314,7 @@ async fn blacklisted_operator_is_dropped_from_the_resolved_set() {
     let reads = Arc::new(StubReads::new().origins(&[(7, &[addr(0xA), addr(0xB)])]));
     let stakers = Arc::new(StubStakers::new(&[nid(0xA), nid(0xB)]));
     let deny = Arc::new(ContentDenylist::empty());
-    deny.apply_chain_origin(addr(0xB), true);
+    deny.set_chain_origins(std::collections::HashSet::from([addr(0xB)]));
     let dir = directory_with_deny(
         Arc::clone(&reads),
         HashMap::from([(addr(0xA), nid(0xA)), (addr(0xB), nid(0xB))]),
@@ -328,7 +328,7 @@ async fn blacklisted_operator_is_dropped_from_the_resolved_set() {
 
     // The filter is applied live: lifting the blacklist restores B with no
     // re-fetch, proving the deny-set is not baked into the cached set.
-    deny.apply_chain_origin(addr(0xB), false);
+    deny.set_chain_origins(std::collections::HashSet::new());
     assert_eq!(dir.lookup_origins(ns(7)).await, vec![nid(0xA), nid(0xB)]);
     assert_eq!(
         reads.call_count(),

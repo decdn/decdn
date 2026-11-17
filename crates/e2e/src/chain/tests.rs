@@ -25,22 +25,23 @@ fn write_json(path: &Path, json: &str) {
     std::fs::write(path, json).expect("write json fixture");
 }
 
-/// A minimal deploy manifest with distinct, valid addresses for each field.
+/// A minimal governance deploy manifest with distinct, valid addresses for
+/// each field.
 fn sample_manifest_json() -> String {
     let addr = |n: u8| format!("0x{n:0>40x}");
     format!(
         r#"{{
               "contracts": {{
-                "CapacityBond": "{}", "PaymentPool": "{}", "FeeRouter": "{}",
+                "CapacityBond": "{}", "FeeRouter": "{}",
                 "Token": "{}", "SlashJudge": "{}", "SlashAppeal": "{}",
                 "DecdnGovernor": "{}", "TimelockController": "{}",
                 "PublisherRegistry": "{}", "OriginAssignment": "{}",
-                "ManualVettingPolicy": "{}", "ContentBlacklist": "{}"
+                "ManualVettingPolicy": "{}", "ContentBlacklist": "{}",
+                "CctpSweepReceiver": "{}"
               }},
               "externalDeps": {{ "usdc": "{}" }}
             }}"#,
         addr(1),
-        addr(2),
         addr(3),
         addr(4),
         addr(5),
@@ -51,8 +52,14 @@ fn sample_manifest_json() -> String {
         addr(10),
         addr(11),
         addr(12),
+        addr(13),
         addr(0xff),
     )
+}
+
+/// A minimal payment-chain deploy manifest: its `PaymentPool`.
+fn sample_payment_json() -> String {
+    format!(r#"{{ "contracts": {{ "PaymentPool": "0x{:0>40x}" }} }}"#, 2)
 }
 
 #[test]
@@ -94,17 +101,25 @@ fn write_atomic_commits_whole_file() {
 fn read_manifest_parses_contracts_and_usdc() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("manifest.json");
+    let payment = dir.path().join("payment.json");
     write_json(&path, &sample_manifest_json());
-    let manifest = read_manifest(&path).expect("parse manifest");
+    write_json(&payment, &sample_payment_json());
+    let manifest = read_manifest(&path, &payment).expect("parse manifest");
     assert_eq!(manifest.addrs.capacity_bond, Address::with_last_byte(1));
+    assert_eq!(manifest.addrs.payment_pool, Address::with_last_byte(2));
     assert_eq!(
         manifest.addrs.content_blacklist,
         Address::with_last_byte(12)
     );
     assert_eq!(manifest.usdc, Address::with_last_byte(0xff));
-    // Every `contracts` entry, name-sorted, including those with no typed
-    // field.
-    assert_eq!(manifest.contracts.len(), 12);
+    // Every `contracts` entry of both manifests, name-sorted, including those
+    // with no typed field.
+    assert_eq!(manifest.contracts.len(), 13);
+    assert!(
+        manifest
+            .contracts
+            .contains(&("PaymentPool".to_string(), Address::with_last_byte(2)))
+    );
     assert_eq!(
         manifest.contracts.first(),
         Some(&("CapacityBond".to_string(), Address::with_last_byte(1)))
@@ -121,39 +136,40 @@ fn read_manifest_parses_contracts_and_usdc() {
 fn read_manifest_requires_usdc() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("manifest.json");
+    let payment = dir.path().join("payment.json");
+    write_json(&payment, &sample_payment_json());
     // Strip externalDeps: the settlement token must be present.
     write_json(&path, r#"{ "contracts": {} }"#);
-    assert!(read_manifest(&path).is_err());
+    assert!(read_manifest(&path, &payment).is_err());
 }
 
 #[test]
 #[allow(clippy::expect_used, clippy::panic)]
-fn load_cached_deployment_needs_both_files() {
+fn load_cached_deployment_needs_every_file() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = dir.path().join("state.json");
-    let manifest = dir.path().join("manifest.json");
+    let paths = CachePaths {
+        state: dir.path().join("state.json"),
+        payment: dir.path().join("payment.json"),
+        manifest: dir.path().join("manifest.json"),
+    };
 
-    // Neither present, or only one present, is a miss.
+    // None present, or only some present, is a miss.
+    assert!(load_cached_deployment(&paths).expect("miss").is_none());
+    write_atomic(&paths.state, b"0x00").expect("write state");
+    write_json(&paths.payment, &sample_payment_json());
     assert!(
-        load_cached_deployment(&state, &manifest)
-            .expect("miss")
-            .is_none()
-    );
-    write_atomic(&state, b"0x00").expect("write state");
-    assert!(
-        load_cached_deployment(&state, &manifest)
+        load_cached_deployment(&paths)
             .expect("half-written miss")
             .is_none(),
-        "manifest is the commit marker; state alone is not a hit"
+        "the governance manifest is the commit marker; the rest alone is not a hit"
     );
 
-    // Both present is a hit that surfaces the parsed addresses.
-    write_json(&manifest, &sample_manifest_json());
-    let hit = load_cached_deployment(&state, &manifest)
-        .expect("hit")
-        .expect("some");
+    // Every file present is a hit that surfaces the parsed addresses.
+    write_json(&paths.manifest, &sample_manifest_json());
+    let hit = load_cached_deployment(&paths).expect("hit").expect("some");
     assert_eq!(hit.manifest.usdc, Address::with_last_byte(0xff));
-    assert_eq!(hit.state_path, state);
+    assert_eq!(hit.manifest.addrs.payment_pool, Address::with_last_byte(2));
+    assert_eq!(hit.state_path, paths.state);
 }
 
 #[test]
@@ -162,9 +178,13 @@ fn artifact_cache_key_invalidates_on_bytecode_change() {
     let dir = tempfile::tempdir().expect("tempdir");
     let contracts = dir.path();
     let usdc = contracts.join("out/MintableUSDC.sol/MintableUSDC.json");
+    let cctp = contracts.join("out/LoopbackCctp.sol/LoopbackCctp.json");
     let deploy = contracts.join("out/DeployProtocol.s.sol/DeployProtocol.json");
+    let pool = contracts.join("out/DeployPaymentPool.s.sol/DeployPaymentPool.json");
     write_json(&usdc, r#"{ "bytecode": { "object": "0x6001" } }"#);
+    write_json(&cctp, r#"{ "bytecode": { "object": "0x6004" } }"#);
     write_json(&deploy, r#"{ "bytecode": { "object": "0x6002" } }"#);
+    write_json(&pool, r#"{ "bytecode": { "object": "0x6005" } }"#);
 
     let key1 = artifact_cache_key(contracts).expect("key1");
     assert_eq!(
@@ -175,7 +195,11 @@ fn artifact_cache_key_invalidates_on_bytecode_change() {
 
     // A recompiled deploy script (embeds every `new`d contract) rekeys the cache.
     write_json(&deploy, r#"{ "bytecode": { "object": "0x6003" } }"#);
-    assert_ne!(key1, artifact_cache_key(contracts).expect("key2"));
+    let key2 = artifact_cache_key(contracts).expect("key2");
+    assert_ne!(key1, key2);
+    // So does a recompiled payment-pool deploy script.
+    write_json(&pool, r#"{ "bytecode": { "object": "0x6006" } }"#);
+    assert_ne!(key2, artifact_cache_key(contracts).expect("key3"));
 }
 
 #[test]

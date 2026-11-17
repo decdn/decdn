@@ -22,6 +22,7 @@ pub decdn_client::bundle::ForeignReason::UnreadableCache(alloc::string::String)
 pub decdn_client::bundle::ForeignReason::Unrecorded
 #[non_exhaustive] pub enum decdn_client::bundle::Funding
 pub decdn_client::bundle::Funding::Delegated
+pub decdn_client::bundle::Funding::Delegated::pool: decdn_incentive::deployment::Deployment
 pub decdn_client::bundle::Funding::Delegated::slot: decdn_client::credential::CredentialSlot
 pub decdn_client::bundle::Funding::SelfOwned
 pub decdn_client::bundle::Funding::SelfOwned::deposit: decdn_client::session::DepositPolicy
@@ -41,7 +42,7 @@ pub decdn_client::bundle::BundleOutcome::report: decdn_client::bundle::BundleRep
 pub struct decdn_client::bundle::BundlePuller
 impl decdn_client::bundle::BundlePuller
 pub fn decdn_client::bundle::BundlePuller::builder(decdn_client::session::ChainConfig, decdn_client::session::PullSite, iroh::endpoint::Endpoint, alloc::sync::Arc<dyn decdn_incentive::buyer_pool::BuyerPoolStore>, decdn_client::bundle::Funding, decdn_client::session::DiscoveryOptions, decdn_client::bundle::NodeSelection) -> decdn_client::bundle::BundlePullerBuilder
-pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&self, [u8; 32], &std::path::Path, bool) -> anyhow::Result<decdn_client::bundle::BundleManifest>
+pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&mut self, [u8; 32], &std::path::Path, bool) -> anyhow::Result<decdn_client::bundle::BundleManifest>
 pub async fn decdn_client::bundle::BundlePuller::finish(self)
 pub fn decdn_client::bundle::BundlePuller::funding_shortfall(&self) -> core::option::Option<alloc::string::String>
 pub async fn decdn_client::bundle::BundlePuller::pull(&mut self, &decdn_client::bundle::BundleManifest, &std::path::Path, bool, &tokio_util::sync::cancellation_token::CancellationToken) -> decdn_client::bundle::BundleOutcome
@@ -168,7 +169,9 @@ pub fn decdn_client::buyer_pool::ProgressWrite::of(&decdn_client::VoucherProgres
 pub const fn decdn_client::buyer_pool::ProgressWrite::totals(&self) -> decdn_incentive::buyer_pool::BuyerLaneProgress
 #[non_exhaustive] pub enum decdn_client::buyer_pool::WatermarkRow
 pub decdn_client::buyer_pool::WatermarkRow::Delegated(decdn_incentive::deployment::Deployment)
-pub decdn_client::buyer_pool::WatermarkRow::Owned(alloy_primitives::bits::address::Address)
+pub decdn_client::buyer_pool::WatermarkRow::Owned
+pub decdn_client::buyer_pool::WatermarkRow::Owned::deployment: decdn_incentive::deployment::Deployment
+pub decdn_client::buyer_pool::WatermarkRow::Owned::owner: alloy_primitives::bits::address::Address
 pub struct decdn_client::buyer_pool::AllowanceShortfall
 impl core::error::Error for decdn_client::buyer_pool::AllowanceShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::AllowanceShortfall
@@ -213,8 +216,9 @@ pub fn decdn_client::buyer_pool::TopUpUnconfirmed::fmt(&self, &mut core::fmt::Fo
 #[non_exhaustive] pub struct decdn_client::buyer_pool::ToppedUpPool
 pub decdn_client::buyer_pool::ToppedUpPool::credited: alloy_primitives::aliases::U256
 pub decdn_client::buyer_pool::ToppedUpPool::tx: alloy_primitives::aliases::TxHash
-pub struct decdn_client::buyer_pool::UnconfirmedEscrows(_)
+pub struct decdn_client::buyer_pool::UnconfirmedEscrows
 impl decdn_client::buyer_pool::UnconfirmedEscrows
+pub fn decdn_client::buyer_pool::UnconfirmedEscrows::for_pool(&self, decdn_incentive::deployment::Deployment) -> Self
 pub fn decdn_client::buyer_pool::UnconfirmedEscrows::pending(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::EscrowUnconfirmed>
 pub fn decdn_client::buyer_pool::UnconfirmedEscrows::untracked(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::UntrackedEscrow>
 pub struct decdn_client::buyer_pool::UnrecordedEscrow
@@ -326,6 +330,7 @@ pub fn decdn_client::discovery::NodeCandidate::dial_addrs(&self) -> alloc::vec::
 pub struct decdn_client::discovery::Probed
 pub decdn_client::discovery::Probed::candidate: decdn_client::discovery::NodeCandidate
 pub decdn_client::discovery::Probed::coverage: decdn_protocol::coverage::Coverage
+pub decdn_client::discovery::Probed::payment_pools: core::option::Option<alloc::vec::Vec<decdn_protocol::pool_account::PoolAccount>>
 pub decdn_client::discovery::Probed::rtt_ms: f64
 pub decdn_client::discovery::Probed::total_bytes: core::option::Option<decdn_bao_range::size_proof::ProvenSize>
 pub const decdn_client::discovery::BOOTSTRAP_UNREACHABLE: &str
@@ -499,6 +504,7 @@ pub type decdn_client::receipt::ReceiptAmount::Error = ruint::from::FromUintErro
 pub fn decdn_client::receipt::ReceiptAmount::try_from(decdn_client::Cumulative) -> core::result::Result<Self, Self::Error>
 pub struct decdn_client::receipt::ReceiptChain
 pub decdn_client::receipt::ReceiptChain::chain_id: u64
+pub decdn_client::receipt::ReceiptChain::payment_chain_id: u64
 pub decdn_client::receipt::ReceiptChain::payment_pool: alloy_primitives::bits::address::Address
 pub decdn_client::receipt::ReceiptChain::slash_judge: alloy_primitives::bits::address::Address
 pub struct decdn_client::receipt::ReceiptContent
@@ -588,13 +594,13 @@ pub enum decdn_client::session::PoolOpen
 pub decdn_client::session::PoolOpen::Allowed
 pub decdn_client::session::PoolOpen::Refused
 pub struct decdn_client::session::ChainConfig
-pub decdn_client::session::ChainConfig::capacity_bond: core::option::Option<alloy_primitives::bits::address::Address>
-pub decdn_client::session::ChainConfig::chain_id: u64
-pub decdn_client::session::ChainConfig::payment_pool: alloy_primitives::bits::address::Address
-pub decdn_client::session::ChainConfig::rpc_url: alloc::string::String
-pub decdn_client::session::ChainConfig::slash_judge: alloy_primitives::bits::address::Address
+pub decdn_client::session::ChainConfig::governance: decdn_client::session::GovernanceChain
+pub decdn_client::session::ChainConfig::payment_pools: alloc::vec::Vec<decdn_client::session::PaymentPoolChain>
 impl decdn_client::session::ChainConfig
-pub const fn decdn_client::session::ChainConfig::deployment(&self) -> decdn_incentive::deployment::Deployment
+pub fn decdn_client::session::ChainConfig::deployments(&self) -> alloc::vec::Vec<decdn_incentive::deployment::Deployment>
+pub fn decdn_client::session::ChainConfig::first_pool(&self) -> anyhow::Result<&decdn_client::session::PaymentPoolChain>
+pub fn decdn_client::session::ChainConfig::new(decdn_client::session::GovernanceChain, alloc::vec::Vec<decdn_client::session::PaymentPoolChain>) -> anyhow::Result<Self>
+pub fn decdn_client::session::ChainConfig::pool(&self, decdn_incentive::deployment::Deployment) -> core::option::Option<&decdn_client::session::PaymentPoolChain>
 pub struct decdn_client::session::DepositPolicy
 pub decdn_client::session::DepositPolicy::adoption: decdn_client::session::ChainAdoption
 pub decdn_client::session::DepositPolicy::max_approve: bool
@@ -608,6 +614,14 @@ pub decdn_client::session::DiscoveryOptions::rediscover: bool
 pub decdn_client::session::DiscoveryOptions::registry_timeout: core::time::Duration
 impl core::default::Default for decdn_client::session::DiscoveryOptions
 pub fn decdn_client::session::DiscoveryOptions::default() -> Self
+pub struct decdn_client::session::GovernanceChain
+pub decdn_client::session::GovernanceChain::capacity_bond: core::option::Option<alloy_primitives::bits::address::Address>
+pub decdn_client::session::GovernanceChain::chain_id: u64
+pub decdn_client::session::GovernanceChain::rpc_url: alloc::string::String
+pub decdn_client::session::GovernanceChain::slash_judge: alloy_primitives::bits::address::Address
+pub struct decdn_client::session::PaymentPoolChain
+pub decdn_client::session::PaymentPoolChain::deployment: decdn_incentive::deployment::Deployment
+pub decdn_client::session::PaymentPoolChain::rpc_url: alloc::string::String
 pub struct decdn_client::session::PinnedNode
 pub decdn_client::session::PinnedNode::addr: core::option::Option<core::net::socket_addr::SocketAddr>
 pub decdn_client::session::PinnedNode::node_id: iroh_base::key::PublicKey
@@ -1086,6 +1100,7 @@ impl core::fmt::Display for decdn_client::UnprovenSize
 pub fn decdn_client::UnprovenSize::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::UpstreamRefused
 impl decdn_client::UpstreamRefused
+pub fn decdn_client::UpstreamRefused::accepted_pools(&self) -> core::option::Option<&[decdn_protocol::pool_account::PoolAccount]>
 pub const fn decdn_client::UpstreamRefused::error(&self) -> &decdn_protocol::client::StreamError
 pub fn decdn_client::UpstreamRefused::evidence(&self) -> core::option::Option<&decdn_protocol::client::StreamResponse>
 pub const fn decdn_client::UpstreamRefused::mid_stream(decdn_protocol::client::StreamError) -> Self

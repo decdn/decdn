@@ -29,15 +29,13 @@ fn provider_factory_preserves_role_polling_policy() {
     let url: HttpUrl = "http://localhost:8545".parse().expect("valid URL");
     let interval = Duration::from_secs(7);
 
-    let providers = ProviderFactory::new(url, Arc::new(metrics::Metrics::new()));
+    let providers = ProviderFactory::new(url, 31_337, Arc::new(metrics::Metrics::new()));
 
     let read = providers.read_only(interval);
-    let head = providers.shared_head();
     let seller = providers.seller_wallet(PrivateKeySigner::random(), interval);
     let buyer = providers.buyer_wallet(PrivateKeySigner::random(), interval);
 
     assert_eq!(read.client().poll_interval(), interval);
-    assert_eq!(head.client().poll_interval(), Duration::from_millis(250));
     assert_eq!(seller.client().poll_interval(), interval);
     assert_eq!(buyer.client().poll_interval(), interval);
 }
@@ -51,7 +49,7 @@ fn provider_factory_preserves_role_polling_policy() {
 async fn wallet_providers_mark_a_failed_send_request() {
     decdn_common::tls::install_crypto_provider();
     let url: HttpUrl = "http://127.0.0.1:1".parse().expect("valid URL");
-    let providers = ProviderFactory::new(url, Arc::new(metrics::Metrics::new()));
+    let providers = ProviderFactory::new(url, 1, Arc::new(metrics::Metrics::new()));
     let signer = PrivateKeySigner::random();
     let request = alloy::rpc::types::TransactionRequest {
         from: Some(signer.address()),
@@ -96,7 +94,7 @@ async fn wallet_providers_send_an_estimate_with_headroom() {
         .await
         .expect("bind a loopback port");
     let url: HttpUrl = stub.url().parse().expect("valid URL");
-    let providers = ProviderFactory::new(url, Arc::new(metrics::Metrics::new()));
+    let providers = ProviderFactory::new(url, 1, Arc::new(metrics::Metrics::new()));
     let signer = PrivateKeySigner::random();
     let request = alloy::rpc::types::TransactionRequest {
         from: Some(signer.address()),
@@ -223,7 +221,7 @@ async fn listener_stays_closed_when_initial_blacklist_sync_fails() {
     let (ready_tx, ready_rx) = oneshot::channel();
     let started = Arc::new(AtomicBool::new(false));
     ready_tx
-        .send(Err("ContentBlacklist getLogs unavailable".to_string()))
+        .send(Err("ContentBlacklist mutationCount unavailable".to_string()))
         .expect("readiness receiver is live");
 
     let err = gate_listener_on_blacklist_sync(ready_rx, {
@@ -234,7 +232,7 @@ async fn listener_stays_closed_when_initial_blacklist_sync_fails() {
     .expect_err("failed initial sync must fail startup");
 
     assert!(
-        format!("{err:#}").contains("ContentBlacklist getLogs unavailable"),
+        format!("{err:#}").contains("ContentBlacklist mutationCount unavailable"),
         "startup error should preserve the sync failure: {err:#}"
     );
     assert!(
@@ -262,8 +260,8 @@ async fn listener_fails_closed_when_watcher_drops_readiness() {
     .expect_err("a dropped readiness channel must fail startup closed");
 
     assert!(
-        format!("{err:#}").contains("blacklist watcher exited before initial sync completed"),
-        "startup error should explain the watcher exited early: {err:#}"
+        format!("{err:#}").contains("blacklist sync exited before initial sync completed"),
+        "startup error should explain the sync exited early: {err:#}"
     );
     assert!(
         !started.load(Ordering::SeqCst),
@@ -317,12 +315,15 @@ fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, Resolve
             rpc_url: "http://localhost:8545".into(),
             eth_keystore: PathBuf::from("/tmp/keystore.json"),
             keystore_password_file: None,
-            payment_pool_address: "0x0000000000000000000000000000000000000001".into(),
+            payment_chains: vec![decdn_common::config::ResolvedPaymentChain {
+                rpc_url: "http://localhost:8545".into(),
+                chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
+                payment_pools: vec![alloy::primitives::Address::with_last_byte(1)],
+            }],
+            cctp_sweep_receiver_address: None,
             capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,
-            event_poll_interval_ms: 7000,
-            get_logs_max_block_span: decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
-            fee_shares_poll_interval_sec: 3600,
+            receipt_poll_interval_ms: 7000,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
@@ -1337,66 +1338,6 @@ async fn build_endpoint_binds_with_discovery_and_custom_relay() {
     ep.close().await;
 }
 
-/// The runtime hands `blockchain.get_logs_max_block_span` to the poller:
-/// dropping the setter would silently ignore the knob.
-#[tokio::test]
-async fn chain_poller_builder_uses_the_configured_get_logs_span() {
-    struct NoHead;
-    #[async_trait::async_trait]
-    impl HeadSource for NoHead {
-        async fn head(&self) -> anyhow::Result<u64> {
-            Ok(0)
-        }
-    }
-    let (_tmp, mut cfg) = cfg_with_origin(None);
-    cfg.blockchain.get_logs_max_block_span = 150;
-    let node_metrics = Arc::new(metrics::Metrics::new());
-    let builder = chain_poller_builder(
-        Arc::new(NoHead),
-        Duration::from_secs(7),
-        &cfg.blockchain,
-        &node_metrics,
-    );
-    assert_eq!(builder.span_ceiling(), 150);
-
-    // The hooks land in the exported series: `run` reports the starting
-    // span, and a range rejection and a window retry bump their counters.
-    let built = builder.build();
-    assert!(built.is_ok(), "an empty poller builds");
-    let Ok(poller) = built else { return };
-    poller.fire_range_rejection_for_test();
-    poller.fire_window_retry_for_test();
-    poller.fire_window_deferred_for_test();
-    let provider = alloy::providers::ProviderBuilder::new()
-        .connect_mocked_client(alloy::providers::mock::Asserter::new());
-    let shutdown = CancellationToken::new();
-    shutdown.cancel();
-    crate::chain_events::multiplexed_poller::run(provider, poller, shutdown).await;
-    let scrape = node_metrics.encode().unwrap_or_default();
-    assert!(
-        scrape.lines().any(|l| l == "decdn_chain_get_logs_span 150"),
-        "span gauge not wired: {scrape}"
-    );
-    assert!(
-        scrape
-            .lines()
-            .any(|l| l == "decdn_chain_get_logs_range_rejections_total 1"),
-        "rejection counter not wired"
-    );
-    assert!(
-        scrape
-            .lines()
-            .any(|l| l == "decdn_chain_get_logs_retries_total 1"),
-        "window-retry counter not wired"
-    );
-    assert!(
-        scrape
-            .lines()
-            .any(|l| l == "decdn_chain_get_logs_deferred_total 1"),
-        "window-deferred counter not wired"
-    );
-}
-
 /// Bind a loopback endpoint with relays off, returning it and a dialable
 /// address.
 async fn loopback_endpoint(alpns: Vec<Vec<u8>>) -> (Endpoint, iroh::EndpointAddr) {
@@ -1516,8 +1457,8 @@ enum MockAnswer {
 }
 
 /// A mocked provider answering the preflight's reads in order:
-/// `eth_chainId`, `eth_getCode`, then (when reached) the `getRateBounds()`
-/// call.
+/// `eth_chainId`, `eth_getCode`, then (when reached) the `operatorBps()` and
+/// `sweepDomain()` calls.
 fn preflight_provider(answers: Vec<MockAnswer>) -> impl Provider + Clone {
     let asserter = alloy::providers::mock::Asserter::new();
     for answer in answers {
@@ -1548,12 +1489,16 @@ fn code_present() -> serde_json::Value {
     serde_json::json!(alloy::primitives::Bytes::from(vec![0x60]))
 }
 
-/// `getRateBounds()` answering a per-MB rate floor, as every `PaymentPool`
+/// `operatorBps()` then `sweepDomain()` answering, as every `PaymentPool`
 /// does.
-fn rate_bounds_answers() -> serde_json::Value {
+fn pool_identity_answers() -> [MockAnswer; 2] {
     use alloy::sol_types::SolValue;
-    let floor = alloy::primitives::U256::from(10u64);
-    serde_json::json!(alloy::primitives::Bytes::from(floor.abi_encode()))
+    let word = |value: u64| {
+        serde_json::json!(alloy::primitives::Bytes::from(
+            alloy::primitives::U256::from(value).abi_encode()
+        ))
+    };
+    [MockAnswer::Ok(word(6_000)), MockAnswer::Ok(word(0))]
 }
 
 /// An empty-bytes answer: no code at the address for `eth_getCode`, or no
@@ -1569,15 +1514,16 @@ fn preflight_retry_budget() -> BootRetry {
     )
 }
 
-/// The healthy path: matching chain id, code present, `getRateBounds()`
-/// answers.
+/// The healthy path: matching chain id, code present, `operatorBps()` and
+/// `sweepDomain()` answer.
 #[tokio::test]
 async fn a_matching_deployment_passes_the_preflight() {
-    let provider = preflight_provider(vec![
+    let mut answers = vec![
         MockAnswer::Ok(chain_id_ok()),
         MockAnswer::Ok(code_present()),
-        MockAnswer::Ok(rate_bounds_answers()),
-    ]);
+    ];
+    answers.extend(pool_identity_answers());
+    let provider = preflight_provider(answers);
     check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
         .await
         .expect("a matching deployment must pass");
@@ -1600,8 +1546,12 @@ async fn a_chain_id_mismatch_aborts_the_preflight() {
     .expect_err("a mismatched chain id must abort");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("blockchain.chain_id") && msg.contains("rebind the lane store"),
-        "the error must name the key and the consequence: {msg}"
+        msg.contains("chain_id") && msg.contains("serves chain 1"),
+        "the error must name the key and the served chain: {msg}"
+    );
+    assert!(
+        msg.contains(&PREFLIGHT_DEPLOYMENT.pool_account().to_string()),
+        "the error must name the pool whose chain mismatches: {msg}"
     );
 }
 
@@ -1621,12 +1571,12 @@ async fn a_codeless_payment_pool_address_aborts_the_preflight() {
     .expect_err("a codeless address must abort");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("has no code") && msg.contains("blockchain.payment_pool_address"),
+        msg.contains("has no code") && msg.contains("payment_pools"),
         "the error must name the key: {msg}"
     );
 }
 
-/// A contract that does not answer `getRateBounds()` — a sibling address
+/// A contract that does not answer `operatorBps()` — a sibling address
 /// pasted from the same deploy manifest — aborts as a permanent contract
 /// error rather than passing on code presence alone. Both shapes of "no such
 /// view" are covered: the revert a real node answers (JSON-RPC code 3) and
@@ -1651,7 +1601,7 @@ async fn a_non_payment_pool_contract_aborts_the_preflight() {
                 .expect_err("a non-PaymentPool target must abort");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("does not answer PaymentPool.getRateBounds()"),
+            msg.contains("does not answer PaymentPool.operatorBps()"),
             "{shape}: the error must say the contract identity check failed: {msg}"
         );
         assert!(
@@ -1667,12 +1617,13 @@ async fn a_non_payment_pool_contract_aborts_the_preflight() {
 /// retry backoff sleep cost no real time.
 #[tokio::test(start_paused = true)]
 async fn a_transient_rpc_error_is_retried_by_the_preflight() {
-    let provider = preflight_provider(vec![
+    let mut answers = vec![
         MockAnswer::TransientError,
         MockAnswer::Ok(chain_id_ok()),
         MockAnswer::Ok(code_present()),
-        MockAnswer::Ok(rate_bounds_answers()),
-    ]);
+    ];
+    answers.extend(pool_identity_answers());
+    let provider = preflight_provider(answers);
     check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
         .await
         .expect("a transient fault must be retried to success");

@@ -40,8 +40,8 @@ use decdn_cache::{CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::{PoolStateStore, StoreError};
 use decdn_incentive::{
-    Capability, LaneKey, LaneState, RetrySignal, SignedCapability, SignedVoucher, StreamSlashData,
-    verify_binding, voucher_reject_reason, wire_voucher_to_signed,
+    Capability, Deployment, LaneKey, LaneState, RetrySignal, SignedCapability, SignedVoucher,
+    StreamSlashData, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
     ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
@@ -135,6 +135,94 @@ const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
 const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
+/// One `PaymentPool` this node accepts, with every per-pool service the serve
+/// path calls (ADR 005 § Payment pool routing). A request names its pool in
+/// `StreamRequest.payment_pool`; the handler routes it to the matching
+/// [`PoolRoute`] before any pool read, and refuses a pool it has no route for.
+pub struct PoolRoute {
+    /// The pool: payment chain id and contract address.
+    pub deployment: Deployment,
+    /// Durable per-lane cumulative state of this pool. Fences voucher replay
+    /// across a restart (ADR 003 §Off-chain voucher state persistence).
+    pub store: Arc<dyn PoolStateStore>,
+    /// Cached `getPool` view (owner + remaining) of this pool, read by the
+    /// floor-`M` solvency gate and the ADR 011 funder gate. `None` (tests)
+    /// disables both gates — they fail open.
+    pub pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
+    /// Best-effort nudge to this pool's settlement service that a lane's
+    /// accrued claim advanced; sent on every accepted voucher. `None` when no
+    /// settlement service is wired.
+    pub redeem_hint: Option<mpsc::Sender<LaneKey>>,
+    /// The pool's operator share (`PaymentPool.operatorBps()`), the `(1 − f)`
+    /// numerator the ADR 041 serve credit realizes. Zero (tests) credits
+    /// nothing.
+    pub operator_shares: crate::fee_shares::OperatorShares,
+    /// The voucher and capability EIP-712 domain of [`Self::deployment`].
+    voucher_domain: Eip712Domain,
+}
+
+impl PoolRoute {
+    /// A route for `deployment` over `store`, with no pool view, no redeem
+    /// hint and a zero operator share; the runtime sets each.
+    #[must_use]
+    pub fn new(deployment: Deployment, store: Arc<dyn PoolStateStore>) -> Self {
+        Self {
+            deployment,
+            store,
+            pool_view: None,
+            redeem_hint: None,
+            operator_shares: crate::fee_shares::OperatorShares::new(0),
+            voucher_domain: deployment.voucher_domain(),
+        }
+    }
+
+    /// The voucher and capability EIP-712 domain of this pool.
+    #[must_use]
+    pub const fn voucher_domain(&self) -> &Eip712Domain {
+        &self.voucher_domain
+    }
+}
+
+impl std::fmt::Debug for PoolRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolRoute")
+            .field("deployment", &self.deployment)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A seller lane on one pool: the pool's [`Deployment`] and the
+/// [`LaneKey`] within it. Pool ids repeat across deployments, so the handler
+/// keys its lane registry by this pair. Dereferences to the [`LaneKey`], so
+/// its fields read as `lane.pool_id`, `lane.signer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LaneId {
+    /// The pool's deployment.
+    pub deployment: Deployment,
+    /// The lane within that pool.
+    pub key: LaneKey,
+}
+
+impl std::ops::Deref for LaneId {
+    type Target = LaneKey;
+
+    fn deref(&self) -> &LaneKey {
+        &self.key
+    }
+}
+
+impl LaneId {
+    /// The pool this lane draws on.
+    #[must_use]
+    pub const fn pool(&self) -> PoolKey {
+        (self.deployment, self.key.pool_id)
+    }
+}
+
+/// One pool on one deployment: the `PaymentPool` contract and the pool id on
+/// it.
+pub type PoolKey = (Deployment, B256);
+
 /// Per-lane delivery state: the validated voucher watermark, the lane-wide
 /// cumulative byte counter that feeds voucher reconstruction (ADR 003 §Voucher
 /// wire format — `bytes_delivered` is not on the wire), and the bytes of that
@@ -211,7 +299,7 @@ impl LaneDeliveryState {
 /// global lock.
 #[derive(Clone)]
 pub struct LaneActivityClock {
-    lanes: Arc<DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>,
+    lanes: Arc<DashMap<LaneId, Arc<Mutex<LaneDeliveryState>>>>,
 }
 
 impl std::fmt::Debug for LaneActivityClock {
@@ -232,17 +320,17 @@ impl LaneActivityClock {
     }
 
     /// Whole seconds since each live lane last accepted a voucher, keyed by
-    /// [`LaneKey`]. A lane whose stamp is `0` (none accepted since this process
+    /// [`LaneId`]. A lane whose stamp is `0` (none accepted since this process
     /// hydrated it) is omitted, so a caller reads it back as "never" rather than
     /// a bogus zero age. Best-effort: `Instant`-free wall-clock arithmetic, so a
     /// clock that stepped backwards can only under-report the age — the safe
     /// direction for a diagnostic.
-    pub async fn ages(&self) -> HashMap<LaneKey, u64> {
+    pub async fn ages(&self) -> HashMap<LaneId, u64> {
         let now_ms = unix_millis();
         // Snapshot the live lane handles first (cloning the per-lane `Arc`s
         // releases the registry's shard guards), then read each stamp with only
         // its own (brief) lane lock held — never a shard guard across an await.
-        let handles: Vec<(LaneKey, Arc<Mutex<LaneDeliveryState>>)> = self
+        let handles: Vec<(LaneId, Arc<Mutex<LaneDeliveryState>>)> = self
             .lanes
             .iter()
             .map(|e| (*e.key(), Arc::clone(e.value())))
@@ -262,7 +350,7 @@ impl LaneActivityClock {
     /// what the voucher-accept path does to a live lane, without a running
     /// handler. Used to drive the admin `lanes` ordering test.
     #[cfg(test)]
-    pub(crate) fn with_stamped_lanes(lanes: &[LaneKey]) -> Self {
+    pub(crate) fn with_stamped_lanes(lanes: &[LaneId]) -> Self {
         let now = unix_millis();
         let map = DashMap::new();
         for &key in lanes {
@@ -318,6 +406,36 @@ impl ClientHandler {
             lanes: Arc::clone(&self.lanes),
         }
     }
+
+    /// The live lanes of `deployment`, as pool → signers: every lane that
+    /// accepted a voucher within `window`. A stream pays before it receives a
+    /// byte, so every stream that delivers has stamped its lane. The settlement
+    /// service re-reads these pools and signers on its refresh cadence, so a
+    /// live stream's solvency and signer-cap re-checks read recent chain state.
+    pub async fn live_lanes(
+        &self,
+        deployment: Deployment,
+        window: std::time::Duration,
+    ) -> HashMap<B256, std::collections::HashSet<Address>> {
+        let mut live: HashMap<B256, std::collections::HashSet<Address>> = HashMap::new();
+        let since =
+            unix_millis().saturating_sub(u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
+        let handles: Vec<(LaneId, Arc<Mutex<LaneDeliveryState>>)> = self
+            .lanes
+            .iter()
+            .filter(|e| e.key().deployment == deployment)
+            .map(|e| (*e.key(), Arc::clone(e.value())))
+            .collect();
+        for (lane, state) in handles {
+            let stamped = state.lock().await.last_voucher_at.load(Ordering::Relaxed);
+            if stamped != 0 && stamped >= since {
+                live.entry(lane.key.pool_id)
+                    .or_default()
+                    .insert(lane.key.signer);
+            }
+        }
+        live
+    }
 }
 
 /// Server-side classification of a `serve_stream` refusal, used to pick the
@@ -332,6 +450,10 @@ enum ServeRejectReason {
     /// corruption quarantine with no blacklist entry behind it.
     EvictedSinceProbe,
     CacheMiss,
+    /// The request names a `payment_pool` this node does not accept (ADR 005
+    /// § Payment pool routing). Signed `Declined`, carrying the pools the node
+    /// does accept, before any pool read or chain call.
+    UnacceptedPool,
     /// A fault in this node: a local store fault, or a fill that faulted on
     /// this node's own side. Signed `Declined`, never a false absence.
     InternalError,
@@ -481,6 +603,7 @@ impl ServeRejectReason {
             // from a governance entry or a withdrawn blob, so it cannot map an
             // operator's private legal exposure (ADR 011 §StreamRequest Response).
             Self::EvictedSinceProbe
+            | Self::UnacceptedPool
             | Self::InternalError
             | Self::RangeNotSatisfiable
             | Self::BlobTooLarge
@@ -713,20 +836,16 @@ pub struct ClientHandlerDeps {
     pub eth_signer: Arc<PrivateKeySigner>,
     /// EIP-712 domain for slash attestations.
     pub slash_domain: Eip712Domain,
-    /// EIP-712 domain for payment vouchers.
-    pub voucher_domain: Eip712Domain,
     /// EIP-712 domain for lane bindings.
     pub bind_domain: Eip712Domain,
-    /// Durable per-lane cumulative state. Fences voucher replay across a
-    /// restart (ADR 003 §Off-chain voucher state persistence).
-    pub pool_state_store: Arc<dyn PoolStateStore>,
+    /// The payment pools this node accepts, in configuration order, each with
+    /// its own store, pool view, redeem hint and operator share. A request on
+    /// any other pool is refused `Declined` with these pools listed (the first
+    /// `decdn_protocol::MAX_PAYMENT_POOLS`).
+    pub pools: Vec<PoolRoute>,
     /// Non-blocking sink for the served-and-paid audit log. One receipt per
     /// accepted voucher, so a single delivery emits several.
     pub receipt_sink: Arc<dyn ReceiptSink>,
-    /// Cached `getPool` view (owner + remaining), read by the floor-`M` solvency
-    /// gate and the ADR 011 funder gate. `None` (tests) disables both gates —
-    /// they fail open, exactly as before E4 wired the view.
-    pub pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
     /// Per-request rate limiter (`[serve.rate_limit]`, ADR 005 §Request rate
     /// limiting), checked once per stream before its request is read. `None`
     /// (tests) admits every stream the stream cap admits.
@@ -757,7 +876,7 @@ pub struct ClientHandlerDeps {
     /// Liveness of the node's chain reads (ADR 011 § Serving while chain-stale).
     /// `Some` only when the blacklist watcher is wired; the admit path refuses a
     /// serve once this reads stale. `None` (dev/test, no chain) disables the
-    /// gate — the same fail-open shape as an unwired [`Self::pool_view`].
+    /// gate — the same fail-open shape as an unwired [`PoolRoute::pool_view`].
     pub chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
     /// The origin attestations this node holds (ADR 022 § Origin
     /// Attestation). An `ok: true` response forwards the one held for its hash
@@ -765,10 +884,6 @@ pub struct ClientHandlerDeps {
     /// advertise what it pulls. `None` (tests without a DHT) forwards none.
     pub attestations: Option<Arc<crate::attestations::Attestations>>,
     // Optional wiring — `None` unless the deployment enables the feature.
-    /// Best-effort nudge to the settlement service that a lane's accrued
-    /// claim advanced; sent on every accepted voucher, against no threshold.
-    /// `None` when no settlement service is wired.
-    pub redeem_hint: Option<mpsc::Sender<LaneKey>>,
     /// Deadline for the node-to-node cache-miss pull, so a slow upstream
     /// cannot pin the delivery path. `None` disables the node-to-node leg
     /// only; a miss can still fill from the local origin via
@@ -810,10 +925,6 @@ pub struct ClientHandlerDeps {
     /// [`crate::warming_allowance::spawn_warming_creditor`], and a handler left
     /// with the default simply applies no warming credit.
     pub warming_credit: Arc<dyn crate::warming_allowance::WarmingCreditSink>,
-    /// Live operator fee-share (basis points) cell (`FeeRouter.getShares()[0]`), the
-    /// `(1 − f)` numerator the ADR 041 serve credit realizes. Defaults to zero
-    /// (tests): a zero share credits nothing.
-    pub operator_shares: crate::fee_shares::OperatorShares,
     /// Origin-only policy (#1759). When `false`, `serve_stream` declines any
     /// hash its own backend does not hold — including a cache HIT for a
     /// foreign hash — before any discovery, lane accounting, or spend. `true`
@@ -854,9 +965,8 @@ impl ClientHandlerDeps {
         cache: CacheEngine,
         eth_signer: Arc<PrivateKeySigner>,
         slash_domain: Eip712Domain,
-        voucher_domain: Eip712Domain,
         bind_domain: Eip712Domain,
-        pool_state_store: Arc<dyn PoolStateStore>,
+        pool: PoolRoute,
         receipt_sink: Arc<dyn ReceiptSink>,
         rate_per_mb: u64,
         max_concurrent_streams: usize,
@@ -872,11 +982,9 @@ impl ClientHandlerDeps {
             cache,
             eth_signer,
             slash_domain,
-            voucher_domain,
             bind_domain,
-            pool_state_store,
+            pools: vec![pool],
             receipt_sink,
-            pool_view: None,
             request_limiter: None,
             pool_min_remaining_deposit,
             rate_per_mb,
@@ -884,7 +992,6 @@ impl ClientHandlerDeps {
             content_deny,
             chain_freshness: None,
             attestations: None,
-            redeem_hint: None,
             pull_through: None,
             local_populate: None,
             pull_through_origin: None,
@@ -892,7 +999,6 @@ impl ClientHandlerDeps {
             idle_timeout: None,
             pool_recheck_interval: None,
             warming_credit: Arc::new(crate::warming_allowance::NoopWarmingCreditSink),
-            operator_shares: crate::fee_shares::OperatorShares::new(0),
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             coarse_clock: None,
             redeem_interval_secs: decdn_common::config::DEFAULT_REDEEM_INTERVAL_SECS,
@@ -1028,11 +1134,11 @@ pub struct ClientHandler {
     slash_domain: Eip712Domain,
     /// Held origin attestations, forwarded on `ok: true` responses.
     attestations: Option<Arc<crate::attestations::Attestations>>,
-    /// `PaymentPool` EIP-712 domain for voucher verification.
-    voucher_domain: Eip712Domain,
     /// `CapacityBond` EIP-712 domain for ephemeral `BindNodeId` verification.
     bind_domain: Eip712Domain,
-    pool_state_store: Arc<dyn PoolStateStore>,
+    /// The pools this node accepts, in configuration order (see
+    /// [`ClientHandlerDeps::pools`]). Fixed at construction.
+    pools: Vec<PoolRoute>,
     /// Refundable minimum-remaining-deposit floor `M` for the floor-M serving
     /// guard (see [`ClientHandlerDeps::pool_min_remaining_deposit`]).
     pool_min_remaining_deposit: U256,
@@ -1043,22 +1149,20 @@ pub struct ClientHandler {
     /// A dropped receipt (queue full) is non-fatal — the payment already advanced
     /// the lane watermark.
     receipt_sink: Arc<dyn ReceiptSink>,
-    /// Cached `getPool` view for the floor-`M` and ADR 011 funder gates. `None`
-    /// (tests) makes both gates fail open.
-    pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
     /// See [`ClientHandlerDeps::request_limiter`].
     request_limiter: Option<Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>>,
     /// Liveness of the node's chain reads (ADR 011 § Serving while chain-stale).
     /// `Some` only when the blacklist watcher is wired; the admit path refuses
     /// once it reads stale. `None` (tests) disables the gate.
     chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
-    /// Per-lane state, hydrated from the store at construction. The sharded map
-    /// resolves independent lanes concurrently — a lookup keyed by [`LaneKey`]
+    /// Per-lane state of every pool, hydrated from each pool's store at
+    /// construction. The sharded map
+    /// resolves independent lanes concurrently — a lookup keyed by [`LaneId`]
     /// is a point read that only locks that key's shard; each inner mutex
     /// serializes voucher application for one lane across its concurrent streams
     /// (ADR 003 §concurrent streams). No call site holds a map entry across an
     /// `.await`, so lane lookup never blocks an unrelated lane's admission.
-    lanes: Arc<DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>,
+    lanes: Arc<DashMap<LaneId, Arc<Mutex<LaneDeliveryState>>>>,
     /// Live-lane count backing `decdn_lanes_open` (#1789 item 3): `fetch_add`
     /// on a real insert, `fetch_sub` on a real remove, seeded once at
     /// construction from the hydrated map. Holding the count in an atomic keeps
@@ -1068,7 +1172,7 @@ pub struct ClientHandler {
     /// Test-only: a lane [`ClientHandler::register_lane_after_next_resolution`]
     /// armed, registered right after the next request resolves its lane.
     #[cfg(any(test, feature = "test-support"))]
-    lane_after_resolution: std::sync::Mutex<Option<LaneState>>,
+    lane_after_resolution: std::sync::Mutex<Option<(Deployment, LaneState)>>,
     /// Serializes the read-and-publish half of [`Self::tune_lane_gauge`], so
     /// two concurrent lane-lifecycle calls cannot publish `decdn_lanes_open`
     /// out of order. The atomic alone fixes the count, not the publication:
@@ -1082,11 +1186,6 @@ pub struct ClientHandler {
     /// capability on every request skips the per-request `ecrecover` in
     /// [`ClientHandler::intake_capability`].
     capability_verify_cache: std::sync::Mutex<CapabilityVerifyCache>,
-    /// Redeem-hint sender to the on-chain settlement service (#327), set at
-    /// construction via [`ClientHandlerDeps`]. `None` when no settlement service
-    /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
-    /// full channel just skips it. Keyed by [`LaneKey`]: redemption is per-lane.
-    redeem_hint: Option<mpsc::Sender<LaneKey>>,
     /// Node-to-node cache-miss pull-through deadline (#831), set at construction
     /// via [`ClientHandlerDeps`]. `None` (the default — feature off, and in
     /// tests) disables pull-through: a cache miss returns `NotFound`. When
@@ -1181,8 +1280,6 @@ pub struct ClientHandler {
     /// buy loop and eviction share. Enqueues the realized operator margin on each
     /// clean serve (a no-op for an untagged hash) without taking the ledger lock.
     warming_credit: Arc<dyn crate::warming_allowance::WarmingCreditSink>,
-    /// Live operator fee-share (basis points), the ADR 041 serve-credit numerator.
-    operator_shares: crate::fee_shares::OperatorShares,
     /// Origin-only policy (#1759), set at construction via
     /// [`ClientHandlerDeps::relay_foreign_namespaces`]. Read by the gate at the
     /// top of `serve_stream`.
@@ -1215,7 +1312,7 @@ impl ClientHandler {
     pub const ALPN: &'static [u8] = ALPN_CLIENT;
 
     /// Construct the handler from [`ClientHandlerDeps`], hydrating per-lane
-    /// state from the deps' `pool_state_store`.
+    /// state from each pool's store.
     ///
     /// All optional runtime wiring (settlement redeem hints, pull-through
     /// deadlines, the window/leech providers, …) is supplied on `deps` as
@@ -1226,14 +1323,26 @@ impl ClientHandler {
     ///
     /// Propagates a [`decdn_incentive::StoreError`] if the persisted lane
     /// state cannot be loaded — the node must not serve paid delivery without
-    /// knowing prior voucher state (the #527 replay guard).
+    /// knowing prior voucher state (the #527 replay guard). Errors on a
+    /// deployment listed twice in [`ClientHandlerDeps::pools`].
     pub fn new(deps: ClientHandlerDeps) -> anyhow::Result<Self> {
-        let map: DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>> = DashMap::new();
-        for state in deps.pool_state_store.load_all()? {
-            map.insert(
-                state.key(),
-                Arc::new(Mutex::new(LaneDeliveryState::hydrated(state))),
+        let map: DashMap<LaneId, Arc<Mutex<LaneDeliveryState>>> = DashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for pool in &deps.pools {
+            anyhow::ensure!(
+                seen.insert(pool.deployment),
+                "payment pool {} is configured twice",
+                pool.deployment.pool_account()
             );
+            for state in pool.store.load_all()? {
+                map.insert(
+                    LaneId {
+                        deployment: pool.deployment,
+                        key: state.key(),
+                    },
+                    Arc::new(Mutex::new(LaneDeliveryState::hydrated(state))),
+                );
+            }
         }
         // Seed the atomic lane counter once at hydrate; `register_lane` /
         // `forget_lane` tune it from then on (#1789 item 3). The pool deposit
@@ -1250,12 +1359,10 @@ impl ClientHandler {
             cache: deps.cache,
             eth_signer: deps.eth_signer,
             slash_domain: deps.slash_domain,
-            voucher_domain: deps.voucher_domain,
             bind_domain: deps.bind_domain,
-            pool_state_store: deps.pool_state_store,
+            pools: deps.pools,
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,
             receipt_sink: deps.receipt_sink,
-            pool_view: deps.pool_view,
             request_limiter: deps.request_limiter,
             chain_freshness: deps.chain_freshness,
             attestations: deps.attestations,
@@ -1265,7 +1372,6 @@ impl ClientHandler {
             lane_after_resolution: std::sync::Mutex::new(None),
             lane_gauge_publish: std::sync::Mutex::new(()),
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
-            redeem_hint: deps.redeem_hint,
             pull_through: deps.pull_through,
             local_populate: deps.local_populate,
             pull_through_origin: deps.pull_through_origin,
@@ -1283,7 +1389,6 @@ impl ClientHandler {
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
             warming_credit: deps.warming_credit,
-            operator_shares: deps.operator_shares,
             relay_foreign_namespaces: deps.relay_foreign_namespaces,
             // A handler with no clock wired (tests) reads the live wall clock on
             // every call, exactly as before #1792 item 4.
@@ -1307,11 +1412,15 @@ impl ClientHandler {
     /// task's last act on a clean completion — costs whatever that sink costs.
     /// The runtime's channel sink is one tag-map shard read and one bounded
     /// `try_send`, and never waits on the bucket lock the buy loop takes, which
-    /// is what the sink contract requires of anything on this path.
-    fn credit_warming_serve(&self, hash: Hash, served_bytes: u64) {
+    /// is what the sink contract requires of anything on this path. The
+    /// operator share is that of the pool the serve was paid on.
+    fn credit_warming_serve(&self, deployment: Deployment, hash: Hash, served_bytes: u64) {
+        let operator_bps = self
+            .pool_route(deployment)
+            .map_or(0, |route| route.operator_shares.bps());
         let sell_rate = self.rate_per_mb;
         let margin_per_mb = sell_rate
-            .saturating_mul(u64::from(self.operator_shares.bps()))
+            .saturating_mul(u64::from(operator_bps))
             .saturating_div(10_000);
         let mb = served_bytes.div_ceil(decdn_protocol::MB_BYTES);
         self.warming_credit
@@ -1335,15 +1444,38 @@ impl ClientHandler {
     /// — the mid-stream re-check uses [`Self::pool_recheck_stop`].
     pub(super) async fn pool_view_status(
         &self,
-        pool_id: B256,
+        pool: PoolKey,
     ) -> Option<crate::pool_view::PoolStatus> {
-        self.pool_view.as_ref()?.status(pool_id).await
+        self.pool_view(pool.0)?.status(pool.1).await
+    }
+
+    /// The route of `deployment`, or `None` when this node does not accept
+    /// that pool.
+    pub(super) fn pool_route(&self, deployment: Deployment) -> Option<&PoolRoute> {
+        self.pools
+            .iter()
+            .find(|route| route.deployment == deployment)
+    }
+
+    /// The pool view of `deployment`, or `None` when the node does not accept
+    /// that pool or wired no view for it.
+    fn pool_view(&self, deployment: Deployment) -> Option<&Arc<dyn crate::pool_view::PoolView>> {
+        self.pool_route(deployment)?.pool_view.as_ref()
+    }
+
+    /// The pools this node accepts as wire accounts, in configuration order,
+    /// for a `Declined` refusal of an unaccepted pool.
+    pub(super) fn accepted_pools(&self) -> Vec<decdn_protocol::PoolAccount> {
+        self.pools
+            .iter()
+            .map(|route| route.deployment.pool_account())
+            .collect()
     }
 
     /// Count a pool re-check that reads the pool view while
     /// [`Self::chain_freshness`] reads stale, and log a throttled `warn!` naming
     /// the stream. [`Self::pool_recheck_stop`] calls it once it has a view.
-    fn count_stale_pool_recheck(&self, lane_key: &LaneKey, hash: &Hash) {
+    fn count_stale_pool_recheck(&self, lane_key: &LaneId, hash: &Hash) {
         if self
             .chain_freshness
             .as_ref()
@@ -1376,9 +1508,9 @@ impl ClientHandler {
     /// - No pool view wired (dev/test, no chain): `None`. There is nothing to
     ///   check, so the stream fails open.
     /// - The view holds no status for the pool: [`ServeStop::PoolClosed`].
-    ///   Admission puts every admitted stream's pool in the view, and the view
-    ///   drops a pool only once it is reclaimed or a re-anchor read finds it
-    ///   closed, so the pool closed under this stream. `redeemMany` reverts on a
+    ///   Admission puts every admitted stream's pool in the view, and the
+    ///   view drops a live lane's pool only once a refresh read finds it
+    ///   closed or absent, so the pool closed under this stream. `redeemMany` reverts on a
     ///   closed pool.
     /// - The pool is `Closing` and its dispute deadline falls inside the
     ///   capability expiry margin ([`Self::inside_expiry_margin`]):
@@ -1404,8 +1536,8 @@ impl ClientHandler {
     /// the projection may be frozen, and a drain or close that landed on-chain
     /// since does not show. The staleness itself ends nothing: the re-check
     /// still reads the projection, and its usual verdict on that data applies.
-    async fn pool_recheck_stop(&self, lane_key: &LaneKey, hash: &Hash) -> Option<ServeStop> {
-        let view = self.pool_view.as_ref()?;
+    async fn pool_recheck_stop(&self, lane_key: &LaneId, hash: &Hash) -> Option<ServeStop> {
+        let view = self.pool_view(lane_key.deployment)?;
         self.count_stale_pool_recheck(lane_key, hash);
         let Some(status) = view.cached_status(lane_key.pool_id).await else {
             tracing::warn!(
@@ -1444,10 +1576,9 @@ impl ClientHandler {
     /// [`Self::pool_recheck_stop`] returns `None`, so with a view wired the view
     /// still holds the pool and this `spent` is not the `0` of a forgotten pool.
     /// See [`crate::pool_view::PoolView::signer_spent_cached`].
-    pub(super) async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
-        self.pool_view
-            .as_ref()?
-            .signer_spent_cached(pool_id, signer)
+    pub(super) async fn signer_spent_cached(&self, pool: PoolKey, signer: Address) -> Option<u64> {
+        self.pool_view(pool.0)?
+            .signer_spent_cached(pool.1, signer)
             .await
     }
 
@@ -1482,12 +1613,12 @@ impl ClientHandler {
     /// the dispatch sink counts on the mid-stream metric.
     pub(super) async fn signer_cap_drained_midstream(
         &self,
-        pool_id: B256,
+        pool: PoolKey,
         signer: Address,
         held_cap: U256,
         rate_per_mb: u64,
     ) -> bool {
-        let Some(spent) = self.signer_spent_cached(pool_id, signer).await else {
+        let Some(spent) = self.signer_spent_cached(pool, signer).await else {
             return false;
         };
         let headroom = held_cap.saturating_sub(U256::from(spent));
@@ -1499,8 +1630,8 @@ impl ClientHandler {
     /// re-check, or `None` when no pool-view is wired or the read faulted (the
     /// re-check then falls back to the open-time gates and the hash-denylist
     /// re-check). Cached, so a per-MB call is cheap.
-    pub(super) async fn pool_funder(&self, pool_id: B256) -> Option<Address> {
-        self.pool_view_status(pool_id).await.map(|s| s.owner)
+    pub(super) async fn pool_funder(&self, pool: PoolKey) -> Option<Address> {
+        self.pool_view_status(pool).await.map(|s| s.owner)
     }
 
     /// Recover an owner-signed capability's EIP-712 signer (ADR 003
@@ -1518,8 +1649,11 @@ impl ClientHandler {
     /// stale cached owner. Caching the recovered ADDRESS rather than an
     /// accept/reject verdict is what keeps this sound across an on-chain owner
     /// transfer: the comparison is re-made against the live owner every call.
-    fn recover_capability_owner(&self, grant: &SignedCapability) -> CapabilityVerifyOutcome {
-        let domain = &self.voucher_domain;
+    fn recover_capability_owner(
+        &self,
+        grant: &SignedCapability,
+        domain: &Eip712Domain,
+    ) -> CapabilityVerifyOutcome {
         let signing_hash = grant.capability.signing_hash(domain);
         let signature = grant.signature.as_bytes();
         // The lock is held only for the cache lookup/insert — a hash lookup plus
@@ -1554,9 +1688,10 @@ impl ClientHandler {
     /// §Capability delegation): verify the owner signature against the on-chain
     /// pool owner, register the lane so the voucher path serves it, and persist
     /// the grant so the redeemer can register the signer on its first on-chain
-    /// redemption. `signer` is the request's bound Ethereum address; `pool_id`
-    /// is [`StreamRequest::pool_id`]; `pool_owner` is `getPool.owner` from the
-    /// cached pool-view.
+    /// redemption. `signer` is the request's bound Ethereum address; `pool` is
+    /// the routed pool deployment with [`StreamRequest::pool_id`]; `pool_owner`
+    /// is `getPool.owner` from the cached pool-view. The capability verifies
+    /// against that deployment's EIP-712 domain.
     ///
     /// The owner check is authoritative here, not deferred: the on-chain
     /// `PaymentPool.redeemMany` verifies every capability's owner signature
@@ -1585,12 +1720,16 @@ impl ClientHandler {
     #[allow(clippy::cognitive_complexity)] // linear verify → register → persist sequence.
     fn intake_capability(
         &self,
+        deployment: Deployment,
         pool_id: B256,
         signer: Address,
         pool_owner: Address,
         capability: &decdn_protocol::client::WireCapability,
     ) {
         use crate::metrics::CapabilityIntakeDropReason;
+        let Some(route) = self.pool_route(deployment) else {
+            return;
+        };
         let spending_cap = capability.spending_cap;
         let expiry = capability.expiry;
         // The on-chain `PaymentPool` reads an expiry of `0` as already expired
@@ -1636,7 +1775,7 @@ impl ClientHandler {
         // client-side signing bug, while a well-formed signature recovering to
         // the wrong address is operator-actionable — usually a client still
         // signing against an owner the pool has since transferred away.
-        match self.recover_capability_owner(&grant) {
+        match self.recover_capability_owner(&grant, route.voucher_domain()) {
             CapabilityVerifyOutcome::Owner(owner) if owner == pool_owner => {}
             CapabilityVerifyOutcome::Owner(recovered) => {
                 tracing::warn!(
@@ -1699,7 +1838,7 @@ impl ClientHandler {
             decdn_incentive::LaneChain::NONE,
         );
         lane.owner_sig = Some(signature.as_bytes());
-        if let Err(e) = self.register_lane(lane) {
+        if let Err(e) = self.register_lane(route.deployment, lane) {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
         }
     }
@@ -1731,9 +1870,23 @@ impl ClientHandler {
     ///
     /// # Errors
     ///
-    /// Propagates a [`StoreError`] if the store `record` fails.
-    pub fn register_lane(&self, state: LaneState) -> Result<(), StoreError> {
-        let key = state.key();
+    /// Propagates a [`StoreError`] if the store `record` fails, and refuses a
+    /// `deployment` this node does not accept.
+    pub fn register_lane(
+        &self,
+        deployment: Deployment,
+        state: LaneState,
+    ) -> Result<(), StoreError> {
+        let Some(route) = self.pool_route(deployment) else {
+            return Err(StoreError::Backend(format!(
+                "no accepted payment pool {}",
+                deployment.pool_account()
+            )));
+        };
+        let key = LaneId {
+            deployment,
+            key: state.key(),
+        };
         if self.lanes.contains_key(&key) {
             return Ok(());
         }
@@ -1754,11 +1907,45 @@ impl ClientHandler {
         if let dashmap::mapref::entry::Entry::Vacant(entry) = self.lanes.entry(key) {
             // A failed record leaves the slot vacant: the live map never holds
             // a lane the store did not accept.
-            self.pool_state_store.record(&state)?;
+            route.store.record(&state)?;
             entry.insert(Arc::new(Mutex::new(LaneDeliveryState::hydrated(state))));
             self.tune_lane_gauge(1);
         }
         Ok(())
+    }
+
+    /// Record `state` in the lane store of `deployment`'s pool. Non-blocking
+    /// (see [`PoolStateStore::record`]).
+    ///
+    /// # Errors
+    ///
+    /// The store's error, or a [`StoreError::Backend`] for a pool this node
+    /// does not accept.
+    pub(super) fn record_lane(
+        &self,
+        deployment: Deployment,
+        state: &LaneState,
+    ) -> Result<(), StoreError> {
+        match self.pool_route(deployment) {
+            Some(route) => route.store.record(state),
+            None => Err(StoreError::Backend(format!(
+                "no accepted payment pool {}",
+                deployment.pool_account()
+            ))),
+        }
+    }
+
+    /// Hint the lane's pool settlement service that the lane's accrued claim
+    /// advanced (#749/#327). Best-effort: an absent sender or a full channel
+    /// just skips.
+    pub(super) fn hint_redeem(&self, lane: LaneId) {
+        if let Some(tx) = self
+            .pool_route(lane.deployment)
+            .and_then(|route| route.redeem_hint.as_ref())
+            && let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(lane.key)
+        {
+            self.metrics.redeem_hint_dropped();
+        }
     }
 
     /// Test-only: register `state` right after the next `serve_stream` resolves
@@ -1766,9 +1953,9 @@ impl ClientHandler {
     /// while this request is past its lane resolution, the window in which the
     /// request must keep the answer it resolved.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn register_lane_after_next_resolution(&self, state: LaneState) {
+    pub fn register_lane_after_next_resolution(&self, deployment: Deployment, state: LaneState) {
         if let Ok(mut armed) = self.lane_after_resolution.lock() {
-            *armed = Some(state);
+            *armed = Some((deployment, state));
         }
     }
 
@@ -1781,8 +1968,8 @@ impl ClientHandler {
             .lock()
             .ok()
             .and_then(|mut armed| armed.take());
-        if let Some(state) = armed
-            && let Err(e) = self.register_lane(state)
+        if let Some((deployment, state)) = armed
+            && let Err(e) = self.register_lane(deployment, state)
         {
             tracing::warn!(error = %e, "test seam: armed lane registration failed");
         }
@@ -1798,10 +1985,14 @@ impl ClientHandler {
     /// lane is what the voucher path reads.
     async fn clamp_lane_to_registration(
         &self,
+        deployment: Deployment,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         cap: u64,
         expiry: u64,
     ) {
+        let Some(route) = self.pool_route(deployment) else {
+            return;
+        };
         let mut guard = lane.lock().await;
         if !guard.state.clamp_to_registration(cap, expiry) {
             return;
@@ -1813,7 +2004,7 @@ impl ClientHandler {
             held_expiry = guard.state.expiry,
             "lane clamped to the signer's on-chain registration"
         );
-        if let Err(error) = self.pool_state_store.record(&guard.state) {
+        if let Err(error) = route.store.record(&guard.state) {
             tracing::warn!(
                 pool_id = %guard.state.pool_id,
                 signer = %guard.state.signer,
@@ -1832,15 +2023,19 @@ impl ClientHandler {
     /// Propagates a [`StoreError`] if the store cannot take the tombstone (its
     /// buffer mutex is poisoned), or if the blocking store task fails to join —
     /// a panic inside the store, or the runtime shutting down mid-call.
-    pub async fn forget_lane(&self, key: LaneKey) -> Result<(), StoreError> {
+    pub async fn forget_lane(&self, lane: LaneId) -> Result<(), StoreError> {
         // Removing the lane row drops its `last_voucher_at` stamp with it (issue
         // #1733): the timestamp lives on the lane's delivery state, so its
         // lifecycle follows the lane automatically — no separate activity-map
         // eviction. Only a real removal tunes the lane gauge down.
-        if self.lanes.remove(&key).is_some() {
+        if self.lanes.remove(&lane).is_some() {
             self.tune_lane_gauge(-1);
         }
-        let store = Arc::clone(&self.pool_state_store);
+        let Some(route) = self.pool_route(lane.deployment) else {
+            return Ok(());
+        };
+        let store = Arc::clone(&route.store);
+        let key = lane.key;
         tokio::task::spawn_blocking(move || store.forget(key))
             .await
             .map_err(|e| StoreError::Backend(format!("forget_lane join: {e}")))?
@@ -1889,7 +2084,7 @@ impl ClientHandler {
                 interval = ?self.deposit_refusal_warn.interval(),
                 "refusing paying clients: pool's refundable remaining deposit below the reserved cost. \
                  A sustained rate here is either a client running dry (no action) or this \
-                 node's chain watcher lagging behind an on-chain top-up (check RPC health) \
+                 node's pool read older than an on-chain top-up (check RPC health) \
                  — see docs/runbook.md"
             );
         }
@@ -1970,7 +2165,7 @@ impl ClientHandler {
     ///
     /// `remaining` is a chain quantity read from `getPool`; the handler does not
     /// hold an RPC client, so **E4 threads `remaining` to every call site** (from
-    /// the redemption/pool watcher's cached `getPool` view, cached like
+    /// the pool view's held `getPool` read, cached like
     /// `withdrawn_cache`). This method owns only the policy arithmetic.
     pub(super) fn pool_remaining_covers_window(
         &self,
@@ -2400,6 +2595,13 @@ fn always_admit_shed() -> Arc<crate::load_shed::LoadShedController> {
     })
 }
 
+/// The one payment pool the handler-layer tests route to.
+#[cfg(test)]
+pub(super) const TEST_DEPLOYMENT: Deployment = Deployment {
+    chain_id: 31_337,
+    payment_pool: Address::repeat_byte(0x34),
+};
+
 /// Build a `ClientHandler` over an arbitrary [`PoolStateStore`] for the
 /// sibling-module tests (e.g. `voucher.rs`'s #527 durability tests need a
 /// fault-injecting store). Kept at module level (not inside `mod tests`) so a
@@ -2427,9 +2629,8 @@ pub(super) async fn handler_over_store(
         cache,
         Arc::new(alloy::signers::local::PrivateKeySigner::random()),
         domain.clone(),
-        domain.clone(),
         domain,
-        store,
+        PoolRoute::new(TEST_DEPLOYMENT, store),
         Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
             crate::receipt_log::NoopReceiptLog,
         ))) as Arc<dyn ReceiptSink>,

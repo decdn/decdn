@@ -109,6 +109,23 @@ fn payment_domain() -> Eip712Domain {
     voucher_domain(CHAIN_ID, Address::repeat_byte(0x34))
 }
 
+/// The one payment pool the loopback handlers accept: the deployment
+/// [`payment_domain`] names.
+const fn loopback_deployment() -> decdn_incentive::Deployment {
+    decdn_incentive::Deployment {
+        chain_id: CHAIN_ID,
+        payment_pool: Address::repeat_byte(0x34),
+    }
+}
+
+/// The handler's lane id of [`lane_key`] on [`loopback_deployment`].
+fn lane_id(signer: Address) -> decdn_node::handlers::client::LaneId {
+    decdn_node::handlers::client::LaneId {
+        deployment: loopback_deployment(),
+        key: lane_key(signer),
+    }
+}
+
 fn binding_domain() -> Eip712Domain {
     bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
 }
@@ -1007,6 +1024,7 @@ async fn open_paid_range_stream(
     let req = StreamRequest {
         hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset,
         byte_len,
@@ -2189,6 +2207,7 @@ async fn stall_delivery_at_closing_voucher(
     let req = StreamRequest {
         hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -2326,6 +2345,7 @@ async fn open_expecting_refusal(
     let req = StreamRequest {
         hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -3400,7 +3420,7 @@ async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
         !activity
             .ages()
             .await
-            .contains_key(&lane_key(client_signer.address())),
+            .contains_key(&lane_id(client_signer.address())),
         "no voucher accepted yet → clock must report the lane as absent (never)"
     );
 
@@ -3434,7 +3454,7 @@ async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
         activity
             .ages()
             .await
-            .contains_key(&lane_key(client_signer.address())),
+            .contains_key(&lane_id(client_signer.address())),
         "an accepted voucher must advance the lane's last-voucher clock"
     );
 
@@ -4922,6 +4942,193 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A [`PoolView`](decdn_node::pool_view::PoolView) that counts every admit-path
+/// read and confirms no pool, so a test sees which pool's view a request
+/// reached.
+#[derive(Debug, Default)]
+struct RouteProbeView {
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl RouteProbeView {
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for RouteProbeView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+}
+
+/// A bound stream request on `payment_pool` for `hash`.
+fn bound_request(hash: [u8; 32], payment_pool: decdn_protocol::PoolAccount) -> StreamRequest {
+    StreamRequest {
+        hash,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: now_us(),
+    }
+}
+
+/// Spawn a handler whose pools are the loopback pool, read through `view`,
+/// plus `extra` routes, and return the target, server endpoint, task and
+/// metrics.
+async fn spawn_multi_pool_server(
+    cache: CacheEngine,
+    view: Arc<RouteProbeView>,
+    extra: Vec<decdn_node::handlers::client::PoolRoute>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+        Arc::new(MemoryPoolStateStore::new()) as Arc<dyn PoolStateStore>,
+        RATE_PER_MB,
+        |deps| {
+            support::set_pool_view(deps, view);
+            deps.pools.extend(extra);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_ep, server_task, metrics))
+}
+
+/// A request on a pool the node does not accept is refused `Declined`, and the
+/// refusal lists the pools the node does accept (ADR 005 § Payment pool
+/// routing). The refusal comes before any pool read: the node's pool view is
+/// never consulted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_on_an_unaccepted_pool_is_declined_with_the_accepted_pools() -> anyhow::Result<()>
+{
+    let (cache, hash, _cache_tmp) = cache_with_blob(&[0x42u8; 4_096]).await?;
+    let view = Arc::new(RouteProbeView::default());
+    let (target, server_ep, server_task, metrics) =
+        spawn_multi_pool_server(cache, Arc::clone(&view), Vec::new()).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&PrivateKeySigner::random(), client_node_id)?;
+    let foreign = decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x99; 20]);
+    match raw_request(
+        &client_ep,
+        target,
+        &bound_request(*hash.as_bytes(), foreign),
+        Some(&ext),
+    )
+    .await?
+    {
+        (ClientMessage::StreamResponse(resp), resp_ext) => {
+            anyhow::ensure!(!resp.body.ok, "an unaccepted pool must be refused");
+            anyhow::ensure!(
+                matches!(
+                    resp_ext.error(),
+                    Some(decdn_protocol::client::StreamError::Declined)
+                ),
+                "expected Declined, got {:?}",
+                resp_ext.error()
+            );
+            anyhow::ensure!(
+                resp_ext.payment_pools == Some(vec![loopback_deployment().pool_account()]),
+                "the refusal must list the accepted pools: {:?}",
+                resp_ext.payment_pools
+            );
+        }
+        other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
+    }
+    anyhow::ensure!(
+        view.reads() == 0,
+        "an unaccepted pool must cost no pool read"
+    );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_unaccepted_pool_total 1"
+        ),
+        "the refusal must count as unaccepted_pool"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Two pools on two payment chains: each request reaches only the pool view of
+/// the pool it names.
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_route_to_the_pool_they_name() -> anyhow::Result<()> {
+    let (cache, hash, _cache_tmp) = cache_with_blob(&[0x43u8; 4_096]).await?;
+    let view_a = Arc::new(RouteProbeView::default());
+    let view_b = Arc::new(RouteProbeView::default());
+    let pool_b = decdn_incentive::Deployment {
+        chain_id: CHAIN_ID + 1,
+        payment_pool: Address::repeat_byte(0x77),
+    };
+    let mut route_b = decdn_node::handlers::client::PoolRoute::new(
+        pool_b,
+        Arc::new(MemoryPoolStateStore::new()) as Arc<dyn PoolStateStore>,
+    );
+    route_b.pool_view = Some(Arc::clone(&view_b) as _);
+    let (target, server_ep, server_task, _metrics) =
+        spawn_multi_pool_server(cache, Arc::clone(&view_a), vec![route_b]).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&PrivateKeySigner::random(), client_node_id)?;
+
+    raw_request(
+        &client_ep,
+        target.clone(),
+        &bound_request(*hash.as_bytes(), pool_b.pool_account()),
+        Some(&ext),
+    )
+    .await?;
+    anyhow::ensure!(
+        (view_a.reads(), view_b.reads()) == (0, 1),
+        "a request on pool B reads pool B's view only: A={} B={}",
+        view_a.reads(),
+        view_b.reads()
+    );
+
+    raw_request(
+        &client_ep,
+        target,
+        &bound_request(*hash.as_bytes(), loopback_deployment().pool_account()),
+        Some(&ext),
+    )
+    .await?;
+    anyhow::ensure!(
+        (view_a.reads(), view_b.reads()) == (1, 1),
+        "a request on pool A reads pool A's view only: A={} B={}",
+        view_a.reads(),
+        view_b.reads()
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// #327 boundary + #848 free-egress: a stream request for a lane the node has
 /// never persisted is refused *pre-serve* — the node signs `ok: false` with the
 /// delivery-side `NotFound` code and ships zero bytes. It never serves a free
@@ -4953,6 +5160,7 @@ async fn client_unknown_lane_is_rejected() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5035,6 +5243,7 @@ async fn client_underfunded_pool_is_refused_pre_serve() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5179,6 +5388,7 @@ async fn client_deposit_gate_prices_one_chunk() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5235,6 +5445,7 @@ async fn client_spent_down_pool_is_refused_pre_serve() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5306,6 +5517,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: TAIL_OFFSET,
         byte_len: 0,
@@ -5371,6 +5583,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -5812,7 +6025,7 @@ async fn a_drained_signer_refused_at_admission_is_unfunded() -> anyhow::Result<(
         cache,
         store_dyn,
         RATE_PER_MB,
-        |deps| deps.pool_view = Some(Arc::clone(&view) as _),
+        |deps| support::set_pool_view(deps, Arc::clone(&view) as _),
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -5920,7 +6133,7 @@ async fn an_unbound_request_reads_no_pool() -> anyhow::Result<()> {
         cache,
         store_dyn,
         RATE_PER_MB,
-        |deps| deps.pool_view = Some(Arc::clone(&view) as _),
+        |deps| support::set_pool_view(deps, Arc::clone(&view) as _),
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -6003,7 +6216,7 @@ async fn a_closing_pool_is_unfunded_to_its_lane_and_not_found_to_anyone_else() -
         cache,
         store_dyn,
         RATE_PER_MB,
-        |deps| deps.pool_view = Some(Arc::new(ClosingPoolView { owner })),
+        |deps| support::set_pool_view(deps, Arc::new(ClosingPoolView { owner })),
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -6094,7 +6307,7 @@ async fn spawn_handler_server_with_pool(
         store,
         RATE_PER_MB,
         |deps| {
-            deps.pool_view = Some(Arc::new(FixedRemainingPoolView { owner, remaining }));
+            support::set_pool_view(deps, Arc::new(FixedRemainingPoolView { owner, remaining }));
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -6258,7 +6471,7 @@ async fn spawn_handler_server_with_pool_view(
         store,
         RATE_PER_MB,
         |deps| {
-            deps.pool_view = Some(view);
+            support::set_pool_view(deps, view);
             deps.pool_recheck_interval = Some(recheck_interval);
             deps.pool_min_remaining_deposit = pool_min_remaining_deposit;
         },
@@ -8187,10 +8400,13 @@ async fn spawn_handler_server_with_deny(
         16,
         |deps| {
             deps.content_deny = deny;
-            deps.pool_view = Some(Arc::new(FixedRemainingPoolView {
-                owner,
-                remaining: U256::MAX,
-            }));
+            support::set_pool_view(
+                deps,
+                Arc::new(FixedRemainingPoolView {
+                    owner,
+                    remaining: U256::MAX,
+                }),
+            );
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -8543,6 +8759,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -8578,6 +8795,7 @@ async fn stream_request_with_skewed_timestamp_resets_without_response() -> anyho
     let request_at = |timestamp_us| StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -8694,6 +8912,7 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
     let request_at = |timestamp_us| StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -8734,6 +8953,7 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
     let request_at = |timestamp_us| StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -8781,6 +9001,7 @@ async fn the_timestamp_gate_precedes_the_stale_chain_refusal() -> anyhow::Result
     let request_at = |timestamp_us| StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -8982,6 +9203,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9053,7 +9275,7 @@ async fn client_capability_signed_by_a_non_owner_registers_no_lane() -> anyhow::
         cache,
         store_dyn,
         RATE_PER_MB,
-        |deps| deps.pool_view = Some(Arc::clone(&view) as _),
+        |deps| support::set_pool_view(deps, Arc::clone(&view) as _),
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -9086,6 +9308,7 @@ async fn client_capability_signed_by_a_non_owner_registers_no_lane() -> anyhow::
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9192,6 +9415,7 @@ async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9232,6 +9456,7 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9295,6 +9520,7 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9455,7 +9681,7 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     // Only the FUNDER goes on the deny-set; the delegate signer stays clean.
-    deny.apply_chain_origin(funder.address(), true);
+    deny.set_chain_origins(std::collections::HashSet::from([funder.address()]));
 
     let err = fetch.await?.err().ok_or_else(|| {
         anyhow::anyhow!(
@@ -9905,7 +10131,10 @@ async fn register_lane_is_idempotent_and_preserves_watermark() -> anyhow::Result
     )?;
 
     // A re-observed registration arrives as a fresh (zero-watermark) lane.
-    handler.register_lane(fresh_lane(client, U256::from(10_000_000u64)))?;
+    handler.register_lane(
+        loopback_deployment(),
+        fresh_lane(client, U256::from(10_000_000u64)),
+    )?;
 
     let after = store
         .get(lane_key(client))?
@@ -10010,6 +10239,7 @@ async fn pull_through_gate_authorizes_only_lane_signer() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: miss_hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10111,6 +10341,7 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
     let req = StreamRequest {
         hash: [0xEDu8; 32], // never cached — a miss that would trigger the pull
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10195,7 +10426,7 @@ async fn spawn_counting_pull_server_with_deny(
         |deps| {
             deps.pull_through = Some(std::time::Duration::from_secs(10));
             deps.content_deny = deny;
-            deps.pool_view = Some(Arc::new(FixedRemainingPoolView { owner, remaining }));
+            support::set_pool_view(deps, Arc::new(FixedRemainingPoolView { owner, remaining }));
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -10264,6 +10495,7 @@ async fn underfunded_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: [0x19u8; 32], // never cached — a miss that would trigger the pull
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10345,6 +10577,7 @@ async fn funded_pool_still_reaches_the_paid_pull() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: [0x1Au8; 32],
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10418,6 +10651,7 @@ async fn spent_out_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
     let req = StreamRequest {
         hash: [0x33u8; 32],
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10467,6 +10701,7 @@ async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> 
     let req = StreamRequest {
         hash: [0xB1u8; 32], // never cached — a miss that would trigger the pull
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10514,6 +10749,7 @@ async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> any
     let req = StreamRequest {
         hash: [0xB2u8; 32], // never cached — a miss that would trigger the pull
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -10629,6 +10865,7 @@ async fn pull_through_fills_under_deadline(
     let req = StreamRequest {
         hash: *want.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -11257,7 +11494,7 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
             deps.warming_credit = Arc::new(
                 decdn_node::warming_allowance::DirectWarmingCreditSink::new(Arc::clone(&warming)),
             );
-            deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(0);
+            support::set_operator_shares(deps, decdn_node::fee_shares::OperatorShares::new(0));
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -11365,7 +11602,7 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
             deps.warming_credit = warming_credit;
-            deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(OP_BPS);
+            support::set_operator_shares(deps, decdn_node::fee_shares::OperatorShares::new(OP_BPS));
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -11996,7 +12233,10 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
     let deposit = U256::from(10_000_000u64);
     let (target, server_eth_addr, server_ep, server_task, metrics, handler) =
         spawn_fault_server_with_handler(cache, store, tiers).await?;
-    handler.register_lane_after_next_resolution(fresh_lane(signer.address(), deposit));
+    handler.register_lane_after_next_resolution(
+        loopback_deployment(),
+        fresh_lane(signer.address(), deposit),
+    );
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
@@ -13667,6 +13907,7 @@ async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -15058,6 +15299,7 @@ async fn a_payer_that_stops_reading_faults_at_the_no_progress_timeout() -> anyho
     let req = StreamRequest {
         hash: *blob.hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,

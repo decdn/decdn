@@ -14,8 +14,8 @@ fn common() -> cli::ClientFetchArgs {
         addr: None,
         relay_url: None,
         provider_address: Some("0x0000000000000000000000000000000000000001".into()),
-        rpc_url: None,
-        payment_pool_address: None,
+        governance: cli::GovernanceChainArgs::default(),
+        payment: cli::PoolSelectArgs::default(),
         slash_judge_address: None,
         capacity_bond_address: None,
         region: None,
@@ -24,7 +24,6 @@ fn common() -> cli::ClientFetchArgs {
         proxy_warming_margin_ms: 30,
         max_sources: 4,
         give_up_after_secs: None,
-        chain_id: None,
         keystore: None,
         keystore_password_file: None,
         data_dir: Some(PathBuf::from("/tmp/d")),
@@ -51,7 +50,7 @@ fn config(body: &str) -> FileConfig {
 fn keystore_password_file_flows_through_and_defaults_to_none() {
     let file = config(
         "[blockchain]\nrpc_url = \"http://config:8545\"\n\
-         payment_pool_address = \"0x3333333333333333333333333333333333333333\"\n\
+         payment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\n\
          slash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
     );
     assert!(
@@ -362,29 +361,95 @@ fn unbound_non_notfound_error_is_untouched() {
 #[test]
 fn flags_override_config() {
     let mut c = common();
-    c.rpc_url = Some("http://flag:8545".into());
-    c.chain_id = Some(99);
+    c.governance.governance_rpc_url = Some("http://gov-flag:8545".into());
+    c.governance.governance_chain_id = Some(99);
     let pp = "0x1111111111111111111111111111111111111111";
-    c.payment_pool_address = Some(pp.into());
+    c.payment.pool = Some(format!("eip155:421614:{pp}"));
+    c.payment.pool_rpc_url = Some("http://flag:8545".into());
     c.slash_judge_address = Some("0x2222222222222222222222222222222222222222".into());
     let file = config(
-        "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
     );
     let r = resolve_chain(&c, &file).unwrap();
-    assert_eq!(r.config.rpc_url, "http://flag:8545");
-    assert_eq!(r.config.chain_id, 99);
-    assert_eq!(r.config.payment_pool, Address::from_str(pp).unwrap());
+    assert_eq!(
+        r.config.payment_pools.len(),
+        1,
+        "--pool pays through one pool"
+    );
+    let pool = r.config.first_pool().unwrap();
+    assert_eq!(pool.rpc_url, "http://flag:8545");
+    assert_eq!(pool.deployment.chain_id, 421_614);
+    assert_eq!(pool.deployment.payment_pool, Address::from_str(pp).unwrap());
+    assert_eq!(r.config.governance.chain_id, 99);
+    assert_eq!(r.config.governance.rpc_url, "http://gov-flag:8545");
+}
+
+/// The registry and the signature domains live on the governance chain, so a
+/// fetch needs its RPC: a payment chain's endpoint never stands in for it.
+#[test]
+fn the_governance_rpc_is_required() {
+    let file = config(
+        "[blockchain]\npayment_chains = [{ rpc_url = \"http://pay:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+    );
+    let err = resolve_chain(&common(), &file).expect_err("no governance rpc");
+    assert!(err.to_string().contains("--governance-rpc-url"), "{err}");
+    let mut c = common();
+    c.governance.governance_rpc_url = Some("http://gov:8545".into());
+    assert_eq!(
+        resolve_chain(&c, &file).unwrap().config.governance.rpc_url,
+        "http://gov:8545"
+    );
+}
+
+/// The governance chain and each payment chain keep their own RPC endpoint
+/// and chain id: registry reads and slash and bind domains use the
+/// governance chain, vouchers each pool's payment chain.
+#[test]
+fn governance_and_payment_chains_stay_apart() {
+    let file = config(
+        "[blockchain]\nrpc_url = \"http://gov:8545\"\nchain_id = 11155111\n\
+         slash_judge_address = \"0x4444444444444444444444444444444444444444\"\n\
+         capacity_bond_address = \"0x5555555555555555555555555555555555555555\"\n\
+         [[blockchain.payment_chains]]\nrpc_url = \"http://arb:8545\"\nchain_id = 421614\n\
+         payment_pools = [\"0x3333333333333333333333333333333333333333\", \
+         \"0x6666666666666666666666666666666666666666\"]\n\
+         [[blockchain.payment_chains]]\nrpc_url = \"http://base:8545\"\nchain_id = 84532\n\
+         payment_pools = [\"0x7777777777777777777777777777777777777777\"]\n",
+    );
+    let r = resolve_chain(&common(), &file).unwrap();
+    assert_eq!(r.config.governance.rpc_url, "http://gov:8545");
+    assert_eq!(r.config.governance.chain_id, 11_155_111);
+    let pools: Vec<_> = r
+        .config
+        .payment_pools
+        .iter()
+        .map(|p| {
+            (
+                p.rpc_url.as_str(),
+                p.deployment.chain_id,
+                p.deployment.payment_pool,
+            )
+        })
+        .collect();
+    assert_eq!(
+        pools,
+        vec![
+            ("http://arb:8545", 421_614, Address::repeat_byte(0x33)),
+            ("http://arb:8545", 421_614, Address::repeat_byte(0x66)),
+            ("http://base:8545", 84_532, Address::repeat_byte(0x77)),
+        ]
+    );
 }
 
 #[test]
 fn config_fills_unset_flags_and_defaults() {
     let file = config(
-        "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_working_deposit_micro_usdc = 5000000\n",
+        "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_working_deposit_micro_usdc = 5000000\n",
     );
     let r = resolve_chain(&common(), &file).unwrap();
-    assert_eq!(r.config.rpc_url, "http://config:8545");
+    assert_eq!(r.config.first_pool().unwrap().rpc_url, "http://config:8545");
     // chain_id absent everywhere → default.
-    assert_eq!(r.config.chain_id, DEFAULT_CHAIN_ID);
+    assert_eq!(r.config.governance.chain_id, DEFAULT_CHAIN_ID);
     assert_eq!(r.working_deposit, U256::from(5_000_000u64));
     // keystore defaults under the data dir.
     assert_eq!(
@@ -402,7 +467,7 @@ fn config_fills_unset_flags_and_defaults() {
 /// and surface as an opaque `openPool` `ZeroAmount` revert.
 #[test]
 fn resolve_chain_rejects_deposits_the_daemon_resolver_would_reject() {
-    let base = "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n";
+    let base = "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n";
 
     // A zero working deposit can never open a pool.
     let err = resolve_chain(
@@ -578,7 +643,7 @@ fn a_self_owned_pool_no_voucher_fits_names_the_top_up_command() {
     let hinted = format!("{:#}", with_top_up_hint(err, Some(pool)));
     assert!(
         hinted.contains(&format!(
-            "decdn pool top-up --pool {pool} --amount-micro-usdc"
+            "decdn pool top-up --pool-id {pool} --amount-micro-usdc"
         )),
         "{hinted}"
     );

@@ -509,6 +509,7 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
         let req = StreamRequest {
             hash: *hash.as_bytes(),
             namespace_id: decdn_protocol::client::NO_NAMESPACE,
+            payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
             pool_id: pool_id.into(),
             byte_offset: 0,
             byte_len: 0,

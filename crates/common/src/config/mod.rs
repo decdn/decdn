@@ -22,9 +22,9 @@ pub use errors::{ConfigDiagnostics, ConfigNotice, ConfigNoticeLevel};
 pub use resolved::{
     LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
     ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
-    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe,
-    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedServe,
-    ResolvedServeEconomics, ResolvedTinyLfu,
+    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPaymentChain,
+    ResolvedProbe, ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedServe, ResolvedServeEconomics, ResolvedTinyLfu,
 };
 pub use types::FileConfig;
 
@@ -79,29 +79,19 @@ const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 /// the watchdog probing the RPC endpoint frequently enough to risk
 /// tripping provider rate limits or exhausting paid quotas.
 const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
-/// Default chain-event poll interval (milliseconds). One knob, two unrelated
-/// consumers (see `ResolvedBlockchain::event_poll_interval_ms`): the
-/// `eth_getLogs` watcher tick cadence, and alloy's pending-transaction receipt
-/// heartbeat. 7000 ms matches alloy's non-local default, so live-RPC load is
-/// unchanged from before #1011; it also overrides alloy's 250 ms localhost
-/// default, which the receipt heartbeat would otherwise use against a dev anvil.
-const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
-/// Minimum chain-event poll interval. The node polls chain events with
-/// `eth_getLogs` and issues no `eth_getFilterChanges` anywhere. At 250 ms the node's
-/// ~6 watcher loops would each scan `[cursor, head]` four times a second against
-/// one endpoint, tripping provider rate limits and burning paid quota just as the
-/// original flood did. The same floor bounds the receipt-heartbeat consumer.
-/// 250 ms is kept as the floor because it is alloy's own localhost cadence: a dev
-/// anvil can still be driven at the fastest interval alloy itself considers sane.
-const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
-/// Default ceiling on the block span of one chain-watcher `eth_getLogs`
-/// request. A node that resumes far behind head scans the gap in windows of at
-/// most this many blocks, because one unbounded request would exceed the range
-/// and result caps that RPC providers enforce. 10 000 clears the common
-/// paid-tier range caps. It bounds the block span, not the result count, so a
-/// dense window can still trip a result cap. A provider with a lower cap (free
-/// tiers go down to 10 blocks) or a result cap rejects the request, and the
-/// poller then halves its window until the provider accepts it.
+/// Default pending-transaction receipt poll interval (milliseconds): alloy's
+/// receipt heartbeat while the node awaits a mined transaction (see
+/// `ResolvedBlockchain::receipt_poll_interval_ms`). 7000 ms matches alloy's
+/// non-local default; it also overrides alloy's 250 ms localhost default, which
+/// the heartbeat would otherwise use against a dev anvil.
+const DEFAULT_RECEIPT_POLL_INTERVAL_MS: u64 = 7000;
+/// Minimum receipt poll interval: alloy's own localhost cadence, so a dev anvil
+/// can still be driven at the fastest interval alloy itself considers sane.
+const MIN_RECEIPT_POLL_INTERVAL_MS: u64 = 250;
+/// Default ceiling on the block span of one `eth_getLogs` request of the CLI's
+/// chain scans (`decdn receipt settle`, `decdn node earnings --address`). 10 000
+/// clears the common paid-tier range caps; a scan halves its window when the
+/// provider rejects a range.
 pub const DEFAULT_GET_LOGS_MAX_BLOCK_SPAN: u64 = 10_000;
 
 /// Default accrued-claim redemption threshold: 0.05 USDC (`50_000` `µUSDC`).
@@ -268,7 +258,7 @@ pub const DEFAULT_RELAY_FOREIGN_NAMESPACES: bool = true;
 
 /// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
 /// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
-/// origin-set staleness (there is no event tail); 5 min matches the negative
+/// origin-set staleness; 5 min matches the negative
 /// probe cache order of magnitude.
 pub const DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC: u64 = 300;
 /// Negative-hit TTL: how long "this namespace has no origins / does not
@@ -372,9 +362,9 @@ pub const DEFAULT_SERVE_ECONOMICS_WARMING_REFILL: u64 = 58;
 /// `appendix-poc-production-seams.md` §Seam 8).
 pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 
-/// Default seconds between the blacklist watcher's periodic re-enumeration +
-/// re-scope pass (ADR 011 § Node Behavior's 10-minute cadence).
-pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
+/// Default and largest seconds between two blacklist ledger polls (ADR 011
+/// § Following the mutation ledger: at most 5 minutes).
+pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 300;
 
 /// Default seconds the node may go without a successful chain read before the
 /// serve and probe paths refuse (ADR 011 § Serving while chain-stale). Thirty
@@ -382,12 +372,6 @@ pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
 /// stops serving well before an outage-hidden takedown could cross into
 /// slashable territory, while short RPC blips never take the node dark.
 pub const DEFAULT_CHAIN_STALENESS_GRACE_SEC: u64 = 1800;
-
-/// Default seconds between authoritative `FeeRouter.getShares()` re-reads by
-/// the fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics) — the
-/// safety-net cadence alongside the `SharesUpdated` event subscription. One
-/// hour.
-pub const DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC: u64 = 3600;
 
 /// Default maximum concurrently held (eviction-exempt) blobs for the
 /// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
@@ -507,8 +491,8 @@ pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
 ///
 /// Returns an error if:
 /// - The config file exists but cannot be read or parsed.
-/// - A required field (`rpc_url`, `payment_pool_address`,
-///   `capacity_bond_address`) is not provided by any source.
+/// - A required field (`rpc_url`, `capacity_bond_address`, a
+///   `[[blockchain.payment_chains]]` entry) is not provided by any source.
 /// - The home directory cannot be determined for default paths.
 pub fn resolve_config(
     config_path: Option<&Path>,
@@ -1129,14 +1113,156 @@ fn resolve_contract_address(
     }
 }
 
-/// Resolve blockchain fields.
+/// Resolve an RPC endpoint URL: record `missing_msg` when absent, a parse or
+/// scheme problem when malformed, and return the normalized form (lowercase
+/// scheme, trailing slash; userinfo kept, since some providers authenticate
+/// with it), or an empty placeholder on failure so resolution keeps
+/// accumulating.
+fn resolve_rpc_url(
+    field: &str,
+    missing_msg: &str,
+    raw: Option<String>,
+    bag: &mut ConfigDiagnostics,
+) -> String {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        bag.push(field, missing_msg);
+        // Placeholder; skip the URL parse + scheme checks — a synthesized
+        // URL would only emit a misleading second error.
+        return String::new();
+    };
+    let Some(parsed) = bag.try_with(
+        field,
+        url::Url::parse(&raw).with_context(|| format!("{field} is not a valid URL")),
+    ) else {
+        return String::new();
+    };
+    if bag.check_with(
+        parsed.scheme() == "http" || parsed.scheme() == "https",
+        field,
+        || {
+            format!(
+                "{field} must use http or https scheme (got {:?})",
+                parsed.scheme()
+            )
+        },
+    ) {
+        parsed.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Resolve the `[[blockchain.payment_chains]]` entries. At least one entry;
+/// each names an http(s) `rpc_url`, a nonzero `chain_id` no other entry
+/// names, and at least one nonzero, checksummed `PaymentPool` address no
+/// other entry or position names. Problems record under
+/// `blockchain.payment_chains[i].<field>`.
+fn resolve_payment_chains(
+    entries: &[types::PaymentChainConfig],
+    bag: &mut ConfigDiagnostics,
+) -> Vec<ResolvedPaymentChain> {
+    if entries.is_empty() {
+        bag.push(
+            "blockchain.payment_chains",
+            "missing required option: at least one [[blockchain.payment_chains]] entry \
+             (rpc_url, chain_id, payment_pools)",
+        );
+        return Vec::new();
+    }
+    let mut seen_chains = std::collections::BTreeSet::new();
+    let mut seen_pools = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let rpc_field = format!("blockchain.payment_chains[{i}].rpc_url");
+        let chain_field = format!("blockchain.payment_chains[{i}].chain_id");
+        let pools_field = format!("blockchain.payment_chains[{i}].payment_pools");
+        let rpc_url = resolve_rpc_url(
+            &rpc_field,
+            &format!("missing required option: {rpc_field}"),
+            entry.rpc_url.clone(),
+            bag,
+        );
+        let chain_id = entry.chain_id.unwrap_or(0);
+        if bag.check_with(entry.chain_id.is_some(), chain_field.as_str(), || {
+            format!("missing required option: {chain_field}")
+        }) {
+            bag.check_with(chain_id != 0, chain_field.as_str(), || {
+                format!("{chain_field} must not be 0")
+            });
+            bag.check_with(seen_chains.insert(chain_id), chain_field.as_str(), || {
+                format!(
+                    "{chain_field} repeats chain {chain_id}; list each payment chain once and \
+                     every pool on it under its payment_pools"
+                )
+            });
+        }
+        bag.check_with(
+            !entry.payment_pools.is_empty(),
+            pools_field.as_str(),
+            || format!("{pools_field} is empty; name at least one PaymentPool address"),
+        );
+        let mut payment_pools = Vec::with_capacity(entry.payment_pools.len());
+        for raw in &entry.payment_pools {
+            let Some(checksummed) = bag.try_with(
+                pools_field.as_str(),
+                parse_contract_address("payment_pools", raw),
+            ) else {
+                continue;
+            };
+            let Ok(address) = checksummed.parse::<Address>() else {
+                continue;
+            };
+            if !bag.check_with(!address.is_zero(), pools_field.as_str(), || {
+                format!(
+                    "{pools_field} names the zero address: set it to a deployed PaymentPool \
+                     contract"
+                )
+            }) {
+                continue;
+            }
+            if bag.check_with(
+                seen_pools.insert((chain_id, address)),
+                pools_field.as_str(),
+                || format!("{pools_field} lists pool {checksummed} twice"),
+            ) {
+                payment_pools.push(address);
+            }
+        }
+        out.push(ResolvedPaymentChain {
+            rpc_url,
+            chain_id,
+            payment_pools,
+        });
+    }
+    out
+}
+
+/// Resolve blockchain fields exactly as written.
+#[cfg(test)]
+fn resolve_blockchain_as_written(
+    cli: &crate::cli::run::BlockchainArgs,
+    file: Option<&types::BlockchainConfig>,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<ResolvedBlockchain> {
+    one_section(|bag| resolve_blockchain_into(cli, file, data_dir, true, bag))
+}
+
+/// Resolve blockchain fields for a test of the governance fields: a `file`
+/// that names no payment chain (or no file) gets one valid
+/// `tests::test_payment_chain()` entry, so the test needs to spell out only
+/// what it exercises. A test of the payment chains themselves calls
+/// [`resolve_blockchain_as_written`].
 #[cfg(test)]
 fn resolve_blockchain(
     cli: &crate::cli::run::BlockchainArgs,
     file: Option<&types::BlockchainConfig>,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<ResolvedBlockchain> {
-    one_section(|bag| resolve_blockchain_into(cli, file, data_dir, true, bag))
+    let mut filled = file.cloned().unwrap_or_default();
+    if filled.payment_chains.is_empty() {
+        filled.payment_chains = vec![tests::test_payment_chain()];
+    }
+    resolve_blockchain_as_written(cli, Some(&filled), data_dir)
 }
 
 // Linear field-by-field resolution (rpc_url, keystore, three contract
@@ -1150,50 +1276,14 @@ fn resolve_blockchain_into(
     data_dir_valid: bool,
     bag: &mut ConfigDiagnostics,
 ) -> ResolvedBlockchain {
-    let rpc_url = match cli
-        .rpc_url
-        .clone()
-        .or_else(|| file.and_then(|b| b.rpc_url.clone()))
-        .filter(|s| !s.is_empty())
-    {
-        None => {
-            bag.push(
-                "blockchain.rpc_url",
-                "missing required option: --rpc-url (or blockchain.rpc_url in config file)",
-            );
-            // Placeholder; skip the URL parse + scheme checks below — a
-            // synthesized URL would only emit a misleading second error.
-            String::new()
-        }
-        Some(raw) => {
-            match bag.try_with(
-                "blockchain.rpc_url",
-                url::Url::parse(&raw).context("blockchain.rpc_url is not a valid URL"),
-            ) {
-                None => String::new(),
-                Some(parsed) => {
-                    if bag.check_with(
-                        parsed.scheme() == "http" || parsed.scheme() == "https",
-                        "blockchain.rpc_url",
-                        || {
-                            format!(
-                                "blockchain.rpc_url must use http or https scheme (got {:?})",
-                                parsed.scheme()
-                            )
-                        },
-                    ) {
-                        // Store the normalized form (lowercase scheme,
-                        // trailing slash, etc.). Userinfo (basic auth) is
-                        // preserved by `url::Url::to_string` and we depend
-                        // on that for RPC providers that require it.
-                        parsed.to_string()
-                    } else {
-                        String::new()
-                    }
-                }
-            }
-        }
-    };
+    let rpc_url = resolve_rpc_url(
+        "blockchain.rpc_url",
+        "missing required option: --rpc-url (or blockchain.rpc_url in config file)",
+        cli.rpc_url
+            .clone()
+            .or_else(|| file.and_then(|b| b.rpc_url.clone())),
+        bag,
+    );
 
     let keystore_from_cli_or_file =
         cli.eth_keystore.is_some() || file.and_then(|b| b.eth_keystore.as_ref()).is_some();
@@ -1220,16 +1310,41 @@ fn resolve_blockchain_into(
         );
     }
 
-    let payment_pool_address = resolve_contract_address(
-        "blockchain.payment_pool_address",
-        "payment_pool_address",
-        "missing required option: --payment-pool-address \
-         (or blockchain.payment_pool_address in config file)",
-        cli.payment_pool_address
-            .clone()
-            .or_else(|| file.and_then(|b| b.payment_pool_address.clone())),
-        bag,
-    );
+    let payment_chains = resolve_payment_chains(file.map_or(&[], |b| &b.payment_chains), bag);
+
+    // Optional: only the CLI's sweep-receipt command reads it. Present-but-zero
+    // is rejected like every other contract address.
+    let cctp_sweep_receiver_address = file
+        .and_then(|b| b.cctp_sweep_receiver_address.clone())
+        .filter(|s| !s.is_empty())
+        .and_then(|v| {
+            bag.try_with(
+                "blockchain.cctp_sweep_receiver_address",
+                parse_contract_address("cctp_sweep_receiver_address", &v),
+            )
+        });
+    if let Some(addr) = cctp_sweep_receiver_address.as_deref() {
+        bag.check(
+            addr.trim_start_matches("0x").bytes().any(|b| b != b'0'),
+            "blockchain.cctp_sweep_receiver_address",
+            "blockchain.cctp_sweep_receiver_address must not be the zero address — \
+             set it to the deployed CctpSweepReceiver contract",
+        );
+    }
+
+    // Optional, CLI-only like the receiver address; checked here so `decdn
+    // config validate` reports a malformed value.
+    if let Some(iris) = file
+        .and_then(|b| b.cctp_iris_url.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        bag.check(
+            url::Url::parse(iris).is_ok_and(|u| matches!(u.scheme(), "http" | "https")),
+            "blockchain.cctp_iris_url",
+            "blockchain.cctp_iris_url must be an http(s) URL, such as \
+             https://iris-api.circle.com",
+        );
+    }
 
     let capacity_bond_address = resolve_contract_address(
         "blockchain.capacity_bond_address",
@@ -1243,23 +1358,12 @@ fn resolve_blockchain_into(
     );
 
     // The all-zero address checksum-validates cleanly but is never a real
-    // deployment; settling/staking against a codeless address surfaces only as
-    // an opaque on-chain revert. Reject it here — mirroring `slash_judge_address`
+    // deployment; staking against a codeless address surfaces only as an
+    // opaque on-chain revert. Reject it here — mirroring `slash_judge_address`
     // and `content_blacklist_address` below — so `decdn config check` catches it
     // and the daemon's runtime guard (#1219) is uniform defense-in-depth rather
     // than the sole check. Skipped when the value is an empty placeholder: the
     // missing/parse problem is already recorded.
-    if !payment_pool_address.is_empty() {
-        bag.check(
-            payment_pool_address
-                .trim_start_matches("0x")
-                .bytes()
-                .any(|b| b != b'0'),
-            "blockchain.payment_pool_address",
-            "blockchain.payment_pool_address must not be the zero address — \
-             set it to the deployed PaymentPool contract",
-        );
-    }
     if !capacity_bond_address.is_empty() {
         bag.check(
             capacity_bond_address
@@ -1389,15 +1493,16 @@ fn resolve_blockchain_into(
     let content_blacklist_poll_interval_sec = file
         .and_then(|b| b.content_blacklist_poll_interval_sec)
         .unwrap_or(DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC);
-    // `0` is not a "disable" sentinel — disabling the periodic re-scope would
-    // break the retain/re-scope compliance guarantee — and it panics
-    // `tokio::time::interval_at` ("period must be non-zero"), which would kill
-    // the watcher task and silently stop enforcement. Reject it up front.
+    // `0` is not a "disable" sentinel — the ledger poll is the compliance path.
+    // ADR 011 bounds the interval at 5 minutes, inside the 1-hour
+    // compliance-window floor and the chain-staleness grace.
     bag.check(
-        content_blacklist_poll_interval_sec != 0,
+        (1..=DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC)
+            .contains(&content_blacklist_poll_interval_sec),
         "blockchain.content_blacklist_poll_interval_sec",
-        "blockchain.content_blacklist_poll_interval_sec must not be 0 — the \
-         reconcile interval must be non-zero; omit it for the default (600s)",
+        "blockchain.content_blacklist_poll_interval_sec must be between 1 and 300 \
+         seconds — the ledger poll follows every takedown; omit it for the default \
+         (300s)",
     );
 
     let chain_staleness_grace_sec = file
@@ -1412,21 +1517,6 @@ fn resolve_blockchain_into(
         "blockchain.chain_staleness_grace_sec must not be 0 — a zero grace \
          refuses every serve; set a large value to opt out, or omit it for the \
          default (1800s)",
-    );
-
-    let fee_shares_poll_interval_sec = file
-        .and_then(|b| b.fee_shares_poll_interval_sec)
-        .unwrap_or(DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC);
-    // `0` would make the authoritative re-read run every tick (no throttle),
-    // hammering the RPC — the `SharesUpdated` event subscription is already the
-    // prompt path, so the re-read is a slow safety net. Reject rather than
-    // silently over-poll.
-    bag.check(
-        fee_shares_poll_interval_sec != 0,
-        "blockchain.fee_shares_poll_interval_sec",
-        "blockchain.fee_shares_poll_interval_sec must not be 0 — the \
-         authoritative getShares() re-read is a slow safety net; omit it \
-         for the default (3600s)",
     );
 
     let origin_directory_positive_ttl_sec = file
@@ -1475,32 +1565,18 @@ fn resolve_blockchain_into(
         },
     );
 
-    let event_poll_interval_ms = file
-        .and_then(|b| b.event_poll_interval_ms)
-        .unwrap_or(DEFAULT_EVENT_POLL_INTERVAL_MS);
+    let receipt_poll_interval_ms = file
+        .and_then(|b| b.receipt_poll_interval_ms)
+        .unwrap_or(DEFAULT_RECEIPT_POLL_INTERVAL_MS);
     bag.check_with(
-        event_poll_interval_ms >= MIN_EVENT_POLL_INTERVAL_MS,
-        "blockchain.event_poll_interval_ms",
+        receipt_poll_interval_ms >= MIN_RECEIPT_POLL_INTERVAL_MS,
+        "blockchain.receipt_poll_interval_ms",
         || {
             format!(
-                "blockchain.event_poll_interval_ms={event_poll_interval_ms} would poll the \
-                 RPC endpoint too frequently — it drives both the eth_getLogs watcher \
-                 tick and pending-tx receipt polling \
-                 (minimum {MIN_EVENT_POLL_INTERVAL_MS}ms)"
+                "blockchain.receipt_poll_interval_ms={receipt_poll_interval_ms} would poll the \
+                 RPC endpoint for receipts too frequently \
+                 (minimum {MIN_RECEIPT_POLL_INTERVAL_MS}ms)"
             )
-        },
-    );
-
-    let get_logs_max_block_span = file
-        .and_then(|b| b.get_logs_max_block_span)
-        .unwrap_or(DEFAULT_GET_LOGS_MAX_BLOCK_SPAN);
-    bag.check_with(
-        get_logs_max_block_span > 0,
-        "blockchain.get_logs_max_block_span",
-        || {
-            "blockchain.get_logs_max_block_span=0 would scan no blocks; use at least 1 \
-             (the provider's eth_getLogs range limit)"
-                .to_owned()
         },
     );
 
@@ -1606,7 +1682,8 @@ fn resolve_blockchain_into(
         rpc_url,
         eth_keystore,
         keystore_password_file,
-        payment_pool_address,
+        payment_chains,
+        cctp_sweep_receiver_address,
         capacity_bond_address,
         origin_assignment_address,
         origin_directory_positive_ttl_sec,
@@ -1619,9 +1696,7 @@ fn resolve_blockchain_into(
         chain_staleness_grace_sec,
         chain_id,
         rpc_watchdog_interval_sec,
-        event_poll_interval_ms,
-        get_logs_max_block_span,
-        fee_shares_poll_interval_sec,
+        receipt_poll_interval_ms,
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
         redeem_interval_secs,
@@ -3413,10 +3488,23 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     if let Some(b) = cfg.blockchain.as_mut() {
         expand_str(&mut b.rpc_url, "blockchain.rpc_url")?;
         expand_path(&mut b.eth_keystore, "blockchain.eth_keystore")?;
+        for (idx, chain) in b.payment_chains.iter_mut().enumerate() {
+            expand_str(
+                &mut chain.rpc_url,
+                &format!("blockchain.payment_chains[{idx}].rpc_url"),
+            )?;
+            for (pos, pool) in chain.payment_pools.iter_mut().enumerate() {
+                *pool = expand_value(
+                    pool,
+                    &format!("blockchain.payment_chains[{idx}].payment_pools[{pos}]"),
+                )?;
+            }
+        }
         expand_str(
-            &mut b.payment_pool_address,
-            "blockchain.payment_pool_address",
+            &mut b.cctp_sweep_receiver_address,
+            "blockchain.cctp_sweep_receiver_address",
         )?;
+        expand_str(&mut b.cctp_iris_url, "blockchain.cctp_iris_url")?;
         expand_str(
             &mut b.capacity_bond_address,
             "blockchain.capacity_bond_address",

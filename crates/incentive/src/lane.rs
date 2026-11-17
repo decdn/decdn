@@ -104,7 +104,8 @@ pub struct LaneState {
     /// not replay-critical, so it is `pub` rather than a private `last_*` field.
     pub owner_sig: Option<[u8; 65]>,
     /// The lane's paid cumulative: the on-chain `newPaidCumulative` of the most
-    /// recent `PoolRedeemed` this node observed for it (`U256::ZERO` until the
+    /// recent `PoolRedeemed` this node decoded from its own receipts, or the
+    /// `getWatermarks` value its pre-redeem read found (`U256::ZERO` until the
     /// first redemption lands). The seller redeemer subtracts it from
     /// [`Self::owed`] to get the unredeemed value it still has to cash, so a lane
     /// already redeemed to its owed amount drops out of the plan instead of being
@@ -113,10 +114,9 @@ pub struct LaneState {
     ///
     /// Kept ON the lane record — not a side table or a volatile cache — so it is
     /// written in the same durable transaction as the voucher frontier it settles
-    /// against and survives a restart: without it a rebooted node forgets every
-    /// redemption behind its log-poller cursor and re-batches those lanes forever.
-    /// Set by the trusted node-side watcher (`PoolRedeemed`) and the on-disk
-    /// decoder, like `owner_sig`/`registered_until`; not replay-critical (it gates
+    /// against and survives a restart: without it a rebooted node forgets its
+    /// redemptions and re-batches those lanes. Set by the node's redeemer (its
+    /// receipts and its `getWatermarks` read) and the on-disk decoder, like `owner_sig`/`registered_until`; not replay-critical (it gates
     /// redemption planning, not voucher acceptance), so it is `pub` rather than a
     /// private `last_*` field.
     pub paid_cumulative: U256,
@@ -273,7 +273,7 @@ impl LaneState {
     /// `expiry`; the trusted on-disk decoder (`StoredLaneState::into_state`)
     /// assigns the persisted values on the returned `Self` after construction, the
     /// seller intake path sets `owner_sig` on the lane it registers, and the
-    /// `PoolRedeemed` watcher advances `paid_cumulative`.
+    /// seller redeemer advances `paid_cumulative`.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn hydrate(

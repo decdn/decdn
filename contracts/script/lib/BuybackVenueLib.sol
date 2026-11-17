@@ -54,11 +54,12 @@ library BuybackVenueLib {
     ///         fail-fast — see `_requireLiveGuardBand`.
     error GuardBandDead();
 
-    // Steady-state FeeRouter split once buyback is live (ADR 026 § FeeRouter
-    // split, ADR 016 § Deployment Order): 60% operator / 30% buyback / 10% treasury.
-    uint256 internal constant STEADY_OPERATOR_SHARE = 6000;
-    uint256 internal constant STEADY_BUYBACK_SHARE = 3000;
-    uint256 internal constant STEADY_TREASURY_SHARE = 1000;
+    // Steady-state FeeRouter split once buyback is live (ADR 016 § Tunable
+    // Economics example): with the reference `operatorBps` of 6000 on each
+    // payment chain, no rebate and a 75% buyback of the protocol share give the
+    // operator 60%, the buyback 30% and the treasury 10% of each redemption.
+    uint256 internal constant STEADY_REBATE_BPS = 0;
+    uint256 internal constant STEADY_BUYBACK_BPS = 7500;
 
     // The shared MEV-defense guard band is NOT redeclared here. It is
     // `GuardedBuybackBurner.GuardParams` (ADR 018 § Parameter Table) — venue-
@@ -70,10 +71,9 @@ library BuybackVenueLib {
     // The cost of the copy is the extra hop to update and the extra name, which is
     // reason enough not to have one.
 
-    /// @notice The steady-state `FeeRouter` share vector, in the operator /
-    ///         buyback / treasury bucket order `setSharesAndDestinations` expects.
-    function steadyShares() internal pure returns (uint256[3] memory) {
-        return [STEADY_OPERATOR_SHARE, STEADY_BUYBACK_SHARE, STEADY_TREASURY_SHARE];
+    /// @notice The steady-state `FeeRouter.setSplit(rebateBps, buybackBps)`.
+    function steadySplit() internal pure returns (uint256 rebateBps, uint256 buybackBps) {
+        return (STEADY_REBATE_BPS, STEADY_BUYBACK_BPS);
     }
 
     /// @notice Reject an incomplete Uniswap wiring or a dead guard band, before any

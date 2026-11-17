@@ -13,7 +13,7 @@ use super::voucher::StreamAnchor;
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, Connection, Hash,
-    LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream,
+    LaneDeliveryState, LaneId, Mutex, RecvStream, SendStream,
 };
 use crate::metrics::FirstByteClock;
 
@@ -198,7 +198,7 @@ impl ClientHandler {
         byte_offset: u64,
         byte_len: u64,
         total_bytes: u64,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         client_node_id: B256,
         rate_per_mb: u64,
@@ -246,7 +246,7 @@ impl ClientHandler {
         byte_offset: u64,
         byte_len: u64,
         total_bytes: u64,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         client_node_id: B256,
         rate_per_mb: u64,
@@ -404,7 +404,7 @@ impl ClientHandler {
         // ADR 041: credit the realized operator margin back to the source that
         // speculatively warmed this blob (a no-op for an untagged / non-speculative
         // hash), on the same clean-completion edge as the ADR 040 hit sighting.
-        self.credit_warming_serve(hash, delivered);
+        self.credit_warming_serve(lane_key.deployment, hash, delivered);
         Ok(ServeEnd::Completed { bytes: delivered })
     }
 }

@@ -1,24 +1,20 @@
-//! Cross-layer proof that the deployment preflight aborts bring-up **before the
-//! seller lane store is touched**.
+//! Cross-layer proof that the deployment preflight stops bring-up on a
+//! configured `PaymentPool` address that is not a `PaymentPool`.
 //!
-//! The lane store binds to the configured `PaymentPool` deployment when it
-//! opens. On a stamp mismatch it drops the seller lane state, the pending
-//! settles and the watcher checkpoints, and the unredeemed vouchers in them are
-//! lost. A typo'd `blockchain.payment_pool_address` must therefore fail the
-//! preflight and stop the daemon while the store is still bound to the real
-//! deployment. Unit tests cover each preflight verdict against a mocked
-//! provider. Only a real daemon shows the call order: a preflight that ran
-//! after the store open would still exit nonzero, but only after the drop.
+//! A typo'd entry of `blockchain.payment_chains` `payment_pools` would leave
+//! the node serving a pool it can never redeem against, so the preflight fails
+//! the boot with a terminal verdict. Unit tests cover each preflight verdict
+//! against a mocked provider; this journey runs them against a real daemon
+//! and real contracts.
 //!
 //! The journey seeds a seller lane, then repoints the node at a codeless
-//! address, at every other contract the deploy manifest lists, and at the
-//! settlement USDC. Each boot exits nonzero with the matching verdict, and no
-//! boot logs a lane drop. The sweep
-//! also pins that the identity probe tells `PaymentPool` apart from every
-//! sibling, including those that share one of its views: the `FeeRouter`
-//! answers `usdc()` and the `DecdnGovernor` answers `feeRouter()`. With the
-//! config reverted, the node boots on the original deployment and the same
-//! pool session pays for and redeems another blob.
+//! address, at every other contract the deploy manifests list, and at the
+//! settlement USDC. Each boot exits nonzero with the matching verdict. The
+//! sweep also pins that the identity probe
+//! (`operatorBps()` and `sweepDomain()`) tells `PaymentPool` apart from every
+//! sibling, the `FeeRouter` and the `CctpSweepReceiver` the pool's sweeps reach
+//! included. With the config reverted, the node boots on the original
+//! deployment and the same pool session pays for and redeems another blob.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a built `decdn-node` binary:
@@ -46,7 +42,7 @@ use anyhow::Context;
 use decdn_e2e::assert as e2e_assert;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
-use decdn_e2e::node::{FOREIGN_LANE_DROPPED, FOREIGN_LANES_DROPPED, NodeFixture};
+use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
 
 const MIB: usize = 1024 * 1024;
@@ -66,7 +62,8 @@ const PREFLIGHT_EXIT: Duration = Duration::from_secs(90);
 const REDEEM: Duration = Duration::from_secs(90);
 
 #[tokio::test(flavor = "multi_thread")]
-async fn deployment_preflight_aborts_before_the_lane_store_opens() -> anyhow::Result<()> {
+async fn deployment_preflight_refuses_a_contract_that_is_not_a_payment_pool() -> anyhow::Result<()>
+{
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
         .context("deployment-preflight e2e exceeded the overall timeout")??;
@@ -130,11 +127,11 @@ async fn run() -> anyhow::Result<()> {
     node.log_line(&["has no code on chain"])
         .context("the codeless boot never logged the no-code verdict")?;
 
-    // ---- Every other contract in the deploy manifest, read from the manifest
-    // itself so a new contract joins the sweep without an edit here, plus the
-    // settlement USDC. Each has code but does not answer
-    // `PaymentPool.getRateBounds()`, so the preflight aborts on the identity
-    // probe without retrying it. A zero entry is a contract the deploy left
+    // ---- Every other contract in the deploy manifests, read from the
+    // manifests themselves so a new contract joins the sweep without an edit
+    // here, plus the settlement USDC. Each has code but does not answer
+    // `PaymentPool.operatorBps()` and `sweepDomain()`, so the preflight aborts
+    // on the identity probe without retrying it. A zero entry is a contract the deploy left
     // undeployed (the dormant `BuybackBurner`): there is no code to probe, and
     // config validation rejects a zero address before the preflight runs.
     // `payment_pool_probe_selector` covers such a contract by its selectors.
@@ -145,9 +142,9 @@ async fn run() -> anyhow::Result<()> {
         .cloned()
         .collect();
     siblings.push(("USDC".to_string(), chain.usdc()));
-    // The siblings that share a `PaymentPool` view are the cases a weaker probe
-    // lets through; a renamed manifest key must not drop them silently.
-    for must_cover in ["FeeRouter", "DecdnGovernor"] {
+    // The settlement contracts nearest the pool are the likeliest typo; a
+    // renamed manifest key must not drop them from the sweep silently.
+    for must_cover in ["FeeRouter", "CctpSweepReceiver"] {
         anyhow::ensure!(
             siblings.iter().any(|(name, _)| name == must_cover),
             "the deploy manifest lists no {must_cover}; the sweep would not cover it: \
@@ -165,20 +162,16 @@ async fn run() -> anyhow::Result<()> {
             "a boot against the {name} as a PaymentPool must exit nonzero (got {status})"
         );
         // The address in the needle ties the verdict to this boot.
-        let verdict = format!("{sibling} does not answer PaymentPool.getRateBounds()");
+        let verdict =
+            format!("{sibling} does not answer PaymentPool.operatorBps() and sweepDomain()");
         node.log_line(&[&verdict, "not retried"]).with_context(|| {
-            format!("the {name} boot never logged the unretried getRateBounds() verdict")
+            format!("the {name} boot never logged the unretried identity-probe verdict")
         })?;
     }
 
-    // ---- No bad boot opened the lane store, so none dropped a lane.
-    assert_no_lane_dropped(&node, "a boot that failed the deployment preflight")?;
-
     // ---- Revert the config. The node boots on the original deployment, and the
     // same pool session pays for blob B and redeems past its earlier
-    // watermark. A dropped lane would pass this too, because the buyer's
-    // cumulative voucher re-creates it: the drop WARNs' absence is the proof
-    // that the lane survived, and this is the proof the node still serves.
+    // watermark: the bad boots left the lane as it was.
     node.set_payment_pool_address(payment_pool)?;
     node.restart()
         .await
@@ -200,18 +193,5 @@ async fn run() -> anyhow::Result<()> {
     })
     .await?
     .context("the original lane never redeemed past its watermark after the revert")?;
-
-    assert_no_lane_dropped(&node, "a boot of this node")
-}
-
-/// Fail if any spawn of `node` logged either seller-lane drop WARN.
-/// `node_pull_pool_redeploy.rs` asserts that a real redeploy logs both, so
-/// their absence here is a real signal.
-fn assert_no_lane_dropped(node: &NodeFixture, who: &str) -> anyhow::Result<()> {
-    for needle in [FOREIGN_LANES_DROPPED, FOREIGN_LANE_DROPPED] {
-        if let Some(line) = node.log_line(&[needle]) {
-            anyhow::bail!("{who} dropped the seller lane state: {line}");
-        }
-    }
     Ok(())
 }

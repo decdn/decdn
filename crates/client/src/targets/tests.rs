@@ -501,13 +501,13 @@ async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
 /// A chain no test reaches: the pinned probe verifies answers against its
 /// slash domain and reads nothing else from it.
 fn offline_chain() -> ChainConfig {
-    ChainConfig {
-        rpc_url: "http://127.0.0.1:1".to_owned(),
-        chain_id: 31_337,
-        payment_pool: Address::repeat_byte(0x01),
-        slash_judge: Address::repeat_byte(0x02),
-        capacity_bond: None,
-    }
+    crate::session::test_support::one_chain(
+        "http://127.0.0.1:1".to_owned(),
+        31_337,
+        Address::repeat_byte(0x01),
+        Address::repeat_byte(0x02),
+        None,
+    )
 }
 
 /// A node key for the harvest tests. `spawn_harvest` is `pub(crate)`, so
@@ -657,6 +657,7 @@ fn a_pinned_probe_hints_only_a_verified_holder_size() {
         eth_address: Address::repeat_byte(7),
         rtt_ms: 5.0,
         multiaddrs: Bytes::new(),
+        payment_pools: None,
     };
     for outcome in [
         ProbeOutcome::NonHolder(non_holder, sample),
@@ -819,18 +820,21 @@ fn failover_order_prepends_proxies_then_holders() {
             eth_address: Address::repeat_byte(21),
             rtt_ms: 90.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
         discovery::WarmingCandidate {
             node_id: node_key(22),
             eth_address: Address::repeat_byte(22),
             rtt_ms: 150.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
         discovery::WarmingCandidate {
             node_id: node_key(23),
             eth_address: Address::repeat_byte(23),
             rtt_ms: 190.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
     ];
     let out = super::failover_order(holders, &warming_pool, warming_params(true));
@@ -866,6 +870,7 @@ fn failover_order_no_qualifying_proxy_is_holders_only() {
         eth_address: Address::repeat_byte(21),
         rtt_ms: 190.0,
         multiaddrs: Bytes::new(),
+        payment_pools: None,
     }];
     let out = super::failover_order(holders, &warming_pool, warming_params(true));
     assert!(out.warming_lead.is_none());
@@ -887,12 +892,14 @@ fn failover_order_empty_holders_falls_back_to_non_holders_by_rtt() {
             eth_address: Address::repeat_byte(31),
             rtt_ms: 300.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
         discovery::WarmingCandidate {
             node_id: node_key(32),
             eth_address: Address::repeat_byte(32),
             rtt_ms: 100.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
     ];
     let out = super::failover_order(Vec::new(), &non_holders, warming_params(false));
@@ -927,6 +934,7 @@ fn failover_order_carries_registry_multiaddrs() -> anyhow::Result<()> {
         eth_address: Address::repeat_byte(21),
         rtt_ms: 90.0,
         multiaddrs: packed.clone(),
+        payment_pools: None,
     }];
 
     let warm = super::failover_order(vec![holder(10, 200.0)], &pool, warming_params(true));
@@ -1024,6 +1032,7 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
             ProbeResponseExt {
                 coverage: Coverage::empty(),
                 size_proof: Some(decdn_protocol::SizeProof::default()),
+                payment_pools: None,
             },
             crate::probe::ProbeRtt {
                 ms: 5.0,
@@ -1111,6 +1120,7 @@ fn a_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
             ProbeResponseExt {
                 coverage: Coverage::full(1),
                 size_proof,
+                payment_pools: None,
             },
             crate::probe::ProbeRtt {
                 ms: 5.0,

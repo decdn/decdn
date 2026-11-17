@@ -142,6 +142,7 @@ async fn ranged_paid_pull(
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id.into(),
         byte_offset,
         byte_len,

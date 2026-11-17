@@ -2,8 +2,9 @@
 # Fails if crates/cli/deployments/ has drifted from contracts/deployments/.
 #
 # `decdn config init --chain <name>` bakes contract addresses read from the
-# deployment manifest the Foundry `DeployProtocol` script writes. The CLI embeds
-# that manifest with `include_str!`, which cannot escape the package — a path
+# deployment manifests the Foundry `DeployProtocol` (`<chainId>.json`) and
+# `DeployPaymentPool` (`<chainId>-payment.json`) scripts write. The CLI embeds
+# those manifests with `include_str!`, which cannot escape the package — a path
 # outside the crate is unreachable from the published `.crate`, so
 # `cargo install decdn-cli` would fail to build. Hence the mirror.
 #
@@ -29,10 +30,12 @@ shopt -s nullglob
 mirrored=("$MIRROR_DIR"/*.json)
 shopt -u nullglob
 
+# No mirrored manifest means the CLI embeds none (`KNOWN_CHAINS` is empty in
+# crates/cli/src/known_chains.rs): there is nothing to drift. A manifest the
+# code embeds but the mirror lacks fails the build at its `include_str!`.
 if (( ${#mirrored[@]} == 0 )); then
-  echo "error: $MIRROR_DIR contains no manifests." >&2
-  echo "The CLI embeds at least one (see crates/cli/src/known_chains.rs)." >&2
-  exit 1
+  echo "deployment manifest mirror in sync (no chain embedded)"
+  exit 0
 fi
 
 drift=0

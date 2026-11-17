@@ -23,7 +23,12 @@ fn the_binary_reaches_the_daemon_read_and_names_an_unreachable_daemon() {
         .env("ONRAMP_PUBLIC_URL", "https://up.example.org")
         .env("ONRAMP_DAEMON_URL", &daemon_url)
         .env("ONRAMP_DAEMON_TOKEN", "0123456789abcdef0123456789abcdef")
-        .env("ONRAMP_RPC_URL", "https://rpc.example.org/")
+        .env(
+            "ONRAMP_GOVERNANCE_RPC_URL",
+            "https://governance-rpc.example.org/",
+        )
+        .env("ONRAMP_GOVERNANCE_CHAIN_ID", "11155111")
+        .env("ONRAMP_POOL_RPC_URL", "https://rpc.example.org/")
         .env(
             "ONRAMP_CAPACITY_BOND_ADDR",
             "0x2222222222222222222222222222222222222222",

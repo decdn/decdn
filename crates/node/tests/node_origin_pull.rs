@@ -106,6 +106,16 @@ fn slash_domain() -> Eip712Domain {
 fn voucher_dom() -> Eip712Domain {
     voucher_domain(CHAIN_ID, Address::repeat_byte(0x34))
 }
+/// The buyer pool of the `voucher_dom` deployment, the one pool the test
+/// nodes accept.
+fn buyer_pool() -> decdn_node::node_origin::BuyerPool {
+    let deployment = decdn_incentive::Deployment {
+        chain_id: CHAIN_ID,
+        payment_pool: Address::repeat_byte(0x34),
+    };
+    decdn_node::node_origin::BuyerPool::choose(&[deployment], |_| false)
+        .unwrap_or_else(|| unreachable!("one accepted pool"))
+}
 fn binding_dom() -> Eip712Domain {
     bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
 }
@@ -387,6 +397,7 @@ async fn answer_probe_with_coverage(
         Some(&ProbeResponseExt {
             coverage,
             size_proof: Some(support::size_proof_for(req.hash, total_bytes)),
+            payment_pools: None,
         }),
     )
     .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
@@ -919,6 +930,7 @@ async fn build_origin_with_discovery(
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: b_dht,
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -942,7 +954,7 @@ async fn build_origin_with_discovery(
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -1087,6 +1099,7 @@ async fn build_origin_multi_hash(
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: b_dht,
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -1105,7 +1118,7 @@ async fn build_origin_multi_hash(
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -1687,6 +1700,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -1704,7 +1718,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -6987,6 +7001,7 @@ async fn leaf_ranged_paid_pull(
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id.into(),
         byte_offset,
         byte_len,
@@ -7279,6 +7294,7 @@ async fn leaf_paced_pull_mode(
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len,
@@ -7610,7 +7626,7 @@ async fn build_node_b_with_store(
             // paid.
             deps.pull_through = Some(Duration::from_secs(20));
             deps.pull_through_origin = Some(Arc::new(origin));
-            deps.pool_view = Some(pool_view);
+            support::set_pool_view(deps, pool_view);
             if let Some(deny) = content_deny {
                 deps.content_deny = deny;
             }
@@ -8152,7 +8168,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     // Only the FUNDER is blacklisted; the delegate signer stays clean.
-    deny.apply_chain_origin(leaf_funder.address(), true);
+    deny.set_chain_origins(std::collections::HashSet::from([leaf_funder.address()]));
 
     let outcome = tokio::time::timeout(Duration::from_secs(45), leaf)
         .await
@@ -9975,6 +9991,7 @@ async fn leaf_opens_paid_stream(
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
@@ -11342,6 +11359,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -11362,7 +11380,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -13007,6 +13025,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: b_dht,
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -13027,7 +13046,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics: std::sync::Arc::new(decdn_node::serve_economics::OffPolicy),
@@ -14584,6 +14603,7 @@ async fn build_origin_economics(
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
+        buyer_pool: buyer_pool(),
         self_id: b_dht,
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
@@ -14601,7 +14621,7 @@ async fn build_origin_economics(
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            event_poll_interval: Duration::from_millis(50),
+            upstream_pool_refresh: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
             serve_economics,
@@ -14827,7 +14847,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
             deps.warming_credit = Arc::new(
                 decdn_node::warming_allowance::DirectWarmingCreditSink::new(Arc::clone(&warming)),
             );
-            deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(OP_BPS);
+            support::set_operator_shares(deps, decdn_node::fee_shares::OperatorShares::new(OP_BPS));
         },
     )?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -15080,7 +15100,10 @@ async fn attack_b_attempt(
                     Arc::new(decdn_node::warming_allowance::DirectWarmingCreditSink::new(
                         Arc::clone(warming),
                     ));
-                deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(op_bps);
+                support::set_operator_shares(
+                    deps,
+                    decdn_node::fee_shares::OperatorShares::new(op_bps),
+                );
             },
         )?;
         let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -15661,7 +15684,7 @@ async fn build_serving_node(
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
             deps.pull_through_origin = Some(Arc::clone(&origin_s));
-            deps.pool_view = Some(pool_view);
+            support::set_pool_view(deps, pool_view);
         },
     )?;
     let target = EndpointAddr::new(s_id).with_ip_addr(addr_s);

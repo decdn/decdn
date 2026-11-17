@@ -306,7 +306,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     ///      (`timepoint < epochLength`), so callers short-circuit to 0 / `false`
     ///      instead of underflowing `uint64`. Counting only elapsed epochs makes
     ///      the served-byte read immutable at the proposal snapshot, since
-    ///      `FeeRouter.routeSettlement` only ever writes the current epoch's
+    ///      `FeeRouter.deposit` only ever writes the current epoch's
     ///      bucket and never mutates an elapsed one (#847).
     function _endEpoch(uint256 timepoint) private view returns (uint64 endEpoch, bool hasElapsed) {
         uint64 cur = uint64(timepoint / feeRouter.epochLength());

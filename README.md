@@ -247,7 +247,7 @@ covers [testnet funds](https://docs.decdn.org/run-a-node/testnet-funds), the
 [full quickstart](https://docs.decdn.org/run-a-node/quickstart).
 
 ```bash
-decdn config init            # writes ~/.decdn/node.toml with the testnet RPC and contract addresses
+decdn config init            # writes ~/.decdn/node.toml: fill in the governance chain and payment pools
 decdn setup --mbps 100 --region US --multiaddr /ip4/203.0.113.10/udp/4433/quic-v1
 decdn-node run
 decdn node health            # then: node status, node lanes, node earnings, node top
@@ -263,8 +263,8 @@ bonds, registers the node, and prints a go/no-go summary
 - **Bond.** The bond is `max(minBond, bondRequired(mbps))`, where `bondRequired` is a curve
   over declared bandwidth, super-linear at the default exponent
   ([ADR 026 § Capacity-bond curve](adr/026-tokenomics.md#capacity-bond-curve),
-  [§ Minimum bond](adr/026-tokenomics.md#minimum-bond-is-non-retroactive)). The testnet
-  deployed with `minBond` at 50,000 TOKEN ([manifest](crates/cli/deployments/421614.json)),
+  [§ Minimum bond](adr/026-tokenomics.md#minimum-bond-is-non-retroactive)). The deploy
+  script sets `minBond` at 50,000 TOKEN by default ([`DeployProtocol.s.sol`](contracts/script/DeployProtocol.s.sol)),
   which at the default curve (k = 12.6, α = 1.2) covers declarations up to about
   997 Mbps; 1,000 Mbps needs about 50,162 TOKEN. `decdn node bond --mbps <n> --dry-run`
   prints the live target (it unlocks the keystore first). The maintainers send testnet TOKEN: send your EVM operator
@@ -384,7 +384,10 @@ daemon and its onramp are two more ([`docs/sponsord/`](docs/sponsord/README.md))
 The global `--config <path>` selects the config file, and every `decdn-node run` flag also
 reads a `DECDN_*` environment variable (`decdn-node run --help`). Every chain endpoint and
 contract address comes from the config file, and each command also accepts it as a flag
-(`--rpc-url`, `--*-address`). Operator terms accepted at registration live in
+(`--rpc-url`, `--*-address`). The payment commands (`get`, `gateway`, `quote`, `pool`, `node
+earnings`, `node sweep`, `node receive-sweeps`) name the governance chain with
+`--governance-rpc-url` / `--governance-chain-id` and one `PaymentPool` with
+`--pool eip155:<chainId>:<address>` and `--pool-rpc-url`. Operator terms accepted at registration live in
 [`crates/cli/TERMS.md`](crates/cli/TERMS.md), embedded verbatim in the CLI.
 
 </details>
@@ -455,7 +458,7 @@ how they interact.
 | Tokenomics | USDC pays for bytes. Operators bond TOKEN on a governance-tunable curve over declared bandwidth (super-linear at the default exponent), with a flat `minBond` floor. Fee-split buckets are governance-tunable. Protocol-owned liquidity is a Uniswap V3 50/50 TOKEN/USDC pool that governance seeds after launch. | [026](adr/026-tokenomics.md), [016](adr/016-contract-interactions.md), [018](adr/018-liquidity-strategy.md) |
 | Enforcement | Every `ProbeResponse` and `StreamResponse` carries a secp256k1 EIP-712 `slash_sig`, so a node's quotes and deliveries are on-chain evidence; the Ed25519 NodeId authenticates connections and the registration proof, never slash evidence. A challenge is a commit–reveal that resolves on-chain at reveal time. Slashed TOKEN sits in escrow for a 30-day appeal window. Governance blacklists content hashes. Reputation is a local per-peer EWMA. | [014](adr/014-on-chain-verification.md), [028](adr/028-slashing-appeals.md), [011](adr/011-content-takedown.md), [008](adr/008-reputation.md) |
 | Governance | `DecdnGovernor` with a `TimelockController`. No TOKEN balance carries a vote. Vote weight is trailing-window served bytes, capped per epoch by declared capacity and overall by a per-operator share, ramped by tenure since first bond, and zeroed by a standing slash inside the trailing window. The process moves from admin key to bootstrap multisig to DAO; the contract set stays the same. | [009](adr/009-governance.md), [036](adr/036-served-bytes-voting-weight.md) |
-| Evolution | Varint-length framing, protocol enums, and a three-tier schema-evolution model. Production targets Arbitrum One. | [013](adr/013-schema-evolution.md), [L2 appendix](adr/appendix-l2-deployment.md) |
+| Evolution | Varint-length framing, protocol enums, and a three-tier schema-evolution model. Governance runs on Ethereum L1 and payments run on any admitted chain. | [013](adr/013-schema-evolution.md), [chain admission appendix](adr/appendix-l2-deployment.md) |
 
 </details>
 

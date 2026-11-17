@@ -17,7 +17,7 @@ embedded from the
 
 ```sh
 cargo binstall --locked decdn-cli    # or: cargo install --locked decdn-cli
-decdn config init --chain arbitrum-sepolia
+decdn config init
 ```
 
 Container images are published as `ghcr.io/decdn/decdn` and `decdn/decdn`, with `decdn` as

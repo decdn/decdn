@@ -63,7 +63,7 @@ use super::voucher::StreamAnchor;
 use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
-    Connection, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, ServeRejectReason,
+    Connection, Hash, LaneDeliveryState, LaneId, Mutex, RecvStream, SendStream, ServeRejectReason,
 };
 
 /// The downstream credit frontier a serve leg publishes to its pull leg.
@@ -147,7 +147,7 @@ impl ClientHandler {
         also_pace: &[Arc<FillSession>],
         lane: &Arc<Mutex<LaneDeliveryState>>,
         hash: Hash,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         client_node_id: B256,
         rate_per_mb: u64,
         offset: u64,
@@ -278,7 +278,7 @@ impl ClientHandler {
         waits: &mut ServeWaits,
         guards: &mut SendGuards,
         hash: Hash,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         client_node_id: B256,
         rate_per_mb: u64,
@@ -341,7 +341,7 @@ impl ClientHandler {
         also_pace: &[Arc<FillSession>],
         lane: &Arc<Mutex<LaneDeliveryState>>,
         hash: Hash,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         client_node_id: B256,
         rate_per_mb: u64,
         offset: u64,
@@ -563,7 +563,7 @@ impl ClientHandler {
         // ADR 041: credit the realized operator margin back to the source that
         // speculatively warmed this blob (a no-op for an untagged / non-speculative
         // hash), on the same clean-completion edge as the ADR 040 hit sighting.
-        self.credit_warming_serve(hash, delivered);
+        self.credit_warming_serve(lane_key.deployment, hash, delivered);
         Ok(ServeEnd::Completed { bytes: delivered })
     }
 }

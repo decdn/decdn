@@ -41,6 +41,8 @@
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
 mod backend_source;
+mod buyer_route;
+pub use buyer_route::BuyerPool;
 mod funder;
 mod pull_leg;
 mod ranged_pull;
@@ -521,14 +523,11 @@ pub struct NodeOriginConfig {
     /// refuses a stream quote that exceeds the lower of the two before paying — and
     /// retains the signed over-quote as rate-manipulation evidence.
     pub max_rate_per_mb: u64,
-    /// How often this node's chain watcher polls for events
-    /// (`blockchain.event_poll_interval_ms`), used to size the settle window
-    /// after a funding recovery step's top-up (#1530).
-    ///
-    /// The wait is for the UPSTREAM's watcher, not ours, but every node in the
-    /// network runs the same default cadence and this is the only local reading of
-    /// it we have. See `funder::settle_wait_budget`.
-    pub event_poll_interval: Duration,
+    /// How often an upstream re-reads a live pool's `getPool`
+    /// (`pool_view::POOL_REFRESH_INTERVAL`), used to size the settle window
+    /// after a funding recovery step's top-up (#1530). See
+    /// `funder::settle_wait_budget`.
+    pub upstream_pool_refresh: Duration,
     /// DHT lookup tuning.
     pub lookup: LookupConfig,
     /// This node's self-attested region (`identity.region`), or `None` when
@@ -541,10 +540,9 @@ pub struct NodeOriginConfig {
     /// per MB, on a cache-miss relay leg. `select_policy(&cfg.cache.serve_economics)`
     /// picks `OffPolicy` (no ceiling) or `MarginPolicy` at construction.
     pub serve_economics: Arc<dyn crate::serve_economics::ServeEconomicsPolicy>,
-    /// Live operator fee-share (basis points) from `FeeRouter.getShares()[0]`,
-    /// the `(1 - f)` numerator the `margin` serve-economics policy amortizes
-    /// over. Seeded from chain at startup and kept current by the fee-shares
-    /// watcher (`crate::fee_shares_watcher::route`).
+    /// Operator fee-share (basis points), the `(1 - f)` numerator the `margin`
+    /// serve-economics policy amortizes over: the lowest immutable
+    /// `PaymentPool.operatorBps()` of the accepted pools, read at startup.
     pub operator_shares: crate::fee_shares::OperatorShares,
     /// ADR 040 shared frequency estimator, when built (`cache.eviction_policy`
     /// / `cache.admission_policy` == `"tinylfu"`, or `cache.serve_economics.policy`
@@ -655,6 +653,10 @@ pub struct NodeOriginDeps {
     /// Buyer-side payment-pool service (opens/reuses this node's pool and pins a lane per
     /// provider).
     pub buyer: Arc<dyn PoolOpener>,
+    /// The `PaymentPool` the buyer pays through, and the route over this
+    /// node's accepted pools that chose it (ADR 005 § Payment pool routing).
+    /// An upstream is paid only when the route sends it to this pool.
+    pub buyer_pool: BuyerPool,
     /// This node's DHT id, the lookup requester.
     pub self_id: DhtNodeId,
     /// EIP-712 domain verifying the delivery `slash_sig` (ADR 014 §1).
@@ -972,7 +974,7 @@ impl Origin for NodeOrigin {
                 // and the candidates of both walks that refused this node's
                 // funding: the ones the step asks again.
                 let gate = Arc::new(RecoveryGate::with_settle(settle_window(
-                    deps.config.event_poll_interval,
+                    deps.config.upstream_pool_refresh,
                 )));
                 // The deposit this fill starts at. A sibling fill's step that
                 // lands above it serves this fill too.
@@ -1274,6 +1276,9 @@ enum ProbeDrop {
     Unverifiable,
     /// The response's `has_blob` and coverage disagree.
     Inconsistent,
+    /// The holder's `payment_pools` hint does not route it to the buyer's
+    /// pool, so it would refuse that pool as `Declined`.
+    PoolNotAccepted,
 }
 
 /// What the probe rounds of one discovery saw (#2366): the counts a
@@ -1306,7 +1311,8 @@ impl ProbeTally {
             | ProbeDrop::TimestampRejected
             | ProbeDrop::NoAddress
             | ProbeDrop::Unverifiable
-            | ProbeDrop::Inconsistent => &mut self.dropped,
+            | ProbeDrop::Inconsistent
+            | ProbeDrop::PoolNotAccepted => &mut self.dropped,
         };
         *slot = slot.saturating_add(1);
     }
@@ -1593,12 +1599,14 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
 /// the pair the same way, scores nothing and warns about the clock (throttled); a
 /// same-region claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
 /// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable-but-absent provider
-/// is recorded in the negative-probe cache.
-// Straight-line probe → classify → build; the tracing macros and the three
-// sequential drop-conditions inflate the cognitive-complexity metric past the
-// threshold (same inflation noted in `chain_staker_set`), and splitting the
-// validation further would obscure the flow rather than clarify it.
-#[allow(clippy::cognitive_complexity)]
+/// is recorded in the negative-probe cache; a holder whose `payment_pools`
+/// hint does not route it to the buyer pool is dropped.
+// Straight-line probe → classify → build; the tracing macros and the
+// sequential drop-conditions inflate the cognitive-complexity and length
+// metrics past their thresholds (same inflation noted in `chain_staker_set`),
+// and splitting the validation further would obscure the flow rather than
+// clarify it.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn probe_candidate(
     deps: &NodeOriginDeps,
     peer: DhtNodeId,
@@ -1709,12 +1717,14 @@ async fn probe_candidate(
         return Err(ProbeDrop::Inconsistent);
     }
     if !resp.body.has_blob {
-        // Reachable but does not hold the blob — not a reputation event (no
-        // delivery attempted); cache the negative so the next lookup for this
-        // hash skips it within the TTL.
+        // Reachable but no holder: no reputation event (no delivery tried);
+        // the negative cache skips it for this hash within the TTL.
         deps.negative_cache
             .record_failure(peer, DhtHash::from_bytes(hash_bytes));
         return Err(ProbeDrop::Absent);
+    }
+    if !deps.buyer_pool.pays(resp_ext.payment_pools.as_deref()) {
+        return Err(ProbeDrop::PoolNotAccepted);
     }
     let rtt = ms_to_u32(probe_rtt.ms);
     // Peer's self-attested region (ADR 030), resolved from the on-chain
@@ -2219,8 +2229,8 @@ async fn try_pull(
 ///
 /// The first step of a fill is always allowed; a further step only after a
 /// byte verified since the last one. A step that tops the pool up opens the
-/// gate's settle window: a candidate that still refuses inside it is the
-/// upstream's chain watcher lagging the new deposit, so the fill waits a
+/// gate's settle window: a candidate that still refuses inside it holds a
+/// pool read older than the new deposit, so the fill waits a
 /// [`SETTLE_POLL_STEP`] and asks again instead of taking another step. A fill
 /// that can take no step ends "funding needed" ([`PullMiss::FundingNeeded`]),
 /// which still answers the client `NotFound`.

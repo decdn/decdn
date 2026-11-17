@@ -22,11 +22,21 @@ fn sample_request() -> StreamRequest {
     StreamRequest {
         hash: [1u8; 32],
         namespace_id: [3u8; 32],
+        payment_pool: crate::PoolAccount::eip155(421_614, [0x34; 20]),
         pool_id: [2u8; 32],
         byte_offset: 0,
         byte_len: 0,
         timestamp_us: 0xdead_beef,
     }
+}
+
+/// `n` distinct pool accounts at the full [`crate::MAX_POOL_ACCOUNT_LEN`]
+/// width.
+fn widest_pools(n: usize) -> Result<Vec<crate::PoolAccount>, crate::PoolAccountError> {
+    let chain = format!("abcdefgh:{}", "B".repeat(32));
+    (0..n)
+        .map(|i| crate::PoolAccount::new(&format!("{chain}:{i:0>128}")))
+        .collect()
 }
 
 fn sample_binding() -> ClientBinding {
@@ -77,6 +87,46 @@ fn stream_request_roundtrip() -> Result<(), postcard::Error> {
     let bytes = postcard::to_allocvec(&req)?;
     let decoded: StreamRequest = postcard::from_bytes(&bytes)?;
     assert_eq!(req, decoded);
+    Ok(())
+}
+
+/// `payment_pool` sits in the base request after `namespace_id` and before
+/// `pool_id` (ADR 005), as a length-prefixed CAIP-10 string.
+#[test]
+fn stream_request_wire_format_carries_the_payment_pool() -> Result<(), Box<dyn std::error::Error>> {
+    let req = StreamRequest {
+        payment_pool: crate::PoolAccount::new("cosmos:hub-4:pool1")?,
+        ..sample_request()
+    };
+    let bytes = postcard::to_allocvec(&req)?;
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&[1u8; 32]); // hash
+    expected.extend_from_slice(&[3u8; 32]); // namespace_id
+    expected.push(18u8); // payment_pool length
+    expected.extend_from_slice(b"cosmos:hub-4:pool1"); // payment_pool
+    expected.extend_from_slice(&[2u8; 32]); // pool_id
+    expected.push(0u8); // byte_offset
+    expected.push(0u8); // byte_len
+    expected.extend_from_slice(&postcard::to_allocvec(&0xdead_beef_u64)?); // timestamp_us
+    assert_eq!(bytes, expected);
+    assert_eq!(postcard::from_bytes::<StreamRequest>(&bytes)?, req);
+    Ok(())
+}
+
+/// A request whose `payment_pool` breaks the CAIP-10 rules does not decode.
+#[test]
+fn stream_request_with_a_malformed_payment_pool_does_not_decode() -> Result<(), postcard::Error> {
+    let good = postcard::to_allocvec(&sample_request())?;
+    let mut bad = good.clone();
+    // Upper-case the namespace of `eip155:421614:0x…` in place.
+    let at = 64 + 1;
+    let namespace = bad
+        .get_mut(at..at + 6)
+        .ok_or(postcard::Error::DeserializeUnexpectedEnd)?;
+    assert_eq!(namespace, b"eip155");
+    namespace.copy_from_slice(b"EIP155");
+    assert!(postcard::from_bytes::<StreamRequest>(&good).is_ok());
+    assert!(postcard::from_bytes::<StreamRequest>(&bad).is_err());
     Ok(())
 }
 
@@ -530,6 +580,7 @@ fn stream_response_wire_format_is_stable() -> Result<(), Box<dyn std::error::Err
     expected_framed.push(2u8); // size_proof length prefix
     expected_framed.extend_from_slice(&[0x11, 0x22]); // size_proof bytes
     expected_framed.push(0u8); // origin_attestation = None
+    expected_framed.push(0u8); // payment_pools = None
     assert_eq!(framed, expected_framed);
 
     let refused = encode_stream_response(
@@ -541,7 +592,25 @@ fn stream_response_wire_format_is_stable() -> Result<(), Box<dyn std::error::Err
     expected_refused.push(1u8); // outcome = StreamOutcome::Refused
     expected_refused.push(0u8); // StreamError::NotFound discriminant
     expected_refused.push(0u8); // origin_attestation = None
+    expected_refused.push(0u8); // payment_pools = None
     assert_eq!(refused, expected_refused);
+
+    let declined = encode_stream_response(
+        &resp,
+        Some(&StreamResponseExt::pool_declined(vec![
+            crate::PoolAccount::new("eip155:1:0xab")?,
+        ])),
+    )?;
+    let mut expected_declined = vec![1u8];
+    expected_declined.extend_from_slice(&expected);
+    expected_declined.push(1u8); // outcome = StreamOutcome::Refused
+    expected_declined.push(1u8); // StreamError::Declined discriminant
+    expected_declined.push(0u8); // origin_attestation = None
+    expected_declined.push(1u8); // payment_pools = Some
+    expected_declined.push(1u8); // one pool
+    expected_declined.push(13u8); // pool account length
+    expected_declined.extend_from_slice(b"eip155:1:0xab");
+    assert_eq!(declined, expected_declined);
     Ok(())
 }
 
@@ -1079,6 +1148,71 @@ fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
     );
 }
 
+/// `payment_pools` rides only on a `Declined` refusal (ADR 005 § Payment
+/// pool routing).
+#[test]
+fn stream_response_ext_validate_accepts_payment_pools_on_declined() {
+    let ext = StreamResponseExt::pool_declined(vec![crate::PoolAccount::eip155(10, [1; 20])]);
+    assert_eq!(ext.validate(false), Ok(()));
+    let empty = StreamResponseExt::pool_declined(Vec::new());
+    assert_eq!(empty.validate(false), Ok(()));
+}
+
+#[test]
+fn stream_response_ext_validate_rejects_payment_pools_elsewhere()
+-> Result<(), crate::SizeProofTooLong> {
+    let pools = Some(vec![crate::PoolAccount::eip155(10, [1; 20])]);
+    for (ok, outcome) in [
+        (false, StreamOutcome::Refused(StreamError::NotFound)),
+        (false, StreamOutcome::Refused(StreamError::Unfunded)),
+        (
+            true,
+            StreamOutcome::Served(crate::SizeProof::new(1, vec![0u8])?),
+        ),
+    ] {
+        let ext = StreamResponseExt {
+            outcome,
+            origin_attestation: None,
+            payment_pools: pools.clone(),
+        };
+        assert_eq!(
+            ext.validate(ok),
+            Err(MessageValidationError::PaymentPoolsOutsideDeclined),
+            "{ext:?}"
+        );
+        let without = StreamResponseExt {
+            payment_pools: None,
+            ..ext
+        };
+        assert_eq!(without.validate(ok), Ok(()));
+    }
+    Ok(())
+}
+
+/// The sender helper keeps the first eight pools, and so does the receiver
+/// when a sender lists more.
+#[test]
+fn payment_pools_keep_the_first_eight() -> Result<(), Box<dyn std::error::Error>> {
+    let pools = widest_pools(12)?;
+    let built = StreamResponseExt::pool_declined(pools.clone());
+    assert_eq!(
+        built.payment_pools.as_deref(),
+        pools.get(..crate::MAX_PAYMENT_POOLS)
+    );
+
+    let oversized = StreamResponseExt {
+        payment_pools: Some(pools.clone()),
+        ..StreamResponseExt::refused(StreamError::Declined)
+    };
+    let bytes = postcard::to_allocvec(&oversized)?;
+    let parsed = parse_stream_response_ext(&bytes)?;
+    assert_eq!(
+        parsed.payment_pools.as_deref(),
+        pools.get(..crate::MAX_PAYMENT_POOLS)
+    );
+    Ok(())
+}
+
 /// The base validator cannot see `error`, so an `ok == true` response with a
 /// stray error code passes it. That is not a hole — it is why a receiver must
 /// call BOTH halves — but it is worth pinning so nobody "simplifies" the
@@ -1247,8 +1381,9 @@ fn widest_bundle() -> WatermarkBundle {
 
 /// The widest legitimate `StreamResponse` fits [`MAX_STREAM_RESPONSE_FRAME`]
 /// (ADR 013 § Wire Framing): a served outcome with a full size proof, and an
-/// origin attestation. The widest refusal is far smaller. The payer reads
-/// every response against that ceiling.
+/// origin attestation. The widest refusal, which carries eight full-width
+/// payment pools, is far smaller. The payer reads every response against
+/// that ceiling. Both sizes are pinned exactly so the headroom stays visible.
 #[test]
 fn stream_response_frame_ceiling_holds_the_largest_response()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1282,15 +1417,13 @@ fn stream_response_frame_ceiling_holds_the_largest_response()
             },
             ..response.clone()
         },
-        Some(&StreamResponseExt {
-            outcome: StreamOutcome::Refused(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::BytesRegression,
-                bundle: Some(widest_bundle()),
-            }),
-            origin_attestation: Some(attestation),
-        }),
+        Some(&StreamResponseExt::pool_declined(widest_pools(
+            crate::MAX_PAYMENT_POOLS,
+        )?)),
     )?
     .len();
+    assert_eq!(response_len, 4693, "served StreamResponse at full width");
+    assert_eq!(refusal_len, 1493, "Declined StreamResponse at full width");
     assert!(refusal_len < response_len);
     assert!(response_len > MAX_CLIENT_CONTROL_FRAME as usize);
     assert!(
@@ -1312,6 +1445,7 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dy
     let request = StreamRequest {
         hash: [0x01; 32],
         namespace_id: [0x02; 32],
+        payment_pool: widest_pools(1)?.pop().ok_or("one pool account expected")?,
         pool_id: [0x03; 32],
         byte_offset: u64::MAX,
         byte_len: u64::MAX,
@@ -1329,7 +1463,7 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dy
         }),
     };
     let request_len = encode_stream_request(&request, Some(&ext))?.len();
-    assert_eq!(request_len, 301, "StreamRequest + ext at full width");
+    assert_eq!(request_len, 473, "StreamRequest + ext at full width");
 
     let rejected = StreamError::VoucherRejected {
         reason: VoucherRejectReason::BytesRegression,

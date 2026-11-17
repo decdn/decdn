@@ -67,7 +67,7 @@ impl PoolOwner {
                     "--deposit-micro-usdc",
                     &DEPOSIT_MICRO_USDC.to_string(),
                 ]),
-                chain_flags(chain),
+                pool_flags(chain),
                 owner_flags(&keystore, dir.path()),
             ]
             .concat(),
@@ -142,7 +142,7 @@ impl PoolOwner {
                 strs(&[
                     "pool",
                     "assign",
-                    "--pool",
+                    "--pool-id",
                     &format!("{:#x}", self.pool_id),
                     "--signer",
                     signer,
@@ -152,7 +152,7 @@ impl PoolOwner {
                     "3600",
                 ]),
                 extra.to_vec(),
-                chain_flags(chain),
+                pool_flags(chain),
                 owner_flags(&self.keystore, self.dir.path()),
             ]
             .concat(),
@@ -262,17 +262,37 @@ pub async fn register_capability(
     Ok(delegate)
 }
 
-/// The chain coordinates as flags, so no config file is needed.
+/// The payment pool coordinates as flags, so no config file is needed. Every
+/// `pool` subcommand takes these alone.
+#[must_use]
+pub fn pool_flags(chain: &ChainFixture) -> Vec<String> {
+    vec![
+        "--pool".into(),
+        format!(
+            "eip155:{}:{:#x}",
+            chain.chain_id(),
+            chain.addrs().payment_pool
+        ),
+        "--pool-rpc-url".into(),
+        chain.rpc_url(),
+    ]
+}
+
+/// The governance and payment pool coordinates as flags, as `get` and
+/// `gateway` take them, so no config file is needed. One anvil serves both
+/// chains.
 #[must_use]
 pub fn chain_flags(chain: &ChainFixture) -> Vec<String> {
-    vec![
-        "--rpc-url".into(),
-        chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
+    [
+        vec![
+            "--governance-rpc-url".into(),
+            chain.rpc_url(),
+            "--governance-chain-id".into(),
+            chain.chain_id().to_string(),
+        ],
+        pool_flags(chain),
     ]
+    .concat()
 }
 
 /// The paid-pull flags that pin `node`. `--capacity-bond-address` is the

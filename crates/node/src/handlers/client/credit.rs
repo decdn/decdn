@@ -16,7 +16,7 @@ use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::StreamAnchor;
 use super::{
     Address, Arc, B256, BufferedProofReader, ClientHandler, Connection, Hash, LaneDeliveryState,
-    LaneKey, MAX_PROOFS_PER_CHUNK, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
+    LaneId, MAX_PROOFS_PER_CHUNK, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
     VoucherStop,
 };
 
@@ -51,10 +51,10 @@ impl ClientHandler {
     pub(super) async fn send_guards(
         &self,
         lane: &Arc<Mutex<LaneDeliveryState>>,
-        lane_key: &LaneKey,
+        lane_key: &LaneId,
     ) -> SendGuards {
         SendGuards {
-            funder: self.pool_funder(lane_key.pool_id).await,
+            funder: self.pool_funder(lane_key.pool()).await,
             held_signer_cap: Some(lane.lock().await.state.cap),
             last_pool_check: Instant::now(),
             interval: self.pool_recheck_interval(),
@@ -80,7 +80,7 @@ impl ClientHandler {
         send: &mut SendStream,
         recv: &mut RecvStream,
         hash: Hash,
-        lane_key: &LaneKey,
+        lane_key: &LaneId,
         rate_per_mb: u64,
         guards: &mut SendGuards,
     ) -> anyhow::Result<Option<ServeStop>> {
@@ -99,7 +99,7 @@ impl ClientHandler {
         }
         if let Some(held) = guards.held_signer_cap
             && self
-                .signer_cap_drained_midstream(lane_key.pool_id, lane_key.signer, held, rate_per_mb)
+                .signer_cap_drained_midstream(lane_key.pool(), lane_key.signer, held, rate_per_mb)
                 .await
         {
             self.write_reject(send, VoucherRejectReason::SignerCapExhausted, None)
@@ -146,7 +146,7 @@ impl ClientHandler {
         waits: &mut ServeWaits,
         guards: &mut SendGuards,
         hash: Hash,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         client_node_id: B256,
         rate_per_mb: u64,

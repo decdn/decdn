@@ -74,10 +74,10 @@ interface IContentBlacklist {
     //
     // Permissionless materialization of that expiry. Reverts unless the entry is
     // an emergency entry past its deadline. Deleting the entry removes it from
-    // the enumerable membership and emits HashRemoved — without it the lapsed
-    // entry stays in the raw blacklistedHashes set a node enumerates (see
-    // § Node Behavior). The origin variant is the low-latency signal on its
-    // side, since a node tracks origins by enumeration and event tail.
+    // the enumerable membership, appends an expire record to the mutation
+    // ledger and emits HashRemoved. Without it the lapsed entry stays in the
+    // raw blacklistedHashes set a node enumerates at boot (see § Node
+    // Behavior). The origin variant does the same for blacklistedAddresses.
     function expireEmergencyEntry(bytes32 region, bytes32 blake3Hash) external;
     function expireEmergencyOrigin(address operatorAddress) external;
 
@@ -113,10 +113,14 @@ interface IContentBlacklist {
     function isOriginBlacklisted(address operatorAddress) external view returns (bool);
     function getHashEntry(bytes32 region, bytes32 blake3Hash) external view returns (BlacklistEntry memory);
 
-    // Events. Each is a low-latency signal to re-read the in-scope predicate for
-    // the hashes a node holds; the authoritative deny-set is the full
-    // enumeration (see § Node Behavior), so a missed event is recovered by the
-    // next re-enumeration, not by any counter.
+    // Mutation ledger (see § Following the mutation ledger). Append-only: one
+    // record per state change that an authorised caller makes.
+    // getMutations clamps like the paged enumeration views.
+    function mutationCount() external view returns (uint256);
+    function getMutations(uint256 from, uint256 limit) external view returns (Mutation[] memory);
+
+    // Events. They serve indexers and audit. A node does not read them; it
+    // follows the mutation ledger (see § Node Behavior).
     event HashBlacklisted(bytes32 indexed region, bytes32 indexed blake3Hash, string reason);
     event HashRemoved(bytes32 indexed region, bytes32 indexed blake3Hash);
     // Origin blacklisting is a single toggle, enforced via OriginAssignment
@@ -138,6 +142,23 @@ struct BlacklistEntry {
     uint8   category;         // Category; determines the emergency auto-expiry term.
                               // Meaningless when emergency == false.
 }
+
+// Each kind overwrites the whole state of its key. Order is ABI-frozen.
+enum MutationKind {
+    HASH_ADD, HASH_EMERGENCY_ADD, HASH_RATIFY, HASH_REMOVE, HASH_EXPIRE,
+    ORIGIN_SET, ORIGIN_CLEAR, ORIGIN_EMERGENCY_ADD, ORIGIN_EXPIRE,
+    OPERATOR_ADD, OPERATOR_REMOVE,
+    BODY_REGISTER, BODY_DEREGISTER, BODY_SUSPEND, BODY_SUSPENSION_RATIFY, BODY_UNSUSPEND,
+    COMPLIANCE_WINDOW_SET, EMERGENCY_COMPLIANCE_WINDOW_SET
+}
+
+struct Mutation {             // kind, at and expiresAt share one storage slot
+    MutationKind kind;
+    uint64  at;               // block timestamp of the write
+    uint64  expiresAt;        // 0 = nothing lapses; else the state holds while now <= expiresAt
+    bytes32 region;           // region of a regional hash or a body record; else 0
+    bytes32 key;              // the hash, the address left-padded to 32 bytes, or a window in seconds
+}
 ```
 
 > **Region representation.** `region` is **`bytes32` at every layer** — the external signatures, the events, the mapping keys, and the `BlacklistEntry` struct above. There is no `string` boundary form and no canonicalization step: callers pass the packed key directly, so the value written by a regional body is byte-identical to the one a scope check reads back.
@@ -148,7 +169,7 @@ struct BlacklistEntry {
 
 ### Emergency auto-expiry
 
-Emergency auto-expiry is the one set change that is not caused by a transaction: the entry simply stops being enforceable when its deadline passes, with no write and no log. The liveness views honour that deadline immediately — an expired entry is unenforceable whether or not anyone cleans it up — and a node applies exactly those views (`isHashBlacklistedForOperator`, `isOriginBlacklisted` / `isOperatorBlacklisted`) when it filters its enumerated snapshot, so a lapsed emergency entry is dropped even while it still sits in the raw `blacklistedHashes` / `blacklistedAddresses` membership. `expireEmergencyEntry` (and `expireEmergencyOrigin` on the origin side) then removes it from that membership: permissionless, callable by anyone once the deadline passes, it deletes the entry through the ordinary removal path so a `HashRemoved` lands in the log like any other removal. Nodes rebuild the full deny-set by enumeration ([§ Enumerating the deny-set](#enumerating-the-deny-set)), with no version cursor.
+Emergency auto-expiry is the one set change that is not caused by a transaction. The entry stops being enforceable when its deadline passes, with no write, no log and no ledger record. The liveness views honour that deadline immediately: an expired entry is unenforceable whether or not anyone cleans it up. The mutation ledger carries the deadline as `expiresAt` on the add record, so a node expires the entry locally at the same instant ([§ Following the mutation ledger](#following-the-mutation-ledger)). `expireEmergencyEntry` (and `expireEmergencyOrigin` on the origin side) then removes the entry from the raw `blacklistedHashes` / `blacklistedAddresses` membership. Anyone can call it once the deadline passes. It deletes the entry through the ordinary removal path, appends an expire record to the ledger and emits `HashRemoved` like any other removal.
 
 ### Reason field
 
@@ -182,7 +203,7 @@ Regional bodies operate independently within their scope. A hash blacklisted by 
 
 Regional bodies acting in good faith can still issue entries that are later contested — a wrongly served takedown notice, a body that drifts outside its declared jurisdiction, or a notice that misidentifies content. Two tools answer that, at two different scopes.
 
-For a **single disputed entry**, the removal functions are the recourse, and the two scopes are not interchangeable. `removeHashGlobal` (global entries) is restricted to `GOVERNANCE_ROLE`, which DecdnGovernor proposals reach via the standard timelock; it routes to `_removeHashRegional(GLOBAL_REGION, …)` and so cannot touch a regional entry. `removeHashRegional` is restricted to `REGIONAL_BODY_ROLE`, reverts on the `GLOBAL_REGION` sentinel, and additionally requires the caller to be that region's currently-registered, unsuspended body — so it is a *regional body's* unilateral power, and governance reaches a regional entry only by replacing the body (`deregisterRegionalBody` then `registerRegionalBody`). Both emit `HashRemoved` and drop the entry from the enumerable membership, so nodes pick the removal up on their next re-enumeration.
+For a **single disputed entry**, the removal functions are the recourse, and the two scopes are not interchangeable. `removeHashGlobal` (global entries) is restricted to `GOVERNANCE_ROLE`, which DecdnGovernor proposals reach via the standard timelock; it routes to `_removeHashRegional(GLOBAL_REGION, …)` and so cannot touch a regional entry. `removeHashRegional` is restricted to `REGIONAL_BODY_ROLE`, reverts on the `GLOBAL_REGION` sentinel, and additionally requires the caller to be that region's currently-registered, unsuspended body — so it is a *regional body's* unilateral power, and governance reaches a regional entry only by replacing the body (`deregisterRegionalBody` then `registerRegionalBody`). Both append a remove record to the mutation ledger, emit `HashRemoved` and drop the entry from the enumerable membership, so nodes pick the removal up on their next ledger poll.
 
 For a **systemically misbehaving body**, `suspendRegionalBody` bars that body from writing, subject to governance ratification within 14 days. Two properties matter operationally and pull in opposite directions: it retracts nothing — every entry already issued stays live, enforceable and slashable — and because `_requireActiveBodyFor` gates removals as well as additions, it also *blocks* the body from taking its own entries down. Suspension is therefore the right tool against a body issuing bad entries and the wrong one against a body refusing to remove them; for the latter, replace the body (see [§ Regional Governance Bodies](#regional-governance-bodies)).
 
@@ -424,17 +445,48 @@ This authority extends the DAO's role from negative-only (blacklisting) to posit
 
 ### Enumerating the deny-set
 
-Each node maintains a local deny-set mirroring `ContentBlacklist` — the blacklisted address union (origins and operators) plus the in-scope blacklisted hashes — and builds it by **enumerating current chain state**, never by replaying event history from a block floor.
+Each node keeps a local deny index that mirrors `ContentBlacklist`. The index holds the blacklisted address union (origins and operators), the blacklisted hashes of each region the node has read, the regional-body state and the two compliance windows. Each index entry stores its `expiresAt` (0 for an entry with no auto-expiry). The node evaluates its scope at lookup time. The node reads all chain state by `eth_call`. It does not read event logs.
 
-- **On boot**, the node reads the complete current deny-set directly from the contract at a single pinned block. It pages the address union from `blacklistedAddresses` and keeps only the live members — those satisfying `isOriginBlacklisted(a) || isOperatorBlacklisted(a)`, the same disjunction `OriginAssignment` enforces, so a voted-out operator whose entry never touched the origin mapping is still caught. It reads the in-scope hashes via `getScopeRegions(operator)` and then `blacklistedHashes(region, …)` per returned region, filtering each for liveness through `isHashBlacklistedForOperator`. Both sets remove by swap-and-pop, so every page and the count it is checked against are read at the same pinned block; a `seen != count` mismatch aborts the snapshot rather than seating a partial set. Enumeration returns raw membership, so the per-address / per-hash liveness reads are what honour emergency auto-expiry — omitting a lapsed entry is the fail-open direction, which merely under-enforces a stale ban.
-- **While running**, the node follows the contract's events from the boot snapshot block ([ADR 019 § Boot-time chain reads](019-node-onboarding.md#boot-time-chain-reads)): `HashBlacklisted` / `HashRemoved` for hash entries, and both `OriginBlacklistUpdated` and `OperatorBlacklisted` / `OperatorBlacklistCleared` for the address union. Both address event families feed the one deny-set, because the operator leg is separate on-chain — `addOperator` sets `isOperatorBlacklisted` and never emits `OriginBlacklistUpdated`, so a node that watched only the origin event would keep serving a blacklisted operator.
-- **Periodically**, the node re-enumerates the deny-set at a fresh snapshot block as a backstop and re-scopes its hash set. This repairs any event lost to a reorg or an RPC-backoff gap, and catches [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window) region/ripening transitions, which change a hash's scope while emitting no event. The snapshot block is below the head, so the event tail can already have applied a newer change. The node keeps each change that the tail applied above the snapshot block. A re-enumeration therefore never removes a newer takedown.
+On boot, the node builds the index from the enumeration views. It pins the governance chain's `safe` block and does all of these reads at that block:
 
-The boot snapshot block is below the head, so the node opens for connections with the deny-set of that block. The first poll of the event tail applies a takedown from the blocks between the snapshot block and the head.
+- It reads `mutationCount` and keeps the value as its ledger cursor.
+- It pages the address union from `blacklistedAddresses` and keeps only the live members. A live member satisfies `isOriginBlacklisted(a) || isOperatorBlacklisted(a)`. This is the same disjunction that `OriginAssignment` consumers apply, so the index catches an operator that `addOperator` blacklisted without an origin entry.
+- It reads its scope with `getScopeRegions(operator)`. It pages `blacklistedHashes(region, …)` for each returned region. For each paged hash, one `getHashEntry(region, hash)` read gives both the liveness and the expiry of the entry. An entry is live when its `addedAt` is not 0, and it is not an emergency entry past its category term. The node keeps a hash under a region only when the entry in that region is live.
+- An emergency entry gets `expiresAt` equal to `addedAt` plus its category term. A non-emergency entry gets `expiresAt` 0. For each paged address that `isOriginBlacklisted` reports live, the node reads `getEmergencyOrigin` and sets the expiry of that origin by the same rule.
+- It reads `getRegionalBody` for each region in scope, and `complianceWindow` and `emergencyComplianceWindow`.
 
-The node keeps no version cursor: enumeration reads the full current state on every boot, so there is no delta cursor to persist and no offline gap to recover — a node returning after any downtime rebuilds the complete deny-set from one snapshot. Origin blacklisting is not a separate poll from hash entries; the address union folds both into the same enumeration and tail (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) and [§ Permissionless property](#permissionless-property)). Nodes SHOULD expose the `decdn_blacklist_watcher_last_tick_timestamp_seconds` gauge for operational monitoring — see [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
+Both sets remove by swap-and-pop, so each page and the count it is checked against come from the pinned block. A `seen != count` mismatch aborts the snapshot. The node does not seat a partial set. Enumeration returns raw membership, so the liveness reads drop a lapsed emergency entry that nobody has expired yet.
+
+The node persists no index and no cursor. Each boot builds a new snapshot, so a node that returns after downtime has no gap to recover. Nodes SHOULD expose the `decdn_blacklist_watcher_last_tick_timestamp_seconds` gauge for operational monitoring. See [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
 
 The node MUST NOT accept connections until its initial enumeration completes.
+
+### Following the mutation ledger
+
+`ContentBlacklist` keeps an append-only mutation ledger. The rule is: everything that changes the blacklist is recorded, and only an authorised caller can write. Each state change appends one `Mutation` record. This covers every hash, origin, operator, emergency and expiry write, every regional-body change (registration, deregistration, suspension, suspension ratification, unsuspension) and every compliance-window change. A hash add or re-add always appends a record, because it carries a new notice in its reason. Any other call that leaves the state as it was appends nothing. The two permissionless expiry calls also append a record, because they change the raw membership. Each record carries all that a node needs to apply it, with no other read.
+
+While running, the node polls `mutationCount` by `eth_call` at an interval of at most 5 minutes. This interval is well inside the 1-hour compliance-window floor ([§ Compliance Window](#compliance-window)) and inside the 30-minute default grace of [§ Serving while chain-stale](#serving-while-chain-stale). Each poll pins the governance chain's `safe` block and does all of its reads at that block. A record at or below the `safe` block does not change, so a reorg cannot replace a record that the node applied. On Ethereum the `safe` block trails the head by a few minutes, which stays well inside the compliance windows.
+
+1. The node reads `mutationCount`. If the count is below the cursor, the chain reorganised past the `safe` block. The node then builds a new snapshot as on boot.
+2. The node reads `getScopeRegions(operator)`. [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window) region and ripening transitions change the scope with no write to `ContentBlacklist`. The ledger holds every record since the node's snapshot, but the snapshot holds only the regions in scope at that time. So when a region enters the scope for the first time since boot, the node pages `blacklistedHashes` for it and filters it as on boot. It replaces what the index holds for that region with the result.
+3. If the count is above the cursor, the node reads `getMutations(cursor, …)` in pages up to the count. It applies the records in ledger order and sets the cursor to the count.
+
+The node applies every record in order. It does not filter records by region or by body. Each record overwrites the whole state of its key:
+
+- `HASH_ADD`, `HASH_EMERGENCY_ADD` and `HASH_RATIFY` set the hash present in the record's region with the record's `expiresAt`. Region 0 is the global scope. `HASH_REMOVE` and `HASH_EXPIRE` delete the hash from that region.
+- `ORIGIN_SET` and `ORIGIN_EMERGENCY_ADD` set the origin leg present with the record's `expiresAt`. `ORIGIN_CLEAR` and `ORIGIN_EXPIRE` delete it. `OPERATOR_ADD` and `OPERATOR_REMOVE` set and clear the operator leg.
+- The body kinds set the body state of the record's region: the body address in `key`, and for `BODY_SUSPEND` the moment an unratified suspension lapses in `expiresAt`.
+- `COMPLIANCE_WINDOW_SET` and `EMERGENCY_COMPLIANCE_WINDOW_SET` carry the new window in seconds in `key`.
+
+The index stores no body per hash, and needs none. A body change alters who can write entries for a region. It does not alter which entries are live: entries stay live and slashable through suspension and deregistration ([§ Regional Governance Bodies](#regional-governance-bodies)). A compliance-window change moves only the `effectiveAt` of later adds. So the body and window records change no deny answer, and the node can apply them without a change to its hash index.
+
+A hash present in a region outside the node's scope does not affect a deny answer, because the node evaluates scope at lookup. Because each record is a full overwrite, a record that a snapshot already reflects leaves the index correct. An add and a remove of the same key between two polls leave the entry count unchanged, but they move the ledger by two records, so the node applies both.
+
+The node expires an entry locally when its clock passes `expiresAt`. No record marks that moment, and the node needs none. The later `HASH_EXPIRE` or `ORIGIN_EXPIRE` record only deletes a key that the node already treats as not live.
+
+A successful poll stamps the chain-freshness clock, whether or not the count moved. Liveness for an address keeps the union of both legs: the node refuses an address while its origin leg or its operator leg is live. `addOperator` writes only the operator leg, so a node that tracked only the origin leg would keep serving a blacklisted operator.
+
+The per-item views `isHashBlacklistedForOperator`, `isOriginBlacklisted`, `isOperatorBlacklisted` and `getHashEntry` remain spot checks. The pre-cache check below uses one. An operator or a monitor can use them to audit the local index. The events remain for indexers and audit.
 
 **Pre-cache check:** Before caching any newly-fetched blob (whether from origin pull-through or peer pull), the node MUST check `isHashBlacklistedForOperator(hash, ownOperatorAddress)` and reject the blob if blacklisted. This enables proactive blacklisting of known-bad hashes before any node caches them, and resolves the node's own regional scope rather than global entries alone.
 
@@ -456,15 +508,15 @@ In-flight streams for a blacklisted hash — or on a pool funded by a newly blac
 
 ### Serving while chain-stale
 
-Every serve-path guard that enforces on-chain state reads a local projection. The deny-set, the pool-solvency check, and the per-signer capability cap all advance only while the chain watchers reach the RPC. During an RPC outage each guard passes on stale state. A takedown, a drained pool, or a spent capability that lands on-chain during the outage is invisible to the node. The node keeps signing serve and probe responses it can no longer vouch for. Serving a hash past its compliance window is slashable, and the offense is a signed `StreamResponse{ok:true}` or `ProbeResponse{has_blob:true}` — the node produces its own evidence.
+Every serve-path guard that enforces on-chain state reads a local projection. The deny-set, the pool-solvency check, and the per-signer capability cap all advance only while the node's chain reads reach the RPC. During an RPC outage each guard passes on stale state. A takedown, a drained pool, or a spent capability that lands on-chain during the outage is invisible to the node. The node keeps signing serve and probe responses it can no longer vouch for. Serving a hash past its compliance window is slashable, and the offense is a signed `StreamResponse{ok:true}` or `ProbeResponse{has_blob:true}` — the node produces its own evidence.
 
-The node bounds this exposure with a grace window. It records the wall-clock time of the blacklist watcher's last successful poll tick. When the node has been unable to reach the chain for longer than `chain_staleness_grace_sec`, the serve path refuses new requests and the probe path answers `has_blob: false`. The serve refusal is `NotFound`, which is reputation-benign, so a client re-routes to a peer whose chain reads are live. The node can answer differently once its chain reads recover, so the refusal does not remove it from the client's candidates. This is the runtime counterpart of the boot readiness gate: the boot gate keeps every listener shut until the first enumeration completes, and the staleness gate stops the same signed surfaces when the chain reads go stale after boot.
+The node bounds this exposure with a grace window. It records the wall-clock time of the last successful blacklist ledger poll. The blacklist is governance-chain state, so the clock follows the governance-chain reads. When the node has been unable to reach the chain for longer than `chain_staleness_grace_sec`, the serve path refuses new requests and the probe path answers `has_blob: false`. The serve refusal is `NotFound`, which is reputation-benign, so a client re-routes to a peer whose chain reads are live. The node can answer differently once its chain reads recover, so the refusal does not remove it from the client's candidates. This is the runtime counterpart of the boot readiness gate: the boot gate keeps every listener shut until the first enumeration completes, and the staleness gate stops the same signed surfaces when the chain reads go stale after boot.
 
-The signal is the successful poll *tick*, not the last blacklist event. A quiet chain produces no blacklist events for long periods. Keying on events would take a node dark on any quiet period. A successful tick — including an idle tick with no logs — stamps the clock. The boot enumeration stamps it too, so a node that has just vetted its deny-set is never treated as stale.
+The signal is the successful poll *tick*, not the last ledger record. A quiet chain appends no records for long periods. Keying on records would take a node dark on any quiet period. A successful tick stamps the clock, including a tick where `mutationCount` did not move. The boot enumeration stamps it too, so a node that has just vetted its deny-set is never treated as stale.
 
 The grace window is one operator-local value, always evaluated. There is no separate on/off flag. An operator who accepts the stale-serving risk sets the window large. The default is 30 minutes, which sits inside the one-hour compliance-window floor, so a node stops serving before an outage-hidden takedown can cross into slashable territory, while a short RPC blip never takes the node dark. A value of `0` is rejected at config resolution: a zero grace refuses every serve. This gate is distinct from the RPC connectivity watchdog, which only reports reachability to a metric and gates nothing. The window is a node risk preference, not a governance parameter, so it carries no on-chain surface.
 
-A node with no chain configured (development and test) runs no blacklist watcher, so the runtime wires no freshness clock and the gate is inactive. This is the same fail-open shape the pool-solvency guards use when no chain is present.
+A node with no chain configured (development and test) runs no blacklist sync, so the runtime wires no freshness clock and the gate is inactive. This is the same fail-open shape the pool-solvency guards use when no chain is present.
 
 ### Regional Scope
 

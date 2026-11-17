@@ -31,7 +31,7 @@ region = "us"
 
 [blockchain]
 rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
-payment_pool_address = "0x0000000000000000000000000000000000000001"
+payment_chains = [{ rpc_url = "http://127.0.0.1:8546", chain_id = 84532, payment_pools = ["0x0000000000000000000000000000000000000001"] }]
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 content_blacklist_address = "0x0000000000000000000000000000000000000004"
@@ -39,7 +39,7 @@ content_blacklist_address = "0x0000000000000000000000000000000000000004"
 
 const MISSING_RPC: &str = r#"
 [blockchain]
-payment_pool_address = "0x0000000000000000000000000000000000000001"
+payment_chains = [{ rpc_url = "http://127.0.0.1:8546", chain_id = 84532, payment_pools = ["0x0000000000000000000000000000000000000001"] }]
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 "#;
 
@@ -48,7 +48,7 @@ fn unknown_var_config(var_name: &str) -> String {
         r#"
 [blockchain]
 rpc_url = "${{{var_name}}}"
-payment_pool_address = "0x0000000000000000000000000000000000000001"
+payment_chains = [{{ rpc_url = "http://127.0.0.1:8546", chain_id = 84532, payment_pools = ["0x0000000000000000000000000000000000000001"] }}]
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 "#
     )
@@ -229,7 +229,7 @@ fn validate_fails_when_config_flag_points_at_missing_file() -> anyhow::Result<()
 // max_blob_size_mb >= cache_size_mb, and rate_per_mb = 0.
 const MULTI_ERROR: &str = r#"
 [blockchain]
-payment_pool_address = "0x0000000000000000000000000000000000000001"
+payment_chains = [{ rpc_url = "http://127.0.0.1:8546", chain_id = 84532, payment_pools = ["0x0000000000000000000000000000000000000001"] }]
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 
@@ -338,12 +338,15 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             rpc_url: "https://rpc.example/SECRET_TOKEN_abc123".to_string(),
             eth_keystore: PathBuf::from("/var/lib/decdn/keystore.json"),
             keystore_password_file: None,
-            payment_pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+            payment_chains: vec![decdn_common::config::ResolvedPaymentChain {
+                rpc_url: "https://payment.example/SECRET_TOKEN_def456".to_string(),
+                chain_id: 84_532,
+                payment_pools: vec![alloy::primitives::Address::with_last_byte(1)],
+            }],
+            cctp_sweep_receiver_address: None,
             capacity_bond_address: "0x0000000000000000000000000000000000000002".to_string(),
             rpc_watchdog_interval_sec: 30,
-            event_poll_interval_ms: 7000,
-            get_logs_max_block_span: decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
-            fee_shares_poll_interval_sec: 3600,
+            receipt_poll_interval_ms: 7000,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
@@ -839,7 +842,7 @@ fn config_validate_renders_the_notices_the_resolver_recorded() -> anyhow::Result
 const MINIMAL_VALID_CONFIG: &str = r#"
 [blockchain]
 rpc_url = "http://127.0.0.1:8545"
-payment_pool_address = "0x0000000000000000000000000000000000000001"
+payment_chains = [{ rpc_url = "http://127.0.0.1:8546", chain_id = 84532, payment_pools = ["0x0000000000000000000000000000000000000001"] }]
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 content_blacklist_address = "0x0000000000000000000000000000000000000004"

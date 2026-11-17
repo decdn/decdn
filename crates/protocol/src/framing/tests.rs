@@ -283,6 +283,7 @@ async fn probe_message_full_stack_roundtrip() -> Result<(), FrameError> {
     let ext = crate::message::ProbeResponseExt {
         coverage: crate::Coverage::empty(),
         size_proof: crate::SizeProof::new(1_700_000, vec![0x5A; 64 * 11 + 1000]).ok(),
+        payment_pools: Some(vec![crate::PoolAccount::eip155(1, [0x34; 20])]),
     };
     let ProbeMessage::Response(body) = &resp else {
         unreachable!("resp is a Response")

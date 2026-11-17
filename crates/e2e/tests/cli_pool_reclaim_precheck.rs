@@ -1,6 +1,6 @@
-//! Live anvil-backed e2e for the `decdn pool reclaim --pool` pre-check (#2237).
+//! Live anvil-backed e2e for the `decdn pool reclaim --pool-id` pre-check (#2237).
 //!
-//! `reclaim --pool` reads the pool and the chain's head time before it unlocks
+//! `reclaim --pool-id` reads the pool and the chain's head time before it unlocks
 //! the keystore, and refuses a pool that `reclaim` would revert on with its own
 //! cause. The journey runs every refusal with a *wrong* keystore password: a
 //! refusal that names its cause, not a keystore error, proves the check ran
@@ -121,7 +121,7 @@ async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("no poolId in `pool open` output: {opened}"))?;
     let err = reclaim_refused(home, &pool_id, &chain_argv)?;
     anyhow::ensure!(
-        err.contains("still Open") && err.contains("decdn pool close --pool"),
+        err.contains("still Open") && err.contains("decdn pool close --pool-id"),
         "an Open pool must point at `pool close`: {err}"
     );
 
@@ -129,7 +129,7 @@ async fn run() -> anyhow::Result<()> {
     run_pool(
         home,
         KEYSTORE_PASSWORD,
-        &["close", "--pool", &pool_id],
+        &["close", "--pool-id", &pool_id],
         &chain_argv,
     )?;
     let err = reclaim_refused(home, &pool_id, &chain_argv)?;
@@ -144,7 +144,7 @@ async fn run() -> anyhow::Result<()> {
     let reclaimed = run_pool(
         home,
         KEYSTORE_PASSWORD,
-        &["reclaim", "--pool", &pool_id],
+        &["reclaim", "--pool-id", &pool_id],
         &chain_argv,
     )?;
     anyhow::ensure!(
@@ -161,18 +161,18 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `decdn pool reclaim --pool <id>` with [`WRONG_PASSWORD`], require it to
+/// Run `decdn pool reclaim --pool-id <id>` with [`WRONG_PASSWORD`], require it to
 /// fail before the keystore unlock, and return its stderr.
 fn reclaim_refused(home: &Path, pool_id: &str, chain_argv: &[String]) -> anyhow::Result<String> {
     let out = decdn_command(home, WRONG_PASSWORD)?
-        .args(["pool", "reclaim", "--pool", pool_id])
+        .args(["pool", "reclaim", "--pool-id", pool_id])
         .args(chain_argv)
         .output()
         .context("run decdn pool reclaim")?;
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     anyhow::ensure!(
         !out.status.success(),
-        "`pool reclaim --pool {pool_id}` must be refused: {stderr}"
+        "`pool reclaim --pool-id {pool_id}` must be refused: {stderr}"
     );
     anyhow::ensure!(
         !stderr.contains("keystore"),
@@ -206,12 +206,14 @@ fn run_pool(
 /// The chain + store coordinates every `pool` subcommand here shares.
 fn chain_argv(chain: &ChainFixture, data_dir: &Path, keystore: &Path) -> Vec<String> {
     vec![
-        "--rpc-url".into(),
+        "--pool".into(),
+        format!(
+            "eip155:{}:{:#x}",
+            chain.chain_id(),
+            chain.addrs().payment_pool
+        ),
+        "--pool-rpc-url".into(),
         chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
         "--data-dir".into(),
         data_dir.display().to_string(),
         "--keystore".into(),

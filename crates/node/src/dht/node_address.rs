@@ -7,50 +7,38 @@
 //! (`open_progressive_pull`) verifies the delivery `slash_sig`
 //! recovers *to* it. This module resolves that binding from the same
 //! `CapacityBond` data [`crate::dht::chain_staker_set::ChainStakerSet`] already
-//! reads — `getRegisteredNodes()` returns `NodeInfo { nodeId, ethAddress, .. }` and
-//! `NodeRegistered(nodeId, ethAddress, ..)` carries both — so no new contract
-//! surface is needed.
+//! reads — `getRegisteredNodes()` returns `NodeInfo { nodeId, ethAddress, .. }`
+//! — so no new contract surface is needed.
 //!
 //! This module owns the **projection** only. Because both views come from one
 //! contract, [`crate::dht::capacity_bond_registry`] does a single
-//! `getRegisteredNodes` enumeration and runs a single `eth_getLogs` loop feeding
-//! both, building this via `ChainNodeAddressDirectory::from_parts` (#1110).
+//! `getRegisteredNodes` snapshot feeding both, building this via
+//! `ChainNodeAddressDirectory::from_parts` (#1110).
 //!
 //! The binding is set at `registerNode` and cleared at `deregisterNode`; it is
 //! unaffected by bond / unbonding / ejection transitions (those flip
-//! `isActive`, which the *staker set* tracks separately). So the registry's
-//! bindings arms follow only `NodeRegistered` (insert) and `NodeDeregistered`
-//! (remove) — notably `NodeAutoEjected` deactivates without clearing a binding —
-//! and the enumeration applies no `isActive` filter: an operator below its bond
-//! floor is inactive but still payable.
+//! `isActive`, which the *staker set* tracks separately). The snapshot applies
+//! no `isActive` filter: an operator below its bond floor is inactive but still
+//! payable.
 //!
 //! # Failure model
 //!
-//! Bootstrap: the bindings projection is derived from page data the
-//! (unconditional; fatal on a deterministic fault or once its boot retries are
-//! exhausted) staker-set
-//! enumeration already read, so it has no RPC of its
-//! own and cannot fail independently — see `capacity_bond_registry`'s
-//! §Fatality. It is simply not built when
-//! `cache.node_to_node_pull_through_enabled` is off.
-//!
-//! Watcher RPC failure mid-run → the shared loop logs at `warn!`, backs off
-//! (1s → 60s cap), and re-polls. The cursor is retained across the backoff, so
-//! the next `eth_getLogs` tick re-scans `[cursor, head]` and re-applies any
-//! binding event that landed during the outage — no backoff-gap drift. A missing
-//! binding fails the pull *closed* — the orchestrator skips a provider it cannot
-//! resolve rather than guessing an address it would then pay.
+//! The bindings projection is derived from page data the registry snapshot
+//! already read, so it has no RPC of its own and cannot fail independently. It
+//! is simply not built when `cache.node_to_node_pull_through_enabled` is off. A
+//! failed re-read keeps the previous bindings. A missing binding fails the pull
+//! *closed* — the orchestrator skips a provider it cannot resolve rather than
+//! guessing an address it would then pay.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use alloy::primitives::Address;
 
-use crate::dht::chain_projection::{ChainProjection, mutate_gauged};
+use crate::dht::chain_projection::ChainProjection;
 use crate::dht::routing::NodeId;
-use crate::metrics::Metrics;
 
-/// Names the projection in the poison-recovery `warn!` and gauge helpers.
+/// Names the projection in the poison-recovery `warn!`.
 const LABEL: &str = "ChainNodeAddressDirectory bindings";
 
 /// Read-only resolver from a provider's iroh [`NodeId`] to its bonded operator
@@ -87,18 +75,14 @@ impl NodeAddressResolver for StaticNodeAddressDirectory {
     }
 }
 
-/// Chain-backed [`NodeAddressResolver`]. Cheap to clone via the shared inner
-/// [`Arc`]; the background loop that keeps the cache fresh is the single shared
-/// multiplexed-poller task the runtime owns, so a node-restart cycle never leaks
-/// chain-poll tasks.
+/// Chain-backed [`NodeAddressResolver`] over the registry snapshot's bindings.
 #[derive(Debug)]
 pub struct ChainNodeAddressDirectory {
     proj: ChainProjection<HashMap<NodeId, Address>>,
 }
 
 impl ChainNodeAddressDirectory {
-    /// Assemble from the bindings state owned by `capacity_bond_registry`, which
-    /// does the enumeration and registers the shared poller route.
+    /// Assemble from the bindings state owned by `capacity_bond_registry`.
     pub(super) const fn from_parts(bindings: Arc<RwLock<HashMap<NodeId, Address>>>) -> Self {
         Self {
             proj: ChainProjection::from_parts(bindings, LABEL),
@@ -110,41 +94,6 @@ impl NodeAddressResolver for ChainNodeAddressDirectory {
     fn address_of(&self, node_id: &NodeId) -> Option<Address> {
         self.proj.read(|bindings| bindings.get(node_id).copied())
     }
-}
-
-/// Insert/update `node_id → address`, republishing the size gauge only when the
-/// set actually grew (a re-registration that overwrites an existing binding
-/// with the same key does not change cardinality).
-pub(super) fn set_binding(
-    bindings: &RwLock<HashMap<NodeId, Address>>,
-    metrics: &Arc<Metrics>,
-    node_id: NodeId,
-    address: Address,
-) {
-    mutate_gauged(
-        bindings,
-        LABEL,
-        // `insert` returns the prior value: `None` means a new key (cardinality
-        // grew); `Some` means an overwrite (same key, possibly rotated address)
-        // that leaves the size — and thus the gauge — unchanged.
-        |map| map.insert(node_id, address).is_none().then_some(map.len()),
-        |size| metrics.node_address_directory_size(size),
-    );
-}
-
-/// Remove `node_id`'s binding, republishing the size gauge only on a real
-/// removal (removing an absent key is a no-op).
-pub(super) fn remove_binding(
-    bindings: &RwLock<HashMap<NodeId, Address>>,
-    metrics: &Arc<Metrics>,
-    node_id: &NodeId,
-) {
-    mutate_gauged(
-        bindings,
-        LABEL,
-        |map| map.remove(node_id).is_some().then_some(map.len()),
-        |size| metrics.node_address_directory_size(size),
-    );
 }
 
 #[cfg(test)]

@@ -101,7 +101,7 @@ On the buyer side this costs nothing: the owner issues a capability to an EOA `s
 
 ### Unimplemented — Operator Custody While Serving
 
-**A node whose serving identity is a smart account is not supported, and no implementation is scheduled.** deCDN expects mainnet to want it: an operator custodying a large bond and accumulating USDC earnings has the same reason to hold funds in a multisig that a client does, and unlike a client the operator cannot get there through capability delegation, because a node's serving identity and its fund-holding identity are the same address. `registerNode` binds `msg.sender`, and every `slash_sig` is verified against that address, so separating "hot serving key" from "multisig-custodied funds" needs a mechanism that does not exist yet.
+**A node whose serving identity is a smart account is not supported, and no implementation is scheduled.** An operator is an EOA, and an EOA has the same address on every payment chain. A Safe address differs per chain, so contract-wallet operators are not supported. deCDN expects mainnet to want it: an operator custodying a large bond and accumulating USDC earnings has the same reason to hold funds in a multisig that a client does, and unlike a client the operator cannot get there through capability delegation, because a node's serving identity and its fund-holding identity are the same address. `registerNode` binds `msg.sender`, and every `slash_sig` is verified against that address, so separating "hot serving key" from "multisig-custodied funds" needs a mechanism that does not exist yet.
 
 This section records the requirement and the constraints any future design must satisfy. It commits to no implementation. It exists because the constraints are sharp enough that the obvious approach — verifying `slash_sig` through ERC-1271, the way the contracts already verify cold-path signatures — is unsound, and a future author must not reach for it by default.
 
@@ -124,25 +124,13 @@ The slashing model ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-veri
 
 3. **Gas-bomb on the slash path.** `SlashJudge` → `SignatureChecker` → an external call into the challenged node's contract. A malicious validator burns all forwarded gas or reverts, so the *challenger's* slash transaction fails. `SignatureChecker` puts no gas cap on the ERC-1271 call. Slashing-evasion by denial of service. Any on-chain re-verification of a smart-account signer in a slash path must cap the gas it forwards.
 
-4. **Off-chain ERC-1271 is unsound as evidence.** An off-chain verifier could probe the signer for code and, when present, call `isValidSignature` over an L2 RPC round-trip. But that answers "valid as of block N", and validity is mutable after N. Caching *code presence* is safe (it does not change post-deployment); caching *validity* is not. Fail-open accepts forged signatures; fail-closed makes serving depend on RPC liveness. The recovery-only off-chain path pays none of this.
+4. **Off-chain ERC-1271 is unsound as evidence.** An off-chain verifier could probe the signer for code and, when present, call `isValidSignature` over an RPC round-trip. But that answers "valid as of block N", and validity is mutable after N. Caching *code presence* is safe (it does not change post-deployment); caching *validity* is not. Fail-open accepts forged signatures; fail-closed makes serving depend on RPC liveness. The recovery-only off-chain path pays none of this.
 
 #### The direction, not the design
 
 Because `slash_sig` cannot be ERC-1271, a viable design keeps it EOA-recovered while letting funds sit in a Safe. The shape that does this is a **native operator-signer delegation** that mirrors the buyer capability of [ADR 003 § PaymentPool](003-payments.md#paymentpool): the Safe custodies the bond and earnings and binds, on-chain, a capped hot EOA to the node identity; that EOA signs `slash_sig`, and requesters verify it by recovery exactly as today. The bound EOA is covered by the same bond and the same slashing, so the penalty still lands on a signature the operator cannot avoid emitting to get paid — the property the second signature class requires. This is lower-altitude than a Safe-7579 adapter plus a session-key module, and it does not import a mutable-validity signer into the slash path. It is a direction for a future ADR written against a live consumer, not a commitment here.
 
-### Safe Infrastructure on the Canonical Testnet
-
-deCDN deploys none of the following and depends on none of it. It is recorded because it is what makes "supported" free: the infrastructure an operator or client would need to run a Safe is already deployed on the testnet sibling of the canonical L2 (Arbitrum Sepolia, per [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)), so choosing a Safe costs deCDN nothing.
-
-| Contract | Status | Notes |
-| --- | --- | --- |
-| Safe Singleton (v1.4.1) | Deployed | Core Safe logic |
-| Safe Proxy Factory | Deployed | Deterministic Safe deployment |
-| Safe Singleton Factory | Deployed | `CREATE2` deployment |
-| Compatibility Fallback Handler | Deployed | Stock ERC-1271 routing for an operator or client who chooses a Safe |
-| Multi Send | Deployed | Batch transactions |
-
-A 1-of-1 Safe and any EOA are fully served by the stock `CompatibilityFallbackHandler` above. deCDN runs no ERC-4337 entry point, paymaster, or bundler: operators and clients submit transactions directly and hold ETH for gas, the same assumption as [ADR 003](003-payments.md#adr-003-payment-model). A future operator-custody design ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)) would assess its own dependencies against the hazards recorded there.
+A 1-of-1 Safe and any EOA are served by the stock `CompatibilityFallbackHandler`. deCDN deploys no Safe infrastructure. It runs no ERC-4337 entry point, paymaster, or bundler: operators and clients submit transactions directly and hold the native gas token of each chain they transact on, the same assumption as [ADR 003](003-payments.md#adr-003-payment-model). A future operator-custody design ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)) would assess its own dependencies against the hazards recorded there.
 
 ## Consequences
 

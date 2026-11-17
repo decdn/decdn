@@ -14,7 +14,7 @@ import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
-import { PaymentPool } from "../src/PaymentPool.sol";
+import { CctpSweepReceiver } from "../src/CctpSweepReceiver.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
@@ -38,6 +38,8 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     address internal constant TEST_MULTISIG = address(0xC0DE);
     address internal constant TEST_INITIAL_HOLDER = address(0xbEEF);
     address internal constant TEST_VETTER = address(0xDECAF);
+    address internal constant TEST_TRANSMITTER = address(0xE737);
+    address internal constant TEST_MESSENGER = address(0x8FE6);
 
     // Test-only chain ids so manifest writes never collide with a real
     // `deployments/<realChain>.json`. Each test uses a distinct id to avoid
@@ -55,6 +57,8 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
 
     function setUp() public {
         vm.setEnv("USDC_ADDRESS", vm.toString(TEST_USDC));
+        vm.setEnv("CCTP_MESSAGE_TRANSMITTER", vm.toString(TEST_TRANSMITTER));
+        vm.setEnv("CCTP_TOKEN_MESSENGER", vm.toString(TEST_MESSENGER));
         vm.setEnv("EMERGENCY_MULTISIG", vm.toString(TEST_MULTISIG));
         vm.setEnv("INITIAL_TOKEN_HOLDER", vm.toString(TEST_INITIAL_HOLDER));
         vm.setEnv("INITIAL_VETTER", vm.toString(TEST_VETTER));
@@ -104,11 +108,13 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(uint256(cfg.feeRouterWindowEpochs), uint256(DEFAULT_FEE_ROUTER_WINDOW_EPOCHS), "windowEpochs");
         assertEq(cfg.slashAppealBond, DEFAULT_SLASH_APPEAL_BOND, "slashAppealBond");
 
-        // Launch shares are hard-coded in the script, not env-driven.
-        assertEq(cfg.feeRouterShares[0], LAUNCH_OPERATOR_SHARE, "operator share");
-        assertEq(cfg.feeRouterShares[1], 0, "buyback share dormant");
-        assertEq(cfg.feeRouterShares[2], LAUNCH_TREASURY_SHARE, "treasury share");
+        // The launch split is hard-coded in the script, not env-driven.
+        assertEq(cfg.feeRouterRebateBps, LAUNCH_REBATE_BPS, "rebate");
+        assertEq(cfg.feeRouterBuybackBps, 0, "buyback dormant");
+        assertEq(cfg.feeRouterDeliveryFloor, LAUNCH_DELIVERY_FLOOR, "deliveryFloor");
         assertEq(cfg.buybackBurner, address(0), "buybackBurner unwired");
+        assertEq(address(cfg.cctpMessageTransmitter), TEST_TRANSMITTER, "transmitter");
+        assertEq(cfg.cctpTokenMessenger, TEST_MESSENGER, "messenger");
     }
 
     /// A deploy with no genesis vetter is a governance deadlock (no one can vet a
@@ -161,7 +167,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         d.registry = PublisherRegistry(address(0x06));
         d.timelock = TimelockController(payable(address(0x07)));
         d.governor = DecdnGovernor(payable(address(0x08)));
-        d.paymentPool = PaymentPool(address(0x09));
+        d.sweepReceiver = CctpSweepReceiver(address(0x09));
         d.slashJudge = SlashJudge(address(0x0A));
         d.originAssignment = OriginAssignment(address(0x0B));
         d.vettingPolicy = ManualVettingPolicy(address(0x0C));
@@ -187,7 +193,8 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".contracts.PublisherRegistry"), address(0x06), "PublisherRegistry");
         assertEq(json.readAddress(".contracts.TimelockController"), address(0x07), "Timelock");
         assertEq(json.readAddress(".contracts.DecdnGovernor"), address(0x08), "Governor");
-        assertEq(json.readAddress(".contracts.PaymentPool"), address(0x09), "PaymentPool");
+        assertEq(json.readAddress(".contracts.CctpSweepReceiver"), address(0x09), "CctpSweepReceiver");
+        assertFalse(vm.keyExistsJson(json, ".contracts.PaymentPool"), "no pool on the governance chain");
         assertEq(json.readAddress(".contracts.SlashJudge"), address(0x0A), "SlashJudge");
         assertEq(json.readAddress(".contracts.OriginAssignment"), address(0x0B), "OriginAssignment");
         assertEq(json.readAddress(".contracts.ManualVettingPolicy"), address(0x0C), "ManualVettingPolicy");
@@ -197,6 +204,8 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
 
         assertEq(json.readAddress(".externalDeps.usdc"), TEST_USDC, "usdc");
         assertEq(json.readAddress(".externalDeps.emergencyMultisig"), TEST_MULTISIG, "multisig");
+        assertEq(json.readAddress(".externalDeps.cctpMessageTransmitter"), TEST_TRANSMITTER, "transmitter");
+        assertEq(json.readAddress(".externalDeps.cctpTokenMessenger"), TEST_MESSENGER, "messenger");
 
         assertEq(json.readUint(".chainId"), CHAIN_ID_WRITE, "chainId");
         assertEq(json.readAddress(".deployer"), cfg.deployer, "deployer");
@@ -204,11 +213,9 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readUint(".config.timelockDelay"), DEFAULT_TIMELOCK_DELAY, "timelockDelay");
         assertEq(json.readUint(".config.minBond"), DEFAULT_MIN_BOND, "minBond");
 
-        uint256[] memory shares = json.readUintArray(".config.feeRouterShares");
-        assertEq(shares.length, 3, "shares length");
-        assertEq(shares[0], LAUNCH_OPERATOR_SHARE);
-        assertEq(shares[1], 0);
-        assertEq(shares[2], LAUNCH_TREASURY_SHARE);
+        assertEq(json.readUint(".config.feeRouterRebateBps"), LAUNCH_REBATE_BPS, "rebate");
+        assertEq(json.readUint(".config.feeRouterBuybackBps"), 0, "buyback");
+        assertEq(json.readUint(".config.feeRouterDeliveryFloor"), LAUNCH_DELIVERY_FLOOR, "deliveryFloor");
 
         _cleanupManifest(CHAIN_ID_WRITE);
     }

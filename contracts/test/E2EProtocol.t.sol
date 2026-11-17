@@ -2,11 +2,15 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { Vm } from "forge-std/Vm.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { PaymentPool } from "../src/PaymentPool.sol";
+import { PaymentPoolBase } from "../src/PaymentPoolBase.sol";
+import { ICapacityBondCredit } from "../src/interfaces/ICapacityBondCredit.sol";
+import { IMessageTransmitterV2, ITokenMessengerV2 } from "../src/interfaces/ICctpV2.sol";
+import { LoopbackCctp } from "../testnet/LoopbackCctp.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 
 contract E2EUSDC is ERC20 {
@@ -23,16 +27,19 @@ contract E2EUSDC is ERC20 {
 ///        governance-handed-off contract surface (ADR 003 § PaymentPool):
 ///        open a pool → a signer redeems a voucher against a node, self-
 ///        registering its owner-signed capability on first redemption →
-///        settle through `FeeRouter` → 3-bucket distribution.
+///        sweep the protocol share through CCTP → `CctpSweepReceiver` deposits
+///        it into `FeeRouter` → rebate, treasury, and served-bytes credit.
 /// @dev   Runs the real `_runFullDeploy` pipeline (mock ed25519 verifier +
-///        mock USDC) so `PaymentPool` is wired exactly as production. The
-///        capability + voucher EIP-712 signing mirrors the helpers in
-///        `PaymentPool.t.sol`, rebuilt here against the real deployed pool
-///        and the real `FeeRouter` rather than the unit-test mocks.
+///        mock USDC) with `LoopbackCctp` as the governance chain's CCTP, and a
+///        `PaymentPool` on the same chain that sweeps into the deployed
+///        receiver. The capability + voucher EIP-712 signing mirrors the
+///        helpers in `PaymentPool.t.sol`.
 contract E2EProtocolTest is Test, BaseProtocolDeploy {
     Deployment internal d;
     DeployConfig internal cfg;
     E2EUSDC internal usdc;
+    LoopbackCctp internal cctp;
+    PaymentPool internal pool;
 
     uint256 internal constant OWNER_PK = 0xC11E27;
     uint256 internal constant SIGNER_PK = 0x519E7;
@@ -43,6 +50,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     address internal tokenHolder = address(0x70);
 
     uint256 internal constant MIN_BOND = 50_000e18;
+    uint256 internal constant OPERATOR_BPS = 6000;
     uint64 internal constant DEPOSIT = 1000e6;
     uint64 internal constant SPENDING_CAP = 800e6;
     uint64 internal constant SETTLE_AMOUNT = 800e6;
@@ -59,6 +67,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         signer = vm.addr(SIGNER_PK);
 
         usdc = new E2EUSDC();
+        cctp = new LoopbackCctp(0);
         cfg = DeployConfig({
             usdc: usdc,
             ed25519Verifier: new MockEd25519Verifier(),
@@ -77,58 +86,116 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             currentTermsHash: keccak256("decdn operator terms v1"),
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
-            feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
+            // Launch split: the operator gets 90% of a redemption end to end
+            // (6000 in the pool, then 7500 of the swept 40%), the treasury 10%.
+            feeRouterRebateBps: 7500,
+            feeRouterBuybackBps: 0,
+            feeRouterDeliveryFloor: 1,
             buybackBurner: address(0),
+            cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
+            cctpTokenMessenger: address(cctp),
             slashAppealBond: 1000e18
         });
         d = _runFullDeploy(cfg);
+
+        pool = new PaymentPool({
+            usdc_: usdc,
+            tokenMessenger_: ITokenMessengerV2(address(cctp)),
+            sweepRecipient_: address(d.sweepReceiver),
+            sweepDomain_: 0,
+            disputeWindow_: 48 hours,
+            operatorBps_: OPERATOR_BPS,
+            minSweep_: 1,
+            minDeposit_: 0,
+            pauser_: emergencyMultisig
+        });
 
         vm.warp(1_000_000);
 
         // Fund the pool owner with the USDC it will deposit.
         usdc.transfer(owner, 10_000e6);
         vm.prank(owner);
-        usdc.approve(address(d.paymentPool), type(uint256).max);
+        usdc.approve(address(pool), type(uint256).max);
     }
 
     // -----------------------------------------------------------------
     // Deploy wiring
     // -----------------------------------------------------------------
 
-    function test_deployWiring_paymentPoolWiredAndHandedOff() public view {
-        // Post-deployment role grants (ADR 016 § Post-Deployment Initialization).
-        assertTrue(d.router.hasRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentPool)), "paymentPool ROUTER_CALLER");
-        assertTrue(d.paymentPool.hasRole(d.paymentPool.PAUSER_ROLE(), emergencyMultisig), "paymentPool PAUSER");
-
-        // Constructor dependency wiring.
-        assertEq(d.paymentPool.feeRouter(), address(d.router), "paymentPool.feeRouter");
-        assertEq(address(d.paymentPool.capacityBond()), address(d.bond), "paymentPool.capacityBond");
-
-        // Governance handoff: Timelock governs PaymentPool; deployer holds nothing.
-        address tl = address(d.timelock);
-        assertTrue(d.paymentPool.hasRole(GOVERNANCE_ROLE, tl), "paymentPool gov");
-        assertFalse(d.paymentPool.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer), "no paymentPool back door");
+    function test_deployWiring_sweepReceiverBound() public view {
+        assertEq(address(d.sweepReceiver.feeRouter()), address(d.router), "receiver.feeRouter");
+        assertEq(address(d.sweepReceiver.usdc()), address(usdc), "receiver.usdc");
+        assertEq(address(d.sweepReceiver.messageTransmitter()), address(cctp), "receiver.messageTransmitter");
+        assertEq(d.sweepReceiver.tokenMessenger(), address(cctp), "receiver.tokenMessenger");
+        assertEq(address(d.router.capacityBond()), address(d.bond), "router.capacityBond");
+        assertEq(d.router.treasury(), address(d.timelock), "router.treasury");
     }
 
     // -----------------------------------------------------------------
     // Full redemption lifecycle
     // -----------------------------------------------------------------
 
-    function test_e2e_openPoolRedeemSettlesThroughFeeRouter() public {
+    function test_e2e_openPoolRedeemSweepSettlesThroughFeeRouter() public {
         vm.prank(owner);
-        bytes32 poolId = d.paymentPool.openPool(DEPOSIT);
+        bytes32 poolId = pool.openPool(DEPOSIT);
 
+        _redeem(poolId);
+
+        uint256 operatorShare = uint256(SETTLE_AMOUNT) * OPERATOR_BPS / 10_000;
+        uint256 protocolShare = SETTLE_AMOUNT - operatorShare;
+        assertEq(usdc.balanceOf(operator), operatorShare, "same-transaction operator share");
+        (uint256 pendingBytes, uint256 pendingUsdc) = pool.pending(operator);
+        assertEq(pendingUsdc, protocolShare, "protocol share pending");
+        assertEq(pendingBytes, SETTLE_BYTES, "served bytes pending");
+
+        // `FeeRouter.deposit` rebates and credits only an active operator with
+        // a declared capacity; stand the operator up as both without a full
+        // onboarding. The floor tier's byte ceiling far exceeds SETTLE_BYTES.
+        vm.mockCall(address(d.bond), abi.encodeCall(ICapacityBondCredit.isActive, (operator)), abi.encode(true));
+        vm.mockCall(
+            address(d.bond), abi.encodeCall(ICapacityBondCredit.declaredMbps, (operator)), abi.encode(uint256(10))
+        );
+
+        vm.recordLogs();
+        address[] memory operators = new address[](1);
+        operators[0] = operator;
+        pool.sweep(operators);
+        d.sweepReceiver.receiveSweep(_lastCctpMessage(), hex"01");
+
+        // Launch split, read from cfg so the assertion tracks the deploy config.
+        uint256 rebate = protocolShare * cfg.feeRouterRebateBps / 10_000;
+        assertEq(usdc.balanceOf(operator), operatorShare + rebate, "operator share plus rebate");
+        assertEq(usdc.balanceOf(address(d.timelock)), protocolShare - rebate, "treasury share");
+        assertEq(d.router.buybackBurner(), address(0), "buyback dormant at launch");
+        assertEq(usdc.balanceOf(address(d.router)), 0, "router holds nothing");
+
+        uint256 epoch = block.timestamp / cfg.feeRouterEpochLength;
+        assertEq(d.router.bytesPerEpoch(operator, uint64(epoch)), SETTLE_BYTES, "served bytes credited");
+
+        // Watermark + authorization advanced.
+        PaymentPoolBase.Lane memory lane = pool.getWatermark(poolId, signer, operator);
+        assertEq(lane.amount, SETTLE_AMOUNT, "watermark cumulative advanced");
+        assertEq(lane.bytesDelivered, SETTLE_BYTES, "watermark bytes advanced");
+    }
+
+    // -----------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------
+
+    /// @dev `operator` redeems one sealed voucher for `SETTLE_AMOUNT` against
+    ///      `poolId`, registering the signer's capability in the same batch.
+    function _redeem(bytes32 poolId) internal {
         uint64 expiry = uint64(block.timestamp + 365 days);
-        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
-        caps[0] = PaymentPool.CapabilityReg({
+        PaymentPoolBase.CapabilityReg[] memory caps = new PaymentPoolBase.CapabilityReg[](1);
+        caps[0] = PaymentPoolBase.CapabilityReg({
             signer: signer,
             spendingCap: SPENDING_CAP,
             expiry: expiry,
             ownerSig: _capabilitySig(poolId, signer, SPENDING_CAP, expiry, OWNER_PK)
         });
         (bytes32 vr, bytes32 vvs) = _voucherSig(poolId, signer, operator, SETTLE_AMOUNT, SETTLE_BYTES, SIGNER_PK);
-        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
-        vouchers[0] = PaymentPool.LaneVoucher({
+        PaymentPoolBase.LaneVoucher[] memory vouchers = new PaymentPoolBase.LaneVoucher[](1);
+        vouchers[0] = PaymentPoolBase.LaneVoucher({
             signer: signer,
             cumulative: SETTLE_AMOUNT,
             bytesDelivered: SETTLE_BYTES,
@@ -138,48 +205,32 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             preimage: bytes32(0),
             chainMeter: 0
         });
-        PaymentPool.PoolBatch[] memory batches = new PaymentPool.PoolBatch[](1);
-        batches[0] = PaymentPool.PoolBatch({ poolId: poolId, capabilities: caps, vouchers: vouchers });
+        PaymentPoolBase.PoolBatch[] memory batches = new PaymentPoolBase.PoolBatch[](1);
+        batches[0] = PaymentPoolBase.PoolBatch({ poolId: poolId, capabilities: caps, vouchers: vouchers });
 
-        PaymentPool.LaneSettled[] memory expected = new PaymentPool.LaneSettled[](1);
+        PaymentPoolBase.LaneSettled[] memory expected = new PaymentPoolBase.LaneSettled[](1);
         expected[0] =
-            PaymentPool.LaneSettled({ signer: signer, newPaidCumulative: SETTLE_AMOUNT, bytesPaid: SETTLE_BYTES });
-        // Redemption pays only a bound operator and stamps bytes only for an
-        // active one; stand the operator up as both without a full onboarding.
-        vm.mockCall(
-            address(d.bond),
-            abi.encodeWithSignature("nodeIdOf(address)", operator),
-            abi.encode(bytes32(uint256(0x0FE1)), true)
-        );
+            PaymentPoolBase.LaneSettled({ signer: signer, newPaidCumulative: SETTLE_AMOUNT, bytesPaid: SETTLE_BYTES });
 
-        vm.expectEmit(true, true, true, true, address(d.paymentPool));
+        vm.expectEmit(true, true, true, true, address(pool));
         emit PoolRedeemed(poolId, operator, expected);
 
         vm.prank(operator);
-        d.paymentPool.redeemMany(batches);
-
-        // Three-bucket distribution at the configured launch shares (read from
-        // cfg, not re-hardcoded, so the assertion tracks the deploy config).
-        assertEq(
-            usdc.balanceOf(operator),
-            SETTLE_AMOUNT * cfg.feeRouterShares[0] / 10_000,
-            "operator base share (operator bucket)"
-        );
-        assertEq(usdc.balanceOf(address(d.timelock)), SETTLE_AMOUNT * cfg.feeRouterShares[2] / 10_000, "treasury share");
-        assertEq(usdc.balanceOf(d.router.buybackBurner()), 0, "buyback dormant at launch");
-
-        uint256 epoch = block.timestamp / cfg.feeRouterEpochLength;
-        assertEq(d.router.bytesPerEpoch(operator, uint64(epoch)), SETTLE_BYTES, "served bytes stamped");
-
-        // Watermark + authorization advanced.
-        PaymentPool.Lane memory lane = d.paymentPool.getWatermark(poolId, signer, operator);
-        assertEq(lane.amount, SETTLE_AMOUNT, "watermark cumulative advanced");
-        assertEq(lane.bytesDelivered, SETTLE_BYTES, "watermark bytes advanced");
+        pool.redeemMany(batches);
     }
 
-    // -----------------------------------------------------------------
-    // EIP-712 signing helpers
-    // -----------------------------------------------------------------
+    /// @dev The burn message of the last `LoopbackCctp.MessageSent` in the
+    ///      recorded logs.
+    function _lastCctpMessage() internal view returns (bytes memory) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("MessageSent(bytes)");
+        for (uint256 i = logs.length; i > 0; i--) {
+            if (logs[i - 1].emitter == address(cctp) && logs[i - 1].topics[0] == sig) {
+                return abi.decode(logs[i - 1].data, (bytes));
+            }
+        }
+        revert("no MessageSent");
+    }
 
     function _domainSeparator(address verifyingContract) internal view returns (bytes32) {
         return keccak256(
@@ -199,7 +250,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         returns (bytes memory)
     {
         bytes32 structHash = keccak256(abi.encode(CAPABILITY_TYPEHASH, signer_, spendingCap, poolId, expiry));
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(address(d.paymentPool)), structHash));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(address(pool)), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
     }
@@ -220,11 +271,11 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         bytes32 structHash = keccak256(
             abi.encode(VOUCHER_TYPEHASH, poolId, signer_, provider_, amount, bytesDelivered, bytes32(0), uint256(0))
         );
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(address(d.paymentPool)), structHash));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(address(pool)), structHash));
         (uint8 v, bytes32 r, bytes32 sv) = vm.sign(pk, digest);
         return (r, bytes32(uint256(sv) | (uint256(v - 27) << 255)));
     }
 
-    /// @dev Mirrors `PaymentPool.PoolRedeemed` for `vm.expectEmit`.
-    event PoolRedeemed(bytes32 indexed poolId, address indexed provider, PaymentPool.LaneSettled[] lanes);
+    /// @dev Mirrors `PaymentPoolBase.PoolRedeemed` for `vm.expectEmit`.
+    event PoolRedeemed(bytes32 indexed poolId, address indexed provider, PaymentPoolBase.LaneSettled[] lanes);
 }

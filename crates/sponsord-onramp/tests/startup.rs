@@ -28,12 +28,18 @@ fn fake_source() -> Arc<dyn CapabilitySource> {
 }
 
 #[tokio::test]
-async fn build_takes_the_chain_from_the_daemon() {
-    let st = state::build(&test_config(), fake_source(), gate())
-        .await
-        .unwrap();
-    assert_eq!(st.profile.chain_id, test_info().chain_id);
+async fn build_takes_the_pool_chain_from_the_daemon_and_the_governance_chain_from_config() {
+    let cfg = test_config();
+    let st = state::build(&cfg, fake_source(), gate()).await.unwrap();
+    assert_eq!(st.profile.pool_chain_id, test_info().chain_id);
     assert_eq!(st.profile.payment_pool, test_info().payment_pool);
+    assert_eq!(st.profile.pool_rpc_url, cfg.pool_rpc_url);
+    assert_eq!(st.profile.governance_chain_id, cfg.governance_chain_id);
+    assert_eq!(st.profile.governance_rpc_url, cfg.governance_rpc_url);
+    assert_ne!(
+        st.profile.governance_chain_id, st.profile.pool_chain_id,
+        "the fixtures keep the two chains apart"
+    );
 }
 
 #[tokio::test]

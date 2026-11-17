@@ -1,156 +1,75 @@
 //! Chain-backed [`StakerSet`] implementation.
 //!
 //! This module owns the **projection** only: the cached `NodeId → active?` set
-//! and its accessors. The `CapacityBond` enumeration and
-//! the event watcher that keep it current live in
-//! [`crate::dht::capacity_bond_registry`] (#1110), which builds this via
-//! `ChainStakerSet::from_parts` — it shares one `getRegisteredNodes` read and one
-//! `eth_getLogs` loop with the node-address directory, since both are derived
-//! from the same contract.
+//! and its accessors. The `CapacityBond` snapshot that keeps it current lives in
+//! [`crate::dht::capacity_bond_registry`], which builds this via
+//! `ChainStakerSet::from_parts` and shares one `getRegisteredNodes` read with
+//! the other registry projections.
 //!
-//! The cached set is seeded from `CapacityBond.getRegisteredNodes()`, keyed on the
-//! parallel `active[]` the contract computes per entry — the full `isActive`
-//! predicate: registered, bond ≥ minBond, no unbonding, not ejected. The page
-//! itself is the un-filtered `_registeredAddrs` array (the node-address directory
-//! keeps every entry), so the contract returns the predicate alongside it rather
-//! than filtering the page. It then follows the five membership-mutating events,
-//! applying a `StakerChange`
-//! for every observed transition. (Not an intra-doc link: `StakerChange` is
-//! private to `dht` since #1231, and this module doc is public.)
+//! The cached set is the parallel `active[]` that
+//! `CapacityBond.getRegisteredNodes()` computes per entry — the full `isActive`
+//! predicate: registered, bond ≥ minBond, no unbonding, not ejected. The
+//! registry re-reads it every five minutes, and early when a lookup here misses
+//! (a node that registered since the last read), at most once per minute.
 //!
 //! # Spec mapping
 //!
-//! - ADR 022 §STORE Flow: the receiver checks `holder` is in the
-//!   cached active-staker set populated from
-//!   `CapacityBond.getRegisteredNodes()`.
-//! - ADR 019 § Step 3.3: bootstrap pattern (initial paginated
-//!   `getRegisteredNodes` + event follow — implemented as an `eth_getLogs`
-//!   poll, #1106).
-//! - The event set the watcher follows is grounded in
-//!   `CapacityBond.sol`'s own write-paths — every contract write
-//!   that flips the canonical `isActive` predicate is mirrored by an
-//!   event there.
+//! - ADR 022 §STORE Flow: the receiver checks `holder` is in the cached
+//!   active-staker set populated from `CapacityBond.getRegisteredNodes()`.
+//! - ADR 019 § Step 3.3: the registry snapshot pattern.
 //!
 //! # Failure model
 //!
 //! Bootstrap RPC failure → the registry bootstrap propagates the error (the
-//! runtime treats it as fatal; the DHT cannot function without a staker set).
-//!
-//! Watcher RPC failure (mid-run) → the shared loop logs at `warn!`, sleeps for an
-//! exponentially-growing backoff (1s → 60s cap), and re-polls. The cursor is
-//! retained across the backoff, so the next `eth_getLogs` tick re-scans
-//! `[cursor, head]` and re-applies any membership event that landed during the
-//! outage — no stream-level drift window.
-//!
-//! A narrower drift source: an operator-indexed event whose follow-up
-//! `nodeIdOf(operator)` RPC fails is dropped (the membership change is
-//! lost) without tripping the stream backoff. That case bumps no
-//! restart/down-seconds metric, so it is surfaced separately by
-//! `decdn_staker_set_watcher_resolve_failures_total` (#788).
-//!
-//! This drift window is dashboard-visible and alertable via four
-//! metrics (#783, #788), distinct from `decdn_rpc_healthy` (which tracks
-//! the reachability watchdog, not this task):
-//! - `decdn_staker_set_watcher_restarts_total` — distinct drift windows;
-//!   bumped once on the *edge* from a healthy cycle into the error state,
-//!   not once per backoff iteration of one continuous outage.
-//! - `decdn_staker_set_watcher_down_seconds` — true downtime: reads `0`
-//!   for the whole life of any established cycle (however long/quiet) and
-//!   climbs only while the loop is in error/backoff between a failed cycle
-//!   and the next success, so an alert fires on a *sustained* outage.
-//! - `decdn_staker_set_watcher_resolve_failures_total` — operator-indexed
-//!   events (`Reinstated` / `UnbondingRequested`) dropped because the
-//!   follow-up `nodeIdOf` RPC failed; a nonzero rate is silent-drift risk
-//!   that no stream-level restart would otherwise surface.
-//! - `decdn_staker_set_active_count` — current cached active-set size,
-//!   to spot a frozen or collapsed cache.
-//!
-//! Two more cover the repair rather than the drift:
-//! - `decdn_capacity_bond_registry_resync_failures_total` — re-enumerations
-//!   that could not read chain state and kept the previous projections.
-//! - `decdn_capacity_bond_registry_last_resync_timestamp_seconds` — when the
-//!   last one succeeded; the signal that catches a repair being *skipped*,
-//!   which emits nothing at all.
-//!
-//! Since #1110 these describe the one shared `capacity-bond` loop, which also
-//! feeds the bindings projection — so they are that loop's health for both, and
-//! there is no separate node-address watcher family to correlate against
-//! (#1231).
-//!
-//! Re-enumeration is what repairs the drift sources above:
-//! `capacity_bond_registry` re-derives the whole projection from
-//! `getRegisteredNodes`, build-then-swap, so a dropped `nodeIdOf` change is
-//! corrected without waiting for the next event for that operator. Two triggers
-//! drive it. The cadence runs it every `REGISTRY_RESYNC_INTERVAL`. The recovery
-//! edge runs it on the tick the route comes back from an errored one, through
-//! `LogSink::on_recovered`, which is what covers the outage case the cadence
-//! handles worst: `reconcile_routes` skips a route that errored this tick, so
-//! during the outage the cadence repair does not run at all, and a resync whose
-//! own read fails stamps the clock anyway and defers a further interval.
-//!
-//! Neither trigger is a ceiling, for two reasons worth knowing before reading
-//! the metrics as one. The recovery edge fires on a route-level outage — a tick
-//! that errored — and a dropped `nodeIdOf` does not error the route, since
-//! `on_operator_change` returns `Ok` by design; a change lost that way with the
-//! poll otherwise healthy still waits for the cadence. And the re-enumeration
-//! the edge forces can itself fail, which stamps the clock and defers the next
-//! attempt a further interval. So the window closes on the first *successful*
-//! re-enumeration after recovery, not on recovery itself. The metrics above size
-//! that window; the two registry metrics report whether the repair is landing.
+//! runtime treats it as fatal; the DHT cannot function without a staker set). A
+//! failed re-read keeps the previous set and counts
+//! `decdn_capacity_bond_registry_resync_failures_total`;
+//! `decdn_capacity_bond_registry_last_resync_timestamp_seconds` reports when
+//! the last one succeeded, and `decdn_staker_set_active_count` the set size.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use crate::dht::chain_projection::{ChainProjection, mutate_gauged};
+use crate::chain_events::refresh::RefreshTrigger;
+use crate::dht::chain_projection::ChainProjection;
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
-use crate::metrics::Metrics;
 
-/// Names the projection in the poison-recovery `warn!` and gauge helpers.
+/// Names the projection in the poison-recovery `warn!`.
 const LABEL: &str = "ChainStakerSet active set";
 
-/// One membership transition, as [`apply_change`] applies it to the cached set.
-///
-/// `capacity_bond_registry` builds one of these for every observed
-/// `CapacityBond` event that flips the canonical `isActive` predicate
-/// (`NodeRegistered` / `NodeDeregistered` / `NodeAutoEjected` / `Reinstated` /
-/// `UnbondingRequested`).
-///
-/// Internal to `dht`, and it lives here rather than in `staker_set` because
-/// `ConfigStakerSet` has no use for it: the only producer
-/// (`capacity_bond_registry`) and the only consumer (`apply_change`, below) are
-/// both on the chain-backed path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StakerChange {
-    /// `node_id` joined the active set (was absent, now present).
-    Active(NodeId),
-    /// `node_id` left the active set (was present, now absent).
-    Inactive(NodeId),
-}
-
-/// Chain-backed staker set. Cheap to clone via the shared inner
-/// [`Arc`]; the runtime holds one `Arc<dyn StakerSet>` and consumers
-/// access the cached set through it. The background loop that keeps the
-/// cache fresh is the single shared multiplexed-poller task the runtime
-/// owns, so a node-restart cycle never leaks chain-poll tasks.
+/// Chain-backed staker set. The runtime holds one `Arc<dyn StakerSet>` and
+/// consumers read the cached set through it.
 #[derive(Debug)]
 pub struct ChainStakerSet {
     proj: ChainProjection<HashSet<NodeId>>,
+    /// Asks the registry for an early re-read when a lookup misses.
+    on_miss: RefreshTrigger,
 }
 
 impl ChainStakerSet {
-    /// Assemble from the active-set state owned by `capacity_bond_registry`,
-    /// which does the enumeration and registers the shared poller route.
-    pub(super) const fn from_parts(active: Arc<RwLock<HashSet<NodeId>>>) -> Self {
+    /// Assemble from the active-set state owned by `capacity_bond_registry`.
+    pub(super) const fn from_parts(
+        active: Arc<RwLock<HashSet<NodeId>>>,
+        on_miss: RefreshTrigger,
+    ) -> Self {
         Self {
             proj: ChainProjection::from_parts(active, LABEL),
+            on_miss,
         }
     }
 }
 
 impl StakerSet for ChainStakerSet {
     fn is_active(&self, node_id: &NodeId) -> bool {
-        self.proj.read(|s| s.contains(node_id))
+        let active = self.proj.read(|s| s.contains(node_id));
+        if !active {
+            // A node registered since the last snapshot reads inactive until
+            // the next one; the request pulls that read forward. An inactive
+            // node asks too, and the registry's rate limit bounds the cost.
+            self.on_miss.request();
+        }
+        active
     }
 
     fn active_nodes(&self) -> Vec<NodeId> {
@@ -160,36 +79,6 @@ impl StakerSet for ChainStakerSet {
     fn len(&self) -> usize {
         self.proj.read(HashSet::len)
     }
-}
-
-/// Apply a change to the active set. Returns whether membership actually
-/// moved — `false` for an idempotent no-op (a re-insert, or a remove of an
-/// absent id), which a re-scanned `eth_getLogs` window produces routinely.
-///
-/// The bool mirrors the `HashSet::insert` / `HashSet::remove` contract this
-/// function dispatches to, and is computed anyway to gate the
-/// `staker_set_active_count` republish below. Callers may ignore it (hence no
-/// `#[must_use]`) — every production call site does, since an idempotent no-op
-/// is a routine outcome rather than an error. In production the mutation-gated
-/// gauge is the observable signal; the bool is what the idempotence tests below
-/// assert on.
-pub(super) fn apply_change(
-    active: &RwLock<HashSet<NodeId>>,
-    metrics: &Arc<Metrics>,
-    change: StakerChange,
-) -> bool {
-    mutate_gauged(
-        active,
-        LABEL,
-        |set| {
-            let mutated = match change {
-                StakerChange::Active(id) => set.insert(id),
-                StakerChange::Inactive(id) => set.remove(&id),
-            };
-            mutated.then_some(set.len())
-        },
-        |size| metrics.staker_set_active_count(size),
-    )
 }
 
 #[cfg(test)]

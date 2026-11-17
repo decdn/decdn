@@ -106,30 +106,16 @@ impl BuyerLaneProgress {
 /// Buyer-held state for one pool, fanned out across every `(signer,
 /// provider)` lane the owner has signed vouchers on.
 ///
-/// **Field invariant:** `pool_id` is the **store key**, and it is unique only
-/// within one deployment. The contract derives it as
-/// `keccak256(owner, ownerPoolNonce)` over neither the contract address nor
-/// the chain id, and a fresh `PaymentPool` deployment restarts
-/// `ownerPoolNonce` at zero — so the same owner's Nth pool carries the same
-/// `pool_id` in every deployment.
+/// **Field invariant:** `(deployment, pool_id)` is the **store key**. The
+/// contract derives `pool_id` as `keccak256(owner, ownerPoolNonce)` over
+/// neither the contract address nor the chain id, and a fresh `PaymentPool`
+/// deployment restarts `ownerPoolNonce` at zero — so the same owner's Nth pool
+/// carries the same `pool_id` in every deployment. `deployment` — the payment
+/// chain id and the `PaymentPool` address — tells two such pools apart, so a
+/// [`BuyerPoolStore`] holds rows of several deployments side by side and
+/// every lookup names the deployment it reads.
 ///
-/// `deployment` — the chain id and the `PaymentPool` address — is the
-/// **deployment tag** that tells two such pools apart. It is not part of the
-/// store key: a [`BuyerPoolStore`] keys its pool rows by `pool_id`
-/// alone, so it cannot hold rows for two deployments under one id — recording
-/// the second overwrites the first. (Its delegate lanes carry the deployment
-/// in their key, [`BuyerPoolStore::delegate_lanes`].) What the tag buys is detection, and every
-/// path that reuses a persisted row owes it a check (see [`Self::is_on`]).
-///
-/// A row from a deployment the node is not configured against carries two numbers
-/// that are wrong here, in opposite directions. Its lane progress would seed
-/// the first voucher at a cumulative the live pool has never redeemed against,
-/// so the provider collects the whole of it for bytes it never delivered here.
-/// Its `deposit` may over-state what the live pool can fund, so vouchers signed
-/// past the real balance stop redeeming. Neither is recoverable by resuming
-/// more carefully; the row has to go.
-///
-/// `owner` is a **secondary reuse index** — the
+/// `(deployment, owner)` is a **secondary reuse index** — the
 /// open-pool trigger looks it up to decide whether to reuse an existing pool
 /// instead of opening a new one — not the identity key: two pools can
 /// (transiently) exist for the same owner, e.g. across a rotate. Per-lane
@@ -289,12 +275,9 @@ impl BuyerPoolState {
     }
 
     /// Whether this row describes a pool on `deployment`: the same chain and
-    /// the same `PaymentPool` contract.
-    ///
-    /// Every path that reuses a persisted row must check this first, and treat
-    /// a `false` as "no row": it means the row was written against a different
-    /// `PaymentPool` deployment, and its `pool_id` may nonetheless name an
-    /// existing, unrelated pool here (see the field invariant).
+    /// the same `PaymentPool` contract. [`BuyerPoolStore::load_all`] returns
+    /// the rows of every deployment, so a caller that wants one deployment's
+    /// rows filters on this.
     #[must_use]
     pub fn is_on(&self, deployment: Deployment) -> bool {
         self.deployment == deployment
@@ -543,20 +526,23 @@ pub enum DepositOutcome {
     PoolMismatch,
 }
 
-/// Durable backing store for [`BuyerPoolState`], keyed by `pool_id` (its
-/// on-chain identity) with `owner` as a secondary reuse index.
+/// Durable backing store for [`BuyerPoolState`], keyed by `(deployment,
+/// pool_id)` (its on-chain identity) with `(deployment, owner)` as a secondary
+/// reuse index. Rows of several `PaymentPool` deployments live side by side,
+/// and every lookup names its [`Deployment`].
 ///
 /// Mirrors [`crate::store::PoolStateStore`] but for the buyer's view. The
-/// reuse unit is one open pool per owner, so `get_by_owner` is the hot path
-/// the pool-open trigger consults before deciding to reuse vs. open — it
-/// resolves through the owner index to the primary `pool_id`-keyed row.
+/// reuse unit is one open pool per owner per deployment, so `get_by_owner` is
+/// the hot path the pool-open trigger consults before deciding to reuse vs.
+/// open — it resolves through the owner index to the primary row.
 /// Implementations MUST persist `record`/`forget` durably (fsync, for
 /// disk-backed impls) before returning `Ok`.
 ///
 /// The store also keeps a delegate's lane watermarks, apart from the pool rows
 /// and keyed by deployment and [`LaneKey`] ([`Self::delegate_lanes`]).
 pub trait BuyerPoolStore: Send + Sync {
-    /// Load every persisted buyer pool. Called once at bring-up to hydrate
+    /// Load every persisted buyer pool, of every deployment. Called once at
+    /// bring-up to hydrate
     /// the in-memory pool map and seed the reclaim sweep.
     ///
     /// # Errors
@@ -567,8 +553,9 @@ pub trait BuyerPoolStore: Send + Sync {
     fn load_all(&self) -> Result<BuyerLoad, StoreError>;
 
     /// Persist (insert or overwrite) the state for one pool, keyed by
-    /// `state.pool_id` (primary) with `state.owner` maintained as a
-    /// secondary reuse index. MUST be durable before returning `Ok`.
+    /// `(state.deployment, state.pool_id)` (primary) with `(state.deployment,
+    /// state.owner)` maintained as a secondary reuse index. MUST be durable
+    /// before returning `Ok`.
     ///
     /// Callers SHOULD pass a `state` whose lane progress is a non-strict
     /// monotonic successor of any previously-recorded state for
@@ -581,15 +568,15 @@ pub trait BuyerPoolStore: Send + Sync {
     /// Returns a [`StoreError`] if the write or fsync fails.
     fn record(&self, state: &BuyerPoolState) -> Result<(), StoreError>;
 
-    /// Drop the persisted entry the owner index currently maps `owner` to
-    /// (after the pool is reclaimed or closed), removing it from both the
-    /// primary table and the owner index. A no-op if no record exists. MUST
-    /// commit durably.
+    /// Drop the persisted entry the owner index currently maps `(deployment,
+    /// owner)` to (after the pool is reclaimed or closed), removing it from
+    /// both the primary table and the owner index. A no-op if no record
+    /// exists. MUST commit durably.
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the delete or durable commit fails.
-    fn forget(&self, owner: Address) -> Result<(), StoreError>;
+    fn forget(&self, deployment: Deployment, owner: Address) -> Result<(), StoreError>;
 
     /// Point-lookup the live pool by its primary key, or `None` if none is
     /// tracked. Unlike [`Self::get_by_owner`] this needs no secondary index
@@ -599,7 +586,11 @@ pub trait BuyerPoolStore: Send + Sync {
     ///
     /// Returns a [`StoreError`] if the backing store is unreadable or the
     /// record is corrupt.
-    fn get_by_pool_id(&self, pool_id: PoolId) -> Result<Option<BuyerPoolState>, StoreError>;
+    fn get_by_pool_id(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+    ) -> Result<Option<BuyerPoolState>, StoreError>;
 
     /// Compare-and-delete: drop `owner`'s entry **only if** the stored
     /// record's `pool_id` still equals `pool_id`. Returns `true` if a row was
@@ -617,17 +608,26 @@ pub trait BuyerPoolStore: Send + Sync {
     ///
     /// Returns a [`StoreError`] if the read, delete, or durable commit
     /// fails.
-    fn forget_if_pool(&self, owner: Address, pool_id: PoolId) -> Result<bool, StoreError>;
+    fn forget_if_pool(
+        &self,
+        deployment: Deployment,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<bool, StoreError>;
 
-    /// Point-lookup the live pool for `owner`, or `None` if none is tracked.
-    /// The open-pool trigger uses this to reuse an existing pool instead of
-    /// opening a new one.
+    /// Point-lookup the live pool for `owner` on `deployment`, or `None` if
+    /// none is tracked. The open-pool trigger uses this to reuse an existing
+    /// pool instead of opening a new one.
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the backing store is unreadable or the
     /// record is corrupt.
-    fn get_by_owner(&self, owner: Address) -> Result<Option<BuyerPoolState>, StoreError>;
+    fn get_by_owner(
+        &self,
+        deployment: Deployment,
+        owner: Address,
+    ) -> Result<Option<BuyerPoolState>, StoreError>;
 
     /// Atomically advance the committed progress for `lane` inside `owner`'s
     /// pool.
@@ -648,6 +648,7 @@ pub trait BuyerPoolStore: Send + Sync {
     /// the `Ok` value.
     fn advance_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -667,6 +668,7 @@ pub trait BuyerPoolStore: Send + Sync {
     /// Returns a [`StoreError`] only on a backend/codec fault.
     fn rebase_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -685,6 +687,7 @@ pub trait BuyerPoolStore: Send + Sync {
     /// Returns a [`StoreError`] only on a backend/codec fault.
     fn seed_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -708,6 +711,7 @@ pub trait BuyerPoolStore: Send + Sync {
     /// committed-row decision is the `Ok` value.
     fn add_deposit(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         additional: U256,
@@ -781,15 +785,36 @@ pub trait BuyerPoolStore: Send + Sync {
 }
 
 /// In-memory backing for [`MemoryBuyerPoolStore`]: the primary
-/// `pool_id`-keyed map plus the `owner → pool_id` secondary reuse index,
-/// held behind one mutex so the pair updates atomically (mirrors the redb
-/// table's single-write-transaction discipline).
+/// `(deployment, pool_id)`-keyed map plus the `(deployment, owner) → pool_id`
+/// secondary reuse index, held behind one mutex so the pair updates
+/// atomically (mirrors the redb table's single-write-transaction discipline).
 #[derive(Debug, Default)]
 struct MemoryInner {
-    pools: HashMap<PoolId, BuyerPoolState>,
-    owner_index: HashMap<Address, PoolId>,
+    pools: HashMap<(Deployment, PoolId), BuyerPoolState>,
+    owner_index: HashMap<(Deployment, Address), PoolId>,
     delegate_lanes: HashMap<(Deployment, LaneKey), BuyerLaneProgress>,
     lane_salt: Option<LaneSalt>,
+}
+
+impl MemoryInner {
+    /// The row the owner index maps `(deployment, owner)` to, when it is
+    /// `pool_id`; otherwise the outcome a progress write reports.
+    fn owned_row(
+        &mut self,
+        deployment: Deployment,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<&mut BuyerPoolState, AdvanceOutcome> {
+        let Some(mapped) = self.owner_index.get(&(deployment, owner)).copied() else {
+            return Err(AdvanceOutcome::UnknownPool);
+        };
+        if mapped != pool_id {
+            return Err(AdvanceOutcome::PoolMismatch);
+        }
+        self.pools
+            .get_mut(&(deployment, pool_id))
+            .ok_or(AdvanceOutcome::UnknownPool)
+    }
 }
 
 /// In-memory [`BuyerPoolStore`] for tests and the trait's reference
@@ -837,57 +862,75 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        guard.owner_index.insert(state.owner, state.pool_id);
-        guard.pools.insert(state.pool_id, state.clone());
+        guard
+            .owner_index
+            .insert((state.deployment, state.owner), state.pool_id);
+        guard
+            .pools
+            .insert((state.deployment, state.pool_id), state.clone());
         Ok(())
     }
 
-    fn forget(&self, owner: Address) -> Result<(), StoreError> {
+    fn forget(&self, deployment: Deployment, owner: Address) -> Result<(), StoreError> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        if let Some(pool_id) = guard.owner_index.remove(&owner) {
-            guard.pools.remove(&pool_id);
+        if let Some(pool_id) = guard.owner_index.remove(&(deployment, owner)) {
+            guard.pools.remove(&(deployment, pool_id));
         }
         Ok(())
     }
 
-    fn forget_if_pool(&self, owner: Address, pool_id: PoolId) -> Result<bool, StoreError> {
+    fn forget_if_pool(
+        &self,
+        deployment: Deployment,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<bool, StoreError> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        if guard.owner_index.get(&owner) == Some(&pool_id) {
-            guard.owner_index.remove(&owner);
-            guard.pools.remove(&pool_id);
+        if guard.owner_index.get(&(deployment, owner)) == Some(&pool_id) {
+            guard.owner_index.remove(&(deployment, owner));
+            guard.pools.remove(&(deployment, pool_id));
             return Ok(true);
         }
         Ok(false)
     }
 
-    fn get_by_pool_id(&self, pool_id: PoolId) -> Result<Option<BuyerPoolState>, StoreError> {
+    fn get_by_pool_id(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+    ) -> Result<Option<BuyerPoolState>, StoreError> {
         let guard = self
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        Ok(guard.pools.get(&pool_id).cloned())
+        Ok(guard.pools.get(&(deployment, pool_id)).cloned())
     }
 
-    fn get_by_owner(&self, owner: Address) -> Result<Option<BuyerPoolState>, StoreError> {
+    fn get_by_owner(
+        &self,
+        deployment: Deployment,
+        owner: Address,
+    ) -> Result<Option<BuyerPoolState>, StoreError> {
         let guard = self
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
         Ok(guard
             .owner_index
-            .get(&owner)
-            .and_then(|pool_id| guard.pools.get(pool_id))
+            .get(&(deployment, owner))
+            .and_then(|pool_id| guard.pools.get(&(deployment, *pool_id)))
             .cloned())
     }
 
     fn advance_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -898,14 +941,9 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        let Some(mapped) = guard.owner_index.get(&owner).copied() else {
-            return Ok(AdvanceOutcome::UnknownPool);
-        };
-        if mapped != pool_id {
-            return Ok(AdvanceOutcome::PoolMismatch);
-        }
-        let Some(state) = guard.pools.get_mut(&pool_id) else {
-            return Ok(AdvanceOutcome::UnknownPool);
+        let state = match guard.owned_row(deployment, owner, pool_id) {
+            Ok(state) => state,
+            Err(outcome) => return Ok(outcome),
         };
         match state.advance_lane(lane, bytes, amount) {
             Ok(()) => Ok(AdvanceOutcome::Advanced),
@@ -915,6 +953,7 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
 
     fn rebase_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -925,14 +964,9 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        let Some(mapped) = guard.owner_index.get(&owner).copied() else {
-            return Ok(AdvanceOutcome::UnknownPool);
-        };
-        if mapped != pool_id {
-            return Ok(AdvanceOutcome::PoolMismatch);
-        }
-        let Some(state) = guard.pools.get_mut(&pool_id) else {
-            return Ok(AdvanceOutcome::UnknownPool);
+        let state = match guard.owned_row(deployment, owner, pool_id) {
+            Ok(state) => state,
+            Err(outcome) => return Ok(outcome),
         };
         state.rebase_lane(lane, anchor, totals);
         Ok(AdvanceOutcome::Advanced)
@@ -940,6 +974,7 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
 
     fn seed_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -950,14 +985,9 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        let Some(mapped) = guard.owner_index.get(&owner).copied() else {
-            return Ok(AdvanceOutcome::UnknownPool);
-        };
-        if mapped != pool_id {
-            return Ok(AdvanceOutcome::PoolMismatch);
-        }
-        let Some(state) = guard.pools.get_mut(&pool_id) else {
-            return Ok(AdvanceOutcome::UnknownPool);
+        let state = match guard.owned_row(deployment, owner, pool_id) {
+            Ok(state) => state,
+            Err(outcome) => return Ok(outcome),
         };
         match state.seed_lane(lane, bytes, amount) {
             Ok(()) => Ok(AdvanceOutcome::Advanced),
@@ -967,6 +997,7 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
 
     fn add_deposit(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         additional: U256,
@@ -975,13 +1006,13 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        let Some(mapped) = guard.owner_index.get(&owner).copied() else {
+        let Some(mapped) = guard.owner_index.get(&(deployment, owner)).copied() else {
             return Ok(DepositOutcome::UnknownPool);
         };
         if mapped != pool_id {
             return Ok(DepositOutcome::PoolMismatch);
         }
-        let Some(state) = guard.pools.get_mut(&pool_id) else {
+        let Some(state) = guard.pools.get_mut(&(deployment, pool_id)) else {
             return Ok(DepositOutcome::UnknownPool);
         };
         state.deposit = state.deposit.saturating_add(additional);

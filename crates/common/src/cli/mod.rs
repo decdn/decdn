@@ -30,8 +30,8 @@ pub mod whoami;
 pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use byte_size::parse_byte_size;
 pub use common::{
-    CommonChainArgs, ConfigPathSource, LogFormat, default_client_data_dir, default_config_path,
-    default_data_dir,
+    CommonChainArgs, ConfigPathSource, GovernanceChainArgs, LogFormat, PoolSelectArgs,
+    default_client_data_dir, default_config_path, default_data_dir,
 };
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use dashboard::DashboardArgs;
@@ -41,9 +41,9 @@ pub use get::GetArgs;
 pub use key_gen::KeyGenArgs;
 pub use node::{
     BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EarningsArgs, EvictArgs,
-    HealthArgs, LanesArgs, LookupArgs, NodeArgs, NodeCommand, PoolsArgs, RegisterArgs, ReloadArgs,
-    RotateKeyArgs, RotateKeyTarget, SlashesArgs, StatusArgs, TopArgs, UnbondArgs,
-    UpdateMultiaddrsArgs, UpdateRegionArgs,
+    HealthArgs, LanesArgs, LookupArgs, NodeArgs, NodeCommand, OperatorKeyArgs, PoolsArgs,
+    ReceiveSweepsArgs, RegisterArgs, ReloadArgs, RotateKeyArgs, RotateKeyTarget, SlashesArgs,
+    StatusArgs, SweepArgs, TopArgs, UnbondArgs, UpdateMultiaddrsArgs, UpdateRegionArgs,
 };
 pub use origin::{OriginArgs, OriginCommand, OriginImportArgs};
 pub use pool::{

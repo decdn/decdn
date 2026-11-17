@@ -129,6 +129,10 @@ async fn run() -> anyhow::Result<()> {
     );
     let row = &all["pools"][0];
     anyhow::ensure!(row["pool_id"] == pool_id.as_str(), "wrong pool: {row}");
+    anyhow::ensure!(
+        row["contract"] == pool_contract(&chain).as_str(),
+        "each row names its PaymentPool as CAIP-10: {row}"
+    );
     anyhow::ensure!(row["status"] == "open", "a fresh pool is Open: {row}");
     anyhow::ensure!(
         row["deposit_micro_usdc"] == DEPOSIT_MICRO_USDC.to_string().as_str(),
@@ -240,15 +244,22 @@ fn run_pool(home: &Path, sub: &[&str], chain_argv: &[String]) -> anyhow::Result<
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The fixture's `PaymentPool` as a CAIP-10 account id.
+fn pool_contract(chain: &ChainFixture) -> String {
+    format!(
+        "eip155:{}:{:#x}",
+        chain.chain_id(),
+        chain.addrs().payment_pool
+    )
+}
+
 /// The chain + store coordinates every `pool` subcommand here shares.
 fn chain_argv(chain: &ChainFixture, data_dir: &Path, keystore: &Path) -> Vec<String> {
     vec![
-        "--rpc-url".into(),
+        "--pool".into(),
+        pool_contract(chain),
+        "--pool-rpc-url".into(),
         chain.rpc_url(),
-        "--payment-pool-address".into(),
-        format!("{}", chain.addrs().payment_pool),
-        "--chain-id".into(),
-        chain.chain_id().to_string(),
         "--data-dir".into(),
         data_dir.display().to_string(),
         "--keystore".into(),

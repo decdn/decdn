@@ -660,6 +660,7 @@ describe("earningsRows", () => {
       since: period(1_793_000_000),
       last_settlement: null,
       pending: null,
+      pools: [],
     });
     expect(rows.map((r) => r.label)).toEqual([
       "Last 24 h",

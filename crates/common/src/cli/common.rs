@@ -82,6 +82,41 @@ pub struct CommonChainArgs {
     pub json: bool,
 }
 
+/// The governance-chain coordinates of a command that reads both the
+/// governance chain and a payment chain (`get`, `gateway`, `quote`,
+/// `node receive-sweeps`). Each overrides its `[blockchain]` key.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct GovernanceChainArgs {
+    /// Governance-chain JSON-RPC endpoint. Overrides `blockchain.rpc_url`.
+    #[arg(long, value_name = "URL")]
+    pub governance_rpc_url: Option<String>,
+
+    /// Governance-chain EIP-155 id, bound into the slash, probe, stream and
+    /// pointer signatures. Overrides `blockchain.chain_id`; defaults to
+    /// Arbitrum Sepolia.
+    #[arg(long, value_name = "ID")]
+    pub governance_chain_id: Option<u64>,
+}
+
+/// Which `PaymentPool` contract a command acts on. Without `--pool` a command
+/// acts on every pool of every `[[blockchain.payment_chains]]` entry (or, for
+/// a command that needs one pool, on the first). `--pool` names one pool as a
+/// CAIP-10 account, `eip155:<chainId>:<address>`; its RPC endpoint is
+/// `--pool-rpc-url`, else the `rpc_url` of the configured payment chain with
+/// that chain id.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct PoolSelectArgs {
+    /// The `PaymentPool` to act on, as a CAIP-10 account
+    /// (`eip155:<chainId>:<address>`).
+    #[arg(long, value_name = "CAIP10")]
+    pub pool: Option<String>,
+
+    /// JSON-RPC endpoint of `--pool`'s payment chain. Overrides the `rpc_url`
+    /// of the configured payment chain with the same chain id.
+    #[arg(long, value_name = "URL", requires = "pool")]
+    pub pool_rpc_url: Option<String>,
+}
+
 /// Log verbosity level.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

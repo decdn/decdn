@@ -20,7 +20,56 @@ fn sample_ext() -> ProbeResponseExt {
     ProbeResponseExt {
         coverage: crate::Coverage::from_block_indices(2, [0].into_iter()),
         size_proof: crate::SizeProof::new(4096, vec![0x42; 3 * 64 + 1024]).ok(),
+        payment_pools: Some(vec![
+            crate::PoolAccount::eip155(42161, [0x11; 20]),
+            crate::PoolAccount::eip155(8453, [0x22; 20]),
+        ]),
     }
+}
+
+/// `n` distinct pool accounts at the full [`crate::MAX_POOL_ACCOUNT_LEN`]
+/// width.
+fn widest_pools(n: usize) -> Result<Vec<crate::PoolAccount>, crate::PoolAccountError> {
+    let chain = format!("abcdefgh:{}", "B".repeat(32));
+    (0..n)
+        .map(|i| crate::PoolAccount::new(&format!("{chain}:{i:0>128}")))
+        .collect()
+}
+
+/// A receiver keeps the first [`crate::MAX_PAYMENT_POOLS`] payment pools and
+/// drops the rest (ADR 005 § Accepted payment pools).
+#[test]
+fn probe_payment_pools_keep_the_first_eight() -> Result<(), Box<dyn std::error::Error>> {
+    let pools = widest_pools(11)?;
+    let ext = ProbeResponseExt {
+        payment_pools: Some(pools.clone()),
+        ..sample_ext()
+    };
+    let buf = encode_probe_response(&sample_response(), Some(&ext))?;
+    let (_, remainder) = postcard::take_from_bytes::<ProbeMessage>(&buf)?;
+    let parsed = parse_probe_response_ext(remainder)?;
+    assert_eq!(
+        parsed.payment_pools.as_deref(),
+        pools.get(..crate::MAX_PAYMENT_POOLS)
+    );
+    assert_eq!(parsed.coverage, ext.coverage);
+    Ok(())
+}
+
+/// A probe answer whose hint holds a malformed pool account does not decode.
+#[test]
+fn probe_ext_with_a_malformed_pool_account_does_not_decode() -> Result<(), postcard::Error> {
+    let mut bytes = postcard::to_allocvec(&ProbeResponseExt {
+        payment_pools: Some(vec![crate::PoolAccount::eip155(1, [0x34; 20])]),
+        ..ProbeResponseExt::default()
+    })?;
+    assert!(parse_probe_response_ext(&bytes).is_ok());
+    let last = bytes
+        .last_mut()
+        .ok_or(postcard::Error::DeserializeUnexpectedEnd)?;
+    *last = b':'; // a colon is outside the CAIP-10 address set
+    assert!(parse_probe_response_ext(&bytes).is_err());
+    Ok(())
 }
 
 #[test]
@@ -126,6 +175,7 @@ fn one_block_ext() -> ProbeResponseExt {
     ProbeResponseExt {
         coverage: crate::Coverage::full(1),
         size_proof: None,
+        payment_pools: None,
     }
 }
 
@@ -160,6 +210,7 @@ fn consistent_with_reads_has_blob_alone_for_the_empty_root() {
     let holder = ProbeResponseExt {
         coverage: crate::Coverage::empty(),
         size_proof: None,
+        payment_pools: None,
     };
     assert!(
         holder.consistent_with(&body_for(EMPTY_ROOT, true)),
@@ -407,6 +458,7 @@ fn probe_response_wire_format_is_stable() -> Result<(), postcard::Error> {
         Some(&ProbeResponseExt {
             coverage: crate::Coverage::empty(),
             size_proof: crate::SizeProof::new(7, vec![0x33]).ok(),
+            payment_pools: None,
         }),
     )?;
     let mut expected_framed = vec![1u8]; // ProbeMessage::Response discriminant
@@ -416,14 +468,16 @@ fn probe_response_wire_format_is_stable() -> Result<(), postcard::Error> {
     expected_framed.push(7u8); // size_proof.size varint
     expected_framed.push(1u8); // size_proof length prefix
     expected_framed.push(0x33); // size_proof bytes
+    expected_framed.push(0u8); // payment_pools = None
     assert_eq!(framed, expected_framed);
     Ok(())
 }
 
 /// Both `cdn/probe/v1` messages at their widest legitimate encoding fit
 /// [`MAX_PROBE_FRAME`] (ADR 013 § Wire Framing): every `u64` at full varint
-/// width, an EOA `slash_sig`, and the extension's coverage bitmap at its
-/// 200-byte wire cap. The sizes are pinned exactly so the headroom stays visible.
+/// width, an EOA `slash_sig`, the extension's coverage bitmap at its 200-byte
+/// wire cap, a full size proof, and eight full-width payment pools. The sizes
+/// are pinned exactly so the headroom stays visible.
 #[test]
 fn probe_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::error::Error>> {
     let request = crate::framing::encode_message(&ProbeMessage::Request(ProbeRequest {
@@ -447,9 +501,10 @@ fn probe_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::er
             u64::MAX,
             vec![0x04; crate::MAX_SIZE_PROOF_BYTES],
         )?),
+        payment_pools: Some(widest_pools(crate::MAX_PAYMENT_POOLS)?),
     };
     let response = encode_probe_response(&response, Some(&ext))?;
-    assert_eq!(response.len(), 4807, "ProbeResponse + ext at full width");
+    assert_eq!(response.len(), 6185, "ProbeResponse + ext at full width");
 
     assert!(request.len() <= MAX_PROBE_REQUEST_FRAME as usize);
     assert!(response.len() <= MAX_PROBE_FRAME as usize);

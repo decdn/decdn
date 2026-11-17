@@ -4,7 +4,16 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::{Address, B256, U256};
 
 use super::{ChainPoolOwners, PoolOwnerSource, PoolOwners};
-use crate::pool_view::PoolProjection;
+use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
+
+/// A held read of an open pool `owner` funds.
+fn open_status(owner: Address) -> PoolStatus {
+    PoolStatus {
+        owner,
+        remaining: U256::from(1u64),
+        lifecycle: Lifecycle::Open,
+    }
+}
 
 /// What the scripted chain answers for one pool.
 #[derive(Clone, Copy)]
@@ -79,7 +88,7 @@ fn owners_with(projection: &PoolProjection, source: &Arc<Scripted>) -> PoolOwner
 async fn a_projection_hit_reads_nothing() {
     let projection = PoolProjection::new();
     let owner = Address::repeat_byte(0x0F);
-    projection.record_opened(pool(1), owner, U256::from(1u64));
+    projection.record_read(pool(1), open_status(owner));
     let source = Arc::new(Scripted::default());
 
     let owners = owners_with(&projection, &source).resolve([pool(1)]).await;
@@ -168,7 +177,7 @@ async fn the_projection_is_read_live() {
 
     assert!(resolver.resolve([pool(1)]).await.is_empty());
 
-    projection.record_opened(pool(1), owner, U256::from(1u64));
+    projection.record_read(pool(1), open_status(owner));
     assert_eq!(
         resolver.resolve([pool(1)]).await.get(&pool(1)),
         Some(&owner)

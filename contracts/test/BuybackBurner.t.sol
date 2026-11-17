@@ -122,7 +122,7 @@ contract BuybackBurnerTest is Test {
         // configurable amount to the BuybackBurner.
         token.transfer(address(source), 1_000_000e18);
         vm.stopPrank();
-        // Fund the BuybackBurner with USDC (would arrive via FeeRouter.routeSettlement).
+        // Fund the BuybackBurner with USDC (arrives via FeeRouter.deposit).
         usdc.transfer(address(bb), 10_000_000e6);
     }
 

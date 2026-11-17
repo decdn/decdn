@@ -219,12 +219,7 @@ fn file_mode_is_owner_only() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let _store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     // Every family file is hardened to 0o600, not just the lane store.
-    for file in [
-        LANES_DB_FILE,
-        SETTLE_DB_FILE,
-        CHECKPOINT_DB_FILE,
-        BUYER_DB_FILE,
-    ] {
+    for file in [LANES_DB_FILE, SETTLE_DB_FILE, BUYER_DB_FILE] {
         let path = dir.path().join(file);
         anyhow::ensure!(path.exists(), "{file} must be created at open()");
         let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
@@ -357,8 +352,13 @@ fn pre_existing_file_chmod_failure_preserves_file() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The buyer pending-settle store of `store`'s deployment over its files.
+fn buyer_pending(store: &Arc<PersistentPoolStateStore>) -> BuyerPendingSettleStoreHandle {
+    BuyerPendingSettleStoreHandle::new(Arc::clone(store.files()), store.deployment())
+}
+
 /// Fill every seller-side family a deployment change must clear — a lane,
-/// a seller and a buyer pending settle, a watcher checkpoint — and flush.
+/// a seller and a buyer pending settle, a sent `redeemMany` hash — and flush.
 fn seed_seller_state(dir: &Path, deployment: Deployment) -> anyhow::Result<LaneState> {
     let store = Arc::new(PersistentPoolStateStore::open(dir, deployment)?);
     let lane = sample(0x31);
@@ -369,30 +369,22 @@ fn seed_seller_state(dir: &Path, deployment: Deployment) -> anyhow::Result<LaneS
         settle_after: 1_700_000_000,
     };
     store.record_pending(&pending)?;
-    BuyerPendingSettleStoreHandle::new(Arc::clone(&store)).record_pending(&pending)?;
-    store.record_checkpoint(CheckpointKey::PoolOpened, 4_242)?;
+    buyer_pending(&store).record_pending(&pending)?;
+    store.record_sent_redeem(deployment, SENT_TX)?;
     Ok(lane)
 }
 
 /// Whether every seller-side family `seed_seller_state` fills is empty.
 fn seller_state_is_empty(store: &Arc<PersistentPoolStateStore>) -> anyhow::Result<bool> {
-    let buyer = BuyerPendingSettleStoreHandle::new(Arc::clone(store));
+    let buyer = buyer_pending(store);
     Ok(store.load_all()?.is_empty()
         && store.load_pending()?.is_empty()
         && buyer.load_pending()?.is_empty()
-        && store.load_checkpoint(CheckpointKey::PoolOpened)?.is_none())
+        && store.sent_redeems(store.deployment())?.is_empty())
 }
 
-/// The stored deployment stamp, read straight from `lanes.redb`.
-fn stored_stamp(dir: &Path) -> anyhow::Result<Option<Deployment>> {
-    let db = Database::create(dir.join(LANES_DB_FILE))?;
-    let txn = db.begin_read()?;
-    let table = txn.open_table(DEPLOYMENT_TABLE)?;
-    Ok(table
-        .get(DEPLOYMENT_KEY)?
-        .map(|guard| Deployment::from_bytes(guard.value()))
-        .transpose()?)
-}
+/// A `redeemMany` hash `seed_seller_state` records.
+const SENT_TX: B256 = B256::repeat_byte(0x5e);
 
 /// A reopen against the same deployment keeps every seller-side row.
 #[test]
@@ -404,114 +396,176 @@ fn reopen_on_the_same_deployment_keeps_seller_state() -> anyhow::Result<()> {
     anyhow::ensure!(store.load_all()? == vec![lane], "lane kept");
     anyhow::ensure!(store.load_pending()?.len() == 1, "seller pending kept");
     anyhow::ensure!(
-        BuyerPendingSettleStoreHandle::new(Arc::clone(&store))
-            .load_pending()?
-            .len()
-            == 1,
+        buyer_pending(&store).load_pending()?.len() == 1,
         "buyer pending kept"
     );
     anyhow::ensure!(
-        store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(4_242),
-        "checkpoint kept"
+        store.sent_redeems(DEPLOYMENT)? == vec![SENT_TX],
+        "sent hash kept"
     );
     Ok(())
 }
 
-/// A reopen against another `PaymentPool` drops every seller-side row the
-/// old deployment wrote — its pool ids repeat on the new one — and restamps
-/// the store. A second reopen on the new deployment keeps the (now empty)
-/// state and the new stamp.
+/// A reopen against another deployment — another `PaymentPool` address, or
+/// the same address on another chain — sees none of the first deployment's
+/// seller rows, writes its own rows under the same pool id, signer and
+/// provider without touching the first's, and a reopen on the first
+/// deployment finds every one of its rows intact.
 #[test]
-fn reopen_on_another_payment_pool_drops_seller_state() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    seed_seller_state(dir.path(), DEPLOYMENT)?;
-    let redeployed = Deployment {
-        payment_pool: address!("00000000000000000000000000000000000000cf"),
-        ..DEPLOYMENT
-    };
+fn another_deployment_keeps_its_own_seller_rows_beside_the_first() -> anyhow::Result<()> {
+    for other in [
+        Deployment {
+            payment_pool: address!("00000000000000000000000000000000000000cf"),
+            ..DEPLOYMENT
+        },
+        Deployment {
+            chain_id: 31_337,
+            ..DEPLOYMENT
+        },
+    ] {
+        let dir = data_dir()?;
+        let first = seed_seller_state(dir.path(), DEPLOYMENT)?;
 
-    let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
-    anyhow::ensure!(
-        seller_state_is_empty(&store)?,
-        "old deployment's rows dropped"
-    );
-    drop(store);
-    anyhow::ensure!(
-        stored_stamp(dir.path())? == Some(redeployed),
-        "store restamped"
-    );
-
-    // New state on the new deployment survives its own reopen.
-    let lane = sample(0x44);
-    {
-        let store = PersistentPoolStateStore::open(dir.path(), redeployed)?;
-        store.record(&lane)?;
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path(), other)?);
+        anyhow::ensure!(
+            seller_state_is_empty(&store)?,
+            "{other:?} must not see the first deployment's rows"
+        );
+        // The same lane identity, other values, on the other deployment.
+        let second = LaneState::hydrate(
+            first.pool_id,
+            first.signer,
+            first.provider,
+            U256::from(7_777u64),
+            2_000_000_000,
+            U256::from(55u64),
+            U256::from(66u64),
+            None,
+            LaneChain::NONE,
+        );
+        store.record(&second)?;
         store.flush()?;
+        store.record_pending(&PendingSettle {
+            pool_id: first.pool_id,
+            settle_after: 1,
+        })?;
+        store.record_sent_redeem(other, B256::repeat_byte(1))?;
+        drop(store);
+
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+        anyhow::ensure!(store.load_all()? == vec![first.clone()], "first lane kept");
+        anyhow::ensure!(
+            store.load_pending()?
+                == vec![PendingSettle {
+                    pool_id: first.pool_id,
+                    settle_after: 1_700_000_000,
+                }],
+            "first pending settle kept"
+        );
+        anyhow::ensure!(
+            buyer_pending(&store).load_pending()?.len() == 1,
+            "first buyer pending kept"
+        );
+        anyhow::ensure!(
+            store.sent_redeems(DEPLOYMENT)? == vec![SENT_TX],
+            "first sent hash kept"
+        );
+        drop(store);
+
+        let store = PersistentPoolStateStore::open(dir.path(), other)?;
+        anyhow::ensure!(store.load_all()? == vec![second], "second lane kept");
+        anyhow::ensure!(store.sent_redeems(other)? == vec![B256::repeat_byte(1)]);
     }
-    let store = PersistentPoolStateStore::open(dir.path(), redeployed)?;
-    anyhow::ensure!(
-        store.load_all()? == vec![lane],
-        "new deployment's lane kept"
-    );
-    drop(store);
-    // The stamp survives the record/flush cycles above: a lost stamp would
-    // silently degrade the NEXT repoint to the claim-and-keep path.
-    anyhow::ensure!(
-        stored_stamp(dir.path())? == Some(redeployed),
-        "stamp survives record/flush cycles"
-    );
     Ok(())
 }
 
-/// The chain id is part of the stamp: the same `PaymentPool` address on
-/// another chain is another deployment.
+/// Two live seller views over one file set — one per pool the node accepts —
+/// keep apart the same lane identity and pending settle, through
+/// a flush and a reopen. A second live view of one deployment is refused, and
+/// dropping a view frees its deployment.
 #[test]
-fn reopen_on_another_chain_drops_seller_state() -> anyhow::Result<()> {
+fn live_views_of_two_deployments_share_the_files_and_stay_apart() -> anyhow::Result<()> {
+    let other = Deployment {
+        chain_id: 31_337,
+        payment_pool: address!("00000000000000000000000000000000000000cf"),
+    };
     let dir = data_dir()?;
-    seed_seller_state(dir.path(), DEPLOYMENT)?;
-    let other_chain = Deployment {
+    let lane_a = sample(0x31);
+    let lane_b = LaneState::hydrate(
+        lane_a.pool_id,
+        lane_a.signer,
+        lane_a.provider,
+        U256::from(7_777u64),
+        2_000_000_000,
+        U256::from(55u64),
+        U256::from(66u64),
+        None,
+        LaneChain::NONE,
+    );
+    {
+        let files = PoolStoreFiles::open(dir.path())?;
+        let a = files.seller_view(DEPLOYMENT)?;
+        let b = files.seller_view(other)?;
+        anyhow::ensure!(
+            files.seller_view(DEPLOYMENT).is_err(),
+            "a second live view of one deployment must be refused"
+        );
+        a.record(&lane_a)?;
+        b.record(&lane_b)?;
+        a.flush()?;
+        b.flush()?;
+        b.record_pending(&PendingSettle {
+            pool_id: lane_b.pool_id,
+            settle_after: 7,
+        })?;
+        anyhow::ensure!(a.load_all()? == vec![lane_a.clone()]);
+        anyhow::ensure!(b.load_all()? == vec![lane_b.clone()]);
+        anyhow::ensure!(a.load_pending()?.is_empty(), "b's pending stays b's");
+        drop(a);
+        // The deployment is free again once its view drops.
+        let again = files.seller_view(DEPLOYMENT)?;
+        anyhow::ensure!(again.load_all()? == vec![lane_a.clone()], "rehydrated");
+    }
+    let files = PoolStoreFiles::open(dir.path())?;
+    let a = files.seller_view(DEPLOYMENT)?;
+    let b = files.seller_view(other)?;
+    anyhow::ensure!(a.load_all()? == vec![lane_a], "a's lane after reopen");
+    anyhow::ensure!(b.load_all()? == vec![lane_b], "b's lane after reopen");
+    anyhow::ensure!(b.load_pending()?.len() == 1 && a.load_pending()?.is_empty());
+    Ok(())
+}
+
+/// Ledger rows key on the deployment: the same block and log index on two
+/// deployments are two rows, and the per-block guard reads one deployment.
+#[test]
+fn ledger_rows_of_two_deployments_do_not_collide() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+    let other = Deployment {
         chain_id: 31_337,
         ..DEPLOYMENT
     };
-
-    let store = Arc::new(PersistentPoolStateStore::open(dir.path(), other_chain)?);
-    anyhow::ensure!(seller_state_is_empty(&store)?, "other chain's rows dropped");
-    Ok(())
-}
-
-/// A store with rows but no stamp is claimed by the first deployment that
-/// opens it: the rows stay and the stamp is written.
-#[test]
-fn an_unstamped_store_is_claimed_without_dropping_rows() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    let lane = seed_seller_state(dir.path(), DEPLOYMENT)?;
-    {
-        let db = Database::create(dir.path().join(LANES_DB_FILE))?;
-        let txn = db.begin_write()?;
-        anyhow::ensure!(txn.delete_table(DEPLOYMENT_TABLE)?, "stamp was present");
-        txn.commit()?;
-    }
-
-    let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-    anyhow::ensure!(store.load_all()? == vec![lane], "lanes kept");
-    // The claim keeps every family, not just the lanes.
-    anyhow::ensure!(store.load_pending()?.len() == 1, "seller pending kept");
+    let row = |deployment: Deployment, tx: u8| SettlementRecord {
+        deployment,
+        block_number: 10,
+        log_index: 2,
+        tx_hash: B256::repeat_byte(tx),
+        landed_at_unix: 1,
+        gross_micro_usdc: 10,
+        net_micro_usdc: 6,
+        bytes_delivered: 100,
+        operator: Address::repeat_byte(0x0E),
+    };
+    store.record_settlement(&row(DEPLOYMENT, 0xA))?;
+    store.record_settlement(&row(other, 0xB))?;
+    let rows = store.load_settlements()?;
     anyhow::ensure!(
-        BuyerPendingSettleStoreHandle::new(Arc::clone(&store))
-            .load_pending()?
-            .len()
-            == 1,
-        "buyer pending kept"
+        rows == vec![row(DEPLOYMENT, 0xA), row(other, 0xB)]
+            || rows == vec![row(other, 0xB), row(DEPLOYMENT, 0xA)],
+        "{rows:?}"
     );
-    anyhow::ensure!(
-        store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(4_242),
-        "checkpoint kept"
-    );
-    drop(store);
-    anyhow::ensure!(
-        stored_stamp(dir.path())? == Some(DEPLOYMENT),
-        "store stamped"
-    );
+    anyhow::ensure!(store.has_settlement_tx(other, 10, B256::repeat_byte(0xB))?);
+    anyhow::ensure!(!store.has_settlement_tx(DEPLOYMENT, 10, B256::repeat_byte(0xB))?);
     Ok(())
 }
 
@@ -530,165 +584,19 @@ fn reopen_on_the_same_deployment_does_not_write() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A stamp of the wrong width aborts the open instead of guessing which
-/// rows to keep.
+/// A corrupt lane row of ANOTHER deployment does not abort this
+/// deployment's bring-up: the hydrate scans this deployment's key range
+/// only. (A corrupt row of THIS deployment still aborts.)
 #[test]
-fn a_malformed_stamp_is_corrupt() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    drop(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-    {
-        let db = Database::create(dir.path().join(LANES_DB_FILE))?;
-        let txn = db.begin_write()?;
-        {
-            let mut table = txn.open_table(DEPLOYMENT_TABLE)?;
-            table.insert(DEPLOYMENT_KEY, [0u8; 3].as_slice())?;
-        }
-        txn.commit()?;
-    }
-
-    let err = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("a malformed stamp must fail the open"))?;
-    anyhow::ensure!(
-        matches!(err, StoreError::Corrupt { .. }),
-        "expected Corrupt, got {err:?}"
-    );
-    Ok(())
-}
-
-/// A boot that crashed between the settle/checkpoint clears and the
-/// lanes+stamp commit leaves the OLD stamp with those tables already gone.
-/// The next boot against the new deployment repeats the whole drop: clearing
-/// the already-missing tables is a no-op, and the lanes and stamp land.
-#[test]
-fn a_crashed_drop_is_repeated_by_the_next_boot() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    seed_seller_state(dir.path(), DEPLOYMENT)?;
-    // The crash state: settle and checkpoint tables deleted, foreign stamp
-    // and lane rows intact.
-    for (file, tables) in [
-        (
-            SETTLE_DB_FILE,
-            vec!["pending_settle_v1", "buyer_pending_settle_v1"],
-        ),
-        (CHECKPOINT_DB_FILE, vec!["watcher_checkpoint_v1"]),
-    ] {
-        let db = Database::create(dir.path().join(file))?;
-        let txn = db.begin_write()?;
-        for name in tables {
-            let table: TableDefinition<'_, &[u8; 32], u64> = TableDefinition::new(name);
-            // The checkpoint table's real key type is &str, but
-            // delete_table drops by NAME; the definition's types are not
-            // checked on delete. Require the delete to have found the
-            // table: a drifted name literal would silently turn this test
-            // into a plain foreign-stamp drop.
-            anyhow::ensure!(
-                txn.delete_table(table)?,
-                "crash-state setup: table {name} was not present"
-            );
-        }
-        txn.commit()?;
-    }
-
-    let redeployed = Deployment {
-        payment_pool: address!("00000000000000000000000000000000000000cf"),
-        ..DEPLOYMENT
-    };
-    let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
-    anyhow::ensure!(seller_state_is_empty(&store)?, "the repeated drop lands");
-    drop(store);
-    anyhow::ensure!(
-        stored_stamp(dir.path())? == Some(redeployed),
-        "the repeated drop restamps"
-    );
-    Ok(())
-}
-
-/// A foreign stamp over a store that never flushed a lane (the lane table
-/// was never created) drops cleanly: the walk tolerates the absent table
-/// and the unconditional lane `delete_table` is a no-op.
-#[test]
-fn a_foreign_stamp_without_a_lane_table_drops_cleanly() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    // Open + close without recording a lane: the stamp exists, the lane
-    // table does not (only a flush creates it).
-    drop(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-    // Precondition: the lane table really is absent — if open() ever
-    // creates it eagerly, this test silently stops covering the
-    // TableDoesNotExist arms.
-    {
-        let db = Database::create(dir.path().join(LANES_DB_FILE))?;
-        let txn = db.begin_read()?;
-        anyhow::ensure!(
-            matches!(
-                txn.open_table(LANE_TABLE),
-                Err(redb::TableError::TableDoesNotExist(_))
-            ),
-            "precondition: the lane table must not exist before a flush"
-        );
-    }
-
-    let redeployed = Deployment {
-        payment_pool: address!("00000000000000000000000000000000000000cf"),
-        ..DEPLOYMENT
-    };
-    let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
-    anyhow::ensure!(seller_state_is_empty(&store)?, "nothing to drop, no error");
-    drop(store);
-    anyhow::ensure!(
-        stored_stamp(dir.path())? == Some(redeployed),
-        "store restamped"
-    );
-    Ok(())
-}
-
-/// The forfeit audit reports the lane's FULL claim: the signed cumulative
-/// plus the chain-verified frontier, minus the paid watermark — the same
-/// figure the redeemer collects. `last_amount` alone would understate a
-/// lane with chain progress, and an over-paid lane saturates to zero.
-#[test]
-fn forfeited_value_counts_the_chain_frontier() {
-    let mut lane = LaneState::hydrate(
-        B256::repeat_byte(0x21),
-        Address::repeat_byte(0x22),
-        Address::repeat_byte(0x23),
-        U256::from(10_000_000u64),
-        1_900_000_000,
-        U256::from(1_000u64), // signed cumulative
-        U256::from(4_096u64),
-        Some([0x11u8; 65]),
-        LaneChain {
-            chain_root: B256::repeat_byte(0x31),
-            chunk_price: U256::from(5u64),
-            verified_index: 3, // frontier worth 15 on top of the signature
-            tip: B256::repeat_byte(0x32),
-        },
-    );
-    lane.paid_cumulative = U256::from(400u64);
-    assert_eq!(
-        forfeited_value(&lane),
-        U256::from(1_000u64 + 15 - 400),
-        "owed (signed + chain frontier) minus paid"
-    );
-
-    // A chain-extended redemption can leave paid above the signed amount:
-    // the difference saturates instead of underflowing.
-    lane.paid_cumulative = U256::from(2_000u64);
-    assert_eq!(forfeited_value(&lane), U256::ZERO);
-}
-
-/// A corrupt row in a FOREIGN store must not abort this deployment's
-/// bring-up: the rebind logs it as undecodable and drops it with the rest.
-/// (A corrupt row under a MATCHING stamp still aborts — `hydrate_lanes`
-/// would use it; here it is about to be deleted.)
-#[test]
-fn a_corrupt_foreign_lane_row_does_not_abort_the_rebind() -> anyhow::Result<()> {
+fn a_corrupt_lane_row_of_another_deployment_does_not_abort_the_open() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let lane = seed_seller_state(dir.path(), DEPLOYMENT)?;
+    let other = Deployment {
+        payment_pool: address!("00000000000000000000000000000000000000cf"),
+        ..DEPLOYMENT
+    };
     {
-        // A garbage value under a fresh, valid 72-byte key.
-        let mut key = lane_key_bytes(&lane.key());
-        key[71] ^= 0xFF;
+        let key = lane_key_bytes(other, &lane.key());
         let db = Database::create(dir.path().join(LANES_DB_FILE))?;
         let txn = db.begin_write()?;
         {
@@ -698,33 +606,28 @@ fn a_corrupt_foreign_lane_row_does_not_abort_the_rebind() -> anyhow::Result<()> 
         txn.commit()?;
     }
 
-    let redeployed = Deployment {
-        payment_pool: address!("00000000000000000000000000000000000000cf"),
-        ..DEPLOYMENT
-    };
-    let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     anyhow::ensure!(
-        seller_state_is_empty(&store)?,
-        "the corrupt row and the healthy row are both dropped"
+        store.load_all()? == vec![lane],
+        "this deployment's lane loads"
     );
     drop(store);
     anyhow::ensure!(
-        stored_stamp(dir.path())? == Some(redeployed),
-        "store restamped despite the corrupt row"
+        PersistentPoolStateStore::open(dir.path(), other).is_err(),
+        "the corrupt row still aborts its own deployment's open"
     );
     Ok(())
 }
 
-/// The deployment rebind never touches `buyer.redb`: a buyer pool row
-/// survives a foreign reopen. The buyer table carries its own per-row
-/// deployment tag and its own drop path (`drop_foreign_row`, #2087).
+/// Opening the store for another deployment never touches `buyer.redb`: a
+/// buyer pool row keyed by its own deployment stays reachable.
 #[test]
-fn a_buyer_pool_row_survives_a_seller_side_drop() -> anyhow::Result<()> {
+fn a_buyer_pool_row_survives_an_open_for_another_deployment() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let pool_id = sample(0x31).pool_id;
     {
         let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-        let buyer = BuyerPoolStoreHandle::new(Arc::clone(&store));
+        let buyer = BuyerPoolStoreHandle::new(Arc::clone(store.files()));
         buyer.record(&BuyerPoolState::new(
             pool_id,
             DEPLOYMENT,
@@ -739,9 +642,9 @@ fn a_buyer_pool_row_survives_a_seller_side_drop() -> anyhow::Result<()> {
         ..DEPLOYMENT
     };
     let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
-    let row = BuyerPoolStoreHandle::new(Arc::clone(&store))
-        .get_by_pool_id(pool_id)?
-        .ok_or_else(|| anyhow::anyhow!("buyer row gone after the seller-side drop"))?;
+    let row = BuyerPoolStoreHandle::new(Arc::clone(store.files()))
+        .get_by_pool_id(DEPLOYMENT, pool_id)?
+        .ok_or_else(|| anyhow::anyhow!("buyer row gone after an open for another deployment"))?;
     anyhow::ensure!(
         row.deployment == DEPLOYMENT,
         "the buyer row keeps its own deployment tag"
@@ -757,7 +660,7 @@ fn a_buyer_pool_row_survives_a_seller_side_drop() -> anyhow::Result<()> {
 fn future_schema_version_refuses_to_load() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let s = sample(4);
-    let key_bytes = lane_key_bytes(&s.key());
+    let key_bytes = lane_key_bytes(DEPLOYMENT, &s.key());
     let forward = StoredLaneState {
         schema_version: SUPPORTED_SCHEMA_VERSION + 1,
         ..StoredLaneState::from(&s)
@@ -765,7 +668,7 @@ fn future_schema_version_refuses_to_load() -> anyhow::Result<()> {
     let encoded = postcard::to_allocvec(&forward)?;
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        let mut wtx = store.lanes_db.begin_write()?;
+        let mut wtx = store.files.lanes_db.begin_write()?;
         wtx.set_durability(Durability::Immediate)?;
         {
             let mut table = wtx.open_table(LANE_TABLE)?;
@@ -792,12 +695,12 @@ fn future_schema_version_refuses_to_load() -> anyhow::Result<()> {
 fn extra_trailing_bytes_are_tolerated() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let s = sample(0x42);
-    let key_bytes = lane_key_bytes(&s.key());
+    let key_bytes = lane_key_bytes(DEPLOYMENT, &s.key());
     let mut encoded = postcard::to_allocvec(&StoredLaneState::from(&s))?;
     encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        let mut tx = store.lanes_db.begin_write()?;
+        let mut tx = store.files.lanes_db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
             let mut t = tx.open_table(LANE_TABLE)?;
@@ -822,13 +725,13 @@ fn extra_trailing_bytes_are_tolerated() -> anyhow::Result<()> {
 fn wrong_length_signature_is_corrupt() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let s = sample(0x77);
-    let key_bytes = lane_key_bytes(&s.key());
+    let key_bytes = lane_key_bytes(DEPLOYMENT, &s.key());
     let mut stored = StoredLaneState::from(&s);
     stored.signature = vec![0xCD; 64];
     let encoded = postcard::to_allocvec(&stored)?;
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        let mut tx = store.lanes_db.begin_write()?;
+        let mut tx = store.files.lanes_db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
             let mut t = tx.open_table(LANE_TABLE)?;
@@ -859,13 +762,13 @@ fn corrupt_owner_sig_on_a_lane_refuses_the_open() -> anyhow::Result<()> {
     // A well-formed lane, then corrupt only its stored owner_sig to a length
     // that is neither empty (None) nor 65 (Some).
     lane.owner_sig = Some([0x11u8; 65]);
-    let key_bytes = lane_key_bytes(&lane.key());
+    let key_bytes = lane_key_bytes(DEPLOYMENT, &lane.key());
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let mut stored = StoredLaneState::from(&lane);
         stored.owner_sig = vec![0xFFu8; 3];
         let encoded = postcard::to_allocvec(&stored)?;
-        let mut tx = store.lanes_db.begin_write()?;
+        let mut tx = store.files.lanes_db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
             let mut table = tx.open_table(LANE_TABLE)?;
@@ -885,25 +788,29 @@ fn corrupt_owner_sig_on_a_lane_refuses_the_open() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The watcher scan checkpoint round-trips, overwrites in place, and
-/// survives a reopen — so the next boot resumes the `PoolOpened` backfill
-/// from the persisted block. An empty table reads as `None` (first boot).
+/// A sent `redeemMany` hash round-trips, survives a reopen (so the next boot
+/// fetches a receipt a crash missed), and forgets cleanly. An empty table
+/// reads as no hash.
 #[test]
-fn watcher_checkpoint_round_trip_and_persist() -> anyhow::Result<()> {
+fn sent_redeem_round_trip_and_persist() -> anyhow::Result<()> {
     let dir = data_dir()?;
+    let (a, b) = (B256::repeat_byte(0xa1), B256::repeat_byte(0xb2));
     {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)?.is_none());
-        store.record_checkpoint(CheckpointKey::PoolOpened, 1_000)?;
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(1_000));
-        store.record_checkpoint(CheckpointKey::PoolOpened, 2_500)?;
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(2_500));
+        anyhow::ensure!(store.sent_redeems(DEPLOYMENT)?.is_empty());
+        store.record_sent_redeem(DEPLOYMENT, a)?;
+        store.record_sent_redeem(DEPLOYMENT, b)?;
+        store.record_sent_redeem(DEPLOYMENT, a)?;
+        anyhow::ensure!(store.sent_redeems(DEPLOYMENT)? == vec![a, b]);
     }
     let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     anyhow::ensure!(
-        store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(2_500),
-        "checkpoint must survive a restart"
+        store.sent_redeems(DEPLOYMENT)? == vec![a, b],
+        "sent hashes must survive a restart"
     );
+    store.forget_sent_redeem(DEPLOYMENT, a)?;
+    store.forget_sent_redeem(DEPLOYMENT, a)?;
+    anyhow::ensure!(store.sent_redeems(DEPLOYMENT)? == vec![b]);
     Ok(())
 }
 
@@ -948,7 +855,10 @@ fn pending_settle_round_trip_and_persist() -> anyhow::Result<()> {
 fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let store = std::sync::Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-    let buyer = BuyerPendingSettleStoreHandle::new(std::sync::Arc::clone(&store));
+    let buyer = BuyerPendingSettleStoreHandle::new(
+        std::sync::Arc::clone(store.files()),
+        store.deployment(),
+    );
     let seller_pool = b256!("aa00000000000000000000000000000000000000000000000000000000000000");
     let buyer_pool = b256!("bb00000000000000000000000000000000000000000000000000000000000000");
     PendingSettleStore::record_pending(
@@ -1032,18 +942,22 @@ fn flush_snapshot_sorts_into_table_key_order() -> anyhow::Result<()> {
             .collect(),
         tombstones: forgotten.iter().rev().copied().collect(),
     };
-    snapshot.sort_by_table_key();
+    snapshot.sort_by_table_key(DEPLOYMENT);
 
     anyhow::ensure!(
         snapshot
             .writes
             .iter()
-            .map(|(lane, _)| lane_key_bytes(lane))
+            .map(|(lane, _)| lane_key_bytes(DEPLOYMENT, lane))
             .is_sorted(),
         "writes ascend by table key"
     );
     anyhow::ensure!(
-        snapshot.tombstones.iter().map(lane_key_bytes).is_sorted(),
+        snapshot
+            .tombstones
+            .iter()
+            .map(|lane| lane_key_bytes(DEPLOYMENT, lane))
+            .is_sorted(),
         "tombstones ascend by table key"
     );
     anyhow::ensure!(
@@ -1100,7 +1014,7 @@ fn flush_of_a_large_batch_lands_packed_and_round_trips() -> anyhow::Result<()> {
         anyhow::ensure!(got == *lane, "each lane round-trips to its own record");
     }
 
-    let read_txn = store.lanes_db.begin_read()?;
+    let read_txn = store.files.lanes_db.begin_read()?;
     let leaf_pages = read_txn.open_table(LANE_TABLE)?.stats()?.leaf_pages();
     anyhow::ensure!(
         leaf_pages <= 55,
@@ -1271,11 +1185,11 @@ mod settlement_ledger {
 
     fn row(block: u64, log_index: u64, tx_byte: u8) -> SettlementRecord {
         SettlementRecord {
+            deployment: DEPLOYMENT,
             block_number: block,
             log_index,
             tx_hash: B256::repeat_byte(tx_byte),
             landed_at_unix: 1_700_000_000 + block,
-            epoch: 9,
             gross_micro_usdc: 1_000 + block,
             net_micro_usdc: 600 + block,
             bytes_delivered: 4_096 * block,
@@ -1303,10 +1217,10 @@ mod settlement_ledger {
             rows,
             vec![row(10, 7, 0xA), row(30, 0, 0xB), row(30, 2, 0xC)]
         );
-        assert!(store.has_settlement_tx(30, B256::repeat_byte(0xB))?);
-        assert!(!store.has_settlement_tx(30, B256::repeat_byte(0xD))?);
+        assert!(store.has_settlement_tx(DEPLOYMENT, 30, B256::repeat_byte(0xB))?);
+        assert!(!store.has_settlement_tx(DEPLOYMENT, 30, B256::repeat_byte(0xD))?);
         assert!(
-            !store.has_settlement_tx(10, B256::repeat_byte(0xB))?,
+            !store.has_settlement_tx(DEPLOYMENT, 10, B256::repeat_byte(0xB))?,
             "the guard reads the named block's rows only"
         );
         Ok(())
@@ -1324,8 +1238,10 @@ mod settlement_ledger {
         Ok(())
     }
 
+    /// The ledger spans every deployment: an open for another deployment
+    /// reads the rows the first wrote, each still naming its deployment.
     #[test]
-    fn a_foreign_deployment_drops_the_ledger() -> anyhow::Result<()> {
+    fn another_deployment_keeps_the_ledger() -> anyhow::Result<()> {
         let dir = data_dir()?;
         {
             let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
@@ -1336,10 +1252,7 @@ mod settlement_ledger {
             payment_pool: address!("00000000000000000000000000000000000000cf"),
         };
         let store = PersistentPoolStateStore::open(dir.path(), other)?;
-        assert!(
-            store.load_settlements()?.is_empty(),
-            "the ledger belongs to the deployment it was written against"
-        );
+        assert_eq!(store.load_settlements()?, vec![row(10, 0, 0xA)]);
         Ok(())
     }
 
@@ -1362,8 +1275,8 @@ mod settlement_ledger {
     fn bind_ledger_start_persists_the_first_stamp() -> anyhow::Result<()> {
         let dir = data_dir()?;
         let db = Database::create(dir.path().join(SETTLE_DB_FILE))?;
-        assert_eq!(PersistentPoolStateStore::bind_ledger_start(&db, 100)?, 100);
-        assert_eq!(PersistentPoolStateStore::bind_ledger_start(&db, 200)?, 100);
+        assert_eq!(PoolStoreFiles::bind_ledger_start(&db, 100)?, 100);
+        assert_eq!(PoolStoreFiles::bind_ledger_start(&db, 200)?, 100);
         let txn = db.begin_read()?;
         let stored = txn
             .open_table(SETTLEMENT_LEDGER_START_TABLE)?
@@ -1399,10 +1312,10 @@ mod settlement_ledger {
         Ok(())
     }
 
-    /// A repoint drops the ledger and its stamp together; the new deployment's
-    /// ledger starts at that open.
+    /// The ledger spans every deployment, so an open for another deployment
+    /// keeps the ledger start.
     #[test]
-    fn a_foreign_deployment_restamps_the_ledger_start() -> anyhow::Result<()> {
+    fn another_deployment_keeps_the_ledger_start() -> anyhow::Result<()> {
         let dir = data_dir()?;
         drop(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
         seed_ledger_start(dir.path(), 5)?;
@@ -1410,17 +1323,12 @@ mod settlement_ledger {
             chain_id: DEPLOYMENT.chain_id,
             payment_pool: address!("00000000000000000000000000000000000000cf"),
         };
-        let before = crate::payment_settlement::unix_now();
         let store = PersistentPoolStateStore::open(dir.path(), other)?;
-        anyhow::ensure!(
-            store.ledger_started_at_unix() >= before,
-            "the old deployment's stamp survived the repoint"
-        );
+        assert_eq!(store.ledger_started_at_unix(), 5);
         Ok(())
     }
 
-    /// A crash between a repoint's ledger clear and the restamp leaves no
-    /// stamp; the next open writes one.
+    /// A `settle.redb` with no ledger-start stamp gets one at the next open.
     #[test]
     fn a_missing_stamp_is_written_at_the_next_open() -> anyhow::Result<()> {
         let dir = data_dir()?;
@@ -1444,10 +1352,10 @@ mod settlement_ledger {
     /// Write raw `value` bytes under the ledger key `(block, 0)`, bypassing the
     /// encoder, to seed a row this binary cannot read.
     fn write_raw(store: &PersistentPoolStateStore, block: u64, value: &[u8]) -> anyhow::Result<()> {
-        let txn = store.settle_db.begin_write()?;
+        let txn = store.files.settle_db.begin_write()?;
         {
             let mut table = txn.open_table(SETTLEMENT_LEDGER_TABLE)?;
-            table.insert(&settlement_key(block, 0), value)?;
+            table.insert(&settlement_key(DEPLOYMENT, block, 0), value)?;
         }
         txn.commit()?;
         Ok(())
@@ -1488,26 +1396,28 @@ mod settlement_ledger {
         assert!(detail.contains("block 10 log 0"), "{detail}");
         // The guard reads only the named block, so block 5 still answers and
         // block 10 reports the corruption.
-        assert!(store.has_settlement_tx(5, B256::repeat_byte(0xA))?);
+        assert!(store.has_settlement_tx(DEPLOYMENT, 5, B256::repeat_byte(0xA))?);
         assert!(matches!(
-            store.has_settlement_tx(10, B256::repeat_byte(0xA)),
+            store.has_settlement_tx(DEPLOYMENT, 10, B256::repeat_byte(0xA)),
             Err(StoreError::Corrupt { .. })
         ));
         Ok(())
     }
 
     #[test]
-    fn the_key_encodes_block_then_log_index_big_endian() {
-        let key = settlement_key(0x0102_0304_0506_0708, 0x0a0b_0c0d_0e0f_1011);
+    fn the_key_encodes_deployment_then_block_then_log_index_big_endian() -> anyhow::Result<()> {
+        let key = settlement_key(DEPLOYMENT, 0x0102_0304_0506_0708, 0x0a0b_0c0d_0e0f_1011);
+        assert_eq!(key[..Deployment::ENCODED_LEN], DEPLOYMENT.to_bytes());
         assert_eq!(
-            key,
+            key[Deployment::ENCODED_LEN..],
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11
             ]
         );
         assert_eq!(
-            settlement_key_parts(&key),
-            (0x0102_0304_0506_0708, 0x0a0b_0c0d_0e0f_1011)
+            settlement_key_parts(&key)?,
+            (DEPLOYMENT, 0x0102_0304_0506_0708, 0x0a0b_0c0d_0e0f_1011)
         );
+        Ok(())
     }
 }
