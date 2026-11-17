@@ -618,12 +618,12 @@ async fn find_sweeps(
     let mut sweeps = Vec::new();
     for target in scan_targets(select, from_block, file)? {
         let deployment = target.pool.deployment;
-        let account = deployment.pool_account().to_string();
+        let pool = deployment.pool_account().to_string();
         let provider = decdn_client::provider::build_read_provider(&target.pool.rpc_url)?;
-        ensure_chain(&provider, deployment.chain_id, &account).await?;
+        ensure_chain(&provider, deployment.chain_id, &pool).await?;
         let head = bounded("eth_blockNumber", provider.get_block_number()).await?;
         eprintln!(
-            "scanning {account} for {operator}'s Swept events over blocks {}..={head}",
+            "scanning {pool} for {operator}'s Swept events over blocks {}..={head}",
             target.from_block
         );
         let filter = Filter::new()
