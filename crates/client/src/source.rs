@@ -125,14 +125,14 @@ pub trait BlobSource: Send + Sync {
         0
     }
 
-    /// Let `reader`, opened for a range that starts where a shorter range
-    /// starts, serve the shorter range alone: once the decoder has read that
-    /// range, [`Self::finish`] stops the pull as [`Self::stop`] does instead of
-    /// draining it to its own end. The range's encoding is a prefix of the
-    /// longer range's, so the decoder reads it from the same stream. What the
-    /// pull paid ahead past the shorter range's end is lost. `false` when the
-    /// reader cannot, and the caller closes it.
-    fn narrow(&self, _reader: &mut Self::Reader) -> bool {
+    /// Let `reader`, opened for a range that starts where `range` starts and
+    /// runs past it, serve `range` alone. `range`'s encoding is a prefix of the
+    /// longer range's, so the decoder reads it from the same stream. The pull
+    /// pays ahead only up to `range`'s end, so the source sends nothing past
+    /// it, and once the decoder has read `range`, [`Self::finish`] stops the
+    /// pull as [`Self::stop`] does instead of draining it to its own end.
+    /// `false` when the reader cannot, and the caller closes it.
+    fn narrow(&self, _reader: &mut Self::Reader, _range: &AlignedRange) -> bool {
         false
     }
 }
@@ -579,8 +579,8 @@ impl BlobSource for PeerSource<'_> {
         self.max_blob_size_bytes
     }
 
-    fn narrow(&self, reader: &mut Self::Reader) -> bool {
-        reader.narrow();
+    fn narrow(&self, reader: &mut Self::Reader, range: &AlignedRange) -> bool {
+        reader.narrow(range.wire_len());
         true
     }
 }
@@ -619,9 +619,10 @@ struct Primed<R> {
 ///
 /// Adoption is by exact [`AlignedRange`] equality, or by a pull of a longer
 /// range from the same start that the wrapped source narrows to the open's
-/// range ([`BlobSource::narrow`]): a narrowed pull stops at the open's end
-/// instead of draining to its own, so it pays for at most the credit it paid
-/// ahead past that end. A source that cannot narrow adopts by equality alone. Call [`clear`](Self::clear) once the drive returns, so a pull no open
+/// range ([`BlobSource::narrow`]): a narrowed pull pays only up to the open's
+/// end and stops there instead of draining to its own. A source that cannot
+/// narrow adopts by equality alone. Call [`clear`](Self::clear) once the drive
+/// returns, so a pull no open
 /// took is closed at once rather than left idle. A pull parked with
 /// [`prime_next`](Self::prime_next) is the next open's alone: an open of another
 /// range closes it before the wrapped source opens, so the peer never holds it
@@ -752,7 +753,7 @@ impl<S: BlobSource> PrimedSource<S> {
             let Primed {
                 header, mut reader, ..
             } = parked;
-            if self.inner.narrow(&mut reader) {
+            if self.inner.narrow(&mut reader, range) {
                 tracing::debug!(
                     byte_offset = range.fetch_start(),
                     byte_len = range.fetch_len(),
@@ -797,8 +798,8 @@ impl<S: BlobSource> BlobSource for PrimedSource<S> {
         self.inner.max_blob_size_bytes()
     }
 
-    fn narrow(&self, reader: &mut Self::Reader) -> bool {
-        self.inner.narrow(reader)
+    fn narrow(&self, reader: &mut Self::Reader, range: &AlignedRange) -> bool {
+        self.inner.narrow(reader, range)
     }
 }
 
@@ -1419,7 +1420,7 @@ mod doubles {
             self.max_blob_size
         }
 
-        fn narrow(&self, reader: &mut Self::Reader) -> bool {
+        fn narrow(&self, reader: &mut Self::Reader, _range: &AlignedRange) -> bool {
             reader.narrowed = true;
             true
         }

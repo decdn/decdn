@@ -3002,6 +3002,9 @@ pub struct UpstreamPull {
     /// The pull serves a prefix of its range alone ([`Self::narrow`]):
     /// [`Self::finish`] stops it instead of draining it.
     narrowed: bool,
+    /// The wire byte the pull pays ahead up to: [`Self::expected_wire_bytes`],
+    /// or the end of the prefix a narrowed pull serves.
+    pay_end: u64,
 }
 
 impl std::fmt::Debug for UpstreamPull {
@@ -3236,13 +3239,15 @@ async fn open_progressive_pull_impl(
 }
 
 impl UpstreamPull {
-    /// Serve a prefix of this pull's range alone: a caller that decodes a
-    /// shorter range from the same start reads its encoding from this stream,
-    /// and [`Self::finish`] then stops the pull ([`Self::stop`]) instead of
-    /// draining it to its own end. What the pull paid ahead past the prefix is
-    /// the payer's loss, at most one credit window.
-    pub(crate) const fn narrow(&mut self) {
+    /// Serve a prefix of this pull's range alone, `prefix_wire` bytes of its
+    /// wire: a caller that decodes a shorter range from the same start reads
+    /// its encoding from this stream. The pull pays ahead only up to the
+    /// prefix's end, so the node, which sends only what payment covers, sends
+    /// nothing past it. [`Self::finish`] then stops the pull ([`Self::stop`])
+    /// instead of draining it to its own end.
+    pub(crate) fn narrow(&mut self, prefix_wire: u64) {
         self.narrowed = true;
+        self.pay_end = self.pay_end.min(prefix_wire);
     }
 
     /// Wire bytes this stream will deliver: the bao-encoded size of the
@@ -3355,7 +3360,7 @@ impl UpstreamPull {
         let held = self.held();
         payer_window::due(
             trust.window_bytes(self.rate_per_mb),
-            self.expected_wire_bytes.saturating_sub(self.cumulative),
+            self.pay_end.saturating_sub(self.cumulative),
             held,
             payer_window::room(trust.cap_room_bytes(self.rate_per_mb), held),
         )

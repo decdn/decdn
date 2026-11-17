@@ -223,8 +223,7 @@ impl OpenedStream {
         let Some(proven) = proven_size.filter(|_| resp.body.ok) else {
             return Err(UpstreamRefused::open(resp, &resp_ext));
         };
-        // A quote above the payer's ceiling is refused before the first paid
-        // interval. `0` = no ceiling.
+        // A quote above the payer's ceiling (`0`: none) is refused unpaid.
         if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
             return Err(RateAboveCeiling::over_ceiling(
                 resp.body.rate_per_mb,
@@ -273,17 +272,7 @@ impl OpenedStream {
                 .or_else(|| decdn_protocol::OriginAttestation::from_response(&resp)),
         };
         let window = deadlines.window;
-        let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let floor = progress::ThroughputFloor::new(
-            progress::FloorConfig {
-                window,
-                floor_bps: deadlines.floor_bps,
-            },
-            Arc::clone(&progress_counter),
-            tokio::time::Instant::now(),
-        );
-        let mut sampler = tokio::time::interval(stall_sample_period(window));
-        sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let (progress_counter, floor, sampler) = throughput_floor(deadlines);
         ledger.note_rate(rate_per_mb);
         let pull = UpstreamPull {
             window,
@@ -312,9 +301,33 @@ impl OpenedStream {
             returned_at: None,
             opened_at: tokio::time::Instant::now(),
             narrowed: false,
+            pay_end: expected_wire_bytes,
         };
         Ok((header, pull))
     }
+}
+
+/// The byte counter, throughput floor and sampling tick a pull's streaming
+/// reads run under ([`PullDeadlines::window`], [`PullDeadlines::floor_bps`]).
+fn throughput_floor(
+    deadlines: PullDeadlines,
+) -> (
+    Arc<std::sync::atomic::AtomicU64>,
+    progress::ThroughputFloor,
+    tokio::time::Interval,
+) {
+    let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let floor = progress::ThroughputFloor::new(
+        progress::FloorConfig {
+            window: deadlines.window,
+            floor_bps: deadlines.floor_bps,
+        },
+        Arc::clone(&progress_counter),
+        tokio::time::Instant::now(),
+    );
+    let mut sampler = tokio::time::interval(stall_sample_period(deadlines.window));
+    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    (progress_counter, floor, sampler)
 }
 
 /// What one open asks for: the blob, the span, the payer, and how long the

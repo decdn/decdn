@@ -316,3 +316,53 @@ async fn a_one_shot_dial_beside_a_pooled_connection_answers() -> anyhow::Result<
     ep.close().await;
     Ok(())
 }
+
+/// A narrowed pull pays ahead only up to the end of the prefix it serves: the
+/// node, which sends only what payment covers, then sends nothing past it.
+/// The pull it narrows would pay for its whole range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrowed_pull_pays_only_up_to_its_prefix() -> anyhow::Result<()> {
+    let blob = blob();
+    let total = u64::try_from(blob.len())?;
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 7,
+        },
+        domain(),
+    )
+    .await?;
+    let (ep, conns) = client().await?;
+    let ctx = ctx(1);
+    let deadlines = PullDeadlines::new(OPEN, OPEN, 0)?;
+    let paid = |due: (u64, u64)| {
+        due.0
+            .saturating_mul(decdn_protocol::CHUNK_BYTES)
+            .saturating_add(due.1)
+    };
+
+    let whole = decdn_bao_range::align_range(0, 0, total)?.wire_len();
+    let opened = open_on(&node, &conns, &ctx, hash_of(&blob)).await?;
+    let (_, pull) = opened.into_pull(&ctx, Arc::new(ctx.new_ledger()), 0, 0, deadlines)?;
+    anyhow::ensure!(
+        paid(pull.pay_ahead_due()) == whole,
+        "a whole pull pays for its whole range: {:?}",
+        pull.pay_ahead_due()
+    );
+    drop(pull);
+
+    let stripe = decdn_bao_range::align_range(0, 2 * 16 * 1024, total)?;
+    let opened = open_on(&node, &conns, &ctx, hash_of(&blob)).await?;
+    let (_, mut pull) = opened.into_pull(&ctx, Arc::new(ctx.new_ledger()), 0, 0, deadlines)?;
+    pull.narrow(stripe.wire_len());
+    anyhow::ensure!(stripe.wire_len() < whole);
+    anyhow::ensure!(
+        paid(pull.pay_ahead_due()) == stripe.wire_len(),
+        "a narrowed pull pays for the stripe's wire alone: {:?} for {}",
+        pull.pay_ahead_due(),
+        stripe.wire_len()
+    );
+    drop(pull);
+    ep.close().await;
+    Ok(())
+}
