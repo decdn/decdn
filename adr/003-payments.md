@@ -48,6 +48,8 @@ The owner issues one capability for each key it authorizes. That key is the owne
 
 Delegation bounds the damage a compromised key does. The `spending_cap` bounds what that key authorizes. The `expiry` retires the key. The owner keeps sole control of `topUp` and `closePool`.
 
+A `decdn gateway` holds capabilities for keys that it keeps, and pays for the requests of other clients with them. There, the owner also states which content a capability pays for: any content, or only the content of namespaces that the owner signs into a scope. The gateway applies the scope before it pays. Nodes and the contract never see the scope ([Public HTTP Gateway § Scope](appendix-gateway.md#scope)).
+
 Registration is write-once for each `(poolId, signer)`. The first capability that lands on-chain for a signer fixes its `cap` and `expiry`. The contract ignores every later capability for that signer. The protocol has no capability renewal. To change the terms, the owner authorizes a new signer key. So a node holds the lower of the presented terms and the registered terms ([Pool solvency](#pool-solvency-and-the-refundable-floor-m)). A voucher past the registered `cap` or `expiry` redeems to nothing, so a node that served it would lose the delivered bytes.
 
 Three sections give the rules in full:
