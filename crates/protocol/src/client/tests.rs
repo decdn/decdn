@@ -1,4 +1,6 @@
 use super::*;
+use crate::Coverage;
+use crate::coverage::MAX_COVERAGE_BYTES;
 use crate::framing::{decode_message, encode_message, read_frame, write_frame};
 use std::assert_matches;
 
@@ -40,6 +42,7 @@ fn sample_ext() -> StreamRequestExt {
     StreamRequestExt {
         binding: Some(sample_binding()),
         capability: Some(sample_capability()),
+        pull_through: true,
     }
 }
 
@@ -132,6 +135,7 @@ fn stream_request_ext_capability_roundtrip() -> Result<(), postcard::Error> {
     let with_cap = StreamRequestExt {
         binding: None,
         capability: Some(sample_capability()),
+        pull_through: false,
     };
     let bytes = postcard::to_allocvec(&with_cap)?;
     let decoded: StreamRequestExt = postcard::from_bytes(&bytes)?;
@@ -169,6 +173,7 @@ fn stream_request_ext_validate_rejects_empty_capability_signature() {
             expiry: 0,
             owner_signature: Vec::new(),
         }),
+        pull_through: false,
     };
     assert_eq!(
         ext.validate(),
@@ -194,7 +199,7 @@ fn stream_response_error_roundtrip() -> Result<(), postcard::Error> {
         },
         ..sample_response()
     };
-    let ext = StreamResponseExt::refused(StreamError::Declined);
+    let ext = StreamResponseExt::refused(StreamError::Declined, Coverage::empty());
     let buf = encode_stream_response(&resp, Some(&ext))?;
     let (decoded, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
     assert_eq!(decoded, ClientMessage::StreamResponse(resp));
@@ -521,6 +526,7 @@ fn stream_response_wire_format_is_stable() -> Result<(), Box<dyn std::error::Err
         Some(&StreamResponseExt::served(
             crate::SizeProof::new(5, vec![0x11, 0x22])?,
             None,
+            Coverage::full(1),
         )),
     )?;
     let mut expected_framed = vec![1u8]; // ClientMessage::StreamResponse discriminant
@@ -530,17 +536,23 @@ fn stream_response_wire_format_is_stable() -> Result<(), Box<dyn std::error::Err
     expected_framed.push(2u8); // size_proof length prefix
     expected_framed.extend_from_slice(&[0x11, 0x22]); // size_proof bytes
     expected_framed.push(0u8); // origin_attestation = None
+    expected_framed.push(1u8); // coverage length prefix
+    expected_framed.push(0b1u8); // coverage: block 0
     assert_eq!(framed, expected_framed);
 
     let refused = encode_stream_response(
         &resp,
-        Some(&StreamResponseExt::refused(StreamError::NotFound)),
+        Some(&StreamResponseExt::refused(
+            StreamError::NotFound,
+            Coverage::empty(),
+        )),
     )?;
     let mut expected_refused = vec![1u8];
     expected_refused.extend_from_slice(&expected);
     expected_refused.push(1u8); // outcome = StreamOutcome::Refused
     expected_refused.push(0u8); // StreamError::NotFound discriminant
     expected_refused.push(0u8); // origin_attestation = None
+    expected_refused.push(0u8); // coverage length prefix: empty
     assert_eq!(refused, expected_refused);
     Ok(())
 }
@@ -1005,6 +1017,7 @@ fn stream_request_ext_validate_rejects_wrong_len_binding_sig() {
             binding_signature: vec![0x01; BINDING_SIG_LEN - 1],
         }),
         capability: None,
+        pull_through: false,
     };
     assert_eq!(
         ext.validate(),
@@ -1031,7 +1044,7 @@ fn client_binding_validate_rejects_wrong_len() {
 
 #[test]
 fn stream_response_ext_validate_rejects_error_with_ok() {
-    let ext = StreamResponseExt::refused(StreamError::NotFound);
+    let ext = StreamResponseExt::refused(StreamError::NotFound, Coverage::empty());
     assert_eq!(
         ext.validate(true),
         Err(MessageValidationError::StreamErrorWithOk)
@@ -1051,7 +1064,11 @@ fn stream_response_ext_validate_rejects_ok_without_ext() {
 #[test]
 fn stream_response_ext_validate_rejects_failure_with_served_outcome()
 -> Result<(), crate::SizeProofTooLong> {
-    let ext = StreamResponseExt::served(crate::SizeProof::new(1, vec![0u8])?, None);
+    let ext = StreamResponseExt::served(
+        crate::SizeProof::new(1, vec![0u8])?,
+        None,
+        Coverage::full(1),
+    );
     assert_eq!(
         ext.validate(false),
         Err(MessageValidationError::MissingStreamError)
@@ -1062,17 +1079,20 @@ fn stream_response_ext_validate_rejects_failure_with_served_outcome()
 
 #[test]
 fn stream_response_ext_validate_accepts_failure_with_delivery_error() {
-    let ext = StreamResponseExt::refused(StreamError::Unfunded);
+    let ext = StreamResponseExt::refused(StreamError::Unfunded, Coverage::empty());
     assert_eq!(ext.validate(false), Ok(()));
 }
 
 #[test]
 fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
     // VoucherRejected is mid-stream-only; it must never ride in the response.
-    let ext = StreamResponseExt::refused(StreamError::VoucherRejected {
-        reason: VoucherRejectReason::SpendingCapExhausted,
-        bundle: None,
-    });
+    let ext = StreamResponseExt::refused(
+        StreamError::VoucherRejected {
+            reason: VoucherRejectReason::SpendingCapExhausted,
+            bundle: None,
+        },
+        Coverage::empty(),
+    );
     assert_eq!(
         ext.validate(false),
         Err(MessageValidationError::VoucherRejectedInResponse)
@@ -1086,7 +1106,7 @@ fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
 #[test]
 fn stream_response_base_validate_cannot_see_the_ext() -> Result<(), MessageValidationError> {
     sample_response().validate()?;
-    let stray = StreamResponseExt::refused(StreamError::NotFound);
+    let stray = StreamResponseExt::refused(StreamError::NotFound, Coverage::empty());
     assert_eq!(
         stray.validate(sample_response().body.ok),
         Err(MessageValidationError::StreamErrorWithOk)
@@ -1121,11 +1141,185 @@ fn stream_response_two_phase_no_ext() -> Result<(), postcard::Error> {
 
 #[test]
 fn stream_response_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::Error> {
-    let ext = StreamResponseExt::refused(StreamError::Declined);
+    let ext = StreamResponseExt::refused(StreamError::Declined, Coverage::full(3));
     let mut bytes = postcard::to_allocvec(&ext)?;
     bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
     assert_eq!(parse_stream_response_ext(&bytes)?, ext);
     Ok(())
+}
+
+/// `pull_through` rides at the end of the request extension and round-trips
+/// both ways.
+#[test]
+fn stream_request_ext_pull_through_roundtrip() -> Result<(), postcard::Error> {
+    for pull_through in [false, true] {
+        let ext = StreamRequestExt {
+            pull_through,
+            ..sample_ext()
+        };
+        let buf = encode_stream_request(&sample_request(), Some(&ext))?;
+        let (_, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+        assert_eq!(parse_stream_request_ext(remainder)?, ext);
+    }
+    assert!(
+        !StreamRequestExt::default().pull_through,
+        "an open runs no miss path unless it asks"
+    );
+    Ok(())
+}
+
+/// `coverage` rides at the end of the response extension and round-trips on
+/// a served answer and on a refusal.
+#[test]
+fn stream_response_ext_coverage_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    for ext in [
+        StreamResponseExt::served(
+            crate::SizeProof::new(5, vec![0x11])?,
+            None,
+            Coverage::from_block_indices(9, [0, 8].into_iter()),
+        ),
+        StreamResponseExt::refused(StreamError::NotFound, Coverage::full(2)),
+        StreamResponseExt::refused(StreamError::Unfunded, Coverage::empty()),
+    ] {
+        let buf = encode_stream_response(&sample_response(), Some(&ext))?;
+        let (_, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+        assert_eq!(parse_stream_response_ext(remainder)?, ext);
+    }
+    Ok(())
+}
+
+// --- StreamResponseExt::consistent_with ------------------------------------
+
+/// A signed body for `hash` with `ok`.
+fn body_for(hash: [u8; 32], ok: bool) -> StreamResponseBody {
+    StreamResponseBody {
+        hash,
+        ok,
+        ..sample_body()
+    }
+}
+
+/// A served ext for a blob of `blocks` discovery blocks with `coverage`.
+fn served_ext(blocks: u64, coverage: Coverage) -> StreamResponseExt {
+    let size = blocks * crate::discovery_block_bytes();
+    StreamResponseExt::served(
+        crate::SizeProof::new(size, Vec::new()).unwrap_or_default(),
+        None,
+        coverage,
+    )
+}
+
+#[test]
+fn consistent_with_accepts_a_served_answer_that_covers_the_span() {
+    let block = crate::discovery_block_bytes();
+    let body = body_for([7u8; 32], true);
+    let full = served_ext(3, Coverage::full(3));
+    assert!(
+        full.consistent_with(&body, 0, 0),
+        "whole blob, full coverage"
+    );
+    assert!(full.consistent_with(&body, block, 1), "one byte of block 1");
+    // A partial holder serves a span inside the blocks it covers.
+    let partial = served_ext(3, Coverage::from_block_indices(3, [1].into_iter()));
+    assert!(
+        partial.consistent_with(&body, block, block),
+        "exactly block 1"
+    );
+    assert!(
+        partial.consistent_with(&body, block + 10, 10),
+        "inside block 1"
+    );
+    // A span past the end is cut at the proven size.
+    let tail = served_ext(3, Coverage::from_block_indices(3, [2].into_iter()));
+    assert!(
+        tail.consistent_with(&body, 2 * block, 5 * block),
+        "cut at the end"
+    );
+    assert!(tail.consistent_with(&body, 2 * block, 0), "to the end");
+}
+
+#[test]
+fn consistent_with_rejects_a_served_answer_that_does_not_cover_the_span() {
+    let block = crate::discovery_block_bytes();
+    let body = body_for([7u8; 32], true);
+    let partial = served_ext(3, Coverage::from_block_indices(3, [1].into_iter()));
+    assert!(
+        !partial.consistent_with(&body, 0, 0),
+        "whole blob, one block"
+    );
+    assert!(
+        !partial.consistent_with(&body, block, 0),
+        "to the end, one block"
+    );
+    assert!(
+        !partial.consistent_with(&body, block - 1, 2),
+        "a span that crosses into block 0"
+    );
+    assert!(
+        !served_ext(3, Coverage::empty()).consistent_with(&body, 0, 1),
+        "no coverage"
+    );
+    assert!(
+        !served_ext(3, Coverage::full(3)).consistent_with(&body, 3 * block, 0),
+        "a span with no byte of the blob"
+    );
+}
+
+#[test]
+fn consistent_with_accepts_a_refusal_that_does_not_cover_the_span() {
+    let block = crate::discovery_block_bytes();
+    let body = body_for([7u8; 32], false);
+    let empty = StreamResponseExt::refused(StreamError::NotFound, Coverage::empty());
+    assert!(empty.consistent_with(&body, 0, 0));
+    assert!(empty.consistent_with(&body, block, block));
+    // A partial holder advertises the blocks it holds outside the span.
+    let hint = StreamResponseExt::refused(
+        StreamError::NotFound,
+        Coverage::from_block_indices(3, [0, 2].into_iter()),
+    );
+    assert!(
+        hint.consistent_with(&body, block, block),
+        "block 1 is not held"
+    );
+    assert!(
+        hint.consistent_with(&body, 0, 2 * block),
+        "block 1 is not held"
+    );
+    // A refusal states no size, so a span to the end has no known end.
+    let full = StreamResponseExt::refused(StreamError::Declined, Coverage::full(3));
+    assert!(full.consistent_with(&body, 0, 0), "an unbounded span");
+}
+
+#[test]
+fn consistent_with_rejects_a_refusal_that_covers_the_span() {
+    let block = crate::discovery_block_bytes();
+    let body = body_for([7u8; 32], false);
+    let hint = StreamResponseExt::refused(
+        StreamError::NotFound,
+        Coverage::from_block_indices(3, [0, 2].into_iter()),
+    );
+    assert!(!hint.consistent_with(&body, 0, block), "block 0 is held");
+    assert!(
+        !hint.consistent_with(&body, 2 * block + 7, 1),
+        "block 2 is held"
+    );
+}
+
+/// The empty blob spans no block: its coverage is empty, and `ok` alone says
+/// whether the node serves it.
+#[test]
+fn consistent_with_reads_ok_alone_for_the_empty_root() {
+    let served = served_ext(0, Coverage::empty());
+    assert!(served.consistent_with(&body_for(EMPTY_ROOT, true), 0, 0));
+    let refused = StreamResponseExt::refused(StreamError::NotFound, Coverage::empty());
+    assert!(refused.consistent_with(&body_for(EMPTY_ROOT, false), 0, 0));
+    let claimed = served_ext(0, Coverage::full(1));
+    assert!(
+        !claimed.consistent_with(&body_for(EMPTY_ROOT, true), 0, 0),
+        "a block claimed for the empty root"
+    );
+    let claimed = StreamResponseExt::refused(StreamError::NotFound, Coverage::full(1));
+    assert!(!claimed.consistent_with(&body_for(EMPTY_ROOT, false), 0, 0));
 }
 
 // --- ClientMessage dispatcher + StreamError domain split -----------------
@@ -1231,6 +1425,18 @@ async fn client_message_full_stack_roundtrip() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// The largest coverage bitmap a receiver decodes: [`MAX_COVERAGE_BYTES`]
+/// bytes, every block set.
+fn widest_coverage() -> Result<Coverage, Box<dyn std::error::Error>> {
+    let coverage = Coverage::full(u32::try_from(MAX_COVERAGE_BYTES * 8)?);
+    assert_eq!(
+        postcard::to_allocvec(&coverage)?.len(),
+        MAX_COVERAGE_BYTES + 2,
+        "the bitmap at the cap, behind its two-byte length prefix"
+    );
+    Ok(coverage)
+}
+
 /// The largest `WatermarkBundle` a node can attach: every `u64` at full varint
 /// width and an EOA signature.
 fn widest_bundle() -> WatermarkBundle {
@@ -1246,9 +1452,10 @@ fn widest_bundle() -> WatermarkBundle {
 }
 
 /// The widest legitimate `StreamResponse` fits [`MAX_STREAM_RESPONSE_FRAME`]
-/// (ADR 013 § Wire Framing): a served outcome with a full size proof, and an
-/// origin attestation. The widest refusal is far smaller. The payer reads
-/// every response against that ceiling.
+/// (ADR 013 § Wire Framing): a served outcome with a full size proof, an
+/// origin attestation and a full [`MAX_COVERAGE_BYTES`] coverage bitmap. The
+/// widest refusal is far smaller. The payer reads every response against that
+/// ceiling.
 #[test]
 fn stream_response_frame_ceiling_holds_the_largest_response()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1271,6 +1478,7 @@ fn stream_response_frame_ceiling_holds_the_largest_response()
         Some(&StreamResponseExt::served(
             crate::SizeProof::new(u64::MAX, vec![0x0E; crate::MAX_SIZE_PROOF_BYTES])?,
             Some(attestation.clone()),
+            widest_coverage()?,
         )),
     )?
     .len();
@@ -1288,6 +1496,7 @@ fn stream_response_frame_ceiling_holds_the_largest_response()
                 bundle: Some(widest_bundle()),
             }),
             origin_attestation: Some(attestation),
+            coverage: widest_coverage()?,
         }),
     )?
     .len();
@@ -1296,6 +1505,10 @@ fn stream_response_frame_ceiling_holds_the_largest_response()
     assert!(
         response_len <= MAX_STREAM_RESPONSE_FRAME as usize,
         "StreamResponse = {response_len} B exceeds MAX_STREAM_RESPONSE_FRAME"
+    );
+    assert!(
+        response_len < 5 * 1024,
+        "StreamResponse = {response_len} B; ADR 013 states under 5 KiB"
     );
     Ok(())
 }
@@ -1327,9 +1540,10 @@ fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dy
             expiry: u64::MAX,
             owner_signature: vec![0x06; VOUCHER_SIG_LEN],
         }),
+        pull_through: true,
     };
     let request_len = encode_stream_request(&request, Some(&ext))?.len();
-    assert_eq!(request_len, 301, "StreamRequest + ext at full width");
+    assert_eq!(request_len, 302, "StreamRequest + ext at full width");
 
     let rejected = StreamError::VoucherRejected {
         reason: VoucherRejectReason::BytesRegression,

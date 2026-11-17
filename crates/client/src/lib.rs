@@ -624,23 +624,23 @@ pub fn sign_client_binding(
     })
 }
 
-/// Build the trailing [`StreamRequestExt`] carrying the context's client
-/// identity binding and/or owner capability, or `None` when the context
-/// carries neither — in which case `encode_stream_request` appends no ext
-/// bytes. Applied by `open_stream`, the single request site, so the capability
-/// rides the same session-start request as the binding.
-fn client_binding_ext(ctx: &PoolContext) -> Option<StreamRequestExt> {
-    if ctx.client_binding.is_none() && ctx.capability.is_none() {
-        return None;
-    }
-    Some(StreamRequestExt {
+/// Build the trailing [`StreamRequestExt`]: the context's client identity
+/// binding and owner capability, when it carries them, and `pull_through`.
+/// Applied by `open_stream`, the single request site, so the capability rides
+/// the same session-start request as the binding.
+///
+/// Every open asks for `pull_through`: a pull expects the node to fill a span
+/// it does not hold before it answers.
+fn request_ext(ctx: &PoolContext) -> StreamRequestExt {
+    StreamRequestExt {
         binding: ctx.client_binding.clone(),
         capability: ctx.capability.as_ref().map(|signed| WireCapability {
             spending_cap: signed.capability.spending_cap,
             expiry: signed.capability.expiry,
             owner_signature: signed.signature.as_bytes().to_vec(),
         }),
-    })
+        pull_through: true,
+    }
 }
 
 impl std::fmt::Debug for PoolContext {
@@ -2076,10 +2076,9 @@ async fn open_stream(
         };
         // Two-phase encode (ADR 005): attach the client identity binding when the
         // context carries one, so the serving node can prove lane authority and
-        // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes: the
-        // base frame alone (unbound node-to-node / registered-client path).
-        let ext = client_binding_ext(ctx);
-        let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
+        // authorize a cache-miss origin pull (#1115), and ask for the miss path.
+        let ext = request_ext(ctx);
+        let payload = decdn_protocol::encode_stream_request(&req, Some(&ext))
             .map_err(|e| anyhow::anyhow!("encode stream request: {e}").context(LocalPullFault))?;
         write_frame(&mut send, &payload)
             .await
@@ -2093,6 +2092,8 @@ async fn open_stream(
             expected_signer,
             hash,
             timestamp_us,
+            byte_offset,
+            byte_len,
         )?;
         Ok((conn, send, recv, resp, resp_ext, proven))
     })
@@ -4519,7 +4520,11 @@ fn voucher_rejection(
 }
 
 /// Validate + verify a `StreamResponse` on receive (ADR 005, ADR 014 §1, #252).
-/// Returns the proven blob size of a served response, `None` for a refusal.
+/// `hash` and `timestamp_us` are the request's, which the signed body echoes;
+/// `byte_offset` and `byte_len` are its span, which the coverage must agree
+/// with. Returns the proven blob size of a served response, `None` for a
+/// refusal.
+#[allow(clippy::too_many_arguments)]
 fn verify_response(
     resp: &StreamResponse,
     ext: &StreamResponseExt,
@@ -4527,6 +4532,8 @@ fn verify_response(
     expected_signer: Address,
     hash: [u8; 32],
     timestamp_us: u64,
+    byte_offset: u64,
+    byte_len: u64,
 ) -> anyhow::Result<Option<ProvenSize>> {
     // #252 + slash_sig length/upper-bound checks on the frozen base...
     resp.validate()
@@ -4550,10 +4557,21 @@ fn verify_response(
         .map_err(|e| anyhow::anyhow!("slash_sig verification failed: {e}"))?;
     // A served response states its size only in its proof (ADR 005 § Bounded
     // byte ranges), and `validate` above ties a served outcome to `ok`.
-    Ok(ext
+    let proven = ext
         .size_proof()
         .map(|proof| check_size_proof(hash, proof))
-        .transpose()?)
+        .transpose()?;
+    // The unsigned coverage must agree with the signed answer for the span
+    // asked: a served answer covers it, a refusal does not. A node that sends
+    // a disagreeing pair is at fault, as for a proof that does not verify.
+    if !ext.consistent_with(&resp.body, byte_offset, byte_len) {
+        anyhow::bail!(
+            "response coverage disagrees with the signed ok = {} for the span \
+             [{byte_offset}, +{byte_len})",
+            resp.body.ok
+        );
+    }
+    Ok(proven)
 }
 
 async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Result<()> {

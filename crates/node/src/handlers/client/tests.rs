@@ -1965,7 +1965,9 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
         byte_len: 0,
         timestamp_us: an_hour_ago,
     };
-    let (resp, _ext) = handler.sign_served(&req, 1, 1024).await?;
+    let (resp, _ext) = handler
+        .sign_served(&req, 1, 1024, decdn_protocol::Coverage::full(1))
+        .await?;
     assert_eq!(resp.body.timestamp_us, an_hour_ago);
     let sig = alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?;
     let recovered = StreamSlashData::from_response_body(&resp.body)
@@ -1995,9 +1997,14 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
         timestamp_us: crate::handlers::timestamp_skew::now_us(),
     };
 
-    let (resp, ext) = handler.sign_served(&req(*hash.as_bytes()), 1, size).await?;
+    let full = || decdn_protocol::Coverage::full(decdn_protocol::num_blocks(size));
+    let (resp, ext) = handler
+        .sign_served(&req(*hash.as_bytes()), 1, size, full())
+        .await?;
     assert!(resp.body.ok);
     assert_eq!(ext.validate(resp.body.ok), Ok(()));
+    assert_eq!(ext.coverage, full(), "the coverage rides as given");
+    assert!(ext.consistent_with(&resp.body, 0, 0));
     let sent = ext
         .size_proof()
         .ok_or_else(|| anyhow::anyhow!("no proof sent"))?;
@@ -2010,13 +2017,13 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
 
     assert!(
         handler
-            .sign_served(&req(*hash.as_bytes()), 1, size + 1)
+            .sign_served(&req(*hash.as_bytes()), 1, size + 1, full())
             .await
             .is_err()
     );
     assert!(
         handler
-            .sign_served(&req([9; 32]), 1, 1 << 60)
+            .sign_served(&req([9; 32]), 1, 1 << 60, full())
             .await
             .is_err()
     );

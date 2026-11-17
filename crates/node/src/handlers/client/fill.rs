@@ -1,7 +1,10 @@
 //! Cache-fill tiers for the serve-miss path.
 
+use decdn_protocol::{Coverage, byte_range_blocks, num_blocks};
+
 use super::{
     Arc, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneDeliveryState, LaneKey, Mutex,
+    StreamRequest,
 };
 use tracing::Instrument as _;
 
@@ -245,6 +248,40 @@ impl ClientHandler {
             .await
             .ok()?;
         missing.is_empty().then_some(size)
+    }
+
+    /// The coverage a covering partial hit of `req` answers with: the
+    /// discovery blocks the store holds whole, plus every block the requested
+    /// span touches.
+    ///
+    /// The node holds every byte of the span ([`Self::partial_hit_size`]), but
+    /// the span can hold only part of a block, and the store counts a block
+    /// only when it holds all of it. The span's blocks keep the answer
+    /// covering what it serves. A store read that fails leaves the span's
+    /// blocks alone.
+    pub(super) async fn partial_hit_coverage(
+        &self,
+        hash: Hash,
+        req: &StreamRequest,
+        total_bytes: u64,
+    ) -> Coverage {
+        let held = self.cache.coverage(hash).await.unwrap_or_else(|e| {
+            tracing::warn!(
+                %hash,
+                error = %decdn_cache::ErrorChain::new(&e),
+                "partial hit: the store coverage read failed; advertising the served span only"
+            );
+            Coverage::empty()
+        });
+        let end = if req.byte_len == 0 {
+            total_bytes
+        } else {
+            req.byte_offset
+                .saturating_add(req.byte_len)
+                .min(total_bytes)
+        };
+        let span = byte_range_blocks(req.byte_offset, end).filter_map(|i| u32::try_from(i).ok());
+        Coverage::from_block_indices(num_blocks(total_bytes), held.covered_blocks().chain(span))
     }
 
     /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if

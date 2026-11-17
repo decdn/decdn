@@ -34,8 +34,8 @@ Each read has a frame ceiling. The ceiling is at least the largest legitimate me
 | --- | --- | --- | --- |
 | `MAX_PROBE_REQUEST_FRAME` | 1 KiB | `ProbeRequest`, which the node reads | `ProbeRequest`: 43 B |
 | `MAX_PROBE_FRAME` | 8 KiB | `ProbeResponse`, which the requester reads | `ProbeResponse` with its extension and a full size proof: 4,807 B |
-| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding and a capability: 301 B |
-| `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a refusal code, an origin attestation and a full size proof: under 5 KiB |
+| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding, a capability and the pull-through flag: 302 B |
+| `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a refusal code, an origin attestation, a full size proof and a coverage bitmap: under 5 KiB |
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |
 | `MAX_DHT_FRAME` | 64 KiB | Every `cdn/dht/v1` read, request and response | `BatchStoreRequest` with 256 entries: 59,939 B |
 

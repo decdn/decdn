@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use anyhow::Context as _;
 use bytes::Bytes;
 
+use decdn_protocol::Coverage;
 use decdn_protocol::client::StreamOutcome;
 use iroh::endpoint::WriteError;
 
@@ -57,11 +58,16 @@ impl ClientHandler {
     /// checks the proof before it reaches here, so a missing proof is this
     /// node's fault and fails the signing: the node states no size it cannot
     /// prove, and a served response always carries one.
+    ///
+    /// `coverage` is the discovery blocks the node serves. It covers every
+    /// block of the requested span, or the payer drops the answer
+    /// (`StreamResponseExt::consistent_with`).
     pub(super) async fn sign_served(
         &self,
         req: &StreamRequest,
         rate_per_mb: u64,
         total_bytes: u64,
+        coverage: Coverage,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
         let proof = self
             .cache
@@ -80,10 +86,11 @@ impl ClientHandler {
             rate_per_mb,
             timestamp_us: req.timestamp_us,
         };
-        self.sign_response(body, StreamOutcome::Served(size_proof))
+        self.sign_response(body, StreamOutcome::Served(size_proof), coverage)
     }
 
-    /// Sign an `ok: false` refusal of `req` with `error` at `rate_per_mb`.
+    /// Sign an `ok: false` refusal of `req` with `error` at `rate_per_mb`. A
+    /// refusal advertises no coverage.
     pub(super) fn sign_refusal(
         &self,
         req: &StreamRequest,
@@ -96,7 +103,7 @@ impl ClientHandler {
             rate_per_mb,
             timestamp_us: req.timestamp_us,
         };
-        self.sign_response(body, StreamOutcome::Refused(error))
+        self.sign_response(body, StreamOutcome::Refused(error), Coverage::empty())
     }
 
     /// Sign a `StreamResponse` body and assemble the frozen base plus its
@@ -107,6 +114,7 @@ impl ClientHandler {
         &self,
         body: StreamResponseBody,
         outcome: StreamOutcome,
+        coverage: Coverage,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
         // Every stream signature passes through here, and every caller echoes
         // the dispatch-gated first request's `timestamp_us`
@@ -139,6 +147,7 @@ impl ClientHandler {
             StreamResponseExt {
                 outcome,
                 origin_attestation,
+                coverage,
             },
         ))
     }

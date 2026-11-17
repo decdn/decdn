@@ -8538,6 +8538,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
             ethereum_address: claimed_addr,
             binding_signature: sign_binding_for(&attacker, client_node_id)?,
         }),
+        pull_through: true,
         ..Default::default()
     };
     let req = StreamRequest {
@@ -8977,6 +8978,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
             ethereum_address: intruder_addr,
             binding_signature: sign_binding_for(&intruder, client_node_id)?,
         }),
+        pull_through: true,
         ..Default::default()
     };
     let req = StreamRequest {
@@ -9082,6 +9084,7 @@ async fn client_capability_signed_by_a_non_owner_registers_no_lane() -> anyhow::
             expiry: forged.capability.expiry,
             owner_signature: forged.signature.as_bytes().to_vec(),
         }),
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -9168,6 +9171,7 @@ fn binding_ext(
             ethereum_address: signer.address().into(),
             binding_signature: sign_binding_for(signer, client_node_id)?,
         }),
+        pull_through: true,
         ..Default::default()
     })
 }
@@ -10036,6 +10040,7 @@ async fn pull_through_gate_authorizes_only_lane_signer() -> anyhow::Result<()> {
             ethereum_address: intruder.address().into(),
             binding_signature: sign_binding_for(&intruder, intruder_node_id)?,
         }),
+        pull_through: true,
         ..Default::default()
     };
     let _ = raw_request(&c2, target.clone(), &req, Some(&ext_intruder)).await?;
@@ -10055,6 +10060,7 @@ async fn pull_through_gate_authorizes_only_lane_signer() -> anyhow::Result<()> {
             ethereum_address: owner.address().into(),
             binding_signature: sign_binding_for(&owner, owner_node_id)?,
         }),
+        pull_through: true,
         ..Default::default()
     };
     let _ = raw_request(&c3, target.clone(), &req, Some(&ext_owner)).await?;
@@ -10642,6 +10648,7 @@ async fn pull_through_fills_under_deadline(
             ethereum_address: owner.address().into(),
             binding_signature: sign_binding_for(&owner, owner_node_id)?,
         }),
+        pull_through: true,
         ..Default::default()
     };
     // The handler answers only after `try_pull_through` resolves (populate

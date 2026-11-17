@@ -76,6 +76,7 @@ pub decdn_protocol::client::StreamRequest::timestamp_us: u64
 pub struct decdn_protocol::client::StreamRequestExt
 pub decdn_protocol::client::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
 pub decdn_protocol::client::StreamRequestExt::capability: core::option::Option<decdn_protocol::client::WireCapability>
+pub decdn_protocol::client::StreamRequestExt::pull_through: bool
 impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::StreamResponse
@@ -89,12 +90,14 @@ pub decdn_protocol::client::StreamResponseBody::ok: bool
 pub decdn_protocol::client::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::client::StreamResponseBody::timestamp_us: u64
 pub struct decdn_protocol::client::StreamResponseExt
+pub decdn_protocol::client::StreamResponseExt::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::client::StreamResponseExt::origin_attestation: core::option::Option<decdn_protocol::dht::OriginAttestation>
 pub decdn_protocol::client::StreamResponseExt::outcome: decdn_protocol::client::StreamOutcome
 impl decdn_protocol::client::StreamResponseExt
+pub fn decdn_protocol::client::StreamResponseExt::consistent_with(&self, &decdn_protocol::client::StreamResponseBody, u64, u64) -> bool
 pub const fn decdn_protocol::client::StreamResponseExt::error(&self) -> core::option::Option<&decdn_protocol::client::StreamError>
-pub const fn decdn_protocol::client::StreamResponseExt::refused(decdn_protocol::client::StreamError) -> Self
-pub const fn decdn_protocol::client::StreamResponseExt::served(decdn_protocol::size_proof::SizeProof, core::option::Option<decdn_protocol::dht::OriginAttestation>) -> Self
+pub const fn decdn_protocol::client::StreamResponseExt::refused(decdn_protocol::client::StreamError, decdn_protocol::coverage::Coverage) -> Self
+pub const fn decdn_protocol::client::StreamResponseExt::served(decdn_protocol::size_proof::SizeProof, core::option::Option<decdn_protocol::dht::OriginAttestation>, decdn_protocol::coverage::Coverage) -> Self
 pub const fn decdn_protocol::client::StreamResponseExt::size_proof(&self) -> core::option::Option<&decdn_protocol::size_proof::SizeProof>
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::Voucher
@@ -143,6 +146,7 @@ pub struct decdn_protocol::coverage::Coverage
 impl decdn_protocol::coverage::Coverage
 pub fn decdn_protocol::coverage::Coverage::covered_blocks(&self) -> impl core::iter::traits::iterator::Iterator<Item = u32> + '_
 pub fn decdn_protocol::coverage::Coverage::covers(&self, u32) -> bool
+pub fn decdn_protocol::coverage::Coverage::covers_byte_range(&self, u64, u64) -> bool
 pub fn decdn_protocol::coverage::Coverage::empty() -> Self
 pub fn decdn_protocol::coverage::Coverage::from_block_indices(u32, impl core::iter::traits::iterator::Iterator<Item = u32>) -> Self
 pub fn decdn_protocol::coverage::Coverage::full(u32) -> Self
@@ -153,6 +157,7 @@ pub fn decdn_protocol::coverage::TestBlockSizeGuard::drop(&mut self)
 pub const decdn_protocol::coverage::DISCOVERY_BLOCK_BYTES: u64
 pub const decdn_protocol::coverage::MAX_COVERAGE_BYTES: usize
 pub const decdn_protocol::coverage::MAX_DISCOVERABLE_BLOB_BYTES: u64
+pub fn decdn_protocol::coverage::byte_range_blocks(u64, u64) -> core::ops::range::Range<u64>
 pub fn decdn_protocol::coverage::discovery_block_bytes() -> u64
 pub fn decdn_protocol::coverage::num_blocks(u64) -> u32
 pub fn decdn_protocol::coverage::override_discovery_block_bytes_for_test(u64) -> decdn_protocol::coverage::TestBlockSizeGuard
@@ -490,6 +495,7 @@ pub struct decdn_protocol::Coverage
 impl decdn_protocol::coverage::Coverage
 pub fn decdn_protocol::coverage::Coverage::covered_blocks(&self) -> impl core::iter::traits::iterator::Iterator<Item = u32> + '_
 pub fn decdn_protocol::coverage::Coverage::covers(&self, u32) -> bool
+pub fn decdn_protocol::coverage::Coverage::covers_byte_range(&self, u64, u64) -> bool
 pub fn decdn_protocol::coverage::Coverage::empty() -> Self
 pub fn decdn_protocol::coverage::Coverage::from_block_indices(u32, impl core::iter::traits::iterator::Iterator<Item = u32>) -> Self
 pub fn decdn_protocol::coverage::Coverage::full(u32) -> Self
@@ -595,6 +601,7 @@ pub decdn_protocol::StreamRequest::timestamp_us: u64
 pub struct decdn_protocol::StreamRequestExt
 pub decdn_protocol::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
 pub decdn_protocol::StreamRequestExt::capability: core::option::Option<decdn_protocol::client::WireCapability>
+pub decdn_protocol::StreamRequestExt::pull_through: bool
 impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::StreamResponse
@@ -608,12 +615,14 @@ pub decdn_protocol::StreamResponseBody::ok: bool
 pub decdn_protocol::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::StreamResponseBody::timestamp_us: u64
 pub struct decdn_protocol::StreamResponseExt
+pub decdn_protocol::StreamResponseExt::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::StreamResponseExt::origin_attestation: core::option::Option<decdn_protocol::dht::OriginAttestation>
 pub decdn_protocol::StreamResponseExt::outcome: decdn_protocol::client::StreamOutcome
 impl decdn_protocol::client::StreamResponseExt
+pub fn decdn_protocol::client::StreamResponseExt::consistent_with(&self, &decdn_protocol::client::StreamResponseBody, u64, u64) -> bool
 pub const fn decdn_protocol::client::StreamResponseExt::error(&self) -> core::option::Option<&decdn_protocol::client::StreamError>
-pub const fn decdn_protocol::client::StreamResponseExt::refused(decdn_protocol::client::StreamError) -> Self
-pub const fn decdn_protocol::client::StreamResponseExt::served(decdn_protocol::size_proof::SizeProof, core::option::Option<decdn_protocol::dht::OriginAttestation>) -> Self
+pub const fn decdn_protocol::client::StreamResponseExt::refused(decdn_protocol::client::StreamError, decdn_protocol::coverage::Coverage) -> Self
+pub const fn decdn_protocol::client::StreamResponseExt::served(decdn_protocol::size_proof::SizeProof, core::option::Option<decdn_protocol::dht::OriginAttestation>, decdn_protocol::coverage::Coverage) -> Self
 pub const fn decdn_protocol::client::StreamResponseExt::size_proof(&self) -> core::option::Option<&decdn_protocol::size_proof::SizeProof>
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::TestBlockSizeGuard
@@ -661,6 +670,7 @@ impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::dht::DhtMessage
 pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
 pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
+pub fn decdn_protocol::byte_range_blocks(u64, u64) -> core::ops::range::Range<u64>
 pub fn decdn_protocol::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::discovery_block_bytes() -> u64
 pub fn decdn_protocol::encode_chunk_frame(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::message::MessageValidationError>

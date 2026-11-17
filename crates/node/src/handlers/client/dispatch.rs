@@ -783,6 +783,9 @@ impl ClientHandler {
             }
         };
         let mut hit_size = audit.hit_size();
+        // A covering partial hit answers with the blocks it holds and the
+        // span it serves, not the whole blob (`partial_hit_coverage`).
+        let mut partial_hit = false;
         // The initial `None` is unread on every live path (both branches below
         // either shed and return or overwrite it, and the audit `Err` returns
         // too) — kept anyway so the slot's declared type and its
@@ -879,6 +882,7 @@ impl ClientHandler {
                     }
                 }
                 hit_size = Some(size);
+                partial_hit = true;
             } else {
                 // The shed gate runs before the lane-authority refusal below,
                 // so an unbound / unknown-lane request can transiently hold a
@@ -1360,8 +1364,16 @@ impl ClientHandler {
                 .await;
         }
 
-        // Build and sign the success response.
-        let (resp, resp_ext) = self.sign_served(&req, rate_per_mb, total_bytes).await?;
+        // Build and sign the success response. A complete blob serves every
+        // block; a covering partial serves its own.
+        let coverage = if partial_hit {
+            self.partial_hit_coverage(hash, &req, total_bytes).await
+        } else {
+            decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes))
+        };
+        let (resp, resp_ext) = self
+            .sign_served(&req, rate_per_mb, total_bytes, coverage)
+            .await?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);

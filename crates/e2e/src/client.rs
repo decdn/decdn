@@ -914,6 +914,7 @@ impl PoolSession {
         StreamRequestExt {
             binding: self.ctx.client_binding.clone(),
             capability: self.ctx.capability.as_ref().map(signed_to_wire_capability),
+            pull_through: true,
         }
     }
 }

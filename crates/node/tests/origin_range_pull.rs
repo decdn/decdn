@@ -190,6 +190,7 @@ async fn ranged_paid_pull(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -391,6 +392,7 @@ async fn idle_open(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -981,6 +983,7 @@ async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> a
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -1071,6 +1074,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let ext = StreamRequestExt {
         binding: None,
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -2460,6 +2464,7 @@ async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> 
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -2570,6 +2575,7 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -2690,6 +2696,7 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -2894,6 +2901,7 @@ async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow:
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),

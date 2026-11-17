@@ -226,20 +226,18 @@ fn aligned_wire_len_clamps_when_the_response_total_is_smaller_than_the_requested
     Ok(())
 }
 
-/// `client_binding_ext` maps an unbound context to `None` (so
-/// `encode_stream_request` appends no ext bytes — the base frame
-/// alone) and a bound one to `Some` carrying exactly the binding at the default
-/// voucher cadence. This is the mapping the single request site
+/// `request_ext` carries exactly the context's binding and capability, and
+/// always asks for the miss path. This is the mapping the single request site
 /// (`open_stream`) relies on, so it guards a refactor that would silently
-/// drop the ext (#1115).
+/// drop the binding (#1115) or the `pull_through` flag.
 #[test]
-fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
+fn request_ext_reflects_the_context() -> anyhow::Result<()> {
     use std::sync::Arc;
 
     use alloy::primitives::{Address, B256, U256};
     use alloy::signers::local::PrivateKeySigner;
 
-    use super::{PoolContext, client_binding_ext, sign_client_binding};
+    use super::{PoolContext, request_ext, sign_client_binding};
 
     let signer = PrivateKeySigner::random();
     let domain = decdn_incentive::bind_node_id_domain(1, Address::ZERO);
@@ -254,17 +252,18 @@ fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
         client_binding: None,
         capability: None,
     };
-    // Unbound ⇒ no ext.
+    // Unbound ⇒ no binding and no capability, and still the miss path.
+    let ext = request_ext(&ctx);
     anyhow::ensure!(
-        client_binding_ext(&ctx).is_none(),
-        "unbound ctx must yield no ext"
+        ext.binding.is_none() && ext.capability.is_none(),
+        "unbound ctx carries no binding"
     );
+    anyhow::ensure!(ext.pull_through, "every open asks for the miss path");
 
     // Bound ⇒ ext carries exactly the binding.
     let binding = sign_client_binding(&signer, B256::repeat_byte(0xAB), &domain)?;
     let ctx = ctx.with_client_binding(binding.clone());
-    let ext =
-        client_binding_ext(&ctx).ok_or_else(|| anyhow::anyhow!("bound ctx must yield an ext"))?;
+    let ext = request_ext(&ctx);
     anyhow::ensure!(
         ext.binding == Some(binding),
         "ext must carry the exact binding"
@@ -285,8 +284,7 @@ fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
     }
     .sign(&owner, &domain)?;
     let ctx = ctx.with_capability(capability.clone());
-    let ext = client_binding_ext(&ctx)
-        .ok_or_else(|| anyhow::anyhow!("ctx with capability must yield an ext"))?;
+    let ext = request_ext(&ctx);
     let wire_cap = ext
         .capability
         .ok_or_else(|| anyhow::anyhow!("ext must carry the capability"))?;
@@ -307,7 +305,7 @@ fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
 
 /// Build a test [`PoolContext`] signing with `signer` over the
 /// `(pool_id, provider)` lane, sharing the shape
-/// `client_binding_ext_reflects_binding_presence` already uses.
+/// `request_ext_reflects_the_context` already uses.
 fn resume_test_ctx(
     pool_id: alloy::primitives::B256,
     provider: alloy::primitives::Address,
@@ -1223,10 +1221,10 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::slash_judge_domain;
     use decdn_incentive::stream_sig::StreamSlashData;
-    use decdn_protocol::SizeProof;
     use decdn_protocol::client::{
         StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
     };
+    use decdn_protocol::{Coverage, SizeProof};
 
     let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
     let size = u64::try_from(blob.len())?;
@@ -1249,12 +1247,13 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
             body,
             slash_sig: sig.as_bytes().to_vec(),
         };
-        super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts)
+        super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts, 0, 0)
     };
 
     let proven = verify(StreamResponseExt::served(
         SizeProof::new(size, proof_bytes.clone())?,
         None,
+        Coverage::full(1),
     ))?;
     anyhow::ensure!(proven.map(super::ProvenSize::get) == Some(size));
     for (what, size_proof) in [
@@ -1264,9 +1263,13 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
         ),
         ("a huge size", SizeProof::new(1u64 << 60, vec![0xCD; 4000])?),
     ] {
-        let err = verify(StreamResponseExt::served(size_proof, None))
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("{what} must not open"))?;
+        let err = verify(StreamResponseExt::served(
+            size_proof,
+            None,
+            Coverage::full(1),
+        ))
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("{what} must not open"))?;
         anyhow::ensure!(
             err.downcast_ref::<super::UnprovenSize>().is_some(),
             "{what}: {err}"
@@ -1276,15 +1279,97 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
             "{what} is the source's fault"
         );
     }
-    let err = verify(StreamResponseExt::refused(StreamError::NotFound))
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("ok without a proof must not open"))?;
+    let err = verify(StreamResponseExt::refused(
+        StreamError::NotFound,
+        Coverage::empty(),
+    ))
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("ok without a proof must not open"))?;
     let expected = decdn_protocol::MessageValidationError::StreamErrorWithOk.to_string();
     anyhow::ensure!(err.to_string().contains(&expected), "no proof: {err}");
     anyhow::ensure!(
         matches!(crate::fault::classify(&err), crate::fault::Fault::Source),
         "no proof is the source's fault"
     );
+    Ok(())
+}
+
+/// The open stage drops an answer whose unsigned coverage disagrees with the
+/// signed `ok` for the requested span: a served answer that does not cover
+/// the span, and a refusal that does. Both are the source's fault.
+#[test]
+fn an_open_whose_coverage_disagrees_is_a_source_fault() -> anyhow::Result<()> {
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::slash_judge_domain;
+    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_protocol::client::{
+        StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
+    };
+    use decdn_protocol::{Coverage, SizeProof};
+
+    let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let size = u64::try_from(blob.len())?;
+    let hash = *blake3::hash(&blob).as_bytes();
+    let proof_bytes = decdn_bao_range::encode_outboard(blob.as_slice(), size)?
+        .size_proof
+        .to_vec();
+    let operator = PrivateKeySigner::random();
+    let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
+    let ts = 1_700_000_000_000_000;
+    let verify = |ext: StreamResponseExt| -> anyhow::Result<Option<super::ProvenSize>> {
+        let body = StreamResponseBody {
+            hash,
+            ok: ext.size_proof().is_some(),
+            rate_per_mb: 10,
+            timestamp_us: ts,
+        };
+        let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+        let resp = StreamResponse {
+            body,
+            slash_sig: sig.as_bytes().to_vec(),
+        };
+        // A bounded span: a refusal states no size, so only a bounded span
+        // can be covered by it.
+        super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts, 0, size)
+    };
+    let served = |coverage| -> anyhow::Result<StreamResponseExt> {
+        Ok(StreamResponseExt::served(
+            SizeProof::new(size, proof_bytes.clone())?,
+            None,
+            coverage,
+        ))
+    };
+
+    // The consistent pairs open: a served answer that covers the blob, and a
+    // refusal with no coverage.
+    verify(served(Coverage::full(1))?)?;
+    verify(StreamResponseExt::refused(
+        StreamError::NotFound,
+        Coverage::empty(),
+    ))?;
+
+    for (what, ext) in [
+        (
+            "a served answer with no coverage",
+            served(Coverage::empty())?,
+        ),
+        (
+            "a refusal that covers the span",
+            StreamResponseExt::refused(StreamError::NotFound, Coverage::full(1)),
+        ),
+    ] {
+        let err = verify(ext)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("{what} must not open"))?;
+        anyhow::ensure!(
+            err.to_string().contains("coverage disagrees"),
+            "{what}: {err}"
+        );
+        anyhow::ensure!(
+            matches!(crate::fault::classify(&err), crate::fault::Fault::Source),
+            "{what} is the source's fault"
+        );
+    }
     Ok(())
 }
 
@@ -1312,7 +1397,10 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         body: body.clone(),
         slash_sig: sig.as_bytes().to_vec(),
     };
-    let response_ext = decdn_protocol::StreamResponseExt::refused(StreamError::Declined);
+    let response_ext = decdn_protocol::StreamResponseExt::refused(
+        StreamError::Declined,
+        decdn_protocol::Coverage::empty(),
+    );
     // Preconditions the real open stage enforces before ever calling `open`.
     response.validate()?;
     response_ext.validate(response.body.ok)?;
@@ -1375,6 +1463,7 @@ fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {
     let served = decdn_protocol::StreamResponseExt::served(
         decdn_protocol::SizeProof::new(0, Vec::new()).unwrap_or_default(),
         None,
+        decdn_protocol::Coverage::empty(),
     );
     let err = UpstreamRefused::open(response, &served);
     assert!(
@@ -1520,5 +1609,50 @@ async fn a_refused_proof_still_rewinds_its_reveal() -> anyhow::Result<()> {
         before.amount - U256::from(10u64),
         "a refused reveal gives back exactly one chunk"
     );
+    Ok(())
+}
+
+/// A refusal class in a `StreamError` frame, which a node may write before
+/// the first `ChunkData` when it refuses admission at the first payment
+/// proof, is the same typed refusal a signed `ok: false` answer gives. It
+/// rewinds no proof, carries no signed response, and `Unfunded` still drives
+/// funding recovery.
+#[tokio::test]
+async fn a_refusal_frame_before_any_chunk_is_a_typed_refusal() -> anyhow::Result<()> {
+    use decdn_protocol::client::StreamError;
+
+    use super::UpstreamRefused;
+    use crate::fault::{Fault, classify};
+
+    for (error, unfunded) in [
+        (StreamError::NotFound, false),
+        (StreamError::Declined, false),
+        (StreamError::Unfunded, true),
+    ] {
+        let (ledger, meter) = ledger_with_a_released_reveal().await?;
+        let before = ledger.committed();
+        let err = super::voucher_rejection(&ledger, &meter, error.clone());
+        let refused = err
+            .downcast_ref::<UpstreamRefused>()
+            .ok_or_else(|| anyhow::anyhow!("{error:?} must be a typed refusal: {err:#}"))?;
+        anyhow::ensure!(*refused.error() == error, "the class survives unchanged");
+        anyhow::ensure!(
+            refused.evidence().is_none(),
+            "a bare frame carries no signed response"
+        );
+        anyhow::ensure!(
+            ledger.committed() == before,
+            "{error:?} is no verdict on the proof"
+        );
+        let fault = classify(&err);
+        anyhow::ensure!(
+            if unfunded {
+                matches!(fault, Fault::Unaffordable)
+            } else {
+                matches!(fault, Fault::Source)
+            },
+            "{error:?} classifies as a funding wait only when unfunded"
+        );
+    }
     Ok(())
 }

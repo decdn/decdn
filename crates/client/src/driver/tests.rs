@@ -18,6 +18,7 @@ use crate::{
     ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamPullHeader, UpstreamRefused,
     UpstreamVoucherRejected, VoucherProgress,
 };
+use decdn_protocol::Coverage;
 use decdn_protocol::client::{
     StreamError, StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
 };
@@ -1538,7 +1539,7 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     body,
                     slash_sig: vec![0u8; 65],
                 };
-                let ext = StreamResponseExt::refused(StreamError::Unfunded);
+                let ext = StreamResponseExt::refused(StreamError::Unfunded, Coverage::empty());
                 return Err(UpstreamRefused::open(resp, &ext));
             }
             self.inner.open(hash, range).await

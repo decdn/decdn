@@ -114,6 +114,21 @@ pub fn num_blocks(total_bytes: u64) -> u32 {
     saturate_blocks(total_bytes.div_ceil(discovery_block_bytes()))
 }
 
+/// The discovery blocks that the byte range `[start, end)` touches, as a
+/// half-open range of block indices at [`discovery_block_bytes`]. Empty when
+/// `end <= start`.
+///
+/// The indices are `u64`, so a range near `u64::MAX` does not saturate: a
+/// caller that builds a [`Coverage`] from them converts each index itself.
+#[must_use]
+pub fn byte_range_blocks(start: u64, end: u64) -> std::ops::Range<u64> {
+    if end <= start {
+        return 0..0;
+    }
+    let block = discovery_block_bytes();
+    (start / block)..(end - 1) / block + 1
+}
+
 /// The overridable discovery-block size, compiled only under `test-support`.
 #[cfg(feature = "test-support")]
 mod test_block_size;
@@ -243,6 +258,23 @@ impl Coverage {
         self.blocks
             .get(byte_idx)
             .is_some_and(|b| (b >> bit) & 1 == 1)
+    }
+
+    /// Does this bitmap cover every discovery block that the byte range
+    /// `[start, end)` touches ([`byte_range_blocks`])?
+    ///
+    /// An empty range touches no block, so no bitmap covers it. A block past
+    /// the end of the bitmap is not covered. The walk checks that bound first,
+    /// so it reads at most the bitmap's own bits, whatever the range.
+    #[must_use]
+    pub fn covers_byte_range(&self, start: u64, end: u64) -> bool {
+        let mut blocks = byte_range_blocks(start, end);
+        let capacity = u64::try_from(self.blocks.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(8);
+        !blocks.is_empty()
+            && blocks.end <= capacity
+            && blocks.all(|block| u32::try_from(block).is_ok_and(|block| self.covers(block)))
     }
 
     /// No block is covered — every byte of the bitmap is zero.

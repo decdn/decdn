@@ -3868,8 +3868,12 @@ fn signed_response(
         .as_bytes()
         .to_vec();
     let ext = match error {
-        None => StreamResponseExt::served(support::size_proof_for(req.hash, total_bytes), None),
-        Some(error) => StreamResponseExt::refused(error),
+        None => StreamResponseExt::served(
+            support::size_proof_for(req.hash, total_bytes),
+            None,
+            decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes)),
+        ),
+        Some(error) => StreamResponseExt::refused(error, decdn_protocol::Coverage::empty()),
     };
     Ok((StreamResponse { body, slash_sig }, ext))
 }
@@ -6983,6 +6987,7 @@ async fn leaf_ranged_paid_pull(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -7275,6 +7280,7 @@ async fn leaf_paced_pull_mode(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -9971,6 +9977,7 @@ async fn leaf_opens_paid_stream(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),

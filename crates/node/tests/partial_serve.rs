@@ -138,6 +138,7 @@ async fn ranged_paid_pull(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -153,6 +154,13 @@ async fn ranged_paid_pull(
 
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
+    // A partial holder's answer covers the span it serves, even where the
+    // span holds only part of a discovery block.
+    anyhow::ensure!(
+        resp_ext.consistent_with(&resp.body, byte_offset, byte_len),
+        "the served coverage {:?} does not cover [{byte_offset}, +{byte_len})",
+        resp_ext.coverage
+    );
     let total_bytes = resp_ext
         .size_proof()
         .map(decdn_protocol::SizeProof::size)
