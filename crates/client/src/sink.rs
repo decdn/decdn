@@ -144,6 +144,24 @@ impl StashedFault for PullReader {
     fn take_fault(&mut self) -> Option<anyhow::Error> {
         self.fault.take()
     }
+
+    fn note_failed_delivery(&mut self) {
+        self.pull.note_node_failure();
+    }
+}
+
+/// The error a decode loop returns when the bao decoder fails on `reader`:
+/// the reader's parked typed fault when it holds one, and otherwise the
+/// decoder's own error, classified by [`classify_decode_error`]. A decoder
+/// error with no parked fault is the source's bytes failing, corrupt or short,
+/// so it tells the reader its delivery failed
+/// ([`StashedFault::note_failed_delivery`]).
+pub(crate) fn decode_failure(reader: &mut impl StashedFault, err: DecodeError) -> anyhow::Error {
+    if let Some(fault) = reader.take_fault() {
+        return fault;
+    }
+    reader.note_failed_delivery();
+    classify_decode_error(err)
 }
 
 /// Split a bao decode failure into "the peer lied" and "the stream ended early",

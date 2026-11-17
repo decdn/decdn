@@ -3394,9 +3394,9 @@ fn is_local_store_fault(err: &anyhow::Error) -> bool {
 /// answer to the stream open. The leg goes only to a source whose
 /// probe advertised the blob, so a `NotFound` from it is rarely an honest miss. It
 /// is one of the refusals the seller's `ServeRejectReason::wire_error` collapses
-/// onto `NotFound`, and the common one is the per-signer live cap: this node pays
-/// every upstream leg from one buyer signer, so its other concurrent pulls on the
-/// same hash can fill that cap. The collapse also carries refusals that do not
+/// onto `NotFound`, and the common ones are a load shed and the seller's
+/// pull-loop guard while its own upstream open for the blob is in progress
+/// (#2224). The collapse also carries refusals that do not
 /// clear by waiting (an unconfirmed pool, a chain-stale seller); the assembly's
 /// wait budget bounds what those cost.
 ///

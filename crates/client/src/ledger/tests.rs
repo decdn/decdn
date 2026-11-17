@@ -1408,3 +1408,56 @@ async fn wire_bytes_are_independent_of_paid_bytes() -> anyhow::Result<()> {
     assert_eq!(ledger.wire_bytes(), 2_000, "payment moves no wire bytes");
     Ok(())
 }
+
+const MIB: u64 = 1 << 20;
+
+/// A node that states an older watermark of ours cannot move the ledger below
+/// price times the bytes this lane verified from it.
+#[tokio::test]
+async fn a_rebase_never_moves_below_the_price_of_verified_bytes() -> anyhow::Result<()> {
+    let ledger = PoolLedger::new(Cumulative::default());
+    ledger.note_rate(10);
+    // 4 MiB paid at 10 base units per MiB.
+    ledger
+        .issue(4 * MIB, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+        .await?;
+    ledger.note_wire(4 * MIB);
+    ledger.note_verified(4 * MIB);
+    let paid = ledger.committed();
+
+    let stale = Cumulative {
+        bytes: U256::from(MIB),
+        amount: U256::from(10u64),
+    };
+    assert_matches!(ledger.rebase(stale, Some(0)).await, Rebase::Rebased { .. });
+    let floor = ledger.committed();
+    assert_eq!(floor.bytes, U256::from(4 * MIB), "bytes keep the floor");
+    assert_eq!(floor.amount, U256::from(40u64), "price of 4 MiB verified");
+    assert_eq!(floor, paid, "nothing verified is paid again");
+    Ok(())
+}
+
+/// A lane with a shared track record, as two signers at one node would hold.
+fn lane_at(trust: &Arc<crate::payer_window::NodeTrust>) -> PoolLedger {
+    let ledger = PoolLedger::new(Cumulative::default());
+    ledger.attach_trust(Arc::clone(trust));
+    ledger.note_rate(10);
+    ledger
+}
+
+fn node() -> Arc<crate::payer_window::NodeTrust> {
+    crate::payer_window::PayerWindows::new(crate::payer_window::PayAheadPolicy::new())
+        .node(alloy::primitives::Address::repeat_byte(9))
+}
+
+/// Bytes a lane verifies feed the operator's shared track record, which every
+/// lane at that operator reads to size its window.
+#[test]
+fn verified_bytes_feed_the_operator_record() {
+    let trust = node();
+    let (a, b) = (lane_at(&trust), lane_at(&trust));
+    a.note_verified(2 * MIB);
+    b.note_verified(3 * MIB);
+    assert_eq!(trust.verified(), 5 * MIB);
+    assert_eq!(trust.lost(), 0);
+}

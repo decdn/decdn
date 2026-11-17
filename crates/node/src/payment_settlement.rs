@@ -787,7 +787,6 @@ impl ClosedPools {
                 info!(pool_id = %pool_id, signer = %key.signer, "pool closed; dropped tracked lane");
             }
         }
-        self.handler.forget_pool_floor((self.deployment, pool_id));
     }
 
     /// Forget the lanes of every pool a read found `Closed` since the last

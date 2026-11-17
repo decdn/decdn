@@ -637,8 +637,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// a probed partial holder counts toward barring it from pull-through,
     /// and a `Declined` refusal or an unhealed voucher rejection declines it
     /// at once, as on its own stream. The scheduler passes only uncovered
-    /// ranges here: an extra stream's covered `NotFound` is most often the
-    /// node's per-signer live cap.
+    /// ranges here: an extra stream's covered `NotFound` is most often a
+    /// load shed.
     pub(crate) fn record_extra_refusal(
         &mut self,
         provider: Address,

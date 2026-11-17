@@ -1,6 +1,6 @@
 use super::{
-    BudgetPacer, CHUNK_BYTES, CHUNK_GROUP_BYTES, DownstreamFrontier, MIN_DRAW_WINDOW,
-    PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, VERIFY_LAG_BYTES, WindowPacer,
+    BudgetPacer, CHUNK_BYTES, CHUNK_GROUP_BYTES, CreditPacer, DownstreamFrontier, MIN_DRAW_WINDOW,
+    PULL_AHEAD_BYTES, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, WindowPacer,
 };
 use alloy::primitives::U256;
 use std::assert_matches;
@@ -321,154 +321,131 @@ fn window_pacer_passes_through_done_and_refuse() {
     assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
 }
 
+/// A lane that holds no credit for the stream draws nothing: the downstream
+/// frontier has not left the stream's start, so the pull waits. A payer that
+/// never pays costs the node no upstream payment.
 #[test]
-fn ramp_pacer_paces_pull_on_the_ramped_window() {
-    // Unpaid: downstream.served_paid = 0 -> window = floor. The pull may run at
-    // most `floor` ahead of the served-paid frontier, then Wait.
-    let floor = 4 * CHUNK_GROUP_BYTES;
-    let pacer = RampPacer {
-        divisor: 2,
-        floor,
-        credit_max: 64 * CHUNK_GROUP_BYTES,
-        paid_base: 0,
-        paid_carried: 0,
-    };
-    let mut s = healthy();
-    s.downstream.served_paid = 0;
-    s.pulled_frontier = floor; // already floor ahead
-    assert_eq!(pacer.decide(&s), PaceDecision::Wait);
-}
-
-#[test]
-fn ramp_pacer_widens_the_pull_window_as_served_paid_advances() {
-    // downstream.served_paid = 32 groups, divisor 2 -> window 16 groups > floor,
-    // so a pull only `floor` ahead may Draw again.
-    let floor = 4 * CHUNK_GROUP_BYTES;
-    let pacer = RampPacer {
-        divisor: 2,
-        floor,
-        credit_max: 64 * CHUNK_GROUP_BYTES,
-        paid_base: 0,
-        paid_carried: 0,
-    };
-    let mut s = healthy();
-    s.downstream.served_paid = 32 * CHUNK_GROUP_BYTES;
-    s.pulled_frontier = floor;
-    assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
-}
-
-#[test]
-fn ramp_pacer_measures_paid_from_the_session_start() {
-    // A request resuming at 32 groups has an ABSOLUTE served-paid frontier of
-    // 32 groups before it pays a byte. The ramp must read that as "0 paid",
-    // so the window stays at the floor and a pull already `floor` ahead Waits.
-    let floor = 4 * CHUNK_GROUP_BYTES;
+fn credit_pacer_draws_nothing_while_the_lane_holds_no_credit() {
     let start = 32 * CHUNK_GROUP_BYTES;
-    let pacer = RampPacer {
-        divisor: 2,
-        floor,
-        credit_max: 64 * CHUNK_GROUP_BYTES,
-        paid_base: start,
-        paid_carried: 0,
-    };
+    let pacer = CreditPacer { paid_base: start };
     let mut s = healthy();
     s.downstream.served_paid = start;
-    s.pulled_frontier = start + floor;
+    s.pulled_frontier = start;
     assert_eq!(pacer.decide(&s), PaceDecision::Wait);
+}
 
-    // Once the stream has paid 32 groups PAST its start, the window is 16
-    // groups (> floor), so the same pull may Draw again.
-    s.downstream.served_paid = start + 32 * CHUNK_GROUP_BYTES;
+/// The pull runs at most `PULL_AHEAD_BYTES` past the credit frontier, then
+/// waits for the lane to pay for more.
+#[test]
+fn credit_pacer_stops_the_pull_at_the_credit_frontier_plus_the_ahead_slack() {
+    let pacer = CreditPacer { paid_base: 0 };
+    let mut s = healthy();
+    s.requested_bytes = 64 * CHUNK_BYTES;
+    s.gap_remaining = 64 * CHUNK_BYTES;
+    s.downstream.served_paid = CHUNK_BYTES;
+    s.pulled_frontier = 0;
+    assert_eq!(
+        pacer.decide(&s),
+        PaceDecision::Draw {
+            up_to_bytes: CHUNK_BYTES + PULL_AHEAD_BYTES
+        }
+    );
+    s.pulled_frontier = CHUNK_BYTES + PULL_AHEAD_BYTES;
+    assert_eq!(pacer.decide(&s), PaceDecision::Wait);
+}
+
+/// A draw below the minimum waits for more credit, so each upstream request
+/// carries a useful amount. The end of the gap draws whatever is left.
+#[test]
+fn credit_pacer_waits_for_a_minimum_draw_except_at_the_gap_end() {
+    let pacer = CreditPacer { paid_base: 0 };
+    let mut s = healthy();
+    s.requested_bytes = 64 * CHUNK_BYTES;
+    s.gap_remaining = 64 * CHUNK_BYTES;
+    s.downstream.served_paid = 4 * CHUNK_GROUP_BYTES;
+    s.pulled_frontier = 4 * CHUNK_GROUP_BYTES;
+    assert_eq!(pacer.decide(&s), PaceDecision::WaitForMinDraw);
+    s.gap_remaining = 2 * CHUNK_GROUP_BYTES;
     assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
 }
 
+/// A serve leg parked within one group past the pull's frontier is waiting on
+/// bytes its credit covers, so it draws one `PULL_AHEAD_BYTES` even with no
+/// credit frontier movement.
 #[test]
-fn ramp_pacer_adds_the_carried_credit_to_the_streams_own_payment() {
-    // A stream that carries 32 groups of lane credit opens at a 16-group
-    // window before it pays a byte, even though it starts at an offset
-    // smaller than the carry: the carry is a term of the ramp, not an offset.
-    let floor = 4 * CHUNK_GROUP_BYTES;
-    let start = 8 * CHUNK_GROUP_BYTES;
-    let pacer = RampPacer {
-        divisor: 2,
-        floor,
-        credit_max: 64 * CHUNK_GROUP_BYTES,
-        paid_base: start,
-        paid_carried: 32 * CHUNK_GROUP_BYTES,
-    };
+fn credit_pacer_serves_a_parked_leg_one_ahead_slack() {
+    let pacer = CreditPacer { paid_base: 0 };
     let mut s = healthy();
-    s.downstream.served_paid = start;
-    s.pulled_frontier = start + floor;
-    assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
-    s.pulled_frontier = start + 16 * CHUNK_GROUP_BYTES;
-    assert_eq!(pacer.decide(&s), PaceDecision::Wait);
-
-    // Its own payment adds to the carry: 16 more paid groups widen the
-    // window to 24 groups.
-    s.downstream.served_paid = start + 16 * CHUNK_GROUP_BYTES;
-    s.pulled_frontier = start + 16 * CHUNK_GROUP_BYTES + 24 * CHUNK_GROUP_BYTES;
-    assert_eq!(pacer.decide(&s), PaceDecision::Wait);
-    s.pulled_frontier -= CHUNK_GROUP_BYTES;
-    assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
-}
-
-/// The liveness invariant `PULL_WINDOW_FLOOR` exists to hold: a pull window
-/// must clear one payment chunk by BOTH group roundings that separate paid
-/// wire from drawable content — `content_paid_frontier`'s floor to a group
-/// boundary, and `WindowPacer`'s floor of its own room to whole groups — plus
-/// the leaf the client verifies past the chunk boundary before it pays, AND
-/// still leave a group for the serving node's one-frame prefetch.
-///
-/// Modelled at the worst case for each: the served-paid frontier lags the
-/// client's true paid position by a full group, and the room the pacer grants
-/// loses another. What survives must be a whole chunk plus the group the serve
-/// leg reads ahead, or one side or the other parks — the client short of the
-/// chunk whose payment would widen the window, or the serve leg short of the
-/// frame it prefetches past its own shut window.
-///
-/// The prefetch term is what ties this constant to
-/// `ClientHandler::frame_target`'s room floor on the serving side. Lowering
-/// this floor, or raising that floor, breaks liveness on the cache-miss leg —
-/// and it breaks it as a hang, not a failed assertion, so it is pinned here
-/// rather than left to an integration test to discover by timeout.
-#[test]
-fn the_pull_window_floor_clears_one_chunk_and_a_prefetch_after_both_roundings() {
-    let survives = PULL_WINDOW_FLOOR - 2 * CHUNK_GROUP_BYTES;
-    let needed = CHUNK_BYTES + VERIFY_LAG_BYTES + CHUNK_GROUP_BYTES;
-    assert!(
-        survives >= needed,
-        "a {PULL_WINDOW_FLOOR}-byte floor leaves only {survives} bytes after both \
-         roundings, short of the {needed} bytes the client must draw — one \
-         {CHUNK_BYTES}-byte chunk plus the {VERIFY_LAG_BYTES}-byte leaf that \
-         verifies its boundary to complete a payment, plus the \
-         {CHUNK_GROUP_BYTES}-byte group the serve leg prefetches past a shut \
-         window. One side or the other would park forever"
+    s.requested_bytes = 64 * CHUNK_BYTES;
+    s.gap_remaining = 64 * CHUNK_BYTES;
+    s.downstream.served_paid = 0;
+    s.pulled_frontier = 0;
+    s.downstream.serve_demand = 1;
+    assert_eq!(
+        pacer.decide(&s),
+        PaceDecision::Draw {
+            up_to_bytes: PULL_AHEAD_BYTES
+        }
     );
 }
 
-/// The same invariant, exercised through the pacer rather than by arithmetic:
-/// with the window at the floor and the pull parked exactly one chunk past a
-/// group-lagged paid frontier, the pacer must still grant a draw. A window of
-/// exactly one chunk does not, which is the deadlock this floor removes.
+/// Money decisions pass through the credit pacer unchanged.
 #[test]
-fn at_the_floor_a_pull_one_chunk_ahead_may_still_draw() {
-    let pacer = RampPacer {
-        divisor: 2,
-        floor: PULL_WINDOW_FLOOR,
-        credit_max: 64 * CHUNK_BYTES,
-        paid_base: 0,
-        paid_carried: 0,
-    };
+fn credit_pacer_passes_through_done_and_refuse() {
+    let pacer = CreditPacer { paid_base: 0 };
+    let mut s = healthy();
+    s.cleared_bytes = s.requested_bytes;
+    assert_eq!(pacer.decide(&s), PaceDecision::Done);
+    let mut s = healthy();
+    s.remaining_deposit = U256::from(4u64);
+    s.next_voucher_cost = U256::from(10u64);
+    assert_eq!(pacer.decide(&s), PaceDecision::Refuse);
+}
+
+/// The liveness invariant `PULL_AHEAD_BYTES` exists to hold: the pull draws
+/// past the credit frontier by both group roundings that separate paid wire
+/// from drawable content (`content_paid_frontier` floors to a group boundary,
+/// and `CreditPacer` floors its room to whole groups) plus the leaf the serve
+/// leg's encoder reads to finish a frame cut at `max(credit, one group)`.
+///
+/// The leaf term ties this constant to `ClientHandler::frame_target`'s room
+/// floor on the serving side. Raising that floor, or lowering this constant,
+/// breaks liveness on the cache-miss leg. It breaks it as a hang, not a failed
+/// assertion, so it is pinned here.
+#[test]
+fn the_pull_ahead_slack_clears_both_roundings_and_a_frame_leaf() {
+    let rounding_groups = 2;
+    let leaf_groups = 1;
+    assert!(
+        PULL_AHEAD_BYTES >= (rounding_groups + leaf_groups) * CHUNK_GROUP_BYTES,
+        "a {PULL_AHEAD_BYTES}-byte slack is short of two rounding groups plus the \
+         frame's leaf group. The serve leg would park on bytes the pull may not draw"
+    );
+    assert_eq!(
+        decdn_bao_range::CHUNK_GROUP_BYTES,
+        CHUNK_GROUP_BYTES,
+        "the room floor in `frame_target` is one chunk group"
+    );
+}
+
+/// With credit for one chunk and the pull at the credit frontier, a serve leg
+/// that cuts one group more than the credit (the room floor) still finds the
+/// bytes it needs inside the pull's reach.
+#[test]
+fn a_frame_one_group_past_the_credit_is_inside_the_pull_reach() {
+    let pacer = CreditPacer { paid_base: 0 };
     let mut s = healthy();
     s.requested_bytes = 64 * CHUNK_BYTES;
-    // The frontier the serve leg publishes trails the client's real paid
-    // position by up to one group (`content_paid_frontier` floors to one).
-    s.downstream.served_paid = 0;
-    s.pulled_frontier = CHUNK_BYTES;
-    assert_matches!(
-        pacer.decide(&s),
-        PaceDecision::Draw { .. },
-        "the pull must be able to feed the client past the chunk boundary it \
-         pays at, or neither side can move"
+    s.gap_remaining = 64 * CHUNK_BYTES;
+    // The frontier the serve leg publishes trails the payer's real position by
+    // up to one group (`content_paid_frontier` floors to one).
+    s.downstream.served_paid = CHUNK_BYTES - CHUNK_GROUP_BYTES;
+    s.pulled_frontier = 0;
+    let PaceDecision::Draw { up_to_bytes } = pacer.decide(&s) else {
+        panic!("the pull must draw while the lane holds credit");
+    };
+    assert!(
+        up_to_bytes >= CHUNK_BYTES + CHUNK_GROUP_BYTES,
+        "the pull reaches {up_to_bytes} bytes, short of the credit plus one frame group"
     );
 }

@@ -135,6 +135,7 @@ pub decdn_protocol::client::Voucher::bytes_delivered: u64
 pub decdn_protocol::client::Voucher::chain_root: [u8; 32]
 pub decdn_protocol::client::Voucher::chunk_price: u64
 pub decdn_protocol::client::Voucher::signature: alloc::vec::Vec<u8>
+pub decdn_protocol::client::Voucher::stream_bytes: u64
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::WatermarkBundle
@@ -749,6 +750,7 @@ pub decdn_protocol::Voucher::bytes_delivered: u64
 pub decdn_protocol::Voucher::chain_root: [u8; 32]
 pub decdn_protocol::Voucher::chunk_price: u64
 pub decdn_protocol::Voucher::signature: alloc::vec::Vec<u8>
+pub decdn_protocol::Voucher::stream_bytes: u64
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::ALPN_CLIENT: &[u8]

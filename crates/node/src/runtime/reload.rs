@@ -984,7 +984,6 @@ impl RuntimeReloadState {
                 buyer_working_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,
-                pool_floor_signer_live_windows: 8,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_poll_interval_sec: 600,
@@ -1046,9 +1045,7 @@ impl RuntimeReloadState {
             // Placeholder rate — `payment.*` is restart-required.
             payment: ResolvedPayment {
                 rate_per_mb: 1,
-                credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
                 frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
-                credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },
@@ -1298,10 +1295,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         warn_ignored("network.* (bind_port, relay_urls, relay_url, discovery)");
     }
     if file.blockchain.is_some() {
-        warn_ignored(
-            "blockchain.* (rpc_url, eth_keystore, contract addresses, \
-             pool_floor_signer_live_windows)",
-        );
+        warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
     }
     if file
         .cache
@@ -1315,10 +1309,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // the served price — an economic commitment on the wire — so it takes
         // effect only at startup; reprice by draining and restarting. The other
         // serve knobs are read once at handler construction.
-        warn_ignored(
-            "payment.* (rate_per_mb, credit_max, \
-             credit_ramp_divisor, frame_target_bytes, voucher_commit_interval_ms)",
-        );
+        warn_ignored("payment.* (rate_per_mb, frame_target_bytes, voucher_commit_interval_ms)");
     }
     if file.dht.is_some() {
         // `dht.*` (rate-limit caps) is not currently hot-reloadable — the

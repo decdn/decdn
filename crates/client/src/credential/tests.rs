@@ -51,10 +51,11 @@ const FAR: u64 = NOW + 10 * NODE_EXPIRY_MARGIN_SECS;
 #[test]
 fn running_low_fires_below_the_work_plus_one_credit_window() {
     let quotes = quoted(10);
-    // 4 MB left at 10 per MB needs 40, and one window is 10.
+    // 4 MB left at 10 per MB needs 40, and the payer holds up to 640 as credit
+    // ahead of delivery at one node.
     let at = |signed: u64| {
         CredentialView::of(
-            &credential(100, FAR),
+            &credential(1000, FAR),
             U256::from(signed),
             4 * MB,
             &quotes,
@@ -62,18 +63,22 @@ fn running_low_fires_below_the_work_plus_one_credit_window() {
         )
     };
 
-    let covered = at(50);
-    assert_eq!(covered.headroom, U256::from(50));
+    let covered = at(320);
+    assert_eq!(covered.headroom, U256::from(680));
     assert_eq!(covered.projected_need, U256::from(40));
-    assert_eq!(covered.window, U256::from(10));
-    assert_eq!(covered.event(), None, "50 covers 40 plus one window of 10");
+    assert_eq!(covered.window, U256::from(640));
+    assert_eq!(
+        covered.event(),
+        None,
+        "680 covers 40 plus one window of 640"
+    );
     assert_eq!(covered.cause(), None);
 
-    let low = at(51);
+    let low = at(321);
     assert_eq!(
         low.event(),
         Some(FundingEvent::RunningLow {
-            headroom: U256::from(49),
+            headroom: U256::from(679),
             projected_need: U256::from(40),
             expires_at: FAR,
         })
@@ -124,7 +129,9 @@ fn the_projection_uses_the_highest_quote() {
     quotes.observe(20, MB / 2);
     let view = CredentialView::of(&credential(1_000, FAR), U256::ZERO, 2 * MB, &quotes, NOW);
     assert_eq!(view.projected_need, U256::from(60));
-    assert_eq!(view.window, U256::from(30));
+    // The window is the payer's per-node credit cap, which exceeds one voucher
+    // interval at the highest quote.
+    assert_eq!(view.window, U256::from(640));
 }
 
 /// A swap bumps the generation, wakes a waiter, and makes a context on the

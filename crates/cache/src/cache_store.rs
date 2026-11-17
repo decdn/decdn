@@ -214,6 +214,7 @@ impl IngestStore for CacheStore {
                         cache_err,
                         CacheError::VerifyFailed { .. } | CacheError::HashMismatch { .. }
                     ) {
+                        reader.note_failed_delivery();
                         return Err(anyhow::Error::new(HashMismatch));
                     }
                     Err(anyhow::Error::from(cache_err))

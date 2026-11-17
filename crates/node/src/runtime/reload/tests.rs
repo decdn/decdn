@@ -61,7 +61,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             buyer_working_deposit_micro_usdc: 10_000_000,
             buyer_max_approve: true,
             pool_min_remaining_deposit_micro_usdc: 1_000_000,
-            pool_floor_signer_live_windows: 8,
             slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             content_blacklist_address: None,
             content_blacklist_poll_interval_sec: 600,
@@ -118,9 +117,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         },
         payment: ResolvedPayment {
             rate_per_mb: rate,
-            credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
-            credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
         },
         observability: ResolvedObservability {

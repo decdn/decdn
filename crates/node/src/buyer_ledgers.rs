@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use decdn_client::payer_window::PayerWindows;
 use decdn_client::{Cumulative, PoolLedger};
 use decdn_incentive::LaneKey;
 
@@ -77,10 +78,14 @@ impl BuyerLedgers {
         // re-seeding from the row would rewind it and re-create the collision this type
         // prevents.
         live.retain(|k, l| k.provider != key.provider || Arc::strong_count(l) > 1);
-        Arc::clone(
-            live.entry(key)
-                .or_insert_with(|| Arc::new(PoolLedger::new(seed))),
-        )
+        Arc::clone(live.entry(key).or_insert_with(|| {
+            let ledger = PoolLedger::new(seed);
+            // Every lane at one upstream operator shares one track record, so the
+            // per-node pay-ahead cap and the window ramp count across this node's
+            // pools and signers there (ADR 003 § Credit Window).
+            ledger.attach_trust(PayerWindows::process().node(key.provider));
+            Arc::new(ledger)
+        }))
     }
 
     /// The pool's total committed spend: the sum, across every live lane whose

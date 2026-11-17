@@ -29,6 +29,12 @@ pub trait StashedFault {
     /// Take the parked typed fault, if any. Returns `None` on a source whose
     /// bytes carry the whole story (an in-memory buffer, a scripted double).
     fn take_fault(&mut self) -> Option<anyhow::Error>;
+
+    /// The decoder failed on this source's bytes: they were corrupt, or the
+    /// stream ended short of them. A paid pull books it as the node failing
+    /// its delivery (ADR 003 § Credit Window); a source with no payment behind
+    /// it has nothing to book.
+    fn note_failed_delivery(&mut self) {}
 }
 
 /// A plain in-memory wire buffer has no out-of-band failure mode: whatever the
