@@ -23,13 +23,13 @@ them. Secrets can be given inline or as files (`*_FILE`); prefer files.
 | Variable | Default | Purpose |
 |---|---|---|
 | `SPONSORD_API_TOKEN` / `_FILE` | required | Bearer token callers present; ≥ 32 bytes (`openssl rand -hex 32`) |
-| `SPONSORD_RPC_URL` | required | JSON-RPC endpoint of the pool's chain |
+| `SPONSORD_RPC_URL` | required | JSON-RPC endpoint of the pool's payment chain |
 | `SPONSORD_PAYMENT_POOL_ADDR` | required | `PaymentPool` contract |
 | `SPONSORD_POOL_ID` | required | Your pool, from `decdn pool open` |
 | `SPONSORD_TREASURY_KEYSTORE` | required | The treasury wallet's keystore JSON |
 | `SPONSORD_TREASURY_PASSWORD` / `_FILE` | required | Its password |
 | `SPONSORD_BIND` | `127.0.0.1:8090` | Listen address |
-| `SPONSORD_CHAIN_ID` | `421614` | Chain id (Arbitrum Sepolia) |
+| `SPONSORD_CHAIN_ID` | `421614` | Payment chain id (Arbitrum Sepolia) |
 | `SPONSORD_MAX_SPENDING_CAP_MICRO_USDC` | `5000000` ($5) | Largest cap per capability |
 | `SPONSORD_MAX_TTL_SECS` | `172800` (48 h) | Longest TTL per capability |
 | `SPONSORD_POOL_LOW_WATER_MICRO_USDC` | `20000000` ($20) | Top up below this |
@@ -49,8 +49,10 @@ on another host needs it.
 |---|---|---|
 | `ONRAMP_PUBLIC_URL` | required | The onramp's public base URL; baked into the installers. The Turnstile gate accepts only tokens for its host |
 | `ONRAMP_DAEMON_TOKEN` / `_FILE` | required | The daemon's API token |
-| `ONRAMP_RPC_URL` | required | Public RPC endpoint users' `decdn` reads the chain through |
-| `ONRAMP_CAPACITY_BOND_ADDR` | required | `CapacityBond` contract, for node discovery |
+| `ONRAMP_GOVERNANCE_CHAIN_ID` | required | Governance chain id (Ethereum L1) |
+| `ONRAMP_GOVERNANCE_RPC_URL` | required | Public RPC endpoint users' `decdn` finds nodes and checks their signatures through, on the governance chain |
+| `ONRAMP_CAPACITY_BOND_ADDR` | required | `CapacityBond` contract on the governance chain, for node discovery |
+| `ONRAMP_POOL_RPC_URL` | required | Public RPC endpoint users' `decdn` pays through, on the payment chain of the daemon's pool. The daemon reports that chain's id |
 | `ONRAMP_TURNSTILE_SECRET` / `_FILE` | required (Turnstile gate) | Cloudflare Turnstile secret |
 | `ONRAMP_TURNSTILE_SITEKEY` | required (Turnstile gate) | Cloudflare Turnstile sitekey |
 | `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install (`v0.3.0` or later; the onramp refuses an older one), and the SHA-256 of its `SHA256SUMS` |
@@ -58,7 +60,7 @@ on another host needs it.
 | `ONRAMP_DAEMON_URL` | `http://127.0.0.1:8090` | The daemon |
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | daemon maximum | Cap requested per capability |
 | `ONRAMP_TTL_SECS` | daemon maximum | TTL requested per capability |
-| `ONRAMP_SLASH_JUDGE_ADDR` | none | `SlashJudge` contract, handed to `decdn` |
+| `ONRAMP_SLASH_JUDGE_ADDR` | none | `SlashJudge` contract on the governance chain, handed to `decdn` |
 | `ONRAMP_GATE` | `turnstile` | The gate; `custom` only for programs that embed the onramp with their own ([integrator.md](integrator.md)) |
 | `ONRAMP_BRAND_NAME` | `deCDN` | Name on the gate page |
 | `ONRAMP_GATE_TEMPLATE` | built-in | Your own gate page (below) |

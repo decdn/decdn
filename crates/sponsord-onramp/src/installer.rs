@@ -11,21 +11,26 @@ use crate::config::OnrampConfig;
 const DECDN_SH_TEMPLATE: &str = include_str!("../assets/decdn.sh");
 const DECDN_PS1_TEMPLATE: &str = include_str!("../assets/decdn.ps1");
 
-/// The chain and contracts a download runs `decdn` against, baked into the
-/// installers.
+/// The chains and contracts a download runs `decdn` against, baked into the
+/// installers: the governance chain, where `decdn` finds nodes and checks
+/// their signatures, and the payment chain of the pool that pays them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
-    /// EIP-155 id of the chain the contracts are on, from the daemon.
-    pub chain_id: u64,
-    /// JSON-RPC endpoint `decdn` reads the chain through.
-    pub rpc_url: String,
+    /// EIP-155 id of the governance chain.
+    pub governance_chain_id: u64,
+    /// JSON-RPC endpoint `decdn` reads the governance chain through.
+    pub governance_rpc_url: String,
+    /// The `CapacityBond` on the governance chain, for node discovery.
+    pub capacity_bond: Address,
+    /// The `SlashJudge` on the governance chain, when the onramp names one.
+    pub slash_judge: Option<Address>,
+    /// EIP-155 id of the payment chain the pool is on, from the daemon.
+    pub pool_chain_id: u64,
+    /// JSON-RPC endpoint `decdn` reads the payment chain through.
+    pub pool_rpc_url: String,
     /// The `PaymentPool` the capabilities are signed against, from the
     /// daemon.
     pub payment_pool: Address,
-    /// The `CapacityBond`, for node discovery.
-    pub capacity_bond: Address,
-    /// The `SlashJudge`, when the onramp names one.
-    pub slash_judge: Option<Address>,
 }
 
 /// Both installers, rendered.
@@ -58,11 +63,16 @@ impl Installers {
                 .replace("{{DECDN_RELEASE}}", &cfg.decdn_release.tag)
                 .replace("{{DECDN_VERSION}}", &cfg.decdn_release.version)
                 .replace("{{DECDN_SUMS_SHA256}}", &cfg.decdn_release.sums_sha256)
-                .replace("{{CHAIN_ID}}", &profile.chain_id.to_string())
-                .replace("{{RPC_URL}}", &profile.rpc_url)
-                .replace("{{PAYMENT_POOL}}", &profile.payment_pool.to_string())
+                .replace(
+                    "{{GOVERNANCE_CHAIN_ID}}",
+                    &profile.governance_chain_id.to_string(),
+                )
+                .replace("{{GOVERNANCE_RPC_URL}}", &profile.governance_rpc_url)
                 .replace("{{CAPACITY_BOND}}", &profile.capacity_bond.to_string())
                 .replace("{{SLASH_JUDGE}}", &slash_judge)
+                .replace("{{POOL_CHAIN_ID}}", &profile.pool_chain_id.to_string())
+                .replace("{{POOL_RPC_URL}}", &profile.pool_rpc_url)
+                .replace("{{PAYMENT_POOL}}", &profile.payment_pool.to_string())
         };
         Self {
             sh: render(DECDN_SH_TEMPLATE),

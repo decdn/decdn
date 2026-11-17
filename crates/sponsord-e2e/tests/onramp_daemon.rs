@@ -154,7 +154,7 @@ async fn the_installers_carry_the_daemon_chain_values() {
         .unwrap();
     let script = String::from_utf8(bytes.to_vec()).unwrap();
     for line in [
-        format!("CHAIN_ID=\"{TEST_CHAIN_ID}\""),
+        format!("POOL_CHAIN_ID=\"{TEST_CHAIN_ID}\""),
         format!("PAYMENT_POOL=\"{TEST_PAYMENT_POOL}\""),
     ] {
         assert!(script.lines().any(|l| l == line), "{line}");

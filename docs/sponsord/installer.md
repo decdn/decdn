@@ -15,7 +15,8 @@ curl -fsSL https://<onramp>/decdn.sh | sh -s -- get 'decdn:<hash>[?ns=<id>]' -o 
 ```
 
 The onramp serves each script with its own URL, the pinned `decdn` release
-and its download profile (chain, RPC, contracts) baked in. Without `get`,
+and its download profile baked in: the governance chain's id, RPC and
+contracts, and the payment chain's id, RPC and pool. Without `get`,
 the script only installs `decdn`.
 
 ## Install

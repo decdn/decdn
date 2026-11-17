@@ -4,10 +4,10 @@
 
 | Component | Runs | Holds | Talks to |
 |---|---|---|---|
-| `sponsord` | your server, private | the treasury key (owns the pool), the API token | the chain; callers with the token |
+| `sponsord` | your server, private | the treasury key (owns the pool), the API token | the pool's payment chain; callers with the token |
 | `sponsord-onramp` | your server, public | the daemon token, the gate's secret | `sponsord`; browsers; the installers |
 | `decdn.sh` / `decdn.ps1` | the user's machine | one throwaway key per download | the onramp; runs `decdn` |
-| `PaymentPool` | the chain | your pool's deposit | nodes redeem vouchers against it |
+| `PaymentPool` | a payment chain | your pool's deposit | nodes redeem vouchers against it |
 
 `sponsord-core` is `sponsord` as a library, and `sponsord-api` holds the wire
 types both servers share.
@@ -34,9 +34,11 @@ That is why:
 
 1. **Install.** `curl …/decdn.sh | sh -s -- get decdn:<hash>/` (or `decdn.ps1`)
    runs the script the onramp serves, with the onramp URL, the pinned
-   `decdn` release and the download profile (chain id, RPC URL,
-   `PaymentPool`, `CapacityBond`) baked in. The onramp takes the chain id and
-   pool from the daemon's `GET /v1/info` at startup. The script downloads
+   `decdn` release and the download profile baked in: the governance chain
+   (chain id, RPC URL, `CapacityBond`, `SlashJudge`) and the payment chain
+   (chain id, RPC URL, `PaymentPool`). The onramp takes the payment chain id
+   and pool from the daemon's `GET /v1/info` at startup, and the rest from
+   its own configuration. The script downloads
    `decdn` from its pinned GitHub Release, checking the release's
    `SHA256SUMS` against a pinned digest and the archive against `SHA256SUMS`.
 2. **Key.** It makes a throwaway key with `decdn key-gen` under

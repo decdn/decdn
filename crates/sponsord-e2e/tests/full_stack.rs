@@ -22,7 +22,9 @@ use decdn_incentive::{CapabilityGrant, voucher_domain};
 use sponsord::http::ApiState;
 use sponsord_api::client::DaemonClient;
 use sponsord_core::test_support::{TEST_CHAIN_ID, TEST_PAYMENT_POOL, fake_sponsor};
-use sponsord_onramp::test_support::{FakeGate, STUB_DECDN, publish_release, test_config};
+use sponsord_onramp::test_support::{
+    FakeGate, STUB_DECDN, TEST_GOVERNANCE_CHAIN_ID, publish_release, test_config,
+};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const HASH: &str = "9194000d7b356650e6924a7746ec4afb0b705838b65913c0e46cba6b15af69e5";
@@ -135,7 +137,7 @@ async fn the_installer_gets_a_capability_through_the_gate_and_runs_decdn() {
     assert!(calls.contains(&format!(
         "--pool eip155:{TEST_CHAIN_ID}:{TEST_PAYMENT_POOL}"
     )));
-    assert!(calls.contains(&format!("--governance-chain-id {TEST_CHAIN_ID}")));
+    assert!(calls.contains(&format!("--governance-chain-id {TEST_GOVERNANCE_CHAIN_ID}")));
     assert!(!state_dir.exists(), "state is deleted after a good pull");
 
     // decdn got the capability the daemon signed for the script's key, as
