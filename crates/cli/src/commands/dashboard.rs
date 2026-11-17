@@ -68,15 +68,9 @@ pub async fn dashboard(args: &DashboardArgs, config_path: Option<&Path>) -> anyh
         .unwrap_or_else(|| cli::common::expand_tilde(Path::new("~/.decdn/dashboard")));
     private_dir(&root)?;
     let token = load_or_create_token(&root.join("token"))?;
-    let token_file = args
-        .gateway_token_file
-        .clone()
-        .unwrap_or_else(|| cli::common::expand_tilde(Path::new("~/.decdn/gateway/token")));
     let targets = Targets {
         pulls_dir: super::activity::pulls_dir(),
         gateway: args.gateway.clone(),
-        gateway_token_file: token_file,
-        gateway_token_named: args.gateway_token_file.is_some(),
         admin_url,
         metrics_url,
     };

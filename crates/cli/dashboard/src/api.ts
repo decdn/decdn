@@ -11,7 +11,7 @@ export interface Counters {
   requests_ok: number;
   requests_not_found: number;
   requests_refused: number;
-  requests_allowance_exhausted: number;
+  requests_payment_required: number;
   pull_failures_funding: number;
   pull_failures_other: number;
   pulls_active: number;
@@ -19,7 +19,11 @@ export interface Counters {
   cache_hits: number;
 }
 
-export type Payer = { kind: "pool" } | { kind: "capability"; signer: string };
+/** The capability a pull pays with: its delegate key and its pool. */
+export interface Payer {
+  signer: string;
+  pool: string;
+}
 
 export interface ActivePull {
   hash: string;
@@ -34,19 +38,11 @@ export interface ActivePull {
 export interface Capability {
   cap: number;
   expiry: number;
-  origin: string | null;
+  /** The namespaces a scoped capability pays for; absent when unscoped. */
+  namespaces?: number[];
   pool: string;
-  scope: string;
   signer: string;
   spent: boolean;
-}
-
-export interface Bucket {
-  namespace: number | null;
-  per_day: number | null;
-  used: number;
-  remaining: number | null;
-  resets_in_secs: number;
 }
 
 export interface Pointer {
@@ -101,7 +97,6 @@ export interface GatewayStatus {
   counters: Counters;
   active_pulls: ActivePull[];
   capabilities: Capability[];
-  allowance: Bucket[] | null;
   pointers: Pointer[] | null;
   pools: PoolSnapshot | null;
   pool_error: string | null;
@@ -227,7 +222,6 @@ export type GatewaySection = {
 } & (
   | { state: "waiting" }
   | { state: "absent" }
-  | { state: "unauthorized" }
   | { state: "error"; message: string }
   | { state: "up"; status: GatewayStatus }
 );

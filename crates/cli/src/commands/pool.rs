@@ -44,6 +44,7 @@ use super::buyer_store::{
     open_client_store_for_escrow,
 };
 use super::chain_ctx;
+use super::gateway::scope::{Scope, SignedScope, scope_domain};
 use super::interrupt::{Interrupt, Interrupted, name_held_escrows};
 
 /// Dispatch `decdn pool <subcommand>`.
@@ -1641,6 +1642,30 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     println!("owner:        {recovered} (recovered from the signature)");
     println!("Token (give this to the delegated client):");
     println!("{token}");
+    let scope = if args.any_namespace {
+        println!("Gateway registration, paying for any content (PUT this to /_capability):");
+        Some(Scope::Any)
+    } else if args.namespaces.is_empty() {
+        None
+    } else {
+        println!(
+            "Gateway registration, scoped to namespaces {:?} (PUT this to /_capability):",
+            args.namespaces
+        );
+        Some(Scope::Namespaces(SignedScope::sign(
+            &owner_signer,
+            signer_addr,
+            pool_id,
+            args.namespaces.clone(),
+            &scope_domain(chain.chain_id, chain.payment_pool),
+        )?))
+    };
+    if let Some(scope) = scope {
+        println!(
+            "{}",
+            serde_json::json!({ "capability": token, "scope": scope })
+        );
+    }
     Ok(())
 }
 

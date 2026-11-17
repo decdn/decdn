@@ -50,6 +50,8 @@ Delegation bounds the damage a compromised key does. The `spending_cap` bounds w
 
 A capability is a spending authorization, and the signer chooses the payee. A signer can pay an address it controls, so an owner grants only a cap it accepts being spent at any payee. The cap is the complete bound. A rule that the payee differ from the signer binds nothing, because a signer meets it with one new address.
 
+A `decdn gateway` holds capabilities for keys that it keeps, and pays for the requests of other clients with them. There, the owner also states which content a capability pays for: any content, or only the content of namespaces that the owner signs into a scope. The gateway applies the scope before it pays. Nodes and the contract never see the scope ([Public HTTP Gateway § Scope](appendix-gateway.md#scope)).
+
 Registration is write-once for each `(poolId, signer)`. The first capability that lands on-chain for a signer fixes its `cap` and `expiry`. The contract ignores every later capability for that signer. The protocol has no capability renewal. To change the terms, the owner authorizes a new signer key. So a node holds the lower of the presented terms and the registered terms ([Pool solvency](#pool-solvency-and-the-refundable-floor-m)). A voucher past the registered `cap` or `expiry` redeems to nothing, so a node that served it would lose the delivered bytes.
 
 Three sections give the rules in full:

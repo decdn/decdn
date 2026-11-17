@@ -1026,11 +1026,6 @@ pub(crate) struct Payer {
     /// pool; `None` for a keystore payer, whose fetches run one at a time,
     /// each lane starting from its persisted watermark.
     ledgers: Option<PerPool<LaneLedgers>>,
-    /// The funding facts concurrent fetches share, one per payment pool, so
-    /// their `topUp`s run one at a time (a `RunFunding` serializes only its
-    /// own): a gateway's pool payer, reporting to `escrows`. `None` for a
-    /// payer whose fetches run one at a time, each pass with its own.
-    funding: Option<(PerPool<RunFunding>, UnconfirmedEscrows)>,
     /// The funding recovery gate of each payment pool.
     recovery: PerPool<RecoveryGate>,
     open_lock: tokio::sync::Mutex<()>,
@@ -1085,7 +1080,6 @@ impl Payer {
                 loaded: tokio::sync::OnceCell::new(),
             },
             ledgers: None,
-            funding: None,
             recovery: PerPool::default(),
             open_lock: tokio::sync::Mutex::new(()),
             evidence: None,
@@ -1097,29 +1091,6 @@ impl Payer {
     pub(crate) fn with_receipt(mut self, evidence: Arc<ReceiptEvidence>) -> Self {
         self.evidence = Some(evidence);
         self
-    }
-
-    /// The fetches of a gateway paying from the keystore's own pool, under
-    /// `delegation` when it is delegated. Fetches that overlap share each
-    /// lane's voucher ledger and one set of funding facts on `escrows`, as a
-    /// bundle pull's entries do, so no two of them send a `topUp` at once.
-    pub(crate) fn pool(delegation: Option<Delegation>, escrows: UnconfirmedEscrows) -> Self {
-        Self {
-            ledgers: Some(PerPool::default()),
-            funding: Some((PerPool::default(), escrows)),
-            ..Self::keystore(delegation)
-        }
-    }
-
-    /// Load the keystore now, so a wrong password or a missing file fails
-    /// here and not at the first fetch.
-    ///
-    /// # Errors
-    ///
-    /// The keystore cannot be read or unlocked, or the lane key cannot be
-    /// derived for `host`'s store.
-    pub(crate) async fn unlock(&self, host: &FetchHost) -> anyhow::Result<()> {
-        self.keys(host).await.map(drop)
     }
 
     /// The key that signs and what its lanes sign under: the held key and its
@@ -1178,7 +1149,6 @@ impl Payer {
                 pool: credential.pool,
             },
             ledgers: Some(PerPool::default()),
-            funding: None,
             recovery: PerPool::default(),
             open_lock: tokio::sync::Mutex::new(()),
             evidence: None,
@@ -1416,14 +1386,9 @@ pub(crate) async fn fetch_on(
         // pool the pass pays from. The escrow handle guards this pool's
         // contract only, so a pending `topUp` on another pool refuses nothing
         // here.
-        let funding = match &payer.funding {
-            Some((per_pool, shared)) => per_pool.get(pass_pool, || {
-                RunFunding::reporting_escrows_to(shared.for_pool(pass_pool))
-            }),
-            None => Arc::new(RunFunding::reporting_escrows_to(
-                escrows.for_pool(pass_pool),
-            )),
-        };
+        let funding = Arc::new(RunFunding::reporting_escrows_to(
+            escrows.for_pool(pass_pool),
+        ));
         let ledgers = payer
             .ledgers
             .as_ref()

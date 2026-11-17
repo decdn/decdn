@@ -67,8 +67,8 @@ export function poolRows(list: Pool[]): PoolRow[] {
 export interface CapabilityRow {
   signer: string;
   pool: string;
-  scope: string;
-  origin: string | null;
+  /** The namespaces it pays for; null when it pays for any request. */
+  namespaces: number[] | null;
   cap: number;
   expiry: number;
   exhausted: boolean;
@@ -96,13 +96,12 @@ export function capabilities(status: GatewayStatus): CapabilityRow[] {
     const bytes = mine?.reduce((sum, d) => sum + d.bytes_delivered, 0) ?? null;
     const used = spentMicro === null ? null : share(spentMicro, c.cap);
     const inFlight = status.active_pulls.filter(
-      (p) => p.payer.kind === "capability" && same(p.payer.signer, c.signer),
+      (p) => same(p.payer.signer, c.signer) && same(p.payer.pool, c.pool),
     ).length;
     return {
       signer: c.signer,
       pool: c.pool,
-      scope: c.scope,
-      origin: c.origin,
+      namespaces: c.namespaces ?? null,
       cap: c.cap,
       expiry: c.expiry,
       exhausted: c.spent,
@@ -111,33 +110,6 @@ export function capabilities(status: GatewayStatus): CapabilityRow[] {
       used,
       inFlight,
       severity: c.spent ? "critical" : severity(used),
-    };
-  });
-}
-
-export interface BucketRow {
-  label: string;
-  perDay: number | null;
-  usedBytes: number;
-  remaining: number | null;
-  /** The share of the day's bytes delivered; null when unbounded. */
-  used: number | null;
-  severity: Severity;
-  resetsIn: number;
-}
-
-/** A public gateway's allowance buckets; none on loopback. */
-export function buckets(status: GatewayStatus): BucketRow[] {
-  return (status.allowance ?? []).map((b) => {
-    const used = b.per_day === null ? null : share(b.used, b.per_day);
-    return {
-      label: b.namespace === null ? "Shared" : `Namespace ${b.namespace}`,
-      perDay: b.per_day,
-      usedBytes: b.used,
-      remaining: b.remaining,
-      used,
-      severity: severity(used),
-      resetsIn: b.resets_in_secs,
     };
   });
 }
@@ -298,8 +270,6 @@ export function gatewayLine(g: GatewaySection): string | null {
       return `Asking the gateway at ${g.url}…`;
     case "absent":
       return `No gateway at ${g.url}.`;
-    case "unauthorized":
-      return `The gateway at ${g.url} asks for a token: pass --gateway-token-file.`;
     case "error":
       return `Could not read the gateway at ${g.url}: ${g.message}`;
     case "up":
@@ -324,10 +294,8 @@ export function gatewayShapeProblem(body: unknown): string | null {
   for (const key of ["active_pulls", "capabilities"]) {
     if (!Array.isArray(body[key])) return `${key} is not a list`;
   }
-  for (const key of ["allowance", "pointers"]) {
-    if (body[key] !== null && !Array.isArray(body[key])) {
-      return `${key} is not a list`;
-    }
+  if (body.pointers !== null && !Array.isArray(body.pointers)) {
+    return "pointers is not a list";
   }
   const p = body.pools;
   if (
