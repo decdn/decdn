@@ -2844,7 +2844,6 @@ dependencies = [
  "lol_html",
  "mime_guess",
  "minisign-verify",
- "psl",
  "rand 0.10.3",
  "reqwest",
  "rexpect",
@@ -6564,21 +6563,6 @@ checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
 ]
-
-[[package]]
-name = "psl"
-version = "2.1.253"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82576eafaa94759a92a0cf047f34d227665811d5cdf70f4b11e25cd813f3de54"
-dependencies = [
- "psl-types",
-]
-
-[[package]]
-name = "psl-types"
-version = "2.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 
 [[package]]
 name = "psm"

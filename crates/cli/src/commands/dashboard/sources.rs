@@ -8,9 +8,6 @@
 //! - The node's lanes, earnings, buyer pools and slashes, every
 //!   [`NODE_SLOW_EVERY`]: `lanes` may read the chain for a pool's owner, and
 //!   `earnings` reads the whole settlement ledger.
-//!
-//! The gateway token goes to a loopback gateway only, and the client follows
-//! no redirect, so no `--gateway` URL hands the token to another host.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -26,7 +23,6 @@ use reqwest::StatusCode;
 use url::Url;
 
 use super::super::activity;
-use super::super::local_http::TOKEN_HEADER;
 use super::super::node::{classify_client_error, is_connection_refused};
 use super::super::node_top::{Snapshot, SnapshotDelta, fetch_metrics, hit_rate, parse_openmetrics};
 use super::status::{
@@ -69,12 +65,6 @@ pub(super) struct Targets {
     pub(super) pulls_dir: Option<PathBuf>,
     /// The gateway's base URL.
     pub(super) gateway: Url,
-    /// The file the gateway token is in. It is read on every ask: a gateway
-    /// that starts after the dashboard writes it then.
-    pub(super) gateway_token_file: PathBuf,
-    /// Whether `--gateway-token-file` named the file, so a missing file is an
-    /// error rather than a gateway that takes no token.
-    pub(super) gateway_token_named: bool,
     /// The node's admin base URL.
     pub(super) admin_url: String,
     /// The node's `/metrics` URL.
@@ -126,13 +116,9 @@ pub(super) fn spawn(sources: &Arc<Sources>, targets: Targets) -> anyhow::Result<
     if let Some(dir) = targets.pulls_dir {
         supervise("pull records", poll_pulls(Arc::clone(sources), dir));
     }
-    let token = GatewayToken {
-        file: targets.gateway_token_file,
-        named: targets.gateway_token_named,
-    };
     supervise(
         "gateway",
-        poll_gateway(Arc::clone(sources), http.clone(), gateway_status, token),
+        poll_gateway(Arc::clone(sources), http.clone(), gateway_status),
     );
     supervise(
         "node",
@@ -161,12 +147,6 @@ fn supervise(name: &'static str, poller: impl Future<Output = ()> + Send + 'stat
     });
 }
 
-/// Where the gateway token is, and whether the operator named the file.
-pub(super) struct GatewayToken {
-    pub(super) file: PathBuf,
-    pub(super) named: bool,
-}
-
 /// Read the pull records in `dir` every [`PULLS_EVERY`].
 async fn poll_pulls(sources: Arc<Sources>, dir: PathBuf) {
     every(PULLS_EVERY, move || {
@@ -183,46 +163,22 @@ async fn poll_pulls(sources: Arc<Sources>, dir: PathBuf) {
 }
 
 /// Ask the gateway's `/_status` at `url` every [`GATEWAY_EVERY`].
-async fn poll_gateway(sources: Arc<Sources>, http: reqwest::Client, url: Url, token: GatewayToken) {
-    let token = Arc::new(token);
+async fn poll_gateway(sources: Arc<Sources>, http: reqwest::Client, url: Url) {
     every(GATEWAY_EVERY, move || {
         let sources = Arc::clone(&sources);
         let http = http.clone();
         let url = url.clone();
-        let token = Arc::clone(&token);
-        async move { gateway_tick(&sources, &http, url, &token).await }
+        async move { gateway_tick(&sources, &http, url).await }
     })
     .await;
 }
 
-/// One ask of the gateway at `url`, with the token its file holds now, into
-/// `sources`.
-pub(super) async fn gateway_tick(
-    sources: &Sources,
-    http: &reqwest::Client,
-    url: Url,
-    token: &GatewayToken,
-) {
-    let state = match read_token(&token.file, token.named) {
-        Ok(held) => {
-            let held = held.filter(|_| is_loopback(&url));
-            ask_gateway(http, url, held.as_deref()).await
-        }
-        Err(message) => GatewayState::Error { message },
-    };
+/// One ask of the gateway at `url`, into `sources`.
+pub(super) async fn gateway_tick(sources: &Sources, http: &reqwest::Client, url: Url) {
+    let state = ask_gateway(http, url).await;
     let mut gateway = write(&sources.gateway);
     gateway.state = state;
     gateway.updated_unix_ms = Some(activity::now_ms());
-}
-
-/// Whether `url` names this host: the gateway token goes nowhere else.
-fn is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
 }
 
 /// Read the node's health, status and `/metrics` every [`NODE_FAST_EVERY`].
@@ -307,12 +263,10 @@ where
     }
 }
 
-/// The client every HTTP read uses. It follows no redirect: a gateway that
-/// redirects would carry the token to the host it names.
+/// The client every HTTP read uses.
 pub(super) fn http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(FAST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| anyhow::anyhow!("build the dashboard's HTTP client: {e}"))
 }
@@ -374,34 +328,9 @@ pub(super) fn read_pulls(dir: &Path) -> PullsSection {
     }
 }
 
-/// The token in `path`: `None` when the file holds none, or does not exist
-/// and the operator did not `named` it.
-///
-/// # Errors
-///
-/// Why the file cannot be read, naming it.
-pub(super) fn read_token(path: &Path, named: bool) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(token) => {
-            let token = token.trim();
-            Ok((!token.is_empty()).then(|| token.to_owned()))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !named => Ok(None),
-        Err(e) => Err(format!("read the gateway token {}: {e}", path.display())),
-    }
-}
-
-/// Ask the gateway at `url` (its `/_status`) for its state, with `token`.
-pub(super) async fn ask_gateway(
-    http: &reqwest::Client,
-    url: Url,
-    token: Option<&str>,
-) -> GatewayState {
-    let mut request = http.get(url);
-    if let Some(token) = token {
-        request = request.header(TOKEN_HEADER, token);
-    }
-    let response = match request.send().await {
+/// Ask the gateway at `url` (its `/_status`) for its state.
+pub(super) async fn ask_gateway(http: &reqwest::Client, url: Url) -> GatewayState {
+    let response = match http.get(url).send().await {
         Ok(response) => response,
         Err(e) if is_connection_refused(&e) => return GatewayState::Absent,
         Err(e) => {
@@ -416,7 +345,6 @@ pub(super) async fn ask_gateway(
             },
             Err(e) => GatewayState::Error { message: chain(e) },
         },
-        StatusCode::UNAUTHORIZED => GatewayState::Unauthorized,
         status => GatewayState::Error {
             message: format!("HTTP {status}"),
         },

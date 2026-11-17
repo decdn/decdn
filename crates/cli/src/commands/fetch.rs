@@ -980,11 +980,6 @@ pub(crate) struct Payer {
     /// whose fetches run one at a time, each lane starting from its persisted
     /// watermark.
     ledgers: Option<LaneLedgers>,
-    /// The funding facts concurrent fetches share, so their `topUp`s run one
-    /// at a time (a `RunFunding` serializes only its own): a gateway's pool
-    /// payer. `None` for a payer whose fetches run one at a time, each pass
-    /// with its own.
-    funding: Option<Arc<RunFunding>>,
     recovery: Arc<RecoveryGate>,
     open_lock: tokio::sync::Mutex<()>,
     /// Where every lane keeps the signed messages a pull receipt holds, and
@@ -1036,7 +1031,6 @@ impl Payer {
                 loaded: tokio::sync::OnceCell::new(),
             },
             ledgers: None,
-            funding: None,
             recovery: Arc::new(RecoveryGate::new()),
             open_lock: tokio::sync::Mutex::new(()),
             evidence: None,
@@ -1048,29 +1042,6 @@ impl Payer {
     pub(crate) fn with_receipt(mut self, evidence: Arc<ReceiptEvidence>) -> Self {
         self.evidence = Some(evidence);
         self
-    }
-
-    /// The fetches of a gateway paying from the keystore's own pool, under
-    /// `grant` when it is delegated. Fetches that overlap share each lane's
-    /// voucher ledger and one set of funding facts on `escrows`, as a bundle
-    /// pull's entries do, so no two of them send a `topUp` at once.
-    pub(crate) fn pool(grant: Option<CapabilityGrant>, escrows: UnconfirmedEscrows) -> Self {
-        Self {
-            ledgers: Some(LaneLedgers::new()),
-            funding: Some(Arc::new(RunFunding::reporting_escrows_to(escrows))),
-            ..Self::keystore(grant)
-        }
-    }
-
-    /// Load the keystore now, so a wrong password or a missing file fails
-    /// here and not at the first fetch.
-    ///
-    /// # Errors
-    ///
-    /// The keystore cannot be read or unlocked, or the lane key cannot be
-    /// derived for `host`'s store.
-    pub(crate) async fn unlock(&self, host: &FetchHost) -> anyhow::Result<()> {
-        self.keys(host).await.map(drop)
     }
 
     /// The key that signs and what its lanes sign under: the held key and its
@@ -1127,7 +1098,6 @@ impl Payer {
                 slot,
             },
             ledgers: Some(LaneLedgers::new()),
-            funding: None,
             recovery: Arc::new(RecoveryGate::new()),
             open_lock: tokio::sync::Mutex::new(()),
             evidence: None,
@@ -1307,10 +1277,7 @@ pub(crate) async fn fetch_on(
     loop {
         // Per pass: the funding facts, the lanes and their handles all name the
         // pool the pass pays from.
-        let funding = payer
-            .funding
-            .clone()
-            .unwrap_or_else(|| Arc::new(RunFunding::reporting_escrows_to(escrows.clone())));
+        let funding = Arc::new(RunFunding::reporting_escrows_to(escrows.clone()));
         // The shared pull/funding deps every lane borrows for the whole pass.
         let deps = LaneDeps {
             endpoint,

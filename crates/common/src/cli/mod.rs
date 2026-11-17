@@ -124,9 +124,8 @@ pub enum Command {
     /// Probe a running node over the `cdn/probe/v1` ALPN.
     Probe(ProbeArgs),
     /// Serve `decdn:` URIs over HTTP: to a browser from a loopback gateway,
-    /// paid with the scoped capabilities pages and the token holder register,
-    /// or to anyone from a public gateway (`--public-url`) paid from its own
-    /// pool within a daily allowance.
+    /// or to anyone from a public gateway (`--public-url`). Either pays only
+    /// with the capabilities pool owners register to its delegate keys.
     Gateway(Box<GatewayArgs>),
     /// Serve one page, on a loopback address, of this host's `decdn get`
     /// pulls, its gateway when one answers, and its node when one runs.

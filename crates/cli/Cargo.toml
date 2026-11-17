@@ -171,7 +171,6 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 mime_guess = { workspace = true }
-psl = { workspace = true }
 data-encoding = { workspace = true }
 lol_html = { workspace = true }
 # `decdn self-update` (#2537): resolves the latest GitHub release, verifies

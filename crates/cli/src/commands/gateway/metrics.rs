@@ -4,9 +4,9 @@
 //! series).
 //!
 //! One unlabeled sibling counter per outcome, as `adr/appendix-observability.md`
-//! § Reason splits prefers: each outcome has its own operator remedy (a
-//! spent allowance or a page no capability covers, a pool that cannot pay,
-//! an upstream fault), so no alert spans the family. Every series exports
+//! § Reason splits prefers: each outcome has its own operator remedy (no
+//! capability that can pay, an upstream fault), so no alert spans the
+//! family. Every series exports
 //! from the start, at zero.
 
 use std::fmt::Write as _;
@@ -22,7 +22,7 @@ pub(super) struct Metrics {
     requests_ok: AtomicU64,
     requests_not_found: AtomicU64,
     requests_refused: AtomicU64,
-    requests_allowance_exhausted: AtomicU64,
+    requests_payment_required: AtomicU64,
     pull_failures_funding: AtomicU64,
     pull_failures_other: AtomicU64,
     pulls_active: AtomicU64,
@@ -42,10 +42,11 @@ pub(super) struct Counters {
     pub(super) requests_not_found: u64,
     /// Requests refused before any pull, a missing token's 401 among them.
     pub(super) requests_refused: u64,
-    /// Requests answered 402: a spent allowance, or a page no capability
-    /// covers.
-    pub(super) requests_allowance_exhausted: u64,
-    /// Requests answered 503.
+    /// Requests answered 402: a loopback gateway holds no capability that
+    /// can pay.
+    pub(super) requests_payment_required: u64,
+    /// Requests answered 503: a public gateway holds no capability that can
+    /// pay.
     pub(super) pull_failures_funding: u64,
     /// Requests answered 502.
     pub(super) pull_failures_other: u64,
@@ -59,15 +60,15 @@ pub(super) struct Counters {
 
 impl Metrics {
     /// Count a request answered with `status`: success and redirects as
-    /// served, 404 as not found, 402 as payment required (a public gateway's
-    /// spent allowance, or a page no capability of a loopback gateway
-    /// covers), 503 as a pool that cannot pay, 502 as an upstream fault, every
-    /// other status (a missing token's 401 among them) as refused.
+    /// served, 404 as not found, 402 as payment required (a loopback gateway
+    /// with no capability that can pay), 503 as a funding failure (a public
+    /// gateway with none), 502 as an upstream fault, every other status (a
+    /// missing token's 401 among them) as refused.
     pub(super) fn request(&self, status: StatusCode) {
         let counter = match status {
             s if s.is_success() || s.is_redirection() => &self.requests_ok,
             StatusCode::NOT_FOUND => &self.requests_not_found,
-            StatusCode::PAYMENT_REQUIRED => &self.requests_allowance_exhausted,
+            StatusCode::PAYMENT_REQUIRED => &self.requests_payment_required,
             StatusCode::SERVICE_UNAVAILABLE => &self.pull_failures_funding,
             StatusCode::BAD_GATEWAY => &self.pull_failures_other,
             _ => &self.requests_refused,
@@ -111,7 +112,7 @@ impl Metrics {
             requests_ok: read(&self.requests_ok),
             requests_not_found: read(&self.requests_not_found),
             requests_refused: read(&self.requests_refused),
-            requests_allowance_exhausted: read(&self.requests_allowance_exhausted),
+            requests_payment_required: read(&self.requests_payment_required),
             pull_failures_funding: read(&self.pull_failures_funding),
             pull_failures_other: read(&self.pull_failures_other),
             pulls_active: read(&self.pulls_active),
@@ -129,7 +130,7 @@ impl Metrics {
             requests_ok,
             requests_not_found,
             requests_refused,
-            requests_allowance_exhausted,
+            requests_payment_required,
             pull_failures_funding,
             pull_failures_other,
             pulls_active,
@@ -163,16 +164,15 @@ impl Metrics {
                 requests_refused,
             ),
             (
-                "decdn_gateway_requests_allowance_exhausted_total",
+                "decdn_gateway_requests_payment_required_total",
                 "counter",
-                "Requests answered 402: on a public gateway the day's allowance is spent; on a \
-                 loopback gateway no capability covers the page.",
-                requests_allowance_exhausted,
+                "Requests answered 402: a loopback gateway holds no capability that can pay.",
+                requests_payment_required,
             ),
             (
                 "decdn_gateway_pull_failures_funding_total",
                 "counter",
-                "Requests answered 503: the gateway's pool cannot pay.",
+                "Requests answered 503: a public gateway holds no capability that can pay.",
                 pull_failures_funding,
             ),
             (
@@ -196,7 +196,7 @@ impl Metrics {
             (
                 "decdn_gateway_cache_hits_total",
                 "counter",
-                "Responses read whole out of the gateway cache, with no pull and no allowance.",
+                "Responses read whole out of the gateway cache, with no pull.",
                 cache_hits,
             ),
         ];

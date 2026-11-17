@@ -113,16 +113,12 @@ fn client() -> reqwest::Client {
     http_client().unwrap()
 }
 
-/// A gateway that answers with the gateway's body when the token is `tok`.
-fn token_gateway(req: &Request<hyper::body::Incoming>) -> Response<Body> {
-    if req.headers().get(TOKEN_HEADER).is_some_and(|t| t == "tok") {
-        json(
-            StatusCode::OK,
-            &serde_json::json!({ "mode": "loopback", "counters": { "requests_ok": 1 } }),
-        )
-    } else {
-        text(StatusCode::UNAUTHORIZED, "token required\n")
-    }
+/// A gateway that answers with a gateway's `/_status` body.
+fn gateway(_: &Request<hyper::body::Incoming>) -> Response<Body> {
+    json(
+        StatusCode::OK,
+        &serde_json::json!({ "mode": "loopback", "counters": { "requests_ok": 1 } }),
+    )
 }
 
 fn closed_port() -> std::net::SocketAddr {
@@ -137,7 +133,7 @@ fn closed_port() -> std::net::SocketAddr {
 async fn a_closed_port_is_no_gateway() {
     let url = Url::parse(&format!("http://{}/_status", closed_port())).unwrap();
     assert!(matches!(
-        ask_gateway(&client(), url, None).await,
+        ask_gateway(&client(), url).await,
         GatewayState::Absent
     ));
 }
@@ -147,134 +143,53 @@ async fn a_closed_port_is_no_gateway() {
 #[tokio::test]
 async fn a_name_that_does_not_resolve_is_an_error() {
     let url = Url::parse("http://decdn-dashboard-test.invalid/_status").unwrap();
-    match ask_gateway(&client(), url, None).await {
+    match ask_gateway(&client(), url).await {
         GatewayState::Error { message } => assert!(message.contains(':'), "{message}"),
         other => panic!("{other:?}"),
     }
 }
 
-/// The gateway's body passes through when the token is right; a refusal is
-/// `unauthorized`, and a body that is no gateway's is an error.
+/// The gateway's body passes through; any other answer is an error, a
+/// refusal included, and so is a body that is no gateway's.
 #[tokio::test]
-async fn the_gateway_answers_through_the_token() {
-    let url = serve(token_gateway).await;
-    match ask_gateway(&client(), url.clone(), Some("tok")).await {
+async fn the_gateway_answers_through() {
+    let url = serve(gateway).await;
+    match ask_gateway(&client(), url).await {
         GatewayState::Up { status } => assert_eq!(status["mode"], "loopback"),
         other => panic!("{other:?}"),
     }
-    assert!(matches!(
-        ask_gateway(&client(), url, None).await,
-        GatewayState::Unauthorized
-    ));
+
+    let refusing = serve(|_| text(StatusCode::UNAUTHORIZED, "token required\n")).await;
+    match ask_gateway(&client(), refusing).await {
+        GatewayState::Error { message } => assert!(message.contains("401"), "{message}"),
+        other => panic!("{other:?}"),
+    }
 
     let other = serve(|_| json(StatusCode::OK, &serde_json::json!({ "hello": 1 }))).await;
     assert!(matches!(
-        ask_gateway(&client(), other, None).await,
+        ask_gateway(&client(), other).await,
         GatewayState::Error { .. }
     ));
-}
-
-/// A redirect is not followed, so the token never reaches the host it names.
-#[tokio::test]
-async fn a_redirect_is_not_followed() {
-    let url = serve(|_| {
-        let mut response = text(StatusCode::FOUND, "");
-        response.headers_mut().insert(
-            hyper::header::LOCATION,
-            hyper::header::HeaderValue::from_static("http://elsewhere.invalid/_status"),
-        );
-        response
-    })
-    .await;
-    match ask_gateway(&client(), url, Some("tok")).await {
-        GatewayState::Error { message } => assert!(message.contains("302"), "{message}"),
-        other => panic!("{other:?}"),
-    }
 }
 
 fn sources() -> Sources {
     Sources::new(&Targets {
         pulls_dir: None,
         gateway: Url::parse("http://127.0.0.1:8484").unwrap(),
-        gateway_token_file: PathBuf::from("/nonexistent/token"),
-        gateway_token_named: false,
         admin_url: "http://127.0.0.1:9191".to_owned(),
         metrics_url: "http://127.0.0.1:9090/metrics".to_owned(),
     })
 }
 
-/// Each ask reads the token file anew: a gateway that writes its token after
-/// the dashboard started is read on the next ask.
+/// One ask records what the gateway answered and when.
 #[tokio::test]
-async fn each_ask_reads_the_token_anew() {
-    let url = serve(token_gateway).await;
-    let dir = tempfile::tempdir().unwrap();
-    let token = GatewayToken {
-        file: dir.path().join("token"),
-        named: false,
-    };
+async fn a_tick_records_the_answer() {
+    let url = serve(gateway).await;
     let sources = sources();
-    gateway_tick(&sources, &client(), url.clone(), &token).await;
-    assert!(matches!(
-        sources.gateway.read().unwrap().state,
-        GatewayState::Unauthorized
-    ));
-    std::fs::write(&token.file, "tok\n").unwrap();
-    gateway_tick(&sources, &client(), url, &token).await;
-    assert!(matches!(
-        sources.gateway.read().unwrap().state,
-        GatewayState::Up { .. }
-    ));
-    assert!(sources.gateway.read().unwrap().updated_unix_ms.is_some());
-}
-
-/// A token file the operator named and that cannot be read is an error that
-/// names it, not a gateway that wants a token.
-#[tokio::test]
-async fn a_named_token_file_that_cannot_be_read_says_so() {
-    let url = serve(token_gateway).await;
-    let dir = tempfile::tempdir().unwrap();
-    let token = GatewayToken {
-        file: dir.path().join("missing"),
-        named: true,
-    };
-    let sources = sources();
-    gateway_tick(&sources, &client(), url, &token).await;
-    match &sources.gateway.read().unwrap().state {
-        GatewayState::Error { message } => assert!(message.contains("missing"), "{message}"),
-        other => panic!("{other:?}"),
-    }
-}
-
-/// The token goes to this host only.
-#[test]
-fn the_token_goes_to_loopback_only() {
-    for url in [
-        "http://127.0.0.1:8484",
-        "http://localhost:8484",
-        "http://[::1]:8484",
-    ] {
-        assert!(is_loopback(&Url::parse(url).unwrap()), "{url}");
-    }
-    for url in [
-        "http://gw.example",
-        "http://10.0.0.1:8484",
-        "http://127.example",
-    ] {
-        assert!(!is_loopback(&Url::parse(url).unwrap()), "{url}");
-    }
-}
-
-#[test]
-fn the_token_file_is_read_trimmed() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("token");
-    assert_eq!(read_token(&path, false), Ok(None));
-    assert!(read_token(&path, true).is_err());
-    std::fs::write(&path, "\n").unwrap();
-    assert_eq!(read_token(&path, true), Ok(None));
-    std::fs::write(&path, "abc\n").unwrap();
-    assert_eq!(read_token(&path, false), Ok(Some("abc".to_owned())));
+    gateway_tick(&sources, &client(), url).await;
+    let section = sources.gateway.read().unwrap();
+    assert!(matches!(section.state, GatewayState::Up { .. }));
+    assert!(section.updated_unix_ms.is_some());
 }
 
 fn call<T>(code: i32) -> Result<T, JsonRpcClientError> {

@@ -53,9 +53,6 @@ const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// The delegate's cap: 5 USDC, far above what the pulls cost.
 const CAP_MICRO_USDC: u64 = 5_000_000;
 const KEYSTORE_PASSWORD: &str = "gateway-concurrent-e2e-password";
-/// The page host the content requests serve. The capability's `*` scope
-/// covers it.
-const PAGE_HOST: &str = "example.com";
 /// The node's count of paying streams it stopped over a rejected voucher.
 const VOUCHER_REJECTED: &str = "decdn_serve_stream_voucher_rejected_total";
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
@@ -164,13 +161,12 @@ async fn run() -> anyhow::Result<()> {
         .spawn()
         .context("spawn decdn gateway")?;
     let base = format!("http://{listen}");
-    let token = wait_for_token(&gateway_dir.path().join("token"), &base).await?;
+    wait_for_gateway(&base).await?;
     let http = reqwest::Client::new();
 
-    // ---- The gateway mints a delegate; the owner issues it a capability ----
+    // ---- The gateway's pending key; the owner issues it a capability ----
     let minted: serde_json::Value = http
         .get(format!("{base}/_delegate"))
-        .header("x-decdn-token", &token)
         .send()
         .await?
         .error_for_status()?
@@ -208,8 +204,7 @@ async fn run() -> anyhow::Result<()> {
         .context("the dcap1: token in `pool assign` output")?;
     let registered = http
         .put(format!("{base}/_capability"))
-        .header("x-decdn-token", &token)
-        .json(&serde_json::json!({ "capability": capability, "scope": "*" }))
+        .json(&serde_json::json!({ "capability": capability, "scope": "any" }))
         .send()
         .await?;
     anyhow::ensure!(
@@ -222,10 +217,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- (1) Four pulls under one capability at once ----
     let rejected_before = node.scrape_metric(VOUCHER_REJECTED).await?;
     let get = |hash: Hash| {
-        let request = http
-            .get(format!("{base}/{}", hash.to_hex()))
-            .header("x-decdn-token", &token)
-            .header("x-decdn-host", PAGE_HOST);
+        let request = http.get(format!("{base}/{}", hash.to_hex()));
         async move {
             let response = request.send().await?;
             let status = response.status();
@@ -266,8 +258,6 @@ async fn run() -> anyhow::Result<()> {
     // ---- (2) A response whose reader stops does not block another ----
     let stalled = http
         .get(format!("{base}/{}", hash_a.to_hex()))
-        .header("x-decdn-token", &token)
-        .header("x-decdn-host", PAGE_HOST)
         .send()
         .await?;
     anyhow::ensure!(stalled.status().is_success(), "{}", stalled.status());
@@ -395,14 +385,12 @@ async fn warm_up(
     }
 }
 
-/// The gateway token, once the gateway has written it and answers on `base`.
-async fn wait_for_token(path: &Path, base: &str) -> anyhow::Result<String> {
+/// Wait until the gateway answers on `base`.
+async fn wait_for_gateway(base: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        if let Ok(token) = std::fs::read_to_string(path)
-            && reqwest::get(format!("{base}/_capability")).await.is_ok()
-        {
-            return Ok(token.trim().to_owned());
+        if reqwest::get(format!("{base}/_capability")).await.is_ok() {
+            return Ok(());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,

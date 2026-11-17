@@ -9,8 +9,6 @@ fn dashboard() -> Dashboard {
     let targets = Targets {
         pulls_dir: None,
         gateway: Url::parse("http://127.0.0.1:8484").unwrap(),
-        gateway_token_file: std::path::PathBuf::from("/nonexistent/token"),
-        gateway_token_named: false,
         admin_url: "http://127.0.0.1:9191".to_owned(),
         metrics_url: "http://127.0.0.1:9090/metrics".to_owned(),
     };

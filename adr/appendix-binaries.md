@@ -97,10 +97,8 @@ It has three sections:
 The gateway grants no cross-origin read. The node's admin port has no
 authentication. Thus the dashboard process reads every source, and the page
 reads only the dashboard's own `GET /_status`. A browser never reaches the
-node's admin port. A loopback gateway's `/_status` needs the gateway token.
-The dashboard reads it from `--gateway-token-file`, by default
-`~/.decdn/gateway/token`, before each read. The dashboard sends the token to
-a loopback address only, and it follows no redirect. To read a gateway on
+node's admin port. The gateway's `/_status` needs no token, so the
+dashboard sends no credential to the gateway. To read a gateway on
 another host, open a tunnel to its `--metrics-listen` address. Use the same
 port on both ends, because the listener refuses a `Host` that is not its
 own.
