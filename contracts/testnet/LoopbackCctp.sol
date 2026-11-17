@@ -16,6 +16,9 @@ import { ITokenMessengerV2, IMessageTransmitterV2 } from "../src/interfaces/ICct
 ///         `amount` to `mintRecipient`. It plays the `TokenMessengerV2` role
 ///         too, so the message's `sender` and `recipient` are this contract.
 /// @dev    It verifies no attestation. Never deploy it where real funds move.
+///         It reverts with Circle's own revert strings, so callers see the
+///         same errors as against the real transmitter.
+// solhint-disable gas-custom-errors
 contract LoopbackCctp is ITokenMessengerV2, IMessageTransmitterV2 {
     using SafeERC20 for IERC20;
 
