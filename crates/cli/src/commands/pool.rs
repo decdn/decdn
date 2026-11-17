@@ -1619,6 +1619,21 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     println!("owner:        {recovered} (recovered from the signature)");
     println!("Token (give this to the delegated client):");
     println!("{token}");
+    if !args.namespaces.is_empty() {
+        let scope = super::gateway::scope::SignedScope::sign(
+            &owner_signer,
+            signer_addr,
+            pool_id,
+            args.namespaces.clone(),
+            &super::gateway::scope::scope_domain(chain.chain_id, chain.payment_pool),
+        )?;
+        let body = serde_json::json!({ "capability": token, "scope": scope });
+        println!(
+            "Gateway registration, scoped to namespaces {:?} (PUT this to /_capability):",
+            args.namespaces
+        );
+        println!("{body}");
+    }
     Ok(())
 }
 

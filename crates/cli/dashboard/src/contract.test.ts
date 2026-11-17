@@ -123,6 +123,7 @@ const PULL: Keys<ActivePull> = {
 const CAPABILITY: Keys<Capability> = {
   cap: true,
   expiry: true,
+  namespaces: true,
   pool: true,
   signer: true,
   spent: true,
@@ -390,7 +391,17 @@ function expectStatus(raw: unknown) {
     expectShape(p, PULL, "active_pulls[]");
     expectShape(p.payer, PAYER, "payer");
   }
-  s.capabilities.forEach((c) => expectShape(c, CAPABILITY, "capabilities[]"));
+  // `namespaces` appears on a scoped capability alone.
+  const unscoped = Object.fromEntries(
+    Object.entries(CAPABILITY).filter(([key]) => key !== "namespaces"),
+  );
+  s.capabilities.forEach((c) =>
+    expectShape(
+      c,
+      c.namespaces === undefined ? unscoped : CAPABILITY,
+      "capabilities[]",
+    ),
+  );
   s.pointers?.forEach((p) => expectShape(p, POINTER, "pointers[]"));
   if (s.pools) {
     expectShape(s.pools, SNAPSHOT, "pools");

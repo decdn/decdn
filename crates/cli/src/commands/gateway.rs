@@ -191,6 +191,7 @@ mod delegates;
 mod metrics;
 pub(crate) mod pointer;
 mod rewrite;
+pub(crate) mod scope;
 mod site;
 mod status;
 mod worker;
@@ -199,6 +200,7 @@ use delegates::{Capability, Delegates};
 use metrics::Metrics;
 use pointer::{Pointers, SetError, SignedPointer, pointer_domain};
 use rewrite::Rewrite;
+use scope::{SignedScope, scope_domain};
 use site::{Route, Site, SiteDomain};
 use worker::{FetchBackend, Job, PullWorker};
 
@@ -717,6 +719,10 @@ fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Resu
 struct RegisterRequest {
     /// The `dcap1:` capability.
     capability: String,
+    /// The pool owner's scope: the namespaces the capability pays for. A
+    /// capability with none pays for any request.
+    #[serde(default)]
+    scope: Option<SignedScope>,
 }
 
 struct Gateway {
@@ -1115,7 +1121,7 @@ impl Gateway {
         }
         match route {
             Some(Route::Site(site)) => {
-                return Self::with_policy(self.site(req, site).await);
+                return Self::with_policy(self.site(req, site, None).await);
             }
             Some(Route::Namespace(ns)) => {
                 let Some(root) = self.public.as_ref().and_then(|p| p.pointers.root(ns)) else {
@@ -1128,7 +1134,7 @@ impl Gateway {
                     hash: root,
                     namespace: Some(ns),
                 };
-                return Self::with_policy(self.site(req, site).await);
+                return Self::with_policy(self.site(req, site, Some(ns)).await);
             }
             Some(Route::Bare) | None => {}
         }
@@ -1190,7 +1196,7 @@ impl Gateway {
             (&Method::PUT, "/_pointer") => self.put_pointer(req).await,
             (&Method::HEAD, "/" | "/favicon.ico") => text(StatusCode::OK, ""),
             (&Method::HEAD, _) => {
-                self.head_blob(target.trim_start_matches('/'), Present::Bare)
+                self.head_blob(target.trim_start_matches('/'), Present::Bare, None)
                     .await
             }
             _ => return Err(Box::new(req)),
@@ -1218,8 +1224,15 @@ impl Gateway {
     }
 
     /// A request on a site origin: the site's own entries, and `/_decdn/` for
-    /// content outside its bundle.
-    async fn site<B>(self: Arc<Self>, req: Request<B>, site: Site) -> Response<Body> {
+    /// content outside its bundle. `pointer` is the namespace whose pointer
+    /// named the site, when one did: a capability scoped to it pays for the
+    /// site's own bundle, and for no other content on its host.
+    async fn site<B>(
+        self: Arc<Self>,
+        req: Request<B>,
+        site: Site,
+        pointer: Option<u64>,
+    ) -> Response<Body> {
         let path = req.uri().path();
         if matches!(
             path,
@@ -1245,10 +1258,12 @@ impl Gateway {
             return text(status, why);
         }
         let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
+        // The pointer's own bundle, which a capability scoped to it pays for.
+        let scoped_bundle = pointer.map(|ns| (ns, site.hash));
         if head {
             return match target.strip_prefix("/_decdn/") {
-                Some(rest) => self.head_blob(rest, Present::Site).await,
-                None => self.head_site(&site, path).await,
+                Some(rest) => self.head_blob(rest, Present::Site, scoped_bundle).await,
+                None => self.head_site(&site, path, pointer).await,
             };
         }
         let range = range_header(headers);
@@ -1257,12 +1272,18 @@ impl Gateway {
                 Ok(uri) => uri,
                 Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
             };
+            let pointer = pointer.filter(|_| uri.hash == site.hash);
             if !site::is_navigation(headers) {
-                return self.paid(&uri, Present::Site, Ask::Get(range)).await;
+                return self
+                    .paid(pointer, &uri, Present::Site, Ask::Get(range))
+                    .await;
             }
             // Another bundle's pages run on their own origin; a blob has none.
             return match uri.target {
-                UriTarget::Blob => self.paid(&uri, Present::Download, Ask::Get(range)).await,
+                UriTarget::Blob => {
+                    self.paid(pointer, &uri, Present::Download, Ask::Get(range))
+                        .await
+                }
                 _ => self.to_site(&uri),
             };
         }
@@ -1278,7 +1299,8 @@ impl Gateway {
             Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
             Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
         };
-        self.paid(&uri, Present::Site, Ask::Get(range)).await
+        self.paid(pointer, &uri, Present::Site, Ask::Get(range))
+            .await
     }
 
     /// `PUT /_pointer`: store a namespace pointer signed by the namespace's
@@ -1435,10 +1457,20 @@ impl Gateway {
             Err(e) => {
                 return text(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    &format!("expected {{\"capability\"}}: {e}\n"),
+                    &format!("expected {{\"capability\", \"scope\"?}}: {e}\n"),
                 );
             }
         };
+        if request
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.namespaces.is_empty())
+        {
+            return text(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a scope names at least one namespace\n",
+            );
+        }
         let grant = match CapabilityGrant::from_token(request.capability.trim()) {
             Ok(grant) => grant,
             Err(e) => return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n")),
@@ -1461,30 +1493,52 @@ impl Gateway {
         if let Err(refusal) = self.delegates().admits(&grant) {
             return text(StatusCode::CONFLICT, refusal.text());
         }
-        if let Err((status, e)) = self.verify_owner(&grant).await {
+        if let Err((status, e)) = self.verify_owner(&grant, request.scope.as_ref()).await {
             return text(status, &e);
         }
-        let response = serde_json::json!({
+        let namespaces = request.scope.map(|scope| scope.namespaces);
+        let mut response = serde_json::json!({
             "expiry": grant.expiry,
             "pool": grant.pool_id.to_string(),
             "signer": grant.signer.to_string(),
         });
+        if let (Some(namespaces), Some(fields)) = (&namespaces, response.as_object_mut()) {
+            fields.insert("namespaces".into(), serde_json::json!(namespaces));
+        }
         let (signer, pool) = (grant.signer, grant.pool_id);
-        if let Err(refusal) = self.delegates().register(grant) {
+        if let Err(refusal) = self.delegates().register(grant, namespaces) {
             return text(StatusCode::CONFLICT, refusal.text());
         }
         tracing::info!(%signer, %pool, "a capability was registered");
         json(StatusCode::CREATED, &response)
     }
 
-    /// Check that `grant` is signed by the on-chain owner of its pool on this
-    /// gateway's deployment. Whether the pool can pay shows only when a pull
-    /// draws on it: a funding stop retires the capability.
-    async fn verify_owner(&self, grant: &CapabilityGrant) -> Result<(), (StatusCode, String)> {
+    /// Check that `grant`, and its `scope` when it has one, are signed by the
+    /// on-chain owner of its pool on this gateway's deployment. Whether the
+    /// pool can pay shows only when a pull draws on it: a funding stop
+    /// retires the capability.
+    async fn verify_owner(
+        &self,
+        grant: &CapabilityGrant,
+        scope: Option<&SignedScope>,
+    ) -> Result<(), (StatusCode, String)> {
         let unprocessable = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
         let signed_by = grant
             .owner(&self.domain)
             .map_err(|e| unprocessable(format!("{e}\n")))?;
+        let scoped_by = scope
+            .map(|scope| {
+                let domain = scope_domain(self.chain.chain_id, self.chain.payment_pool);
+                scope
+                    .owner(grant.signer, grant.pool_id, &domain)
+                    .map_err(|_| unprocessable("the scope signature is malformed\n".to_owned()))
+            })
+            .transpose()?;
+        if scoped_by.is_some_and(|scoped_by| scoped_by != signed_by) {
+            return Err(unprocessable(
+                "the scope is not signed by the capability's pool owner\n".to_owned(),
+            ));
+        }
         let unreachable = |e: String| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -1548,10 +1602,13 @@ impl Gateway {
         Ok(owner)
     }
 
-    /// The capability the next pull pays with: the first one the gateway
-    /// holds that can pay ([`Delegates::paying`]), or `None`.
-    fn paying(&self) -> Option<Credential> {
-        self.delegates().paying(now_secs(), EXPIRY_MARGIN_SECS)
+    /// The capability the next pull pays with, for a request the pointer of
+    /// namespace `pointer` serves or, with `None`, for any other request: the
+    /// first one the gateway holds that can pay ([`Delegates::paying`]), or
+    /// `None`.
+    fn paying(&self, pointer: Option<u64>) -> Option<Credential> {
+        self.delegates()
+            .paying(now_secs(), EXPIRY_MARGIN_SECS, pointer)
     }
 
     /// Retire the capability `credential` pays with after a funding stop. It
@@ -1578,13 +1635,16 @@ impl Gateway {
         {
             return self.to_site(&uri);
         }
-        self.paid(&uri, Present::Bare, Ask::Get(range_header(headers)))
+        self.paid(None, &uri, Present::Bare, Ask::Get(range_header(headers)))
             .await
     }
 
-    /// Serve `uri` as `present` says, paid by [`Self::paying`].
+    /// Serve `uri` as `present` says, paid by [`Self::paying`] for a request
+    /// the pointer of namespace `pointer` serves, or for any other request
+    /// with `None`.
     async fn paid(
         self: &Arc<Self>,
+        pointer: Option<u64>,
         uri: &DecdnUri,
         present: Present,
         ask: Ask<'_>,
@@ -1594,7 +1654,7 @@ impl Gateway {
         // failed load. Each pass retires one, so the loop ends. With nothing
         // left that can pay, a response the cache holds whole is still served.
         loop {
-            let Some(paying) = self.paying() else {
+            let Some(paying) = self.paying(pointer) else {
                 if let Some(response) = self.cached_only(uri, present, ask).await {
                     return response;
                 }
@@ -2257,18 +2317,30 @@ impl Gateway {
     /// size as its `GET` would ([`Self::learn_size`]), paid as [`Self::paid`]
     /// pays. A bundle or an entry redirects to its site, at no pull, where
     /// `GET` under `/_decdn/` would serve a page's request for it inline.
-    async fn head_blob(self: &Arc<Self>, rest: &str, present: Present) -> Response<Body> {
+    ///
+    /// `scoped_bundle` is a pointer's namespace and the bundle it names, on
+    /// that namespace's host: a capability scoped to the namespace pays for
+    /// the size lookup of that bundle's own hash.
+    async fn head_blob(
+        self: &Arc<Self>,
+        rest: &str,
+        present: Present,
+        scoped_bundle: Option<(u64, [u8; 32])>,
+    ) -> Response<Body> {
         let uri: DecdnUri = match format!("decdn:{rest}").parse() {
             Ok(uri) => uri,
             Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
+        let namespace = scoped_bundle
+            .filter(|(_, bundle)| *bundle == uri.hash)
+            .map(|(ns, _)| ns);
         match uri.target {
             UriTarget::Blob => match self.blob_size(uri.hash).await {
                 Some(size) => {
                     let name = alloy::hex::encode(uri.hash);
                     head_response(&blob_type(present, &name), Some(size), uri.hash, present)
                 }
-                None => self.paid(&uri, present, Ask::Head).await,
+                None => self.paid(namespace, &uri, present, Ask::Head).await,
             },
             UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
             _ => text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
@@ -2279,7 +2351,13 @@ impl Gateway {
     /// which the gateway pulls once and caches, so the request costs no pull
     /// of the entry. A directory answers for its `index.html`, and the root
     /// for the bundle's; a response the gateway would rewrite has no length.
-    async fn head_site(self: &Arc<Self>, site: &Site, path: &str) -> Response<Body> {
+    /// `pointer` is the namespace whose pointer named the site, if any.
+    async fn head_site(
+        self: &Arc<Self>,
+        site: &Site,
+        path: &str,
+        pointer: Option<u64>,
+    ) -> Response<Body> {
         // The same resolution as `GET`: a directory is its `index.html`, and
         // the path decodes as a `decdn:` URI's does.
         let entry = if path.len() > 1 && path.ends_with('/') {
@@ -2297,7 +2375,7 @@ impl Gateway {
         // takes the pull.
         let cap_mb = manifest_cap_mb(self.common.max_blob_mb);
         let manifest = loop {
-            let Some(paying) = self.paying() else {
+            let Some(paying) = self.paying(pointer) else {
                 if let Some(Ok(manifest)) = self.known_manifest(site.hash, cap_mb).await {
                     break manifest;
                 }

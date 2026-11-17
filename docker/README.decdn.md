@@ -57,6 +57,19 @@ curl -X PUT https://decdn.link/_capability -H 'content-type: application/json' \
   -d "{\"capability\": \"$CAP\"}"
 ```
 
+To pay only for your own content on a shared gateway, scope the capability to your
+namespaces. `--namespace` (repeatable) signs the scope with the pool owner's key and
+prints the whole request body:
+
+```bash
+BODY=$(decdn pool assign --pool <pool-id> --signer "$KEY" --cap-micro-usdc 5000000 \
+  --expiry-secs 86400 --namespace 7 | grep '^{')
+curl -X PUT https://decdn.link/_capability -H 'content-type: application/json' -d "$BODY"
+```
+
+A scoped capability pays only for requests on `<namespace>.decdn.link` for the bundle that
+your signed pointer names. The gateway cache serves repeated requests with no new spend.
+
 `GET /_capability` and `GET /_status` show each capability's cap, expiry and spend.
 Register the next capability before the current one runs low or nears its expiry: the
 gateway pays with the first one that can pay. The keys live in memory, so a restarted

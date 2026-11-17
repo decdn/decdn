@@ -119,6 +119,13 @@ pub struct PoolAssignArgs {
     #[arg(long, value_name = "UNIX_TS", conflicts_with = "expiry_secs")]
     pub expiry_at: Option<u64>,
 
+    /// Limit the capability, on a `decdn gateway`, to the requests this
+    /// namespace's pointer serves (repeatable). The command then also signs
+    /// a scope with the pool owner's keystore and prints the
+    /// `PUT /_capability` body that registers the capability with it.
+    #[arg(long = "namespace", value_name = "ID", value_parser = clap::value_parser!(u64).range(1..))]
+    pub namespaces: Vec<u64>,
+
     /// Shared chain + store coordinates.
     #[command(flatten)]
     pub chain: PoolChainArgs,

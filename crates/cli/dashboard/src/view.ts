@@ -67,6 +67,8 @@ export function poolRows(list: Pool[]): PoolRow[] {
 export interface CapabilityRow {
   signer: string;
   pool: string;
+  /** The namespaces it pays for; null when it pays for any request. */
+  namespaces: number[] | null;
   cap: number;
   expiry: number;
   exhausted: boolean;
@@ -99,6 +101,7 @@ export function capabilities(status: GatewayStatus): CapabilityRow[] {
     return {
       signer: c.signer,
       pool: c.pool,
+      namespaces: c.namespaces ?? null,
       cap: c.cap,
       expiry: c.expiry,
       exhausted: c.spent,

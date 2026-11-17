@@ -108,7 +108,9 @@ fn grant(signer: Address, pool: u8, expiry: u64) -> CapabilityGrant {
 fn hold_capability(gateway: &Gateway, pool: u8) -> Address {
     let mut delegates = gateway.delegates();
     let signer = delegates.pending();
-    delegates.register(grant(signer, pool, u64::MAX)).unwrap();
+    delegates
+        .register(grant(signer, pool, u64::MAX), None)
+        .unwrap();
     signer
 }
 
@@ -315,7 +317,7 @@ async fn the_pending_key_answers_anyone_until_a_capability_claims_it() {
     assert_eq!(pending_address(&gateway).await, pending, "one pending key");
     gateway
         .delegates()
-        .register(grant(pending, 1, u64::MAX))
+        .register(grant(pending, 1, u64::MAX), None)
         .unwrap();
     let next = pending_address(&gateway).await;
     assert_ne!(next, pending, "a claimed key is no longer pending");
@@ -2946,7 +2948,7 @@ async fn the_capability_list_keeps_its_shape() {
         let signer = delegates.pending();
         let mut held = grant(signer, 0x01, 1_900_000_000);
         held.spending_cap = 5_000;
-        delegates.register(held.clone()).unwrap();
+        delegates.register(held.clone(), None).unwrap();
         delegates.retire(signer, held.pool_id);
         signer
     };
@@ -3802,4 +3804,97 @@ async fn a_gateway_with_no_capability_serves_a_cached_blob() {
     let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(OTHER))).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
     assert!(body.contains("no capability that can pay"), "{body}");
+}
+
+/// A capability scoped to a namespace pays for the requests that
+/// namespace's pointer serves, on its host, and for nothing else: not the
+/// same bundle on its own site host, not other content on the namespace's
+/// host, not a blob on the bare host.
+#[tokio::test]
+async fn a_scoped_capability_pays_only_on_its_namespace_host() {
+    let (gateway, _logs, site_host) =
+        public_gateway_unpaid(HashMap::new(), HashMap::new(), flags(&[])).await;
+    hold(
+        &gateway,
+        unsigned_pointer(7, BLOB, 1),
+        Address::repeat_byte(7),
+    );
+    {
+        let mut delegates = gateway.delegates();
+        let signer = delegates.pending();
+        delegates
+            .register(grant(signer, 1, u64::MAX), Some(vec![7]))
+            .unwrap();
+    }
+    let served = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
+    assert_eq!(served.status, StatusCode::OK, "{}", served.body);
+    assert_eq!(served.body, "abc");
+    let other = format!("/{}", alloy::hex::encode(OTHER));
+    for (host, path) in [
+        (site_host.as_str(), "/a.txt"),
+        ("7.decdn.test", &*format!("/_decdn{other}")),
+        ("decdn.test", other.as_str()),
+    ] {
+        let refused = request(&gateway, host, path, &[]).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{host}{path}: {}",
+            refused.body
+        );
+    }
+}
+
+/// A capability signed by a pool owner, issued to the gateway's pending key.
+async fn signed_grant(gateway: &Arc<Gateway>, owner: &PrivateKeySigner) -> CapabilityGrant {
+    let key = pending_address(gateway).await;
+    let capability = decdn_incentive::Capability {
+        signer: key,
+        spending_cap: 1_000,
+        pool_id: alloy::primitives::B256::repeat_byte(1),
+        expiry: now_secs() + 86_400,
+    };
+    let signed = capability.sign(owner, &gateway.domain).unwrap();
+    CapabilityGrant::from_signed_capability(&signed)
+}
+
+/// `PUT /_capability` with `grant` and the JSON `scope`: the status and body.
+async fn put_scoped(
+    gateway: &Arc<Gateway>,
+    grant: &CapabilityGrant,
+    scope: serde_json::Value,
+) -> (StatusCode, String) {
+    let body = serde_json::json!({ "capability": grant.to_token(), "scope": scope }).to_string();
+    let (status, _, body) = exchange(gateway, Method::PUT, "/_capability", &[], &body).await;
+    (status, body)
+}
+
+/// A scope must name a namespace and be signed by the capability's own pool
+/// owner; both are checked before the chain is read. A scope that passes
+/// them reaches the chain read, which this gateway cannot make.
+#[tokio::test]
+async fn a_scope_is_checked_before_the_chain_is_read() {
+    let gateway = test_gateway().await;
+    let owner = PrivateKeySigner::random();
+    let grant = signed_grant(&gateway, &owner).await;
+    let domain = scope::scope_domain(gateway.chain.chain_id, gateway.chain.payment_pool);
+
+    let empty = serde_json::json!({ "namespaces": [], "signature": "0x00" });
+    let (status, body) = put_scoped(&gateway, &grant, empty).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("at least one namespace"), "{body}");
+
+    let stranger = PrivateKeySigner::random();
+    let foreign =
+        SignedScope::sign(&stranger, grant.signer, grant.pool_id, vec![7], &domain).unwrap();
+    let (status, body) = put_scoped(&gateway, &grant, serde_json::json!(foreign)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.contains("not signed by the capability's pool owner"),
+        "{body}"
+    );
+
+    let own = SignedScope::sign(&owner, grant.signer, grant.pool_id, vec![7], &domain).unwrap();
+    let (status, body) = put_scoped(&gateway, &grant, serde_json::json!(own)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
 }

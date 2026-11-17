@@ -103,6 +103,7 @@ fn a_public_status_keeps_its_shape() {
         capabilities: vec![Capability {
             cap: 20_000_000,
             expiry: 1_900_000_000,
+            namespaces: Some(vec![7]),
             pool: pool.to_string(),
             signer: DELEGATE.to_string(),
             spent: false,
@@ -144,6 +145,7 @@ fn a_loopback_status_keeps_its_shape() {
         capabilities: vec![Capability {
             cap: 4_000_000,
             expiry: 1_900_000_000,
+            namespaces: None,
             pool: pool.to_string(),
             signer: DELEGATE.to_string(),
             spent: false,

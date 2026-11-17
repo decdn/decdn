@@ -12,7 +12,9 @@ export function Capabilities(props: { rows: CapabilityRow[] }) {
           <code>PUT /_capability</code>.
         </Empty>
       ) : (
-        <Table head={["Key", "Pool", "Spent of cap", "Bytes", "Expires"]}>
+        <Table
+          head={["Key", "Pool", "Pays for", "Spent of cap", "Bytes", "Expires"]}
+        >
           {props.rows.map((c) => (
             <tr key={`${c.signer}-${c.pool}`}>
               <Cell mono title={c.signer}>
@@ -20,6 +22,11 @@ export function Capabilities(props: { rows: CapabilityRow[] }) {
               </Cell>
               <Cell mono title={c.pool}>
                 {shortHex(c.pool)}
+              </Cell>
+              <Cell>
+                {c.namespaces === null
+                  ? "any request"
+                  : `namespace ${c.namespaces.join(", ")}`}
               </Cell>
               <td className="border-b border-line py-2 pr-4">
                 {c.used === null || c.spentMicro === null ? (

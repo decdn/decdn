@@ -3,9 +3,12 @@
 //!
 //! At most one key is pending: no capability claims it yet, and
 //! [`Delegates::pending`] returns it to every caller until one does. A key a
-//! capability claimed holds at most one capability per pool. The gateway pays
-//! with the capabilities in the order they were registered
-//! ([`Delegates::paying`]), skipping one a funding stop retired
+//! capability claimed holds at most one capability per pool. A capability is
+//! scoped to a list of namespaces, or unscoped. The gateway pays with the
+//! capabilities in the order they were registered ([`Delegates::paying`]):
+//! for a request a namespace pointer serves, the capabilities scoped to that
+//! namespace first, then the unscoped ones; for any other request, the
+//! unscoped ones alone. It skips one a funding stop retired
 //! ([`Delegates::retire`]) and one inside the expiry margin nodes apply.
 
 use std::collections::HashMap;
@@ -46,13 +49,17 @@ impl Refusal {
 /// One registered capability as `GET /_capability` and `/_status` list it.
 /// The fields are declared in sorted key order, which is the body's key
 /// order: the SDKs read this body, and its shape is a contract
-/// (`the_capability_list_keeps_its_shape`).
+/// (`the_capability_list_keeps_its_shape`). `namespaces` appears on a scoped
+/// capability alone.
 #[derive(Debug, serde::Serialize)]
 pub(super) struct Capability {
     /// The spending cap, in micro-USDC.
     pub(super) cap: u64,
     /// The capability's expiry, Unix seconds.
     pub(super) expiry: u64,
+    /// The namespaces it pays for; absent when it pays for any request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) namespaces: Option<Vec<u64>>,
     /// The pool it spends, `0x` hex.
     pub(super) pool: String,
     /// The delegate key, EIP-55 hex.
@@ -64,6 +71,8 @@ pub(super) struct Capability {
 /// A capability registered to a held key.
 struct Registered {
     grant: CapabilityGrant,
+    /// The namespaces it pays for, or `None` for any request.
+    namespaces: Option<Vec<u64>>,
     /// Its place in registration order.
     order: u64,
     /// Whether a pull stopped for funding on it.
@@ -118,12 +127,18 @@ impl Delegates {
         Ok(())
     }
 
-    /// Register `grant` to its key. A pending key becomes held, and the next
+    /// Register `grant` to its key, scoped to `namespaces` or, with `None`,
+    /// to any request. A pending key becomes held, and the next
     /// [`Self::pending`] creates a fresh one.
-    pub(super) fn register(&mut self, grant: CapabilityGrant) -> Result<(), Refusal> {
+    pub(super) fn register(
+        &mut self,
+        grant: CapabilityGrant,
+        namespaces: Option<Vec<u64>>,
+    ) -> Result<(), Refusal> {
         self.admits(&grant)?;
         let registered = Registered {
             grant,
+            namespaces,
             order: self.next,
             spent: false,
         };
@@ -153,18 +168,31 @@ impl Delegates {
         });
     }
 
-    /// The capability the next pull pays with at `now`: the earliest
-    /// registered that no funding stop retired and that is outside
-    /// `margin_secs` of its expiry.
-    pub(super) fn paying(&self, now: u64, margin_secs: u64) -> Option<Credential> {
+    /// The capability the next pull pays with at `now`, for a request the
+    /// pointer of `namespace` serves, or for any other request with `None`:
+    /// among those that no funding stop retired and that are outside
+    /// `margin_secs` of their expiry, the earliest registered scoped to
+    /// `namespace`, else the earliest registered unscoped one.
+    pub(super) fn paying(
+        &self,
+        now: u64,
+        margin_secs: u64,
+        namespace: Option<u64>,
+    ) -> Option<Credential> {
         self.held
             .values()
             .flat_map(|d| d.capabilities.iter().map(move |r| (d, r)))
             .filter(|(_, r)| {
                 !r.spent && !inside_capability_expiry_margin(r.grant.expiry, margin_secs, now)
             })
-            .min_by_key(|(_, r)| r.order)
-            .map(|(d, r)| Credential {
+            .filter_map(|(d, r)| match &r.namespaces {
+                None => Some((1u8, d, r)),
+                Some(scope) => namespace
+                    .is_some_and(|ns| scope.contains(&ns))
+                    .then_some((0u8, d, r)),
+            })
+            .min_by_key(|(rank, _, r)| (*rank, r.order))
+            .map(|(_, d, r)| Credential {
                 signer: Arc::clone(&d.signer),
                 grant: r.grant.clone(),
             })
@@ -194,6 +222,7 @@ impl Delegates {
             .map(|r| Capability {
                 cap: r.grant.spending_cap,
                 expiry: r.grant.expiry,
+                namespaces: r.namespaces.clone(),
                 pool: r.grant.pool_id.to_string(),
                 signer: r.grant.signer.to_string(),
                 spent: r.spent,

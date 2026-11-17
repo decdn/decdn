@@ -38,6 +38,9 @@
     {
       "cap": 20000000,
       "expiry": 1900000000,
+      "namespaces": [
+        7
+      ],
       "pool": "0x0101010101010101010101010101010101010101010101010101010101010101",
       "signer": "0xCdCDCdCdcdcdcdCdcDcDCdcDcDCdCdcdCdcDCDcD",
       "spent": false

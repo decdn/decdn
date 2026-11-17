@@ -32,16 +32,17 @@ key yet. `GET /_delegate` returns the address of the pending key, and makes
 the key when there is none. Thus two calls return the same address until a
 capability claims the key. The next call then makes a new pending key.
 
-`PUT /_capability` takes `{"capability": "dcap1:…"}`. The capability names a
-key that the gateway holds. Its owner signature must recover the on-chain
-owner of its pool on the gateway's deployment. A key holds at most one
-capability per pool. The gateway answers:
+`PUT /_capability` takes `{"capability": "dcap1:…", "scope": {…}}`. The
+`scope` is optional. The capability names a key that the gateway holds. Its
+owner signature must recover the on-chain owner of its pool on the gateway's
+deployment. A key holds at most one capability per pool. The gateway
+answers:
 
 | Status | When |
 |--------|------|
-| 201 | The capability is registered. The body names `expiry`, `pool` and `signer`. |
+| 201 | The capability is registered. The body names `expiry`, `pool` and `signer`, and `namespaces` for a scoped capability. |
 | 409 | The gateway does not hold the key, or the key holds a capability from this pool. |
-| 422 | The body is not `{"capability"}`, the cap is zero, the expiry is inside the expiry margin, or the signature does not recover the pool's owner. |
+| 422 | The body is not `{"capability", "scope"?}`, the scope names no namespace, the cap is zero, the expiry is inside the expiry margin, or a signature does not recover the pool's owner. |
 | 502 | The pool could not be read on-chain. |
 
 The gateway makes all checks that need no chain read before it reads the
@@ -49,9 +50,10 @@ pool. Thus a capability that cannot register costs the operator's RPC
 nothing.
 
 `GET /_capability` lists the capabilities in the order of registration. Each
-entry has `cap`, `expiry`, `pool`, `signer` and `spent`. The gateway pays
-each pull with the first capability in that order that can pay. A capability
-can pay when no funding stop retired it and when it is outside the expiry
+entry has `cap`, `expiry`, `pool`, `signer` and `spent`. A scoped entry also
+has `namespaces`. The gateway pays each pull with the first capability in
+that order that can pay, after the [scope](#scope) rule. A capability can
+pay when no funding stop retired it and when it is outside the expiry
 margin of the nodes: one redeem interval plus 120 s before its `expiry`
 ([ADR 003 § Revocation](003-payments.md#revocation)). A capability whose
 pull stops for funding before its first byte is retired, and the next one
@@ -69,6 +71,43 @@ of each key. An operator's controller reads them to see what is left.
 The keys and the capabilities live in memory only. A restart drops all of
 them. The operator's controller then gets the new pending key and registers
 new capabilities.
+
+### Scope
+
+A publisher can fund a shared public gateway for its own content only. The
+pool owner signs a scope. The scope limits one capability to a list of
+namespaces. It is an EIP-712 record:
+
+```text
+CapabilityScope(address signer,bytes32 poolId,uint256[] namespaces)
+```
+
+The domain is `decdn-capability-scope`, version `1`, with the chain id and
+the `PaymentPool` address as `verifyingContract`. `signer` and `poolId` name
+the capability, so a scope does not move to another capability. The scope
+signature must recover the pool's on-chain owner. `PUT /_capability` carries
+it as `"scope": {"namespaces": [7, 9], "signature": "0x…"}`.
+`decdn pool assign --namespace <id>` signs one, and prints the whole
+`PUT /_capability` body.
+
+A scoped capability pays only for a request that a namespace pointer serves:
+a request on `<ns>.<host>` for the bundle that the pointer names, with `ns`
+in the scope. The namespace's owner signs the pointer. Thus another client
+can make the capability pay only for content that the owner chose to serve.
+A request names a namespace in two more ways: a `?ns=` query and a
+`<ns>.<hash32>.` label. Anyone can write these, so they select no scoped
+capability.
+
+For a request that a pointer serves, the gateway pays with a capability
+scoped to that namespace first, and then with an unscoped one. For every
+other request, it pays with an unscoped capability. An unscoped capability
+pays for any request. A request can make a scoped capability pay only for
+its own namespace's content. The gateway cache serves a repeated request
+with no pull, so repeated requests spend no more of the cap.
+
+The scope controls which content a capability pays for. It does not control
+which website asks. An `Origin` header proves nothing outside a browser, so
+a public gateway stays readable by every origin.
 
 ## Hosts
 

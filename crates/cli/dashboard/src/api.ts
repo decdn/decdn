@@ -38,6 +38,8 @@ export interface ActivePull {
 export interface Capability {
   cap: number;
   expiry: number;
+  /** The namespaces a scoped capability pays for; absent when unscoped. */
+  namespaces?: number[];
   pool: string;
   signer: string;
   spent: boolean;

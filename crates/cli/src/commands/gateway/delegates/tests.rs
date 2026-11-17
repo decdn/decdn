@@ -17,11 +17,32 @@ fn grant(signer: Address, pool: u8, expiry: u64) -> CapabilityGrant {
     }
 }
 
-/// Register a capability from `pool` to the pending key, and return the key.
+/// Register an unscoped capability from `pool` to the pending key, and
+/// return the key.
 fn claim(delegates: &mut Delegates, pool: u8, expiry: u64) -> Address {
+    claim_scoped(delegates, pool, expiry, None)
+}
+
+/// Register a capability from `pool` to the pending key, scoped to
+/// `namespaces`, and return the key.
+fn claim_scoped(
+    delegates: &mut Delegates,
+    pool: u8,
+    expiry: u64,
+    namespaces: Option<Vec<u64>>,
+) -> Address {
     let signer = delegates.pending();
-    delegates.register(grant(signer, pool, expiry)).unwrap();
+    delegates
+        .register(grant(signer, pool, expiry), namespaces)
+        .unwrap();
     signer
+}
+
+/// The key the next pull pays with at `now`, for a request on `namespace`.
+fn payer(delegates: &Delegates, now: u64, namespace: Option<u64>) -> Option<Address> {
+    delegates
+        .paying(now, MARGIN, namespace)
+        .map(|c| c.signer.address())
 }
 
 #[test]
@@ -29,7 +50,9 @@ fn the_pending_key_is_one_until_a_capability_claims_it() {
     let mut delegates = Delegates::default();
     let pending = delegates.pending();
     assert_eq!(delegates.pending(), pending);
-    delegates.register(grant(pending, 1, u64::MAX)).unwrap();
+    delegates
+        .register(grant(pending, 1, u64::MAX), None)
+        .unwrap();
     let next = delegates.pending();
     assert_ne!(next, pending);
     assert_eq!(delegates.pending(), next);
@@ -40,14 +63,14 @@ fn a_key_holds_one_capability_per_pool() {
     let mut delegates = Delegates::default();
     let held = claim(&mut delegates, 1, u64::MAX);
     assert_eq!(
-        delegates.register(grant(held, 1, u64::MAX)),
+        delegates.register(grant(held, 1, u64::MAX), None),
         Err(Refusal::PoolTaken)
     );
-    delegates.register(grant(held, 2, u64::MAX)).unwrap();
+    delegates.register(grant(held, 2, u64::MAX), None).unwrap();
     assert_eq!(delegates.list().len(), 2);
     // Registering a held key leaves the pending key pending.
     let pending = delegates.pending();
-    delegates.register(grant(held, 3, u64::MAX)).unwrap();
+    delegates.register(grant(held, 3, u64::MAX), None).unwrap();
     assert_eq!(delegates.pending(), pending);
 }
 
@@ -60,7 +83,7 @@ fn a_key_the_gateway_does_not_hold_is_refused() {
         Err(Refusal::UnknownKey)
     );
     assert_eq!(
-        delegates.register(grant(stranger, 1, u64::MAX)),
+        delegates.register(grant(stranger, 1, u64::MAX), None),
         Err(Refusal::UnknownKey)
     );
     assert!(delegates.list().is_empty());
@@ -71,15 +94,14 @@ fn the_earliest_registered_capability_pays_first() {
     let mut delegates = Delegates::default();
     let first = claim(&mut delegates, 1, u64::MAX);
     let second = claim(&mut delegates, 2, u64::MAX);
-    let paying = delegates.paying(0, MARGIN).unwrap();
-    assert_eq!(paying.signer.address(), first);
+    assert_eq!(payer(&delegates, 0, None), Some(first));
     // A funding stop retires it, and the next one pays.
     delegates.retire(first, B256::repeat_byte(1));
-    let paying = delegates.paying(0, MARGIN).unwrap();
+    let paying = delegates.paying(0, MARGIN, None).unwrap();
     assert_eq!(paying.signer.address(), second);
     assert_eq!(paying.grant.pool_id, B256::repeat_byte(2));
     delegates.retire(second, B256::repeat_byte(2));
-    assert!(delegates.paying(0, MARGIN).is_none());
+    assert!(delegates.paying(0, MARGIN, None).is_none());
     // Both stay listed, as spent.
     assert!(delegates.list().iter().all(|c| c.spent));
 }
@@ -89,30 +111,48 @@ fn a_capability_inside_the_expiry_margin_pays_no_more() {
     let mut delegates = Delegates::default();
     let soon = claim(&mut delegates, 1, 1_000);
     let later = claim(&mut delegates, 2, 10_000);
-    assert_eq!(
-        delegates
-            .paying(1_000 - MARGIN - 1, MARGIN)
-            .unwrap()
-            .signer
-            .address(),
-        soon
-    );
-    assert_eq!(
-        delegates
-            .paying(1_000 - MARGIN, MARGIN)
-            .unwrap()
-            .signer
-            .address(),
-        later
-    );
-    assert!(delegates.paying(10_000 - MARGIN, MARGIN).is_none());
+    assert_eq!(payer(&delegates, 1_000 - MARGIN - 1, None), Some(soon));
+    assert_eq!(payer(&delegates, 1_000 - MARGIN, None), Some(later));
+    assert_eq!(payer(&delegates, 10_000 - MARGIN, None), None);
+}
+
+#[test]
+fn a_scoped_capability_pays_only_for_its_namespaces() {
+    let mut delegates = Delegates::default();
+    let scoped = claim_scoped(&mut delegates, 1, u64::MAX, Some(vec![7, 9]));
+    assert_eq!(payer(&delegates, 0, Some(7)), Some(scoped));
+    assert_eq!(payer(&delegates, 0, Some(9)), Some(scoped));
+    assert_eq!(payer(&delegates, 0, Some(8)), None, "another namespace");
+    assert_eq!(payer(&delegates, 0, None), None, "no pointer at all");
+}
+
+#[test]
+fn a_matching_scoped_capability_pays_before_an_unscoped_one() {
+    let mut delegates = Delegates::default();
+    let unscoped = claim(&mut delegates, 1, u64::MAX);
+    let scoped = claim_scoped(&mut delegates, 2, u64::MAX, Some(vec![7]));
+    assert_eq!(payer(&delegates, 0, Some(7)), Some(scoped));
+    assert_eq!(payer(&delegates, 0, Some(8)), Some(unscoped));
+    assert_eq!(payer(&delegates, 0, None), Some(unscoped));
+    // Once the scoped one runs out, the unscoped one pays for its namespace.
+    delegates.retire(scoped, B256::repeat_byte(2));
+    assert_eq!(payer(&delegates, 0, Some(7)), Some(unscoped));
+}
+
+#[test]
+fn the_list_names_a_scoped_capabilitys_namespaces() {
+    let mut delegates = Delegates::default();
+    claim(&mut delegates, 1, u64::MAX);
+    claim_scoped(&mut delegates, 2, u64::MAX, Some(vec![7]));
+    let listed: Vec<_> = delegates.list().into_iter().map(|c| c.namespaces).collect();
+    assert_eq!(listed, [None, Some(vec![7])]);
 }
 
 #[test]
 fn prune_drops_expired_capabilities_and_keys_left_with_none() {
     let mut delegates = Delegates::default();
     let key = claim(&mut delegates, 1, 100);
-    delegates.register(grant(key, 2, 200)).unwrap();
+    delegates.register(grant(key, 2, 200), None).unwrap();
     let pending = delegates.pending();
     delegates.prune(150);
     assert_eq!(delegates.list().len(), 1);
@@ -131,7 +171,7 @@ fn the_list_and_the_lanes_follow_registration_order() {
     let mut delegates = Delegates::default();
     let a = claim(&mut delegates, 1, u64::MAX);
     let b = claim(&mut delegates, 2, u64::MAX);
-    delegates.register(grant(a, 3, u64::MAX)).unwrap();
+    delegates.register(grant(a, 3, u64::MAX), None).unwrap();
     let listed: Vec<_> = delegates
         .list()
         .into_iter()
