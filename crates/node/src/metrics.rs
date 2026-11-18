@@ -1626,28 +1626,37 @@ pub struct DecdnMetrics {
     pub serve_cache_miss: Counter,
     /// `decdn_serve_first_byte_hit_seconds`: time to first byte of a paid serve
     /// the availability gate classed as a hit (complete or partial), from the
-    /// decoded request to the first `ChunkData` frame written. The first frame
-    /// rides the opening credit window, so no client payment round trip is in
-    /// the window; one `getPool` chain read is, when the pool view has no entry
-    /// for the pool. A stream that ends before any frame records nothing.
-    /// Sibling of `serve_first_byte_miss_seconds` on the cache-class axis.
+    /// decoded request to the first `ChunkData` frame written. The node sends no
+    /// byte before a proof pays for it, and a hit runs funding admission at the
+    /// payer's first proof. So the window holds the payer's time to that proof
+    /// (a round trip at least, and for an adopted discovery open the requester's
+    /// choice among its candidates), then the load-shed admit and the `getPool`
+    /// and `getAuthorization` chain reads on a view miss. A stream that ends
+    /// before any frame records nothing. Sibling of
+    /// `serve_first_byte_miss_seconds` on the cache-class axis.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_byte_hit_seconds: Histogram,
     /// `decdn_serve_first_byte_miss_seconds`: time to first byte of a paid serve
     /// the availability gate classed as a miss — the same window as
-    /// `serve_first_byte_hit_seconds`, which here also covers discovery and the
-    /// upstream or origin fill that produces the first frame. A window-paced
-    /// fill streams its first frame early; a buffered fill completes the whole
-    /// blob first, so on that tier the value grows with blob size.
+    /// `serve_first_byte_hit_seconds`, which here also covers the upstream or
+    /// origin fill that produces the first frame. A pull-through miss runs
+    /// funding admission and discovery before it answers. An own-origin serve
+    /// answers first and admits at the payer's first proof, as a hit does. A
+    /// window-paced fill streams its first frame early; a buffered fill
+    /// completes the whole blob first, so on that tier the value grows with
+    /// blob size.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_byte_miss_seconds: Histogram,
-    /// `decdn_serve_admission_seconds`: the admission phase of a paid serve's
-    /// time to first byte, from the decoded request to the load-shed admit. It
-    /// covers the binding check, the deny gates, the `getPool` and
-    /// `getAuthorization` chain reads on a view miss, and the availability
-    /// audit. The class is unknown until the audit ends, so this phase has no
-    /// hit/miss siblings. Records only for a stream that writes its first frame,
-    /// so the three phase histograms and the total share one population.
+    /// `decdn_serve_admission_seconds`: the first phase of a paid serve's time
+    /// to first byte, from the decoded request to the tier pick that classes the
+    /// serve a hit or a miss. It covers the timestamp and binding checks, the
+    /// chain-staleness and deny gates, and the availability audit. It holds no
+    /// funding admission and no chain read: a pull-through miss admits in the
+    /// response phase, and every other serve admits at the payer's first proof,
+    /// in the first-frame phase. The class is unknown until the tier pick, so
+    /// this phase has no hit/miss siblings. Records only for a stream that
+    /// writes its first frame, so the three phase histograms and the total
+    /// share one population.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_admission_seconds: Histogram,
     /// `decdn_serve_signer_auth_cached_total`: admit-path signer confirms the
@@ -1665,25 +1674,35 @@ pub struct DecdnMetrics {
     /// `getAuthorization`, its own or one already in flight for the pair.
     pub serve_signer_auth_reread: Counter,
     /// `decdn_serve_response_hit_seconds`: the response phase of a paid hit,
-    /// from the load-shed admit to the signed `StreamResponse` written.
+    /// from the tier pick to the signed `StreamResponse` written. It covers the
+    /// size proof, the coverage and the signature. A hit admits at the payer's
+    /// first proof, so this phase holds no load-shed admit and no chain read.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_response_hit_seconds: Histogram,
     /// `decdn_serve_response_miss_seconds`: the response phase of a paid miss,
-    /// from the load-shed admit to the signed `StreamResponse` written. It
-    /// covers the pre-spend deposit gate, the origin size and range probes, and
-    /// on a node-to-node fill the upstream discovery, pool open and handshake.
-    /// A buffered fill imports the whole blob in this phase.
+    /// from the tier pick to the signed `StreamResponse` written. It covers the
+    /// own-origin size and range probes. On a pull-through miss it also covers
+    /// the load-shed admit, the funding gates with their chain reads, the
+    /// pre-spend deposit gate and, on a node-to-node fill, the upstream
+    /// discovery, pool open and handshake. A buffered fill imports the whole
+    /// blob in this phase.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_response_miss_seconds: Histogram,
     /// `decdn_serve_first_frame_hit_seconds`: the first-frame phase of a paid
     /// hit, from the `StreamResponse` written to the first `ChunkData` frame
-    /// written. It covers the read and encode of the whole first frame.
+    /// written. It covers the wait for the payer's first proof, funding
+    /// admission at that proof (the load-shed admit, and the chain reads on a
+    /// view miss), and the read and encode of the whole first frame. The wait
+    /// is the payer's: a round trip at least, and for an adopted discovery open
+    /// the requester's choice among its candidates.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_frame_hit_seconds: Histogram,
     /// `decdn_serve_first_frame_miss_seconds`: the first-frame phase of a paid
     /// miss, from the `StreamResponse` written to the first `ChunkData` frame
-    /// written. On a window-paced fill it covers the pull leg filling the whole
-    /// first frame from upstream or origin.
+    /// written. It covers the wait for the payer's first proof. An own-origin
+    /// serve runs funding admission at that proof. On a window-paced fill the
+    /// phase also covers the pull leg filling the whole first frame from
+    /// upstream or origin.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_frame_miss_seconds: Histogram,
     /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
@@ -4060,9 +4079,12 @@ impl Drop for ConnectionGuard<'_> {
 /// clock and records nothing.
 ///
 /// The clock also splits the total into three phases: admission (decoded to
-/// load-shed admit), response (admit to the signed `StreamResponse` written)
-/// and first frame (response written to the first frame written). Each phase
-/// records into its own histogram, and a `debug` event carries all three.
+/// the tier pick that sets the class), response (tier pick to the signed
+/// `StreamResponse` written) and first frame (response written to the first
+/// frame written). Funding admission falls in the response phase on a
+/// pull-through miss and in the first-frame phase on every other serve, at the
+/// payer's first proof. Each phase records into its own histogram, and a
+/// `debug` event carries all three.
 #[derive(Debug)]
 pub(crate) struct FirstByteClock {
     started: Instant,
@@ -4072,7 +4094,7 @@ pub(crate) struct FirstByteClock {
 }
 
 impl FirstByteClock {
-    /// A clock that started at `started` and passed the load-shed gate at
+    /// A clock that started at `started` and picked its serve tier at
     /// `admitted`, for a serve of class `class`.
     pub(crate) const fn new(started: Instant, admitted: Instant, class: RequestClass) -> Self {
         Self {
