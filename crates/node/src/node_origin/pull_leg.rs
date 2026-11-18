@@ -66,11 +66,11 @@ use super::funder::{SETTLE_POLL_STEP, settle_window};
 use super::ranged_pull::{AssembleOutcome, RecoveryEnd, RunOutcome, RunSink, assemble};
 use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
-    EconGate, HeldOpen, NodeOrigin, NodeOriginDeps, OpenGather, OpenSpec, OpenStreams, OpenTally,
-    PullMiss, PullOutcome, PullVerdict, SettleOnDrop, bind_upstream_ctx, cached_candidates,
-    classify_pool_open_arm, classify_pull_failure, count_u16, coverage_spans, discover,
-    discovery_ctx, economic_ceiling, heat_of, lane_ledger, mb_of, open_and_rank,
-    record_backpressure_exhausted, record_backpressure_refusal, record_outcome,
+    Discovery, EconGate, HeldOpen, NodeOrigin, NodeOriginDeps, OpenGather, OpenSpec, OpenStreams,
+    OpenTally, PullMiss, PullOutcome, PullVerdict, SettleOnDrop, assigned_origins,
+    bind_upstream_ctx, cached_candidates, classify_pool_open_arm, classify_pull_failure, count_u16,
+    coverage_spans, discover, discovery_ctx, economic_ceiling, heat_of, lane_ledger, mb_of,
+    open_and_rank, record_backpressure_exhausted, record_backpressure_refusal, record_outcome,
     record_pool_open_failure,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
@@ -833,6 +833,7 @@ impl NodeOrigin {
         let discovered = discover(deps, hash_bytes, namespace_id, requester_id).await;
         let attested = discovered.attested;
         let providers = discovered.providers;
+        let assigned = assigned_origins(&attested, discovered.source, &providers);
         // The trail now describes this list; the cached walk keeps only its
         // handshake count and fault.
         trail.source = discovered.source;
@@ -867,10 +868,14 @@ impl NodeOrigin {
         // The origin-directory supplement inside the open round can list the
         // requester too.
         let spec = OpenSpec::new(ctx, namespace_bytes, open_span);
-        let (mut ranked, mut streams) = open_and_rank(
+        let Discovery {
+            mut ranked,
+            mut streams,
+            cold,
+        } = open_and_rank(
             deps,
             providers,
-            &attested,
+            (&attested, &assigned),
             hash_bytes,
             OpenGather::CoverageUnion,
             namespace_id,
@@ -902,13 +907,16 @@ impl NodeOrigin {
             trail.last_fault = outcome.last_fault;
         }
         match outcome.payload {
-            Ok((total_bytes, size_proof, primed)) => Ok(PullLegTarget {
-                total_bytes,
-                size_proof,
-                namespace_id: namespace_bytes,
-                candidates: ranked,
-                primed,
-            }),
+            Ok((total_bytes, size_proof, primed)) => {
+                cover_cold(&mut ranked, &cold, total_bytes);
+                Ok(PullLegTarget {
+                    total_bytes,
+                    size_proof,
+                    namespace_id: namespace_bytes,
+                    candidates: ranked,
+                    primed,
+                })
+            }
             Err(failed) => Err(PullLegMiss {
                 miss: miss.or(failed),
                 trail,
@@ -1256,6 +1264,19 @@ impl NodeOrigin {
         let _ = header_pull.abort();
         drop(stream_guard);
         Ok((total_bytes, size_proof, None))
+    }
+}
+
+/// Give each `cold` target in `ranked` the coverage of every block of the
+/// `total_bytes` blob: it fills whatever it is asked for, so once the size is
+/// proven the ranged pull may plan any block on it.
+fn cover_cold(ranked: &mut [Candidate], cold: &[[u8; 32]], total_bytes: u64) {
+    if cold.is_empty() {
+        return;
+    }
+    let full = decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes));
+    for candidate in ranked.iter_mut().filter(|c| cold.contains(&c.node_id)) {
+        candidate.coverage = full.clone();
     }
 }
 

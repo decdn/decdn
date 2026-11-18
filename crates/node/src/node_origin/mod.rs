@@ -1098,10 +1098,16 @@ impl Origin for NodeOrigin {
                 // is enough, and each open asks for the whole blob: the stream a
                 // holder serves is the pull's first leg.
                 let spec = OpenSpec::new(ctx, NO_NAMESPACE, (0, 0));
-                let (ranked, mut streams) = open_and_rank(
+                let assigned =
+                    assigned_origins(&discovered.attested, discovered.source, &providers);
+                let Discovery {
+                    ranked,
+                    mut streams,
+                    ..
+                } = open_and_rank(
                     deps,
                     providers,
-                    &discovered.attested,
+                    (&discovered.attested, &assigned),
                     hash_bytes,
                     OpenGather::EarlyExit,
                     U256::ZERO,
@@ -1210,6 +1216,22 @@ struct Discovered {
     /// requester is dropped, [`CandidateSource::Directory`] for a non-empty
     /// directory fallback, [`CandidateSource::None`] when both are empty.
     source: CandidateSource,
+}
+
+/// The hash's assigned origins among what a discovery knows: the `attested`
+/// origins, and `providers` too when `source` says they are the origin
+/// directory's fallback. No extra directory read: a DHT answer's holders are
+/// not taken as origins, and the supplement round names its own.
+pub(super) fn assigned_origins(
+    attested: &[DhtNodeId],
+    source: CandidateSource,
+    providers: &[DhtNodeId],
+) -> Vec<DhtNodeId> {
+    let mut assigned = attested.to_vec();
+    if source == CandidateSource::Directory {
+        assigned.extend(providers.iter().filter(|p| !attested.contains(p)));
+    }
+    assigned
 }
 
 /// Discover candidate providers for `hash`: the DHT iterative lookup first,
@@ -1494,11 +1516,45 @@ async fn discovery_ctx(deps: &NodeOriginDeps) -> Result<PoolContext, (PullMiss, 
     })
 }
 
+/// What one miss's discovery found: the candidates in the order the pull
+/// walks them, the streams of the holders that served the span, and the node
+/// ids of the cold pull-through targets at the tail of `ranked`.
+pub(super) struct Discovery {
+    /// The ranked holders, then the cold targets, nearest first.
+    pub(super) ranked: Vec<Candidate>,
+    /// The served holders' streams ([`OpenStreams`]).
+    pub(super) streams: OpenStreams,
+    /// The cold targets in `ranked`: assigned origins that answered `NotFound`
+    /// with no block, kept only when no holder served the span. They hold
+    /// nothing yet, so they carry no coverage and no size until a pull-through
+    /// open proves the size.
+    pub(super) cold: Vec<[u8; 32]>,
+}
+
+/// The answers one discovery's rounds collected.
+#[derive(Default)]
+struct Gathered {
+    /// Holders, partial holders included.
+    candidates: Vec<Candidate>,
+    /// The streams of the holders that served the span.
+    streams: OpenStreams,
+    /// Assigned origins that answered `NotFound` with no block.
+    cold: Vec<Candidate>,
+}
+
 /// Open up to `open_fanout` providers with voucher-less `cdn/client/v1`
 /// streams of `spec`, build a [`Candidate`] for each that answers as a holder,
-/// and rank them by the combined reputation-weighted selection score. Returns
-/// the ranked candidates and the streams of those that served the span.
-/// `tally` receives what the rounds saw.
+/// and rank them by the combined reputation-weighted selection score. `tally`
+/// receives what the rounds saw.
+///
+/// `assigned` names the peers known to be the hash's assigned origins: the
+/// attested origins and the origin directory's. An assigned origin that
+/// answers `NotFound` with no block holds nothing yet but serves the blob from
+/// its own backend once asked to fill it: it is a cold pull-through target,
+/// not an absent peer, so it is not negative-cached. When no holder serves the
+/// span, the cold targets join the ranked list as its tail, nearest first, as
+/// the client's cold order puts them; the pull opens them with the
+/// pull-through flag. While a holder serves the span they are not used.
 ///
 /// Under [`OpenGather::CoverageUnion`], a round whose holders cannot span the
 /// blob also opens the `attested` origins and the origin directory's
@@ -1512,28 +1568,28 @@ async fn discovery_ctx(deps: &NodeOriginDeps) -> Result<PoolContext, (PullMiss, 
 async fn open_and_rank(
     deps: &NodeOriginDeps,
     providers: Vec<DhtNodeId>,
-    attested: &[DhtNodeId],
+    (attested, assigned): (&[DhtNodeId], &[DhtNodeId]),
     hash_bytes: [u8; 32],
     gather: OpenGather,
     namespace_id: U256,
     spec: &OpenSpec,
     tally: &mut OpenTally,
-) -> (Vec<Candidate>, OpenStreams) {
+) -> Discovery {
     let target = DhtHash::from_bytes(hash_bytes);
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut streams = OpenStreams::default();
+    let mut gathered = Gathered::default();
     let resolved = open_round(
         deps,
-        &providers,
+        (&providers, assigned),
         hash_bytes,
         gather,
         spec,
-        &mut candidates,
-        &mut streams,
+        &mut gathered,
         tally,
     )
     .await;
-    if matches!(gather, OpenGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
+    if matches!(gather, OpenGather::CoverageUnion)
+        && !coverage_spans(hash_bytes, &gathered.candidates)
+    {
         // The supplement can list the requester; the pull leg drops it from the
         // ranked list after this round.
         let directory = fallback_origins(deps, namespace_id, attested, None).await;
@@ -1543,7 +1599,7 @@ async fn open_and_rank(
             .filter(|origin| !resolved.contains(origin))
             .collect();
         let hash = Hash::from_bytes(hash_bytes);
-        let holders = candidates.len();
+        let holders = gathered.candidates.len();
         if origins.is_empty() {
             debug!(
                 %hash,
@@ -1554,14 +1610,14 @@ async fn open_and_rank(
                  adds no unopened candidate"
             );
         } else {
+            // Every supplement candidate is an assigned origin.
             open_round(
                 deps,
-                &origins,
+                (&origins, &origins),
                 hash_bytes,
                 gather,
                 spec,
-                &mut candidates,
-                &mut streams,
+                &mut gathered,
                 tally,
             )
             .await;
@@ -1570,16 +1626,33 @@ async fn open_and_rank(
                 %namespace_id,
                 holders,
                 origins = origins.len(),
-                admitted = candidates.len().saturating_sub(holders),
-                spans = coverage_spans(hash_bytes, &candidates),
+                admitted = gathered.candidates.len().saturating_sub(holders),
+                spans = coverage_spans(hash_bytes, &gathered.candidates),
                 "node-origin: discovered holders did not span the blob; opened origin-directory \
                  candidates"
             );
         }
     }
+    let Gathered {
+        candidates,
+        streams,
+        cold,
+    } = gathered;
     tally.holders = count_u16(candidates.len());
     tally.spans = coverage_spans(hash_bytes, &candidates);
-    let ranked = rank(candidates);
+    let served = candidates.iter().any(|c| c.total_bytes_hint.is_some());
+    let mut ranked = rank(candidates);
+    cache_holders(deps, target, &ranked);
+    let cold = append_cold_tail(&mut ranked, cold, served, hash_bytes);
+    Discovery {
+        ranked,
+        streams,
+        cold,
+    }
+}
+
+/// Write the ranked holders to the candidate cache (ADR 001 §Candidate cache).
+fn cache_holders(deps: &NodeOriginDeps, target: DhtHash, ranked: &[Candidate]) {
     // ADR 001 §Candidate cache: retain the top 10 by selection score, so a
     // repeat miss for this hash inside the TTL skips the lookup and the
     // discovery fan-out. `insert` does the truncation; `ranked` is already in
@@ -1604,12 +1677,37 @@ async fn open_and_rank(
             })
             .collect(),
     );
-    (ranked, streams)
+}
+
+/// Append the `cold` targets to `ranked`, nearest first, when no holder
+/// `served` the span, and return their node ids; else drop them.
+fn append_cold_tail(
+    ranked: &mut Vec<Candidate>,
+    mut cold: Vec<Candidate>,
+    served: bool,
+    hash_bytes: [u8; 32],
+) -> Vec<[u8; 32]> {
+    // The cold tail, only when no holder served the span: nearest first, the
+    // client's cold order (#1911). It is never cached: it holds nothing.
+    if served || cold.is_empty() {
+        return Vec::new();
+    }
+    cold.sort_by_key(|c| c.rtt_ms);
+    let ids = cold.iter().map(|c| c.node_id).collect();
+    debug!(
+        hash = %Hash::from_bytes(hash_bytes),
+        cold = cold.len(),
+        "node-origin: no holder serves the blob; assigned origins that need a fill are \
+         cold pull-through targets"
+    );
+    ranked.extend(cold);
+    ids
 }
 
 /// One concurrent discovery round over `peers`, pushing each holder into
-/// `candidates`, and the stream of each holder that served the span into
-/// `streams`, until `gather`'s stop condition holds or the round drains.
+/// `gathered.candidates`, the stream of each holder that served the span into
+/// `gathered.streams`, and each peer of `assigned` that needs a fill into
+/// `gathered.cold`, until `gather`'s stop condition holds or the round drains.
 /// Returns the peers the round resolved: those it opened, and those the
 /// negative-cache and wedged filters skipped. A peer past the `open_fanout`
 /// cut is in neither, so a later round can open it. `tally` counts the peers
@@ -1620,19 +1718,17 @@ async fn open_and_rank(
 /// Under [`OpenGather::CoverageUnion`] the stop condition counts the holders
 /// already in `candidates`, so a second round stops as soon as its answers close
 /// the union the first round left open.
-#[allow(clippy::too_many_arguments)]
 async fn open_round(
     deps: &NodeOriginDeps,
-    peers: &[DhtNodeId],
+    (peers, assigned): (&[DhtNodeId], &[DhtNodeId]),
     hash_bytes: [u8; 32],
     gather: OpenGather,
     spec: &OpenSpec,
-    candidates: &mut Vec<Candidate>,
-    streams: &mut OpenStreams,
+    gathered: &mut Gathered,
     tally: &mut OpenTally,
 ) -> Vec<DhtNodeId> {
     use futures_util::stream::StreamExt;
-    let mut union = CoverageUnionTracker::from_candidates(hash_bytes, candidates);
+    let mut union = CoverageUnionTracker::from_candidates(hash_bytes, &gathered.candidates);
     let now_secs = crate::payment_settlement::unix_now();
     let target = DhtHash::from_bytes(hash_bytes);
     // Open candidates CONCURRENTLY so the discovery phase is bounded by a single
@@ -1677,7 +1773,7 @@ async fn open_round(
     tally.opened = tally.opened.saturating_add(count_u16(selected.len()));
     let mut opens: futures_util::stream::FuturesUnordered<_> = selected
         .iter()
-        .map(|&peer| open_candidate(deps, peer, hash_bytes, spec))
+        .map(|&peer| open_candidate(deps, peer, hash_bytes, spec, assigned.contains(&peer)))
         .collect();
     // A round that sends no open has no collection window to record.
     let sent_any = !opens.is_empty();
@@ -1695,15 +1791,22 @@ async fn open_round(
     // short of the holders that cover the rest.
     while let Some(result) = opens.next().await {
         let (candidate, stream) = match result {
-            Ok(admitted) => admitted,
+            Ok(Opened::Holder(candidate, stream)) => (candidate, stream),
+            Ok(Opened::Cold(candidate)) => {
+                // It refused the open: counted as absent, kept as a cold target.
+                tally.record(OpenDrop::Absent);
+                gathered.cold.push(candidate);
+                continue;
+            }
             Err(drop) => {
                 tally.record(drop);
                 continue;
             }
         };
         if let Some(stream) = stream {
-            streams.insert(candidate.node_id, stream);
+            gathered.streams.insert(candidate.node_id, *stream);
         }
+        let candidates = &mut gathered.candidates;
         let done = match gather {
             OpenGather::EarlyExit => {
                 candidates.push(candidate);
@@ -1835,6 +1938,14 @@ async fn discovery_answer(
     .ok()
 }
 
+/// What one discovery open admitted.
+enum Opened {
+    /// A holder, and its stream when it served the span.
+    Holder(Candidate, Option<Box<decdn_client::OpenedStream>>),
+    /// An assigned origin that holds nothing yet: a cold pull-through target.
+    Cold(Candidate),
+}
+
 /// Open one provider for discovery: a voucher-less `cdn/client/v1` stream of
 /// `spec` that asks no upstream work of it. Returns a ranked-ready
 /// [`Candidate`], with the open's stream when it served the span, iff the peer
@@ -1855,7 +1966,9 @@ async fn discovery_answer(
 /// ceiling also covers this node's own wait for a discovery slot; a same-region
 /// claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
 /// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable peer that holds no
-/// block is recorded in the negative cache.
+/// block is recorded in the negative cache, unless it is an `assigned_origin`
+/// that answered `NotFound`: that answer means it needs a fill, not that the
+/// blob is absent, so it is returned as [`Opened::Cold`] instead.
 // Straight-line open → classify → build; the tracing macros and the sequential
 // drop conditions inflate the cognitive-complexity metric past the threshold
 // (same inflation noted in `chain_staker_set`), and splitting the classification
@@ -1866,7 +1979,8 @@ async fn open_candidate(
     peer: DhtNodeId,
     hash_bytes: [u8; 32],
     spec: &OpenSpec,
-) -> Result<(Candidate, Option<decdn_client::OpenedStream>), OpenDrop> {
+    assigned_origin: bool,
+) -> Result<Opened, OpenDrop> {
     let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
         // A staker-filtered routing entry should always decode; a failure
         // implies upstream state corruption — skip rather than panic.
@@ -1946,13 +2060,17 @@ async fn open_candidate(
         }
     };
     let served = opened.served();
-    if !served && opened.coverage().is_empty() {
+    let holds_nothing = !served && opened.coverage().is_empty();
+    let error = opened.ext().error().cloned();
+    // An assigned origin's `NotFound` says it has not filled the blob yet: its
+    // backend holds it, and a pull-through open fills it. A cold target.
+    let cold = holds_nothing && assigned_origin && error == Some(StreamError::NotFound);
+    if holds_nothing && !cold {
         // Reachable but holds no block. A `NotFound` is the peer having just
         // looked, so it suppresses the pair for the cache-wide TTL; so does a
         // `Declined`, which says "stop asking". Not a reputation event: no
         // delivery was attempted. Any other refusal is about this node's own
         // funding and suppresses nothing.
-        let error = opened.ext().error().cloned();
         opened.cancel();
         if matches!(error, Some(StreamError::NotFound | StreamError::Declined)) {
             deps.negative_cache
@@ -2020,12 +2138,16 @@ async fn open_candidate(
         total_bytes_hint: opened.proven_size().map(decdn_client::ProvenSize::get),
     };
     if served {
-        Ok((candidate, Some(opened)))
+        Ok(Opened::Holder(candidate, Some(Box::new(opened))))
+    } else if cold {
+        // Not negative-cached: the next miss asks it again.
+        opened.cancel();
+        Ok(Opened::Cold(candidate))
     } else {
         // A partial holder: its blocks are in hand, and its pull opens its own
         // ranges asking it to fill what it lacks.
         opened.cancel();
-        Ok((candidate, None))
+        Ok(Opened::Holder(candidate, None))
     }
 }
 

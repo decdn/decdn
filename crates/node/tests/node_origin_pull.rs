@@ -1182,11 +1182,29 @@ async fn cache_with_fs_origin_only(
 /// pull. Without the binding, A refuses with `NotFound`.
 ///
 /// A's origin publishes no outboard, so A cannot serve the blob before its fill,
-/// and it answers a voucher-less discovery open `NotFound`. B reaches it through
-/// a candidate-cache entry instead, whose pull opens with the pull-through flag.
+/// and it answers B's voucher-less discovery open `NotFound`. A is the hash's
+/// assigned origin (B's directory lists it), so B keeps it as a cold
+/// pull-through target and opens it again with the pull-through flag.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<()> {
+    pull_from_an_assigned_origin_that_needs_a_fill(None).await
+}
+
+/// An assigned origin's `NotFound` to a voucher-less discovery open means it
+/// needs a fill, not that the blob is absent: B does not negative-cache it, and
+/// its next open of A is the pull-through one, which A's origin fills.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assigned_origins_discovery_not_found_is_a_cold_pull_through_target() -> Result<()> {
+    pull_from_an_assigned_origin_that_needs_a_fill(Some(support::capture_spans())).await
+}
+
+/// The body of [`node_origin_pull_chains_reactive_origin_via_client_binding`].
+/// With `spans`, it also checks B's opens of A: one voucher-less discovery
+/// open, then the pull-through open, and no negative-cache entry for the pair.
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn pull_from_an_assigned_origin_that_needs_a_fill(
+    spans: Option<support::SpanCapture>,
+) -> Result<()> {
     let payload = vec![0x9Eu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
 
@@ -1243,24 +1261,23 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
-    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
-    let (_providers, addr_map) = one_provider(a_dht, a_eth.address());
-    let (buyer, _recorded) = stub_opener(pool_id, &b_buyer);
-    let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let (origin, engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
-        buyer,
+        pool_id,
+        &b_buyer,
         &local_rep,
         &b_metrics,
-        &[(a_dht, RATE)],
+        providers,
         addr_map,
-        DEFAULT_TEST_PULL_DEADLINES.0,
-        DEFAULT_TEST_PULL_DEADLINES.1,
     )
     .await;
 
-    // Cached candidate → open (with binding) → A reactively pulls its own origin
+    // Discover → open (A needs a fill) → pull-through open (with binding) → A
+    // reactively pulls its own origin
     // → serve. A held nothing in-store, so a successful pull is proof of the
     // chained reactive fill.
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
@@ -1280,6 +1297,36 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         "upstream A must reactively pull its origin exactly once, got {}",
         cache_a_metrics.origin_fetches.get()
     );
+    if let Some(spans) = spans {
+        anyhow::ensure!(
+            !origin.is_suppressed(a_id, hash),
+            "an assigned origin's discovery NotFound must not be negative-cached"
+        );
+        let a = a_id.to_string();
+        let discovery: Vec<_> = spans
+            .matching("discovery_open", "hash", &hash.to_string())
+            .into_iter()
+            .filter(|s| s.fields.get("peer") == Some(&a))
+            .collect();
+        anyhow::ensure!(
+            discovery.len() == 1
+                && discovery
+                    .first()
+                    .and_then(|s| s.fields.get("pull_through"))
+                    .map(String::as_str)
+                    == Some("false"),
+            "B asks A once without pull-through: {discovery:?}"
+        );
+        let pulls: Vec<_> = spans
+            .matching("open_progressive_pull", "hash", &hash.to_string())
+            .into_iter()
+            .filter(|s| s.fields.get("peer") == Some(&a))
+            .collect();
+        anyhow::ensure!(
+            !pulls.is_empty(),
+            "B's next open of A is the pull-through one: {pulls:?}"
+        );
+    }
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
     Ok(())
@@ -15660,25 +15707,32 @@ async fn an_unreachable_only_candidate_refuses_with_the_walk_on_the_line() -> Re
     serve_miss_discovery_case(DiscoveryCase::DeadOnly, 0).await
 }
 
-/// A directory origin that answers `NotFound` with no block is opened once and then
-/// negative-cached. The next serve for the hash skips it in the first round,
-/// and the origin-directory supplement does not count the skip again: the
-/// refusal line reads `skipped=1`, not `skipped=2` (#2366).
+/// A directory origin that answers its open `Declined` is opened once and then
+/// negative-cached: unlike a `NotFound`, which asks for a fill, a `Declined`
+/// says "stop asking". The next serve for the hash skips it in the first
+/// round, and the origin-directory supplement does not count the skip again:
+/// the refusal line reads `skipped=1`, not `skipped=2` (#2366).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_negative_cached_only_candidate_is_skipped_once_per_walk() -> Result<()> {
     let spans = support::capture_spans();
     let (_block_guard, payload, hash) = two_block_blob()?;
     let ab_pool_id = B256::repeat_byte(0xA4);
+    // A refuses every open `Declined`.
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_signer = Arc::new(PrivateKeySigner::random());
+    let a_eth = a_signer.address();
+    let (ep_a, a_addr) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_refusing_server(
+        ep_a.clone(),
+        a_signer,
+        slash_domain(),
+        (u64::try_from(payload.len())?, RATE),
+        StreamError::Declined,
+        RefuseDiscovery::AtOpen,
+        None,
+    );
     let s_buyer = Arc::new(PrivateKeySigner::random());
-    // A holds no block of the blob, so it answers its open `NotFound`.
-    let (a_id, a_addr, a_eth, ep_a, task_a, _store_a) = spawn_partial_holder(
-        &payload,
-        ab_pool_id,
-        s_buyer.address(),
-        Coverage::from_block_indices(2, std::iter::empty()),
-        0,
-    )
-    .await?;
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
     let discovery = FixtureDiscovery::directory_only(vec![a_dht], U256::ZERO);
     let addr_map = HashMap::from([(a_dht, a_eth)]);
