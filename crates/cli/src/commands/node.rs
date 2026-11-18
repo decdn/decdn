@@ -1733,9 +1733,9 @@ async fn rank_by_open(
         decdn_client::provider::build_provider(&governance.rpc_url, &signer)?,
     );
     let voucher_dom = placeholder_pool.voucher_domain();
-    // A known pool: the context reads no chain to name one.
-    let placeholder =
-        decdn_client::funding::predicted_pool_id(signer.address(), alloy::primitives::U256::ZERO);
+    // A known pool: the context reads no chain to name one. No node reads it,
+    // so an id drawn from the throwaway key serves.
+    let placeholder = alloy::primitives::keccak256(signer.address());
     let ctx = decdn_client::funding::discovery_ctx(
         &store,
         &contract,

@@ -39,6 +39,7 @@
 //! let request = ClientMessage::StreamRequest(StreamRequest {
 //!     hash: [7; 32],
 //!     namespace_id: [0; 32],
+//!     payment_pool: "eip155:421614:0x0000000000000000000000000000000000000001".parse()?,
 //!     pool_id: [9; 32],
 //!     byte_offset: 0,
 //!     byte_len: 0,
@@ -48,7 +49,7 @@
 //! let (decoded, remainder) = decode_message::<ClientMessage>(&frame)?;
 //! assert_eq!(decoded, request);
 //! assert!(remainder.is_empty());
-//! # Ok::<(), decdn_protocol::FrameError>(())
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! This crate holds no cryptography. The signatures carried in these messages

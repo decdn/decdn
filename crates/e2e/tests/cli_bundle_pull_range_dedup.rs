@@ -638,13 +638,9 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
     args.push("4".into());
 
     let before = billed_bytes(client_dir.path(), provider_addr)?;
-    let opens_before = node.scrape_metric("decdn_serve_cache_hit_total").await?;
+    let opens_before = OpenCounts::scrape(&[&node]).await?;
     run_bundle_pull_until_ready(client_dir.path(), &args).await?;
     let paid = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before);
-    let opens = node
-        .scrape_metric("decdn_serve_cache_hit_total")
-        .await?
-        .saturating_sub(opens_before);
 
     let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
     let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin")?;
@@ -674,13 +670,15 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
          ({expected} wire bytes), got {paid}",
         complement.len()
     );
-    // Every open the node served was a paid leg (#2063): one whole-blob open for
-    // `a`, and one per complement range of `b`, each opened by `b`'s one lane.
-    // A size-only open thrown away would add one per entry.
+    // Every open the node admitted was a paid leg (#2063): one whole-blob open
+    // for `a`, and one per complement range of `b`, each opened by `b`'s one
+    // lane. `b`'s whole-blob discovery open is not a leg: its lane pulls
+    // ranges, so it cancels that open unpaid, and the node counts it unclaimed.
     let legs = 1 + complement.len() as u64;
+    let admitted = OpenCounts::admitted_settle(&[&node], opens_before, legs).await?;
     anyhow::ensure!(
-        opens == legs,
-        "the node must serve exactly the {legs} paid legs, served {opens} opens"
+        admitted == legs,
+        "the node must admit exactly the {legs} paid legs, admitted {admitted} opens"
     );
 
     drop(node);
@@ -823,25 +821,11 @@ async fn run_striped_complement() -> anyhow::Result<()> {
         billed_bytes(client_dir.path(), x_addr)?,
         billed_bytes(client_dir.path(), y_addr)?,
     );
-    let opens_before = (
-        holder_x
-            .scrape_metric("decdn_serve_cache_hit_total")
-            .await?,
-        holder_y
-            .scrape_metric("decdn_serve_cache_hit_total")
-            .await?,
-    );
+    let holders = [&holder_x, &holder_y];
+    let opens_before = OpenCounts::scrape(&holders).await?;
     run_bundle_pull_until_ready(client_dir.path(), &args).await?;
     let billed_x = billed_bytes(client_dir.path(), x_addr)?.saturating_sub(billed_before.0);
     let billed_y = billed_bytes(client_dir.path(), y_addr)?.saturating_sub(billed_before.1);
-    let opens = holder_x
-        .scrape_metric("decdn_serve_cache_hit_total")
-        .await?
-        .saturating_sub(opens_before.0)
-        + holder_y
-            .scrape_metric("decdn_serve_cache_hit_total")
-            .await?
-            .saturating_sub(opens_before.1);
 
     let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
     let got_b = std::fs::read(out_dir.join("b.bin")).context("read b.bin")?;
@@ -875,15 +859,71 @@ async fn run_striped_complement() -> anyhow::Result<()> {
         "both holders must serve some of b's complement: billed {billed_x} and \
          {billed_y}, a alone is {wire_a}"
     );
+    // `b`'s whole-blob discovery opens on both holders are not legs: its lanes
+    // pull ranges, so they cancel those opens unpaid.
     let legs = 1 + complement.len() as u64;
+    let admitted = OpenCounts::admitted_settle(&holders, opens_before, legs).await?;
     anyhow::ensure!(
-        opens == legs,
-        "the holders must serve exactly the {legs} paid legs between them, served {opens} opens"
+        admitted == legs,
+        "the holders must admit exactly the {legs} paid legs between them, admitted \
+         {admitted} opens"
     );
 
     drop(holder_x);
     drop(holder_y);
     Ok(())
+}
+
+/// How long the open counters may lag the pull's exit. A discovery open the
+/// client cancels ends at the node after the reset reaches it.
+const OPEN_COUNT_SETTLE: Duration = Duration::from_secs(10);
+
+/// The opens a set of nodes answered from a complete local blob, and those of
+/// them that ended before their first voucher. Their difference is the opens
+/// the nodes admitted: the paid legs.
+#[derive(Clone, Copy)]
+struct OpenCounts {
+    /// `decdn_serve_cache_hit_total`, summed.
+    hits: u64,
+    /// `decdn_serve_stream_unclaimed_total`, summed.
+    unclaimed: u64,
+}
+
+impl OpenCounts {
+    async fn scrape(nodes: &[&NodeFixture]) -> anyhow::Result<Self> {
+        let mut counts = Self {
+            hits: 0,
+            unclaimed: 0,
+        };
+        for node in nodes {
+            counts.hits += node.scrape_metric("decdn_serve_cache_hit_total").await?;
+            counts.unclaimed += node
+                .scrape_metric("decdn_serve_stream_unclaimed_total")
+                .await?;
+        }
+        Ok(counts)
+    }
+
+    /// The opens `nodes` admitted since `before`, once the count reaches
+    /// `want` or [`OPEN_COUNT_SETTLE`] passes.
+    async fn admitted_settle(
+        nodes: &[&NodeFixture],
+        before: Self,
+        want: u64,
+    ) -> anyhow::Result<u64> {
+        let deadline = tokio::time::Instant::now() + OPEN_COUNT_SETTLE;
+        loop {
+            let now = Self::scrape(nodes).await?;
+            let admitted = now
+                .hits
+                .saturating_sub(before.hits)
+                .saturating_sub(now.unclaimed.saturating_sub(before.unclaimed));
+            if admitted == want || tokio::time::Instant::now() >= deadline {
+                return Ok(admitted);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 
 /// The 16 KiB bao chunk group the dedup planner aligns donor interiors to.
