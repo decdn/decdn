@@ -179,7 +179,8 @@ pub(crate) mod coverage_plan;
 /// the capability runs low, and the funding signal that says when.
 pub mod credential;
 /// Client-side node discovery (#936): read + select the active node set from
-/// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
+/// `CapacityBond.getRegisteredNodes`, then rank the blob-holders a discovery
+/// open finds.
 pub mod discovery;
 /// The `Downloader` consumption face (#1848): fetch a set of content-addressed
 /// blobs (a bundle, or a single blob) to files in a directory, out-of-order and
@@ -192,7 +193,7 @@ pub mod downloader;
 /// [`pacer::Pacer`] axis.
 pub mod driver;
 /// One-shot client `Endpoint` construction: relay + discovery resolution for
-/// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
+/// the `cdn/client/v1` dial path (#935/#936).
 pub mod endpoint;
 pub mod session;
 // Docs live in `uri.rs` as `//!`, for the same reason as `sink` below.
@@ -236,8 +237,6 @@ pub mod payer_window;
 /// latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
 #[doc(hidden)]
 pub mod peer_store;
-/// Reusable `cdn/probe/v1` client.
-pub mod probe;
 /// Sub-frame byte-progress observation (#1797): a `ProgressReader` that tallies bytes
 /// off the QUIC stream beneath the message decode, and the `ThroughputFloor` that judges
 /// those bytes against a minimum rate over a trailing window.
@@ -867,9 +866,8 @@ impl std::fmt::Display for ResumeOffsetPastEnd {
 impl std::error::Error for ResumeOffsetPastEnd {}
 
 /// A node stated a blob size it did not prove (ADR 005 § Bounded byte
-/// ranges): the size proof of a `StreamResponse` with `ok = true`, or of a
-/// probe answer, does not verify against the content hash and the size it
-/// states.
+/// ranges): the size proof of a `StreamResponse` with `ok = true` does not
+/// verify against the content hash and the size it states.
 ///
 /// The size is a fault of that node. The client uses no part of the answer:
 /// it plans nothing, allocates nothing and pays nothing against the size. The

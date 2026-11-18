@@ -60,8 +60,8 @@
 //! [`decdn_cache::CacheEngine::evict`] durably records the takedown (survives
 //! restart via `evicted.log`) and cascades to every serving surface through
 //! [`decdn_cache::CacheEngine::refuses`]: the DHT republisher drops the hash on
-//! its next tick, the probe handler stops signing `has_blob: true`, and the
-//! client handler never re-pull-fills it. `evict` is sticky and works on absent
+//! its next tick, and the client handler refuses it, opens included, and never
+//! re-pull-fills it. `evict` is sticky and works on absent
 //! hashes, so a hash blacklisted while the node was offline (and not yet held) is
 //! still pre-blocked.
 //!

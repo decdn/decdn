@@ -3,8 +3,8 @@
 //!
 //! Neither hash half of the denylist lives here — local and governance alike are
 //! held by `CacheEngine` beside the eviction set, because "will this node
-//! serve/announce/acquire this hash" has five consumers (serve, probe hold, DHT
-//! republish, populate, and the per-MB in-flight re-check) and ADR 011 requires
+//! serve/announce/acquire this hash" has four consumers (serve, DHT republish,
+//! populate, and the per-MB in-flight re-check) and ADR 011 requires
 //! one answer for all of them. See `CacheEngine::refuses`. Addresses have two —
 //! the open-time delivery gate and that same in-flight re-check — and the cache
 //! knows nothing about them, so they stay here.

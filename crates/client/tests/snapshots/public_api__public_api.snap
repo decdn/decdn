@@ -317,6 +317,12 @@ pub decdn_client::discovery::Bootstrap::Live::store_warning: core::option::Optio
 impl decdn_client::discovery::Bootstrap
 pub fn decdn_client::discovery::Bootstrap::into_peers(self) -> alloc::vec::Vec<decdn_client::discovery::NodeCandidate>
 pub fn decdn_client::discovery::Bootstrap::warning(&self) -> core::option::Option<alloc::string::String>
+pub struct decdn_client::discovery::DiscoveredHolder
+pub decdn_client::discovery::DiscoveredHolder::candidate: decdn_client::discovery::NodeCandidate
+pub decdn_client::discovery::DiscoveredHolder::coverage: decdn_protocol::coverage::Coverage
+pub decdn_client::discovery::DiscoveredHolder::rate_per_mb: u64
+pub decdn_client::discovery::DiscoveredHolder::rtt_ms: f64
+pub decdn_client::discovery::DiscoveredHolder::total_bytes: core::option::Option<decdn_bao_range::size_proof::ProvenSize>
 pub struct decdn_client::discovery::NodeCandidate
 pub decdn_client::discovery::NodeCandidate::eth_address: alloy_primitives::bits::address::Address
 pub decdn_client::discovery::NodeCandidate::multiaddrs: alloy_primitives::bytes_::Bytes
@@ -324,12 +330,6 @@ pub decdn_client::discovery::NodeCandidate::node_id: iroh_base::key::PublicKey
 pub decdn_client::discovery::NodeCandidate::region_hint: core::option::Option<decdn_protocol::region::Region>
 impl decdn_client::discovery::NodeCandidate
 pub fn decdn_client::discovery::NodeCandidate::dial_addrs(&self) -> alloc::vec::Vec<core::net::socket_addr::SocketAddr>
-pub struct decdn_client::discovery::Probed
-pub decdn_client::discovery::Probed::candidate: decdn_client::discovery::NodeCandidate
-pub decdn_client::discovery::Probed::coverage: decdn_protocol::coverage::Coverage
-pub decdn_client::discovery::Probed::rate_per_mb: u64
-pub decdn_client::discovery::Probed::rtt_ms: f64
-pub decdn_client::discovery::Probed::total_bytes: core::option::Option<decdn_bao_range::size_proof::ProvenSize>
 pub const decdn_client::discovery::BOOTSTRAP_UNREACHABLE: &str
 pub fn decdn_client::discovery::admit_sources(alloc::vec::Vec<decdn_client::discovery::NodeCandidate>, usize) -> alloc::vec::Vec<decdn_client::discovery::NodeCandidate>
 pub async fn decdn_client::discovery::bootstrap_nodes(&str, alloy_primitives::bits::address::Address, &std::path::Path, core::time::Duration) -> anyhow::Result<decdn_client::discovery::Bootstrap>
@@ -402,12 +402,6 @@ pub const decdn_client::payer_window::DEFAULT_LOSS_WEIGHT: u64
 pub const decdn_client::payer_window::DEFAULT_PAY_AHEAD_CAP_MICRO_USDC: u64
 pub const decdn_client::payer_window::DEFAULT_PAY_AHEAD_DIVISOR: u64
 pub const decdn_client::payer_window::WINDOW_FLOOR_BYTES: u64
-pub mod decdn_client::probe
-pub struct decdn_client::probe::ProbeRtt
-pub decdn_client::probe::ProbeRtt::direct: bool
-pub decdn_client::probe::ProbeRtt::ms: f64
-pub async fn decdn_client::probe::probe_once(&iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, [u8; 32], u64, core::time::Duration) -> anyhow::Result<(decdn_protocol::message::ProbeResponse, decdn_protocol::message::ProbeResponseExt, decdn_client::probe::ProbeRtt)>
-pub fn decdn_client::probe::verify_probe_response(&decdn_protocol::message::ProbeResponse, alloy_primitives::bits::address::Address, &alloy_sol_types::eip712::Eip712Domain, [u8; 32], u64) -> anyhow::Result<()>
 pub mod decdn_client::provider
 pub fn decdn_client::provider::build_provider(&str, &alloy_signer_local::PrivateKeySigner) -> anyhow::Result<impl alloy_provider::provider::trait::Provider + core::clone::Clone + use<>>
 pub fn decdn_client::provider::build_read_provider(&str) -> anyhow::Result<impl alloy_provider::provider::trait::Provider + core::clone::Clone + use<>>

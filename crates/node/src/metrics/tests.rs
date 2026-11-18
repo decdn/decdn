@@ -193,42 +193,6 @@ fn set_unredeemed_usdc_publishes_the_total() {
     );
 }
 
-#[test]
-fn probe_hold_unavailable_exports_every_reason_at_zero() {
-    // Pins the pre-materialization in `Metrics::new` (#1443). A `Family`
-    // creates each child series lazily on `get_or_create`, so without that
-    // step a `reason` would be missing from `/metrics` until it first
-    // fired — a dashboard gap where the three `reason` series of
-    // `decdn_probe_hold_unavailable_total` read absent instead of zero, and
-    // a silent hole in the `DecdnProbeHoldViolations` alert's
-    // input. Also pins the rendered series text (label name, snake_case
-    // value encoding, and the `_total` suffix the encoder appends).
-    let metrics = Metrics::new();
-    let text = metrics.encode().unwrap();
-
-    for reason in ["exhausted", "disabled", "stake_lane_reserved"] {
-        let name = format!("decdn_probe_hold_unavailable_total{{reason=\"{reason}\"}}");
-        assert!(
-            has_metric_line(&text, &name, 0),
-            "{name} should be exposed at zero from a fresh registry:\n{text}"
-        );
-    }
-
-    // None of these three names is a valid export; probe-hold reasons ship
-    // only as `reason` labels on the collapsed counter
-    // `decdn_probe_hold_unavailable_total`.
-    for retired in [
-        "decdn_probe_hold_violations_total",
-        "decdn_probe_holds_disabled_total",
-        "decdn_probe_stake_lane_reserved_total",
-    ] {
-        assert!(
-            !text.lines().any(|line| line.starts_with(retired)),
-            "retired metric name {retired} must not be exported:\n{text}"
-        );
-    }
-}
-
 /// Every `(method, outcome)` child of `decdn_rpc_requests_total` and every
 /// per-method duration histogram exports at zero from a fresh registry, so
 /// an error-ratio panel has a series before the first failure. A recorded
@@ -425,35 +389,6 @@ fn staker_set_active_by_region_replaces_the_previous_map() {
         "a departed region kept its series"
     );
     assert!(has("decdn_staker_set_active_unknown_region 0"), "{text}");
-}
-
-#[test]
-fn probe_hold_unavailable_increments_only_the_named_reason() {
-    // The whole point of the label is that each value keeps its own
-    // remedy: `exhausted` drives "raise max_probe_holds", `disabled` is an
-    // intentional operator choice, and `stake_lane_reserved` is a priority
-    // decision taken before the cache is even consulted. Bumping one must
-    // never move another, or the alert filter re-fires on the deliberate
-    // cases the #739/#757 split existed to keep out.
-    let metrics = Metrics::new();
-    metrics.probe_hold_unavailable(ProbeHoldUnavailableReason::Exhausted);
-    let text = metrics.encode().unwrap();
-
-    assert!(
-        has_metric_line(
-            &text,
-            "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}",
-            1
-        ),
-        "the named reason must increment:\n{text}"
-    );
-    for untouched in ["disabled", "stake_lane_reserved"] {
-        let name = format!("decdn_probe_hold_unavailable_total{{reason=\"{untouched}\"}}");
-        assert!(
-            has_metric_line(&text, &name, 0),
-            "{name} must stay at zero:\n{text}"
-        );
-    }
 }
 
 /// Every `reason` of `decdn_capability_intake_dropped_total` exports at zero
@@ -654,7 +589,7 @@ fn cache_metrics_counters_start_at_zero() {
 
 #[test]
 fn quic_0rtt_and_session_ticket_series_are_not_exposed() {
-    // The probe path is a plain QUIC handshake: no early-data
+    // Every ALPN runs a plain QUIC handshake: no early-data
     // classification and no session-ticket working-set proxy, so no
     // metric may name either. A partial revert that reintroduces one
     // counter but not its recorder shows up here.
@@ -1387,54 +1322,6 @@ impl decdn_cache::Origin for StubOrigin {
         };
         Box::pin(async move { result })
     }
-}
-
-/// `decdn_probe_hold_slots_used` tracks hold expiry with no probe
-/// traffic: a hold taken once reads `1` at the next scrape and `0` at a
-/// scrape after `PROBE_HOLD_DURATION` lapses, with nothing but the clock
-/// in between.
-#[tokio::test(start_paused = true)]
-async fn probe_hold_slots_used_drops_to_zero_after_hold_expires() {
-    use std::sync::Arc;
-
-    use decdn_cache::{CacheEngine, PROBE_HOLD_DURATION, ProbeHoldOutcome};
-
-    let payload = b"probe hold gauge".to_vec();
-    let hash = iroh_blobs::Hash::new(&payload);
-    let stub = StubOrigin {
-        data: bytes::Bytes::from(payload),
-        hash,
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(stub) as Arc<dyn decdn_cache::Origin>],
-        10,
-    )
-    .await
-    .unwrap();
-    let _ = engine.get(hash).await.unwrap();
-
-    let metrics = Metrics::new();
-    metrics.attach_probe_holds(engine.clone());
-    assert_eq!(
-        engine.try_probe_hold(hash).await.unwrap(),
-        ProbeHoldOutcome::Held
-    );
-
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_probe_hold_slots_used", 1),
-        "a live hold must read 1:\n{text}"
-    );
-
-    tokio::time::advance(PROBE_HOLD_DURATION + Duration::from_secs(1)).await;
-
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_probe_hold_slots_used", 0),
-        "an expired hold must read 0 with no further probe:\n{text}"
-    );
 }
 
 #[tokio::test]

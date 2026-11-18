@@ -107,8 +107,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             eviction_target_pct: 80,
             eviction_per_sweep_budget: 16,
             eviction_tick_secs: 1,
-            max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
-            stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             node_to_node_pull_through_enabled: false,
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             node_pull_open_fanout: decdn_common::config::DEFAULT_NODE_PULL_OPEN_FANOUT,
@@ -150,7 +148,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         },
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         dht: decdn_common::config::ResolvedDht::default(),
-        probe: decdn_common::config::ResolvedProbe::default(),
         serve: decdn_common::config::ResolvedServe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
         content: decdn_common::config::ResolvedContent::default(),
@@ -541,12 +538,12 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
 
     // --- Reload #2: the mutable `log_level` change applies, bundled with
     //     restart-required ones. payment/network/blockchain/identity/
-    //     dht/probe/receipts warn on presence; `[cache]`
+    //     dht/serve/receipts warn on presence; `[cache]`
     //     warns because it sets the non-reloadable `cache_dir` (a
     //     pinned_hashes-only edit would not); `[observability]` warns once for
     //     each of `metrics_port` and `otlp_endpoint`, which differ from
     //     startup, and not for the reloadable `log_level`; `[security]` is
-    //     fully reloadable, so it stays silent. Empty `[dht]`/`[probe]`/
+    //     fully reloadable, so it stays silent. Empty `[dht]`/`[serve]`/
     //     `[receipts]`/`[security]` tables are "present" so they exercise
     //     those emitter branches.
     write_config(
@@ -566,7 +563,7 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
          [identity]\n\
          region = \"US\"\n\n\
          [dht]\n\n\
-         [probe]\n\n\
+         [serve]\n\n\
          [receipts]\n\n\
          [security]\n",
     );
@@ -594,7 +591,7 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         "cache",
         "identity",
         "dht",
-        "probe",
+        "serve",
         "receipts",
     ] {
         assert_eq!(

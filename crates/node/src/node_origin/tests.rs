@@ -883,7 +883,7 @@ fn a_timestamp_refusal_is_not_scored_unreachable() {
 #[test]
 fn a_timestamp_refusal_suppresses_the_pair_without_scoring() -> anyhow::Result<()> {
     let metrics = Metrics::new();
-    let negative_cache = NegativeProbeCache::new();
+    let negative_cache = NegativeCandidateCache::new();
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public();
     let hash_bytes = [9; 32];
     let node = DhtNodeId::from_bytes(*peer.as_bytes());

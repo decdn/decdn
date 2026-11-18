@@ -11,7 +11,6 @@ use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
 use crate::chain_events::shared_head::{HeadSource, SharedHead};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,8 +37,6 @@ use crate::dht::{DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::client::{ClientHandler, ClientProtocol, MAX_CLIENT_STREAMS};
 use crate::handlers::dht::DhtHandler;
-use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePolicy};
-use crate::handlers::probe_rate_limit::ProbeRateLimiter;
 use crate::metrics;
 use crate::payment_settlement::PoolSettlementService;
 use crate::pool_store::PersistentPoolStateStore;
@@ -59,10 +56,10 @@ use decdn_incentive::eth_identity;
 /// Ceiling on each bounded shutdown stage: the router close ([`close_router`]),
 /// the final redeem sweep, and the drain of spawned tasks after the endpoint and
 /// metrics server have been signalled to stop. Sized comfortably larger than the
-/// sum of the probe handler's accept + close timeouts (see
-/// `handlers::probe::ACCEPT_BI_TIMEOUT` + `PROBE_READ_TIMEOUT` +
-/// `PROBE_CLOSE_TIMEOUT`) so in-flight handlers finish naturally, and than an
-/// endpoint close's `3 * PTO` wait; each stage's give-up branch only fires as a
+/// sum of the DHT handler's accept + read + close timeouts (see
+/// `handlers::dht::FIRST_STREAM_TIMEOUT` + `READ_TIMEOUT` + `CLOSE_TIMEOUT`)
+/// so in-flight handlers finish naturally, and than an endpoint close's
+/// `3 * PTO` wait; each stage's give-up branch only fires as a
 /// safety net.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -82,12 +79,11 @@ const EGRESS_EWMA_INTERVAL: Duration = Duration::from_secs(1);
 /// is empty.
 const DHT_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
-/// Interval between periodic GC sweeps of the probe and serve rate-limiters'
-/// per-peer keyed maps (#645, #982). Matches
-/// `DHT_RATE_LIMIT_GC_INTERVAL` — the keyed limiters share the same
-/// keyspace-cleanup mental model.
+/// Interval between periodic GC sweeps of the serve rate-limiter's per-peer
+/// keyed map (#645). Matches `DHT_RATE_LIMIT_GC_INTERVAL` — the keyed
+/// limiters share the same keyspace-cleanup mental model.
 /// Separate constant so a future tune to one limiter doesn't drag the other.
-const PROBE_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
+const SERVE_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Period between periodic sweeps of the local per-peer reputation store
 /// (ADR 008 §Local Score Calculation). `LocalReputation::evict` drops
@@ -116,7 +112,7 @@ pub(crate) const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between QUIC PING keep-alive frames. Per ADR 005 §Connection
 /// lifetime, endpoints SHOULD send PINGs at 10s intervals — strictly
-/// less than [`QUIC_MAX_IDLE_TIMEOUT`] so a single dropped probe doesn't
+/// less than [`QUIC_MAX_IDLE_TIMEOUT`] so a single dropped PING doesn't
 /// trip the idle reaper, and well below the typical NAT mapping timeout
 /// so middleboxes don't drop the path under quiet load. Quinn applies
 /// this on every connection regardless of role, so this endpoint emits
@@ -125,12 +121,10 @@ const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Maximum number of concurrent bidirectional streams a peer may open on
 /// a single connection. Sized for `cdn/client/v1` (the largest cap in
-/// ADR 005 §Concurrent stream limits: client=100, probe=1, dht=1).
+/// ADR 005 §Concurrent stream limits: client=100, dht=1).
 /// `QuicTransportConfig` is per-endpoint, not per-ALPN, so the QUIC
 /// layer can only enforce the union of these caps; tighter per-ALPN
-/// limits are enforced inside each handler. The probe handler already
-/// does this implicitly by calling `accept_bi()` exactly once per
-/// connection and then closing.
+/// limits are enforced inside each handler.
 const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 
 /// Connection-level QUIC receive window: the most stream data one peer may have
@@ -383,7 +377,7 @@ fn warn_if_pins_exceed_cache(cache: &decdn_cache::CacheEngine, cache_size_mb: u6
 }
 
 /// Emit one `debug` line for a per-peer rate-limiter GC sweep that pruned
-/// buckets. Shared by the DHT, probe and serve rate-limiter GC ticks.
+/// buckets. Shared by the DHT and serve rate-limiter GC ticks.
 fn log_keyspace_gc(kind: &'static str, sweep: Option<(usize, usize)>) {
     if let Some((before, after)) = sweep {
         tracing::debug!(
@@ -470,10 +464,6 @@ async fn build_infra(
     // for the whole boot. The watchdog spawned in `spawn_background_tasks`
     // owns the gauge from then on.
     node_metrics.rpc_healthy(true);
-
-    // Registry-mandatory `decdn_probe_hold_slots_max` (ADR
-    // appendix-observability.md) — static, set once from config.
-    node_metrics.probe_hold_slots_max(cfg.cache.max_probe_holds);
 
     // Issue #406: load the Ethereum keystore into a live `PrivateKeySigner`
     // before the rest of startup so any password-source error (env unset,
@@ -674,8 +664,6 @@ async fn build_infra(
     // `build_cache` succeeds so a SIGHUP delivered during the rest of
     // startup will still find a target.
     reload_state.attach_cache(Some(cache.clone()));
-    // `decdn_probe_hold_slots_used` samples this cache on every scrape.
-    node_metrics.attach_probe_holds(cache.clone());
 
     // Admission/eviction policy selection (ADR 040) plus the ADR 041 estimator
     // decoupling (see `wire_cache_policies`).
@@ -758,7 +746,6 @@ async fn build_infra(
 /// referenced by [`run`] after the serve call returns.
 struct ServeInputs {
     ep: Endpoint,
-    probe_handler: Arc<ProbeHandler>,
     client_handler: Arc<ClientHandler>,
     dht_handler: Arc<DhtHandler>,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
@@ -779,13 +766,12 @@ async fn serve_until_shutdown(
 ) -> anyhow::Result<(Router, ShutdownSignal)> {
     let ServeInputs {
         ep,
-        probe_handler,
         client_handler,
         dht_handler,
         blacklist_ready_rx,
     } = serve_in;
 
-    // No Probe, Client, or DHT ALPN is registered before the mandatory first
+    // No Client or DHT ALPN is registered before the mandatory first
     // global + operator-region blacklist enumeration and enforcement pass
     // succeeds. That pass runs inline in `build_chain_and_handlers`, before the
     // admin listener binds, and has always resolved by the time control
@@ -796,7 +782,6 @@ async fn serve_until_shutdown(
     // rather than ever serving un-vetted content.
     let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
         Router::builder(ep.clone())
-            .accept(ProbeHandler::ALPN, probe_handler)
             .accept(ClientProtocol::ALPN, ClientProtocol::new(client_handler))
             .accept(DhtHandler::ALPN, dht_handler)
             .spawn()
@@ -858,9 +843,7 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     poller: crate::chain_events::resumable_watcher::WatcherHandle,
     slash_store: crate::slash_watcher::SlashStore,
     node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>>,
-    probe_rate_limiter: Arc<ProbeRateLimiter>,
     serve_rate_limiter: Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>,
-    probe_handler: Arc<ProbeHandler>,
     dht_rate_limiter: Arc<DhtRateLimiter>,
     record_store: Arc<std::sync::Mutex<RecordStore>>,
     origin_directory: Arc<dyn crate::dht::origin::OriginDirectory>,
@@ -940,7 +923,7 @@ fn chain_poller_builder(
 
 /// Middle phase of [`run`] (#1253): parse the chain contract addresses and
 /// EIP-712 domains, bootstrap the `CapacityBond` registry / slash / origin
-/// watchers, and construct the probe, client, and DHT handlers plus the
+/// watchers, and construct the client and DHT handlers plus the
 /// seller-side [`PoolSettlementService`]. Borrows [`Infra`]; the buyer-side
 /// provider/store construction and the background tasks belong to
 /// `spawn_background_tasks`. Returns [`ChainHandlers`], whose seller-wallet provider `P` [`run`]
@@ -951,7 +934,7 @@ async fn build_chain_and_handlers(
     reload_state: &RuntimeReloadState,
     infra: &Infra,
 ) -> anyhow::Result<ChainHandlers<impl Provider + Clone + 'static>> {
-    // SlashJudge EIP-712 domain for probe `slash_sig` (ADR 014 §1–2). Parsed
+    // SlashJudge EIP-712 domain for stream `slash_sig` (ADR 014 §1–2). Parsed
     // through the shared zero-address guard (#1219) for a uniform "every daemon
     // contract address is non-zero" invariant. `resolve_blockchain` already
     // rejects a zero or malformed `slash_judge_address` at config load, so here
@@ -968,9 +951,7 @@ async fn build_chain_and_handlers(
     // budget below): an
     // empty set silently rejects every inbound `Store`, and once the
     // iterative `FindValue` lookup filter exists it would drop every
-    // responder. Built here (ahead of the probe handler) so the probe
-    // handler can consult it for stake-lane probe-acceptance (#757); the
-    // DHT handler below shares the same `Arc`.
+    // responder. The DHT handler below shares the same `Arc`.
     let rpc_url: HttpUrl = cfg.blockchain.rpc_url.parse().with_context(|| {
         format!(
             "blockchain.rpc_url {:?} is not a valid URL",
@@ -1101,42 +1082,6 @@ async fn build_chain_and_handlers(
             None
         };
 
-    // Stake-lane probe-acceptance reservation (#757, ADR 003 §Admission and
-    // Priority). Strictly operator opt-in: a policy is built only for a
-    // non-zero `cache.stake_lane_reserved_holds` (the `NonZeroUsize` gate
-    // makes the "off" case unrepresentable in `StakeLanePolicy`), so the
-    // default single-lane node passes `None` and the probe handler's hot
-    // path is unchanged. A reservation paired with disabled holds
-    // (`max_probe_holds == 0`) can never fire — surface that misconfig as a
-    // warning and leave the lane off rather than wire a dead per-probe lookup.
-    let stake_lane_policy =
-        NonZeroUsize::new(cfg.cache.stake_lane_reserved_holds).and_then(|reserved| {
-            if cfg.cache.max_probe_holds == 0 {
-                tracing::warn!(
-                    reserved_holds = reserved.get(),
-                    "cache.stake_lane_reserved_holds is set but cache.max_probe_holds=0; \
-                     the stake-lane reservation has no effect (probe holds are disabled)"
-                );
-                None
-            } else {
-                Some(ProbeStakeLanePolicy::new(
-                    Arc::clone(&staker_set),
-                    reserved,
-                    cfg.cache.max_probe_holds,
-                ))
-            }
-        });
-
-    // ADR 005 §Probe rate limiting two-layer token-bucket limiter for
-    // `cdn/probe/v1`. Built from `[probe.rate_limit]` and run *in addition* to
-    // the shared `ConnectionLimiter` (see `probe_rate_limit` module docs); the
-    // per-peer (NodeId) layer it adds is the gap #982 closed.
-    // `from_resolved` rather than `new`: both limiter configs are aliases of
-    // the same struct, so passing `&cfg.dht` here would compile (#1457).
-    let probe_rate_limiter = Arc::new(ProbeRateLimiter::from_resolved(
-        &cfg.probe,
-        Arc::clone(&infra.node_metrics),
-    ));
     // `cdn/client/v1` per-request limiter, from `[serve.rate_limit]` (ADR 005
     // §Request rate limiting). Checked once per stream before the request is
     // read, in addition to the `ConnectionLimiter` and the stream cap.
@@ -1149,7 +1094,7 @@ async fn build_chain_and_handlers(
 
     // Chain-read liveness (ADR 011 §Serving while chain-stale). One handle,
     // stamped by the blacklist watcher (boot enumeration + every successful poll
-    // tick) and read by the probe and serve paths, which refuse once the node
+    // tick) and read by the serve path, which refuses once the node
     // has been unable to reach the chain for longer than the grace window. This
     // runtime path always wires the blacklist watcher — `content_blacklist_address`
     // is mandatory at node config resolution — so the gate is always live here;
@@ -1157,20 +1102,6 @@ async fn build_chain_and_handlers(
     // handler with no chain.
     let chain_freshness = crate::chain_freshness::ChainFreshness::new(Duration::from_secs(
         cfg.blockchain.chain_staleness_grace_sec,
-    ));
-
-    let probe_handler = Arc::new(ProbeHandler::new(
-        infra.secret_key.public(),
-        cfg.payment.rate_per_mb,
-        Arc::clone(&infra.node_metrics),
-        Arc::clone(&infra.limiter),
-        Arc::clone(&probe_rate_limiter),
-        infra.cache.clone(),
-        Arc::clone(&infra.eth_signer),
-        slash_domain.clone(),
-        stake_lane_policy,
-        cfg.cache.relay_foreign_namespaces,
-        Some(chain_freshness.clone()),
     ));
 
     // `cdn/dht/v1` handler (ADR 022 / #320): serves FindNode, FindValue, and
@@ -1564,7 +1495,7 @@ async fn build_chain_and_handlers(
     // replaying logs, then follows the live tail seeded at that block. It evicts
     // held blobs whose hash is blacklisted in scope for this operator, which
     // cascades to DHT-announce suppression (the republisher's `is_evicted` gate),
-    // probe `has_blob:false`, and delivery refusal — the node's only local
+    // open refusal, and delivery refusal — the node's only local
     // protection against the slash for serving blacklisted content.
     // `blacklist_ready_rx` gates the ALPN router below on that first enumeration.
     // The route carries a shutdown-token-observing sink factory (its re-scope
@@ -1667,9 +1598,7 @@ async fn build_chain_and_handlers(
         poller,
         slash_store,
         node_address_resolver,
-        probe_rate_limiter,
         serve_rate_limiter,
-        probe_handler,
         dht_rate_limiter,
         record_store,
         origin_directory,
@@ -1707,7 +1636,6 @@ struct Background {
     record_store_gc_stop_tx: oneshot::Sender<()>,
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
-    probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     serve_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     reputation_evict_stop_tx: oneshot::Sender<()>,
     republish_stop: CancellationToken,
@@ -1850,7 +1778,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // protection — the iroh-blobs GC sweep is what actually reclaims disk.
         // With the sweep disabled the ceiling is unenforceable, and the symptom
         // (a cache pinned at 100% while the driver reports work) points at
-        // pinning/probe-holds rather than at the real cause. Say so at boot.
+        // pinning or in-use holds rather than at the real cause. Say so at boot.
         if cfg.cache.gc_interval_sec == 0 {
             tracing::warn!(
                 cache_size_mb = cfg.cache.cache_size_mb,
@@ -1913,28 +1841,14 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         )
     };
 
-    // Probe rate-limiter keyspace GC (#982) — same DoS-shape rationale and panic
-    // contract as the DHT GC above, for the `cdn/probe/v1` per-peer keyed map.
-    let probe_rate_limit_gc_stop_tx = {
-        let limiter = Arc::clone(&ch.probe_rate_limiter);
-        spawn_periodic(
-            &mut tasks,
-            "probe_rate_limit_gc",
-            PROBE_RATE_LIMIT_GC_INTERVAL,
-            move || {
-                log_keyspace_gc("probe", limiter.gc_per_peer());
-            },
-        )
-    };
-
-    // `cdn/client/v1` request-limiter keyspace GC, same shape as the probe GC
+    // `cdn/client/v1` request-limiter keyspace GC, same shape as the DHT GC
     // above, for the serve per-peer keyed map.
     let serve_rate_limit_gc_stop_tx = {
         let limiter = Arc::clone(&ch.serve_rate_limiter);
         spawn_periodic(
             &mut tasks,
             "serve_rate_limit_gc",
-            PROBE_RATE_LIMIT_GC_INTERVAL,
+            SERVE_RATE_LIMIT_GC_INTERVAL,
             move || {
                 log_keyspace_gc("serve", limiter.gc_per_peer());
             },
@@ -2278,7 +2192,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     attestations: attestations_c,
                     // FIND_VALUE directory reads: the last-resort fallback when
                     // the DHT returns no providers, and the supplement when a
-                    // ranged pull's probed holders do not span the blob (ADR 022
+                    // ranged pull's discovered holders do not span the blob (ADR 022
                     // §FIND_VALUE Flow; #912, #2195). Shares the single origin
                     // directory built above with the reactive pull-through gate,
                     // so a configured `ChainOriginDirectory` backs both reads for
@@ -2291,7 +2205,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     slash_domain: node_origin_slash_domain,
                     bind_domain: node_origin_bind_domain,
                     local_rep: local_reputation_c,
-                    negative_cache: crate::dht::NegativeProbeCache::new(),
+                    negative_cache: crate::dht::NegativeCandidateCache::new(),
                     candidate_cache: crate::dht::CandidateCache::new(),
                     metrics: node_metrics_for_origin,
                     registry_regions: registry_regions_c,
@@ -2474,7 +2388,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         record_store_gc_stop_tx,
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
-        probe_rate_limit_gc_stop_tx,
         serve_rate_limit_gc_stop_tx,
         reputation_evict_stop_tx,
         republish_stop,
@@ -2578,7 +2491,6 @@ pub async fn run(
         &bg.drain_trigger,
         ServeInputs {
             ep: infra.ep,
-            probe_handler: ch.probe_handler,
             client_handler: ch.client_handler,
             dht_handler: ch.dht_handler,
             blacklist_ready_rx: ch.blacklist_ready_rx,
@@ -2594,7 +2506,6 @@ pub async fn run(
         record_store_gc_stop_tx: bg.record_store_gc_stop_tx,
         eviction_stop_tx: bg.eviction_stop_tx,
         dht_rate_limit_gc_stop_tx: bg.dht_rate_limit_gc_stop_tx,
-        probe_rate_limit_gc_stop_tx: bg.probe_rate_limit_gc_stop_tx,
         serve_rate_limit_gc_stop_tx: bg.serve_rate_limit_gc_stop_tx,
         reputation_evict_stop_tx: bg.reputation_evict_stop_tx,
         republish_stop: bg.republish_stop,
@@ -2629,7 +2540,6 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     record_store_gc_stop_tx: oneshot::Sender<()>,
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
-    probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     serve_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     reputation_evict_stop_tx: oneshot::Sender<()>,
     republish_stop: CancellationToken,
@@ -2717,7 +2627,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
         record_store_gc_stop_tx,
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
-        probe_rate_limit_gc_stop_tx,
         serve_rate_limit_gc_stop_tx,
         reputation_evict_stop_tx,
         republish_stop,
@@ -2767,7 +2676,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // The task also drains via `JoinSet::join_next` below.
     let _ = eviction_stop_tx.send(());
     let _ = dht_rate_limit_gc_stop_tx.send(());
-    let _ = probe_rate_limit_gc_stop_tx.send(());
     let _ = serve_rate_limit_gc_stop_tx.send(());
     // Best-effort, same rationale as the GC sweeps above: the reputation
     // evict tick exits on this stop signal (or a panic, which surfaces
@@ -2838,7 +2746,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     //
     // *After* `router.shutdown` deliberately, and the capacity-bond route is why:
     // its projection is the cached active-staker set, which gates DHT `Store`
-    // admission and decides which probes the stake-lane reservation sheds.
+    // admission.
     // Cancelling it before the drain would freeze that set while the router is
     // still serving, so a membership change landing mid-drain would be missed by
     // exactly the requests still in flight. This binding constraint forces the
@@ -3502,10 +3410,8 @@ async fn build_cache(
     )
     .await
     .context("failed to open cache engine")?;
-    // `cache.*` is restart-required (not hot-reloaded), so applying the
-    // probe-hold budget once here is sufficient (ADR 005 §Hold budget, #318).
-    engine.set_max_probe_holds(cfg.cache.max_probe_holds);
-    // One origin read on the range-pull path (an outboard fetch or one data
+    // `cache.*` is restart-required (not hot-reloaded), so the settings below
+    // apply once here. One origin read on the range-pull path (an outboard fetch or one data
     // window) gets the streaming stage's throughput floor: the stall window as a
     // head start, plus the read size at the minimum throughput. The budget
     // scales with the read, so it never caps the blob size, and a stuck origin
@@ -3514,7 +3420,7 @@ async fn build_cache(
         std::time::Duration::from_secs(cfg.cache.node_pull_stall_window_sec),
         cfg.cache.node_pull_min_throughput_bps,
     );
-    // Live-origin probe memo (#1130 pt3) — likewise restart-configured once.
+    // Live-origin probe memo (#1130 pt3) — restart-configured once.
     engine.set_origin_probe_config(decdn_cache::origin_probe::OriginProbePolicy {
         positive_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
         negative_ttl: std::time::Duration::from_secs(cfg.cache.origin_probe_negative_ttl_sec),

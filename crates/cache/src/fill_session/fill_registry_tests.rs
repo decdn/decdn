@@ -599,7 +599,7 @@ fn last_observer_leaving_cancels_and_removes() {
 #[test]
 fn claim_ahead_of_a_live_owners_paid_frontier_owns_its_own_span() {
     // A whole-blob owner whose client has paid nothing (a header-only open,
-    // such as the CLI's multi-source size probe) has its paid frontier at 0.
+    // such as a discovery open) has its paid frontier at 0.
     // A request that starts at 4 groups is AHEAD of that frontier: attaching would park it on a pull that only
     // advances as the owner pays, and the owner never will. It must OWN its
     // own span instead. Both sessions stay live under the hash.

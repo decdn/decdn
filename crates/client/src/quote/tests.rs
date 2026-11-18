@@ -237,7 +237,7 @@ fn size_hint_is_the_nearest_holders() {
 fn tally_sorts_outcomes_by_hash() {
     let hashes = [[1; 32], [2; 32]];
     let holder = OpenOutcome::Holder(
-        discovery::Probed {
+        discovery::DiscoveredHolder {
             candidate: cand(1, 1),
             rtt_ms: 12.0,
             rate_per_mb: 17,

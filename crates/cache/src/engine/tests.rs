@@ -156,7 +156,7 @@ impl Origin for MultiStubOrigin {
 }
 
 /// Origin that answers `size()` (a `HEAD`/`HeadObject` stand-in) for one
-/// hash and COUNTS the calls, so a test can prove `origin_probe_size`
+/// hash and COUNTS the calls, so a test can prove `origin_probe_presence`
 /// memoises rather than re-probing the backend on every probe. An optional
 /// delay exercises the per-probe timeout.
 #[derive(Debug)]
@@ -304,18 +304,13 @@ async fn origin_probe_presence_transport_error_is_fault_not_absent() -> anyhow::
          the origin chain — a steady state re-probes once per fault TTL, \
          not once per request",
     );
-    assert_eq!(
-        engine.origin_probe_size(hash).await,
-        None,
-        "the thin size wrapper still folds Fault to None",
-    );
     Ok(())
 }
 
 /// A present remote object is discovered by a live `HEAD` and the answer is
 /// memoised: a second probe for the same hash issues NO further backend call.
 #[tokio::test]
-async fn origin_probe_size_hits_origin_then_memoises_positive() -> anyhow::Result<()> {
+async fn origin_probe_presence_hits_origin_then_memoises_positive() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let hash = Hash::new(b"remote object");
     let (origin, calls) = CountingSizeOrigin::new(hash, 4096);
@@ -323,14 +318,14 @@ async fn origin_probe_size_hits_origin_then_memoises_positive() -> anyhow::Resul
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
     assert_eq!(
-        engine.origin_probe_size(hash).await,
-        Some(4096),
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::Present(4096),
         "live HEAD finds it"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "one backend HEAD");
     assert_eq!(
-        engine.origin_probe_size(hash).await,
-        Some(4096),
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::Present(4096),
         "served from memo"
     );
     assert_eq!(
@@ -344,7 +339,7 @@ async fn origin_probe_size_hits_origin_then_memoises_positive() -> anyhow::Resul
 /// A 404 is memoised too — the whole point of the negative cache is that a
 /// random-hash probe flood does not re-`HeadObject` the origin every time.
 #[tokio::test]
-async fn origin_probe_size_memoises_absent() -> anyhow::Result<()> {
+async fn origin_probe_presence_memoises_absent() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let present = Hash::new(b"present");
     let absent = Hash::new(b"absent");
@@ -353,11 +348,15 @@ async fn origin_probe_size_memoises_absent() -> anyhow::Result<()> {
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
     assert_eq!(
-        engine.origin_probe_size(absent).await,
-        None,
+        engine.origin_probe_presence(absent).await,
+        OriginPresence::Absent,
         "not in origin"
     );
-    assert_eq!(engine.origin_probe_size(absent).await, None, "still absent");
+    assert_eq!(
+        engine.origin_probe_presence(absent).await,
+        OriginPresence::Absent,
+        "still absent"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "negative answer is cached");
     Ok(())
 }
@@ -365,7 +364,7 @@ async fn origin_probe_size_memoises_absent() -> anyhow::Result<()> {
 /// A refused (denied/blacklisted/evicted) hash is never advertised, and the
 /// guard short-circuits BEFORE any backend probe.
 #[tokio::test]
-async fn origin_probe_size_refused_never_probes() -> anyhow::Result<()> {
+async fn origin_probe_presence_refused_never_probes() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let hash = Hash::new(b"denied object");
     let (origin, calls) = CountingSizeOrigin::new(hash, 100);
@@ -374,41 +373,14 @@ async fn origin_probe_size_refused_never_probes() -> anyhow::Result<()> {
     engine.set_chain_denied_one(hash, true);
 
     assert_eq!(
-        engine.origin_probe_size(hash).await,
-        None,
+        engine.origin_probe_presence(hash).await,
+        OriginPresence::Absent,
         "refused stays hidden"
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
         "no HEAD for a refused hash"
-    );
-    Ok(())
-}
-
-/// A slow origin must not stall the probe: the live HEAD is bounded by
-/// `origin_probe_timeout_ms` and a timeout folds to `None` (safe — never
-/// slashable).
-#[tokio::test]
-async fn origin_probe_size_times_out_to_absent() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let hash = Hash::new(b"slow object");
-    let (origin, _calls) = CountingSizeOrigin::slow(hash, 100, Duration::from_millis(400));
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-    // Tight timeout so the 400 ms origin overruns it.
-    engine.set_origin_probe_config(OriginProbePolicy {
-        positive_ttl: Duration::from_secs(15),
-        negative_ttl: Duration::from_secs(2),
-        fault_ttl: Duration::from_secs(5),
-        timeout: Duration::from_millis(20),
-        capacity: 16,
-    });
-
-    assert_eq!(
-        engine.origin_probe_size(hash).await,
-        None,
-        "a HEAD slower than the ceiling folds to absent",
     );
     Ok(())
 }
@@ -482,33 +454,6 @@ async fn origin_probe_presence_distinguishes_present_absent_and_fault() -> anyho
         1,
         "the second probe served the cached fault instead of re-hitting \
          the backend (#1789 item 6)",
-    );
-    Ok(())
-}
-
-/// `origin_probe_size` stays a thin `Present -> Some`, `Absent`/`Fault ->
-/// None` wrapper (#1766): callers that only care about advertising size
-/// (probe `has_blob`, DHT announce) must not change behavior when a fault
-/// is now distinguishable one layer down.
-#[tokio::test]
-async fn origin_probe_size_folds_fault_to_none_like_absent() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let hash = Hash::new(b"slow object for size wrapper");
-    let (origin, _calls) = CountingSizeOrigin::slow(hash, 100, Duration::from_millis(400));
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-    engine.set_origin_probe_config(OriginProbePolicy {
-        positive_ttl: Duration::from_secs(15),
-        negative_ttl: Duration::from_secs(2),
-        fault_ttl: Duration::from_secs(5),
-        timeout: Duration::from_millis(20),
-        capacity: 16,
-    });
-
-    assert_eq!(
-        engine.origin_probe_size(hash).await,
-        None,
-        "a fault still folds to None through the size wrapper",
     );
     Ok(())
 }
@@ -634,7 +579,7 @@ async fn rescan_origins_indexes_fs_and_present_pins() -> anyhow::Result<()> {
     // A hash denied AFTER the last rescan must drop out of the *live* reads
     // immediately — the snapshot still lists it, but `refuses` is the
     // authority. This guards the #1130 blacklist-compliance interaction:
-    // without it the probe would sign has_blob:true for a just-blacklisted
+    // without it an open would answer `ok: true` for a just-blacklisted
     // blob (g_node_04). No rescan between the deny and the assertions.
     engine.set_denied(&crate::DeniedHashes::new(
         [from_store_hash(h1)].into_iter().collect(),
@@ -780,7 +725,7 @@ impl Origin for ThrottlableOrigin {
 
 /// A faulted size probe must not evict a hash from the origin-held index.
 ///
-/// The index is what probe and DHT-announce advertise. A transport fault is
+/// The index is what the serve path and DHT-announce advertise. A transport fault is
 /// not an authoritative absence, so dropping on one makes a throttle window
 /// the origin recovers from in seconds cost a whole rescan interval of
 /// announce coverage — with every downstream signal reporting success.
@@ -3529,173 +3474,11 @@ fn denied(hashes: &[Hash]) -> crate::DeniedHashes {
     crate::DeniedHashes::new(hashes.iter().map(|h| from_store_hash(*h)).collect())
 }
 
-// ---- Probe-triggered eviction hold (#318, ADR 005) ----
-
+/// An operator evict (DMCA takedown) wins over a live [`InUse`] guard: the
+/// hash stops being served at once, though the guard keeps it out of the LRU
+/// candidates until it drops.
 #[tokio::test]
-async fn try_probe_hold_unavailable_when_blob_absent() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
-    let absent = Hash::new(b"never fetched");
-    anyhow::ensure!(
-        engine.try_probe_hold(absent).await? == ProbeHoldOutcome::Unavailable,
-        "absent blob must not be holdable (an absent blob is never advertised)"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn try_probe_hold_true_when_cached_and_excluded_from_eviction() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"holdable blob";
-    let hash = Hash::new(payload);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    let _ = engine.get(hash).await?;
-
-    anyhow::ensure!(
-        engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held,
-        "cached blob should hold"
-    );
-    anyhow::ensure!(engine.probe_hold_slots_used() == 1, "one slot used");
-    anyhow::ensure!(
-        !engine
-            .eviction_candidates()
-            .into_inner()
-            .contains_key(&hash),
-        "held hash must be invisible to the LRU driver"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn probe_hold_is_shared_per_blob_not_per_probe() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"popular blob";
-    let hash = Hash::new(payload);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    let _ = engine.get(hash).await?;
-    engine.set_max_probe_holds(1);
-
-    // Many "peers" probing the same hash share one slot.
-    for _ in 0..3 {
-        anyhow::ensure!(engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held);
-    }
-    anyhow::ensure!(
-        engine.probe_hold_slots_used() == 1,
-        "shared per-blob slot must not grow with probe volume"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn probe_hold_budget_exhaustion_reports_exhausted() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let a: &[u8] = b"blob a";
-    let b: &[u8] = b"blob bee";
-    let (ha, hb) = (Hash::new(a), Hash::new(b));
-    // One engine, one multi-blob origin: opening a second engine on the
-    // same dir would deadlock on iroh-blobs' single-writer lock.
-    let origin = Arc::new(MultiStubOrigin::new(&[a, b]));
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 10).await?;
-    let _ = engine.get(ha).await?;
-    let _ = engine.get(hb).await?;
-    engine.set_max_probe_holds(1);
-
-    anyhow::ensure!(
-        engine.try_probe_hold(ha).await? == ProbeHoldOutcome::Held,
-        "first hold fits budget"
-    );
-    anyhow::ensure!(
-        engine.try_probe_hold(hb).await? == ProbeHoldOutcome::BudgetExhausted,
-        "second distinct hold must be refused when budget is exhausted"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn probe_hold_disabled_when_budget_zero() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"unhold me";
-    let hash = Hash::new(payload);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    let _ = engine.get(hash).await?;
-    engine.set_max_probe_holds(0);
-    // `max == 0` is an operator config decision (holds turned off), not
-    // budget pressure — it must report a cause distinct from
-    // `BudgetExhausted` (#739) so the "increase max_probe_holds" alert
-    // isn't tripped by an intentional disable.
-    anyhow::ensure!(
-        engine.try_probe_hold(hash).await? == ProbeHoldOutcome::HoldsDisabled,
-        "max_probe_holds=0 must disable has_blob:true entirely"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn runtime_disable_overrides_existing_probe_hold() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"held then disabled";
-    let hash = Hash::new(payload);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    let _ = engine.get(hash).await?;
-    engine.set_max_probe_holds(1);
-    anyhow::ensure!(
-        engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held,
-        "hold should be granted while the budget is positive"
-    );
-    // Lowering the budget to 0 while a hold is live must take effect
-    // immediately: a re-probe for the already-held blob must NOT refresh
-    // the hold and re-sign has_blob:true (#739). `max == 0` means "never
-    // sign has_blob:true", unconditionally.
-    engine.set_max_probe_holds(0);
-    anyhow::ensure!(
-        engine.try_probe_hold(hash).await? == ProbeHoldOutcome::HoldsDisabled,
-        "a runtime disable must override an existing live hold"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn absent_blob_is_unavailable_even_when_holds_disabled() -> anyhow::Result<()> {
-    // Precedence pin (#739): the `max == 0` early return must sit *after*
-    // the `has()` check, so an absent blob is a true negative
-    // (`Unavailable`), never a `HoldsDisabled` config-disable event. Guards
-    // against a future reorder that moves the cheap `max == 0` load above
-    // the store lookup and silently inflates
-    // `probe_hold_unavailable{reason="disabled"}` with
-    // probes for content the node never had.
-    let tmp = tempfile::tempdir()?;
-    let absent = Hash::new(b"never fetched");
-    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
-    engine.set_max_probe_holds(0);
-    anyhow::ensure!(
-        engine.try_probe_hold(absent).await? == ProbeHoldOutcome::Unavailable,
-        "absent blob must win over holds-disabled"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn operator_evict_overrides_probe_hold() -> anyhow::Result<()> {
+async fn operator_evict_wins_over_an_in_use_hold() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"dmca target";
     let hash = Hash::new(payload);
@@ -3706,58 +3489,16 @@ async fn operator_evict_overrides_probe_hold() -> anyhow::Result<()> {
     )
     .await?;
     let _ = engine.get(hash).await?;
-    anyhow::ensure!(
-        engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held,
-        "held before evict"
-    );
+    let hold = engine.hold_in_use(hash);
+    anyhow::ensure!(engine.has(hash).await?, "held before evict");
 
     engine.evict(hash).await?;
     anyhow::ensure!(
-        engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Unavailable,
-        "operator evict (DMCA) must win over a probe hold"
+        !engine.has(hash).await?,
+        "operator evict (DMCA) must win over an in-use hold"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn expired_probe_hold_is_swept_and_re_evictable() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"expiring blob";
-    let hash = Hash::new(payload);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    let _ = engine.get(hash).await?;
-    engine.observe_hit(hash); // make it an LRU candidate
-
-    // Inject an already-expired hold directly (the real 35s duration is
-    // impractical to sleep on a real clock).
-    {
-        let mut g = engine
-            .inner
-            .probe_holds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let past = tokio::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(tokio::time::Instant::now);
-        g.insert(hash, past);
-    }
-
-    anyhow::ensure!(
-        engine.probe_hold_slots_used() == 0,
-        "expired hold must be swept from the slot count"
-    );
-    anyhow::ensure!(
-        engine
-            .eviction_candidates()
-            .into_inner()
-            .contains_key(&hash),
-        "an expired hold must no longer shield the hash from LRU"
-    );
+    drop(hold);
+    anyhow::ensure!(!engine.is_in_use(hash));
     Ok(())
 }
 

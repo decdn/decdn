@@ -2,8 +2,8 @@
 //! `CapacityBond.getRegisteredNodes` so a client can pick a node instead of being
 //! handed an explicit `--node-id`/`--addr`/`--provider-address`. Read from
 //! `fetch::discover_provider` and from the discovery branch of
-//! `bundle_pull::bundle_pull`; the ranking half is also used by
-//! `fetch::probe_and_rank`. `decdn probe` deliberately still requires an
+//! `bundle_pull::bundle_pull`; the ranking half is also used by the target
+//! selection in `targets`. `decdn probe` deliberately still requires an
 //! explicit target.
 //!
 //! This is the **read + select** half, plus the peer store that backs it up.
@@ -688,9 +688,8 @@ pub fn admit_sources(ordered: Vec<NodeCandidate>, max_sources: usize) -> Vec<Nod
 
 /// A candidate that holds the blob, with its measured RTT and its quote.
 #[derive(Debug, Clone)]
-pub struct Probed {
-    /// The node that answered: a discovery open's `ok`, or a probe's
-    /// `has_blob = true`.
+pub struct DiscoveredHolder {
+    /// The node that answered a discovery open with `ok`.
     pub candidate: NodeCandidate,
     /// Round-trip time measured for the answer, in milliseconds.
     pub rtt_ms: f64,
@@ -703,22 +702,19 @@ pub struct Probed {
     /// Which discovery blocks this holder holds or can serve
     /// (`decdn_protocol::coverage`), taken from its answer's extension.
     /// Unsigned and outside `slash_sig`: a hint for the scheduler's segment
-    /// assignment, never a commitment. `has_blob:true` means "will serve at
-    /// least one block" (for every blob with a block), so this may be a
-    /// proper subset of the blob rather than the whole thing — a **partial
-    /// holder** is admitted here
-    /// exactly like a full one; nothing in this module treats the two
-    /// differently. The requester-side `has_blob`/`coverage.is_empty()`
-    /// consistency check (ADR 013 §Tier 1, `ProbeResponseExt::consistent_with`)
-    /// runs before a `Probed` is ever constructed, so a malformed pairing never
-    /// reaches this field. Empty here only for the empty root, which spans no
+    /// assignment, never a commitment. This may be a proper subset of the
+    /// blob rather than the whole thing — a **partial holder** is admitted
+    /// here exactly like a full one; nothing in this module treats the two
+    /// differently. The requester-side consistency check (ADR 013 §Tier 1,
+    /// `StreamResponseExt::consistent_with`) runs before a `DiscoveredHolder`
+    /// is ever constructed, so a malformed pairing never reaches this field. Empty here only for the empty root, which spans no
     /// block (#2471).
     pub coverage: Coverage,
 }
 
 /// A bonded non-holder the client has a measured RTT for, and could route a
 /// warming request through (ADR 037 § Candidate pool). Distinct from
-/// [`Probed`], which is a confirmed blob-holder.
+/// [`DiscoveredHolder`], which is a confirmed blob-holder.
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct WarmingCandidate {
@@ -727,15 +723,15 @@ pub struct WarmingCandidate {
     /// Its Ethereum address — the `--provider-address` a warming lane pays
     /// and the `slash_sig` is verified against.
     pub eth_address: Address,
-    /// Measured round-trip time in milliseconds, from the **live `cdn/probe/v1`
-    /// probe issued for this request**.
+    /// Measured round-trip time in milliseconds, from the **live discovery
+    /// open issued for this request**.
     ///
     /// The persisted peer knowledge base (ADR 037 § RTT source,
     /// `decdn_client::peer_store`) does not track which peers hold which
     /// blobs, only identity, latency, and price — it cannot tell a non-holder
     /// from a holder for this hash. So this warming candidate pool still comes
-    /// only from nodes this request actually probed (`has_blob: false`
-    /// responses), not from the full peer store minus holders.
+    /// only from nodes this request actually opened (`NotFound` answers),
+    /// not from the full peer store minus holders.
     pub rtt_ms: f64,
     /// The candidate's registry-published, packed `multiaddrs` field, carried
     /// from its [`NodeCandidate`] so a warming lane dials the proxy directly

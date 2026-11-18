@@ -1055,7 +1055,7 @@ impl PeerEvent {
 /// A late answer that joins the running fetch.
 pub(crate) enum LateJoin {
     /// A verified holder.
-    Holder(crate::discovery::Probed),
+    Holder(crate::discovery::DiscoveredHolder),
     /// A verified non-holder the warming rule picks as a proxy.
     Proxy(crate::discovery::WarmingCandidate),
 }

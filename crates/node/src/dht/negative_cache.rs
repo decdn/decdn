@@ -12,9 +12,9 @@
 //!   suppression structure, not slashing evidence.
 //!
 //! The DHT iterative lookup ([`super::lookup`]) consumes
-//! [`NegativeProbeCache::contains_active`] as the third ADR 022
+//! [`NegativeCandidateCache::contains_active`] as the third ADR 022
 //! §Lookup-integrity filter on `FindValueResponse.providers`.
-//! [`NegativeProbeCache::record_failure`] is the producer-side hook
+//! [`NegativeCandidateCache::record_failure`] is the producer-side hook
 //! for the node's outbound discovery opens.
 
 use std::sync::Mutex;
@@ -51,24 +51,24 @@ struct Inner {
     /// Hard cap on live entries. Clamped to ≥ 1 in the constructor.
     cap: usize,
     /// TTL applied to each entry on insert. Anchored at insertion
-    /// (NOT refreshed on read) — see [`NegativeProbeCache::contains_active`].
+    /// (NOT refreshed on read) — see [`NegativeCandidateCache::contains_active`].
     ttl: Duration,
 }
 
 /// Bounded LRU cache of `(NodeId, hash)` pairs that answered `NotFound`
 /// within the TTL window.
 #[derive(Debug)]
-pub struct NegativeProbeCache {
+pub struct NegativeCandidateCache {
     inner: Mutex<Inner>,
 }
 
-impl Default for NegativeProbeCache {
+impl Default for NegativeCandidateCache {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl NegativeProbeCache {
+impl NegativeCandidateCache {
     /// Build a cache with the ADR 001 §Candidate cache defaults (1024
     /// entries, 5-minute TTL).
     #[must_use]
@@ -210,7 +210,7 @@ impl NegativeProbeCache {
         match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => {
-                warn!("NegativeProbeCache mutex poisoned; recovering inner state");
+                warn!("NegativeCandidateCache mutex poisoned; recovering inner state");
                 poisoned.into_inner()
             }
         }

@@ -99,7 +99,7 @@ async fn frame_roundtrip() -> Result<(), FrameError> {
     let mut buf = Vec::new();
     write_frame(&mut buf, &payload).await?;
     let mut cursor = std::io::Cursor::new(buf);
-    let got = read_frame(&mut cursor, crate::MAX_PROBE_FRAME).await?;
+    let got = read_frame(&mut cursor, crate::MAX_CLIENT_CONTROL_FRAME).await?;
     assert_eq!(got, payload);
     Ok(())
 }
@@ -126,7 +126,7 @@ async fn frame_short_read_errors() -> Result<(), FrameError> {
     write_varint_u32(&mut buf, 10).await?;
     buf.extend_from_slice(b"abc");
     let mut cursor = std::io::Cursor::new(buf);
-    let r = read_frame(&mut cursor, crate::MAX_PROBE_FRAME).await;
+    let r = read_frame(&mut cursor, crate::MAX_CLIENT_CONTROL_FRAME).await;
     assert_matches!(r, Err(FrameError::Io(_)));
     Ok(())
 }
@@ -170,10 +170,10 @@ async fn empty_payload_encodes_single_zero_byte() -> Result<(), FrameError> {
 
 #[tokio::test]
 async fn decode_message_rejects_garbage() {
-    use crate::ProbeMessage;
-    // Discriminant 99 has no matching `ProbeMessage` variant → Decode error.
+    use crate::ClientMessage;
+    // Discriminant 99 has no matching `ClientMessage` variant → Decode error.
     let garbage = [99u8, 0, 0, 0];
-    let r = decode_message::<ProbeMessage>(&garbage);
+    let r = decode_message::<ClientMessage>(&garbage);
     assert_matches!(r, Err(FrameError::Decode(_)), "expected FrameError::Decode");
 }
 
@@ -245,59 +245,4 @@ fn unknown_variant_false_for_malformed_leading_varint() {
     // fault → stays MALFORMED (classifier returns false).
     assert!(!is_unknown_variant::<TwoVariant>(&[]));
     assert!(!is_unknown_variant::<TwoVariant>(&[0x80u8]));
-}
-
-#[tokio::test]
-async fn probe_message_full_stack_roundtrip() -> Result<(), FrameError> {
-    use crate::ProbeMessage;
-    use crate::message::{ProbeRequest, ProbeResponse, ProbeResponseBody};
-
-    let req = ProbeMessage::Request(ProbeRequest {
-        hash: [5u8; 32],
-        timestamp_us: 0xfeed_face,
-    });
-    let resp = ProbeMessage::Response(ProbeResponse {
-        body: ProbeResponseBody {
-            hash: [5u8; 32],
-            has_blob: true,
-            rate_per_mb: 7,
-            timestamp_us: 0xfeed_face,
-        },
-        slash_sig: vec![0x3u8; crate::SLASH_SIG_LEN],
-    });
-
-    for msg in [req, resp.clone()] {
-        let payload = encode_message(&msg)?;
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &payload).await?;
-        let mut cursor = std::io::Cursor::new(buf);
-        let frame = read_frame(&mut cursor, crate::MAX_PROBE_FRAME).await?;
-        let (decoded, tail) = decode_message::<ProbeMessage>(&frame)?;
-        assert_eq!(decoded, msg);
-        assert!(tail.is_empty(), "no extension bytes expected");
-    }
-
-    // The same round trip carrying a Tier-1 extension: the framing layer is
-    // agnostic to it, so the base still decodes and the remainder is the ext
-    // — which is the property the two-phase pattern rests on end to end.
-    let ext = crate::message::ProbeResponseExt {
-        coverage: crate::Coverage::empty(),
-        size_proof: crate::SizeProof::new(1_700_000, vec![0x5A; 64 * 11 + 1000]).ok(),
-    };
-    let ProbeMessage::Response(body) = &resp else {
-        unreachable!("resp is a Response")
-    };
-    let payload = crate::message::encode_probe_response(body, Some(&ext))?;
-    let mut buf = Vec::new();
-    write_frame(&mut buf, &payload).await?;
-    let mut cursor = std::io::Cursor::new(buf);
-    let frame = read_frame(&mut cursor, crate::MAX_PROBE_FRAME).await?;
-    let (decoded, tail) = decode_message::<ProbeMessage>(&frame)?;
-    assert_eq!(decoded, resp);
-    assert!(!tail.is_empty(), "extension bytes expected");
-    assert_eq!(
-        crate::message::parse_probe_response_ext(tail).map_err(FrameError::from)?,
-        ext
-    );
-    Ok(())
 }

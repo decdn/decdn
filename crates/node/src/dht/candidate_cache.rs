@@ -168,7 +168,7 @@ impl CandidateCache {
     ///
     /// Production code uses [`Self::new`]; this is the test / tuning seam, for
     /// the same reason
-    /// [`super::negative_cache::NegativeProbeCache::with_capacity_and_ttl`] is:
+    /// [`super::negative_cache::NegativeCandidateCache::with_capacity_and_ttl`] is:
     /// the TTL is anchored on [`Instant`], so `tokio::time` pause / advance has
     /// no effect on it, and 30 s of wall clock per assertion is not a test suite.
     /// `cap` is clamped to ≥ 1.
@@ -284,7 +284,7 @@ impl CandidateCache {
     }
 
     /// Poison-tolerant lock acquisition — see
-    /// [`super::negative_cache::NegativeProbeCache`] for why we recover rather
+    /// [`super::negative_cache::NegativeCandidateCache`] for why we recover rather
     /// than propagate.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         match self.inner.lock() {

@@ -64,9 +64,9 @@ impl std::error::Error for UpstreamRateLimited {}
 /// as a dead peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamTimestampRejected {
-    /// The reason label from the `CONNECTION_CLOSE` frame (`cdn/probe/v1`
-    /// mirrors the stream code there), lossily decoded. `None` when the
-    /// refusal was a `RESET_STREAM`, which carries no reason bytes.
+    /// The reason label from a `CONNECTION_CLOSE` frame that carries the
+    /// code, lossily decoded. `None` for a `RESET_STREAM`, the shape the
+    /// `cdn/client/v1` skew gate sends, which carries no reason bytes.
     pub label: Option<String>,
 }
 
@@ -87,7 +87,7 @@ impl std::error::Error for UpstreamTimestampRejected {}
 /// three shapes a shed reaches the requester in:
 ///
 /// - `ConnectionError::ApplicationClosed` with the rate-limit code — the close
-///   the dispatch limiter and the probe limiter send, surfacing from `connect`,
+///   the dispatch limiter sends, surfacing from `connect`,
 ///   `open_bi`, or as the `ConnectionLost` cause of a stream read/write.
 /// - `ReadError::Reset` / `WriteError::Stopped` with the rate-limit code — the
 ///   per-connection stream-cap reset.
@@ -142,8 +142,7 @@ fn app_code_refusal(err: &(dyn std::error::Error + 'static), code: u32) -> Optio
 /// reaches the requester in:
 ///
 /// - `ConnectionError::ApplicationClosed` with the code — the close the
-///   dispatch limiter, the probe limiter and the probe skew gate send,
-///   surfacing from `connect`, `open_bi`, or as the `ConnectionLost` cause of
+///   dispatch limiter sends, surfacing from `connect`, `open_bi`, or as the `ConnectionLost` cause of
 ///   a stream read/write.
 /// - `ReadError::Reset` / `WriteError::Stopped` with the code — the
 ///   per-connection stream-cap reset and the stream skew gate's reset.

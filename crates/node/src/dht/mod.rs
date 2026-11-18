@@ -35,7 +35,7 @@ pub use candidate_cache::{CachedCandidate, CandidateCache, DISCOVERY_ANSWER_TTL}
 pub use chain_origin_directory::ChainOriginDirectory;
 pub use chain_staker_set::ChainStakerSet;
 pub use lookup::{Lookup, LookupConfig, find_providers};
-pub use negative_cache::NegativeProbeCache;
+pub use negative_cache::NegativeCandidateCache;
 pub use node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, StaticNodeAddressDirectory,
 };

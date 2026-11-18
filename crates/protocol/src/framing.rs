@@ -12,8 +12,8 @@
 //!
 //! Every read names its own ceiling, sized to the largest legitimate message
 //! that can arrive at that read (ADR 013 § Wire Framing). The ceilings live
-//! beside the messages they bound: [`crate::message::MAX_PROBE_FRAME`],
-//! [`crate::client::MAX_CLIENT_CONTROL_FRAME`], [`crate::client::MAX_CHUNK_FRAME`]
+//! beside the messages they bound: [`crate::client::MAX_CLIENT_CONTROL_FRAME`],
+//! [`crate::client::MAX_STREAM_RESPONSE_FRAME`], [`crate::client::MAX_CHUNK_FRAME`]
 //! and [`crate::dht::MAX_DHT_FRAME`]. There is no global ceiling, so no read can
 //! fall back to a bound far above what its ALPN carries.
 
@@ -61,8 +61,8 @@ pub fn decode_message<M: DeserializeOwned>(frame: &[u8]) -> Result<(M, &[u8]), F
     Ok(postcard::take_from_bytes::<M>(frame)?)
 }
 
-/// A top-level ALPN protocol enum (one per ALPN — [`crate::ProbeMessage`],
-/// [`crate::ClientMessage`], [`crate::DhtMessage`]). Serialized as the
+/// A top-level ALPN protocol enum (one per ALPN — [`crate::ClientMessage`],
+/// [`crate::DhtMessage`]). Serialized as the
 /// outermost postcard value in a frame, so its variant discriminant is the
 /// frame's leading varint.
 ///

@@ -8294,8 +8294,8 @@ async fn spawn_handler_server_with_deny(
 /// refused even though the node still physically holds the bytes.
 ///
 /// Two properties in one test. `CacheEngine::refuses` makes the blob report
-/// absent everywhere (defence in depth — this is what also suppresses the probe
-/// `has_blob` signature and DHT republish), while the serve gate above the
+/// absent everywhere (defence in depth — this is what also suppresses an open's
+/// `ok` and DHT republish), while the serve gate above the
 /// availability check is what turns that into a `Declined` with its own
 /// metric rather than a `NotFound`.
 ///
@@ -11534,11 +11534,9 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
 /// A serve miss on a hash the node **advertises as origin-held** answers with a
 /// signed `StreamResponse{ok: false}` rather than dropping the stream.
 ///
-/// A fail-silent gate (#1130) would suppress this path. A signed
-/// `has_blob: true` probe plus a signed `ok: false` stream is not
-/// phantom-announcement evidence: the refusal is inert (rate manipulation
-/// requires `ok == true`, blacklist violation requires a served claim — ADR
-/// 014), so the accountable answer is to sign it. Dropping instead costs the
+/// A fail-silent gate (#1130) would suppress this path. A signed `ok: false`
+/// stream is inert as evidence (blacklist violation requires a served claim —
+/// ADR 014), so the accountable answer is to sign it. Dropping instead costs the
 /// requester a full open-stage timeout.
 ///
 /// The setup is the [`unbound_client_fetch_is_refused_on_origin_only_blob`]
@@ -11550,8 +11548,8 @@ async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow
     let payload = vec![0x3Cu8; 32 * 1024];
     let (cache, hash, _cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
-    // Populate the origin-held index: the node now advertises this hash on
-    // probe (`has_blob: true`) even though the store has never held it.
+    // Populate the origin-held index: the node now advertises this hash even
+    // though the store has never held it.
     cache.rescan_origins().await;
     anyhow::ensure!(
         cache.origin_held_size(hash) == Some(payload.len() as u64),

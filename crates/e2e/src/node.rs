@@ -195,8 +195,8 @@ impl NodeFixture {
     /// Rewrite `payment.rate_per_mb` in the daemon's config and restart the daemon
     /// so the new rate takes effect, returning the newly-configured rate.
     ///
-    /// `payment.rate_per_mb` is restart-required — the probe and client handlers
-    /// read it as a value fixed at startup — so repricing a running node means
+    /// `payment.rate_per_mb` is restart-required — the client handler reads it
+    /// as a value fixed at startup — so repricing a running node means
     /// rewriting the config and bouncing the process ([`Self::restart`]). The
     /// captured probe (before) and stream (after) form the bait-and-switch pair a
     /// `SlashJudge` rate challenge punishes (#1042); the judge sees two
@@ -205,9 +205,9 @@ impl NodeFixture {
     ///
     /// The returned value is the configured rate this call wrote. The rate the node
     /// signs is clamped into the on-chain `[floor, ceiling]` band per response
-    /// (`handlers::client::wire::clamped_rate`, and its probe twin), so a caller
-    /// that needs `stream > probe` asserts on the `rate_per_mb` inside the captured
-    /// `StreamResponse`/`ProbeResponse` — the signed bytes that become evidence.
+    /// (`handlers::client::wire::clamped_rate`), so a caller that needs a raised
+    /// rate asserts on the `rate_per_mb` inside the captured `StreamResponse` —
+    /// the signed bytes that become evidence.
     pub async fn set_rate_per_mb(&self, rate: u64) -> anyhow::Result<u64> {
         let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
         let rewritten = rewrite_rate_per_mb(&config, rate)?;

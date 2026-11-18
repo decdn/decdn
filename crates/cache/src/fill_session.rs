@@ -1591,8 +1591,8 @@ impl FillRegistry {
                     // starts AHEAD of that frontier would park on it too, and an
                     // observer's payments extend a fill's paid prefix only once the
                     // prefix reaches the observer's start (`extend_served_from`).
-                    // With the owner not paying — a header-only open (the CLI's
-                    // multi-source size probe), or a stalled client — the
+                    // With the owner not paying — a header-only open (a
+                    // discovery open), or a stalled client — the
                     // observer starves until its own stall
                     // budget expires. So such a request is not coalesced: it OWNS
                     // its own span, and the two fills coexist under the hash. A

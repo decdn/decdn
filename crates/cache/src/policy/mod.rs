@@ -1,6 +1,6 @@
 //! Pluggable cache admission and eviction policy traits (ADR 040).
 //!
-//! The engine owns the store and every safety exemption (pins, probe-holds,
+//! The engine owns the store and every safety exemption (pins, in-use holds,
 //! deny/takedown). A policy is a pure decision function fed observations: it
 //! ranks eligible candidates or classifies an admission, and never reaches
 //! into the store.
@@ -50,7 +50,7 @@ pub trait AdmissionPolicy: Send + Sync + std::fmt::Debug {
 
 /// Everything a policy needs to plan one eviction sweep. The engine assembles
 /// it and never interprets the policy's semantics — `candidates` is already
-/// stripped of pins and probe-holds (a deny-listed hash stays a candidate even
+/// stripped of pins and in-use holds (a deny-listed hash stays a candidate even
 /// when pinned: deny wins over pin), and `segments` is the generic
 /// `hash -> Segment` membership the engine tracks with no meaning attached.
 #[derive(Debug)]
@@ -87,7 +87,7 @@ pub trait EvictionPolicy: Send + Sync + std::fmt::Debug {
     /// The one sweep-time decision: what leaves, what graduates. A policy that
     /// ranks by frequency reads the shared [`FrequencyEstimator`] directly — the
     /// engine feeds that estimator on every serve. `candidates` is already
-    /// stripped of pins and probe-holds by the engine; a deny-listed hash stays
+    /// stripped of pins and in-use holds by the engine; a deny-listed hash stays
     /// a candidate even when pinned (deny wins over pin).
     fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan;
 }

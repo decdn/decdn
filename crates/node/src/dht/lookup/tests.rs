@@ -57,7 +57,7 @@ fn filter_active_stakers_drops_non_staked() {
 
 #[test]
 fn filter_negative_cache_drops_only_active_pairs_for_target() {
-    let cache = NegativeProbeCache::new();
+    let cache = NegativeCandidateCache::new();
     let target = h(0xAA);
     cache.record_failure(nid(1), target);
     cache.record_failure(nid(2), h(0xBB)); // different target → no effect
@@ -171,7 +171,7 @@ fn fold_response_negative_cache_does_not_drop_closer_nodes() {
     let staked: StdHashSet<NodeId> = [nid(0x05), nid(0x10), nid(0x20)].into_iter().collect();
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
 
-    let cache = NegativeProbeCache::new();
+    let cache = NegativeCandidateCache::new();
     // Both 0x05 and 0x10 are flagged negative for `target`.
     cache.record_failure(nid(0x05), target);
     cache.record_failure(nid(0x10), target);
@@ -215,7 +215,7 @@ fn fold_response_drops_unattested_providers_and_keeps_their_origins() {
         nid(0xFF),
         LookupConfig::default(),
     );
-    let cache = NegativeProbeCache::new();
+    let cache = NegativeCandidateCache::new();
     cache.record_failure(nid(0x03), target);
 
     let unattested = decdn_protocol::dht::Provider {
@@ -256,7 +256,7 @@ fn fold_response_records_providers_even_when_no_closer_node() {
 
     let staked: StdHashSet<NodeId> = [nid(0x05), nid(0x07)].into_iter().collect();
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
-    let cache = NegativeProbeCache::new();
+    let cache = NegativeCandidateCache::new();
 
     // Responder at 0x05 returns provider 0x07 and a closer_node
     // 0x07 that is NOT strictly closer than the responder
@@ -308,7 +308,7 @@ fn fold_response_all_filters_compose() {
 
     // (nid(0x10), target) flagged negative — should drop from
     // providers but NOT from closer_nodes.
-    let cache = NegativeProbeCache::new();
+    let cache = NegativeCandidateCache::new();
     cache.record_failure(nid(0x10), target);
 
     let resp = decdn_protocol::dht::FindValueResponse {

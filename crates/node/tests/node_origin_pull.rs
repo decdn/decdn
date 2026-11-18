@@ -43,7 +43,7 @@ use decdn_node::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
-    CachedCandidate, CandidateCache, ConfigStakerSet, NegativeProbeCache, NodeAddressResolver,
+    CachedCandidate, CandidateCache, ConfigStakerSet, NegativeCandidateCache, NodeAddressResolver,
     OriginDirectory, StakerSet, StaticNodeAddressDirectory, StaticOriginDirectory,
 };
 use decdn_node::handlers::timestamp_skew::now_us;
@@ -623,7 +623,7 @@ async fn build_origin_with_timeout(
         pull_timeout,
         stall_timeout,
         max_blob_size_bytes,
-        NegativeProbeCache::new(),
+        NegativeCandidateCache::new(),
     )
     .await
 }
@@ -650,7 +650,7 @@ async fn build_origin_with_negative_cache(
     pull_timeout: Duration,
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
-    negative_cache: NegativeProbeCache,
+    negative_cache: NegativeCandidateCache,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     build_origin_with_discovery_caches(
         ep_b,
@@ -693,7 +693,7 @@ async fn build_origin_with_discovery_caches(
     pull_timeout: Duration,
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
-    negative_cache: NegativeProbeCache,
+    negative_cache: NegativeCandidateCache,
     candidate_cache: CandidateCache,
     // Namespace the directory keys the provider set under. Buffered/generic callers
     // pass `U256::ZERO` (the generic `Origin::fetch` path looks the directory up
@@ -771,7 +771,7 @@ async fn build_origin_with_discovery(
     pull_timeout: Duration,
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
-    negative_cache: NegativeProbeCache,
+    negative_cache: NegativeCandidateCache,
     candidate_cache: CandidateCache,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let FixtureDiscovery {
@@ -933,7 +933,7 @@ async fn build_origin_seeded_ranking(
         pull_timeout,
         stall_timeout,
         0,
-        NegativeProbeCache::new(),
+        NegativeCandidateCache::new(),
         candidate_cache,
         U256::ZERO,
     )
@@ -992,7 +992,7 @@ async fn build_origin_multi_hash(
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
-        negative_cache: NegativeProbeCache::new(),
+        negative_cache: NegativeCandidateCache::new(),
         candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -1607,7 +1607,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
-        negative_cache: NegativeProbeCache::new(),
+        negative_cache: NegativeCandidateCache::new(),
         candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(&b_metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -5752,7 +5752,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-        NegativeProbeCache::with_capacity_and_ttl(16, TINY_CACHE_TTL),
+        NegativeCandidateCache::with_capacity_and_ttl(16, TINY_CACHE_TTL),
     )
     .await;
 
@@ -6197,7 +6197,7 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         DEFAULT_TEST_PULL_DEADLINES.0,
         DEFAULT_TEST_PULL_DEADLINES.1,
         0,
-        NegativeProbeCache::new(),
+        NegativeCandidateCache::new(),
         CandidateCache::new(),
     )
     .await;
@@ -10883,7 +10883,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
-        negative_cache: NegativeProbeCache::new(),
+        negative_cache: NegativeCandidateCache::new(),
         candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(&b_metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -11210,7 +11210,7 @@ async fn a_fetch_past_the_ttl_opens_again() -> Result<()> {
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-        NegativeProbeCache::new(),
+        NegativeCandidateCache::new(),
         CandidateCache::with_capacity_and_ttl(16, Duration::from_millis(300)),
         // Buffered `Origin::fetch` path — directory keyed under `NO_NAMESPACE`.
         U256::ZERO,
@@ -11366,7 +11366,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-        NegativeProbeCache::with_capacity_and_ttl(64, Duration::ZERO),
+        NegativeCandidateCache::with_capacity_and_ttl(64, Duration::ZERO),
     )
     .await;
 
@@ -11531,7 +11531,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-        NegativeProbeCache::with_capacity_and_ttl(64, Duration::ZERO),
+        NegativeCandidateCache::with_capacity_and_ttl(64, Duration::ZERO),
     )
     .await;
 
@@ -12400,7 +12400,7 @@ async fn a_candidate_cache_hit_drops_a_provider_no_longer_admitted() -> Result<(
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
-        negative_cache: NegativeProbeCache::new(),
+        negative_cache: NegativeCandidateCache::new(),
         candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(&b_metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -13115,7 +13115,7 @@ async fn top_up_fixture_multi_rep(
         DEFAULT_TEST_PULL_DEADLINES.0,
         DEFAULT_TEST_PULL_DEADLINES.1,
         total_bytes.saturating_mul(4),
-        NegativeProbeCache::new(),
+        NegativeCandidateCache::new(),
         CandidateCache::new(),
         U256::ZERO,
     )
@@ -13960,7 +13960,7 @@ async fn build_origin_economics(
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
-        negative_cache: NegativeProbeCache::new(),
+        negative_cache: NegativeCandidateCache::new(),
         candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -14986,7 +14986,7 @@ async fn build_serving_node(
         DEFAULT_TEST_PULL_DEADLINES.0,
         DEFAULT_TEST_PULL_DEADLINES.1,
         0, // max_blob_size_bytes: 0 = unlimited; these tests do not exercise the size ceiling
-        NegativeProbeCache::new(),
+        NegativeCandidateCache::new(),
         candidate_cache,
     )
     .await;

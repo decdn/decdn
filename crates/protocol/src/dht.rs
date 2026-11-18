@@ -42,7 +42,7 @@
 //! [`MAX_DHT_FRAME`], but the per-field caps stop peers from forcing the
 //! responder to allocate thousands of 32-byte `NodeId`s (or tens of thousands
 //! of booleans) inside one frame.
-//! Pattern mirrors `ProbeResponseBody::rate_per_mb`.
+//! Pattern mirrors `StreamResponseBody::rate_per_mb`.
 
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
@@ -283,11 +283,11 @@ pub struct FindValueRequest {
 ///
 /// `coverage` is unsigned and responder-controlled, like the rest of a DHT
 /// record — see the module docs' authentication-model note. A lying
-/// responder can only ever cost the requester a wasted probe against a
+/// responder can only ever cost the requester a wasted open against a
 /// provider that turns out not to hold what it claimed; it cannot forge a
 /// record for a `node` it doesn't control (the STORE-time `holder ==
 /// authenticated NodeId` check still applies). The requester verifies
-/// `attestation` itself before it probes `node`.
+/// `attestation` itself before it opens a stream to `node`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provider {
     /// The holder's `NodeId`.
@@ -527,7 +527,7 @@ pub struct BatchStoreAck {
 
 // --- Bounded-Vec deserialization hooks (see module docs).
 //
-// Pattern follows `ProbeResponseBody::rate_per_mb`'s field-level
+// Pattern follows `StreamResponseBody::rate_per_mb`'s field-level
 // `deserialize_with` so the postcard positional layout stays
 // derive-driven — no mirror struct, no `Deserialize` impl drift risk.
 

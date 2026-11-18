@@ -746,7 +746,7 @@ fn node_key(seed: u8) -> PublicKey {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn holder(seed: u8, rtt_ms: f64) -> discovery::Probed {
+fn holder(seed: u8, rtt_ms: f64) -> discovery::DiscoveredHolder {
     super::tests_support::holder(seed, rtt_ms)
 }
 
@@ -842,7 +842,7 @@ fn failover_order_no_qualifying_proxy_is_holders_only() {
 /// origin-only with zero cache holders, so an empty holder set is the normal
 /// first-fetch state, not a terminal error. The fallback is independent of
 /// proxy warming — here warming is off — and reports no lead, size, or
-/// holder coverage, since nothing answered `has_blob`.
+/// holder coverage, since nothing answered `ok`.
 #[test]
 fn failover_order_empty_holders_falls_back_to_non_holders_by_rtt() {
     let non_holders = vec![

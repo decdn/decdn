@@ -14,9 +14,8 @@
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
 //!     signed body fields `{hash, ok, rate_per_mb, timestamp_us}` (ADR 014
-//!     §1), produced by the stream-response slash signer in `decdn_incentive`
-//!     (analogous to its `ProbeSlashData`). The outcome (the size proof or
-//!     the refusal class) is unsigned.
+//!     §1), produced by the stream-response slash signer in `decdn_incentive`.
+//!     The outcome (the size proof or the refusal class) is unsigned.
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
 //!     carries `{signature, amount}` and the receiver reconstructs the full typed
 //!     data `{poolId, signer, provider, amount, bytesDelivered}` from stream
@@ -462,9 +461,8 @@ pub struct StreamResponse {
     /// Signed body. Its wire layout is frozen per ADR 013.
     pub body: StreamResponseBody,
     /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 014 §1;
-    /// produced by the `decdn_incentive` stream slash signer, analogous to its
-    /// `ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`] bytes — *not* a
-    /// signature over postcard bytes.
+    /// produced by the `decdn_incentive` stream slash signer). Always exactly
+    /// [`SLASH_SIG_LEN`] bytes — *not* a signature over postcard bytes.
     pub slash_sig: Vec<u8>,
 }
 
@@ -735,8 +733,9 @@ impl StreamResponse {
                 rate: self.body.rate_per_mb,
             });
         }
-        // #252: requesters MUST reject a zero rate on receive — same rule as
-        // ProbeResponse. Shared `RateIsZero` so both paths fail identically.
+        // #252: requesters MUST reject a zero rate on receive. The decode hook
+        // only bounds the upper end; zero is a legitimate `u64` the wire
+        // accepts but a requester must not.
         if self.body.rate_per_mb == 0 {
             return Err(MessageValidationError::RateIsZero);
         }

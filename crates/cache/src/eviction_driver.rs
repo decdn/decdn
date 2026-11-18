@@ -193,7 +193,7 @@ const fn reconcile(state: &mut DriverState, raw: u64) -> u64 {
 ///
 /// Emits `evictions_starved` when there is nothing left to evict while still
 /// over target — either because the candidate set is empty (everything pinned,
-/// operator-evicted, or probe-held, or the open-time recency seed failed so
+/// operator-evicted, or in use, or the open-time recency seed failed so
 /// blobs from before the restart are not candidates; see
 /// `decdn_cache_recency_seed_failures_total`) or because a whole pass released
 /// nothing.

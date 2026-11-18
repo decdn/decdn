@@ -267,16 +267,18 @@ async fn run_rotation() -> anyhow::Result<()> {
     // ---- 6. The retired key cannot serve; the new one can. iroh authenticates
     // the peer key during the handshake, so dialing the old id at the same
     // socket does not reach whoever is listening — it fails to connect.
-    let probe = client
-        .probe_node_id(live_id, node.bind_port(), hash)
+    let opened = client
+        .discovery_open_at(&chain, &node, live_id, hash)
         .await?;
+    let served = opened.served();
+    opened.cancel();
     assert!(
-        probe.body.has_blob,
+        served,
         "the rotated node must still serve the blob it held under its old identity"
     );
     assert!(
         client
-            .probe_node_id(old_node_id, node.bind_port(), hash)
+            .discovery_open_at(&chain, &node, old_node_id, hash)
             .await
             .is_err(),
         "the retired node id must no longer be reachable at this socket"
@@ -475,9 +477,8 @@ async fn run_unbound() -> anyhow::Result<()> {
     );
 
     // ---- 5. The repaired node serves under the key it is now bound to.
-    let probe = client_probe(&chain, &node, hash).await?;
     assert!(
-        probe.body.has_blob,
+        client_open_served(&chain, &node, hash).await?,
         "the repaired node must serve normally under its now-bound identity"
     );
 
@@ -737,16 +738,20 @@ async fn run_eth_cli_raw(node: &NodeFixture, extra: &[&str]) -> anyhow::Result<O
     run_node_cli_raw(node, &args).await
 }
 
-/// Probe `node` at its live identity through a throwaway client.
-async fn client_probe(
+/// Whether `node`, at its live identity, answers a discovery open of `hash`
+/// from a throwaway client with `ok`.
+async fn client_open_served(
     chain: &ChainFixture,
     node: &NodeFixture,
     hash: decdn_cache::Hash,
-) -> anyhow::Result<decdn_protocol::ProbeResponse> {
+) -> anyhow::Result<bool> {
     let client = ClientFixture::new(chain).await?;
-    client
-        .probe_node_id(node.current_node_id().await?, node.bind_port(), hash)
-        .await
+    let opened = client
+        .discovery_open_at(chain, node, node.current_node_id().await?, hash)
+        .await?;
+    let served = opened.served();
+    opened.cancel();
+    Ok(served)
 }
 
 /// Run `decdn node <args…>` against the fixture's config + keystore, asserting

@@ -488,7 +488,7 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     }
 
     /// Enumerate the hashes this origin currently holds, so a node can
-    /// advertise them (probe `has_blob` / DHT announce) *before* any
+    /// advertise them (open answers / DHT announce) *before* any
     /// pull-through — closing the "cold origin blob is undiscoverable until
     /// first pulled" gap (#1130).
     ///

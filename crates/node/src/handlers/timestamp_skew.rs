@@ -1,13 +1,12 @@
 //! Bound on the requester-generated `timestamp_us` a handler accepts.
 //!
-//! Every signed response body ([`decdn_protocol::ProbeResponseBody`],
-//! [`decdn_protocol::client::StreamResponseBody`]) echoes the request's
-//! `timestamp_us` into the EIP-712 slash-evidence set (ADR 014 §1), and
-//! `SlashJudge` reads that field as the serve time: it pairs evidence inside a
-//! window keyed on it, applies blacklist effective-time comparisons to it, and
-//! rejects evidence stamped more than 60 seconds ahead of block time. A node
+//! The signed response body ([`decdn_protocol::client::StreamResponseBody`])
+//! echoes the request's `timestamp_us` into the EIP-712 slash-evidence set
+//! (ADR 014 §1), and `SlashJudge` reads that field as the serve time: it
+//! pairs evidence inside a window keyed on it, applies blacklist
+//! effective-time comparisons to it, and rejects evidence stamped more than 60 seconds ahead of block time. A node
 //! that signs whatever timestamp a requester chose therefore attests to a
-//! serve time of the requester's choosing. Both handlers refuse a skewed
+//! serve time of the requester's choosing. The client handler refuses a skewed
 //! request before anything is signed, so every `slash_sig` this node emits
 //! carries a timestamp consistent with its clock at admission. A long serve
 //! only ages the admitted timestamp: the window tiers and the closing response
@@ -71,7 +70,7 @@ pub fn now_us() -> u64 {
                     error = %err,
                     suppressed,
                     "wall-clock before UNIX_EPOCH; request timestamps read against 0, so \
-                     every inbound probe/stream request will be refused for clock skew. Set \
+                     every inbound stream request will be refused for clock skew. Set \
                      the host clock."
                 );
             }

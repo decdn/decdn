@@ -6,17 +6,16 @@
 //! projection that only advances while the chain watchers can reach the RPC.
 //! During an RPC outage each of those guards silently passes on stale data: a
 //! takedown, a drained pool, or a spent capability that landed on-chain during
-//! the blind window is invisible, so the node keeps signing serve and probe
-//! responses it can no longer vouch for. Serving a hash past its compliance
-//! window is slashable (ADR 011 § Slashing), and the offense is exactly a signed
-//! `StreamResponse{ok:true}` or `ProbeResponse{has_blob:true}` — the node
-//! produces its own evidence.
+//! the blind window is invisible, so the node keeps signing serve responses it
+//! can no longer vouch for. Serving a hash past its compliance window is
+//! slashable (ADR 011 § Slashing), and the offense is exactly a signed
+//! `StreamResponse{ok:true}` — the node produces its own evidence.
 //!
 //! [`ChainFreshness`] is the single backstop over that whole family: it holds
 //! the wall-clock time of the blacklist watcher's last successful poll tick and
 //! answers one question — has the node been unable to reach the chain for longer
-//! than the operator's grace window? While it has, the serve and probe paths
-//! refuse rather than sign. The signal is the *successful tick*, not the last
+//! than the operator's grace window? While it has, the serve path refuses
+//! rather than sign. The signal is the *successful tick*, not the last
 //! event: a quiet chain produces no blacklist events for hours legitimately, and
 //! keying on events would take every node dark on any quiet stretch. The tick
 //! stamps on every successful poll including idle ones (the same liveness the
@@ -55,7 +54,7 @@ fn live_secs() -> u64 {
 }
 
 /// Shared liveness of the node's chain reads. Cloned into the blacklist watcher
-/// (which stamps it) and the serve and probe handlers (which read it); every
+/// (which stamps it) and the serve handler (which reads it); every
 /// clone shares one cell.
 #[derive(Clone, Debug)]
 pub struct ChainFreshness {
@@ -63,7 +62,7 @@ pub struct ChainFreshness {
     /// enumeration). `0` means "never stamped", which reads as stale.
     last_ok_secs: Arc<AtomicU64>,
     /// How long the node may go without a successful chain read before the serve
-    /// and probe paths refuse. Always evaluated; a large value is how an operator
+    /// path refuses. Always evaluated; a large value is how an operator
     /// opts out.
     grace_secs: u64,
 }

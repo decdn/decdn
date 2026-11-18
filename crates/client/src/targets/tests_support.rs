@@ -10,8 +10,8 @@ pub(crate) fn node_key(seed: u8) -> PublicKey {
 
 /// A verified holder of the whole blob at `rtt_ms`, quoting 1 per MiB, paid at the address
 /// `seed` repeated.
-pub(crate) fn holder(seed: u8, rtt_ms: f64) -> discovery::Probed {
-    discovery::Probed {
+pub(crate) fn holder(seed: u8, rtt_ms: f64) -> discovery::DiscoveredHolder {
+    discovery::DiscoveredHolder {
         candidate: NodeCandidate {
             node_id: node_key(seed),
             eth_address: Address::repeat_byte(seed),

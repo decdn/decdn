@@ -1,43 +1,15 @@
-//! Wire message payload types for deCDN ALPN protocols.
+//! Items every signed wire message shares: the rate bound, the `slash_sig`
+//! length, the validation errors, and the empty-blob root.
 //!
-//! Every ALPN defines a top-level enum (e.g. [`ProbeMessage`]) whose variants
-//! wrap the per-message structs. The enum is serialized as the outermost
-//! postcard value inside a length-prefixed frame (see [`crate::framing`]).
-//!
-//! # Signed-field freezing (ADR 013 §Signed Field Freezing)
-//!
-//! [`ProbeResponse`] is exactly a signed [`ProbeResponseBody`] plus its
-//! `slash_sig`; every unsigned field trails in [`ProbeResponseExt`], encoded
-//! separately and decoded two-phase (ADR 013 §Tier 1). Unlike an Ed25519
-//! signature over postcard bytes, `slash_sig` is **not** computed over a
-//! postcard serialization: it is an EIP-712
-//! secp256k1 signature over the *typed-data hash of the body fields*
-//! `{hash, has_blob, rate_per_mb, timestamp_us}`, exactly as defined in ADR
-//! 014 §EIP-712 Type Definitions and implemented in
-//! `decdn_incentive::ProbeSlashData`. There is intentionally no
-//! `signing_bytes()` helper here — postcard bytes are *not* the signing
-//! input, and exposing one would invite incompatible verifier
-//! implementations. The `#[serde(deserialize_with)]` validation on
-//! `rate_per_mb` lives on the body field so the protocol-boundary bound on
-//! [`MAX_RATE_PER_MB`] continues to apply (issue #378).
-//!
-//! This establishes the `cdn/probe/v1` signed baseline — it is **not** an
-//! ALPN bump. ADR 013 freezes a signed field set at the protocol version that
-//! introduces it; `cdn/probe/v1` had no prior signed `ProbeResponse`, so the
-//! set `{hash, has_blob, rate_per_mb, timestamp_us}` is the v1 baseline (ADR
-//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` and its `size_proof` ride
-//! in [`ProbeResponseExt`] as ADR 013 Tier-1 unsigned extension fields (ADR
-//! 005 §`cdn/probe/v1`) and are NOT covered by `slash_sig`: the proof, not a
-//! signature, makes the size a fact.
-//!
-//! This crate deliberately does not depend on any crypto library. The caller
-//! (`decdn_incentive::ProbeSlashData` and the probe handler/CLI) computes and
-//! verifies the EIP-712 `slash_sig`.
+//! The per-ALPN message types live in [`crate::client`] and [`crate::dht`].
+//! This crate holds no cryptography: the caller (`decdn_incentive`) computes
+//! and verifies every EIP-712 `slash_sig`.
 
+use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde::{Deserialize, Serialize};
 
-/// Maximum permitted value for [`ProbeResponseBody::rate_per_mb`] (issue #378).
+/// Maximum permitted value for a signed `rate_per_mb`, such as
+/// [`crate::StreamResponseBody::rate_per_mb`] (issue #378).
 ///
 /// 1000 µUSDC/MB (USDC at 6 decimals: ~$1/GB), a realistic ceiling about 100×
 /// market price (~10 µUSDC/MB ≈ $0.01/GB). It bounds two things at once. It is
@@ -55,28 +27,6 @@ use serde::{Deserialize, Serialize};
 /// defense-in-depth — the bound is the protocol-boundary check, not a
 /// substitute for safe math.
 pub const MAX_RATE_PER_MB: u64 = 1000;
-
-/// Frame ceiling for the [`ProbeResponse`] a requester reads on
-/// `cdn/probe/v1`, in payload bytes (ADR 013 § Wire Framing). A node reads
-/// requests against [`MAX_PROBE_REQUEST_FRAME`].
-///
-/// The largest legitimate
-/// message is a [`ProbeResponse`] with its [`ProbeResponseExt`] at full width:
-/// 4,807 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap
-/// and its 2-byte length) and the size proof up to 4,493 (its `Some` tag, a
-/// 10-byte varint size, and a [`crate::MAX_SIZE_PROOF_BYTES`] proof with its
-/// 2-byte length). A [`ProbeRequest`] is at most 43 bytes. The ceiling leaves headroom
-/// for Tier-1 extension fields and refuses a larger frame before the reader
-/// buffers it. The `probe_frame_ceiling_holds_the_largest_message` test pins
-/// the margin.
-pub const MAX_PROBE_FRAME: u32 = 8 * 1024;
-
-/// Frame ceiling for the [`ProbeRequest`] a node reads, in payload bytes (ADR
-/// 013 § Wire Framing). A request is at most 43 bytes; the ceiling leaves
-/// headroom for Tier-1 fields and keeps the node's per-probe read buffer
-/// small. The `probe_frame_ceiling_holds_the_largest_message` test pins the
-/// margin.
-pub const MAX_PROBE_REQUEST_FRAME: u32 = 1024;
 
 /// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
 ///
@@ -96,11 +46,11 @@ pub const SLASH_SIG_LEN: usize = 65;
 /// Errors produced when validating wire-decoded protocol messages.
 ///
 /// `RateTooLarge` surfaces from the [`Deserialize`] impl on
-/// [`ProbeResponseBody`] (postcard wraps it as [`postcard::Error`] which the
-/// framing layer maps to [`crate::FrameError::Decode`]).
+/// [`crate::StreamResponseBody`] (postcard wraps it as [`postcard::Error`]
+/// which the framing layer maps to [`crate::FrameError::Decode`]).
 /// `InvalidSlashSigLen` is a requester-side obligation enforced via
-/// [`ProbeResponse::validate`] — it is intentionally NOT enforced at decode
-/// time so the handler can build the response before signing it.
+/// [`crate::StreamResponse::validate`] — it is intentionally NOT enforced at
+/// decode time so the handler can build the response before signing it.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MessageValidationError {
     /// `rate_per_mb` exceeds [`MAX_RATE_PER_MB`].
@@ -114,12 +64,12 @@ pub enum MessageValidationError {
     /// while earning the node nothing — an obvious misconfiguration. Nodes
     /// reject it at config resolution; requesters MUST also reject it on
     /// receive (#252, ADR 005 §Rate bounds validation). Enforced via
-    /// [`ProbeResponse::validate`] / `StreamResponse::validate`, not at decode
-    /// time, so a handler can still build a response before signing it.
+    /// [`crate::StreamResponse::validate`], not at decode time, so a handler
+    /// can still build a response before signing it.
     #[error("rate_per_mb is zero (requesters must reject; #252)")]
     RateIsZero,
     /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 014 §1
-    /// mandates a non-empty signature on every `ProbeResponse`; the
+    /// mandates a non-empty signature on every signed response; the
     /// EOA-only off-chain signing path (ADR 024 §Off-Chain Signature
     /// Verification — EOA Recovery Only) makes that exactly [`SLASH_SIG_LEN`],
     /// which requesters MUST reject deviations from.
@@ -205,249 +155,21 @@ pub enum MessageValidationError {
     EmptyCapabilitySignature,
 }
 
-/// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per
-/// ADR 013 — new variants MUST be appended at the end.
-///
-/// ⚠️ **VARIANT ORDER FROZEN — ADR 013 §Protocol Enums**
-/// Postcard encodes each variant as its declaration-order index. Reordering,
-/// inserting, or removing a variant is a wire-breaking change requiring an
-/// ALPN version bump (`cdn/probe/v2`). The discriminant assignments are
-/// locked in by the tests `probe_message_request_discriminant_is_zero` and
-/// `probe_message_response_discriminant_is_one` — if you change this enum,
-/// those tests will fail and tell you why.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProbeMessage {
-    /// discriminant 0 — asserted by `probe_message_request_discriminant_is_zero`
-    Request(ProbeRequest),
-    /// discriminant 1 — asserted by `probe_message_response_discriminant_is_one`
-    Response(ProbeResponse),
-}
-
-impl crate::framing::TopLevelEnum for ProbeMessage {
-    /// `Request` (0), `Response` (1). Pinned by
-    /// `probe_message_variant_count_matches_discriminants`.
-    const VARIANT_COUNT: u32 = 2;
-}
-
-/// Client → node request on `cdn/probe/v1` (ADR 005 §`cdn/probe/v1`).
-///
-/// A probe is unauthenticated and unpaid: it asks a candidate node whether it
-/// holds `hash` and at what rate it will serve it, so the client can rank
-/// candidates on both availability and price in a single round-trip.
-/// `timestamp_us` is a requester-generated microsecond timestamp echoed back
-/// in [`ProbeResponseBody::timestamp_us`]; it serves both response
-/// correlation and RTT measurement (RTT = `receive_time` − `timestamp_us`)
-/// and is
-/// part of the EIP-712 signed set so the slashing window can be computed
-/// on-chain from a single requester clock (ADR 014 §1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProbeRequest {
-    /// BLAKE3 hash of the blob being queried (iroh `Hash`, 32 bytes).
-    pub hash: [u8; 32],
-    /// Requester-generated microseconds since Unix epoch, echoed back. Read
-    /// from the requester's current wall clock. It must lie within 30 seconds
-    /// of the node's clock, or the node refuses the probe with
-    /// [`crate::APP_ERR_TIMESTAMP_SKEW`].
-    pub timestamp_us: u64,
-}
-
-/// Node → client response on `cdn/probe/v1` (ADR 005 §`cdn/probe/v1`).
-///
-/// **This struct holds only the frozen base** (ADR 013 §Tier 1): the signed
-/// [`ProbeResponseBody`] and the `slash_sig` covering it. Unsigned fields live
-/// in [`ProbeResponseExt`], which travels as separate trailing bytes — see
-/// [`encode_probe_response`] / [`parse_probe_response_ext`].
-///
-/// The split is what keeps a future unsigned field out of Tier 3. Postcard is
-/// positional and fills no defaults for absent trailing fields, so an
-/// `Option<T>` appended to *this* struct would fail to decode against an older
-/// sender that never wrote it; appended to the separately-decoded extension it
-/// costs no coordination at all.
-///
-/// `slash_sig` is mandatory and non-empty on the wire; requesters MUST reject
-/// missing/zero-length signatures (enforced via [`ProbeResponse::validate`] and
-/// the requester's [`SLASH_SIG_LEN`] check).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProbeResponse {
-    /// Signed body. Its wire layout is frozen per ADR 013.
-    pub body: ProbeResponseBody,
-    /// EIP-712 secp256k1 signature over the typed-data hash of `body`'s
-    /// fields `{hash, has_blob, rate_per_mb, timestamp_us}` (ADR 014 §1; see
-    /// `decdn_incentive::ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`]
-    /// bytes — *not* a signature over postcard bytes. The verify path
-    /// rejects any other length.
-    pub slash_sig: Vec<u8>,
-}
-
-/// Optional [`ProbeResponse`] extension fields, carried as trailing bytes after
-/// the `ProbeResponse` message via the two-phase pattern (ADR 013 §Tier 1; see
-/// [`encode_probe_response`] / [`parse_probe_response_ext`]).
-///
-/// Nothing here is covered by `slash_sig`. `coverage` is a hint: nothing may
-/// let it decide a payment, a slash, or anything a lying node profits from.
-/// `total_bytes` is a fact once its `size_proof` verifies against the hash,
-/// and nothing before that.
-///
-/// New fields are appended to the END of this struct and MUST be `Option<T>` or
-/// have a meaningful `Default`. Insertions and reordering are Tier-3.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ProbeResponseExt {
-    /// Which discovery blocks (`decdn_protocol::coverage`) this node will
-    /// serve. Unsigned: treat it as a hint, never as a commitment. A
-    /// requester MUST check it against the signed body (`hash` and
-    /// `has_blob`) with [`ProbeResponseExt::consistent_with`] and drop a
-    /// response where they disagree rather than trust either field alone.
-    pub coverage: crate::Coverage,
-    /// The blob's size and its proof under the signed `hash` (ADR 005 §
-    /// Bounded byte ranges): the only way a probe answer states a size, so a
-    /// requester can price the blob before it opens a payment pool. A
-    /// requester verifies the proof before it uses the size, and drops a
-    /// response whose proof does not verify.
-    pub size_proof: Option<crate::SizeProof>,
-}
-
 /// The BLAKE3 hash of zero bytes: the root of the empty blob.
 ///
 /// The empty blob spans zero discovery blocks, so it is the one hash whose
 /// coverage is empty on every honest holder. For it,
-/// [`ProbeResponseExt::consistent_with`] only requires an empty coverage, and
-/// the requester reads `has_blob` alone to learn whether the node serves it.
+/// [`crate::StreamResponseExt::consistent_with`] only requires an empty
+/// coverage, and the requester reads `ok` alone to learn whether the node
+/// serves it.
 pub const EMPTY_ROOT: [u8; 32] = [
     0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc, 0xc9, 0x49,
     0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca, 0xe4, 0x1f, 0x32, 0x62,
 ];
 
-impl ProbeResponseExt {
-    /// Does this ext's `coverage` agree with the signed `body` (ADR 013 §Tier
-    /// 1; ADR 022 § Consistency rule; #1506)?
-    ///
-    /// For every blob but the empty one, `body.has_blob` and
-    /// `coverage.is_empty()` are a biconditional by construction: the probe
-    /// handler derives `has_blob` FROM `coverage`, never the other way round,
-    /// so any disagreement means a malformed or dishonest response.
-    ///
-    /// The empty blob ([`EMPTY_ROOT`]) spans zero blocks, so its coverage is
-    /// empty on a holder and a non-holder alike. For that hash the coverage
-    /// must be empty and `has_blob` alone says whether the node serves it
-    /// (#2471). The rule keys on `body.hash`, which the signature covers,
-    /// never on `total_bytes`.
-    ///
-    /// Neither `coverage` nor `total_bytes` is in the signed set, so a mismatch
-    /// has no attributable author to slash: a requester finding `false` here
-    /// MUST drop the candidate rather than admit it, and must NOT score it to
-    /// local reputation — the same treatment an unrecovered `slash_sig` gets.
-    #[must_use]
-    pub fn consistent_with(&self, body: &ProbeResponseBody) -> bool {
-        if body.hash == EMPTY_ROOT {
-            self.coverage.is_empty()
-        } else {
-            body.has_blob != self.coverage.is_empty()
-        }
-    }
-}
-
-/// Signed fields of a [`ProbeResponse`]. Layout is frozen per ADR 013 — future
-/// additions go on [`ProbeResponse`] as optional unsigned fields, not here.
-///
-/// `rate_per_mb` is bounded by [`MAX_RATE_PER_MB`] at the wire boundary — the
-/// field-level `deserialize_rate_per_mb` hook rejects oversize values so a
-/// malicious node cannot poison the client selection score with an
-/// overflow-inducing rate (issue #378). Server-side construction is
-/// unconstrained at the type level; the node's config layer
-/// (`resolve_payment`) enforces the same ceiling at startup and on hot
-/// reload, keeping the bound bilateral.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProbeResponseBody {
-    /// BLAKE3 hash this response answers for, echoed from the request.
-    pub hash: [u8; 32],
-    /// Whether the node currently holds the blob and will serve it. A node
-    /// MUST NOT sign `true` unless it can guarantee delivery within the
-    /// slashing window (ADR 005 §Probe-triggered eviction hold).
-    pub has_blob: bool,
-    /// The node's current quoted rate in payment-token base units per MB. The
-    /// token is USDC, fixed at contract deployment (ADR 003), so the wire
-    /// carries no token identifier and the units need no normalization.
-    /// Bounded by [`MAX_RATE_PER_MB`].
-    #[serde(deserialize_with = "deserialize_rate_per_mb")]
-    pub rate_per_mb: u64,
-    /// The requester-generated microsecond timestamp from the corresponding
-    /// [`ProbeRequest`], echoed back unchanged.
-    pub timestamp_us: u64,
-}
-
-/// Encode a [`ProbeResponse`] with its optional trailing [`ProbeResponseExt`]
-/// (ADR 013 §Tier 1, two-phase).
-///
-/// The base message and the extension are encoded as two adjacent postcard
-/// values in one frame. Encoding them separately is what makes a future field
-/// appended to [`ProbeResponseExt`] invisible to an older receiver, which stops
-/// consuming at the end of the base and discards the rest.
-///
-/// # Errors
-///
-/// Propagates a [`postcard::Error`] if serialization fails.
-pub fn encode_probe_response(
-    resp: &ProbeResponse,
-    ext: Option<&ProbeResponseExt>,
-) -> Result<Vec<u8>, postcard::Error> {
-    let mut buf = postcard::to_allocvec(&ProbeMessage::Response(resp.clone()))?;
-    if let Some(ext) = ext {
-        buf.extend_from_slice(&postcard::to_allocvec(ext)?);
-    }
-    Ok(buf)
-}
-
-/// Parse the trailing [`ProbeResponseExt`] bytes returned as the remainder by
-/// [`crate::decode_message`] after a `ProbeMessage::Response`.
-///
-/// An empty remainder ⇒ [`ProbeResponseExt::default`] (no size). Trailing
-/// bytes beyond the known fields are tolerated for forward compatibility (ADR
-/// 013 §Tier 1): a future optional field appended to [`ProbeResponseExt`] is
-/// read by new receivers and skipped by old ones.
-///
-/// # Errors
-///
-/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
-/// `ProbeResponseExt` prefix.
-pub fn parse_probe_response_ext(remainder: &[u8]) -> Result<ProbeResponseExt, postcard::Error> {
-    if remainder.is_empty() {
-        Ok(ProbeResponseExt::default())
-    } else {
-        Ok(postcard::take_from_bytes::<ProbeResponseExt>(remainder)?.0)
-    }
-}
-
-impl ProbeResponse {
-    /// Validate field invariants. The wire-decode path enforces the
-    /// `rate_per_mb` bound automatically via `deserialize_rate_per_mb`; this
-    /// method additionally enforces the requester-side mandatory-`slash_sig`
-    /// rule (ADR 014 §1) and is exposed so construction sites can re-check
-    /// before sending and tests can assert validity without a full
-    /// encode/decode roundtrip.
-    pub const fn validate(&self) -> Result<(), MessageValidationError> {
-        if self.body.rate_per_mb > MAX_RATE_PER_MB {
-            return Err(MessageValidationError::RateTooLarge {
-                rate: self.body.rate_per_mb,
-            });
-        }
-        // #252: requesters MUST reject a zero rate on receive. The decode hook
-        // only bounds the upper end (a peer-controlled overflow source, #378);
-        // zero is a legitimate `u64` the wire accepts but a requester must not.
-        if self.body.rate_per_mb == 0 {
-            return Err(MessageValidationError::RateIsZero);
-        }
-        if self.slash_sig.len() != SLASH_SIG_LEN {
-            return Err(MessageValidationError::InvalidSlashSigLen {
-                len: self.slash_sig.len(),
-            });
-        }
-        Ok(())
-    }
-}
-
 // Field-level deserialize hook so the protocol boundary rejects oversize
 // `rate_per_mb` (issue #378). Using `#[serde(deserialize_with)]` rather
-// than a hand-written `impl Deserialize for ProbeResponseBody` keeps the
+// than a hand-written `impl Deserialize for StreamResponseBody` keeps the
 // struct's field order and codec in lockstep with the derive — there is
 // no mirror struct to drift out of sync. The wire bytes are byte-identical
 // to what a fully-derived `Deserialize` would have read, so postcard's

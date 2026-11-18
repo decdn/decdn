@@ -53,7 +53,7 @@ async fn a_loaded_lane_has_nothing_left_to_claim() {
 }
 
 /// A client that sends garbage on the proof stream is a peer fault, not a node
-/// bug: it must reach `debug!`, not the node-fault counter. The `ProbeRequest`
+/// bug: it must reach `debug!`, not the node-fault counter. The `StreamEnd`
 /// stands in for any `ClientMessage` variant that is not a proof.
 #[tokio::test]
 async fn a_malformed_or_unexpected_proof_frame_is_attributed_to_the_peer() {

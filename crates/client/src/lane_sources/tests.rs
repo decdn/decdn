@@ -217,7 +217,7 @@ fn late_non_holder(seed: u8, rtt_ms: f64) -> crate::targets::OpenOutcome {
 fn late_holder(seed: u8, rtt_ms: f64) -> crate::targets::OpenOutcome {
     let node_id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
     crate::targets::OpenOutcome::Holder(
-        crate::discovery::Probed {
+        crate::discovery::DiscoveredHolder {
             candidate: crate::discovery::NodeCandidate {
                 node_id,
                 eth_address: Address::repeat_byte(seed),

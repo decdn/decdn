@@ -2,24 +2,21 @@
 //! traffic on authenticated QUIC handlers.
 //!
 //! This is the engine behind the `cdn/dht/v1` limiter (ADR 022 §DHT Rate
-//! Limiting, via [`crate::dht::rate_limit::DhtRateLimiter`]), the
-//! `cdn/probe/v1` limiter (ADR 005 §Probe rate limiting, via
-//! [`crate::handlers::probe_rate_limit::ProbeRateLimiter`]) and the
+//! Limiting, via [`crate::dht::rate_limit::DhtRateLimiter`]) and the
 //! `cdn/client/v1` limiter (ADR 005 §Request rate limiting, via
 //! [`crate::handlers::serve_rate_limit::ServeRateLimiter`]). The ADRs specify
 //! the identical two-layer shape — the differences are the default
 //! parameters, the operator-visible metric names, and that the DHT path
 //! additionally drives the engine's batch-token accounting
-//! ([`LayeredRateLimiter::admit_batch_extra`]) while the probe path issues
-//! exactly one [`LayeredRateLimiter::check`] per connection and the serve
-//! path one per stream. So the
+//! ([`LayeredRateLimiter::admit_batch_extra`]) while the serve path issues
+//! exactly one [`LayeredRateLimiter::check`] per stream. So the
 //! mechanism lives here once and each path supplies its own
 //! [`RateLimitMetricsSink`].
 //!
 //! Distinct from the connection-level [`crate::dispatch::ConnectionLimiter`]:
 //! that limiter caps how many connection handlers run at once; this one caps
-//! the per-request work done on each accepted connection (for DHT, many
-//! requests per connection; the probe path is one probe per connection).
+//! the per-request work done on each accepted connection (many requests per
+//! connection on both paths).
 //!
 //! # Layered checks
 //!
@@ -34,7 +31,7 @@
 //! and `adr/appendix-observability.md` § Reason splits). Each layer has an
 //! unrelated remedy, so no alert spans the family. Operators recover the
 //! rolled-up rate with
-//! `sum(rate({__name__=~"decdn_(probe|dht|serve)_rate_limit_rejected_(per_peer|global)_total"}[1m]))`.
+//! `sum(rate({__name__=~"decdn_(dht|serve)_rate_limit_rejected_(per_peer|global)_total"}[1m]))`.
 //!
 //! The layers key on the `NodeId` and on nothing else. A source-address key
 //! binds no attacker: a relay-routed connection carries no client address, so
@@ -61,14 +58,14 @@ use crate::prune_guard::PruneGuard;
 /// A layer is disabled (its `Option<_>` limiter is `None`) when its quota is
 /// not buildable — see `make_quota`: that is `*_rate_per_sec <= 0.0`, a
 /// non-finite rate, **or** `*_burst == 0`. The config resolver
-/// (`resolve_{dht,probe,serve}_into`) rejects `rate > 0, burst == 0` as a
+/// (`resolve_{dht,serve}_into`) rejects `rate > 0, burst == 0` as a
 /// deny-all, so in production a layer is disabled by a `0.0` rate, whatever its
 /// burst. A `RateLimitConfig` built directly (bypassing the resolver) with
 /// `rate > 0, burst == 0` will silently disable that layer rather than error —
-/// construct via the `From<&Resolved{Dht,Probe,Serve}>` impls or the resolver
+/// construct via the `From<&Resolved{Dht,Serve}>` impls or the resolver
 /// to keep that invariant.
 ///
-/// [`Default`] returns the ADR 022 DHT-layer values. The probe path supplies
+/// [`Default`] returns the ADR 022 DHT-layer values. The serve path supplies
 /// its own ADR 005 defaults through the config resolver and never relies on
 /// `Default` here.
 #[derive(Debug, Clone)]
@@ -98,7 +95,7 @@ impl Default for RateLimitConfig {
     }
 }
 
-// The resolved DHT/probe/serve config (in `decdn-common`) and this engine config
+// The resolved DHT/serve config (in `decdn-common`) and this engine config
 // hold the identical five fields, but `common` can't depend on `node`, so the
 // engine config lives here. These `From` impls are the single mapping point
 // the runtime uses to build a limiter from resolved config, so a field added
@@ -119,7 +116,7 @@ impl Default for RateLimitConfig {
 //   cannot help: the fields are `f64`/`u32`/`usize`, so swapping
 //   `per_peer_burst` with `global_burst` still compiles. The tests feed
 //   pairwise-distinct sentinels through each impl and pin every landing slot.
-// - **Wiring** — `{Probe,Dht}RateLimiter::from_resolved`, which take the
+// - **Wiring** — `{Serve,Dht}RateLimiter::from_resolved`, which take the
 //   `Resolved*` type rather than the mapped config. Both limiter configs are
 //   aliases of `RateLimitConfig`, so a limiter built from the *other*
 //   protocol's section type-checks fine; going through `from_resolved` at the
@@ -132,18 +129,6 @@ impl Default for RateLimitConfig {
 // those two in step.
 impl From<&decdn_common::config::ResolvedDht> for RateLimitConfig {
     fn from(r: &decdn_common::config::ResolvedDht) -> Self {
-        Self {
-            per_peer_rate_per_sec: r.per_peer_rate_per_sec,
-            per_peer_burst: r.per_peer_burst,
-            global_rate_per_sec: r.global_rate_per_sec,
-            global_burst: r.global_burst,
-            max_tracked_per_peer: r.max_tracked_per_peer,
-        }
-    }
-}
-
-impl From<&decdn_common::config::ResolvedProbe> for RateLimitConfig {
-    fn from(r: &decdn_common::config::ResolvedProbe) -> Self {
         Self {
             per_peer_rate_per_sec: r.per_peer_rate_per_sec,
             per_peer_burst: r.per_peer_burst,
@@ -170,11 +155,9 @@ impl From<&decdn_common::config::ResolvedServe> for RateLimitConfig {
 /// the right per-layer Counter via [`RateLimitMetricsSink::rejected`].
 ///
 /// A **sibling-counter** split, per the convention settled in #1475 — one
-/// unlabeled counter per layer (`decdn_probe_rate_limit_rejected_{per_peer,
-/// global}_total` on the probe path, and the matching pairs on the DHT and
-/// serve paths — this enum is shared by all three), not a `layer` label. The
-/// labeled `decdn_probe_hold_unavailable_total` is the one deliberate
-/// reason-split exception.
+/// unlabeled counter per layer (`decdn_dht_rate_limit_rejected_{per_peer,
+/// global}_total` on the DHT path, and the matching pair on the serve path —
+/// this enum is shared by both), not a `layer` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectLayer {
     /// Per-peer (`NodeId`) bucket exhausted.
@@ -195,7 +178,7 @@ impl RejectLayer {
 }
 
 /// Metrics fan-out for a [`LayeredRateLimiter`]. Each protocol path
-/// (`cdn/dht/v1`, `cdn/probe/v1`, `cdn/client/v1`) supplies an implementation
+/// (`cdn/dht/v1`, `cdn/client/v1`) supplies an implementation
 /// that routes to its own operator-visible counters/gauges, so the limiter core
 /// stays backend-agnostic. Implementations must be cheap and lock-free on the
 /// hot `rejected` path.

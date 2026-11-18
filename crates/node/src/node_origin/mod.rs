@@ -91,7 +91,7 @@ use crate::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
-    CachedCandidate, CandidateCache, LookupConfig, NegativeProbeCache, NodeAddressResolver,
+    CachedCandidate, CandidateCache, LookupConfig, NegativeCandidateCache, NodeAddressResolver,
     OriginDirectory, StakerSet,
 };
 use crate::metrics::Metrics;
@@ -140,7 +140,7 @@ static UPSTREAM_TIMESTAMP_WARN: crate::warn_throttle::WarnThrottle =
 /// record an outcome.
 fn record_upstream_timestamp_rejected(
     metrics: &Metrics,
-    negative_cache: &NegativeProbeCache,
+    negative_cache: &NegativeCandidateCache,
     peer: PublicKey,
     hash_bytes: [u8; 32],
     stage: &'static str,
@@ -687,7 +687,7 @@ pub struct NodeOriginDeps {
     /// Local per-peer reputation score store (folded on each pull outcome).
     pub local_rep: Arc<LocalReputation>,
     /// Requester-side negative cache (drops known-absent providers).
-    pub negative_cache: NegativeProbeCache,
+    pub negative_cache: NegativeCandidateCache,
     /// Requester-side candidate cache (ADR 001 §Candidate cache): lets a repeat
     /// miss for a hash inside the TTL skip the DHT lookup and the discovery
     /// fan-out (#1165). Beside the negative cache, and by value for the same reason:
@@ -3382,7 +3382,7 @@ fn persist_buyer_progress(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefusalVerdict {
     /// A true, lasting fact about this (peer, hash) pair: the peer answered
-    /// `Declined`. Suppress the pair for the full [`NegativeProbeCache`] TTL,
+    /// `Declined`. Suppress the pair for the full [`NegativeCandidateCache`] TTL,
     /// because asking again soon gets the same answer.
     DurableMiss,
     /// Transient, or not attributable to the peer at all. Suppress the pair only briefly

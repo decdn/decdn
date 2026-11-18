@@ -10,14 +10,14 @@ fn h(byte: u8) -> Hash {
 
 #[test]
 fn absent_key_returns_false() {
-    let c = NegativeProbeCache::new();
+    let c = NegativeCandidateCache::new();
     assert!(!c.contains_active(&nid(1), &h(1)));
     assert!(c.is_empty());
 }
 
 #[test]
 fn record_then_contains_returns_true() {
-    let c = NegativeProbeCache::new();
+    let c = NegativeCandidateCache::new();
     c.record_failure(nid(1), h(1));
     assert!(c.contains_active(&nid(1), &h(1)));
     assert!(!c.contains_active(&nid(2), &h(1)));
@@ -30,11 +30,11 @@ fn record_then_contains_returns_true() {
 /// lets an unattributable delivery refusal — a wire `NotFound`, onto which every
 /// not-now reject reason deliberately collapses, a load shed and a stale chain among
 /// them — cost a peer
-/// seconds of suppression rather than the five minutes an authoritative probe answer
+/// seconds of suppression rather than the five minutes an authoritative open answer
 /// earns.
 #[test]
 fn a_short_ttl_entry_expires_while_a_default_one_is_still_active() {
-    let c = NegativeProbeCache::new(); // 5-minute default
+    let c = NegativeCandidateCache::new(); // 5-minute default
     c.record_failure(nid(1), h(1)); // authoritative: the full TTL
     c.record_failure_with_ttl(nid(2), h(1), Duration::from_millis(30)); // weak evidence
 
@@ -59,7 +59,7 @@ fn expired_entry_returns_false_and_is_evicted() {
     // Margins kept generous (TTL 500ms, sleep 750ms) so loaded
     // CI runners with cargo-nextest parallelism don't flake on
     // wall-clock checks.
-    let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(500));
+    let c = NegativeCandidateCache::with_capacity_and_ttl(8, Duration::from_millis(500));
     c.record_failure(nid(1), h(1));
     assert!(c.contains_active(&nid(1), &h(1)));
     thread::sleep(Duration::from_millis(750));
@@ -72,7 +72,7 @@ fn expired_entry_returns_false_and_is_evicted() {
 
 #[test]
 fn lru_eviction_at_cap_drops_oldest() {
-    let c = NegativeProbeCache::with_capacity(2);
+    let c = NegativeCandidateCache::with_capacity(2);
     c.record_failure(nid(1), h(1));
     c.record_failure(nid(2), h(2));
     c.record_failure(nid(3), h(3));
@@ -85,7 +85,7 @@ fn lru_eviction_at_cap_drops_oldest() {
 
 #[test]
 fn read_hit_bumps_lru_so_oldest_eviction_changes() {
-    let c = NegativeProbeCache::with_capacity(2);
+    let c = NegativeCandidateCache::with_capacity(2);
     c.record_failure(nid(1), h(1));
     c.record_failure(nid(2), h(2));
     // Bump nid(1) by reading it → nid(2) becomes LRU.
@@ -105,7 +105,7 @@ fn read_hit_bumps_lru_so_oldest_eviction_changes() {
 /// degrades.
 #[test]
 fn shift_insert_on_existing_key_moves_to_front_of_lru() {
-    let c = NegativeProbeCache::with_capacity(4);
+    let c = NegativeCandidateCache::with_capacity(4);
     c.record_failure(nid(1), h(1));
     c.record_failure(nid(2), h(2));
     c.record_failure(nid(3), h(3));
@@ -119,14 +119,14 @@ fn shift_insert_on_existing_key_moves_to_front_of_lru() {
     );
 }
 
-/// Pins the ADR 001 § Probe cache invariant that TTL is anchored
+/// Pins the ADR 001 § Candidate cache invariant that TTL is anchored
 /// at insertion, NOT refreshed on read. A regression in
-/// [`NegativeProbeCache::contains_active`] that re-stamped
+/// [`NegativeCandidateCache::contains_active`] that re-stamped
 /// expiry during the LRU bump would extend the suppression
 /// window beyond spec and ship green without this test.
 #[test]
 fn read_hit_does_not_refresh_ttl() {
-    let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(500));
+    let c = NegativeCandidateCache::with_capacity_and_ttl(8, Duration::from_millis(500));
     c.record_failure(nid(1), h(1));
     // Half-TTL — entry still live; read bumps LRU.
     thread::sleep(Duration::from_millis(250));
@@ -147,7 +147,7 @@ fn re_recording_same_key_refreshes_ttl_does_not_grow_len() {
     // would have expired by t=1250ms; the refresh at t=500ms
     // reset the window, so the entry should still be live at
     // t=1250ms (750ms post-refresh, inside the 1000ms TTL).
-    let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_secs(1));
+    let c = NegativeCandidateCache::with_capacity_and_ttl(8, Duration::from_secs(1));
     c.record_failure(nid(1), h(1));
     thread::sleep(Duration::from_millis(500));
     c.record_failure(nid(1), h(1));

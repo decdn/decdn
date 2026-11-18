@@ -335,14 +335,16 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // (3) The SERVER ends up holding the blob it pulled — the miss was filled
-    // into its cache, not just streamed through. Its probe now answers
-    // `has_blob: true` for the hash.
-    let probe = client
-        .probe(&server, blob_hash)
+    // into its cache, not just streamed through. A discovery open, which asks
+    // no pull-through, now answers `ok` for the hash.
+    let opened = client
+        .discovery_open(&chain, &server, blob_hash)
         .await
-        .context("probe server for the pulled blob")?;
+        .context("open the pulled blob on the server")?;
+    let held = opened.served();
+    opened.cancel();
     anyhow::ensure!(
-        probe.body.has_blob,
+        held,
         "the server must hold the blob it pulled through and topped up for"
     );
 

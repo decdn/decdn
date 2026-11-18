@@ -82,24 +82,9 @@ fn dht_mapping_is_not_transposed() {
     assert_sentinels_in_place(&RateLimitConfig::from(&resolved));
 }
 
-/// Sibling of `dht_mapping_is_not_transposed` for `From<&ResolvedProbe>`.
+/// Sibling of `dht_mapping_is_not_transposed` for `From<&ResolvedServe>`.
 /// Load-bearing independently of the DHT test: the `Self { .. }` literals
-/// are byte-identical, so a transposition in one is invisible to review. A
-/// `per_peer`/`global` swap here raises the per-peer probe cap from 5/sec to
-/// the global 1000 — and the per-peer bucket is the only layer that charges
-/// one prober on its own (ADR 005 §Probe rate limiting).
-#[test]
-fn probe_mapping_is_not_transposed() {
-    let resolved = decdn_common::config::ResolvedProbe {
-        per_peer_rate_per_sec: S_PER_PEER_RATE,
-        per_peer_burst: S_PER_PEER_BURST,
-        global_rate_per_sec: S_GLOBAL_RATE,
-        global_burst: S_GLOBAL_BURST,
-        max_tracked_per_peer: S_MAX_TRACKED_PER_PEER,
-    };
-    assert_sentinels_in_place(&RateLimitConfig::from(&resolved));
-}
-
+/// are byte-identical, so a transposition in one is invisible to review.
 #[test]
 fn serve_mapping_is_not_transposed() {
     let resolved = decdn_common::config::ResolvedServe {
@@ -127,9 +112,8 @@ fn sentinels_never_collide_with_defaults() {
     // Every `Resolved*` default plus this engine's own, since a fallback
     // could plausibly reach for any of them.
     let dht = RateLimitConfig::from(&decdn_common::config::ResolvedDht::default());
-    let probe = RateLimitConfig::from(&decdn_common::config::ResolvedProbe::default());
     let serve = RateLimitConfig::from(&decdn_common::config::ResolvedServe::default());
-    for cfg in [&RateLimitConfig::default(), &dht, &probe, &serve] {
+    for cfg in [&RateLimitConfig::default(), &dht, &serve] {
         for rate in [cfg.per_peer_rate_per_sec, cfg.global_rate_per_sec] {
             assert!(
                 !sentinel_rates.contains(&rate),

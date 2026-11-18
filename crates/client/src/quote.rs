@@ -122,7 +122,7 @@ impl HashCensus {
         let mut non_holders = Vec::new();
         for answer in &self.answers {
             if answer.has_blob {
-                holders.push(discovery::Probed {
+                holders.push(discovery::DiscoveredHolder {
                     candidate: answer.candidate.clone(),
                     rtt_ms: answer.rtt_ms,
                     rate_per_mb: answer.rate_per_mb,

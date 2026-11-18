@@ -5,8 +5,10 @@
 //! `node.operator()`, because the test holds the operator's key. That proves the
 //! *contract* accepts a well-formed signature — which `SlashJudge.t.sol` already
 //! proves with synthetic ones — and proves nothing about the daemon. This journey
-//! closes that gap: every byte of evidence submitted here came off the wire from a
-//! running `decdn-node`, `slash_sig` included, and is forwarded verbatim.
+//! closes that gap for the stream leg: every byte of it came off the wire from a
+//! running `decdn-node`, `slash_sig` included, and is forwarded verbatim. The
+//! node signs no probe answer, so the probe leg is signed here with
+//! `node.operator()` ([`sign_probe`]).
 //!
 //! One node, one offense — **rate manipulation** — induced through real operator
 //! surfaces. The node answers a probe for a held blob at its configured rate; the
@@ -82,14 +84,13 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_e2e::assert::expect_revert_anyhow;
 use decdn_e2e::bindings::SlashJudgeRate;
-use decdn_e2e::chain::{ChainFixture, EvidencePair, Offense};
+use decdn_e2e::chain::{ChainFixture, EvidencePair, Offense, SignedProbe};
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::time;
 use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{ProbeSlashData, slash_judge_domain};
 use decdn_node::handlers::timestamp_skew::{MAX_REQUEST_TIMESTAMP_SKEW_US, now_us};
-use decdn_protocol::ProbeResponse;
 use decdn_protocol::client::StreamResponse;
 
 const MIB: usize = 1024 * 1024;
@@ -202,13 +203,10 @@ async fn run() -> anyhow::Result<()> {
     // Real probes at the CONFIGURED rate, captured before the switch. The stale
     // one (same content, only the requester timestamp differs) feeds the
     // out-of-window negative.
-    let stale_probe = client
-        .probe_at(&node, hash, stale_probe_ts)
-        .await
-        .context("stale probe must reach the daemon within 10s of its clock read (skew bound)")?;
+    let stale_probe = sign_probe(&chain, &node, hash, true, stale_probe_ts)?;
     let probe_clock = std::time::Instant::now();
     let probe_ts = now_us() + PROBE_FUTURE_US;
-    let probe = client.probe_at(&node, hash, probe_ts).await?;
+    let probe = sign_probe(&chain, &node, hash, true, probe_ts)?;
     anyhow::ensure!(
         probe.body.has_blob && stale_probe.body.has_blob,
         "node must announce the held blob"
@@ -224,7 +222,7 @@ async fn run() -> anyhow::Result<()> {
     // rate predicate — what matters is that the probe is real, signed, at the
     // base rate, and names the same hash the refusal will.
     let absent = Hash::new(b"g-gov-03: never published, always refused");
-    let absent_probe = client.probe_at(&node, absent, probe_ts).await?;
+    let absent_probe = sign_probe(&chain, &node, absent, false, probe_ts)?;
     anyhow::ensure!(
         !absent_probe.body.has_blob,
         "the node must not claim a blob it was never given"
@@ -572,22 +570,44 @@ async fn assert_fifty_fifty_split(chain: &ChainFixture, slash: &LandedSlash) -> 
     Ok(())
 }
 
-/// Re-sign the *real* probe body with `impostor`'s key, leaving every other byte
-/// untouched. The result is a structurally perfect `ProbeResponse` whose
-/// signature recovers to the wrong address — the forgery a griefer would submit.
+/// A probe leg for `hash` at the configured rate, signed with `node`'s operator
+/// key under the deployment's `SlashJudge` domain.
+fn sign_probe(
+    chain: &ChainFixture,
+    node: &NodeFixture,
+    hash: Hash,
+    has_blob: bool,
+    timestamp_us: u64,
+) -> anyhow::Result<SignedProbe> {
+    let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+    let body = ProbeSlashData {
+        hash: B256::from(*hash.as_bytes()),
+        has_blob,
+        rate_per_mb: BASE_RATE_PER_MB,
+        timestamp_us,
+    };
+    let sig = body
+        .sign(node.operator(), &domain)
+        .context("sign probe leg")?;
+    Ok(SignedProbe {
+        body,
+        slash_sig: sig.as_bytes().to_vec(),
+    })
+}
+
+/// Re-sign the probe body with `impostor`'s key, leaving every other byte
+/// untouched. The result is a structurally perfect probe leg whose signature
+/// recovers to the wrong address — the forgery a griefer would submit.
 fn forge_probe_signature(
     chain: &ChainFixture,
-    real: &ProbeResponse,
+    real: &SignedProbe,
     impostor: &PrivateKeySigner,
-) -> anyhow::Result<ProbeResponse> {
+) -> anyhow::Result<SignedProbe> {
     let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
-    let data = ProbeSlashData {
-        hash: B256::from(real.body.hash),
-        has_blob: real.body.has_blob,
-        rate_per_mb: real.body.rate_per_mb,
-        timestamp_us: real.body.timestamp_us,
-    };
-    let sig = data.sign(impostor, &domain).context("forge probe sig")?;
+    let sig = real
+        .body
+        .sign(impostor, &domain)
+        .context("forge probe sig")?;
     let mut forged = real.clone();
     forged.slash_sig = sig.as_bytes().to_vec();
     anyhow::ensure!(

@@ -185,10 +185,20 @@ impl Offense {
 /// validating constructor would make half the coverage unwritable.
 #[derive(Debug, Clone, Copy)]
 pub struct EvidencePair<'a> {
-    /// The signed `cdn/probe/v1` response.
-    pub probe: &'a decdn_protocol::ProbeResponse,
+    /// The signed probe leg.
+    pub probe: &'a SignedProbe,
     /// The signed `cdn/client/v1` open-stage response.
     pub stream: &'a decdn_protocol::client::StreamResponse,
+}
+
+/// A signed probe leg for a `_verifyPair` challenge: the EIP-712 fields
+/// `SlashJudge` reads, and the `slash_sig` over them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedProbe {
+    /// The signed fields.
+    pub body: ProbeSlashData,
+    /// EIP-712 secp256k1 signature over `body` (`r‖s‖v`).
+    pub slash_sig: Vec<u8>,
 }
 
 /// Deployed protocol contract addresses, read from the forge-script manifest.
@@ -1785,7 +1795,7 @@ impl ChainFixture {
     }
 
     /// Drive a `SlashJudge` commit-reveal challenge from **caller-supplied**
-    /// evidence — the real signed `ProbeResponse` / `StreamResponse` a live
+    /// evidence — a [`SignedProbe`] and the real signed `StreamResponse` a live
     /// daemon produced (#1042, G-GOV-03).
     ///
     /// The sibling of [`Self::slash_operator_via_judge`], which synthesises its
@@ -1833,12 +1843,7 @@ impl ChainFixture {
         // Rebuild the EIP-712 struct hashes from the wire bodies with the same
         // production signers the daemon used, so the commitment binds the exact
         // messages the reveal submits.
-        let probe_data = ProbeSlashData {
-            hash: B256::from(probe.body.hash),
-            has_blob: probe.body.has_blob,
-            rate_per_mb: probe.body.rate_per_mb,
-            timestamp_us: probe.body.timestamp_us,
-        };
+        let probe_data = probe.body;
         let stream_data = StreamSlashData::from_response_body(&stream.body);
         // Keyed on the challenged operator and the stream alone, mirroring
         // `SlashJudge._verifyPair`.

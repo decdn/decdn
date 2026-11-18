@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::origin::{FilesystemOrigin, OriginFetch};
+use std::sync::atomic::AtomicUsize;
 
 /// An origin that holds no object and answers every `{H}.sizeproof` read
 /// with no proof, or with a transport fault when `down`. It counts the reads.

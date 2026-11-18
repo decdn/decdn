@@ -465,13 +465,13 @@ fn admit_sources_zero_max_returns_empty() {
     assert_eq!(admit_sources(ranked, 0), Vec::new());
 }
 
-/// A [`Probed`] holder carries the coverage its probe reported, and a
+/// A [`DiscoveredHolder`] holder carries the coverage its probe reported, and a
 /// **partial** holder (a proper subset of the blob's blocks) is admitted
 /// exactly like a full one: `admit_sources` operates on `NodeCandidate`
 /// rank order and operator identity only, so it has no way to see —
 /// and must not need to see — that one holder's coverage is a strict
 /// subset of another's. Two operators here each answered for a disjoint
-/// half of the blob; both are admitted, and each one's `Probed` still
+/// half of the blob; both are admitted, and each one's `DiscoveredHolder` still
 /// carries its own half, not the other's or the full blob's.
 #[test]
 fn partial_holders_carry_their_own_coverage_and_are_admitted_like_full_holders() {
@@ -481,14 +481,14 @@ fn partial_holders_carry_their_own_coverage_and_are_admitted_like_full_holders()
     // op1 holds only block 0; op2 holds only block 1 — both partial, of a
     // 2-block blob, and disjoint.
     let probed = [
-        Probed {
+        DiscoveredHolder {
             candidate: op1.clone(),
             rtt_ms: 10.0,
             rate_per_mb: 1,
             total_bytes: Some(ProvenSize::assume_for_tests(128 * 1024 * 1024)),
             coverage: Coverage::from_block_indices(2, [0].into_iter()),
         },
-        Probed {
+        DiscoveredHolder {
             candidate: op2.clone(),
             rtt_ms: 12.0,
             rate_per_mb: 1,

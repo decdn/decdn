@@ -134,6 +134,13 @@ pub fn num_blocks(total_bytes: u64) -> u32 {
 /// The indices are `u64`, so a range near `u64::MAX` does not saturate: a
 /// caller that builds a [`Coverage`] from them converts each index itself.
 #[must_use]
+#[cfg_attr(
+    not(feature = "test-support"),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "`discovery_block_bytes` is not const under `test-support`"
+    )
+)]
 pub fn byte_range_blocks(start: u64, end: u64) -> std::ops::Range<u64> {
     if end <= start {
         return 0..0;
@@ -151,7 +158,7 @@ mod test_block_size;
 ///
 /// While the guard is held, [`discovery_block_bytes`] and [`num_blocks`] report
 /// `bytes` instead of [`DISCOVERY_BLOCK_BYTES`], so the block-spanning planner
-/// (`decdn_client::plan_covered_runs`) and the node's coverage-union probe
+/// (`decdn_client::plan_covered_runs`) and the node's coverage-union
 /// gather split a tiny blob into several blocks. Dropping the guard restores the
 /// production default.
 ///

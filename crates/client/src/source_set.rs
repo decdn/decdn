@@ -373,7 +373,7 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// and does not count, so the order in which the loop takes worker ends
     /// cannot change the bar. A tie goes to the refusal.
     pull_through_served_at: HashMap<Address, Instant>,
-    /// Probed partial holders that said `NotFound` to
+    /// Discovered partial holders that said `NotFound` to
     /// [`ABSENT_AFTER_NOT_FOUND`] ranges outside their coverage, each with
     /// the time its bar ends ([`PULL_THROUGH_BAR`] after the refusal that set
     /// it). Each one serves only the blocks it covers until then.
@@ -401,7 +401,7 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// holder barred again after its probe counts as one that cannot serve
     /// the work left.
     pull_through_bars: HashMap<Address, u32>,
-    /// Probed partial holders that refused a range outside their coverage
+    /// Discovered partial holders that refused a range outside their coverage
     /// `Declined` (ADR 005 §Open-time refusal classes), most often for their
     /// cap on bytes held for the blob, which a node applies only to a
     /// pull-through: it holds that much already, so it lands no more. Neither a

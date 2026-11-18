@@ -358,8 +358,6 @@ fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, Resolve
             eviction_target_pct: 80,
             eviction_per_sweep_budget: 16,
             eviction_tick_secs: 1,
-            max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
-            stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             node_to_node_pull_through_enabled: false,
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             node_pull_open_fanout: decdn_common::config::DEFAULT_NODE_PULL_OPEN_FANOUT,
@@ -401,7 +399,6 @@ fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, Resolve
         },
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         dht: decdn_common::config::ResolvedDht::default(),
-        probe: decdn_common::config::ResolvedProbe::default(),
         serve: decdn_common::config::ResolvedServe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
         content: decdn_common::config::ResolvedContent::default(),
@@ -644,7 +641,7 @@ fn shutdown_signal_display_is_stable() {
 
 /// A `spawn_periodic` task exits promptly when its stop signal fires, even
 /// when the next tick is far away. This is the shared shutdown contract for
-/// every periodic runner (dispatch / region / record-store / DHT / probe
+/// every periodic runner (dispatch / region / record-store / DHT / serve
 /// GC): without the `biased; stop-before-tick` select, a regression that
 /// dropped the stop arm or polled it after `ticker.tick()` would silently
 /// extend `SHUTDOWN_DEADLINE` by up to one full tick interval (60s at
@@ -977,10 +974,8 @@ async fn shutdown_streams_recv_resolves_on_sigterm() {
 
 /// Guard test for ADR 005 transport defaults. Catches accidental edits to
 /// the constants and verifies `quic_transport_config()` builds without
-/// error — the integration test in `tests/probe_loopback.rs` rebuilds
-/// the config on its own to shorten the idle window, so without this
-/// assertion a regression that changes the defaults (or removes the
-/// helper's call site) would not be caught.
+/// error, so a regression that changes the defaults (or removes the helper's
+/// call site) fails here.
 #[test]
 fn adr_005_transport_defaults() {
     assert_eq!(QUIC_MAX_IDLE_TIMEOUT, Duration::from_secs(30));

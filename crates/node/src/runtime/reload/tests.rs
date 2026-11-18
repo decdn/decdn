@@ -87,8 +87,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             eviction_target_pct: 80,
             eviction_per_sweep_budget: 16,
             eviction_tick_secs: 1,
-            max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
-            stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             node_to_node_pull_through_enabled: false,
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             node_pull_open_fanout: decdn_common::config::DEFAULT_NODE_PULL_OPEN_FANOUT,
@@ -131,7 +129,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
         dht: decdn_common::config::ResolvedDht::default(),
-        probe: decdn_common::config::ResolvedProbe::default(),
         serve: decdn_common::config::ResolvedServe::default(),
         content: decdn_common::config::ResolvedContent::default(),
     }
@@ -555,7 +552,7 @@ fn denylist_state(initial: &decdn_common::config::ResolvedConfig) -> RuntimeRelo
 ///
 /// Asserts through `CacheEngine::is_denied`, not the deny-set handle,
 /// because reaching the cache is the whole fix — that is what suppresses
-/// probe `has_blob`, DHT republish, and `populate` alongside the serve gate.
+/// DHT republish and `populate` alongside the serve gate.
 #[tokio::test]
 async fn reload_applies_content_denylist_to_the_cache_lever() {
     let dir = tempfile::tempdir().unwrap();
@@ -581,7 +578,7 @@ async fn reload_applies_content_denylist_to_the_cache_lever() {
     assert!(engine.is_denied(hash), "hash denied after reload");
     assert!(
         engine.refuses(hash),
-        "and therefore refused by probe/DHT/populate too"
+        "and therefore refused by DHT/populate too"
     );
     assert!(
         deny.is_origin_denied(&origin.parse().unwrap()),

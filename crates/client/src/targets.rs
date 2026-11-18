@@ -291,7 +291,7 @@ pub(crate) type Sample = (PublicKey, f64, u64);
 pub(crate) enum OpenOutcome {
     /// A verified answer that serves the span, or a signed `NotFound` with
     /// the blocks a partial holder holds, with its peer-store sample.
-    Holder(discovery::Probed, Sample),
+    Holder(discovery::DiscoveredHolder, Sample),
     /// A verified answer that does not hold the blob (a signed `NotFound`),
     /// with its peer-store sample: a proxy-warming or pull-through candidate.
     NonHolder(discovery::WarmingCandidate, Sample),
@@ -516,7 +516,7 @@ pub(crate) fn cancel_all(opened: HashMap<PublicKey, OpenedStream>) {
 /// A round's outcomes, split by what [`open_and_order`] does with each.
 struct OpenTally {
     /// The verified holders.
-    holders: Vec<discovery::Probed>,
+    holders: Vec<discovery::DiscoveredHolder>,
     /// Asked bonded nodes that answered a signed `NotFound` — reachable, with
     /// a measured RTT, but not holding the blob in their cache store. They
     /// serve two roles: the proxy-warming candidate pool (ADR 037 § Candidate
@@ -688,7 +688,7 @@ pub(crate) fn classify_open(
                 if over_ceiling {
                     return (OpenOutcome::OverCeiling, None);
                 }
-                let holder = discovery::Probed {
+                let holder = discovery::DiscoveredHolder {
                     candidate: cand.clone(),
                     rtt_ms,
                     rate_per_mb,
@@ -723,7 +723,7 @@ pub(crate) fn classify_open(
         opened.cancel();
         return (OpenOutcome::OverCeiling, None);
     }
-    let holder = discovery::Probed {
+    let holder = discovery::DiscoveredHolder {
         candidate: cand.clone(),
         rtt_ms,
         rate_per_mb,
@@ -877,7 +877,7 @@ pub async fn open_and_order(
 fn late_slot<F>(
     round: OpenRound,
     tail: futures_util::stream::FuturesUnordered<F>,
-    holders: &[discovery::Probed],
+    holders: &[discovery::DiscoveredHolder],
     warming: ProxyWarmingParams,
 ) -> LateSlot
 where
@@ -907,7 +907,7 @@ fn late_stream_slot<S>(
     round: OpenRound,
     empty: bool,
     tail: S,
-    holders: &[discovery::Probed],
+    holders: &[discovery::DiscoveredHolder],
     warming: ProxyWarmingParams,
 ) -> LateSlot
 where
@@ -940,7 +940,7 @@ where
 
 /// The proven size of the nearest holder that gave one: the fetch's first
 /// size ([`ResolvedTargets::size_hint`]).
-fn nearest_size_hint(holders: &[discovery::Probed]) -> Option<crate::ProvenSize> {
+fn nearest_size_hint(holders: &[discovery::DiscoveredHolder]) -> Option<crate::ProvenSize> {
     holders
         .iter()
         .filter(|h| h.total_bytes.is_some())
@@ -967,7 +967,9 @@ pub(crate) const RANK_RTT_BAND_MS: f64 = 20.0;
 ///
 /// A quote above the fetch's `--max-rate-per-mb` never reaches the order
 /// ([`OpenOutcome::OverCeiling`]).
-pub(crate) fn holder_rank(holder: &discovery::Probed) -> (u64, u64, std::cmp::Reverse<usize>, f64) {
+pub(crate) fn holder_rank(
+    holder: &discovery::DiscoveredHolder,
+) -> (u64, u64, std::cmp::Reverse<usize>, f64) {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -1026,7 +1028,7 @@ pub(crate) struct FailoverOrder {
 /// or off. `warming_lead` and `coverage_by_node` are both empty here, since no
 /// holder answered.
 pub(crate) fn failover_order(
-    mut holders: Vec<discovery::Probed>,
+    mut holders: Vec<discovery::DiscoveredHolder>,
     non_holders: &[discovery::WarmingCandidate],
     warming: ProxyWarmingParams,
 ) -> FailoverOrder {
@@ -1507,7 +1509,7 @@ pub struct ResolvedTargets {
     /// holder, as a node that answers `ok` does.
     pub(crate) pinned: bool,
     /// The blob size the nearest holder proved
-    /// ([`discovery::Probed::total_bytes`]), or else a size an earlier fetch
+    /// ([`discovery::DiscoveredHolder::total_bytes`]), or else a size an earlier fetch
     /// proved or verified ([`OpenOpts::known_size`]). `None` when nothing was
     /// asked and no size is known (the peer-store fast path, a pinned
     /// rediscovery), when no holder stated it, or when a pinned `--node-id`'s

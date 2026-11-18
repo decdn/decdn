@@ -748,8 +748,8 @@ impl ReloadableSection for LoadShedSection {
 
 /// Shared, mutable handles for the fields the runtime can hot-reload.
 ///
-/// Held inside an `Arc` so the SIGHUP handler and the `ProbeHandler` can
-/// both observe updates. Each section is registered as both a concrete
+/// Held inside an `Arc` so the SIGHUP handler and the handlers can both
+/// observe updates. Each section is registered as both a concrete
 /// `Arc<SectionStruct>` (so `attach_*` and accessors can reach into its
 /// state) and as `Arc<dyn ReloadableSection>` (so `reload()` drives the
 /// three-phase iteration without a central match arm per section).
@@ -1012,8 +1012,6 @@ impl RuntimeReloadState {
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
                 eviction_tick_secs: 1,
-                max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
-                stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
                 relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_open_fanout: decdn_common::config::DEFAULT_NODE_PULL_OPEN_FANOUT,
@@ -1059,7 +1057,6 @@ impl RuntimeReloadState {
             },
             load_shed: decdn_common::config::ResolvedLoadShed::default(),
             dht: decdn_common::config::ResolvedDht::default(),
-            probe: decdn_common::config::ResolvedProbe::default(),
             serve: decdn_common::config::ResolvedServe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
             content: decdn_common::config::ResolvedContent::default(),
@@ -1299,7 +1296,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         .as_ref()
         .is_some_and(cache_has_restart_required_field)
     {
-        warn_ignored("cache.* (cache_dir, sizes, origin, decompress, max_probe_holds)");
+        warn_ignored("cache.* (cache_dir, sizes, origin, decompress)");
     }
     if file.payment.is_some() {
         // The whole `[payment]` section is restart-required. `rate_per_mb` is
@@ -1316,14 +1313,9 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // state.
         warn_ignored("dht.* (rate-limit)");
     }
-    if file.probe.is_some() {
-        // `probe.rate_limit` is read once at startup; changing it requires
-        // a restart (same footing as `dht.*`).
-        warn_ignored("probe.* (rate_limit)");
-    }
     if file.serve.is_some() {
         // `serve.rate_limit` is read once at startup; changing it requires
-        // a restart (same footing as `probe.*`).
+        // a restart (same footing as `dht.*`).
         warn_ignored("serve.* (rate_limit)");
     }
     if file.receipts.is_some() {
@@ -1366,8 +1358,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         eviction_target_pct,
         eviction_per_sweep_budget,
         eviction_tick_secs,
-        max_probe_holds,
-        stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
         relay_foreign_namespaces,
         node_pull_open_fanout,
@@ -1406,8 +1396,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || eviction_target_pct.is_some()
         || eviction_per_sweep_budget.is_some()
         || eviction_tick_secs.is_some()
-        || max_probe_holds.is_some()
-        || stake_lane_reserved_holds.is_some()
         || node_to_node_pull_through_enabled.is_some()
         || relay_foreign_namespaces.is_some()
         || node_pull_open_fanout.is_some()
