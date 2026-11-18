@@ -19,7 +19,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256};
 use anyhow::Context as _;
 use decdn_protocol::client::{StreamResponse, StreamResponseExt};
-use decdn_protocol::{CHUNK_BYTES, Coverage};
+use decdn_protocol::{CHUNK_BYTES, Coverage, PoolAccount};
 use iroh::EndpointAddr;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
@@ -66,6 +66,9 @@ pub struct OpenedStream {
     pub(crate) hash: [u8; 32],
     pub(crate) byte_offset: u64,
     pub(crate) byte_len: u64,
+    /// The `PaymentPool` contract the request named (ADR 005 § Payment pool
+    /// routing).
+    pub(crate) payment_pool: PoolAccount,
     /// The pool the request named.
     pub(crate) pool_id: B256,
     /// The key the request bound: the lane signer every voucher on the
@@ -161,11 +164,23 @@ impl OpenedStream {
         self.answered_at
     }
 
-    /// Whether `ctx` can pay this stream: the request named `ctx`'s pool and
-    /// bound `ctx`'s signer, and the node holds the stream for that lane alone.
+    /// Whether the node refused the request's `payment_pool` itself: a
+    /// `Declined` whose `payment_pools` hint leaves that pool out
+    /// ([`StreamResponseExt::declines_pool`]). Such an answer says nothing
+    /// about the blob.
+    #[must_use]
+    pub fn declines_pool(&self) -> bool {
+        !self.resp.body.ok && self.resp_ext.declines_pool(&self.payment_pool)
+    }
+
+    /// Whether `ctx` can pay this stream: the request named `ctx`'s pool on
+    /// `ctx`'s `PaymentPool` contract and bound `ctx`'s signer, and the node
+    /// holds the stream for that lane alone.
     #[must_use]
     pub fn paid_by(&self, ctx: &PoolContext) -> bool {
-        self.pool_id == ctx.pool_id && self.signer == ctx.client_signer.address()
+        self.pool_id == ctx.pool_id
+            && self.signer == ctx.client_signer.address()
+            && crate::payment_pool(&ctx.voucher_domain).is_ok_and(|pool| pool == self.payment_pool)
     }
 
     /// Reset the stream: `send.reset(0)` and `recv.stop(0)`. The node ends it
@@ -249,10 +264,11 @@ impl OpenedStream {
             byte_offset,
             byte_len,
             permit,
+            payment_pool,
             ..
         } = self;
         let Some(proven) = proven_size.filter(|_| resp.body.ok) else {
-            return Err(UpstreamRefused::open(resp, &resp_ext));
+            return Err(UpstreamRefused::open(resp, &resp_ext, &payment_pool));
         };
         // A quote above the lane's ceiling is refused unpaid.
         rate_ceiling.admit(resp.body.rate_per_mb)?;
@@ -404,6 +420,8 @@ pub(crate) async fn open_answer(
         }
         Err(err) => return Err(err),
     };
+    let payment_pool = crate::payment_pool(&args.ctx.voucher_domain)
+        .map_err(|e| e.context(crate::LocalPullFault))?;
     let answered_at = tokio::time::Instant::now();
     let rtt = if measure_rtt {
         path_rtt(&conn, DIRECT_PATH_GRACE).await
@@ -421,6 +439,7 @@ pub(crate) async fn open_answer(
         hash: args.hash,
         byte_offset: args.byte_offset,
         byte_len: args.byte_len,
+        payment_pool,
         pool_id: args.ctx.pool_id,
         signer: args.ctx.client_signer.address(),
         rtt,

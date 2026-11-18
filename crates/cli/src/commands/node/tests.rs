@@ -20,6 +20,23 @@ fn health_response_with_registry(
     }
 }
 
+/// `node earnings --pool` without `--address` is refused, and with no `--pool`
+/// the daemon is asked for every pool.
+#[test]
+fn earnings_refuses_pool_in_daemon_mode() {
+    let picked = cli::PoolSelectArgs {
+        pool: Some(format!("eip155:1:{}", alloy::primitives::Address::ZERO)),
+        pool_rpc_url: None,
+    };
+    let err = refuse_pool_in_daemon_mode(&picked).unwrap_err();
+    assert!(err.to_string().contains("--address"), "{err:#}");
+    let every = cli::PoolSelectArgs {
+        pool: None,
+        pool_rpc_url: None,
+    };
+    assert!(refuse_pool_in_daemon_mode(&every).is_ok());
+}
+
 fn health_lines(resp: &HealthResponse) -> String {
     let mut buf = Vec::new();
     write_health(&mut buf, resp).expect("write to a Vec cannot fail");
@@ -565,6 +582,7 @@ fn mk_lane(
     eligible: bool,
 ) -> LaneSnapshot {
     LaneSnapshot {
+        pool: "eip155:84532:0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
         pool_id: pool_id.to_string(),
         counterparty: Some(counterparty.to_string()),
         // Self-signing default; the delegated and unknown-owner renderings
@@ -668,7 +686,25 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
     );
     // Second row: no activity → "never", not eligible → "no".
     assert!(s.contains("never"), "never sentinel missing: {s}");
+    // Each row names the PaymentPool contract: its chain id and a short
+    // address.
+    assert!(s.contains("POOL"), "pool header missing: {s}");
+    assert!(
+        s.contains("84532:0xb0b0b0b0b0"),
+        "pool contract preview missing: {s}"
+    );
     Ok(())
+}
+
+/// The pool column shortens a CAIP-10 account to its chain id and address
+/// preview, and passes anything else through.
+#[test]
+fn short_pool_keeps_the_chain_and_a_short_address() {
+    assert_eq!(
+        short_pool("eip155:84532:0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0"),
+        "84532:0xb0b0b0b0b0…"
+    );
+    assert_eq!(short_pool("garbage"), "garbage");
 }
 
 #[test]
@@ -695,7 +731,6 @@ fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
                 offense_type: 0,
                 amount: "1_000_000".to_string(),
                 evidence_hash: format!("0x{}", "a".repeat(64)),
-                block_number: Some(1_234_567),
                 appeal_window_close: Some(1_700_000_000),
             },
             SlashRecordDto {
@@ -703,7 +738,6 @@ fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
                 offense_type: 0,
                 amount: "2_500_000".to_string(),
                 evidence_hash: format!("0x{}", "c".repeat(64)),
-                block_number: None,
                 appeal_window_close: None,
             },
         ],
@@ -714,12 +748,12 @@ fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
     assert!(s.contains("slashes=2"), "{s}");
     assert!(s.contains("SLASH_ID"), "header missing: {s}");
     assert!(s.contains("APPEAL_CLOSE"), "header missing: {s}");
-    // First row: slash id, offense type, amount, block, evidence preview.
+    // First row: slash id, offense type, amount, evidence preview.
     assert!(s.contains("42"), "slash id missing: {s}");
     assert!(s.contains("1_000_000"), "amount missing: {s}");
-    assert!(s.contains("1234567"), "block number missing: {s}");
+    assert!(s.contains("1700000000"), "appeal close missing: {s}");
     assert!(s.contains("0xaaaaaaaaaa"), "evidence preview missing: {s}");
-    // Second row: missing block / appeal close render as "?".
+    // Second row: a missing appeal close renders as "?".
     assert!(s.contains('?'), "missing-value sentinel missing: {s}");
     Ok(())
 }
@@ -753,7 +787,7 @@ fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
     assert!(s.contains("SIGNER"), "SIGNER header missing: {s}");
     let row = s
         .lines()
-        .find(|l| l.starts_with("0xaaaaaaaaaa"))
+        .find(|l| l.contains(" 0xaaaaaaaaaa"))
         .unwrap_or_default();
     assert!(
         row.contains(&short_node_id(&delegate)),
@@ -795,7 +829,7 @@ fn write_lanes_table_renders_an_unknown_counterparty() -> anyhow::Result<()> {
     let s = String::from_utf8(buf)?;
     let row = s
         .lines()
-        .find(|l| l.starts_with("0xaaaaaaaaaa"))
+        .find(|l| l.contains(" 0xaaaaaaaaaa"))
         .unwrap_or_default();
     assert!(
         row.contains("unknown"),
@@ -1163,7 +1197,44 @@ mod earnings {
                 last_sweep_at_unix: Some(NOW - 50),
                 next_sweep_at_unix: Some(NOW + 250),
             }),
+            pools: Vec::new(),
         }
+    }
+
+    /// Each pool gets a line: what its settlements paid and the protocol
+    /// share waiting for `decdn node sweep`.
+    #[test]
+    fn write_earnings_renders_one_line_per_pool() {
+        let mut resp = response();
+        resp.pools = vec![
+            decdn_common::admin::PoolEarnings {
+                pool: "eip155:84532:0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_owned(),
+                settled: period(COVERED_FROM, 600_000, 1_000_000_000, 2),
+                protocol_share: Some(decdn_common::admin::ProtocolShare {
+                    pending_micro_usdc: 1_500_000,
+                    pending_bytes: 4_096,
+                    min_sweep_micro_usdc: 1_000_000,
+                }),
+            },
+            decdn_common::admin::PoolEarnings {
+                pool: "eip155:421614:0xc0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0".to_owned(),
+                settled: period(COVERED_FROM, 0, 0, 0),
+                protocol_share: None,
+            },
+        ];
+        let s = render(&resp);
+        let lines: Vec<&str> = s.lines().collect();
+        let first = lines.get(7).copied().unwrap_or_default();
+        assert!(
+            first.starts_with("pool eip155:84532:0xb0b0")
+                && first.contains("net 0.600000 USDC")
+                && first.contains("gross 1.000000 USDC")
+                && first.contains("protocol share 1.500000 USDC pending")
+                && first.contains("ready: decdn node sweep"),
+            "{first}"
+        );
+        let second = lines.get(8).copied().unwrap_or_default();
+        assert!(second.contains("protocol share unknown"), "{second}");
     }
 
     fn render(resp: &EarningsResponse) -> String {
@@ -1514,11 +1585,10 @@ async fn not_found_node(
 /// sorts last with none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lookup_ranking_needs_no_keystore() {
-    let chain = decdn_client::session::ChainConfig {
+    let chain = decdn_client::session::GovernanceChain {
         // Nothing reads the chain: a dead RPC proves it.
         rpc_url: "http://127.0.0.1:1".to_owned(),
         chain_id: 31_337,
-        payment_pool: Address::ZERO,
         slash_judge: Address::repeat_byte(0x02),
         capacity_bond: Some(Address::repeat_byte(0x03)),
     };

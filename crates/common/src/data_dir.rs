@@ -22,9 +22,6 @@ pub const NODE_LANES_DB_FILE: &str = "lanes.redb";
 /// The daemon's pending-settle store (seller and buyer sets).
 pub const NODE_SETTLE_DB_FILE: &str = "settle.redb";
 
-/// The daemon's settlement-watcher checkpoint store.
-pub const NODE_CHECKPOINT_DB_FILE: &str = "checkpoint.redb";
-
 /// The standalone client's buyer-only pool store (`decdn get`, `decdn pool`).
 pub const CLIENT_BUYER_DB_FILE: &str = "buyer-pools.redb";
 
@@ -33,12 +30,8 @@ pub const CLIENT_BUYER_DB_FILE: &str = "buyer-pools.redb";
 /// The daemon's store opens all of them at bring-up, so any one of them present
 /// means a daemon has run against this directory. Nothing a client runs creates
 /// any of them.
-pub const DAEMON_STORE_FILES: &[&str] = &[
-    NODE_BUYER_DB_FILE,
-    NODE_LANES_DB_FILE,
-    NODE_SETTLE_DB_FILE,
-    NODE_CHECKPOINT_DB_FILE,
-];
+pub const DAEMON_STORE_FILES: &[&str] =
+    &[NODE_BUYER_DB_FILE, NODE_LANES_DB_FILE, NODE_SETTLE_DB_FILE];
 
 /// The daemon-owned file that marks `data_dir` as a node's, if any.
 ///

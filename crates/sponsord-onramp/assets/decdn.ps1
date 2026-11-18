@@ -47,13 +47,17 @@
     $DecdnVersion = '{{DECDN_VERSION}}'
     $DecdnSumsSha256 = '{{DECDN_SUMS_SHA256}}'
 
-    # The chain and contracts a download runs against. $SlashJudge is empty
-    # when the onramp names none.
-    $ChainId = '{{CHAIN_ID}}'
-    $RpcUrl = '{{RPC_URL}}'
-    $PaymentPool = '{{PAYMENT_POOL}}'
+    # The chains and contracts a download runs against: the governance chain,
+    # where decdn finds nodes and checks their signatures, and the payment
+    # chain of the pool that pays them. $SlashJudge is empty when the onramp
+    # names none.
+    $GovernanceChainId = '{{GOVERNANCE_CHAIN_ID}}'
+    $GovernanceRpcUrl = '{{GOVERNANCE_RPC_URL}}'
     $CapacityBond = '{{CAPACITY_BOND}}'
     $SlashJudge = '{{SLASH_JUDGE}}'
+    $PoolChainId = '{{POOL_CHAIN_ID}}'
+    $PoolRpcUrl = '{{POOL_RPC_URL}}'
+    $PaymentPool = '{{PAYMENT_POOL}}'
 
     # How often, and for how long, to ask the onramp for the capability
     # while the person passes the gate. A rate-limited ask (429) is retried,
@@ -345,10 +349,11 @@
       '--keystore', $KeystoreFile,
       '--keystore-password-file', $PasswordFile,
       '--data-dir', $DataDir,
-      '--rpc-url', $RpcUrl,
-      '--payment-pool-address', $PaymentPool,
+      '--governance-rpc-url', $GovernanceRpcUrl,
+      '--governance-chain-id', $GovernanceChainId,
       '--capacity-bond-address', $CapacityBond,
-      '--chain-id', $ChainId
+      '--pool', "eip155:${PoolChainId}:${PaymentPool}",
+      '--pool-rpc-url', $PoolRpcUrl
     )
     if ($SlashJudge) { $PullArgs += '--slash-judge-address', $SlashJudge }
 

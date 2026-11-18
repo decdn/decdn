@@ -453,13 +453,13 @@ async fn a_pinned_fetch_with_a_known_size_opens_nothing() {
 /// A chain no test reaches: the pinned open verifies answers against its
 /// slash domain and reads nothing else from it.
 fn offline_chain() -> ChainConfig {
-    ChainConfig {
-        rpc_url: "http://127.0.0.1:1".to_owned(),
-        chain_id: 31_337,
-        payment_pool: Address::repeat_byte(0x01),
-        slash_judge: Address::repeat_byte(0x02),
-        capacity_bond: None,
-    }
+    crate::session::test_support::one_chain(
+        "http://127.0.0.1:1".to_owned(),
+        31_337,
+        Address::repeat_byte(0x01),
+        Address::repeat_byte(0x02),
+        None,
+    )
 }
 
 /// A node key for the harvest tests. `spawn_harvest` is `pub(crate)`, so
@@ -614,6 +614,7 @@ fn a_pinned_open_hints_only_a_verified_holder_size() {
         eth_address: Address::repeat_byte(7),
         rtt_ms: 5.0,
         multiaddrs: Bytes::new(),
+        payment_pools: None,
     };
     for outcome in [
         OpenOutcome::NonHolder(non_holder, sample),
@@ -779,18 +780,21 @@ fn failover_order_prepends_proxies_then_holders() {
             eth_address: Address::repeat_byte(21),
             rtt_ms: 90.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
         discovery::WarmingCandidate {
             node_id: node_key(22),
             eth_address: Address::repeat_byte(22),
             rtt_ms: 150.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
         discovery::WarmingCandidate {
             node_id: node_key(23),
             eth_address: Address::repeat_byte(23),
             rtt_ms: 190.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
     ];
     let out = super::failover_order(holders, &warming_pool, warming_params(true));
@@ -826,6 +830,7 @@ fn failover_order_no_qualifying_proxy_is_holders_only() {
         eth_address: Address::repeat_byte(21),
         rtt_ms: 190.0,
         multiaddrs: Bytes::new(),
+        payment_pools: None,
     }];
     let out = super::failover_order(holders, &warming_pool, warming_params(true));
     assert!(out.warming_lead.is_none());
@@ -847,12 +852,14 @@ fn failover_order_empty_holders_falls_back_to_non_holders_by_rtt() {
             eth_address: Address::repeat_byte(31),
             rtt_ms: 300.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
         discovery::WarmingCandidate {
             node_id: node_key(32),
             eth_address: Address::repeat_byte(32),
             rtt_ms: 100.0,
             multiaddrs: Bytes::new(),
+            payment_pools: None,
         },
     ];
     let out = super::failover_order(Vec::new(), &non_holders, warming_params(false));
@@ -887,6 +894,7 @@ fn failover_order_carries_registry_multiaddrs() -> anyhow::Result<()> {
         eth_address: Address::repeat_byte(21),
         rtt_ms: 90.0,
         multiaddrs: packed.clone(),
+        payment_pools: None,
     }];
 
     let warm = super::failover_order(vec![holder(10, 200.0)], &pool, warming_params(true));
@@ -1231,6 +1239,58 @@ async fn a_declined_answer_is_named_in_the_terminal_error() -> anyhow::Result<()
     Ok(())
 }
 
+/// A node that refuses the open's payment pool says nothing about the blob:
+/// it is a serve target, not a decline, and the round keeps the pools it
+/// names as its `payment_pools` hint, so a later pass on one of them pays it
+/// (ADR 005 § Payment pool routing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_that_refuses_the_pool_is_routed_by_its_hint() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let accepted = vec![decdn_protocol::PoolAccount::eip155(8_453, [0xB1; 20])];
+    let node = FakeNode::spawn(
+        Answer::DeclinePool {
+            accepted: accepted.clone(),
+            rate: 6,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let cand = node.candidate()?;
+    let res = open_candidate(
+        &cand,
+        None,
+        spec(&conns, &ctx, 0),
+        &open_domain(),
+        [7; 32],
+        false,
+    )
+    .await;
+    let (outcome, stream) = classify_open(&cand, res, 0);
+    match outcome {
+        OpenOutcome::NonHolder(candidate, _) => {
+            assert_eq!(candidate.payment_pools.as_ref(), Some(&accepted));
+        }
+        _ => anyhow::bail!("a node that refuses the pool is a serve target"),
+    }
+    assert!(stream.is_none());
+    let targets = open_and_order(
+        std::slice::from_ref(&cand),
+        None,
+        [7; 32],
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await?;
+    assert_eq!(targets.pool_hints.get(&cand.node_id), Some(&accepted));
+    client.close().await;
+    Ok(())
+}
+
 /// A round keeps each holder's stream open for the fetch to adopt, and a
 /// stream nobody takes is reset when the targets drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1339,7 +1399,7 @@ async fn a_pinned_open_asks_pull_through_and_keeps_its_stream() -> anyhow::Resul
     let blob = served_blob();
     let hash = *blake3::hash(&blob).as_bytes();
     let chain = offline_chain();
-    let domain = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let domain = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
     let node = FakeNode::spawn(
         Answer::Serve {
             blob: blob.clone(),

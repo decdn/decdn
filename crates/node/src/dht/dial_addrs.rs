@@ -2,7 +2,7 @@
 //! Discovery), mirrored into an iroh [`MemoryLookup`] that the runtime registers
 //! on the node's endpoint.
 //!
-//! The `CapacityBond` registry watcher keeps this directory in step with each
+//! The `CapacityBond` registry refresh keeps this directory in step with each
 //! node's on-chain `multiaddrs`. With its lookup on the endpoint, every
 //! `EndpointAddr::new(node_id)` dial (DHT RPCs, upstream discovery opens and pulls,
 //! waiver requests) resolves the registry addresses at once, alongside the
@@ -64,6 +64,7 @@ impl DialAddrDirectory {
     }
 
     /// Replace `node`'s addresses. An empty list removes the node.
+    #[cfg(test)]
     pub(crate) fn set(&self, node: NodeId, addrs: Vec<SocketAddr>) {
         with_write(&self.addrs, LABEL, |m| {
             if addrs.is_empty() {
@@ -77,6 +78,7 @@ impl DialAddrDirectory {
     }
 
     /// Remove `node` and its addresses.
+    #[cfg(test)]
     pub(crate) fn remove(&self, node: &NodeId) {
         with_write(&self.addrs, LABEL, |m| {
             m.remove(node);

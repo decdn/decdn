@@ -77,7 +77,9 @@ fn default_config_template_covers_every_wired_field() {
     let config::types::BlockchainConfig {
         rpc_url,
         eth_keystore,
-        payment_pool_address,
+        payment_chains,
+        cctp_sweep_receiver_address,
+        cctp_iris_url,
         capacity_bond_address,
         origin_assignment_address,
         origin_directory_positive_ttl_sec,
@@ -91,21 +93,33 @@ fn default_config_template_covers_every_wired_field() {
         chain_staleness_grace_sec,
         chain_id,
         rpc_watchdog_interval_sec,
-        event_poll_interval_ms,
+        receipt_poll_interval_ms,
         get_logs_max_block_span,
-        fee_shares_poll_interval_sec,
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
         redeem_interval_secs,
         buyer_working_deposit_micro_usdc,
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
-        usdc_address,
     } = &config::types::BlockchainConfig::default();
+    // Each payment-chain table field is named too, so a new one fails here.
+    let config::types::PaymentChainConfig {
+        rpc_url: payment_rpc_url,
+        chain_id: payment_chain_id,
+        payment_pools,
+    } = &config::types::PaymentChainConfig::default();
     let blockchain = [
         ("rpc_url =", rpc_url.is_none()),
         ("eth_keystore =", eth_keystore.is_none()),
-        ("payment_pool_address =", payment_pool_address.is_none()),
+        ("[[blockchain.payment_chains]]", payment_chains.is_empty()),
+        ("payment_pools =", payment_pools.is_empty()),
+        ("rpc_url =", payment_rpc_url.is_none()),
+        ("chain_id =", payment_chain_id.is_none()),
+        (
+            "cctp_sweep_receiver_address =",
+            cctp_sweep_receiver_address.is_none(),
+        ),
+        ("cctp_iris_url =", cctp_iris_url.is_none()),
         ("capacity_bond_address =", capacity_bond_address.is_none()),
         (
             "origin_assignment_address =",
@@ -146,14 +160,13 @@ fn default_config_template_covers_every_wired_field() {
             "rpc_watchdog_interval_sec =",
             rpc_watchdog_interval_sec.is_none(),
         ),
-        ("event_poll_interval_ms =", event_poll_interval_ms.is_none()),
+        (
+            "receipt_poll_interval_ms =",
+            receipt_poll_interval_ms.is_none(),
+        ),
         (
             "get_logs_max_block_span =",
             get_logs_max_block_span.is_none(),
-        ),
-        (
-            "fee_shares_poll_interval_sec =",
-            fee_shares_poll_interval_sec.is_none(),
         ),
         (
             "redeem_threshold_micro_usdc =",
@@ -173,7 +186,6 @@ fn default_config_template_covers_every_wired_field() {
             "pool_min_remaining_deposit_micro_usdc =",
             pool_min_remaining_deposit_micro_usdc.is_none(),
         ),
-        ("usdc_address =", usdc_address.is_none()),
     ];
 
     let config::types::CacheConfig {
@@ -305,14 +317,23 @@ fn default_config_template_covers_every_wired_field() {
     }
 }
 
-/// `config init` with no `--chain` (the sole-chain default) must emit a
-/// config that parses, carries the seeded chain id, and has every baked
-/// contract address active — i.e. runs out of the box modulo a keystore.
+/// The baked payment chains equal the target's payment manifests.
+fn assert_payment_chains(bc: &config::types::BlockchainConfig, chain: &known_chains::KnownChain) {
+    let want = chain.payment_chains().expect("payment chains");
+    assert_eq!(bc.payment_chains.len(), want.len());
+    for (got, want) in bc.payment_chains.iter().zip(&want) {
+        assert_eq!(got.rpc_url.as_deref(), Some(want.public_rpc));
+        assert_eq!(got.chain_id, Some(want.chain_id));
+        assert_eq!(got.payment_pools, want.payment_pools);
+    }
+}
+
+/// `config init` with a known target must emit a config that parses,
+/// carries the governance chain id, every baked governance address and every
+/// payment chain active — i.e. runs out of the box modulo a keystore.
 #[test]
-fn render_config_for_default_chain_is_runnable() {
-    let chain = known_chains::resolve(None)
-        .expect("resolve")
-        .expect("sole chain");
+fn render_config_for_a_known_chain_is_runnable() {
+    let chain = &known_chains::tests::FIXTURE;
     let rendered = render_config(Some(chain), &Role::Relay).expect("render");
 
     let cfg: config::FileConfig =
@@ -325,14 +346,15 @@ fn render_config_for_default_chain_is_runnable() {
     // Every manifest-derived address is filled in (not left commented), and
     // equals the manifest exactly.
     let a = chain.addresses().expect("addresses");
-    assert_eq!(bc.payment_pool_address, Some(a.payment_pool));
     assert_eq!(bc.capacity_bond_address, Some(a.capacity_bond));
     assert_eq!(bc.slash_judge_address, Some(a.slash_judge));
     assert_eq!(bc.content_blacklist_address, Some(a.content_blacklist));
     assert_eq!(bc.origin_assignment_address, Some(a.origin_assignment));
     assert_eq!(bc.publisher_registry_address, Some(a.publisher_registry));
     assert_eq!(bc.slash_appeal_address, Some(a.slash_appeal));
-    assert_eq!(bc.usdc_address, Some(a.usdc));
+    assert_eq!(bc.cctp_sweep_receiver_address, Some(a.cctp_sweep_receiver));
+    assert_eq!(bc.cctp_iris_url.as_deref(), Some(chain.cctp_iris_url));
+    assert_payment_chains(&bc, chain);
 
     // Splicing preserved the other sections.
     for header in ["[identity]", "[cache]", "[payment]", "[content]"] {
@@ -353,9 +375,7 @@ fn render_config_none_equals_default_template() {
 /// as an explicit commented line, and leave every other section intact.
 #[test]
 fn render_origin_config_activates_backend_and_notes_role() {
-    let chain = known_chains::resolve(None)
-        .expect("resolve")
-        .expect("sole chain");
+    let chain = &known_chains::tests::FIXTURE;
     // `parse_origin_url` appends the trailing slash the runtime needs; the
     // rendered file must carry the normalized form.
     let spec = parse_origin_spec("https://origin.example/v1").expect("valid origin URL");
@@ -487,14 +507,12 @@ fn client_config_template_is_trimmed_and_parses() {
     );
 }
 
-/// `--client` with the default chain bakes the client-consumed coordinates
-/// (pool + USDC) AND the operator addresses the daemon resolver requires,
-/// so the emitted file still passes `decdn config validate`.
+/// `--client` with a known target bakes the client-consumed payment chains
+/// AND the operator addresses the daemon resolver requires, so the emitted
+/// file still passes `decdn config validate`.
 #[test]
-fn render_client_config_for_default_chain_bakes_addresses() {
-    let chain = known_chains::resolve(None)
-        .expect("resolve")
-        .expect("sole chain");
+fn render_client_config_for_a_known_chain_bakes_addresses() {
+    let chain = &known_chains::tests::FIXTURE;
     let rendered = render_config(Some(chain), &Role::Client).expect("render");
 
     let cfg: config::FileConfig =
@@ -504,8 +522,7 @@ fn render_client_config_for_default_chain_bakes_addresses() {
 
     assert_eq!(bc.chain_id, Some(chain.chain_id));
     assert_eq!(bc.rpc_url.as_deref(), Some(chain.public_rpc));
-    assert_eq!(bc.payment_pool_address, Some(a.payment_pool));
-    assert_eq!(bc.usdc_address, Some(a.usdc));
+    assert_payment_chains(&bc, chain);
     // Required by the daemon resolver — kept active so `config validate`
     // accepts the client file.
     assert_eq!(bc.capacity_bond_address, Some(a.capacity_bond));

@@ -68,9 +68,10 @@ pub const MAX_CHAIN_LENGTH: u8 = 255;
 /// bytes (ADR 013 § Wire Framing).
 ///
 /// The node reads a [`StreamRequest`] and every later payment proof against it.
-/// The largest legitimate message is a [`StreamRequest`] with a client binding
-/// and a capability: 302 bytes, since every signature on the wire is a 65-byte
-/// EOA signature. The ceiling leaves headroom for Tier-1 extension fields and
+/// The largest legitimate message is a [`StreamRequest`] with a
+/// [`crate::MAX_POOL_ACCOUNT_LEN`]-byte pool account, a client binding and a
+/// capability: 474 bytes, since every signature on the wire is a 65-byte EOA
+/// signature. The ceiling leaves headroom for Tier-1 extension fields and
 /// refuses a larger frame before the reader buffers it. It is also the wire
 /// bound on `owner_signature`, which decode checks only for being non-empty.
 /// The `client_control_frame_ceiling_holds_the_largest_message` test pins the
@@ -81,8 +82,9 @@ pub const MAX_CLIENT_CONTROL_FRAME: u32 = 4 * 1024;
 /// (ADR 013 § Wire Framing).
 ///
 /// The largest legitimate response carries a full [`crate::MAX_SIZE_PROOF_BYTES`]
-/// size proof, an origin attestation, a [`crate::coverage::MAX_COVERAGE_BYTES`] coverage
-/// bitmap and a refusal code: under 5 KiB. The
+/// size proof, an origin attestation, a
+/// [`crate::coverage::MAX_COVERAGE_BYTES`] coverage bitmap and
+/// [`crate::MAX_PAYMENT_POOLS`] full-width payment pools: 6,272 bytes. The
 /// ceiling leaves headroom for Tier-1 extension fields and refuses a larger
 /// frame before the reader buffers it. The node reads no response, so this
 /// ceiling adds nothing to the node's reader buffers. The
@@ -249,6 +251,13 @@ pub struct StreamRequest {
     /// the frozen base — every node reads it for origin routing (a node with no
     /// chain origin directory configured resolves nothing from it).
     pub namespace_id: [u8; 32],
+    /// The `PaymentPool` contract that holds `pool_id` (ADR 005 § Payment pool
+    /// routing). A pool id is unique only inside one contract, so the node
+    /// routes the request, the pool reads and the voucher domain on this
+    /// account. A node that does not accept the contract answers
+    /// [`StreamError::Declined`] with its accepted pools in
+    /// [`StreamResponseExt::payment_pools`].
+    pub payment_pool: crate::PoolAccount,
     /// `poolId = keccak256(owner, poolNonce)` (ADR 005).
     pub pool_id: [u8; 32],
     /// Resume position in bytes; `0` for a full-blob fetch.
@@ -500,6 +509,16 @@ pub struct StreamResponseExt {
     /// body and the requested span with [`StreamResponseExt::consistent_with`]
     /// and drops a response where they disagree.
     pub coverage: crate::Coverage,
+    /// The `PaymentPool` contracts the node accepts (ADR 005 § Payment pool
+    /// routing). The node sets it on every answer, served or refused, so a
+    /// discovery open learns where the node is paid. A receiver keeps at most
+    /// the first [`crate::MAX_PAYMENT_POOLS`] entries. It is a hint: a
+    /// requester routes the node to a listed contract where it holds a funded
+    /// pool, and retries a node that refuses the request's `payment_pool` as
+    /// [`StreamError::Declined`] once on a listed contract. A wrong hint costs
+    /// one more refusal. `None` means the node named no contract.
+    #[serde(deserialize_with = "crate::pool_account::deserialize_payment_pools")]
+    pub payment_pools: Option<Vec<crate::PoolAccount>>,
 }
 
 /// The unsigned answer of a [`StreamResponse`]: a served blob's size, or the
@@ -540,6 +559,7 @@ impl StreamResponseExt {
             outcome: StreamOutcome::Served(size_proof),
             origin_attestation,
             coverage,
+            payment_pools: None,
         }
     }
 
@@ -551,7 +571,39 @@ impl StreamResponseExt {
             outcome: StreamOutcome::Refused(error),
             origin_attestation: None,
             coverage,
+            payment_pools: None,
         }
+    }
+
+    /// The [`StreamError::Declined`] refusal of a `payment_pool` the node does
+    /// not accept, carrying the pools it does accept (ADR 005 § Payment pool
+    /// routing). Keeps the first [`crate::MAX_PAYMENT_POOLS`] entries.
+    #[must_use]
+    pub fn pool_declined(payment_pools: Vec<crate::PoolAccount>) -> Self {
+        Self::refused(StreamError::Declined, crate::Coverage::empty())
+            .with_payment_pools(payment_pools)
+    }
+
+    /// This answer with `payment_pools` as the contracts the node accepts.
+    /// Keeps the first [`crate::MAX_PAYMENT_POOLS`] entries.
+    #[must_use]
+    pub fn with_payment_pools(mut self, mut payment_pools: Vec<crate::PoolAccount>) -> Self {
+        payment_pools.truncate(crate::MAX_PAYMENT_POOLS);
+        self.payment_pools = Some(payment_pools);
+        self
+    }
+
+    /// Whether this answer refuses the request's `payment_pool` itself: a
+    /// [`StreamError::Declined`] whose `payment_pools` does not list
+    /// `requested`. A `Declined` that lists it, or one with no list, refuses
+    /// the blob or the span instead.
+    #[must_use]
+    pub fn declines_pool(&self, requested: &crate::PoolAccount) -> bool {
+        matches!(self.error(), Some(StreamError::Declined))
+            && self
+                .payment_pools
+                .as_ref()
+                .is_some_and(|pools| !pools.contains(requested))
     }
 
     /// Does this ext's `coverage` agree with the signed `body`, for a request

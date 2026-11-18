@@ -99,7 +99,7 @@ pub async fn probe(
             target = target.with_relay_url(url.clone());
         }
         let chain = &host.chain().config;
-        let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+        let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
         let opened = decdn_client::discovery_open(
             host.connections(),
             &target,
@@ -140,11 +140,8 @@ pub(crate) fn fetch_args(args: &cli::ProbeArgs) -> anyhow::Result<cli::ClientFet
     common.provider_address = Some(args.provider_address.clone());
     common.addr = args.addr;
     common.relay_url.clone_from(&args.relay_url);
-    common.rpc_url.clone_from(&args.rpc_url);
-    common.chain_id = args.chain_id;
-    common
-        .payment_pool_address
-        .clone_from(&args.payment_pool_address);
+    common.governance.clone_from(&args.governance);
+    common.payment.clone_from(&args.payment);
     common
         .slash_judge_address
         .clone_from(&args.slash_judge_address);

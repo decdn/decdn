@@ -33,6 +33,19 @@ pub async fn mine_blocks<P: Provider>(provider: &P, count: u64) -> anyhow::Resul
     Ok(())
 }
 
+/// Mine past a node's snapshot lag margin: a node pins its registry, seat and
+/// slash snapshots `SNAPSHOT_LAG_MARGIN_BLOCKS` below the head, so a daemon
+/// that boots after this call sees every transaction mined before it. Each
+/// block advances the chain clock by one second, as `anvil_mine` does.
+pub async fn mine_past_snapshot_margin<P: Provider>(provider: &P) -> anyhow::Result<()> {
+    mine_blocks(
+        provider,
+        decdn_node::chain_events::snapshot::SNAPSHOT_LAG_MARGIN_BLOCKS + 1,
+    )
+    .await
+    .context("mine past the snapshot lag margin")
+}
+
 /// Advance the chain clock so `block.timestamp >= ready_at`, then mine. A
 /// no-op (still mines once) if the head is already past `ready_at`. Useful for
 /// timelock `readyAt` gates (namespace transfer, publisher vetting).

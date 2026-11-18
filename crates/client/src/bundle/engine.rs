@@ -78,6 +78,7 @@ use alloy::providers::Provider;
 use anyhow::{Context as _, anyhow, bail};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_common::redact::sanitize_err_chain;
+use decdn_incentive::Deployment;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
 use futures_util::StreamExt as _;
@@ -91,16 +92,17 @@ use super::{
     FileObserver, MAX_MANIFEST_MB, ManifestEntry, NodeSelection, STAGING_DIR, Selection,
     format_hash, manifest_cache, parse_hash, path_key,
 };
-use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
+use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UnconfirmedEscrows, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
 use crate::fault::{carries_untracked_escrow, fold_escrow};
 use crate::funding::RunFunding;
 use crate::lane_sources::{FirstLeg, LaneSources, discovery_span};
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
+use crate::pool_route::PoolPasses;
 use crate::receipt::ReceiptEvidence;
 use crate::scheduler::{BUILD_DRAIN, fold_late_escrow};
-use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
+use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PaymentPoolChain, PullSite};
 use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
@@ -1066,7 +1068,7 @@ pub(super) async fn discover_candidates(
     site: &PullSite,
     discovery: &DiscoveryOptions,
 ) -> anyhow::Result<Registry> {
-    let capacity_bond = chain.capacity_bond.ok_or_else(|| {
+    let capacity_bond = chain.governance.capacity_bond.ok_or_else(|| {
         anyhow!(
             "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
              blockchain.capacity_bond_address), or pass --node-id to pull from one node"
@@ -1081,7 +1083,7 @@ pub(super) async fn discover_candidates(
         });
     }
     let bootstrap = crate::discovery::bootstrap_nodes(
-        &chain.rpc_url,
+        &chain.governance.rpc_url,
         capacity_bond,
         &site.data_dir,
         discovery.registry_timeout,
@@ -1374,8 +1376,9 @@ fn invites_rerun(err: &anyhow::Error) -> bool {
         || err.downcast_ref::<FundingNeeded>().is_some()
 }
 
-/// One run's result from its `first` pass, which a pool replacement ended,
-/// and its `second` pass against the new pool. Both passes walk the same
+/// One run's result from its `first` pass and its `second` pass: against a
+/// pool a replacement opened, or on the next pool of the route. Both passes
+/// walk the same
 /// entries in the same order, so an entry the first pass landed and the
 /// second found present keeps the first pass's outcome, and so does any
 /// entry the second did not run; every other entry takes the second's. The two transfers add up.
@@ -1680,6 +1683,80 @@ pub(super) enum RunPayer {
     Delegated(CredentialSlot),
 }
 
+/// One payment pool a bundle run pays through in a pass (ADR 005 § Payment
+/// pool routing), and what the run's lanes on it share. A pool id is unique
+/// only inside one `PaymentPool` contract, so lanes, funding facts and the
+/// recovery gate never cross pools.
+pub(super) struct PassPool<P: Provider + Clone> {
+    /// The pool's contract and its payment chain's RPC endpoint.
+    pub(super) pool: PaymentPoolChain,
+    pub(super) contract: PaymentPool::PaymentPoolInstance<P>,
+    pub(super) rpc: P,
+    /// The pool's settlement token (USDC), read once via `PaymentPool.usdc()`.
+    pub(super) token: Address,
+    pub(super) voucher_dom: Eip712Domain,
+    /// The per-lane voucher ledgers (ADR 039): every entry and chunk on a
+    /// `(pool_id, signer, provider)` lane draws on one monotonic issuer, so
+    /// concurrent same-lane fetches never race the cumulative watermark.
+    pub(super) ledgers: LaneLedgers,
+    /// The funding facts ([`RunFunding`]): the pool's spend outside the
+    /// run's lanes, and a wallet too short of USDC to top it up.
+    pub(super) funding: RunFunding,
+    /// The funding recovery gate (ADR 003 § Funding recovery). A bundle pull
+    /// is one fetch for every entry, so its entries share one progress rule
+    /// on the pool, and so does the pass that runs the remaining entries
+    /// again against a replaced pool.
+    pub(super) recovery: Arc<RecoveryGate>,
+}
+
+impl<P: Provider + Clone> PassPool<P> {
+    /// The pool `pool`, reached through `rpc`, whose token is `token`, with
+    /// fresh lanes and recovery gate, reporting its escrows to `escrows`.
+    pub(super) fn new(
+        pool: PaymentPoolChain,
+        rpc: P,
+        token: Address,
+        escrows: &UnconfirmedEscrows,
+    ) -> Self {
+        let deployment = pool.deployment;
+        Self {
+            contract: PaymentPool::new(deployment.payment_pool, rpc.clone()),
+            rpc,
+            token,
+            voucher_dom: deployment.voucher_domain(),
+            ledgers: LaneLedgers::new(),
+            funding: RunFunding::reporting_escrows_to(escrows.for_pool(deployment)),
+            recovery: Arc::new(RecoveryGate::new()),
+            pool,
+        }
+    }
+}
+
+/// Builds the provider of a payment pool's chain ([`PullCtx::connect`]).
+pub(super) type Connect<P> = Box<dyn Fn(&PaymentPoolChain) -> anyhow::Result<P> + Send + Sync>;
+
+/// What one pass of a pull ([`PullCtx::pool_pass`]) ran: its entries, the
+/// pool replacement its rerun ran against, and the bytes it paid for and
+/// received on the wire.
+struct PassRun {
+    run: PullRun,
+    rerun: Option<PoolReplaced>,
+    paid: alloy::primitives::U256,
+    wire: u64,
+}
+
+/// Whether a pass left work for a pass on another pool: an entry failed or
+/// did not run, or a fault ended it. An interrupted pass leaves none: its
+/// caller stopped the pull.
+fn leaves_work(run: &PullRun) -> bool {
+    !run.interrupted
+        && (run.stopped.is_some()
+            || run
+                .outcomes
+                .iter()
+                .any(|o| matches!(o, EntryOutcome::Failed { .. } | EntryOutcome::NotRun)))
+}
+
 /// The run's state, shared by the entry fetch loop. Borrowed by every
 /// in-flight entry future, and every entry must be polled on one task, as
 /// `buffer_unordered` does: each entry reads its lanes' ledgers and queues
@@ -1688,16 +1765,28 @@ pub(super) enum RunPayer {
 pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) endpoint: Endpoint,
     pub(super) store: Arc<dyn BuyerPoolStore>,
-    pub(super) contract: PaymentPool::PaymentPoolInstance<P>,
-    pub(super) rpc: P,
     /// The keys every entry's lanes sign under.
     pub(super) payer: RunPayer,
     pub(super) self_address: Address,
-    /// The pool's settlement token (USDC), read once via `PaymentPool.usdc()`.
-    pub(super) token: Address,
-    pub(super) voucher_dom: Eip712Domain,
     pub(super) slash_dom: Eip712Domain,
     pub(super) chain: ChainConfig,
+    /// The payment pool the current pass pays through, with its lanes,
+    /// funding facts and recovery gate. The first pass pays through the first
+    /// pool of the buyer's route
+    /// ([`PoolRoute::for_buyer`](crate::pool_route::PoolRoute::for_buyer)).
+    pub(super) pass: PassPool<P>,
+    /// The pools of earlier passes, by contract, kept for their recovery
+    /// gates and funding facts, and for a later pass on the same pool.
+    pub(super) parked: HashMap<Deployment, PassPool<P>>,
+    /// Builds the provider of a pool a later pass pays through.
+    pub(super) connect: Connect<P>,
+    /// The escrow handle every pool's funding facts report to
+    /// ([`UnconfirmedEscrows::for_pool`]).
+    pub(super) escrows: UnconfirmedEscrows,
+    /// The run's routing of each node to a pool: a pass pays only the nodes
+    /// routed to [`Self::pass`]'s pool. Each manifest fetch and each pull
+    /// starts its passes afresh.
+    pub(super) passes: PoolPasses,
     pub(super) site: PullSite,
     pub(super) relays: Vec<RelayUrl>,
     /// The node every entry is pinned to, or every active registered node for
@@ -1717,24 +1806,11 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// the namespace as a big-endian `uint256`; `NO_NAMESPACE` when the
     /// caller names none.
     pub(super) namespace_id: [u8; 32],
-    /// The run's shared per-lane voucher ledgers (ADR 039): every entry and
-    /// chunk on a `(pool_id, signer, provider)` lane draws on one monotonic
-    /// issuer, so concurrent same-lane fetches never race the cumulative
-    /// watermark.
-    pub(super) ledgers: LaneLedgers,
-    /// The run's funding facts ([`RunFunding`]): the pool's spend
-    /// outside the run's lanes, and a wallet too short of USDC to top it up.
-    pub(super) funding: RunFunding,
-    /// The run's funding recovery gate (ADR 003 § Funding recovery). A bundle
-    /// pull is one fetch for every entry, so its entries share one progress
-    /// rule, and so does the pass that runs the remaining entries again
-    /// against a replaced pool.
-    pub(super) recovery: Arc<RecoveryGate>,
     /// Run-scoped range-dedup counters (bytes spliced from disk, hints dropped by
     /// a fault), accumulated by every entry and reported once the pull finishes.
     pub(super) dedup_stats: DedupStats,
-    /// Serializes every pool open-or-reuse across the whole bundle. The
-    /// bundle's every entry shares ONE `PaymentPool` deposit (ADR 003), so
+    /// Serializes every pool open-or-reuse across the whole bundle. A pass's
+    /// every entry shares ONE `PaymentPool` deposit (ADR 003), so
     /// distinct providers cannot open concurrently: its on-chain state (deposit,
     /// standing USDC allowance) is one resource regardless of which provider an
     /// entry is bound for. Taken around the whole open-or-reuse call (which may
@@ -1792,12 +1868,14 @@ impl<P: Provider + Clone> PullCtx<P> {
             marks: None,
             endpoint: &self.endpoint,
             store: &self.store,
-            contract: &self.contract,
-            rpc: &self.rpc,
+            contract: &self.pass.contract,
+            rpc: &self.pass.rpc,
             slash_dom: &self.slash_dom,
             self_address: self.self_address,
-            token: self.token,
+            token: self.pass.token,
             chain: &self.chain,
+            pool: &self.pass.pool,
+            passes: &self.passes,
             site: &self.site,
             deposit: self.deposit,
             // The bundle-level namespace (ADR 002): routes any cache-miss origin
@@ -1814,7 +1892,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             deadlines: PullDeadlines::new(STALL_WINDOW, STALL_WINDOW, 0)?,
             connections: &self.connections,
             writes: &self.writes,
-            funding: &self.funding,
+            funding: &self.pass.funding,
             evidence: self.evidence.as_deref(),
         })
     }
@@ -1874,12 +1952,12 @@ impl<P: Provider + Clone> PullCtx<P> {
         };
         crate::funding::discovery_ctx(
             self.store.as_ref(),
-            &self.contract,
+            &self.pass.contract,
             payer,
-            &self.chain,
+            (&self.chain.governance, self.pass.pool.deployment),
             &self.endpoint,
-            &self.voucher_dom,
-            self.funding.pool_id(),
+            &self.pass.voucher_dom,
+            self.pass.funding.pool_id(),
         )
         .await
         .map_err(|err| {
@@ -1929,8 +2007,17 @@ impl<P: Provider + Clone> PullCtx<P> {
                 .await)
             }
             Selection::Registry(registry) => {
-                // The entry's round streams: its fetch starts at the first
-                // verified holder, and the holders that answer later join it.
+                // With one pool, the entry's round streams: its fetch starts
+                // at the first verified holder, and the holders that answer
+                // later join it. With several pools, the round settles first,
+                // so an entry whose holders all take another pool sees each
+                // of them, and leaves the entry to that pool's pass
+                // ([`Self::acquire_entry`]).
+                let round = if self.passes.route().order().len() > 1 {
+                    OpenRound::Settle
+                } else {
+                    OpenRound::Stream
+                };
                 let candidates = registry.entry_candidates(&self.site);
                 let targets = open_and_order(
                     &candidates,
@@ -1939,13 +2026,31 @@ impl<P: Provider + Clone> PullCtx<P> {
                     spec,
                     self.discovery.proxy_warming,
                     &self.slash_dom,
-                    OpenRound::Stream,
+                    round,
                 )
                 .await?;
                 self.record_rates(&targets.samples);
                 Ok(targets)
             }
         }
+    }
+
+    /// Whether a holder in `targets` is routed to a pool other than the
+    /// current pass's ([`crate::pool_route::PoolRoute::choose`]): the entry
+    /// then waits for that pool's pass rather than for a holder this pass
+    /// can pay.
+    fn routed_elsewhere(&self, targets: &ResolvedTargets) -> bool {
+        let pass = self.pass.pool.deployment;
+        targets.candidates.iter().any(|candidate| {
+            let hint = targets
+                .pool_hints
+                .get(&candidate.node_id)
+                .map(Vec::as_slice);
+            self.passes
+                .route()
+                .choose(hint)
+                .is_some_and(|chosen| chosen != pass)
+        })
     }
 
     /// Keep each `(node_id, rtt_ms, rate_per_mb)` sample, at the lowest RTT
@@ -2030,13 +2135,19 @@ impl<P: Provider + Clone> PullCtx<P> {
                 RunPayer::Delegated(slot) => LanePayer::Delegated(slot),
                 RunPayer::Owned(payer) => LanePayer::Owned(payer),
             },
-            &self.voucher_dom,
+            &self.pass.voucher_dom,
             Some(&self.open_lock),
-            Some(&self.ledgers),
+            Some(&self.pass.ledgers),
             Some(&self.lane_cap),
-            &self.recovery,
+            &self.pass.recovery,
         );
         let holders = sources.holders_from(targets);
+        if holders.is_empty() && self.routed_elsewhere(targets) {
+            return Err(anyhow!(
+                "every holder of this entry takes payment through another pool; that pool's \
+                 pass fetches it"
+            ));
+        }
         // A fetch dropped by a cancel, or still running [`GROUP_DRAIN`] after
         // a sibling's command-wide fault ([`run_groups`]), queues every lane's
         // vouchers for recording too.
@@ -2056,7 +2167,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             let mut downloader = Downloader::new(&sources, sources.funder())
                 .holders(holders)
                 .health(Arc::clone(&self.health))
-                .recovery(Arc::clone(&self.recovery))
+                .recovery(Arc::clone(&self.pass.recovery))
                 .max_lanes(self.discovery.max_sources)
                 .max_blob_bytes(max_blob_bytes)
                 .run_demand(Arc::clone(&self.demand));
@@ -2070,7 +2181,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                     dest: staging,
                     ranges,
                 }],
-                &self.ledgers,
+                &self.pass.ledgers,
                 progress,
                 stop,
             ))
@@ -2090,20 +2201,21 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// `use_cache` allows and one is cached, else fetched through the run's
     /// acquire loop and cached. A cache file that cannot be read, or fails its
     /// hash check, is fail-open: the observer gets the warning and the run
-    /// fetches. A failed cache write is a warning too.
+    /// fetches. A failed cache write is a warning too. The fetch runs one
+    /// pass per pool that a holder is routed to, as a single-blob fetch does
+    /// ([`Self::fetch_manifest_bytes`]).
     pub(super) async fn fetch_manifest(
-        &self,
+        &mut self,
         hash: [u8; 32],
         out_root: &Path,
         use_cache: bool,
     ) -> anyhow::Result<super::BundleManifest> {
-        let bytes = if let Some(cached) =
-            cached_manifest(out_root, hash, use_cache, |warning| self.warn(warning))
-        {
+        let cached = cached_manifest(out_root, hash, use_cache, |warning| self.warn(warning));
+        let bytes = if let Some(cached) = cached {
             cached
         } else {
             let fetched = self
-                .fetch_to_memory(hash, out_root)
+                .fetch_manifest_bytes(hash, out_root)
                 .await
                 .map_err(manifest_fetch_error)?;
             if let Some(warning) = manifest_cache::store(out_root, hash, &fetched) {
@@ -2124,16 +2236,117 @@ impl<P: Provider + Clone> PullCtx<P> {
         }
     }
 
+    /// Every pool replacement the run's funding recovery steps made, on every
+    /// pool a pass paid through ([`RecoveryGate::replacements`]).
+    pub(super) fn replacements(&self) -> Vec<PoolReplaced> {
+        std::iter::once(&self.pass)
+            .chain(self.parked.values())
+            .flat_map(|pass| pass.recovery.replacements())
+            .collect()
+    }
+
+    /// The warning for a wallet seen to hold too little USDC to top a pool
+    /// up, one per pool that saw one.
+    pub(super) fn funding_shortfalls(&self) -> Vec<String> {
+        std::iter::once(&self.pass)
+            .chain(self.parked.values())
+            .filter_map(|pass| pass.funding.shortfall())
+            .collect()
+    }
+
+    /// Start the passes of a manifest fetch or a pull afresh, on the current
+    /// pool: no node has taken its one retry yet (ADR 005 § Payment pool
+    /// routing).
+    fn restart_passes(&mut self) {
+        self.passes = PoolPasses::new(self.passes.route().clone());
+        self.passes.start(self.pass.pool.deployment);
+    }
+
+    /// Move the run onto pool `next` for the next pass. A pool an earlier
+    /// pass paid through comes back with its lanes and funding facts; a new
+    /// one is connected and its token read. The pool it leaves is parked.
+    ///
+    /// # Errors
+    ///
+    /// `next` is not configured, its provider cannot be built, or its token
+    /// read fails. The run stays on its current pool.
+    async fn switch_pool(&mut self, next: Deployment) -> anyhow::Result<()> {
+        if self.pass.pool.deployment == next {
+            return Ok(());
+        }
+        let pass = if let Some(pass) = self.parked.remove(&next) {
+            pass
+        } else {
+            let pool =
+                self.chain.pool(next).cloned().ok_or_else(|| {
+                    anyhow!("payment pool {} is not configured", next.pool_account())
+                })?;
+            let rpc = (self.connect)(&pool)?;
+            let token = PaymentPool::new(next.payment_pool, rpc.clone())
+                .usdc()
+                .call()
+                .await
+                .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
+            PassPool::new(pool, rpc, token, &self.escrows)
+        };
+        let left = std::mem::replace(&mut self.pass, pass);
+        self.parked.insert(left.pool.deployment, left);
+        self.passes.start(next);
+        Ok(())
+    }
+
+    /// The manifest blob `hash`, fetched into memory: one pass per pool that
+    /// a holder is routed to, as a single-blob fetch runs them. A fault ends
+    /// the pass, and the next pool's pass tries the holders routed to it. A
+    /// pool replacement ends the fetch: the pull that follows pays from the
+    /// new pool.
+    async fn fetch_manifest_bytes(
+        &mut self,
+        hash: [u8; 32],
+        out_root: &Path,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.restart_passes();
+        loop {
+            let err = match self.fetch_to_memory(hash, out_root).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(err) => err,
+            };
+            if err.downcast_ref::<PoolReplaced>().is_some() {
+                return Err(err);
+            }
+            let Some(next) = self.passes.next() else {
+                return Err(err);
+            };
+            tracing::info!(
+                failed_pool = %self.pass.pool.deployment.pool_account(),
+                next_pool = %next.pool_account(),
+                error = %sanitize_err_chain(&err),
+                "the manifest fetch on this payment pool ended; it goes on with the nodes \
+                 that take payment through the next pool"
+            );
+            if let Err(switch) = self.switch_pool(next).await {
+                return Err(err.context(format!(
+                    "the next payment pool cannot be used: {}",
+                    sanitize_err_chain(&switch)
+                )));
+            }
+        }
+    }
+
     /// Pull every entry of `manifest` into `out_root`, and say how it ended.
     ///
-    /// A funding recovery step that replaced the pool ends the first pass. The
-    /// remaining entries run once more against the new pool: lanes key on the
-    /// pool, so the pass starts with fresh ledgers and funding facts, and each
-    /// entry resumes the partial data it holds (ADR 003 § Funding recovery). A
-    /// second replacement that ends the pass against the new pool ends the
-    /// pull "funding needed". A replacement that did not end the first pass
-    /// runs nothing again ([`replaced_pool`]). The outcome lists every
-    /// replacement the pull made, a second one too.
+    /// The pull runs one pass per pool that an entry's holder is routed to
+    /// (ADR 005 § Payment pool routing). A pass that leaves work
+    /// ([`leaves_work`]) hands it to the next pool's pass: a node routed to
+    /// that pool, or one that refused a pool as `Declined` and named that
+    /// one, is paid there. Every pass walks every entry: a file an earlier
+    /// pass completed is skipped, `overwrite` or not, and a partial file
+    /// resumes.
+    ///
+    /// Inside a pool's pass, a funding recovery step that replaced the pool
+    /// ends it, and the remaining entries run once more against the new pool
+    /// ([`Self::pool_pass`]). The outcome lists every replacement the pull
+    /// made, on every pool.
     pub(super) async fn run(
         &mut self,
         manifest: &super::BundleManifest,
@@ -2151,53 +2364,56 @@ impl<P: Provider + Clone> PullCtx<P> {
         if let Some(observer) = &self.observer {
             observer.run_started(planned, total_content_bytes(entries));
         }
-        // Loaded once per pass: the pre-pass skip decisions consult it, and it
-        // seeds the incremental skip-cache flush inside `pull_all` — a run's
-        // completed files are folded onto this prior and rewritten as the pull
-        // progresses, so an interrupted pull leaves the files it landed
-        // recorded rather than losing the whole index. The skip-cache is
-        // advisory, so a flush failure is logged (inside the flush) and never
-        // fails the pull.
-        let saved = skip_cache::load(out_root);
-        leave_carried_replacement(&self.recovery, &mut self.ledgers, &mut self.funding);
-        // The replacements this pull's steps make are the gate's from here on.
-        let replaced_before = self.recovery.replacements().len();
-        // The lanes outlive one pull (a manifest fetch or an earlier pull of
-        // this puller drew on them), so this pull's payment is what the
-        // lanes' paid bytes grew by while it ran. Its wire bytes are what the
-        // lanes' wire bytes grew by, measured the same way.
-        let paid_before = self.ledgers.paid_bytes();
-        let wire_before = self.ledgers.wire_bytes();
-        // A halt lasts one pass ([`run_groups`]). Clear it as each pass starts
-        // and ends, so it halts neither the next pass, nor a later manifest
-        // fetch or pull of this puller, nor a pull after one its caller
-        // dropped mid-pass.
-        self.stop = self.stop.next_pass();
-        let mut run = self
-            .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
+        // The replacements this pull's steps make are the ones not listed
+        // before it.
+        let replaced_before = self.replacements();
+        self.restart_passes();
+        let mut pass = self
+            .pool_pass(entries, bundle, out_root, overwrite, cancel)
             .await;
-        self.stop = self.stop.next_pass();
-        let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
-        let mut wire = self.ledgers.wire_bytes().saturating_sub(wire_before);
-        let rerun = replaced_pool(&run);
-        if let Some(new) = rerun {
-            if let Some(observer) = &self.observer {
-                observer.pool_replaced(&new);
+        while leaves_work(&pass.run) {
+            let Some(next) = self.passes.next() else {
+                break;
+            };
+            tracing::info!(
+                failed_pool = %self.pass.pool.deployment.pool_account(),
+                next_pool = %next.pool_account(),
+                "the pass on this payment pool left entries; the pull goes on with the nodes \
+                 that take payment through the next pool"
+            );
+            if let Err(err) = self.switch_pool(next).await {
+                let err = err.context(format!(
+                    "the pull cannot go on through payment pool {}",
+                    next.pool_account()
+                ));
+                match &pass.run.stopped {
+                    Some(_) => tracing::warn!(
+                        error = %sanitize_err_chain(&err),
+                        "the next payment pool cannot be used"
+                    ),
+                    None => pass.run.stopped = Some(err),
+                }
+                break;
             }
-            // Every lane in the fresh registry is built during this pass: its
-            // paid bytes count from its seed and its wire bytes from zero, so
-            // the second pass's payment and wire bytes are the new registry's
-            // whole totals.
-            start_pass_on_new_pool(&self.recovery, &mut self.ledgers, &mut self.funding);
-            let saved = skip_cache::load(out_root);
-            let second = self
-                .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
+            // The first pass already wrote every file it landed and recorded
+            // it in the skip-cache, so a later pass skips it even under
+            // `overwrite`.
+            let later = self
+                .pool_pass(entries, bundle, out_root, false, cancel)
                 .await;
-            self.stop = self.stop.next_pass();
-            run = merge_passes(run, second);
-            paid = paid.saturating_add(self.ledgers.paid_bytes());
-            wire = wire.saturating_add(self.ledgers.wire_bytes());
+            pass = PassRun {
+                run: merge_passes(pass.run, later.run),
+                rerun: later.rerun,
+                paid: pass.paid.saturating_add(later.paid),
+                wire: pass.wire.saturating_add(later.wire),
+            };
         }
+        let PassRun {
+            run,
+            rerun,
+            paid,
+            wire,
+        } = pass;
         let PullRun {
             outcomes,
             mut warnings,
@@ -2205,19 +2421,18 @@ impl<P: Provider + Clone> PullCtx<P> {
             interrupted,
             stopped,
         } = run;
-        warnings.extend(self.funding.shortfall());
+        warnings.extend(self.funding_shortfalls());
         // Every entry has joined, so the shared dedup counters are now stable.
         let dedup = self.dedup_stats.take();
         let mut report = bundle_report(&outcomes, transfer, dedup, warnings);
         report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
         report.wire_bytes = wire;
         let replaced = self
-            .recovery
             .replacements()
-            .get(replaced_before..)
-            .unwrap_or_default()
-            .to_vec();
-        let escrows = self.funding.escrows();
+            .into_iter()
+            .filter(|made| !replaced_before.contains(made))
+            .collect();
+        let escrows = &self.escrows;
         let end = pull_end(
             interrupted,
             stopped,
@@ -2229,6 +2444,78 @@ impl<P: Provider + Clone> PullCtx<P> {
             report,
             end,
             replaced,
+        }
+    }
+
+    /// One pass of a pull on the current pool: every entry of `entries`.
+    ///
+    /// A funding recovery step that replaced the pool ends the pass. The
+    /// remaining entries run once more against the new pool: lanes key on the
+    /// pool, so that rerun starts with fresh ledgers and funding facts, and
+    /// each entry resumes the partial data it holds (ADR 003 § Funding
+    /// recovery). A second replacement that ends the rerun ends the pull
+    /// "funding needed". A replacement that did not end the pass runs nothing
+    /// again ([`replaced_pool`]).
+    async fn pool_pass(
+        &mut self,
+        entries: &[ManifestEntry],
+        bundle: [u8; 32],
+        out_root: &Path,
+        overwrite: bool,
+        cancel: &CancellationToken,
+    ) -> PassRun {
+        // Loaded once per pass: the pre-pass skip decisions consult it, and it
+        // seeds the incremental skip-cache flush inside `pull_all` — a run's
+        // completed files are folded onto this prior and rewritten as the pull
+        // progresses, so an interrupted pull leaves the files it landed
+        // recorded rather than losing the whole index. The skip-cache is
+        // advisory, so a flush failure is logged (inside the flush) and never
+        // fails the pull.
+        let saved = skip_cache::load(out_root);
+        let pass = &mut self.pass;
+        leave_carried_replacement(&pass.recovery, &mut pass.ledgers, &mut pass.funding);
+        // The lanes outlive one pull (a manifest fetch or an earlier pull of
+        // this puller drew on them), so this pass's payment is what the
+        // lanes' paid bytes grew by while it ran. Its wire bytes are what the
+        // lanes' wire bytes grew by, measured the same way.
+        let paid_before = pass.ledgers.paid_bytes();
+        let wire_before = pass.ledgers.wire_bytes();
+        // A halt lasts one pass ([`run_groups`]). Clear it as each pass starts
+        // and ends, so it halts neither the next pass, nor a later manifest
+        // fetch or pull of this puller, nor a pull after one its caller
+        // dropped mid-pass.
+        self.stop = self.stop.next_pass();
+        let mut run = self
+            .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
+            .await;
+        self.stop = self.stop.next_pass();
+        let mut paid = self.pass.ledgers.paid_bytes().saturating_sub(paid_before);
+        let mut wire = self.pass.ledgers.wire_bytes().saturating_sub(wire_before);
+        let rerun = replaced_pool(&run);
+        if let Some(new) = rerun {
+            if let Some(observer) = &self.observer {
+                observer.pool_replaced(&new);
+            }
+            // Every lane in the fresh registry is built during this rerun: its
+            // paid bytes count from its seed and its wire bytes from zero, so
+            // the rerun's payment and wire bytes are the new registry's whole
+            // totals.
+            let pass = &mut self.pass;
+            start_pass_on_new_pool(&pass.recovery, &mut pass.ledgers, &mut pass.funding);
+            let saved = skip_cache::load(out_root);
+            let second = self
+                .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
+                .await;
+            self.stop = self.stop.next_pass();
+            run = merge_passes(run, second);
+            paid = paid.saturating_add(self.pass.ledgers.paid_bytes());
+            wire = wire.saturating_add(self.pass.ledgers.wire_bytes());
+        }
+        PassRun {
+            run,
+            rerun,
+            paid,
+            wire,
         }
     }
 

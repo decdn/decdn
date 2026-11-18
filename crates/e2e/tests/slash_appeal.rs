@@ -10,7 +10,8 @@
 //!    sized from the other operators' bytes, so B needs A's in the window.
 //! 2. Slash A through a **real** `SlashJudge` blacklist-violation commit-reveal
 //!    challenge.
-//! 3. Assert A's daemon surfaces the slash over `admin_v1_slashes`.
+//! 3. Restart A's daemon and assert it surfaces the slash over
+//!    `admin_v1_slashes`.
 //! 4. File the appeal through the **`decdn appeal slash` CLI** (posts the bond),
 //!    the emergency multisig fast-tracks, and a **real Governor proposal**
 //!    (propose → vote → queue → timelock → execute) grants it.
@@ -115,17 +116,23 @@ async fn run() -> anyhow::Result<()> {
     // zeroed by the slash regardless. Declared here, before the age warp and
     // the serve below, so the `declareMbps` checkpoint precedes the served
     // epoch's end (the cap samples `declaredMbpsAtEpoch` at that boundary).
+    //
+    // A declares too: a received sweep credits `FeeRouter`'s epoch counter
+    // only up to the operator's declared capacity, and B's vote cap is sized
+    // from A's credited bytes.
     let declare_target = chain
         .min_bond()
         .await?
         .max(chain.bond_required(FLOOR_MBPS).await?);
-    let active = chain.active_bond(node_b.operator_addr()).await?;
-    if declare_target > active {
-        chain
-            .transfer_token(node_b.operator_addr(), declare_target - active)
-            .await?;
+    for node in [&node_a, &node_b] {
+        let active = chain.active_bond(node.operator_addr()).await?;
+        if declare_target > active {
+            chain
+                .transfer_token(node.operator_addr(), declare_target - active)
+                .await?;
+        }
+        run_node_cli(node, &["bond", "--mbps", &FLOOR_MBPS.to_string()])?;
     }
-    run_node_cli(&node_b, &["bond", "--mbps", &FLOOR_MBPS.to_string()])?;
 
     // ---- Age the chain past the ~180-day vote-weight ramp so B's weight is at
     // full strength once it has served bytes.
@@ -138,30 +145,64 @@ async fn run() -> anyhow::Result<()> {
         .fetch(&chain, &node_b, hash_b, alloy::primitives::U256::ZERO)
         .await?;
     assert_eq!(outcome.bytes, payload, "B must deliver the blob");
+    // A node redeems a stream's vouchers in more than one batch, so wait for
+    // the whole blob: a sweep of a partial redemption leaves the rest to a
+    // later batch, which skews the two operators' credit.
+    let whole = U256::from(payload.len());
     let served = poll(Duration::from_secs(120), || async {
         let b = chain.served_bytes(node_b.operator_addr()).await?;
-        Ok((b > U256::ZERO).then_some(b))
+        Ok((b >= whole).then_some(b))
     })
-    .await?;
-    assert!(served.is_some(), "B's on-chain served-bytes never advanced");
+    .await?
+    .context("B's on-chain served-bytes never reached the whole blob")?;
+    // Vote weight reads `FeeRouter`'s epoch counter, which only a received
+    // sweep credits, so B's pending share is swept now, at what it holds.
+    chain.sweep(&[node_b.operator_addr()]).await?;
 
     // ---- A serves bytes too. The per-operator vote cap is sized from the
     // OTHER operators' bytes in the window (ADR 036), so B's weight needs bytes
-    // from someone else; a lone serving operator has a zero cap.
+    // from someone else; a lone serving operator has a zero cap. A's credit at
+    // least matches B's, so B's capped weight clears the 4% quorum.
     let outcome = client
         .fetch(&chain, &node_a, hash_a, alloy::primitives::U256::ZERO)
         .await?;
     assert_eq!(outcome.bytes, payload, "A must deliver the blob");
-    let served_a = poll(Duration::from_secs(120), || async {
+    poll(Duration::from_secs(120), || async {
         let a = chain.served_bytes(node_a.operator_addr()).await?;
-        Ok((a > U256::ZERO).then_some(a))
+        Ok((a >= served).then_some(a))
     })
-    .await?;
+    .await?
+    .context("A's on-chain served-bytes never reached B's")?;
+    // A sweeps through the real `decdn node sweep`, listing B as a batch
+    // partner. B's share was swept above, so the batch carries B only if B
+    // redeemed again since; A's share is always in it, first.
+    let swept = node_cli_json(
+        &node_a,
+        &[
+            "sweep",
+            "--with",
+            &format!("{:#x}", node_b.operator_addr()),
+            "--json",
+        ],
+    )?;
+    let pool_line = &swept[0];
+    assert_eq!(pool_line["outcome"], "swept", "{swept}");
+    let shares = pool_line["swept"].as_array().context("swept shares")?;
     assert!(
-        served_a.is_some(),
-        "A's on-chain served-bytes never advanced"
+        (1..=2).contains(&shares.len()),
+        "A alone, or A and B: {swept}"
     );
-
+    assert_eq!(
+        shares[0]["operator"].as_str().map(str::to_lowercase),
+        Some(format!("{:#x}", node_a.operator_addr())),
+        "{swept}"
+    );
+    let sweep_tx: B256 = pool_line["tx"]
+        .as_str()
+        .context("sweep tx")?
+        .parse()
+        .context("parse sweep tx")?;
+    chain.receive_sweep(sweep_tx).await?;
     // ---- Cross an epoch boundary so those bytes sit in a fully-elapsed epoch
     // inside the trailing window at the proposal snapshot.
     time::increase_time(chain.admin(), 8 * DAY).await?;
@@ -175,23 +216,12 @@ async fn run() -> anyhow::Result<()> {
         .slash_operator_via_judge(&challenger, node_a.operator(), a_node_id, blob_hash)
         .await?;
 
-    // ---- Layer 1 (daemon): A surfaces the slash over admin RPC.
+    // ---- Layer 1 (daemon): A surfaces the slash over admin RPC. The live
+    // refresh reads `operatorSlashCount` every 15 minutes, past this test's
+    // budget, so a restart drives the read: bootstrap rebuilds the in-memory
+    // store from the chain (#1032). From the new process's view, the slash was
+    // mined while it was down.
     let admin_a = node_a.admin_client()?;
-    let surfaced = poll(Duration::from_secs(30), || async {
-        let resp = admin_a.slashes().await.context("admin slashes")?;
-        Ok(resp
-            .slashes
-            .iter()
-            .any(|s| s.slash_id == slash_id.to_string())
-            .then_some(()))
-    })
-    .await?;
-    assert!(surfaced.is_some(), "A's daemon never surfaced the slash");
-
-    // ---- Restart regression (#1032): a fresh process must re-surface the slash
-    // by rebuilding its in-memory store from the SlashJudge floor scan, not
-    // silently drop it. From the new process's view, the slash was mined while
-    // it was down — the exact gap this guards against.
     node_a.restart().await?;
     let after_restart = poll(Duration::from_secs(30), || async {
         let resp = admin_a
@@ -351,6 +381,27 @@ fn run_node_cli(node: &NodeFixture, args: &[&str]) -> anyhow::Result<()> {
         args.join(" "),
     );
     Ok(())
+}
+
+/// Run `decdn node <args…>` like [`run_node_cli`] and parse its stdout as
+/// JSON.
+fn node_cli_json(node: &NodeFixture, args: &[&str]) -> anyhow::Result<serde_json::Value> {
+    let out = decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?
+        .arg("node")
+        .args(args)
+        .arg("--config")
+        .arg(node.config_path())
+        .output()
+        .context("spawn decdn node")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`decdn node {}` exited non-zero: {}\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    serde_json::from_slice(&out.stdout).context("parse `decdn node` JSON output")
 }
 
 /// Run the built `decdn appeal slash` command against the rendered config and

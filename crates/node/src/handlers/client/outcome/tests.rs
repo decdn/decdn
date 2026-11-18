@@ -47,6 +47,7 @@ fn export_one(end: ServeEnd) -> HashMap<String, String> {
     let req = StreamRequest {
         hash: [0xAB; 32],
         namespace_id: [0; 32],
+        payment_pool: decdn_protocol::PoolAccount::eip155(421_614, [0x34; 20]),
         pool_id: [0xCD; 32],
         byte_offset: 4096,
         byte_len: 8192,
@@ -160,6 +161,7 @@ const fn refusal_is_listed(reason: ServeRejectReason) {
     match reason {
         ServeRejectReason::Withdrawn
         | ServeRejectReason::CacheMiss
+        | ServeRejectReason::UnacceptedPool
         | ServeRejectReason::InternalError
         | ServeRejectReason::UnknownLane
         | ServeRejectReason::OwnerMismatch
@@ -186,10 +188,15 @@ const fn refusal_is_listed(reason: ServeRejectReason) {
 /// together they reach every name in `INBOUND_FAILURE_REASONS`. A completed
 /// end counts on none.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table of every failed end and its reason"
+)]
 fn every_failed_end_counts_on_exactly_one_listed_reason() {
     let refusals = [
         ServeRejectReason::Withdrawn,
         ServeRejectReason::CacheMiss,
+        ServeRejectReason::UnacceptedPool,
         ServeRejectReason::InternalError,
         ServeRejectReason::UnknownLane,
         ServeRejectReason::OwnerMismatch,

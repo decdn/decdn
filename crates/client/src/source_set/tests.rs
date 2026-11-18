@@ -32,6 +32,7 @@ fn non_holder(provider: Address, rtt_ms: f64) -> Holder {
 struct FakeProvider {
     discover: Mutex<Vec<anyhow::Result<Vec<Holder>>>>,
     faults: Mutex<Vec<Address>>,
+    pool_declines: Mutex<Vec<(Address, Vec<decdn_protocol::PoolAccount>)>>,
 }
 
 impl SourceProvider for FakeProvider {
@@ -57,13 +58,69 @@ impl SourceProvider for FakeProvider {
             f.push(holder.provider);
         }
     }
+    fn on_pool_declined(&self, holder: &Holder, accepted: &[decdn_protocol::PoolAccount]) {
+        if let Ok(mut d) = self.pool_declines.lock() {
+            d.push((holder.provider, accepted.to_vec()));
+        }
+    }
 }
 
 fn provider(discover: Vec<anyhow::Result<Vec<Holder>>>) -> FakeProvider {
     FakeProvider {
         discover: Mutex::new(discover),
         faults: Mutex::new(Vec::new()),
+        pool_declines: Mutex::new(Vec::new()),
     }
+}
+
+/// A `Declined` refusal of the request's payment pool, naming `accepted`.
+fn pool_declined(accepted: Vec<decdn_protocol::PoolAccount>) -> anyhow::Error {
+    let response = decdn_protocol::client::StreamResponse {
+        body: decdn_protocol::client::StreamResponseBody {
+            hash: [0; 32],
+            ok: false,
+            rate_per_mb: 1,
+            timestamp_us: 1,
+        },
+        slash_sig: vec![0; 65],
+    };
+    crate::UpstreamRefused::open(
+        response,
+        &decdn_protocol::StreamResponseExt::pool_declined(accepted),
+        &decdn_protocol::PoolAccount::eip155(1, [0xEE; 20]),
+    )
+}
+
+/// A node that refuses the payment pool leaves the blob, a partial holder
+/// too, and the provider hears the pools it named once.
+#[tokio::test(start_paused = true)]
+async fn a_pool_refusal_drops_the_node_and_names_its_pools() {
+    let p = provider(vec![]);
+    let partial = Holder {
+        coverage: Some(decdn_protocol::Coverage::from_block_indices(
+            2,
+            [0].into_iter(),
+        )),
+        ..holder(A, 10.0)
+    };
+    let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial]);
+    let accepted = vec![decdn_protocol::PoolAccount::eip155(8_453, [0xb1; 20])];
+    let now = Instant::now();
+    set.record_fault(A, &pool_declined(accepted.clone()), None, now, U256::ZERO);
+    assert!(
+        set.next_to_start(
+            now + Duration::from_secs(3_600),
+            U256::ZERO,
+            &HashSet::new()
+        )
+        .is_none()
+    );
+    let declines = p
+        .pool_declines
+        .lock()
+        .map(|d| d.clone())
+        .unwrap_or_default();
+    assert_eq!(declines, vec![(A, accepted)]);
 }
 
 fn candidate() -> anyhow::Result<StreamCandidate<ScriptedSource>> {

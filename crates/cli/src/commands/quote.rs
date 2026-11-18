@@ -40,7 +40,6 @@ use decdn_client::session::{PoolOpen, ProxyWarmingParams};
 use decdn_client::targets::ResolveConfigFault;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::{ClientFetchArgs, QuoteArgs};
-use decdn_incentive::CapabilityGrant;
 
 use super::bundle_pull::{self, human_bytes};
 use super::fetch;
@@ -205,7 +204,7 @@ pub(crate) struct QuoteHost {
     payer: fetch::Payer,
     /// The `--capability` delegation, when the quote pays from another
     /// owner's pool.
-    grant: Option<CapabilityGrant>,
+    delegation: Option<fetch::Delegation>,
 }
 
 impl QuoteHost {
@@ -222,9 +221,13 @@ impl QuoteHost {
         common: &ClientFetchArgs,
         config_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        let (host, grant) = fetch::FetchHost::open(common, config_path, false).await?;
-        let payer = fetch::Payer::keystore(grant.clone());
-        Ok(Self { host, payer, grant })
+        let (host, delegation) = fetch::FetchHost::open(common, config_path, false).await?;
+        let payer = fetch::Payer::keystore(delegation.clone());
+        Ok(Self {
+            host,
+            payer,
+            delegation,
+        })
     }
 
     /// Open the nodes for `plan`'s sampled blobs and price it. The nodes
@@ -288,7 +291,7 @@ impl QuoteHost {
             uri,
             bundle_pull::PullerBuyer {
                 chain: self.host.chain(),
-                grant: self.grant.as_ref(),
+                delegation: self.delegation.as_ref(),
                 store: &self.host.store(),
                 signer: Some(signer),
             },

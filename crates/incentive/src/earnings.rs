@@ -2,7 +2,7 @@
 //!
 //! Both producers of an [`EarningsResponse`] use these: the daemon over its
 //! own [`SettlementRecord`] rows, and `decdn node earnings --address` over
-//! rows it rebuilt from `FeeRouter.Settled` logs. One summer for both keeps the
+//! rows it rebuilt from chain logs. One summer for both keeps the
 //! two tables from drifting apart.
 //!
 //! [`EarningsResponse`]: decdn_common::admin::EarningsResponse

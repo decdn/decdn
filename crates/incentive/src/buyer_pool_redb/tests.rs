@@ -159,7 +159,7 @@ fn record_then_reuse_resumes_watermark_across_reopen() -> anyhow::Result<()> {
     // instead of re-signing stale totals (#940).
     let reopened = store(&dir)?;
     let got = reopened
-        .get_by_owner(s.owner)?
+        .get_by_owner(s.deployment, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("row vanished across reopen"))?;
     anyhow::ensure!(got == s, "watermark must resume across invocations");
     Ok(())
@@ -177,6 +177,10 @@ fn record_then_reuse_resumes_watermark_across_reopen() -> anyhow::Result<()> {
 /// watermark — so assert the resulting **row**, not just the outcome
 /// enum.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one assertion per delegated operation reads best in one place"
+)]
 fn store_delegates_every_op() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = store(&dir)?;
@@ -185,7 +189,7 @@ fn store_delegates_every_op() -> anyhow::Result<()> {
     // record + get_by_owner + load_all
     store.record(&s)?;
     anyhow::ensure!(
-        store.get_by_owner(s.owner)?.as_ref() == Some(&s),
+        store.get_by_owner(s.deployment, s.owner)?.as_ref() == Some(&s),
         "record/get"
     );
     anyhow::ensure!(store.load_all()?.pools.len() == 1, "load_all");
@@ -193,6 +197,7 @@ fn store_delegates_every_op() -> anyhow::Result<()> {
     // advance_progress
     anyhow::ensure!(
         store.advance_progress(
+            s.deployment,
             s.owner,
             s.pool_id,
             lane,
@@ -204,7 +209,7 @@ fn store_delegates_every_op() -> anyhow::Result<()> {
 
     // add_deposit
     anyhow::ensure!(
-        store.add_deposit(s.owner, s.pool_id, U256::from(7u64))?
+        store.add_deposit(s.deployment, s.owner, s.pool_id, U256::from(7u64))?
             == DepositOutcome::Added(s.deposit + U256::from(7u64)),
         "add_deposit"
     );
@@ -212,7 +217,7 @@ fn store_delegates_every_op() -> anyhow::Result<()> {
     // The outcomes above are all reachable with the U256 arguments
     // permuted; only the row proves each landed in its own field.
     let row = store
-        .get_by_owner(s.owner)?
+        .get_by_owner(s.deployment, s.owner)?
         .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
     let progress = row
         .lane_progress(lane)
@@ -235,19 +240,25 @@ fn store_delegates_every_op() -> anyhow::Result<()> {
 
     // forget_if_pool: wrong id leaves the row, right id deletes it.
     anyhow::ensure!(
-        !store.forget_if_pool(s.owner, PoolId::repeat_byte(0xee))?,
+        !store.forget_if_pool(s.deployment, s.owner, PoolId::repeat_byte(0xee))?,
         "forget_if_pool must not delete on a mismatched pool"
     );
-    anyhow::ensure!(store.get_by_owner(s.owner)?.is_some(), "row must survive");
     anyhow::ensure!(
-        store.forget_if_pool(s.owner, s.pool_id)?,
+        store.get_by_owner(s.deployment, s.owner)?.is_some(),
+        "row must survive"
+    );
+    anyhow::ensure!(
+        store.forget_if_pool(s.deployment, s.owner, s.pool_id)?,
         "forget_if_pool must delete on a match"
     );
-    anyhow::ensure!(store.get_by_owner(s.owner)?.is_none(), "row must be gone");
+    anyhow::ensure!(
+        store.get_by_owner(s.deployment, s.owner)?.is_none(),
+        "row must be gone"
+    );
 
     // forget
     store.record(&s)?;
-    store.forget(s.owner)?;
+    store.forget(s.deployment, s.owner)?;
     anyhow::ensure!(store.load_all()?.pools.is_empty(), "forget");
 
     // advance_delegate_progress + rebase_delegate_progress + delegate_lanes:

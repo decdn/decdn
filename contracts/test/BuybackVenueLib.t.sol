@@ -59,12 +59,16 @@ contract BuybackVenueLibTest is Test {
         });
     }
 
-    function test_steadySharesMatchAdr026Split() public pure {
-        uint256[3] memory shares = BuybackVenueLib.steadyShares();
-        assertEq(shares[0], 6000, "operator");
-        assertEq(shares[1], 3000, "buyback");
-        assertEq(shares[2], 1000, "treasury");
-        assertEq(shares[0] + shares[1] + shares[2], 10_000, "sums to 10_000 bps");
+    /// With the reference `operatorBps` of 6000, the steady split gives the
+    /// operator 60%, the buyback 30% and the treasury 10% of a redemption.
+    function test_steadySplitMatchesAdr026Shares() public pure {
+        (uint256 rebateBps, uint256 buybackBps) = BuybackVenueLib.steadySplit();
+        uint256 protocolShare = 10_000 - 6000;
+        uint256 operator = 6000 + (protocolShare * rebateBps) / 10_000;
+        uint256 buyback = (protocolShare * buybackBps) / 10_000;
+        assertEq(operator, 6000, "operator");
+        assertEq(buyback, 3000, "buyback");
+        assertEq(10_000 - operator - buyback, 1000, "treasury");
     }
 }
 

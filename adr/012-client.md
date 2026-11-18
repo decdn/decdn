@@ -159,7 +159,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 #### Trusted — the client relies on external guarantees
 
-- **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list.
+- **RPC endpoints:** The governance-chain RPC returns correct registry data. A compromised RPC can return a fabricated node list.
 - **Registry correctness:** The `CapacityBond` contract accurately reflects bonded operators. Enforced by EVM execution — trust in the chain, not any specific party.
 
 #### Not trusted — the client does not rely on these
@@ -197,7 +197,7 @@ running-low signal counts the recorded amount as earlier spend of the signer
 signal](039-multi-source-parallel-fetch.md#client-sdk-funding-signal)). `decdn pool`
 reads and writes `buyer-pools.redb`. A `decdn pool` command whose data dir holds any
 of the daemon's stores (`decdn_common::data_dir::DAEMON_STORE_FILES` — `buyer.redb`,
-`lanes.redb`, `settle.redb`, `checkpoint.redb`) is pointed at a node: it reports the
+`lanes.redb`, `settle.redb`) is pointed at a node: it reports the
 node's pools through the admin RPC (`decdn node pools`) and refuses to escrow into a
 store the node never reads. The daemon holds its lock only while it runs, so with the
 daemon stopped `decdn pool list` reads `buyer.redb` directly and marks the listing as
@@ -219,7 +219,7 @@ Default configuration:
 
 A client and a node share one schema (`decdn_common::config::FileConfig`), and `deny_unknown_fields`
 rejects only unknown keys, not node-only sections a client leaves unused. So a client needs no config
-of its own: `decdn config init --chain <name>` writes a ready-to-run file — chain id, RPC endpoint,
+of its own: `decdn config init --chain <name>` writes a ready-to-run file — chain ids, RPC endpoints,
 and contract addresses baked in from the shipped deployment manifest — and a client uses the same
 file the node does, ignoring `[cache]`, `[payment]`, and the bond. `decdn get` also reads every one
 of these values as a flag, so a client can run with no config file at all. The client-relevant shape,
@@ -227,9 +227,30 @@ in current schema terms:
 
 - `[identity]` — `data_dir` (holds the buyer payment-pool store and, by default, the ETH
   keystore) and an optional ISO 3166-1 alpha-2 `region`.
-- `[blockchain]` — `rpc_url`, `eth_keystore`, `chain_id`, plus the `payment_pool_address` /
-  `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
-  and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
+- `[blockchain]` — `eth_keystore`, the governance-chain set, and the payment chains. The
+  governance-chain set is the table's own keys: `rpc_url`, `chain_id`, `capacity_bond_address`,
+  and `slash_judge_address`. Each payment chain is one `[[blockchain.payment_chains]]` entry:
+  `rpc_url`, `chain_id`, and `payment_pools`, a list of one or more `PaymentPool` contract
+  addresses. The config names at least one entry, and no pool appears twice. The settlement token
+  is the `usdc()` of each pool, so the config does not name it. A client reads the registry from
+  the governance chain and pays on a payment chain ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
+  A client with pools on several payment chains lists one entry for each. For each
+  candidate node it picks a `PaymentPool` contract that is in its own list and in the
+  `payment_pools` hint of the node's answer, and it sets that contract as `payment_pool` in the
+  `StreamRequest` ([ADR 005 § Payment pool routing](005-protocol.md#payment-pool-routing)). Its
+  discovery opens name a pool on its most preferred contract, and every answer, a refusal
+  included, carries the hint. It prefers a contract
+  where it already holds a pool, and it gives a node with no hint the first contract in its list.
+  A node that refuses the contract lists its accepted contracts in the refusal, and the client
+  retries that node once on a listed contract in its own list. A fetch pays through one contract
+  per pass, so the nodes routed to another contract are paid in that contract's pass. A bundle
+  pull runs the same passes, and a pass does not fetch a file again that an earlier pass
+  completed. A delegated client pays only through the contract of its capability's pool. The
+  EIP-712 domain of a capability binds one contract. Under the domain of that contract only, the
+  owner signature recovers to the on-chain owner of the pool. The gateway and `decdn get
+  --capability` check the signature against each contract in the list and keep the first
+  contract where it matches. A capability that matches no contract in the list is refused.
+  The RPC URLs and keystore live here, **not** under `[network]`/`[keys]`.
 - `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery opens
   to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull
   applies it to each entry's candidate sample, with the same widening rule as a single fetch.

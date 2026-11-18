@@ -68,6 +68,10 @@ pub async fn node_dispatch(
         cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Lanes(c) => lanes(c, global_config).await,
         cli::NodeCommand::Earnings(e) => earnings(e, global_config).await,
+        cli::NodeCommand::Sweep(s) => crate::commands::sweep::sweep(s, global_config).await,
+        cli::NodeCommand::ReceiveSweeps(r) => {
+            crate::commands::sweep::receive_sweeps(r, global_config).await
+        }
         cli::NodeCommand::Slashes(s) => slashes(s, global_config).await,
         cli::NodeCommand::Pools(p) => pools(p, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
@@ -595,6 +599,7 @@ pub async fn earnings(
         let operator = chain_ctx::parse_nonzero_address(address, "--address")?;
         earnings_chain::run(args, operator, since_unix, global_config).await?
     } else {
+        refuse_pool_in_daemon_mode(&args.payment)?;
         anyhow::ensure!(
             args.timeout_ms > 0,
             "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
@@ -620,6 +625,18 @@ pub async fn earnings(
         let mut stdout = io::stdout().lock();
         write_earnings(&mut stdout, &resp, unix_now()).context("failed to write earnings")?;
     }
+    Ok(())
+}
+
+/// Refuse `--pool` without `--address`: the daemon's periods add up every
+/// pool it serves, and it prints one line per pool after them, so a pool
+/// filter there would leave its totals naming pools it hides.
+pub(crate) fn refuse_pool_in_daemon_mode(payment: &cli::PoolSelectArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        payment.pool.is_none(),
+        "--pool selects the pools of a chain scan and needs --address; the running node \
+         reports every pool it serves, one line per pool"
+    );
     Ok(())
 }
 
@@ -740,10 +757,48 @@ pub(crate) fn write_earnings(
             last.block_number,
         )?,
     }
-    match &resp.pending {
-        Some(pending) => write_pending(w, pending, now_unix),
-        None => Ok(()),
+    if let Some(pending) = &resp.pending {
+        write_pending(w, pending, now_unix)?;
     }
+    for pool in &resp.pools {
+        write_pool_earnings(w, pool)?;
+    }
+    Ok(())
+}
+
+/// One pool's line of [`write_earnings`]: what its settlements paid, and the
+/// protocol share it holds for `decdn node sweep`.
+fn write_pool_earnings(
+    w: &mut impl io::Write,
+    pool: &decdn_common::admin::PoolEarnings,
+) -> io::Result<()> {
+    let settled = &pool.settled;
+    let share = match &pool.protocol_share {
+        None => "protocol share unknown".to_owned(),
+        Some(share) => {
+            let ready = if share.pending_micro_usdc > 0
+                && share.pending_micro_usdc >= share.min_sweep_micro_usdc
+            {
+                "ready: decdn node sweep"
+            } else {
+                "below min sweep"
+            };
+            format!(
+                "protocol share {} USDC pending (min sweep {}; {ready})",
+                format_usdc(share.pending_micro_usdc),
+                format_usdc(share.min_sweep_micro_usdc),
+            )
+        }
+    };
+    writeln!(
+        w,
+        "pool {}: net {} USDC, gross {} USDC, {} over {} settlements; {share}",
+        pool.pool,
+        format_usdc(settled.net_micro_usdc),
+        format_usdc(settled.gross_micro_usdc),
+        human_bytes(settled.bytes_settled),
+        settled.settlements,
+    )
 }
 
 /// The daemon-mode pending lines of [`write_earnings`]: the redeemable total
@@ -863,12 +918,13 @@ fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result
     if resp.lanes.is_empty() {
         return writeln!(w, "(no open lanes)");
     }
-    // Fixed-column layout: lane preview | counterparty preview | voucher
-    // signer preview | nonce | outstanding | unredeemed | deposit |
-    // last-voucher age | eligible.
+    // Fixed-column layout: pool contract | lane preview | counterparty
+    // preview | voucher signer preview | nonce | outstanding | unredeemed |
+    // deposit | last-voucher age | eligible.
     writeln!(
         w,
-        "{:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} {:>12} ELIGIBLE",
+        "{:<22} {:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} {:>12} ELIGIBLE",
+        "POOL",
         "LANE",
         "COUNTERPARTY",
         "SIGNER",
@@ -887,6 +943,7 @@ fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result
 /// Render one lane as a fixed-column row. Split out so the column
 /// formatting stays in one place and the loop body reads as a single call.
 fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
+    let pool = short_pool(&c.pool);
     let lane = short_node_id(&c.pool_id);
     // The node names the pool owner only once its pool view has seen the pool;
     // say so rather than leave the column blank.
@@ -909,8 +966,8 @@ fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
     let eligible = if c.settlement_eligible { "yes" } else { "no" };
     writeln!(
         w,
-        "{lane:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {:>12} {last_voucher:>12} \
-         {eligible}",
+        "{pool:<22} {lane:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {:>12} \
+         {last_voucher:>12} {eligible}",
         c.last_nonce,
         format_usdc(c.outstanding_micro_usdc),
         format_usdc(c.unredeemed_micro_usdc),
@@ -1037,23 +1094,19 @@ fn write_slashes_table(w: &mut impl io::Write, resp: &SlashesResponse) -> io::Re
     }
     writeln!(
         w,
-        "{:<20} {:>6} {:>14} {:>10} {:>10} APPEAL_CLOSE",
-        "SLASH_ID", "TYPE", "AMOUNT", "BLOCK", "EVIDENCE",
+        "{:<20} {:>6} {:>14} {:>10} APPEAL_CLOSE",
+        "SLASH_ID", "TYPE", "AMOUNT", "EVIDENCE",
     )?;
     for s in &resp.slashes {
-        let block = s
-            .block_number
-            .map_or_else(|| "?".to_string(), |b| b.to_string());
         let close = s
             .appeal_window_close
             .map_or_else(|| "?".to_string(), |c| c.to_string());
         writeln!(
             w,
-            "{:<20} {:>6} {:>14} {:>10} {:>10} {close}",
+            "{:<20} {:>6} {:>14} {:>10} {close}",
             s.slash_id,
             s.offense_type,
             s.amount,
-            block,
             short_node_id(&s.evidence_hash),
         )?;
     }
@@ -1261,6 +1314,17 @@ fn port_from_config_file(
                 path.display()
             )),
         },
+    }
+}
+
+/// A `PaymentPool` CAIP-10 account as `<chainId>:<address preview>`, for a
+/// table column. Anything that is not `<namespace>:<chain>:<address>` passes
+/// through unchanged.
+fn short_pool(account: &str) -> String {
+    let mut parts = account.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(chain), Some(address)) => format!("{chain}:{}", short_node_id(address)),
+        _ => account.to_owned(),
     }
 }
 
@@ -1606,11 +1670,9 @@ async fn open_and_rank(
             )
         })?;
     let slash_judge = chain_ctx::parse_nonzero_address(&slash_judge_raw, "slash_judge_address")?;
-    let chain = decdn_client::session::ChainConfig {
+    let governance = decdn_client::session::GovernanceChain {
         rpc_url: resolved.rpc_url.clone(),
         chain_id: resolved.chain_id,
-        // No voucher is sent, so the voucher domain's contract is never used.
-        payment_pool: Address::ZERO,
         slash_judge,
         capacity_bond: Some(resolved.capacity_bond_address),
     };
@@ -1622,7 +1684,7 @@ async fn open_and_rank(
         candidates,
         &conns,
         relays.first(),
-        &chain,
+        &governance,
         Duration::from_millis(args.timeout_ms),
     )
     .await;
@@ -1638,12 +1700,15 @@ async fn open_and_rank(
 /// fetches nothing and nothing is paid.
 ///
 /// The opens name a throwaway payer: a key made for this run, an in-memory
-/// buyer store, and a placeholder pool. A node answers a miss that asks no
-/// pull-through before it checks the pool or the signer, so the lookup needs
-/// no keystore, no buyer store and no `PaymentPool`. The key still signs the
-/// identity binding under `chain`'s `CapacityBond`, as every open carries
-/// one. Each answer must verify against the candidate's registry address
-/// under `chain`'s `SlashJudge`. A candidate that cannot be reached
+/// buyer store, and a placeholder pool on a zero `PaymentPool` contract. A
+/// node checks the pool's contract against its own list and reads no chain
+/// for it: it refuses the placeholder `Declined` with the pools it accepts,
+/// or answers a miss that asks no pull-through before it checks the signer.
+/// Either answer is signed, so the lookup needs no keystore, no buyer store
+/// and no `PaymentPool`. The key still signs the identity binding under
+/// `governance`'s `CapacityBond`, as every open carries one. Each answer must
+/// verify against the candidate's registry address under `governance`'s
+/// `SlashJudge`. A candidate that cannot be reached
 /// (offline, no route, timeout), or whose answer does not verify, is kept at
 /// the end with `rtt_ms: None` and a warning on stderr rather than dropped
 /// or failing the whole lookup — the point of `--probe` is to rank the
@@ -1652,17 +1717,22 @@ async fn rank_by_open(
     candidates: Vec<NodeCandidate>,
     conns: &decdn_client::Connections,
     relay: Option<&iroh::RelayUrl>,
-    chain: &decdn_client::session::ChainConfig,
+    governance: &decdn_client::session::GovernanceChain,
     timeout: Duration,
 ) -> anyhow::Result<Vec<LookupRow>> {
     let signer = std::sync::Arc::new(alloy::signers::local::PrivateKeySigner::random());
     let payer = decdn_client::buyer_pool::OwnedPayer::sole(std::sync::Arc::clone(&signer));
     let store = decdn_incentive::buyer_pool::MemoryBuyerPoolStore::new();
+    // No voucher is sent, so the placeholder contract is never called.
+    let placeholder_pool = decdn_incentive::Deployment {
+        chain_id: governance.chain_id,
+        payment_pool: Address::ZERO,
+    };
     let contract = decdn_incentive::payment_pool::PaymentPool::new(
-        chain.payment_pool,
-        decdn_client::provider::build_provider(&chain.rpc_url, &signer)?,
+        placeholder_pool.payment_pool,
+        decdn_client::provider::build_provider(&governance.rpc_url, &signer)?,
     );
-    let voucher_dom = decdn_incentive::voucher_domain(chain.chain_id, chain.payment_pool);
+    let voucher_dom = placeholder_pool.voucher_domain();
     // A known pool: the context reads no chain to name one.
     let placeholder =
         decdn_client::funding::predicted_pool_id(signer.address(), alloy::primitives::U256::ZERO);
@@ -1670,13 +1740,14 @@ async fn rank_by_open(
         &store,
         &contract,
         decdn_client::lanes::LanePayer::Owned(&payer),
-        chain,
+        (governance, placeholder_pool),
         conns.endpoint(),
         &voucher_dom,
         Some(placeholder),
     )
     .await?;
-    let slash_dom = decdn_incentive::slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let slash_dom =
+        decdn_incentive::slash_judge_domain(governance.chain_id, governance.slash_judge);
     let hash = lookup_sentinel();
     let mut rows = Vec::with_capacity(candidates.len());
     for c in candidates {

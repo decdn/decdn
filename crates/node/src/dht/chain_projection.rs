@@ -3,25 +3,20 @@
 //! Each of [`ChainStakerSet`](super::chain_staker_set::ChainStakerSet),
 //! [`ChainNodeAddressDirectory`](super::node_address::ChainNodeAddressDirectory),
 //! and [`ChainOriginDirectory`](super::chain_origin_directory::ChainOriginDirectory)
-//! caches chain state behind an `RwLock`, reads it on the hot path with
-//! poison-tolerant recovery, republishes a size gauge only on a *real* mutation,
-//! and owns the background watcher task that keeps the cache fresh. This module
-//! factors those three pieces out:
+//! caches chain state behind an `RwLock` and reads it on the hot path with
+//! poison-tolerant recovery. A refresh loop replaces the cache from a fresh
+//! chain snapshot. This module factors the shared pieces out:
 //!
 //! - [`with_read`] / [`with_write`] — the poison-recovery lock idiom, one
 //!   `warn!` site, `label` naming the projection.
 //! - [`with_lock`] — the same idiom for a `Mutex`: the DHT republish scheduler's
 //!   heap and its live-hash map, and the DHT routing table.
-//! - [`mutate_gauged`] — mutate under the write lock, sample the size while
-//!   still holding it, and republish the gauge only when the mutation actually
-//!   changed the set (a re-scanned `eth_getLogs` window replays no-ops).
 //! - [`ChainProjection`] — the façade-held bundle of the shared state, exposing
 //!   the read seam.
 //!
-//! The mutation helpers stay free functions over `&RwLock<T>` because the
-//! *sink* — which lives inside the shared poller task, so it cannot reach back
-//! into the [`ChainProjection`] — is what applies mutations, holding its own
-//! `Arc<RwLock<T>>` clone made in `bootstrap`.
+//! The write helper stays a free function over `&RwLock<T>` because the refresh
+//! loop, which cannot reach back into the [`ChainProjection`], applies each
+//! snapshot through its own `Arc<RwLock<T>>` clone made in `bootstrap`.
 
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -82,34 +77,9 @@ pub(crate) fn with_lock<T, R>(lock: &Mutex<T>, label: &str, f: impl FnOnce(&mut 
     }
 }
 
-/// Apply `mutate` under the write lock and republish a size gauge only on a real
-/// change. `mutate` returns `Some(sample)` when it actually changed the state
-/// (and the size to publish, sampled while the lock is held so the gauge never
-/// observes a torn view) or `None` for an idempotent no-op — a re-insert or an
-/// absent-remove, which a re-scanned `eth_getLogs` window produces routinely.
-/// Returns whether it mutated, mirroring the underlying collection op's bool.
-pub(super) fn mutate_gauged<T, S>(
-    state: &RwLock<T>,
-    label: &str,
-    mutate: impl FnOnce(&mut T) -> Option<S>,
-    gauge: impl FnOnce(S),
-) -> bool {
-    let sample = with_write(state, label, mutate);
-    match sample {
-        Some(sample) => {
-            gauge(sample);
-            true
-        }
-        None => false,
-    }
-}
-
 /// The shared state behind a chain-backed projection. Cheap to build via
-/// [`from_parts`](ChainProjection::from_parts). The background loop that keeps
-/// the state fresh is the single [`multiplexed_poller`] task the runtime owns
-/// and shuts down; the projection holds no per-watcher handle.
-///
-/// [`multiplexed_poller`]: crate::chain_events::multiplexed_poller
+/// [`from_parts`](ChainProjection::from_parts). The registry refresh loop
+/// writes the state; the projection only reads it.
 #[derive(Debug)]
 pub(super) struct ChainProjection<T> {
     state: Arc<RwLock<T>>,
@@ -117,7 +87,7 @@ pub(super) struct ChainProjection<T> {
 }
 
 impl<T> ChainProjection<T> {
-    /// Assemble from the state the sink also holds (created in `bootstrap`).
+    /// Assemble from the state the registry refresh also holds.
     pub(super) const fn from_parts(state: Arc<RwLock<T>>, label: &'static str) -> Self {
         Self { state, label }
     }

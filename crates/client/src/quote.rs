@@ -64,6 +64,10 @@ pub struct NodeAnswer {
     /// signed answer before the census keeps it, and empty exactly when
     /// `has_blob` is false, except for the empty blob, which has no block.
     pub coverage: decdn_protocol::Coverage,
+    /// The `PaymentPool` contracts the node accepts, from its answer's
+    /// `payment_pools` hint; `None` when it named none (ADR 005 § Payment
+    /// pool routing). Unsigned, like `coverage`.
+    pub payment_pools: Option<Vec<decdn_protocol::PoolAccount>>,
 }
 
 /// Every answer one hash got in a [`census`], and how many opens got none.
@@ -128,6 +132,7 @@ impl HashCensus {
                     rate_per_mb: answer.rate_per_mb,
                     total_bytes: answer.total_bytes,
                     coverage: answer.coverage.clone(),
+                    payment_pools: answer.payment_pools.clone(),
                 });
             } else {
                 non_holders.push(discovery::WarmingCandidate {
@@ -135,6 +140,7 @@ impl HashCensus {
                     eth_address: answer.candidate.eth_address,
                     rtt_ms: answer.rtt_ms,
                     multiaddrs: answer.candidate.multiaddrs.clone(),
+                    payment_pools: answer.payment_pools.clone(),
                 });
             }
         }
@@ -273,7 +279,7 @@ pub async fn census(
         outage_fallback,
     } = nodes;
     let outage_fallback = *outage_fallback;
-    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
     // The whole blob, with no rate ceiling: the census keeps every answer,
     // and `serve_order` applies the ceiling the pull would.
     let spec = OpenSpec {
@@ -371,6 +377,7 @@ pub(crate) fn tally(
                 has_blob: true,
                 total_bytes: holder.total_bytes,
                 coverage: holder.coverage,
+                payment_pools: holder.payment_pools,
             }),
             OpenOutcome::NonHolder(warming, (_, _, rate_per_mb)) => {
                 entry.answers.push(NodeAnswer {
@@ -380,6 +387,7 @@ pub(crate) fn tally(
                     has_blob: false,
                     total_bytes: None,
                     coverage: decdn_protocol::Coverage::empty(),
+                    payment_pools: warming.payment_pools,
                 });
             }
             OpenOutcome::Unreachable => entry.unreachable += 1,

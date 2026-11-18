@@ -320,7 +320,7 @@ impl ClientHandler {
             Admission::OnFirstProof(_) if total_bytes == 0 => {
                 drop(export);
                 return self
-                    .complete_delivery(send, recv, &mut waits, hash, 0)
+                    .complete_delivery(send, recv, &mut waits, hash, 0, None)
                     .await;
             }
             Admission::OnFirstProof(adm) => {
@@ -427,8 +427,15 @@ impl ClientHandler {
             self.metrics.bytes_served(len);
         }
 
-        self.complete_delivery(send, recv, &mut waits, hash, delivered)
-            .await
+        self.complete_delivery(
+            send,
+            recv,
+            &mut waits,
+            hash,
+            delivered,
+            Some(lane_key.deployment),
+        )
+        .await
     }
 
     /// End a delivery cleanly: the whole request is on the wire and every byte
@@ -441,6 +448,7 @@ impl ClientHandler {
         waits: &mut ServeWaits,
         hash: Hash,
         delivered: u64,
+        deployment: Option<super::Deployment>,
     ) -> anyhow::Result<ServeEnd> {
         waits
             .time(
@@ -462,8 +470,12 @@ impl ClientHandler {
         self.cache.observe_hit(hash);
         // ADR 041: credit the realized operator margin back to the source that
         // speculatively warmed this blob (a no-op for an untagged / non-speculative
-        // hash), on the same clean-completion edge as the ADR 040 hit sighting.
-        self.credit_warming_serve(hash, delivered);
+        // hash), on the same clean-completion edge as the ADR 040 hit sighting,
+        // at the operator share of the pool that paid for it. The empty blob
+        // sells no byte and names no pool.
+        if let Some(deployment) = deployment {
+            self.credit_warming_serve(deployment, hash, delivered);
+        }
         Ok(ServeEnd::Completed { bytes: delivered })
     }
 }

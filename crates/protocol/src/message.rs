@@ -12,12 +12,14 @@ use serde::de::{self, Deserializer};
 /// [`crate::StreamResponseBody::rate_per_mb`] (issue #378).
 ///
 /// 1000 µUSDC/MB (USDC at 6 decimals: ~$1/GB), a realistic ceiling about 100×
-/// market price (~10 µUSDC/MB ≈ $0.01/GB). It bounds two things at once. It is
-/// the largest `rate_per_mb` the wire decodes, and it caps the governance
-/// `deliveryFloor` on-chain (ADR 003 §Rate-floor enforcement); the floor can
-/// never exceed the wire price. A cap far above market lets a governance floor
-/// near the ceiling drive credited bytes toward zero and suppress ADR-036
-/// vote-weight accrual, so the cap stays close to real prices.
+/// market price (~10 µUSDC/MB ≈ $0.01/GB). It is the largest `rate_per_mb` the
+/// wire decodes. The governance-chain `FeeRouter` bounds its `deliveryFloor`
+/// at the same value (ADR 003 §Rate-floor enforcement, ADR 009). That floor
+/// is the net-USDC price of one MB of vote weight, not a rate a node must
+/// quote: the `FeeRouter` credits `min(bytes, net × 1 MiB / deliveryFloor)`
+/// per sweep. A floor far above real prices would drive credited bytes toward
+/// zero and suppress ADR-036 vote-weight accrual, so the bound stays close to
+/// real prices.
 ///
 /// The value also participates in the client selection score
 /// `rate_per_mb × rtt_ms × scale / reputation²` (issue #322, ADR 001 §Node

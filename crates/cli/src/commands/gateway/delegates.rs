@@ -3,7 +3,9 @@
 //!
 //! At most one key is pending: no capability claims it yet, and
 //! [`Delegates::pending`] returns it to every caller until one does. A key a
-//! capability claimed holds at most one capability per pool. A capability is
+//! capability claimed holds at most one capability per pool. A pool is a pool
+//! id on one configured `PaymentPool` contract: an owner's pool ids repeat
+//! across contracts, so the contract is part of its name. A capability is
 //! scoped to a list of namespaces, or unscoped. The gateway pays with the
 //! capabilities in the order they were registered ([`Delegates::paying`]):
 //! for a request of a namespace, the capabilities scoped to that namespace
@@ -17,9 +19,10 @@ use std::sync::Arc;
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::inside_capability_expiry_margin;
-use decdn_incentive::{CapabilityGrant, PoolId};
+use decdn_incentive::{CapabilityGrant, Deployment, PoolId};
 
 use super::super::fetch::Credential;
+use super::worker::DelegateKey;
 
 /// Why a capability does not register.
 #[derive(Debug, PartialEq, Eq)]
@@ -71,6 +74,9 @@ pub(super) struct Capability {
 /// A capability registered to a held key.
 struct Registered {
     grant: CapabilityGrant,
+    /// The configured `PaymentPool` contract the capability's pool lives in:
+    /// every pull it pays for pays through it.
+    pool: Deployment,
     /// The namespaces it pays for, or `None` for any request.
     namespaces: Option<Vec<u64>>,
     /// Its place in registration order.
@@ -105,39 +111,66 @@ impl Delegates {
             .address()
     }
 
-    /// Whether `grant` would register: its key is one the gateway holds, and
-    /// that key holds no capability from its pool. The check before the
-    /// owner's signature is read on-chain.
-    pub(super) fn admits(&self, grant: &CapabilityGrant) -> Result<(), Refusal> {
-        if self
+    /// Whether `grant` could register on one of `contracts`, the configured
+    /// `PaymentPool` contracts its pool may be on: its key is one the gateway
+    /// holds, and on at least one of them that key holds no capability from
+    /// its pool. The check before the owner's signature is read on-chain,
+    /// which names the one contract [`Self::register`] then checks.
+    pub(super) fn admits(
+        &self,
+        grant: &CapabilityGrant,
+        contracts: &[Deployment],
+    ) -> Result<(), Refusal> {
+        let pending = self
             .pending
             .as_ref()
-            .is_some_and(|key| key.address() == grant.signer)
-        {
+            .is_some_and(|key| key.address() == grant.signer);
+        if pending {
             return Ok(());
         }
-        let delegate = self.held.get(&grant.signer).ok_or(Refusal::UnknownKey)?;
-        if delegate
-            .capabilities
-            .iter()
-            .any(|r| r.grant.pool_id == grant.pool_id)
+        if !self.held.contains_key(&grant.signer) {
+            return Err(Refusal::UnknownKey);
+        }
+        if !contracts.is_empty()
+            && contracts
+                .iter()
+                .all(|&pool| self.holds(grant.signer, pool, grant.pool_id))
         {
             return Err(Refusal::PoolTaken);
         }
         Ok(())
     }
 
-    /// Register `grant` to its key, scoped to `namespaces` or, with `None`,
-    /// to any request. A pending key becomes held, and the next
-    /// [`Self::pending`] creates a fresh one.
+    /// Whether `signer` holds a capability from pool `pool_id` on contract
+    /// `pool`.
+    fn holds(&self, signer: Address, pool: Deployment, pool_id: PoolId) -> bool {
+        self.held.get(&signer).is_some_and(|delegate| {
+            delegate
+                .capabilities
+                .iter()
+                .any(|r| r.pool == pool && r.grant.pool_id == pool_id)
+        })
+    }
+
+    /// Register `grant`, whose pool is on contract `pool`, to its key, scoped
+    /// to `namespaces` or, with `None`, to any request. A pending key becomes
+    /// held, and the next [`Self::pending`] creates a fresh one.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::UnknownKey`] when the gateway does not hold its key, and
+    /// [`Refusal::PoolTaken`] when that key holds a capability from the same
+    /// pool on the same contract.
     pub(super) fn register(
         &mut self,
         grant: CapabilityGrant,
+        pool: Deployment,
         namespaces: Option<Vec<u64>>,
     ) -> Result<(), Refusal> {
-        self.admits(&grant)?;
+        self.admits(&grant, &[pool])?;
         let registered = Registered {
             grant,
+            pool,
             namespaces,
             order: self.next,
             spent: false,
@@ -195,16 +228,19 @@ impl Delegates {
             .map(|(_, d, r)| Credential {
                 signer: Arc::clone(&d.signer),
                 grant: r.grant.clone(),
+                pool: r.pool,
             })
     }
 
-    /// Retire the capability `signer` holds from `pool` after a funding stop.
-    /// It stays listed, as spent, until it expires.
-    pub(super) fn retire(&mut self, signer: Address, pool: PoolId) {
-        let registered = self
-            .held
-            .get_mut(&signer)
-            .and_then(|d| d.capabilities.iter_mut().find(|r| r.grant.pool_id == pool));
+    /// Retire the capability `signer` holds from pool `pool_id` on contract
+    /// `pool` after a funding stop. It stays listed, as spent, until it
+    /// expires.
+    pub(super) fn retire(&mut self, signer: Address, pool: Deployment, pool_id: PoolId) {
+        let registered = self.held.get_mut(&signer).and_then(|d| {
+            d.capabilities
+                .iter_mut()
+                .find(|r| r.pool == pool && r.grant.pool_id == pool_id)
+        });
         if let Some(registered) = registered {
             registered.spent = true;
         }
@@ -230,12 +266,13 @@ impl Delegates {
             .collect()
     }
 
-    /// The `(pool, signer)` of every capability, whose lanes `/_status` reads.
-    pub(super) fn lanes(&self) -> Vec<(PoolId, Address)> {
+    /// The `(contract, pool, signer)` of every capability, whose lanes
+    /// `/_status` reads.
+    pub(super) fn lanes(&self) -> Vec<DelegateKey> {
         self.held
             .values()
             .flat_map(|d| d.capabilities.iter())
-            .map(|r| (r.grant.pool_id, r.grant.signer))
+            .map(|r| (r.pool, r.grant.pool_id, r.grant.signer))
             .collect()
     }
 }

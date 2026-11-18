@@ -710,6 +710,39 @@ pub(crate) fn build_handler_full_with_sink(
     ))?))
 }
 
+/// The `PaymentPool` deployment a voucher domain names: its chain id and
+/// verifying contract. A domain with neither names chain `0` and the zero
+/// address, which no test request routes to.
+pub(crate) fn deployment_of(voucher_domain: &Eip712Domain) -> decdn_incentive::Deployment {
+    decdn_incentive::Deployment {
+        chain_id: voucher_domain
+            .chain_id
+            .and_then(|id| u64::try_from(id).ok())
+            .unwrap_or(0),
+        payment_pool: voucher_domain.verifying_contract.unwrap_or_default(),
+    }
+}
+
+/// Wire `view` as the pool view of the handler's one pool.
+pub(crate) fn set_pool_view(
+    deps: &mut ClientHandlerDeps,
+    view: Arc<dyn decdn_node::pool_view::PoolView>,
+) {
+    if let Some(pool) = deps.pools.first_mut() {
+        pool.pool_view = Some(view);
+    }
+}
+
+/// Set the operator share of the handler's one pool.
+pub(crate) fn set_operator_shares(
+    deps: &mut ClientHandlerDeps,
+    shares: decdn_node::fee_shares::OperatorShares,
+) {
+    if let Some(pool) = deps.pools.first_mut() {
+        pool.operator_shares = shares;
+    }
+}
+
 /// The required-deps [`ClientHandlerDeps`] shared by the builders — every
 /// optional wiring hook left `None`. Callers set the optionals they need.
 #[allow(clippy::too_many_arguments)]
@@ -732,9 +765,8 @@ fn client_handler_deps(
         cache,
         Arc::clone(server_eth),
         domains.slash.clone(),
-        domains.voucher.clone(),
         domains.binding.clone(),
-        store,
+        decdn_node::handlers::client::PoolRoute::new(deployment_of(&domains.voucher), store),
         receipt_sink,
         rate,
         max_concurrent_streams,

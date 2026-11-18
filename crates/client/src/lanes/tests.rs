@@ -7,6 +7,17 @@ use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{Deployment, bind_node_id_domain};
 
+/// One chain at `http://config:8545`, id 1, that no test reaches.
+fn test_chain() -> ChainConfig {
+    crate::session::test_support::one_chain(
+        "http://config:8545".to_string(),
+        1,
+        Address::repeat_byte(0x33),
+        Address::repeat_byte(0x44),
+        None,
+    )
+}
+
 fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> PoolContext {
     ctx_with_deposit(binding, U256::ZERO)
 }
@@ -120,10 +131,7 @@ fn rebase_store_fixture() -> anyhow::Result<(
     };
     let mut state = BuyerPoolState::new(
         pool_id,
-        Deployment {
-            chain_id: 421_614,
-            payment_pool: Address::repeat_byte(0x7B),
-        },
+        FIXTURE_DEPLOYMENT,
         owner,
         Address::repeat_byte(0x7C),
         U256::from(1_000u64),
@@ -135,13 +143,27 @@ fn rebase_store_fixture() -> anyhow::Result<(
     Ok((dir, store, owner, pool_id, lane))
 }
 
+/// The deployment the rebase fixture's pool row lives on.
+const FIXTURE_DEPLOYMENT: Deployment = Deployment {
+    chain_id: 421_614,
+    payment_pool: Address::repeat_byte(0x7B),
+};
+
+/// The fixture owner's own pool row on [`FIXTURE_DEPLOYMENT`].
+const fn owned(owner: Address) -> WatermarkRow {
+    WatermarkRow::Owned {
+        deployment: FIXTURE_DEPLOYMENT,
+        owner,
+    }
+}
+
 fn lane_record(
     store: &dyn BuyerPoolStore,
     pool_id: PoolId,
     lane: LaneKey,
 ) -> anyhow::Result<BuyerLaneProgress> {
     store
-        .get_by_pool_id(pool_id)?
+        .get_by_pool_id(FIXTURE_DEPLOYMENT, pool_id)?
         .and_then(|s| s.lane_progress(lane))
         .ok_or_else(|| anyhow::anyhow!("lane record missing"))
 }
@@ -206,13 +228,8 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
     let rpc = alloy::providers::ProviderBuilder::new()
         .connect_mocked_client(alloy::providers::mock::Asserter::new());
     let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
-    let chain = ChainConfig {
-        rpc_url: "http://config:8545".to_string(),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: None,
-    };
+    let chain = test_chain();
+    let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
     let site = PullSite {
         data_dir: dir.path().to_path_buf(),
         region: None,
@@ -234,6 +251,8 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
             self_address: Address::repeat_byte(0x0A),
             token: Address::repeat_byte(0x22),
             chain: &chain,
+            pool: &pool,
+            passes: &passes,
             site: &site,
             deposit: DepositPolicy {
                 working_deposit: U256::from(1_000_000u64),
@@ -312,7 +331,7 @@ fn persist_watermark_overwrites_once_on_a_rebase() -> anyhow::Result<()> {
     };
     let progress = VoucherProgress::from_cumulative(totals, U256::from(90u64))
         .with_rebase_anchor(Some(anchor));
-    persist_watermark(&store, WatermarkRow::Owned(owner), lane, &progress);
+    persist_watermark(&store, owned(owner), lane, &progress);
     let got = lane_record(&store, pool_id, lane)?;
     assert_eq!(
         (got.last_bytes, got.last_amount),
@@ -324,7 +343,7 @@ fn persist_watermark_overwrites_once_on_a_rebase() -> anyhow::Result<()> {
         amount: U256::from(65u64),
     };
     let progress = VoucherProgress::from_cumulative(lower, U256::ZERO);
-    persist_watermark(&store, WatermarkRow::Owned(owner), lane, &progress);
+    persist_watermark(&store, owned(owner), lane, &progress);
     let got = lane_record(&store, pool_id, lane)?;
     assert_eq!(
         (got.last_bytes, got.last_amount),
@@ -416,11 +435,11 @@ async fn a_rebase_read_first_never_lands_over_a_newer_advance() -> anyhow::Resul
     drop(queue_watermark_writes(
         &writes,
         &store,
-        WatermarkRow::Owned(owner),
+        owned(owner),
         vec![rebase],
     ));
     let advance = lane_write(lane, (300, 80), 70, None);
-    let landed = queue_watermark_writes(&writes, &store, WatermarkRow::Owned(owner), vec![advance]);
+    let landed = queue_watermark_writes(&writes, &store, owned(owner), vec![advance]);
     release.send(())?;
     tokio::time::timeout(Duration::from_secs(10), landed).await??;
     let got = lane_record(store.as_ref(), pool_id, lane)?;
@@ -444,11 +463,11 @@ async fn a_stale_advance_read_first_never_lands_over_a_rebase() -> anyhow::Resul
     drop(queue_watermark_writes(
         &writes,
         &store,
-        WatermarkRow::Owned(owner),
+        owned(owner),
         vec![advance],
     ));
     let rebase = lane_write(lane, (200, 70), 90, Some((100, 60)));
-    let landed = queue_watermark_writes(&writes, &store, WatermarkRow::Owned(owner), vec![rebase]);
+    let landed = queue_watermark_writes(&writes, &store, owned(owner), vec![rebase]);
     release.send(())?;
     tokio::time::timeout(Duration::from_secs(10), landed).await??;
     let got = lane_record(store.as_ref(), pool_id, lane)?;
@@ -477,7 +496,7 @@ fn a_detached_settle_lands_by_runtime_shutdown() -> anyhow::Result<()> {
         drop(queue_watermark_writes(
             &writes,
             &store,
-            WatermarkRow::Owned(owner),
+            owned(owner),
             vec![advance],
         ));
     });
@@ -614,7 +633,14 @@ fn persist_watermark_records_a_delegated_lane() -> anyhow::Result<()> {
     let progress = VoucherProgress::from_cumulative(paid, U256::ZERO);
     let owned = ProgressWrite::of(&progress)
         .ok_or_else(|| anyhow::anyhow!("an advance calls for a write"))?
-        .apply(&store, WatermarkRow::Owned(lane.signer), lane)?;
+        .apply(
+            &store,
+            WatermarkRow::Owned {
+                deployment,
+                owner: lane.signer,
+            },
+            lane,
+        )?;
     anyhow::ensure!(owned == AdvanceOutcome::UnknownPool);
 
     persist_watermark(&store, WatermarkRow::Delegated(deployment), lane, &progress);
@@ -664,13 +690,8 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
     let rpc = alloy::providers::ProviderBuilder::new()
         .connect_mocked_client(alloy::providers::mock::Asserter::new());
     let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
-    let chain = ChainConfig {
-        rpc_url: "http://config:8545".to_string(),
-        chain_id: 1,
-        payment_pool: Address::repeat_byte(0x33),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: None,
-    };
+    let chain = test_chain();
+    let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
     let site = PullSite {
         data_dir: dir.path().to_path_buf(),
         region: None,
@@ -691,6 +712,8 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
         self_address: Address::repeat_byte(0x0A),
         token: Address::repeat_byte(0x22),
         chain: &chain,
+        pool: &pool,
+        passes: &passes,
         site: &site,
         deposit: DepositPolicy {
             working_deposit: U256::from(1_000_000u64),

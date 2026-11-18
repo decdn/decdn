@@ -18,7 +18,7 @@ use decdn_client::buyer_pool::{
 };
 use decdn_client::discovery::{self, NodeCandidate};
 use decdn_client::lanes::LanePayer;
-use decdn_client::session::ChainConfig;
+use decdn_client::session::GovernanceChain;
 use decdn_client::{
     Connections, Funder, PeerSource, PoolContext, PoolLedger, PullDeadlines, Recovery,
     SourceFuture, StreamCandidate, VoucherProgress, discovery_open, endpoint, provider,
@@ -118,10 +118,7 @@ impl Buyer {
         // store's salt, so another data dir on the same wallet signs on its
         // own lanes of the same pool.
         let payer = OwnedPayer::for_store(Arc::clone(&signer), &store)?;
-        // A row from another deployment names a pool this contract never saw.
-        let reusable = store
-            .get_by_owner(owner)?
-            .filter(|pool| pool.is_on(deployment));
+        let reusable = store.get_by_owner(deployment, owner)?;
         let pool = if let Some(pool) = reusable {
             pool
         } else {
@@ -188,12 +185,15 @@ impl Buyer {
 
         // The opens carry the buyer's pool, lane key and identity binding like
         // any open; the node admits the payer only at the first voucher.
-        let chain = ChainConfig {
+        let governance = GovernanceChain {
             rpc_url: self.env.rpc_url.clone(),
             chain_id: self.env.chain_id,
-            payment_pool: self.env.payment_pool,
             slash_judge: self.env.slash_judge,
             capacity_bond: Some(self.env.capacity_bond),
+        };
+        let deployment = Deployment {
+            chain_id: self.env.chain_id,
+            payment_pool: self.env.payment_pool,
         };
         let contract = PaymentPool::new(
             self.env.payment_pool,
@@ -203,7 +203,7 @@ impl Buyer {
             &self.store,
             &contract,
             LanePayer::Owned(&self.payer),
-            &chain,
+            (&governance, deployment),
             &self.endpoint,
             &self.voucher_domain,
             Some(self.pool.pool_id),
@@ -327,7 +327,10 @@ impl Buyer {
             let Some(write) = ProgressWrite::of(&progress) else {
                 continue;
             };
-            let row = WatermarkRow::Owned(self.payer.owner().address());
+            let row = WatermarkRow::Owned {
+                deployment: self.pool.deployment,
+                owner: self.payer.owner().address(),
+            };
             if let Err(err) = write.apply(&self.store, row, lane.key) {
                 tracing::warn!(provider = %lane.key.provider, error = %err, "lane not recorded");
             }

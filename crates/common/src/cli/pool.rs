@@ -10,7 +10,7 @@
 //! anyone); `assign` issues an owner-signed spending capability delegating a
 //! bounded spend on the pool to a delegate signer key, printing the `dcap1:`
 //! token to hand off. Each of `top-up`/`close`/`reclaim`/`assign` names its
-//! target pool explicitly via `--pool` — there is no implicit per-provider
+//! target pool explicitly via `--pool-id` — there is no implicit per-provider
 //! lookup, because one pool fans out to every provider the owner pays
 //! (ADR 003). `close` and `reclaim` also accept `--all`, which enumerates every
 //! pool this keystore owns on-chain (`getPools`) and acts on each eligible one.
@@ -27,7 +27,7 @@
 //! the same `buyer.redb` directly and labels the listing as a disk read.
 //! The commands that would escrow into a store the node never reads —
 //! `open`, `top-up`, and the chain-enumerating `close --all` / `reclaim --all` —
-//! refuse. `close --pool` and `reclaim --pool` still run, and say plainly that
+//! refuse. `close --pool-id` and `reclaim --pool-id` still run, and say plainly that
 //! the daemon's own record was left untouched.
 
 use std::path::PathBuf;
@@ -96,7 +96,7 @@ pub struct PoolAssignArgs {
     /// The pool to delegate spend on (0x-prefixed 32-byte `poolId`). The caller
     /// must own it — the capability is signed with the owner keystore.
     #[arg(long, value_name = "0xHASH")]
-    pub pool: String,
+    pub pool_id: String,
 
     /// The delegate's Ethereum address (0x-prefixed) — the voucher-signing key
     /// authorized to spend against the pool under this capability.
@@ -154,7 +154,7 @@ pub struct PoolTopUpArgs {
     /// The pool to fund (0x-prefixed 32-byte `poolId`, from `pool open`'s output
     /// or `pool list`).
     #[arg(long, value_name = "0xHASH")]
-    pub pool: String,
+    pub pool_id: String,
 
     /// Amount to add, in micro-USDC (USDC base units).
     #[arg(long, value_name = "MICRO_USDC")]
@@ -167,21 +167,21 @@ pub struct PoolTopUpArgs {
 
 /// `decdn pool close` flags.
 ///
-/// Targets exactly one of a single `--pool` or `--all`. `--all` enumerates every
-/// pool this keystore owns from chain (`getPools`) and closes the ones that are
-/// still `Open`.
+/// Targets exactly one of a single `--pool-id` or `--all`. `--all` enumerates
+/// every pool this keystore owns from chain (`getPools`) and closes the ones
+/// that are still `Open`.
 #[derive(Args, Debug)]
-#[command(group(clap::ArgGroup::new("close_target").required(true).args(["pool", "all"])))]
+#[command(group(clap::ArgGroup::new("close_target").required(true).args(["pool_id", "all"])))]
 pub struct PoolCloseArgs {
     /// The pool to close (0x-prefixed 32-byte `poolId`). Mutually exclusive
     /// with `--all`.
     #[arg(long, value_name = "0xHASH")]
-    pub pool: Option<String>,
+    pub pool_id: Option<String>,
 
     /// Close every pool this keystore owns that is currently `Open`, discovered
     /// on-chain via `getPools`. Pools already closing or closed are skipped;
     /// one pool's failure does not abort the rest. Mutually exclusive with
-    /// `--pool`.
+    /// `--pool-id`.
     #[arg(long)]
     pub all: bool,
 
@@ -192,23 +192,23 @@ pub struct PoolCloseArgs {
 
 /// `decdn pool reclaim` flags.
 ///
-/// Targets exactly one of a single `--pool` or `--all`. `--all` enumerates every
-/// pool this keystore owns from chain (`getPools`) and reclaims the ones whose
-/// dispute window has elapsed.
+/// Targets exactly one of a single `--pool-id` or `--all`. `--all` enumerates
+/// every pool this keystore owns from chain (`getPools`) and reclaims the ones
+/// whose dispute window has elapsed.
 #[derive(Args, Debug)]
-#[command(group(clap::ArgGroup::new("reclaim_target").required(true).args(["pool", "all"])))]
+#[command(group(clap::ArgGroup::new("reclaim_target").required(true).args(["pool_id", "all"])))]
 pub struct PoolReclaimArgs {
     /// The pool to reclaim (0x-prefixed 32-byte `poolId`). Its status and
     /// dispute deadline are checked on-chain before the keystore is unlocked;
     /// a pool that is not reclaimable is refused with its cause. Mutually
     /// exclusive with `--all`.
     #[arg(long, value_name = "0xHASH")]
-    pub pool: Option<String>,
+    pub pool_id: Option<String>,
 
     /// Reclaim every pool this keystore owns whose grace window has elapsed,
     /// discovered on-chain via `getPools`. Pools still `Open`, still inside
     /// their dispute window, or already reclaimed are skipped; one pool's
-    /// failure does not abort the rest. Mutually exclusive with `--pool`.
+    /// failure does not abort the rest. Mutually exclusive with `--pool-id`.
     #[arg(long)]
     pub all: bool,
 
@@ -225,19 +225,12 @@ pub struct PoolReclaimArgs {
 /// `pool` command shares one precedence path.
 #[derive(Args, Debug)]
 pub struct PoolChainArgs {
-    /// JSON-RPC endpoint of the chain (else `blockchain.rpc_url`).
-    #[arg(long, value_name = "URL")]
-    pub rpc_url: Option<String>,
-
-    /// `PaymentPool` contract address — the on-chain call target and the
-    /// EIP-712 `verifyingContract` (else `blockchain.payment_pool_address`).
-    #[arg(long, value_name = "ADDRESS")]
-    pub payment_pool_address: Option<String>,
-
-    /// EVM chain id for the EIP-712 domain (else `blockchain.chain_id` >
-    /// default).
-    #[arg(long, value_name = "ID")]
-    pub chain_id: Option<u64>,
+    /// The `PaymentPool` contract the command acts on: the on-chain call
+    /// target and the EIP-712 `verifyingContract`. Without `--pool`, the first
+    /// pool of the first `[[blockchain.payment_chains]]` entry; `list` without
+    /// `--all` lists the stored pools of every contract.
+    #[command(flatten)]
+    pub payment: super::common::PoolSelectArgs,
 
     /// Ethereum keystore path (else `blockchain.eth_keystore` > under the data
     /// dir). Password from `$DECDN_KEYSTORE_PASSWORD`, else
@@ -278,9 +271,9 @@ pub struct PoolListArgs {
     /// chain: the disagreement is itself the diagnostic.
     ///
     /// Sends no transaction and writes no pool record, so unlike `close --all`
-    /// / `reclaim --all` it is NOT refused on a node's data dir. Needs
-    /// `--rpc-url`, `--payment-pool-address`, and the keystore whose address it
-    /// enumerates by.
+    /// / `reclaim --all` it is NOT refused on a node's data dir. Reads every
+    /// configured `PaymentPool` contract, or only `--pool`, and needs the
+    /// keystore whose address it enumerates by.
     #[arg(long)]
     pub all: bool,
 

@@ -20,7 +20,7 @@
 //! | Buyer bookkeeping | [`buyer_pool`] (the buyer's pools and lanes), `buyer_pool_table` and `buyer_pool_redb` (an on-disk `redb` store, behind the `buyer-store-core` and `redb` features) |
 //! | Response signatures | [`stream_sig`] (the `slash_sig` on stream responses and the `SlashJudge` domain), [`bind_sig`] (client bindings), [`sig_canon`] (canonical `s`) |
 //! | Keys | [`eth_identity`] (Web3 Secret Storage keystores and the `PrivateKeySigner` they load) |
-//! | Contract bindings | [`payment_pool`], [`capacity_bond`], [`node_register`], [`erc20`], [`slash_judge`], [`slash_appeal`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
+//! | Contract bindings | [`payment_pool`] (`PaymentPool`, `FeeRouter`, `CctpSweepReceiver`),[`capacity_bond`], [`node_register`], [`erc20`], [`slash_judge`], [`slash_appeal`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
 //! | Transactions | [`tx`] (send, await the receipt, fail on a revert), [`pool_open_error`] (`PaymentPool` revert decoding), [`log_scan`] (bounded `eth_getLogs` windows that learn a provider's range cap) |
 //!
 //! # Sign and verify a voucher
@@ -49,10 +49,10 @@
 //! # Who drives settlement
 //!
 //! This crate holds the primitives. The `decdn-node` daemon drives both sides
-//! of settlement with them. As a seller, it records each lane's watermark from
-//! the `PoolOpened` and `Redeemed` events, redeems every lane worth the gas on a
-//! sweep that runs well inside a closing pool's grace window, and forgets a
-//! reclaimed pool. As a buyer on a cache miss,
+//! of settlement with them. As a seller, it reads each pool by `eth_call`,
+//! records each lane's paid watermark from its own `redeemMany` receipts,
+//! redeems every lane worth the gas on a sweep that runs well inside a closing
+//! pool's grace window, and forgets a closed pool. As a buyer on a cache miss,
 //! it approves USDC once, opens or tops up a pool, signs the vouchers, and
 //! closes and reclaims a pool it no longer uses.
 //!
@@ -89,6 +89,7 @@ pub mod payment_pool;
 pub mod pool_open_error;
 pub mod publisher_registry;
 pub mod rate;
+pub mod settlement_receipt;
 pub mod sig_canon;
 pub mod slash_appeal;
 pub mod slash_judge;
@@ -128,9 +129,8 @@ pub use pool_open_error::{
 };
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 pub use store::{
-    CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, MemorySettlementLedger,
-    PendingSettle, PendingSettleStore, PoolStateStore, SettlementLedger, SettlementRecord,
-    StoreError,
+    MemoryPoolStateStore, MemorySettlementLedger, PendingSettle, PendingSettleStore,
+    PoolStateStore, SettlementKey, SettlementLedger, SettlementRecord, StoreError,
 };
 pub use stream_sig::{
     SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION, STREAM_RESPONSE_TYPEHASH, StreamSlashData,

@@ -177,8 +177,10 @@ fn probe_fetch_args_carry_its_flags_and_default_the_rest() {
         &hash,
         "--addr",
         "127.0.0.1:4433",
-        "--rpc-url",
+        "--governance-rpc-url",
         "http://127.0.0.1:8545",
+        "--pool",
+        "eip155:84532:0x0000000000000000000000000000000000000003",
         "--slash-judge-address",
         "0x0000000000000000000000000000000000000002",
         "--keystore",
@@ -197,7 +199,14 @@ fn probe_fetch_args_carry_its_flags_and_default_the_rest() {
         Some("0x0000000000000000000000000000000000000042")
     );
     assert_eq!(common.addr, Some("127.0.0.1:4433".parse().unwrap()));
-    assert_eq!(common.rpc_url.as_deref(), Some("http://127.0.0.1:8545"));
+    assert_eq!(
+        common.governance.governance_rpc_url.as_deref(),
+        Some("http://127.0.0.1:8545")
+    );
+    assert_eq!(
+        common.payment.pool.as_deref(),
+        Some("eip155:84532:0x0000000000000000000000000000000000000003")
+    );
     assert_eq!(
         common.slash_judge_address.as_deref(),
         Some("0x0000000000000000000000000000000000000002")

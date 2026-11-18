@@ -305,6 +305,7 @@ const LANES: Keys<LanesResponse> = {
   redeem_threshold_micro_usdc: true,
 };
 const LANE_SNAPSHOT: Keys<LaneSnapshot> = {
+  pool: true,
   pool_id: true,
   counterparty: true,
   voucher_signer: true,
@@ -324,6 +325,7 @@ const EARNINGS: Keys<EarningsResponse> = {
   since: true,
   last_settlement: true,
   pending: true,
+  pools: true,
 };
 const PERIOD: Keys<EarningsPeriod> = {
   from_unix: true,

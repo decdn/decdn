@@ -12,7 +12,7 @@ use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, CoverageShortfall,
-    Hash, LaneDeliveryState, LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream,
+    Hash, LaneDeliveryState, LaneId, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream,
     SendStream, ServeRejectReason, StreamRequest, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 use crate::pool_view::PoolStatus;
@@ -119,7 +119,7 @@ impl ClientHandler {
         req: &StreamRequest,
         hash: Hash,
         client_node_id: B256,
-        lane_key: LaneKey,
+        lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         origin: Arc<NodeOrigin>,
         pool_status: Option<PoolStatus>,

@@ -464,16 +464,18 @@ impl ProgressWrite {
         lane: LaneKey,
     ) -> Result<AdvanceOutcome, StoreError> {
         match (row, *self) {
-            (WatermarkRow::Owned(owner), Self::Rebase { anchor, totals }) => {
-                store.rebase_progress(owner, lane.pool_id, lane, anchor, totals)
+            (WatermarkRow::Owned { deployment, owner }, Self::Rebase { anchor, totals }) => {
+                store.rebase_progress(deployment, owner, lane.pool_id, lane, anchor, totals)
             }
-            (WatermarkRow::Owned(owner), Self::Advance { totals }) => store.advance_progress(
-                owner,
-                lane.pool_id,
-                lane,
-                totals.last_bytes,
-                totals.last_amount,
-            ),
+            (WatermarkRow::Owned { deployment, owner }, Self::Advance { totals }) => store
+                .advance_progress(
+                    deployment,
+                    owner,
+                    lane.pool_id,
+                    lane,
+                    totals.last_bytes,
+                    totals.last_amount,
+                ),
             (WatermarkRow::Delegated(deployment), Self::Rebase { anchor, totals }) => {
                 store.rebase_delegate_progress(deployment, lane, anchor, totals)
             }
@@ -488,8 +490,14 @@ impl ProgressWrite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WatermarkRow {
-    /// The pool row of this owner: a lane on the buyer's own pool.
-    Owned(Address),
+    /// The pool row of this owner on this deployment: a lane on the buyer's
+    /// own pool.
+    Owned {
+        /// The `PaymentPool` deployment the pool lives on.
+        deployment: Deployment,
+        /// The pool owner the row is indexed under.
+        owner: Address,
+    },
     /// The delegate lanes on this deployment: a lane a key signs under an
     /// owner-signed capability on a pool another owner funds
     /// ([`BuyerPoolStore::delegate_lanes`]).
@@ -983,17 +991,30 @@ impl std::fmt::Display for EscrowUnconfirmed {
 ///
 /// A clone shares the same lists, so one handle can outlive the per-pass state
 /// that the transactions run under.
+///
+/// A pool id is unique only inside one `PaymentPool` contract, so a handle
+/// for one contract ([`Self::for_pool`]) keeps its own pending `openPool` and
+/// `topUp` guards and its own live pools on the shared lists. A pending
+/// `topUp` on one contract refuses no `topUp` on another.
+/// [`Self::pending`] and [`Self::untracked`] list the entries of every
+/// contract.
 #[derive(Debug, Default, Clone)]
-pub struct UnconfirmedEscrows(Arc<Shared>);
+pub struct UnconfirmedEscrows {
+    shared: Arc<Shared>,
+    /// The contract this handle's transactions go to; `None` for a handle
+    /// that names no contract.
+    pool: Option<Deployment>,
+}
 
-/// What every clone of one [`UnconfirmedEscrows`] shares.
+/// What every clone of one [`UnconfirmedEscrows`] shares. Each pending entry
+/// and live pool carries the contract of the handle that added it.
 #[derive(Debug, Default)]
 struct Shared {
-    pending: Mutex<Vec<EscrowUnconfirmed>>,
+    pending: Mutex<Vec<(Option<Deployment>, EscrowUnconfirmed)>>,
     /// Oldest first, one per tx. An entry is never removed.
     untracked: Mutex<Vec<UntrackedEscrow>>,
     /// One entry per pool. An entry is never removed.
-    live: Mutex<Vec<PoolId>>,
+    live: Mutex<Vec<(Option<Deployment>, PoolId)>>,
 }
 
 /// An `openPool` or `topUp` that mined and escrowed USDC that no local record
@@ -1072,11 +1093,24 @@ impl UnrecordedEscrow {
 }
 
 impl UnconfirmedEscrows {
+    /// A handle on the same lists for the transactions a run sends to the
+    /// `PaymentPool` contract `deployment`. The pending `openPool` and `topUp`
+    /// transactions that refuse a later one on this handle, and the pools it
+    /// saw live, are those of `deployment` only. [`Self::pending`] and
+    /// [`Self::untracked`] still list every contract.
+    #[must_use]
+    pub fn for_pool(&self, deployment: Deployment) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            pool: Some(deployment),
+        }
+    }
+
     /// The `openPool` and `topUp` transactions that escrowed USDC no local
     /// record credits, oldest first.
     #[must_use]
     pub fn untracked(&self) -> Vec<UntrackedEscrow> {
-        self.0
+        self.shared
             .untracked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1091,7 +1125,7 @@ impl UnconfirmedEscrows {
             return false;
         };
         let mut held = self
-            .0
+            .shared
             .untracked
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -1112,22 +1146,37 @@ impl UnconfirmedEscrows {
         self.hold_untracked(err);
     }
 
-    /// The transactions no local record credits yet, oldest first: each
-    /// receipt that was not read, and each mined one whose record has not
-    /// resolved ([`UnrecordedEscrow`]).
+    /// The transactions no local record credits yet, on every contract,
+    /// oldest first: each receipt that was not read, and each mined one whose
+    /// record has not resolved ([`UnrecordedEscrow`]).
     #[must_use]
     pub fn pending(&self) -> Vec<EscrowUnconfirmed> {
-        self.0
+        self.shared
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .iter()
+            .map(|(_, held)| *held)
+            .collect()
     }
 
-    /// The pending `openPool` transactions ([`Self::pending`]), oldest first.
+    /// The pending transactions of this handle's contract, oldest first.
+    fn own_pending(&self) -> Vec<EscrowUnconfirmed> {
+        self.shared
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(pool, _)| *pool == self.pool)
+            .map(|(_, held)| *held)
+            .collect()
+    }
+
+    /// The pending `openPool` transactions of this handle's contract, oldest
+    /// first.
     #[must_use]
     pub(crate) fn opens(&self) -> Vec<OpenUnconfirmed> {
-        self.pending()
+        self.own_pending()
             .into_iter()
             .filter_map(|held| match held {
                 EscrowUnconfirmed::Open(open) => Some(open),
@@ -1136,10 +1185,11 @@ impl UnconfirmedEscrows {
             .collect()
     }
 
-    /// The pending `topUp` transactions ([`Self::pending`]), oldest first.
+    /// The pending `topUp` transactions of this handle's contract, oldest
+    /// first.
     #[must_use]
     pub(crate) fn top_ups(&self) -> Vec<TopUpUnconfirmed> {
-        self.pending()
+        self.own_pending()
             .into_iter()
             .filter_map(|held| match held {
                 EscrowUnconfirmed::TopUp(top_up) => Some(top_up),
@@ -1148,22 +1198,29 @@ impl UnconfirmedEscrows {
             .collect()
     }
 
-    /// Record that a run on the handle saw `pool_id` live: it opened or topped
-    /// up the pool, or read it on chain as this wallet's.
+    /// Record that a run on the handle saw `pool_id` of this handle's
+    /// contract live: it opened or topped up the pool, or read it on chain as
+    /// this wallet's.
     pub(crate) fn note_live(&self, pool_id: PoolId) {
-        let mut live = self.0.live.lock().unwrap_or_else(PoisonError::into_inner);
-        if !live.contains(&pool_id) {
-            live.push(pool_id);
+        let key = (self.pool, pool_id);
+        let mut live = self
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !live.contains(&key) {
+            live.push(key);
         }
     }
 
-    /// Whether a run on the handle saw `pool_id` live ([`Self::note_live`]).
+    /// Whether a run on the handle saw `pool_id` of this handle's contract
+    /// live ([`Self::note_live`]).
     pub(crate) fn saw_live(&self, pool_id: PoolId) -> bool {
-        self.0
+        self.shared
             .live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(&pool_id)
+            .contains(&(self.pool, pool_id))
     }
 
     /// Hold `escrow` as a submitted transaction no record credits yet, for a
@@ -1175,11 +1232,11 @@ impl UnconfirmedEscrows {
 
     /// Hold `escrow` from its submit.
     fn insert(&self, escrow: impl Into<EscrowUnconfirmed>) {
-        self.0
+        self.shared
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(escrow.into());
+            .push((self.pool, escrow.into()));
     }
 
     /// Release `escrow` once its record resolves, its receipt shows a revert,
@@ -1187,13 +1244,13 @@ impl UnconfirmedEscrows {
     /// Releases one entry: two calls that hold equal entries each release
     /// their own.
     fn remove(&self, escrow: impl Into<EscrowUnconfirmed>) {
-        let escrow = escrow.into();
+        let entry = (self.pool, escrow.into());
         let mut held = self
-            .0
+            .shared
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(at) = held.iter().position(|entry| *entry == escrow) {
+        if let Some(at) = held.iter().position(|held| *held == entry) {
             held.remove(at);
         }
     }
@@ -1206,9 +1263,10 @@ impl UnconfirmedEscrows {
         submitted: impl Into<EscrowUnconfirmed>,
         broadcast: impl Into<EscrowUnconfirmed>,
     ) {
-        let (submitted, broadcast) = (submitted.into(), broadcast.into());
+        let submitted = (self.pool, submitted.into());
+        let broadcast = (self.pool, broadcast.into());
         let mut held = self
-            .0
+            .shared
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner);

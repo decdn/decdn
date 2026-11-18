@@ -99,7 +99,7 @@ impl Backend for Fake {
     async fn pools(
         &self,
         (): &(),
-        delegates: &[(PoolId, Address)],
+        delegates: &[super::DelegateKey],
     ) -> anyhow::Result<PoolSnapshot> {
         if self.log.lock().unwrap().end_pulls_in_store_read {
             self.release.notify_waiters();
@@ -111,7 +111,7 @@ impl Backend for Fake {
         Ok(PoolSnapshot {
             delegate_lanes: delegates
                 .iter()
-                .map(|&(pool_id, signer)| DelegateLanes::new(signer, pool_id, Vec::new()))
+                .map(|&(_, pool_id, signer)| DelegateLanes::new(signer, pool_id, Vec::new()))
                 .collect(),
             ..PoolSnapshot::default()
         })
@@ -165,6 +165,7 @@ fn credential_on(signer: &Arc<PrivateKeySigner>, pool: PoolId) -> Credential {
             expiry: u64::MAX,
             owner_signature: vec![0; 65],
         },
+        pool: DEPLOYMENT,
     }
 }
 
@@ -369,6 +370,36 @@ async fn one_key_on_two_pools_pays_through_two_payers() {
     assert_eq!(log.payers_made, 2);
 }
 
+/// The same pool id on two `PaymentPool` contracts names two pools: pulls
+/// under one key on both run under two payers.
+#[tokio::test]
+async fn one_pool_id_on_two_contracts_pays_through_two_payers() {
+    let (worker, log, release) = start(4).await;
+    let key = Arc::new(PrivateKeySigner::random());
+    let here = credential(&key);
+    let there = Credential {
+        pool: OTHER_DEPLOYMENT,
+        ..credential(&key)
+    };
+    let (_a, a_done) = send_paid(&worker, HOLD, here, 1024);
+    let (_b, b_done) = send_paid(&worker, HOLD, there, 1024);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while log.lock().unwrap().pulled_under.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both pulls start");
+    release.notify_waiters();
+    for done in [a_done, b_done] {
+        done.await.unwrap().unwrap();
+    }
+    worker.stop().await;
+    let log = log.lock().unwrap();
+    assert_ne!(log.pulled_under[0], log.pulled_under[1]);
+    assert_eq!(log.payers_made, 2);
+}
+
 /// A worker whose host cannot be built does not start.
 #[tokio::test]
 async fn a_host_that_cannot_be_built_fails_the_start() {
@@ -406,14 +437,14 @@ async fn a_pools_query_is_answered_beside_running_pulls() {
     let (worker, _log, release) = start(1).await;
     let signer = Arc::new(PrivateKeySigner::random());
     let (_held, held_done) = send(&worker, HOLD, &signer, 1024);
-    let delegate = (PoolId::repeat_byte(7), signer.address());
+    let delegate = (DEPLOYMENT, PoolId::repeat_byte(7), signer.address());
     let snapshot = tokio::time::timeout(Duration::from_secs(10), worker.pools(vec![delegate]))
         .await
         .expect("the query is answered while the only slot is held")
         .expect("the fake answers");
     assert_eq!(snapshot.delegate_lanes.len(), 1);
-    assert_eq!(snapshot.delegate_lanes[0].pool_id, delegate.0);
-    assert_eq!(snapshot.delegate_lanes[0].signer, delegate.1);
+    assert_eq!(snapshot.delegate_lanes[0].pool_id, delegate.1);
+    assert_eq!(snapshot.delegate_lanes[0].signer, delegate.2);
     release.notify_one();
     held_done.await.unwrap().unwrap();
     worker.stop().await;
@@ -428,8 +459,8 @@ async fn a_pools_query_counts_the_pulls_in_flight() {
     let bob = Arc::new(PrivateKeySigner::random());
     let (_held, held_done) = send(&worker, HOLD, &alice, 1024);
     let delegates = vec![
-        (PoolId::ZERO, alice.address()),
-        (PoolId::ZERO, bob.address()),
+        (DEPLOYMENT, PoolId::ZERO, alice.address()),
+        (DEPLOYMENT, PoolId::ZERO, bob.address()),
     ];
     let spend = |snapshot: &PoolSnapshot| {
         snapshot
@@ -542,7 +573,7 @@ async fn a_pull_that_ends_during_the_store_read_still_counts() {
     .expect("the held pull starts");
     log.lock().unwrap().end_pulls_in_store_read = true;
     let snapshot = worker
-        .pools(vec![(PoolId::ZERO, alice.address())])
+        .pools(vec![(DEPLOYMENT, PoolId::ZERO, alice.address())])
         .await
         .unwrap();
     held_done.await.unwrap().unwrap();
@@ -573,17 +604,23 @@ const DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
     payment_pool: Address::repeat_byte(0x9c),
 };
 
-/// A delegate lane of `signer` on `pool`, to node `0xb2`, at `amount`.
+/// A second `PaymentPool` contract, on another payment chain.
+const OTHER_DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
+    chain_id: 84_532,
+    payment_pool: Address::repeat_byte(0x9d),
+};
+
+/// A delegate lane of `signer` on `pool` of `deployment`, to node `0xb2`, at
+/// `amount`.
 fn seed_delegate_lane(
     store: &decdn_incentive::MemoryBuyerPoolStore,
-    pool: PoolId,
-    signer: Address,
+    (deployment, pool, signer): super::DelegateKey,
     amount: u64,
 ) {
     use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerLaneProgress, BuyerPoolStore as _};
     let outcome = store
         .advance_delegate_progress(
-            DEPLOYMENT,
+            deployment,
             decdn_incentive::lane::LaneKey {
                 pool_id: pool,
                 signer,
@@ -598,16 +635,24 @@ fn seed_delegate_lane(
     assert_eq!(outcome, AdvanceOutcome::Advanced);
 }
 
-/// The store read lists each queried capability's delegate lanes on its
-/// pool.
+/// The store read lists each queried capability's delegate lanes on its pool
+/// and contract: here one capability on each of two configured contracts.
 #[test]
 fn the_store_read_lists_every_queried_keys_lanes() {
     let store = decdn_incentive::MemoryBuyerPoolStore::new();
-    let registered = (PoolId::repeat_byte(1), Address::repeat_byte(0x11));
-    let granted = (PoolId::repeat_byte(2), Address::repeat_byte(0x22));
-    seed_delegate_lane(&store, registered.0, registered.1, 100);
-    seed_delegate_lane(&store, granted.0, granted.1, 250);
-    let snapshot = read_pools(&store, DEPLOYMENT, &[registered, granted]).unwrap();
+    let registered = (
+        OTHER_DEPLOYMENT,
+        PoolId::repeat_byte(1),
+        Address::repeat_byte(0x11),
+    );
+    let granted = (
+        DEPLOYMENT,
+        PoolId::repeat_byte(2),
+        Address::repeat_byte(0x22),
+    );
+    seed_delegate_lane(&store, registered, 100);
+    seed_delegate_lane(&store, granted, 250);
+    let snapshot = read_pools(&store, &[registered, granted]).unwrap();
     let mut listed: Vec<_> = snapshot
         .delegate_lanes
         .iter()
@@ -620,9 +665,12 @@ fn the_store_read_lists_every_queried_keys_lanes() {
     assert_eq!(
         listed,
         vec![
-            (registered.0, registered.1, 100),
-            (granted.0, granted.1, 250)
+            (registered.1, registered.2, 100),
+            (granted.1, granted.2, 250)
         ]
     );
     assert!(snapshot.pools.pools.is_empty());
+    // The same pool and key on the other contract holds no lane.
+    let elsewhere = read_pools(&store, &[(DEPLOYMENT, registered.1, registered.2)]).unwrap();
+    assert!(elsewhere.delegate_lanes[0].lanes.is_empty());
 }

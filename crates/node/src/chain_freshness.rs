@@ -3,7 +3,7 @@
 //!
 //! Every serve-path guard that reads on-chain state — the blacklist deny-set,
 //! the pool-solvency recheck, the per-signer capability cap — answers from a
-//! projection that only advances while the chain watchers can reach the RPC.
+//! snapshot that only advances while the node's chain reads reach the RPC.
 //! During an RPC outage each of those guards silently passes on stale data: a
 //! takedown, a drained pool, or a spent capability that landed on-chain during
 //! the blind window is invisible, so the node keeps signing serve responses it
@@ -12,24 +12,24 @@
 //! `StreamResponse{ok:true}` — the node produces its own evidence.
 //!
 //! [`ChainFreshness`] is the single backstop over that whole family: it holds
-//! the wall-clock time of the blacklist watcher's last successful poll tick and
+//! the wall-clock time of the blacklist sync's last successful ledger poll and
 //! answers one question — has the node been unable to reach the chain for longer
 //! than the operator's grace window? While it has, the serve path refuses
-//! rather than sign. The signal is the *successful tick*, not the last
-//! event: a quiet chain produces no blacklist events for hours legitimately, and
-//! keying on events would take every node dark on any quiet stretch. The tick
-//! stamps on every successful poll including idle ones (the same liveness the
-//! `decdn_blacklist_watcher_last_tick_timestamp_seconds` gauge exports), and the
-//! boot enumeration stamps it too, so a freshly-booted node that has just
-//! vetted its deny-set is never treated as stale.
+//! rather than sign. The signal is the *successful poll*, not the last
+//! ledger record: a quiet chain appends no records for hours legitimately, and
+//! keying on records would take every node dark on any quiet stretch. Every
+//! successful poll stamps it, including one where `mutationCount` did not move
+//! (the same liveness the `decdn_blacklist_watcher_last_tick_timestamp_seconds`
+//! gauge exports), and the boot snapshot stamps it too, so a freshly-booted
+//! node that has just vetted its deny-set is never treated as stale.
 //!
 //! **Grace, not a switch.** There is one knob — the grace window in seconds — and
-//! it is always evaluated. An operator who wants the old fail-open behavior sets
-//! the window large (a year); there is no separate enable flag, so there is no
+//! it is always evaluated. An operator who accepts stale serving sets the window
+//! large (a year); there is no separate enable flag, so there is no
 //! "enabled but zero-grace" state to reason about.
 //!
 //! **Unwired = fail-open.** A node with no chain configured (dev/test) has no
-//! blacklist watcher to stamp the cell, so the runtime wires no
+//! blacklist sync to stamp the cell, so the runtime wires no
 //! [`ChainFreshness`] at all and the guards read `None` — the same fail-open
 //! shape the pool-view guards use when no chain is present.
 

@@ -3,8 +3,8 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, Connection, FillOutcome,
-    FirstMessage, Hash, LaneKey, MissPath, MissRefusal, OwnedSemaphorePermit, PublicKey,
+    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, Connection, Deployment, FillOutcome,
+    FirstMessage, Hash, LaneId, LaneKey, MissPath, MissRefusal, OwnedSemaphorePermit, PublicKey,
     RecvStream, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest, U256,
     VarInt, read_first_message, reset_stream, verify_binding,
 };
@@ -455,6 +455,27 @@ impl ClientHandler {
             return Ok(ServeEnd::Reset(ResetCause::TimestampSkew));
         }
 
+        // Payment pool routing (ADR 005 § Payment pool routing). The request
+        // names the pool it pays from; every pool read, voucher domain and lane
+        // below belongs to that pool's route. A pool this node does not accept
+        // is refused `Declined` with the accepted pools listed, before any pool
+        // read or chain call, so the requester can retry on one it holds.
+        let Some(deployment) = Deployment::from_pool_account(&req.payment_pool)
+            .filter(|deployment| self.pool_route(*deployment).is_some())
+        else {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::UnacceptedPool,
+                    self.rate_per_mb,
+                )
+                .await;
+        };
+        let pool_view = self
+            .pool_route(deployment)
+            .and_then(|route| route.pool_view.clone());
+
         // Verify an ephemeral client binding if present (ADR 005 §Client
         // identity binding) and remember the recovered address for the
         // connection's lifetime (a binding may be sent once and omitted on
@@ -508,8 +529,8 @@ impl ClientHandler {
         // The request's price: the node's configured `rate_per_mb`, quoted
         // verbatim and threaded to every refusal and to the window tier. The
         // delivery floor never rewrites it — a sub-floor rate still sells, and
-        // settlement clamps only the vote-weight byte credit (ADR 003
-        // § Rate-floor enforcement).
+        // the floor prices only the vote-weight credit the governance chain's
+        // `FeeRouter` grants on a sweep (ADR 003 § Rate-floor enforcement).
         let rate_per_mb = self.rate_per_mb;
 
         // Chain-staleness gate (ADR 011 §Serving while chain-stale). Every gate
@@ -578,10 +599,13 @@ impl ClientHandler {
         // `pull_authorized` refuses it before every fill tier, and admission
         // refuses it `OwnerMismatch`).
         let self_operator = self.eth_signer.address();
-        let lane_key = verified_client.map(|signer| LaneKey {
-            pool_id: B256::from(req.pool_id),
-            signer,
-            provider: self_operator,
+        let lane_key = verified_client.map(|signer| LaneId {
+            deployment,
+            key: LaneKey {
+                pool_id: B256::from(req.pool_id),
+                signer,
+                provider: self_operator,
+            },
         });
 
         // Backend and chain work only for a request that names a lane. A
@@ -595,7 +619,7 @@ impl ClientHandler {
         // pulls through. The per-request limiter and the admit-read cap bound
         // what bound requests can spend. With no pool-view wired (dev/test) the
         // admission refuses it.
-        if self.pool_view.is_some() && lane_key.is_none() {
+        if pool_view.is_some() && lane_key.is_none() {
             self.warn_unbound_request(&peer);
             return self
                 .respond_error(
@@ -811,6 +835,7 @@ impl ClientHandler {
                             let adm = DeferredAdmission::new(
                                 req.clone(),
                                 ext,
+                                deployment,
                                 verified_client,
                                 lane_key,
                                 peer,
@@ -911,7 +936,14 @@ impl ClientHandler {
             // count before the gates read the chain.
             drop(unadmitted_slot.take());
             let funding = match self
-                .funding_gates(&req, &ext, verified_client, lane_key, rate_per_mb)
+                .funding_gates(
+                    &req,
+                    &ext,
+                    deployment,
+                    verified_client,
+                    lane_key,
+                    rate_per_mb,
+                )
                 .await
             {
                 Ok(funding) => funding,
@@ -1258,6 +1290,7 @@ impl ClientHandler {
             None => Admission::OnFirstProof(DeferredAdmission::new(
                 req.clone(),
                 ext,
+                deployment,
                 verified_client,
                 lane_key,
                 peer,

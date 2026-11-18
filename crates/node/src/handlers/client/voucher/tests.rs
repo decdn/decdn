@@ -48,7 +48,13 @@ async fn verify_voucher_advances_candidate() {
         decdn_incentive::LaneChain::NONE,
     );
     let lane = Arc::new(Mutex::new(LaneDeliveryState::hydrated(seed)));
-    handler.lanes.insert(lane_key, Arc::clone(&lane));
+    handler.lanes.insert(
+        crate::handlers::client::LaneId {
+            deployment: crate::handlers::client::TEST_DEPLOYMENT,
+            key: lane_key,
+        },
+        Arc::clone(&lane),
+    );
 
     // A cumulative voucher paying exactly one MB from zero, signed by the
     // lane's pinned signer over the lane context.

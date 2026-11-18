@@ -37,19 +37,25 @@ capability claims the key. The next call then makes a new pending key.
 content, or a signed [namespace scope](#scope). Thus a capability pays for
 any content only when its registrant says so. The capability names a key
 that the gateway holds. Its owner signature must recover the on-chain owner
-of its pool on the gateway's deployment. A key holds at most one capability
-per pool. The gateway answers:
+of its pool on one of the configured `PaymentPool` contracts. The gateway
+tries each configured contract in order, under the capability domain of that
+contract. The first contract where the two agree is the pool's contract, and
+every pull the capability pays for pays through it. A pool is a pool id on
+one contract, because an owner's pool ids repeat across contracts. A key
+holds at most one capability per pool. The gateway answers:
 
 | Status | When |
 |--------|------|
 | 201 | The capability is registered. The body names `expiry`, `pool` and `signer`, and `namespaces` for a scoped capability. |
 | 409 | The gateway does not hold the key, or the key holds a capability from this pool. |
 | 422 | The body is not `{"capability", "scope"}`, the scope is not `"any"` or a namespace scope, the scope names no namespace, the cap is zero, the expiry is inside the expiry margin, or a signature does not recover the pool's owner. |
-| 502 | The pool could not be read on-chain. |
+| 502 | No configured contract matches, and the pool could not be read on-chain on one of them. |
 
 The gateway makes all checks that need no chain read before it reads the
 pool. Thus a capability that cannot register costs the operator's RPC
-nothing.
+nothing. The gateway refuses a key that holds a capability from the pool id
+on every configured contract before the read. Otherwise the read finds the
+pool's contract, and the gateway checks the key on that contract.
 
 `GET /_capability` lists the capabilities in the order of registration. Each
 entry has `cap`, `expiry`, `pool`, `signer` and `spent`. A scoped entry also
@@ -84,10 +90,13 @@ namespaces. It is an EIP-712 record:
 CapabilityScope(address signer,bytes32 poolId,uint256[] namespaces)
 ```
 
-The domain is `decdn-capability-scope`, version `1`, with the chain id and
-the `PaymentPool` address as `verifyingContract`. `signer` and `poolId` name
-the capability, so a scope does not move to another capability. The scope
-signature must recover the pool's on-chain owner. `PUT /_capability` carries
+The domain is `decdn-capability-scope`, version `1`, with the payment chain
+id and the `PaymentPool` address of the capability's pool as
+`verifyingContract`. `signer` and `poolId` name the capability, so a scope
+does not move to another capability. The scope signature must recover the
+pool's on-chain owner. Before any chain read, the gateway keeps only the
+configured contracts under whose domains the capability and the scope
+recover the same signer. `PUT /_capability` carries
 it as `"scope": {"namespaces": [7, 9], "signature": "0x…"}`.
 `decdn pool assign --namespace <id>` signs one, and prints the whole
 `PUT /_capability` body. `decdn pool assign --any-namespace` prints the body
@@ -205,7 +214,7 @@ The pointer is an EIP-712 record:
 Pointer(uint256 namespaceId,bytes32 root,uint64 seq)
 ```
 
-The domain is `decdn-pointer`, version `1`, with the chain id and the
+The domain is `decdn-pointer`, version `1`, with the governance chain id and the
 `PublisherRegistry` address as `verifyingContract`. A pointer signed for one
 deployment means nothing on another: namespace ids repeat across chains and
 redeploys. `root` is the bundle's manifest hash. `seq` orders the pointers
@@ -252,7 +261,7 @@ key's hold with one `decdn publish point`.
 
 Pointers live in `<data-dir>/pointers/<ns>.json`, one file per namespace,
 with the signer each recovered to, the highest `seq` stored from each
-signer, and the chain id and registry the owner was read on. The gateway
+signer, and the governance chain id and registry the owner was read on. The gateway
 reads them at start and fails to start on a damaged file, or on a file
 stored for another deployment: the same data dir on another chain or
 registry does not serve pointers nobody there signed. A restart changes no
@@ -424,7 +433,7 @@ when the operator sets it. It needs no token in either place.
 | `mode` | `loopback` or `public`. |
 | `version` | The `decdn` version. |
 | `started_unix`, `uptime_secs`, `listen` | When the gateway started, and its main listen address. |
-| `chain_id`, `payment_pool` | The deployment the gateway pays on. |
+| `chain_id`, `payment_pool` | The payment chain id and pool the gateway pays on. |
 | `counters` | The [metrics](#metrics) series, each by its name without the `decdn_gateway_` prefix and the `_total` suffix. |
 | `active_pulls` | Each pull in flight: blob hash, namespace, byte window, payer (the capability, by its key and pool), age, bytes delivered. |
 | `capabilities` | The registered capabilities, in the shape and order of `GET /_capability`. |

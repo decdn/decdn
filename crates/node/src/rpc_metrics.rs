@@ -35,20 +35,8 @@ pub(crate) fn metered_http_client(url: Url, metrics: &Arc<Metrics>) -> RpcClient
         .http(url)
 }
 
-/// Whether a failed call is the provider's rate limit: HTTP 429, an HTTP error
-/// that carries a `Retry-After` delay, or a JSON-RPC error response with code
-/// 429 or rate-limit wording (Infura `-32005 "project ID request rate
-/// exceeded"`).
-pub(crate) fn is_rate_limit(err: &TransportError) -> bool {
-    match err {
-        RpcError::Transport(kind) => is_rate_limited_transport(kind),
-        RpcError::ErrorResp(resp) => is_rate_limited_response(resp),
-        _ => false,
-    }
-}
-
-/// Words that mark a JSON-RPC error response as a rate limit. See
-/// [`is_rate_limit`].
+/// Words that mark a JSON-RPC error response as a rate limit (Infura
+/// `-32005 "project ID request rate exceeded"`).
 const RATE_LIMIT_WORDS: [&str; 3] = ["rate limit", "rate exceeded", "too many requests"];
 
 fn is_rate_limited_transport(kind: &TransportErrorKind) -> bool {

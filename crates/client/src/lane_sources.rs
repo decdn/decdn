@@ -346,7 +346,18 @@ where
         if !opened.is_empty() {
             self.opened.replace(opened);
         }
-        let holders = holders_from(targets, &mut self.lock_nodes());
+        let holders: Vec<Holder> = {
+            let mut nodes = self.lock_nodes();
+            holders_from(targets, &mut nodes)
+                .into_iter()
+                .filter(|holder| {
+                    let hint = nodes
+                        .get(&holder.provider)
+                        .and_then(|node| targets.pool_hints.get(&node.node_id));
+                    self.pays(holder.provider, hint.map(Vec::as_slice))
+                })
+                .collect()
+        };
         for holder in &holders {
             let Some(node_id) = self.lock_nodes().get(&holder.provider).map(|n| n.node_id) else {
                 continue;
@@ -373,7 +384,7 @@ where
             self.deps.store.as_ref(),
             self.deps.contract,
             self.payer,
-            self.deps.chain,
+            (&self.deps.chain.governance, self.deps.pool.deployment),
             self.deps.endpoint,
             self.voucher_dom,
             self.deps.funding.pool_id(),
@@ -381,14 +392,26 @@ where
         .await
     }
 
+    /// Whether this pass pays the node at `provider`, whose discovery answer
+    /// gave `hint` ([`crate::pool_route::PoolPasses::admits`]).
+    fn pays(&self, provider: Address, hint: Option<&[decdn_protocol::PoolAccount]>) -> bool {
+        self.deps
+            .passes
+            .admits(self.deps.pool.deployment, provider, hint)
+    }
+
     /// The [`Holder`] for a late `join` ([`admit_late`]), counted as joined.
-    /// `None` when the join's operator is already in the set.
+    /// `None` when the join's operator is already in the set, or when this
+    /// pass does not pay it.
     fn register_late(&self, join: LateJoin) -> Option<Holder> {
-        let quote = match &join {
-            LateJoin::Holder(holder) => Some(holder.rate_per_mb),
-            LateJoin::Proxy(_) => None,
+        let (quote, hint) = match &join {
+            LateJoin::Holder(holder) => (Some(holder.rate_per_mb), holder.payment_pools.clone()),
+            LateJoin::Proxy(proxy) => (None, proxy.payment_pools.clone()),
         };
         let holder = admit_late(&mut self.lock_nodes(), join)?;
+        if !self.pays(holder.provider, hint.as_deref()) {
+            return None;
+        }
         if let Some(rate_per_mb) = quote {
             self.rate_ceiling(holder.provider).note_quote(rate_per_mb);
         }
@@ -412,9 +435,9 @@ where
                 LanePayer::Owned(payer) => payer.owner().address(),
                 LanePayer::Delegated(_) => self.deps.self_address,
             },
-            deployment: self.deps.chain.deployment(),
+            deployment: self.deps.pool.deployment,
             token: self.deps.token,
-            payment_pool_addr: self.deps.chain.payment_pool,
+            payment_pool_addr: self.deps.pool.deployment.payment_pool,
             working_deposit: self.deps.deposit.working_deposit,
             max_approve: self.deps.deposit.max_approve,
             open: self.deps.deposit.open,
@@ -451,7 +474,7 @@ where
         }
         let signer = slot.current().signer.address();
         let pool_id = slot.pool_id();
-        let deployment = self.deps.chain.deployment();
+        let deployment = self.deps.pool.deployment;
         let lanes = match self.deps.store.delegate_lanes(deployment, pool_id, signer) {
             Ok(lanes) => lanes,
             Err(error) => {
@@ -746,8 +769,11 @@ where
     /// pool row, or the delegate lanes on the fetch's deployment.
     fn watermark_row(&self) -> WatermarkRow {
         match self.payer {
-            LanePayer::Owned(payer) => WatermarkRow::Owned(payer.owner().address()),
-            LanePayer::Delegated(_) => WatermarkRow::Delegated(self.deps.chain.deployment()),
+            LanePayer::Owned(payer) => WatermarkRow::Owned {
+                deployment: self.deps.pool.deployment,
+                owner: payer.owner().address(),
+            },
+            LanePayer::Delegated(_) => WatermarkRow::Delegated(self.deps.pool.deployment),
         }
     }
 
@@ -1042,6 +1068,15 @@ where
             node_id,
             at_secs: now_secs(),
         });
+    }
+
+    /// The node refused this pass's pool and listed the pools it accepts: it
+    /// gets one retry, in the pass of a listed pool the buyer can pay through
+    /// ([`crate::pool_route::PoolPasses::declined`]).
+    fn on_pool_declined(&self, holder: &Holder, accepted: &[decdn_protocol::PoolAccount]) {
+        self.deps
+            .passes
+            .declined(self.deps.pool.deployment, holder.provider, accepted);
     }
 }
 

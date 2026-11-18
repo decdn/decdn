@@ -1,110 +1,49 @@
-//! Shared chain-event log streaming for the on-chain watchers.
+//! Chain-state reads shared by the node's chain-state snapshots.
 //!
-//! Every watcher registers a `Route` on one `multiplexed_poller`, a single
-//! `eth_getLogs` polling loop that merges all routes into one call per tick and
-//! unifies historical backfill and the live tail into one resumable,
-//! cursor-persisting loop (#1092). The node makes no `watch_logs`/`eth_newFilter`
-//! call: the default public Arbitrum Sepolia RPC and most keyless endpoints
-//! reject those with `-32601` (#1106).
-//!
-//! # Watchers scan to head, deliberately
-//!
-//! Every watcher's scan upper bound is the head block itself. There is no
-//! confirmation lag and no knob for one.
-//!
-//! Two distinct things can go wrong at the unstable tip, and re-scan idempotency
-//! covers only one of them:
-//!
-//! - **Re-delivery of a canonical log.** Covered. The retry and reorg-rewind
-//!   paths already re-deliver, so `resumable_watcher`'s module doc does not
-//!   merely observe sink idempotency, it *requires* it (dedup by id / set
-//!   insertion / authoritative re-read). A re-mined event is re-applied
-//!   harmlessly.
-//! - **A log that never becomes canonical.** *Not* covered, and not the same
-//!   property: idempotency makes a repeated apply cheap, whereas a confirmation
-//!   lag would prevent the apply happening at all. `eth_getLogs` returns only
-//!   canonical logs, so no sink ever observes a removal and none has an un-apply
-//!   path. An event from an orphaned block therefore stays applied.
-//!
-//! That second case is an accepted residual, not a solved problem. It is
-//! accepted because reorgs on the target chain are shallow and rare (see
-//! `backfill`'s `REORG_MARGIN_BLOCKS`, which carries the sizing rationale for an
-//! Arbitrum-Sepolia-class L2 and is the single place that claim lives), and
-//! because the sinks holding an authoritative on-chain enumeration source
-//! re-read it and self-heal. The one without one is where an orphan sticks:
-//! settlement's pool projection (`PoolProjection::record_opened`) — an orphaned
-//! `PoolOpened` leaves a phantom pool in memory until the next restart. A `redeem`
-//! against a pool that does not exist pays nothing, so the node goes unpaid for
-//! anything it serves against the phantom.
-//!
-//! For the settlement watcher specifically, a lag also carries a concrete cost,
-//! which is what makes zero an active choice there rather than an inherited one:
-//! it would delay the pool projection, so a client's first request on a
-//! freshly-opened pool would miss it and pay a `getPool` read on admission.
-//!
-//! If a future chain needs a lag, reintroduce it as a config knob with a
-//! **non-zero default and a test asserting a live production config engages
-//! it** — not a silently-zero field whose unit test exercises the arithmetic
-//! rather than the wiring.
+//! The node reads every piece of chain state it keeps by `eth_call`. It reads
+//! no event log. Each snapshot (the `CapacityBond` registry, this operator's
+//! slashes, the `OriginAssignment` seats, the `ContentBlacklist` deny index and
+//! the live payment pools) is re-read by its own `refresh::run_refresh_loop`.
+//! This module holds what those loops share: the per-call timeout (`timed`),
+//! the boot retry ([`boot_retry`]) and the pinned snapshot block
+//! (`snapshot::snapshot_block`).
 
-pub(crate) mod backfill;
-// Public because `BootRetry` appears in the `pub` bootstrap signatures that
-// external integration tests (`tests/anvil_settlement_e2e.rs`) call.
+// Public because `BootRetry` appears in `pub` bootstrap signatures.
 pub mod boot_retry;
-// Public because `Route` appears in the `pub` watcher `bootstrap` signatures and
-// the builder/`spawn` are driven by external integration tests
-// (`tests/anvil_settlement_e2e.rs`) to run the settlement route.
-pub mod multiplexed_poller;
-pub(crate) mod resumable_watcher;
-// Public because it appears in the `pub` watcher `bootstrap` signatures, which
-// external integration tests (`tests/anvil_settlement_e2e.rs`) call.
-pub mod shared_head;
-
-// `resumable_watcher` is crate-private, but `WatcherHandle` is the return type of
-// the `pub multiplexed_poller::spawn`, so external callers must be able to name
-// it. Re-export it on a public path rather than widen the whole module.
-pub use resumable_watcher::WatcherHandle;
-
-pub(crate) use backfill::{
-    REORG_MARGIN_BLOCKS, Shrunk, WindowSpan, is_range_rejection, window_end,
-};
+pub mod refresh;
+pub mod snapshot;
 
 use std::future::IntoFuture;
 use std::time::Duration;
 
 use anyhow::Result;
 
-/// Default first backoff after a failing poll tick, doubled (bounded by
-/// [`WATCHER_MAX_BACKOFF`]) on each successive failure and reset on a clean
-/// tick. The one shared multiplexed poller drives every route on this schedule,
-/// so the recovery cadence is uniform by construction (#1092).
+/// First backoff after a failed boot read, doubled (bounded by
+/// [`WATCHER_MAX_BACKOFF`]) on each successive failure.
 pub(crate) const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Default ceiling for the per-tick exponential backoff. See
+/// Ceiling for the boot read's exponential backoff. See
 /// [`WATCHER_INITIAL_BACKOFF`].
 pub(crate) const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Fallback per-RPC-call timeout when a caller does not set its own. The alloy
 /// HTTP provider has no request timeout of its own, so a provider that keeps the
-/// connection open but never responds would otherwise wedge the tick forever —
-/// silently stopping event processing and blocking graceful shutdown. A bounded
-/// default makes such a call fail fast into the retry/backoff path instead.
+/// connection open but never responds would otherwise wedge a refresh loop
+/// forever and block graceful shutdown. A bounded default makes such a call
+/// fail fast instead.
 pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Apply a per-call timeout to an RPC future, folding the elapsed case and the
 /// call's own error into one `anyhow::Error`. A `None` config uses
 /// [`DEFAULT_RPC_CALL_TIMEOUT`].
 ///
-/// **Every** chain read on a watcher's path routes through here: the loop's own
-/// `get_logs`, `shared_head`'s `get_block_number`, and each follow-up RPC a
-/// [`resumable_watcher::LogSink`] issues from `apply` / `on_tick_complete`
-/// (for example the registry's `nodeIdOf`, the fee-shares `getShares`, and the
-/// slash and blacklist re-enumeration reads). This is not automatic — the loop
-/// cannot see a sink's own reads, so a *new* sink read that does not wrap itself
-/// here reintroduces the wedge this exists
-/// to prevent: the alloy HTTP provider has no request timeout, so a provider
-/// that holds the connection open and never responds stalls the tick forever,
-/// with no backoff, no metric, and no graceful-shutdown path.
+/// **Every** chain read on a refresh loop's path routes through here: the
+/// snapshot block read, the registry, slash, origin-seat and blacklist
+/// snapshots, the pool refresh and the redeemer's reads. A *new* read that does
+/// not wrap itself here reintroduces the wedge this exists to prevent: the
+/// alloy HTTP provider has no request timeout, so a provider that holds the
+/// connection open and never responds stalls the loop forever, with no metric
+/// and no graceful-shutdown path.
 ///
 /// This helper guarantees only that a call is *bounded*. What a timeout **means**
 /// is the call site's decision, and each documents its own. The serve-admission
@@ -130,29 +69,21 @@ where
 
 /// A provider whose RPCs never resolve, for proving a read is bounded.
 ///
-/// Every `timed` call site is a claim that *this* read cannot wedge the tick.
+/// Every `timed` call site is a claim that *this* read cannot wedge its loop.
 /// The only way to test that claim is to drive the production read path against
 /// a provider that stalls — asserting the pure helper (as
 /// `timed_bounds_a_hanging_call_at_the_default` does) proves the mechanism but
-/// not the wiring, which is exactly the gap that let `confirmations` ship
-/// documented-but-disabled.
+/// not the wiring.
 ///
 /// alloy's `Asserter` cannot express a stall: `MockTransport::map_request` pops
 /// a queued response or errors immediately on an empty queue — it never pends.
 /// So this is the smallest transport that can: `poll_ready` is always ready and
 /// `call` returns `pending()`, so a request is dispatched and then hangs with no
-/// I/O involved. That last part matters, but not for the reason you might
-/// expect. Under `#[tokio::test(start_paused = true)]` the clock auto-advances
-/// whenever the runtime goes idle, and waiting on I/O does *not* inhibit that —
-/// only `spawn_blocking` does (it is the sole caller of tokio's
-/// `inhibit_auto_advance`; `park_thread_timeout` otherwise polls the I/O driver
-/// with a zero timeout and then advances). So a wiremock server with a long
-/// response delay does not hang the test — it fails it *vacuously*: the clock
-/// races to the 10s deadline while the HTTP round-trip is still in flight, so
-/// `timed` fires on virtual time rather than on the stall being tested, and the
-/// test no longer distinguishes a bounded read from a slow one. A never-resolving
-/// in-process future has nothing to race: the deadline is the only pending timer,
-/// so firing it is the assertion.
+/// I/O involved. Under `#[tokio::test(start_paused = true)]` the clock
+/// auto-advances whenever the runtime goes idle, and waiting on I/O does *not*
+/// inhibit that, so a wiremock server with a long response delay would fail the
+/// test vacuously. A never-resolving in-process future has nothing to race: the
+/// deadline is the only pending timer, so firing it is the assertion.
 #[cfg(test)]
 #[allow(clippy::panic)]
 pub(crate) mod test_support;

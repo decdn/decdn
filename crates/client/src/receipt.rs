@@ -25,13 +25,13 @@ use alloy::sol_types::Eip712Domain;
 use decdn_incentive::chain::CHUNK_BYTES;
 use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{
-    LaneKey, slash_judge_domain, verify_forward, voucher_domain, wire_voucher_to_signed,
+    Deployment, LaneKey, slash_judge_domain, verify_forward, voucher_domain, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{StreamResponse, StreamResponseBody, Voucher as WireVoucher};
 use serde::{Deserialize, Serialize};
 
 use crate::ledger::{PoolLedger, ProvedFrontier};
-use crate::session::ChainConfig;
+use crate::session::GovernanceChain;
 
 /// How many signed vouchers a lane keeps. A rejection rewinds the lane by one
 /// voucher, so an anchor this pull signed is one of the last few it signed.
@@ -155,17 +155,36 @@ impl ReceiptEvidence {
         Self::default()
     }
 
-    /// Collect for `lane` on `chain`, paid through `ledger`. A ledger already
-    /// collected for keeps its first entry.
-    pub(crate) fn attach(&self, chain: &ChainConfig, lane: LaneKey, ledger: &Arc<PoolLedger>) {
-        self.chain
+    /// Collect for `lane`, paid through `ledger` on `deployment`, with stream
+    /// responses signed under `governance`. A ledger already collected for
+    /// keeps its first entry. A receipt binds one deployment: a lane on
+    /// another deployment than the first attached one is not collected.
+    pub(crate) fn attach(
+        &self,
+        (governance, deployment): (&GovernanceChain, Deployment),
+        lane: LaneKey,
+        ledger: &Arc<PoolLedger>,
+    ) {
+        let bound = *self
+            .chain
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get_or_insert(ReceiptChain {
-                chain_id: chain.chain_id,
-                payment_pool: chain.payment_pool,
-                slash_judge: chain.slash_judge,
+                chain_id: governance.chain_id,
+                slash_judge: governance.slash_judge,
+                payment_chain_id: deployment.chain_id,
+                payment_pool: deployment.payment_pool,
             });
+        if (bound.payment_chain_id, bound.payment_pool)
+            != (deployment.chain_id, deployment.payment_pool)
+        {
+            tracing::warn!(
+                pool = %deployment.pool_account(),
+                "this pull paid a lane through a second payment pool; its receipt holds only \
+                 the lanes of the first pool"
+            );
+            return;
+        }
         let evidence = ledger.attach_evidence();
         let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
         if lanes.iter().any(|l| Arc::ptr_eq(&l.ledger, ledger)) {
@@ -342,16 +361,18 @@ pub struct PullReceipt {
     pub lanes: Vec<ReceiptLane>,
 }
 
-/// The deployment a receipt's signatures are bound to: the chain and the two
-/// contracts whose EIP-712 domains they sign under.
+/// The deployment a receipt's signatures are bound to: the two chains and the
+/// two contracts whose EIP-712 domains they sign under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptChain {
-    /// The chain id both domains carry.
+    /// The governance chain id, which the stream responses' domain carries.
     pub chain_id: u64,
-    /// The `PaymentPool` contract, the vouchers' `verifyingContract`.
-    pub payment_pool: Address,
     /// The `SlashJudge` contract, the stream responses' `verifyingContract`.
     pub slash_judge: Address,
+    /// The payment chain id, which the vouchers' domain carries.
+    pub payment_chain_id: u64,
+    /// The `PaymentPool` contract, the vouchers' `verifyingContract`.
+    pub payment_pool: Address,
 }
 
 /// What a pull fetched.
@@ -858,7 +879,7 @@ impl PullReceipt {
     #[must_use]
     pub fn verify(&self) -> Vec<ReceiptFault> {
         let slash_dom = slash_judge_domain(self.chain.chain_id, self.chain.slash_judge);
-        let voucher_dom = voucher_domain(self.chain.chain_id, self.chain.payment_pool);
+        let voucher_dom = voucher_domain(self.chain.payment_chain_id, self.chain.payment_pool);
         let content = &self.content;
         let listed = |hash: &B256| {
             *hash == content.hash

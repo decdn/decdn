@@ -317,7 +317,7 @@ contract DecdnGovernorTest is Test {
     /// @notice #847 regression — the core defect. A settlement landing in the
     ///         in-progress epoch (`tp / EPOCH`) after a proposal snapshot must
     ///         NOT change the weight read at that snapshot. Because the window
-    ///         now ends at the last fully-elapsed epoch and `routeSettlement`
+    ///         now ends at the last fully-elapsed epoch and `deposit`
     ///         only ever writes the current bucket, the snapshot read is
     ///         immutable. This assertion FAILS on the pre-#847 code (which read
     ///         the live current-epoch bucket) and PASSES after the fix.
@@ -331,7 +331,7 @@ contract DecdnGovernorTest is Test {
 
         // Simulate a mid-vote settlement: the node settles a large byte count
         // into the CURRENT (in-progress) epoch bucket — the mock analogue of
-        // `FeeRouter.routeSettlement` writing `block.timestamp / epochLength`.
+        // `FeeRouter.deposit` writing `block.timestamp / epochLength`.
         uint64 currentEpoch = uint64(tp / EPOCH);
         feeRouter.setBytes(operator, currentEpoch, 1_000_000_000);
         feeRouter.setTotalBytes(currentEpoch, 1_000_000_000);

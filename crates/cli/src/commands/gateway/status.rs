@@ -38,7 +38,10 @@ pub(super) struct Status {
     uptime_secs: u64,
     /// The main listener's address.
     listen: SocketAddr,
+    /// The payment chain of `payment_pool`.
     chain_id: u64,
+    /// The first configured payment pool. A capability draws from whichever
+    /// configured pool its owner signature names.
     #[serde(serialize_with = "super::eip55")]
     payment_pool: Address,
     counters: Counters,
@@ -75,8 +78,18 @@ impl Gateway {
             started_unix: self.started_unix,
             uptime_secs: self.started.elapsed().as_secs(),
             listen: self.listen,
-            chain_id: self.chain.chain_id,
-            payment_pool: self.chain.payment_pool,
+            chain_id: self
+                .chain
+                .payment_pools
+                .first()
+                .map_or(self.chain.governance.chain_id, |pool| {
+                    pool.deployment.chain_id
+                }),
+            payment_pool: self
+                .chain
+                .payment_pools
+                .first()
+                .map_or(Address::ZERO, |pool| pool.deployment.payment_pool),
             counters: self.metrics.snapshot(),
             active_pulls: self.active_pulls(),
             capabilities: self.capabilities(),

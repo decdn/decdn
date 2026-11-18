@@ -54,7 +54,6 @@ async fn slashes_reports_detected_records_newest_first() {
             offense_type: 0,
             amount: U256::from(100u64),
             evidence_hash: B256::repeat_byte(0x11),
-            block_number: Some(10),
             appeal_window_close: Some(999),
         },
         crate::slash_watcher::DetectedSlash {
@@ -62,7 +61,6 @@ async fn slashes_reports_detected_records_newest_first() {
             offense_type: 0,
             amount: U256::from(200u64),
             evidence_hash: B256::repeat_byte(0x22),
-            block_number: Some(20),
             appeal_window_close: None,
         },
     ]));
@@ -1071,8 +1069,14 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
     let threshold = U256::from(1_000_000u64);
     // Only pool 1's owner resolved; pool 2's read failed.
     let owners = pools_owned_by(&[(1, owner)]);
-    let snaps = build_lane_snapshots(&states, threshold, &ages, &owners);
+    let snaps = build_lane_snapshots(ADMIN_DEPLOYMENT, &states, threshold, &ages, &owners);
     assert_eq!(snaps.len(), 2);
+    assert!(
+        snaps
+            .iter()
+            .all(|snap| snap.pool == "eip155:31337:0x3434343434343434343434343434343434343434"),
+        "every lane names its PaymentPool contract as CAIP-10"
+    );
     // No activity recorded → both have `None`; within the `None`
     // group ordering is by descending outstanding, so the
     // 2_500_000-claim lane comes first.
@@ -1116,7 +1120,13 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
 fn build_lane_snapshots_threshold_is_inclusive() {
     let states = vec![mk_lane(1, 0xAA, 1_000_000)];
     let ages = HashMap::new();
-    let snaps = build_lane_snapshots(&states, U256::from(1_000_000u64), &ages, &HashMap::new());
+    let snaps = build_lane_snapshots(
+        ADMIN_DEPLOYMENT,
+        &states,
+        U256::from(1_000_000u64),
+        &ages,
+        &HashMap::new(),
+    );
     assert!(
         snaps.first().expect("snapshot").settlement_eligible,
         "outstanding == threshold must be eligible (>=)"
@@ -1153,6 +1163,7 @@ fn build_lane_snapshots_report_the_verified_chain_frontier() {
     };
     let snapshot = |state: LaneState, threshold: u64| {
         build_lane_snapshots(
+            ADMIN_DEPLOYMENT,
             &[state],
             U256::from(threshold),
             &HashMap::new(),
@@ -1195,6 +1206,7 @@ fn build_lane_snapshots_orders_active_lanes_first() {
     // lane must still sort first (recency beats size).
     let ages = HashMap::from([(active.key(), 3u64)]);
     let snaps = build_lane_snapshots(
+        ADMIN_DEPLOYMENT,
         &[idle, active],
         U256::from(1_000_000u64),
         &ages,
@@ -1225,6 +1237,21 @@ async fn lanes_without_handles_returns_empty() {
 /// computed against it. Pool 1's owner comes from the pool view; pool 2 is
 /// not in it, as a lane carried across a restart is not, so its owner comes
 /// from the chain read.
+/// The one pool the admin lane tests read.
+const ADMIN_DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
+    chain_id: 31_337,
+    payment_pool: Address::repeat_byte(0x34),
+};
+
+/// `store` and `owners` as the admin handles of [`ADMIN_DEPLOYMENT`].
+fn admin_pool(store: Arc<dyn PoolStateStore>, owners: PoolOwners) -> AdminPool {
+    AdminPool {
+        deployment: ADMIN_DEPLOYMENT,
+        store,
+        owners,
+    }
+}
+
 #[tokio::test]
 async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -1234,13 +1261,22 @@ async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
     let owner = Address::repeat_byte(0x0F);
     let chain_owner = Address::repeat_byte(0x0E);
     let projection = PoolProjection::new();
-    projection.record_opened(lane_pool_id(1), owner, U256::from(10_000_000u64));
+    projection.record_read(
+        lane_pool_id(1),
+        crate::pool_view::PoolStatus {
+            owner,
+            remaining: U256::from(10_000_000u64),
+            lifecycle: crate::pool_view::Lifecycle::Open,
+        },
+    );
     let (state, _tmp) = state_with().await;
     let handles = LaneStatusHandles {
-        pool_store: store as Arc<dyn PoolStateStore>,
+        pools: vec![admin_pool(
+            store,
+            PoolOwners::new(projection, Some(Arc::new(OneOwner(chain_owner)))),
+        )],
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
-        pool_owners: PoolOwners::new(projection, Some(Arc::new(OneOwner(chain_owner)))),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let resp = rpc.lanes().await.expect("lanes ok");
@@ -1373,10 +1409,15 @@ async fn lanes_rpc_reflects_stamped_lane_through_activity_clock() -> anyhow::Res
 
     let (state, _tmp) = state_with().await;
     let handles = LaneStatusHandles {
-        pool_store: store as Arc<dyn PoolStateStore>,
-        lane_activity: LaneActivityClock::with_stamped_lanes(&[active_id]),
+        pools: vec![admin_pool(
+            store,
+            PoolOwners::new(PoolProjection::new(), None),
+        )],
+        lane_activity: LaneActivityClock::with_stamped_lanes(&[crate::handlers::client::LaneId {
+            deployment: ADMIN_DEPLOYMENT,
+            key: active_id,
+        }]),
         redeem_threshold_micro_usdc: 1_000_000,
-        pool_owners: PoolOwners::new(PoolProjection::new(), None),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let resp = rpc.lanes().await.expect("lanes ok");
@@ -1422,10 +1463,12 @@ async fn lanes_rpc_surfaces_store_load_failure() {
 
     let (state, _tmp) = state_with().await;
     let handles = LaneStatusHandles {
-        pool_store: Arc::new(FailingStore) as Arc<dyn PoolStateStore>,
+        pools: vec![admin_pool(
+            Arc::new(FailingStore),
+            PoolOwners::new(PoolProjection::new(), None),
+        )],
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
-        pool_owners: PoolOwners::new(PoolProjection::new(), None),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let err = rpc.lanes().await.expect_err("expected store-load error");
@@ -1486,6 +1529,7 @@ fn build_lane_snapshots_report_the_unredeemed_part() {
     let mut over_paid = mk_lane(1, 2, 100);
     over_paid.paid_cumulative = U256::from(500u64);
     let snapshots = build_lane_snapshots(
+        ADMIN_DEPLOYMENT,
         &[partly_paid, over_paid],
         U256::MAX,
         &HashMap::new(),
@@ -1515,11 +1559,14 @@ mod earnings {
 
     fn row(block: u64, landed_at: u64, net: u64, gross: u64, bytes: u64) -> SettlementRecord {
         SettlementRecord {
+            deployment: decdn_incentive::Deployment {
+                chain_id: 31_337,
+                payment_pool: Address::repeat_byte(0x9c),
+            },
             block_number: block,
             log_index: 0,
             tx_hash: B256::repeat_byte(u8::try_from(block).unwrap_or(0)),
             landed_at_unix: landed_at,
-            epoch: 1,
             gross_micro_usdc: gross,
             net_micro_usdc: net,
             bytes_delivered: bytes,
@@ -1558,9 +1605,79 @@ mod earnings {
             operator,
             NOW,
             since,
-            &RedeemSchedule::default(),
+            &[RedeemSchedule::default()],
             started,
+            &[],
         )
+    }
+
+    /// Each pool gets its own settled sum and its pending protocol share; a
+    /// pool whose share read failed reports none.
+    #[test]
+    fn each_pool_reports_its_settlements_and_protocol_share() {
+        let first = decdn_incentive::Deployment {
+            chain_id: 31_337,
+            payment_pool: Address::repeat_byte(0x9c),
+        };
+        let second = decdn_incentive::Deployment {
+            chain_id: 421_614,
+            payment_pool: Address::repeat_byte(0x9d),
+        };
+        let mut other = row(4, NOW - 60, 5, 9, 50);
+        other.deployment = second;
+        let mut all = rows();
+        all.push(other);
+        let share = ProtocolShare {
+            pending_micro_usdc: 30,
+            pending_bytes: 300,
+            min_sweep_micro_usdc: 1_000,
+        };
+        let resp = build_earnings_response(
+            &all,
+            &[],
+            None,
+            NOW,
+            None,
+            &[RedeemSchedule::default()],
+            STARTED,
+            &[(first, Some(share.clone())), (second, None)],
+        );
+        let pools: Vec<_> = resp
+            .pools
+            .iter()
+            .map(|p| {
+                (
+                    p.pool.as_str(),
+                    p.settled.settlements,
+                    p.settled.net_micro_usdc,
+                    p.settled.gross_micro_usdc,
+                    p.settled.bytes_settled,
+                    p.protocol_share.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pools,
+            vec![
+                (
+                    "eip155:31337:0x9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c",
+                    3,
+                    70,
+                    140,
+                    700,
+                    Some(share)
+                ),
+                (
+                    "eip155:421614:0x9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d",
+                    1,
+                    5,
+                    9,
+                    50,
+                    None
+                ),
+            ]
+        );
+        assert_eq!(resp.since_ledger_start.settlements, 4, "totals span pools");
     }
 
     #[test]

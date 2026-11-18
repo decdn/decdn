@@ -151,6 +151,7 @@ impl ClientHandler {
                 outcome,
                 origin_attestation,
                 coverage,
+                payment_pools: self.payment_pools_hint(),
             },
         ))
     }

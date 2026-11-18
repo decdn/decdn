@@ -710,6 +710,10 @@ pub struct DiscoveredHolder {
     /// is ever constructed, so a malformed pairing never reaches this field. Empty here only for the empty root, which spans no
     /// block (#2471).
     pub coverage: Coverage,
+    /// The `payment_pools` hint of its answer: the `PaymentPool`
+    /// contracts it accepts, or `None` when it gave none (ADR 005 § Accepted
+    /// payment pools). Unsigned, like `coverage`.
+    pub payment_pools: Option<Vec<decdn_protocol::PoolAccount>>,
 }
 
 /// A bonded non-holder the client has a measured RTT for, and could route a
@@ -737,6 +741,10 @@ pub struct WarmingCandidate {
     /// from its [`NodeCandidate`] so a warming lane dials the proxy directly
     /// (see [`NodeCandidate::multiaddrs`]). Never read by ranking.
     pub multiaddrs: Bytes,
+    /// The `payment_pools` hint of its answer: the `PaymentPool`
+    /// contracts it accepts, or `None` when it gave none (ADR 005 § Accepted
+    /// payment pools).
+    pub payment_pools: Option<Vec<decdn_protocol::PoolAccount>>,
 }
 
 /// ADR 037 § Client selection policy: the ordered list of nearby non-holders to

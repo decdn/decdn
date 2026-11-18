@@ -1,9 +1,9 @@
 //! Integration tests for `decdn pool top-up` / `close` / `reclaim`.
 //!
 //! These exercise the guard paths that are reachable without a live
-//! node/anvil: a malformed `--pool` id fails fast at parse time, before the
+//! node/anvil: a malformed `--pool-id` fails fast at parse time, before the
 //! buyer-pool store is opened, the keystore is loaded, or any RPC is dialed;
-//! and `reclaim --pool` reads the pool before it opens the store or unlocks the
+//! and `reclaim --pool-id` reads the pool before it opens the store or unlocks the
 //! keystore.
 //! The on-chain `openPool`/`topUp`/`closePool`/`reclaim` primitives themselves
 //! are covered by the node crate's anvil settlement e2e.
@@ -42,14 +42,15 @@ fn empty_config(dir: &Path) -> std::path::PathBuf {
     path
 }
 
-/// Chain flags that satisfy `resolve_chain` (rpc + payment-pool required) so
-/// the guard tests reach the `--pool` parse. Nothing listens on the RPC port,
-/// so a case that does dial it fails at its first read.
+/// Chain flags that satisfy `resolve_chain` (a pool and its RPC) so the guard
+/// tests reach the `--pool-id` parse. Nothing listens on the RPC port, so a
+/// case that does dial it fails at its first read.
 fn chain_args(dir: &Path) -> PoolChainArgs {
     PoolChainArgs {
-        rpc_url: Some("http://127.0.0.1:1".to_string()),
-        payment_pool_address: Some("0x00000000000000000000000000000000000000ab".to_string()),
-        chain_id: None,
+        payment: decdn_common::cli::PoolSelectArgs {
+            pool: Some("eip155:421614:0x00000000000000000000000000000000000000ab".to_string()),
+            pool_rpc_url: Some("http://127.0.0.1:1".to_string()),
+        },
         keystore: None,
         keystore_password_file: None,
         data_dir: Some(dir.to_path_buf()),
@@ -62,15 +63,15 @@ async fn top_up_with_unparseable_pool_id_errors_before_touching_chain() {
     let cfg = empty_config(dir.path());
     let args = PoolArgs {
         command: PoolCommand::TopUp(PoolTopUpArgs {
-            pool: "not-a-pool-id".to_string(),
+            pool_id: "not-a-pool-id".to_string(),
             amount_micro_usdc: 1_000_000,
             chain: chain_args(dir.path()),
         }),
     };
     let err = pool_dispatch(&args, Some(&cfg))
         .await
-        .expect_err("an unparseable --pool must error before touching chain");
-    assert!(err.to_string().contains("invalid --pool"), "{err}");
+        .expect_err("an unparseable --pool-id must error before touching chain");
+    assert!(err.to_string().contains("invalid --pool-id"), "{err}");
 }
 
 #[tokio::test]
@@ -79,15 +80,15 @@ async fn close_with_unparseable_pool_id_errors_before_touching_chain() {
     let cfg = empty_config(dir.path());
     let args = PoolArgs {
         command: PoolCommand::Close(PoolCloseArgs {
-            pool: Some("not-a-pool-id".to_string()),
+            pool_id: Some("not-a-pool-id".to_string()),
             all: false,
             chain: chain_args(dir.path()),
         }),
     };
     let err = pool_dispatch(&args, Some(&cfg))
         .await
-        .expect_err("an unparseable --pool must error before touching chain");
-    assert!(err.to_string().contains("invalid --pool"), "{err}");
+        .expect_err("an unparseable --pool-id must error before touching chain");
+    assert!(err.to_string().contains("invalid --pool-id"), "{err}");
 }
 
 #[tokio::test]
@@ -96,18 +97,18 @@ async fn reclaim_with_unparseable_pool_id_errors_before_touching_chain() {
     let cfg = empty_config(dir.path());
     let args = PoolArgs {
         command: PoolCommand::Reclaim(PoolReclaimArgs {
-            pool: Some("not-a-pool-id".to_string()),
+            pool_id: Some("not-a-pool-id".to_string()),
             all: false,
             chain: chain_args(dir.path()),
         }),
     };
     let err = pool_dispatch(&args, Some(&cfg))
         .await
-        .expect_err("an unparseable --pool must error before touching chain");
-    assert!(err.to_string().contains("invalid --pool"), "{err}");
+        .expect_err("an unparseable --pool-id must error before touching chain");
+    assert!(err.to_string().contains("invalid --pool-id"), "{err}");
 }
 
-/// `reclaim --pool` reads the pool on a wallet-free provider before anything
+/// `reclaim --pool-id` reads the pool on a wallet-free provider before anything
 /// else touches local state: with no keystore and an unreachable RPC, the
 /// failure is the `getPool` read, not a keystore or password error, and the
 /// buyer-pool store is never created.
@@ -117,7 +118,7 @@ async fn reclaim_pool_reads_chain_before_store_or_keystore() {
     let cfg = empty_config(dir.path());
     let args = PoolArgs {
         command: PoolCommand::Reclaim(PoolReclaimArgs {
-            pool: Some(format!("0x{}", "11".repeat(32))),
+            pool_id: Some(format!("0x{}", "11".repeat(32))),
             all: false,
             chain: chain_args(dir.path()),
         }),

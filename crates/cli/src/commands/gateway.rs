@@ -29,11 +29,14 @@
 //! address and creates it when there is none, so repeated calls get the same
 //! address until a capability claims the key. `PUT /_capability` takes a
 //! `dcap1:` capability issued to a key the gateway holds, and its owner
-//! signature must recover the on-chain owner of its pool on the gateway's
-//! deployment. It also takes the capability's scope, always stated: `"any"`
-//! pays for any request, and a namespace scope its pool owner signs pays
-//! only for those namespaces' content (`scope`). A key holds at most one capability per pool: a key the
-//! gateway does not hold, or a second capability from one pool, answers 409.
+//! signature must recover the on-chain owner of its pool on one of the
+//! configured `PaymentPool` contracts, which every pull it pays for then
+//! pays through (`capability_pool`). It also takes the capability's scope,
+//! always stated: `"any"` pays for any request, and a namespace scope its
+//! pool owner signs pays only for those namespaces' content (`scope`). A key
+//! holds at most one capability per pool, a pool id on one contract: a key
+//! the gateway does not hold, or a second capability from one pool, answers
+//! 409.
 //! A zero cap, or an expiry already inside the expiry margin nodes apply
 //! ([`EXPIRY_MARGIN_SECS`]), is refused before the chain is read.
 //! `GET /_capability` lists the capabilities in the order they were
@@ -160,7 +163,6 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
-use alloy::sol_types::Eip712Domain;
 use anyhow::Context as _;
 use bytes::Bytes;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
@@ -170,9 +172,8 @@ use decdn_common::address::parse_nonzero_address;
 use decdn_common::cli::{self, ClientFetchArgs, GatewayArgs};
 use decdn_common::config::{FileConfig, inside_capability_expiry_margin, load_file_config};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
-use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::publisher_registry::PublisherRegistry;
-use decdn_incentive::{CapabilityGrant, PoolId, voucher_domain};
+use decdn_incentive::{CapabilityGrant, Deployment, PoolId};
 use http_body_util::{BodyExt as _, Limited, StreamBody};
 use hyper::body::{Body as HttpBody, Frame};
 use hyper::service::service_fn;
@@ -184,6 +185,7 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc, oneshot};
 
 use decdn_cache::{CacheEngine, CacheMetrics};
 
+use super::capability_pool::{CapabilityPoolError, capability_pool, read_pool_owner};
 use super::fetch::{
     BlobFetch, CacheStores, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb,
     resolve_chain,
@@ -325,7 +327,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     private_dir(&root)?;
     let temp_store = store_dir(&root)?;
     common.data_dir = Some(temp_store.path().to_path_buf());
-    let (sites, public) = mode(args, &root, chain.chain_id, &file)?;
+    let (sites, public) = mode(args, &root, chain.governance.chain_id, &file)?;
 
     let listener = TcpListener::bind(args.listen)
         .await
@@ -347,7 +349,6 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     .context("start the gateway's pull worker")?;
     let gateway = Arc::new(Gateway {
         common,
-        domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: std::sync::Mutex::default(),
         pulls,
@@ -671,16 +672,33 @@ fn fill_chain_defaults(common: &mut ClientFetchArgs, file: &FileConfig) -> anyho
         return Ok(());
     };
     let addresses = chain.addresses()?;
-    if common.rpc_url.is_none() && bc.and_then(|b| b.rpc_url.as_ref()).is_none() {
-        common.rpc_url = Some(chain.public_rpc.to_owned());
-    }
-    if common.chain_id.is_none() && bc.and_then(|b| b.chain_id).is_none() {
-        common.chain_id = Some(chain.chain_id);
-    }
-    if common.payment_pool_address.is_none()
-        && bc.and_then(|b| b.payment_pool_address.as_ref()).is_none()
+    if common.governance.governance_rpc_url.is_none()
+        && bc.and_then(|b| b.rpc_url.as_ref()).is_none()
     {
-        common.payment_pool_address = Some(addresses.payment_pool);
+        common.governance.governance_rpc_url = Some(chain.public_rpc.to_owned());
+    }
+    if common.governance.governance_chain_id.is_none() && bc.and_then(|b| b.chain_id).is_none() {
+        common.governance.governance_chain_id = Some(chain.chain_id);
+    }
+    // With no configured payment chain and no `--pool`, the gateway pays
+    // through the known target's first pool; a config file that names any
+    // payment chain supplies its own pools.
+    let configured_payment = bc.is_some_and(|b| !b.payment_chains.is_empty());
+    if let Some(payment) = chain.payment_chains()?.into_iter().next()
+        && !configured_payment
+        && common.payment.pool.is_none()
+        && let Some(pool) = payment.payment_pools.first()
+    {
+        let pool = parse_nonzero_address(pool, "payment_pools")?;
+        common.payment.pool = Some(
+            Deployment {
+                chain_id: payment.chain_id,
+                payment_pool: pool,
+            }
+            .pool_account()
+            .to_string(),
+        );
+        common.payment.pool_rpc_url = Some(payment.public_rpc.to_owned());
     }
     if common.slash_judge_address.is_none()
         && bc.and_then(|b| b.slash_judge_address.as_ref()).is_none()
@@ -701,22 +719,6 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Whether a pool whose on-chain owner is `on_chain` accepts a capability its
-/// signature recovers to `signed_by`.
-fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Result<(), String> {
-    if on_chain.is_zero() {
-        Err(format!(
-            "pool {pool_id} does not exist on this deployment\n"
-        ))
-    } else if on_chain != signed_by {
-        Err(format!(
-            "the capability is not signed by the owner of pool {pool_id}\n"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 /// The body of `PUT /_capability`.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -730,10 +732,9 @@ struct RegisterRequest {
 
 struct Gateway {
     common: ClientFetchArgs,
-    /// The chain a registered capability's pool must live on.
+    /// The chains a registered capability's pool must live on: one of the
+    /// configured payment pools. Registry reads use its governance chain.
     chain: ChainConfig,
-    /// The EIP-712 domain a capability's owner signs under.
-    domain: Eip712Domain,
     /// The delegate keys and the capabilities registered to them.
     delegates: std::sync::Mutex<Delegates>,
     /// Runs every pull, on one endpoint and one buyer-pool store.
@@ -1340,7 +1341,7 @@ impl Gateway {
             }
         };
         let ns = pointer.namespace;
-        let domain = pointer_domain(self.chain.chain_id, public.registry);
+        let domain = pointer_domain(self.chain.governance.chain_id, public.registry);
         let signer = match pointer.signer(&domain) {
             Ok(signer) => signer,
             Err(e) => return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n")),
@@ -1442,7 +1443,10 @@ impl Gateway {
 
     /// `PUT /_capability`: register a capability to a key the gateway holds.
     /// Every check that needs no chain read runs first, so a capability that
-    /// cannot register costs the operator's RPC nothing.
+    /// cannot register costs the operator's RPC nothing. A key that already
+    /// holds a capability from its pool id on every configured contract is
+    /// refused here; otherwise the read names the pool's contract, and the
+    /// registration checks the key on that contract.
     async fn register<B>(&self, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
@@ -1496,12 +1500,19 @@ impl Gateway {
                 ),
             );
         }
-        if let Err(refusal) = self.delegates().admits(&grant) {
+        let contracts: Vec<Deployment> = self
+            .chain
+            .payment_pools
+            .iter()
+            .map(|pool| pool.deployment)
+            .collect();
+        if let Err(refusal) = self.delegates().admits(&grant, &contracts) {
             return text(StatusCode::CONFLICT, refusal.text());
         }
-        if let Err((status, e)) = self.verify_owner(&grant, signed_scope.as_ref()).await {
-            return text(status, &e);
-        }
+        let pool = match self.verify_owner(&grant, signed_scope.as_ref()).await {
+            Ok(pool) => pool,
+            Err((status, e)) => return text(status, &e),
+        };
         let namespaces = signed_scope.map(|scope| scope.namespaces);
         let mut response = serde_json::json!({
             "expiry": grant.expiry,
@@ -1511,54 +1522,77 @@ impl Gateway {
         if let (Some(namespaces), Some(fields)) = (&namespaces, response.as_object_mut()) {
             fields.insert("namespaces".into(), serde_json::json!(namespaces));
         }
-        let (signer, pool) = (grant.signer, grant.pool_id);
-        if let Err(refusal) = self.delegates().register(grant, namespaces) {
+        let (signer, pool_id) = (grant.signer, grant.pool_id);
+        if let Err(refusal) = self.delegates().register(grant, pool, namespaces) {
             return text(StatusCode::CONFLICT, refusal.text());
         }
-        tracing::info!(%signer, %pool, "a capability was registered");
+        tracing::info!(
+            %signer,
+            pool = %pool_id,
+            chain_id = pool.chain_id,
+            payment_pool = %pool.payment_pool,
+            "a capability was registered"
+        );
         json(StatusCode::CREATED, &response)
     }
 
-    /// Check that `grant`, and its `scope` when it has one, are signed by the
-    /// on-chain owner of its pool on this gateway's deployment. Whether the
-    /// pool can pay shows only when a pull draws on it: a funding stop
+    /// The configured `PaymentPool` contract whose on-chain owner of
+    /// `grant`'s pool signed it, and signed its `scope` when it has one
+    /// ([`capability_pool`]), or the status and text to answer with: 422 for
+    /// a malformed signature, a scope no candidate pool's owner signed, or no
+    /// matching pool; 502 when no pool matches and a read failed. The scope
+    /// is checked against each pool's domains before any chain read. Whether
+    /// the pool can pay shows only when a pull draws on it: a funding stop
     /// retires the capability.
     async fn verify_owner(
         &self,
         grant: &CapabilityGrant,
         scope: Option<&SignedScope>,
-    ) -> Result<(), (StatusCode, String)> {
+    ) -> Result<Deployment, (StatusCode, String)> {
         let unprocessable = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
-        let signed_by = grant
-            .owner(&self.domain)
-            .map_err(|e| unprocessable(format!("{e}\n")))?;
-        let scoped_by = scope
-            .map(|scope| {
-                let domain = scope_domain(self.chain.chain_id, self.chain.payment_pool);
-                scope
-                    .owner(grant.signer, grant.pool_id, &domain)
-                    .map_err(|_| unprocessable("the scope signature is malformed\n".to_owned()))
-            })
-            .transpose()?;
-        if scoped_by.is_some_and(|scoped_by| scoped_by != signed_by) {
-            return Err(unprocessable(
-                "the scope is not signed by the capability's pool owner\n".to_owned(),
-            ));
-        }
-        let unreachable = |e: String| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("could not read the capability's pool on-chain: {e}\n"),
-            )
+        let candidates = match scope {
+            None => self.chain.payment_pools.clone(),
+            Some(scope) => {
+                let mut agree = Vec::new();
+                for pool in &self.chain.payment_pools {
+                    let deployment = pool.deployment;
+                    let signed_by = grant
+                        .owner(&deployment.voucher_domain())
+                        .map_err(|e| unprocessable(format!("{e}\n")))?;
+                    let domain = scope_domain(deployment.chain_id, deployment.payment_pool);
+                    let scoped_by =
+                        scope
+                            .owner(grant.signer, grant.pool_id, &domain)
+                            .map_err(|_| {
+                                unprocessable("the scope signature is malformed\n".to_owned())
+                            })?;
+                    if scoped_by == signed_by {
+                        agree.push(pool.clone());
+                    }
+                }
+                if agree.is_empty() {
+                    return Err(unprocessable(
+                        "the scope is not signed by the capability's pool owner\n".to_owned(),
+                    ));
+                }
+                agree
+            }
         };
-        let rpc = decdn_client::provider::build_read_provider(&self.chain.rpc_url)
-            .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
-        let pool = PaymentPool::new(self.chain.payment_pool, rpc)
-            .getPool(grant.pool_id)
-            .call()
-            .await
-            .map_err(|e| unreachable(sanitize_error_sources(&e)))?;
-        owner_matches(pool.owner, signed_by, grant.pool_id).map_err(unprocessable)
+        capability_pool(grant, &candidates, |pool, pool_id| {
+            let pool = pool.clone();
+            async move {
+                read_pool_owner(&pool, pool_id)
+                    .await
+                    .map_err(|e| sanitize_err_chain(&e))
+            }
+        })
+        .await
+        .map_err(|e| match e {
+            CapabilityPoolError::Malformed(text) | CapabilityPoolError::NoMatch(text) => {
+                unprocessable(text)
+            }
+            CapabilityPoolError::Unread(text) => (StatusCode::BAD_GATEWAY, text),
+        })
     }
 
     /// `GET /_capability`: every capability not yet expired, in the order
@@ -1591,7 +1625,7 @@ impl Gateway {
                 &format!("could not read the namespace's owner on-chain: {e}\n"),
             ))
         };
-        let rpc = decdn_client::provider::build_read_provider(&self.chain.rpc_url)
+        let rpc = decdn_client::provider::build_read_provider(&self.chain.governance.rpc_url)
             .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
         let registry = PublisherRegistry::new(public.registry, rpc);
         let lookup = registry.ownerOf(U256::from(ns));
@@ -1620,8 +1654,11 @@ impl Gateway {
     /// Retire the capability `credential` pays with after a funding stop. It
     /// stays listed, as spent, until it expires.
     fn mark_spent(&self, credential: &Credential) {
-        self.delegates()
-            .retire(credential.signer.address(), credential.grant.pool_id);
+        self.delegates().retire(
+            credential.signer.address(),
+            credential.pool,
+            credential.grant.pool_id,
+        );
     }
 
     /// Content on the bare host. A bundle or an entry opens as its site for

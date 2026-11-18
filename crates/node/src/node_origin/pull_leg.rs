@@ -1496,7 +1496,7 @@ pub(crate) async fn run_pull_leg(
         admit_store: &admit_store,
         pacer: &pacer,
         pacing_wait: &pacing_wait,
-        recovery: RecoveryGate::with_settle(settle_window(deps.config.event_poll_interval)),
+        recovery: RecoveryGate::with_settle(settle_window(deps.config.upstream_pool_refresh)),
         gap_seen: std::sync::Mutex::new(None),
         seen_deposit: std::sync::Mutex::new(deps.buyer.pool_deposit().unwrap_or(U256::ZERO)),
         cancel: &cancel,
@@ -1733,8 +1733,8 @@ impl RunSink for PeerRunSink<'_> {
     /// The assembly's funding recovery step, under its gate. The gap's shrink
     /// since the last check is the verified progress the gate counts: the store
     /// admits only bao-verified bytes. Inside the settle window after a top-up,
-    /// a source that still refuses is the upstream's chain watcher lagging the
-    /// new deposit, so the assembly waits a [`SETTLE_POLL_STEP`] and asks again
+    /// a source that still refuses holds a pool read older than the new
+    /// deposit, so the assembly waits a [`SETTLE_POLL_STEP`] and asks again
     /// without a step.
     async fn recover(&self, gap_chunks: u64) -> Result<(), RecoveryEnd> {
         {

@@ -15,10 +15,10 @@
 //!      and the serve handler registers a lane from that capability and persists a
 //!      genuine client-signed voucher. The seller redeemer then submits `redeem`;
 //!      the contract's `ECDSA.recover` accepts the normalized voucher signature,
-//!      `getWatermark` advances, and `FeeRouter.bytesPerEpoch` increments.
-//!   2. **Live event decode.** The [`PoolSettlementService`] watcher's
-//!      subscribe+decode path runs against a live RPC (`PoolRedeemed` drives the
-//!      paid watermark cache that gates redemption).
+//!      `getWatermark` advances, and the operator's `pending` sweep grows.
+//!   2. **Live receipt decode.** The [`PoolSettlementService`] redeemer decodes
+//!      its own `redeemMany` receipt against a live RPC (`PoolRedeemed` drives
+//!      the paid watermark that gates redemption).
 //!   3. **Buyer lifecycle.** A [`BuyerPoolService`] opens a pool, delivers a paid
 //!      stream signed via the service-produced [`PoolContext`], tops the pool up,
 //!      and — after an owner `closePool` and a grace-window warp — reclaims the
@@ -26,9 +26,11 @@
 //!
 //! ## Shape
 //!
-//! 1. Spawn a local `anvil`, deploy a mintable mock USDC, then deploy the full
-//!    protocol via the production `forge script DeployProtocol.s.sol` (reading the
-//!    deployed addresses from the `deployments/<chainId>.json` manifest).
+//! 1. Spawn a local `anvil`, deploy a mintable mock USDC and a `LoopbackCctp`,
+//!    then the governance suite via the production `forge script
+//!    DeployProtocol.s.sol` and the `PaymentPool` via `DeployPaymentPool.s.sol`
+//!    (reading the deployed addresses from the `deployments/<chainId>.json` and
+//!    `deployments/<chainId>-payment.json` manifests).
 //! 2. Activate the node operator on-chain: `stake` + `registerNode` (the iroh
 //!    ed25519 node key signs the ownership proof the production `Ed25519Verifier`
 //!    checks; the eth key signs the EIP-712 binding).
@@ -39,8 +41,8 @@
 //!    pointed at the anvil RPC.
 //! 4. Seller path — a buyer opens a pool on-chain, runs a real iroh paid-delivery
 //!    roundtrip carrying its self-capability so a genuine voucher is produced, and
-//!    the redeemer's `redeem` lands: `getWatermark` advances and
-//!    `FeeRouter.bytesPerEpoch` increments.
+//!    the redeemer's `redeem` lands: `getWatermark` advances and the operator's
+//!    `pending` sweep grows.
 //! 5. Buyer path — a [`BuyerPoolService`] opens a pool, delivers over the
 //!    service-produced context, tops the pool up, then closes + reclaims after the
 //!    grace window, asserting the full deposit refunds and the record drops.
@@ -81,12 +83,11 @@ use decdn_client::sign_client_binding;
 use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolStore, KeyedCheckpointStore, MemoryBuyerPoolStore, PoolStateStore,
-    bind_node_id_domain, register_node_signing_hash, slash_judge_domain, voucher_domain,
+    BuyerPoolStore, MemoryBuyerPoolStore, PoolStateStore, bind_node_id_domain,
+    register_node_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_pool::BuyerPoolService;
 use decdn_node::chain_events::boot_retry::BootRetry;
-use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
 use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::PoolSettlementService;
@@ -97,6 +98,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod anvil_deploy;
 mod support;
 use support::{
     HandlerDomains, build_handler_full_configured, cache_with_blob, fresh_key, local_endpoint,
@@ -124,7 +126,6 @@ const DEPLOYER_ADDR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 // it would desync alloy's cached nonce ("nonce too low").
 const ADMIN_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
-const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60; // FeeRouter/CapacityBond constant
 const RATE_PER_MB: u64 = 10; // µUSDC per MiB (within deliveryFloor/ceiling)
 const MIB: usize = 1024 * 1024;
 
@@ -277,29 +278,18 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReconcileFailureLa
 /// process.
 struct AnvilGuard {
     child: Child,
-    manifest: PathBuf,
+    manifests: [PathBuf; 2],
 }
 
 impl Drop for AnvilGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // Manifest is gitignored, but remove it so re-runs start clean.
-        let _ = std::fs::remove_file(&self.manifest);
+        // The manifests are gitignored, but remove them so re-runs start clean.
+        for manifest in &self.manifests {
+            let _ = std::fs::remove_file(manifest);
+        }
     }
-}
-
-/// A real [`SharedHead`] over the anvil provider, matching the poll interval the
-/// settlement service is bootstrapped with (so the TTL is 125 ms here, not the
-/// 3.5 s a production 7 s interval yields).
-fn e2e_head<P>(provider: &P) -> Arc<dyn HeadSource>
-where
-    P: Provider + Clone + 'static,
-{
-    Arc::new(SharedHead::new(
-        provider.clone(),
-        Duration::from_millis(250),
-    ))
 }
 
 /// Current Unix time in seconds — the base for a generous capability expiry.
@@ -430,7 +420,7 @@ fn empty_output_is_not_retryable() {
 // `topUp`, `closePool`, `reclaim`, `getPool`, `getWatermark`, and every event) is
 // reused from `decdn_incentive::payment_pool::PaymentPool` — the same ABI the
 // runtime decodes — so there is a single source of truth for the pool layout.
-// Only the ERC-20, operator-registration, and FeeRouter views are declared here.
+// Only the ERC-20 and operator-registration calls are declared here.
 alloy::sol! {
     #[sol(rpc)]
     contract Erc20 {
@@ -452,11 +442,6 @@ alloy::sol! {
             bytes ed25519Signature
         ) external;
         function isActive(address operator) external view returns (bool);
-    }
-
-    #[sol(rpc)]
-    contract FeeRouterView {
-        function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
     }
 }
 
@@ -562,9 +547,10 @@ async fn run_e2e() -> anyhow::Result<()> {
         .spawn()
         .expect("spawn anvil (is foundry installed?)");
     let manifest = contracts.join(format!("deployments/{CHAIN_ID}.json"));
+    let payment_manifest = contracts.join(format!("deployments/{CHAIN_ID}-payment.json"));
     let _anvil = AnvilGuard {
         child,
-        manifest: manifest.clone(),
+        manifests: [manifest.clone(), payment_manifest.clone()],
     };
 
     let url: reqwest::Url = rpc_url.parse()?;
@@ -606,11 +592,22 @@ async fn run_e2e() -> anyhow::Result<()> {
             .await?;
     }
 
-    // ---- 3. Deploy mock USDC (mintable) from its compiled bytecode, then run
-    // the production deploy script with USDC_ADDRESS pointed at it.
+    // ---- 3. Deploy mock USDC (mintable) from its compiled bytecode and the
+    // loopback CCTP, then run the production deploy scripts with USDC_ADDRESS
+    // pointed at it: the governance suite, then the payment pool.
     let usdc_addr = deploy_mock_usdc(&admin, &contracts).await?;
-    run_deploy_script(&contracts, &rpc_url, usdc_addr, node_addr).await?;
-    let (capacity_bond, payment_pool, fee_router, token, slash_judge) = read_manifest(&manifest)?;
+    let cctp = anvil_deploy::deploy_loopback_cctp(&admin, &contracts).await?;
+    run_deploy_script(&contracts, &rpc_url, (usdc_addr, cctp), node_addr).await?;
+    let (capacity_bond, token, slash_judge) = read_manifest(&manifest)?;
+    let receiver = anvil_deploy::manifest_contract(&manifest, "CctpSweepReceiver")?;
+    let payment_pool = anvil_deploy::deploy_payment_pool(
+        &contracts,
+        &rpc_url,
+        (DEPLOYER_KEY, DEPLOYER_ADDR),
+        (usdc_addr, cctp, receiver),
+        &payment_manifest,
+    )
+    .await?;
 
     // Build the per-role providers + contract handles.
     // Simple nonce management mirrors production (`runtime::mod`, #904): a send
@@ -630,7 +627,6 @@ async fn run_e2e() -> anyhow::Result<()> {
     let usdc_admin = Erc20::new(usdc_addr, admin.clone());
     let pool_client = PaymentPool::new(payment_pool, client_provider.clone());
     let pool_read = PaymentPool::new(payment_pool, node_provider.clone());
-    let fee_view = FeeRouterView::new(fee_router, node_provider.clone());
 
     // ---- 4. Activate the node operator: bond + registerNode → isActive.
     let min_bond: U256 = "50000000000000000000000".parse()?; // 50_000e18 (deploy default)
@@ -701,7 +697,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     )?;
     // One concrete redb-backed store backs the lane-state trait (the handler +
     // #527 replay guard), the capability sink/source (first-redemption
-    // registration), and the watcher checkpoint — mirrors the runtime wiring.
+    // registration), and the settlement ledger — mirrors the runtime wiring.
     let concrete_store = Arc::new(PersistentPoolStateStore::open(
         store_tmp.path(),
         Deployment {
@@ -710,7 +706,6 @@ async fn run_e2e() -> anyhow::Result<()> {
         },
     )?);
     let store: Arc<dyn PoolStateStore> = concrete_store.clone();
-    let checkpoint_store: Arc<dyn KeyedCheckpointStore> = concrete_store.clone();
     let ledger: Arc<dyn decdn_incentive::SettlementLedger> = concrete_store.clone();
 
     let node_eth = Arc::new(node_signer.clone());
@@ -726,14 +721,17 @@ async fn run_e2e() -> anyhow::Result<()> {
     // receiver drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
-    // Event-fed pool view, shared with the settlement service below (its watcher
-    // is the writer). The capability-intake gate reads the on-chain pool owner
-    // from it; without an owner the capability is dropped and no lane registers,
-    // so the test waits for the projection to catch `PoolOpened` before serving.
-    let pool_view = decdn_node::pool_view::PoolProjection::new();
+    // The `getPool`-backed pool view, shared with the settlement service below
+    // (its refresh loop re-reads the pools with a live lane). The
+    // capability-intake gate reads the on-chain pool owner from it.
+    let pool_view = Arc::new(decdn_node::payment_settlement::ResolvingPoolView::new(
+        PaymentPool::new(payment_pool, node_provider.clone()),
+        decdn_node::pool_view::PoolProjection::new(),
+        Arc::clone(&metrics),
+    ));
     let handler = {
         let hint = redeem_tx.clone();
-        let pool_view = pool_view.clone();
+        let pool_view = Arc::clone(&pool_view);
         build_handler_full_configured(
             node_pub,
             &node_eth,
@@ -745,19 +743,26 @@ async fn run_e2e() -> anyhow::Result<()> {
             &domains,
             16,
             move |deps| {
-                deps.redeem_hint = Some(hint);
-                deps.pool_view =
-                    Some(Arc::new(pool_view) as Arc<dyn decdn_node::pool_view::PoolView>);
+                for pool in &mut deps.pools {
+                    pool.redeem_hint = Some(hint.clone());
+                    pool.pool_view =
+                        Some(Arc::clone(&pool_view) as Arc<dyn decdn_node::pool_view::PoolView>);
+                }
             },
         )?
     };
 
-    let (service, settlement_route) = PoolSettlementService::bootstrap(
+    // The pool's immutable operator share: the ledger scales each net income
+    // back to the gross payout by it.
+    let operator_bps = u16::try_from(pool_read.operatorBps().call().await?)?;
+    let service = PoolSettlementService::bootstrap(
         node_provider.clone(),
-        payment_pool,
+        decdn_incentive::Deployment {
+            chain_id: CHAIN_ID,
+            payment_pool,
+        },
         node_addr,
         Arc::clone(&store),
-        Arc::clone(&checkpoint_store),
         Arc::clone(&ledger),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
@@ -765,24 +770,12 @@ async fn run_e2e() -> anyhow::Result<()> {
         Duration::from_secs(300),
         Arc::clone(&metrics),
         &BootRetry::single_attempt(Arc::clone(&metrics)),
-        pool_view.clone(),
+        Arc::clone(&pool_view),
         redeem_tx,
         redeem_rx,
+        operator_bps,
     )
     .await?;
-    // The paid-watermark watcher is now a route on the shared multiplexed poller,
-    // not a service-owned task. Spawn a single-route poller so the settlement
-    // watcher actually runs (folds `PoolOpened` / `PoolRedeemed` events, drives
-    // the pool projection) as it does in the runtime. The handle is held for the
-    // test's duration; dropping it aborts the poller.
-    let settlement_poller = {
-        use decdn_node::chain_events::multiplexed_poller::{MultiplexedPollerBuilder, spawn};
-        let poller =
-            MultiplexedPollerBuilder::new(e2e_head(&node_provider), Duration::from_millis(250))
-                .route(settlement_route)
-                .build()?;
-        spawn(node_provider.clone(), poller)
-    };
 
     let (server_ep, server_addr) = local_endpoint(node_iroh_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), Arc::clone(&handler));
@@ -812,7 +805,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // SELLER PATH — the `client` account opens a pool, delivers one paid stream
     // carrying its self-capability (producing a genuine voucher), and the
     // redeemer redeems it. Assert the on-chain watermark advances and the byte
-    // delta is routed into the operator's FeeRouter epoch counter.
+    // delta is credited to the operator's pending sweep.
     // ============================================================
     // `openPool` takes the pool's own `uint64` USDC width.
     let deposit = DEPOSIT_MICRO_USDC;
@@ -835,22 +828,20 @@ async fn run_e2e() -> anyhow::Result<()> {
     // batched-read proof): no redeem on this lane can land before this block.
     let redeem_scan_from = node_provider.get_block_number().await?;
 
-    // Wait for the settlement watcher to fold `PoolOpened` into the shared pool
-    // projection: the capability-intake gate reads the owner from it, and drops
-    // the capability if the owner is not yet known. In production a serve request
-    // against a just-opened pool would fail open (serve, defer registration); the
-    // test pins the owner first so the single lane deterministically registers.
+    // The pool view reads `getPool` on its first sight of the pool: the
+    // capability-intake gate reads the owner from it. Pin the owner first so
+    // the single lane deterministically registers.
     {
         use decdn_node::pool_view::PoolView;
-        let view = pool_view.clone();
+        let view = Arc::clone(&pool_view);
         let owner = poll_until(Duration::from_secs(30), || {
-            let view = view.clone();
+            let view = Arc::clone(&view);
             async move { view.status(pool_id).await.map(|s| s.owner) }
         })
         .await;
         anyhow::ensure!(
             owner == Some(client_addr),
-            "pool projection did not observe PoolOpened owner in time"
+            "pool view did not read the pool owner in time"
         );
     }
 
@@ -916,14 +907,16 @@ async fn run_e2e() -> anyhow::Result<()> {
         "on-chain redeem never landed (normalized v-byte not accepted, or capability lane not registered)"
     );
 
-    // FeeRouter routing: the redeem routed its byte delta into the operator's
-    // per-epoch counter. Which voucher the single redeem lands on is
-    // timing-dependent, so assert it incremented, not an exact value.
-    let epoch = current_epoch(&node_provider).await?;
-    let routed = fee_view.bytesPerEpoch(node_addr, epoch).call().await?;
+    // Protocol share: the redeem credited its byte delta and the protocol's
+    // USDC share to the operator's pending sweep (`pending(operator)`), which
+    // a sweep carries to the governance chain's `FeeRouter`. Which voucher the
+    // single redeem lands on is timing-dependent, so assert it grew, not an
+    // exact value.
+    let pending = pool_read.pending(node_addr).call().await?;
     anyhow::ensure!(
-        routed > U256::ZERO,
-        "FeeRouter.bytesPerEpoch did not increment (settlement not routed): {routed}"
+        pending.servedBytes > U256::ZERO,
+        "PaymentPool.pending did not credit the operator's served bytes: {}",
+        pending.servedBytes
     );
 
     // ------------------------------------------------------------
@@ -1120,7 +1113,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         "Authorization must not change across the second, already-registered sweep"
     );
     // Poll for the same reason as `lane_after_first`: the second redeem's
-    // `store.set_registered_until` (if any) and the watcher `paid` update race
+    // `store.set_registered_until` (if any) and the receipt `paid` update race
     // the `getWatermark` poll above.
     let _lane_after_second = poll_until(Duration::from_secs(10), || {
         let store = Arc::clone(&store);
@@ -1211,61 +1204,66 @@ async fn run_e2e() -> anyhow::Result<()> {
     .await
     .ok_or_else(|| anyhow::anyhow!("the settlement ledger did not record both redeems"))?;
     anyhow::ensure!(rows.len() == 2, "one ledger row per redeemMany: {rows:?}");
+    let (first, second) = (&rows[0], &rows[1]);
     anyhow::ensure!(
-        rows[0].tx_hash == tx_first && rows[0].block_number == block_first,
-        "the first row is the first redeem ({tx_first} at {block_first}): {:?}",
-        rows[0]
+        first.tx_hash == tx_first && first.block_number == block_first,
+        "the first row is the first redeem ({tx_first} at {block_first}): {first:?}"
     );
     anyhow::ensure!(
-        rows[1].tx_hash == tx_second,
-        "the second row is the second redeem ({tx_second}): {:?}",
-        rows[1]
+        second.tx_hash == tx_second,
+        "the second row is the second redeem ({tx_second}): {second:?}"
     );
-    let fee_router_addr = PaymentPool::new(payment_pool, &node_provider)
-        .feeRouter()
-        .call()
-        .await?;
-    let shares = decdn_incentive::payment_pool::FeeRouter::new(fee_router_addr, &node_provider)
-        .getShares()
-        .call()
-        .await?;
-    let bps = U256::from(10_000u64);
     for row in &rows {
         anyhow::ensure!(
-            row.gross_micro_usdc > 0 && row.bytes_delivered > 0 && row.landed_at_unix > 0,
-            "a ledger row carries the gross, the bytes paid and the block time: {row:?}"
+            row.net_micro_usdc > 0 && row.bytes_delivered > 0 && row.landed_at_unix > 0,
+            "a ledger row carries the net, the bytes paid and the block time: {row:?}"
         );
-        let gross = U256::from(row.gross_micro_usdc);
-        let expected_net = gross - gross * shares[1] / bps - gross * shares[2] / bps;
+        // The pool pays floor(gross × bps / 10000) to the operator, and the row
+        // records the smallest gross that floors to the net.
+        let floored = row.gross_micro_usdc * u64::from(operator_bps) / 10_000;
         anyhow::ensure!(
-            U256::from(row.net_micro_usdc) == expected_net,
-            "a ledger row's net is the operator's share of the gross under the live split \
-             {shares:?}: {row:?}"
+            floored == row.net_micro_usdc,
+            "a ledger row's gross scales back to its net at {operator_bps} bps: {row:?}"
         );
     }
-    // The watcher's backfill decodes the same receipt into the same row, and a
-    // second backfill of a known transaction fetches nothing.
+    // Boot recovery decodes a recorded sent hash into the same row, and drops
+    // the hash, so a second recovery fetches nothing.
     let backfill_ledger = Arc::new(decdn_incentive::MemorySettlementLedger::default());
     let recorder = decdn_node::settlement_ledger::SettlementRecorder::new(
         backfill_ledger.clone(),
         node_addr,
+        decdn_node::settlement_ledger::LedgerSource {
+            deployment: Deployment {
+                chain_id: CHAIN_ID,
+                payment_pool,
+            },
+            usdc: usdc_addr,
+            operator_bps,
+        },
         Arc::clone(&metrics),
     );
-    recorder
-        .backfill(&node_provider, block_first, tx_first)
-        .await;
+    recorder.record_sent(tx_first).await;
+    recorder.recover_sent(&node_provider).await;
     let backfilled = decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?;
     anyhow::ensure!(
         backfilled.as_slice() == &rows[..1],
-        "a backfilled row equals the redeemer's row: {backfilled:?} vs {:?}",
-        rows[0]
+        "a recovered row equals the redeemer's row: {backfilled:?} vs {first:?}"
     );
-    recorder
-        .backfill(&node_provider, block_first, tx_first)
-        .await;
+    anyhow::ensure!(
+        decdn_incentive::SettlementLedger::sent_redeems(
+            backfill_ledger.as_ref(),
+            Deployment {
+                chain_id: CHAIN_ID,
+                payment_pool,
+            },
+        )?
+        .is_empty(),
+        "a recovered hash is dropped"
+    );
+    recorder.recover_sent(&node_provider).await;
     anyhow::ensure!(
         decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?.len() == 1,
-        "a known transaction is not written twice"
+        "a recovered transaction is not written twice"
     );
 
     // ============================================================
@@ -1345,20 +1343,19 @@ async fn run_e2e() -> anyhow::Result<()> {
     // requester endpoint (`client_ep` here) to the serve gate.
     let buyer_binding = sign_client_binding(buyer_signer.as_ref(), client_node_id, &bind_domain)?;
     let buyer_ctx = buyer_ctx.with_client_binding(buyer_binding);
-    // As with the seller pool: wait for the settlement watcher to fold this
-    // freshly-opened pool's `PoolOpened` into the shared projection, so the
-    // capability-intake gate can confirm the owner and register the lane.
+    // As with the seller pool: read this freshly-opened pool's owner first, so
+    // the capability-intake gate can confirm it and register the lane.
     {
         use decdn_node::pool_view::PoolView;
-        let view = pool_view.clone();
+        let view = Arc::clone(&pool_view);
         let owner = poll_until(Duration::from_secs(30), || {
-            let view = view.clone();
+            let view = Arc::clone(&view);
             async move { view.status(buyer_pool_id).await.map(|s| s.owner) }
         })
         .await;
         anyhow::ensure!(
             owner == Some(buyer_addr),
-            "pool projection did not observe the buyer pool's PoolOpened owner in time"
+            "pool view did not read the buyer pool's owner in time"
         );
     }
     let suffix = stream_fetch(
@@ -1435,7 +1432,15 @@ async fn run_e2e() -> anyhow::Result<()> {
     buyer_service.sweep_reclaimable_once().await;
 
     anyhow::ensure!(
-        buyer_store.get_by_owner(buyer_addr)?.is_none(),
+        buyer_store
+            .get_by_owner(
+                Deployment {
+                    chain_id: CHAIN_ID,
+                    payment_pool,
+                },
+                buyer_addr
+            )?
+            .is_none(),
         "reclaimed buyer pool record must be dropped"
     );
     let balance_after = usdc_buyer.balanceOf(buyer_addr).call().await?;
@@ -1449,10 +1454,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         "reclaimed pool must be Closed on-chain"
     );
 
-    // Retire the seller service: stop the shared poller (flushes the settlement
-    // route's scan checkpoint), then the service's graceful-shutdown path
-    // (quiesce the redeemer, run a final redeem sweep).
-    settlement_poller.shutdown();
+    // Retire the seller service through its graceful-shutdown path (quiesce
+    // the redeemer, run a final redeem sweep).
     service.shutdown(Duration::from_secs(30)).await;
 
     // PRE-REDEEM RECONCILIATION GATE (#2076). Asserted here, after the forced
@@ -1543,16 +1546,6 @@ fn cap_count_for_tx(
         .ok_or_else(|| anyhow::anyhow!("no captured cap_count log line for redeem tx {tx_hash}"))
 }
 
-/// Current `FeeRouter` epoch = `block.timestamp / epochLength`.
-async fn current_epoch<P: Provider>(provider: &P) -> anyhow::Result<u64> {
-    let block: serde_json::Value = provider
-        .raw_request("eth_getBlockByNumber".into(), ("latest", false))
-        .await?;
-    let ts_hex = block["timestamp"].as_str().expect("block timestamp");
-    let ts = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)?;
-    Ok(ts / EPOCH_LENGTH_SECS)
-}
-
 /// Deploy the mintable mock USDC from its compiled artifact bytecode.
 async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow::Result<Address> {
     let artifact = contracts.join("out/MintableUSDC.sol/MintableUSDC.json");
@@ -1592,7 +1585,7 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
 async fn run_deploy_script(
     contracts: &Path,
     rpc_url: &str,
-    usdc: Address,
+    (usdc, cctp): (Address, Address),
     initial_token_holder: Address,
 ) -> anyhow::Result<()> {
     for attempt in 1..=DEPLOY_ATTEMPTS {
@@ -1610,6 +1603,8 @@ async fn run_deploy_script(
                 DEPLOYER_ADDR,
             ])
             .env("USDC_ADDRESS", usdc.to_string())
+            .env("CCTP_MESSAGE_TRANSMITTER", cctp.to_string())
+            .env("CCTP_TOKEN_MESSENGER", cctp.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
             // DeployProtocol.s.sol requires a genesis VETTER_ROLE holder (a deploy
@@ -1669,22 +1664,9 @@ async fn run_deploy_script(
     anyhow::bail!("DEPLOY_ATTEMPTS must be >= 1 (was {DEPLOY_ATTEMPTS})")
 }
 
-/// Read `(CapacityBond, PaymentPool, FeeRouter, Token, SlashJudge)` from the
-/// deploy manifest.
-fn read_manifest(path: &Path) -> anyhow::Result<(Address, Address, Address, Address, Address)> {
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    let c = &json["contracts"];
-    let get = |k: &str| -> anyhow::Result<Address> {
-        Ok(c[k]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing {k}"))?
-            .parse()?)
-    };
-    Ok((
-        get("CapacityBond")?,
-        get("PaymentPool")?,
-        get("FeeRouter")?,
-        get("Token")?,
-        get("SlashJudge")?,
-    ))
+/// Read `(CapacityBond, Token, SlashJudge)` from the governance deploy
+/// manifest.
+fn read_manifest(path: &Path) -> anyhow::Result<(Address, Address, Address)> {
+    let get = |k: &str| anvil_deploy::manifest_contract(path, k);
+    Ok((get("CapacityBond")?, get("Token")?, get("SlashJudge")?))
 }

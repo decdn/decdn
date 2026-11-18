@@ -15,7 +15,8 @@ use clap::Args;
 /// the pool as `decdn get` does, and pays nothing and sends no transaction.
 /// The answer's signature must recover to `--provider-address`, its echoed
 /// fields must match the request, and a size it states must carry its proof.
-/// The chain, keystore and data-dir flags resolve as for `decdn get`: flag >
+/// The answer names the `PaymentPool` contracts the node accepts. The chain,
+/// keystore and data-dir flags resolve as for `decdn get`: flag >
 /// `[blockchain]`/`[identity]` config > default.
 #[derive(Args, Debug)]
 pub struct ProbeArgs {
@@ -51,19 +52,15 @@ pub struct ProbeArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// JSON-RPC endpoint. Overrides `blockchain.rpc_url`.
-    #[arg(long, value_name = "URL")]
-    pub rpc_url: Option<String>,
+    /// The governance chain: its RPC endpoint and chain id (the domain the
+    /// answer's signature verifies under).
+    #[command(flatten)]
+    pub governance: super::common::GovernanceChainArgs,
 
-    /// EIP-712 `chainId`. Overrides `blockchain.chain_id`; defaults to
-    /// Arbitrum Sepolia.
-    #[arg(long, value_name = "ID")]
-    pub chain_id: Option<u64>,
-
-    /// `PaymentPool` contract address (0x hex): the pool the open names
-    /// lives there. Overrides `blockchain.payment_pool_address`.
-    #[arg(long, value_name = "0xADDR")]
-    pub payment_pool_address: Option<String>,
+    /// The `PaymentPool` the open names. Without `--pool` the open names the
+    /// first pool of the route `decdn get` pays through.
+    #[command(flatten)]
+    pub payment: super::common::PoolSelectArgs,
 
     /// `SlashJudge` contract address (0x hex): the domain the answer's
     /// signature verifies under. Overrides `blockchain.slash_judge_address`.

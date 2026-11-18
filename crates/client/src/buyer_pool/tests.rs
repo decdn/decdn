@@ -1580,3 +1580,62 @@ async fn an_unreadable_estimate_falls_back_to_the_pools_status() {
         assert!(asserter.read_q().is_empty(), "{case}: both reads ran");
     }
 }
+
+/// Two `PaymentPool` contracts on one handle.
+fn two_contracts() -> (decdn_incentive::Deployment, decdn_incentive::Deployment) {
+    (
+        decdn_incentive::Deployment {
+            chain_id: 1,
+            payment_pool: Address::repeat_byte(0xA1),
+        },
+        decdn_incentive::Deployment {
+            chain_id: 2,
+            payment_pool: Address::repeat_byte(0xB2),
+        },
+    )
+}
+
+/// A pool id is unique only inside one contract: the same id seen live on one
+/// contract is not live on another.
+#[test]
+fn a_live_pool_is_live_on_its_own_contract_only() {
+    let (a, b) = two_contracts();
+    let escrows = UnconfirmedEscrows::default();
+    let pool_id = B256::repeat_byte(7);
+    escrows.for_pool(a).note_live(pool_id);
+    assert!(escrows.for_pool(a).saw_live(pool_id));
+    assert!(!escrows.for_pool(b).saw_live(pool_id));
+    assert!(!escrows.saw_live(pool_id));
+}
+
+/// A pending `topUp` or `openPool` on one contract refuses only that
+/// contract's next one, and every handle still names it.
+#[test]
+fn a_pending_escrow_guards_its_own_contract_only() {
+    let (a, b) = two_contracts();
+    let escrows = UnconfirmedEscrows::default();
+    let top_up = TopUpUnconfirmed { tx: None, nonce: 3 };
+    let open = OpenUnconfirmed { tx: None, nonce: 4 };
+    escrows.for_pool(a).hold_pending_for_test(top_up);
+    escrows.for_pool(a).hold_pending_for_test(open);
+    assert_eq!(escrows.for_pool(a).top_ups(), vec![top_up]);
+    assert_eq!(escrows.for_pool(a).opens(), vec![open]);
+    assert!(escrows.for_pool(b).top_ups().is_empty());
+    assert!(escrows.for_pool(b).opens().is_empty());
+    assert_eq!(
+        escrows.for_pool(b).pending(),
+        vec![
+            EscrowUnconfirmed::TopUp(top_up),
+            EscrowUnconfirmed::Open(open)
+        ],
+        "every handle names every pending escrow"
+    );
+    escrows.for_pool(b).remove(top_up);
+    assert_eq!(
+        escrows.for_pool(a).top_ups(),
+        vec![top_up],
+        "another contract's release leaves the entry"
+    );
+    escrows.for_pool(a).remove(top_up);
+    assert!(escrows.for_pool(a).top_ups().is_empty());
+}

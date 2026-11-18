@@ -15,14 +15,13 @@
 //!   applied on the next reload without a restart. ADR 011 §One-hour removal
 //!   orders makes this the only mechanism sized to a sub-day statutory deadline,
 //!   because it is the only one entirely within the order recipient's control.
-//! - **On-chain**, from `ContentBlacklist`'s `OriginBlacklistUpdated` AND
-//!   `OperatorBlacklisted` — two separate on-chain mappings the node unions.
-//!   Watching only the first would leave the primary governance path
-//!   (`addOperator`, which also ejects from `CapacityBond`) unenforced at the
-//!   delivery gate.
+//! - **On-chain**, from `ContentBlacklist`'s origin leg AND operator leg — two
+//!   separate on-chain mappings the node unions. Tracking only the first would
+//!   leave the primary governance path (`addOperator`, which also ejects from
+//!   `CapacityBond`) unenforced at the delivery gate.
 //!
 //! Separate slots because their lifecycles are independent — a config reload
-//! must not clobber what the chain watcher learned, and vice versa — but
+//! must not clobber what the blacklist sync learned, and vice versa — but
 //! [`ContentDenylist::is_origin_denied`] unions them, and the wire refusal that
 //! results does not say which matched. That is a requirement, not an omission: ADR 011 §`StreamRequest`
 //! Response specifies the response must not distinguish governance from local
@@ -87,40 +86,14 @@ impl ContentDenylist {
         origin_count
     }
 
-    /// Replace the on-chain origin set wholesale — the watcher's boot seed from
-    /// the enumerated address union, and its periodic re-enumeration refresh.
+    /// Replace the on-chain origin set wholesale: the live address union of
+    /// the blacklist sync's deny index, published on every enforcement pass.
     ///
-    /// The union is the origin ∪ operator deny set read from
-    /// `ContentBlacklist.blacklistedAddresses`, liveness-filtered by
-    /// `isOriginBlacklisted || isOperatorBlacklisted` (see
-    /// `decdn-node::blacklist_watcher`). It is rebuilt from chain each boot, so
-    /// there is no durable projection to reload.
+    /// The union holds every address whose origin leg or operator leg is live
+    /// (see `decdn-node::blacklist_watcher`). It is rebuilt from chain each
+    /// boot, so there is no durable projection to reload.
     pub fn set_chain_origins(&self, origins: HashSet<Address>) {
         self.chain_origins.store(Arc::new(origins));
-    }
-
-    /// Apply a single `OriginBlacklistUpdated` event.
-    ///
-    /// Read-modify-write rather than an in-place mutation, because [`ArcSwap`]
-    /// has no such thing. Origin events are rare (a governance action), so the
-    /// clone is irrelevant next to keeping reads lock-free; a `RwLock` would
-    /// trade that for a write that is still rare. Returns whether the set
-    /// actually changed, so callers can skip logging a no-op replay — the
-    /// watcher re-scans a block range after a restart and will re-deliver
-    /// events it has already applied.
-    pub fn apply_chain_origin(&self, addr: Address, blacklisted: bool) -> bool {
-        let current = self.chain_origins.load();
-        if current.contains(&addr) == blacklisted {
-            return false;
-        }
-        let mut next = HashSet::clone(&current);
-        if blacklisted {
-            next.insert(addr);
-        } else {
-            next.remove(&addr);
-        }
-        self.chain_origins.store(Arc::new(next));
-        true
     }
 
     /// Number of on-chain blacklisted origins currently tracked. For telemetry

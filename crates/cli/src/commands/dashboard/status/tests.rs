@@ -279,6 +279,7 @@ fn node_up() -> NodeSection {
         }),
         lanes: ok(LanesResponse {
             lanes: vec![LaneSnapshot {
+                pool: "eip155:421614:0x1111111111111111111111111111111111111111".to_owned(),
                 pool_id: POOL.to_owned(),
                 counterparty: Some("0xAbaBabaBABaBAbAbABABaBABAbabABAbAbaBabab".to_owned()),
                 voucher_signer: "0xCdCdCdCDCdcDcDCdCdCDCdCDCdcdcDcDcdcDCDcd".to_owned(),
@@ -312,6 +313,7 @@ fn node_up() -> NodeSection {
                 last_sweep_at_unix: Some(1_792_999_000),
                 next_sweep_at_unix: Some(1_793_002_600),
             }),
+            pools: Vec::new(),
         }),
         pools: ok(BuyerPoolsResponse {
             pools: vec![BuyerPoolSnapshot {

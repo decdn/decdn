@@ -27,6 +27,7 @@ fn answer(seed: u8, rtt_ms: f64, rate_per_mb: u64, has_blob: bool, size: u64) ->
         has_blob,
         total_bytes: has_blob.then_some(ProvenSize::assume_for_tests(size)),
         coverage: decdn_protocol::Coverage::empty(),
+        payment_pools: None,
     }
 }
 

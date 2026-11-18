@@ -79,11 +79,13 @@ pub async fn build(
         .map_err(|e| anyhow::anyhow!("read daemon info from {}: {e}", cfg.daemon_url))?;
     cfg.check_against(&info)?;
     let profile = Profile {
-        chain_id: info.chain_id,
-        rpc_url: cfg.rpc_url.clone(),
-        payment_pool: info.payment_pool,
+        governance_chain_id: cfg.governance_chain_id,
+        governance_rpc_url: cfg.governance_rpc_url.clone(),
         capacity_bond: cfg.capacity_bond,
         slash_judge: cfg.slash_judge,
+        pool_chain_id: info.chain_id,
+        pool_rpc_url: cfg.pool_rpc_url.clone(),
+        payment_pool: info.payment_pool,
     };
     Ok(AppState {
         gate,

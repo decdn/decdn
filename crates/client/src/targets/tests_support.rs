@@ -22,6 +22,7 @@ pub(crate) fn holder(seed: u8, rtt_ms: f64) -> discovery::DiscoveredHolder {
         rate_per_mb: 1,
         total_bytes: Some(ProvenSize::assume_for_tests(128 * 1024 * 1024)),
         coverage: decdn_protocol::Coverage::empty(),
+        payment_pools: None,
     }
 }
 
@@ -52,6 +53,7 @@ pub(crate) fn two_holder_targets() -> (ResolvedTargets, NodeCandidate, NodeCandi
         size_hint: Some(ProvenSize::assume_for_tests(128 * 1024 * 1024)),
         late: super::LateSlot::default(),
         opened: super::OpenedSlot::default(),
+        pool_hints: std::collections::HashMap::new(),
     };
     (targets, node_a, node_b)
 }

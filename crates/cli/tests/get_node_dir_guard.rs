@@ -55,9 +55,11 @@ fn config_pointing_at(home: &Path, data_dir: &Path) -> std::path::PathBuf {
         &path,
         format!(
             "[identity]\ndata_dir = \"{}\"\n\n[blockchain]\nrpc_url = \
-             \"http://127.0.0.1:8545\"\npayment_pool_address = \
-             \"0x0000000000000000000000000000000000000001\"\nslash_judge_address = \
-             \"0x0000000000000000000000000000000000000002\"\n",
+             \"http://127.0.0.1:8545\"\nslash_judge_address = \
+             \"0x0000000000000000000000000000000000000002\"\n\n\
+             [[blockchain.payment_chains]]\nrpc_url = \"http://127.0.0.1:8545\"\n\
+             chain_id = 31337\npayment_pools = \
+             [\"0x0000000000000000000000000000000000000001\"]\n",
             data_dir.display()
         ),
     )

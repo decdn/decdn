@@ -30,7 +30,8 @@ use decdn_incentive::{
 };
 use decdn_protocol::client::{ClientMessage, StreamError, StreamResponse, WireCapability};
 use decdn_protocol::{
-    ALPN_CLIENT, StreamRequest, StreamRequestExt, decode_message, encode_stream_request,
+    ALPN_CLIENT, PoolAccount, StreamRequest, StreamRequestExt, decode_message,
+    encode_stream_request,
 };
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -100,6 +101,21 @@ impl PoolSession {
     #[must_use]
     pub const fn pool_id(&self) -> B256 {
         self.ctx.pool_id
+    }
+
+    /// The `PaymentPool` contract that holds this session's pool: the
+    /// contract its voucher domain binds.
+    fn payment_pool(&self) -> anyhow::Result<PoolAccount> {
+        let domain = &self.ctx.voucher_domain;
+        let chain_id = domain
+            .chain_id
+            .context("session voucher domain names no chain id")?;
+        let chain_id =
+            u64::try_from(chain_id).context("session voucher domain chain id exceeds u64")?;
+        let contract = domain
+            .verifying_contract
+            .context("session voucher domain names no verifying contract")?;
+        Ok(PoolAccount::eip155(chain_id, contract.into()))
     }
 
     /// Fold whatever the node acked into the lane's cumulative voucher
@@ -486,6 +502,7 @@ impl ClientFixture {
             // instead of a delivery. The origin backend itself remains hash-keyed
             // and opaque (it never sees the namespace).
             namespace_id: namespace_id.to_be_bytes(),
+            payment_pool: session.payment_pool()?,
             pool_id: session.ctx.pool_id.into(),
             byte_offset: 0,
             byte_len: 0,
@@ -579,6 +596,7 @@ impl ClientFixture {
         let req = StreamRequest {
             hash: *hash.as_bytes(),
             namespace_id: namespace_id.to_be_bytes(),
+            payment_pool: session.payment_pool()?,
             pool_id: session.ctx.pool_id.into(),
             byte_offset: 0,
             byte_len: 0,

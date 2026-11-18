@@ -31,7 +31,6 @@ use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::get::{DEFAULT_JOBS, DEFAULT_MAX_LANE_STREAMS};
 use decdn_common::cli::{ClientFetchArgs, GetArgs};
 use decdn_common::config::load_file_config;
-use decdn_incentive::CapabilityGrant;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::eth_identity::{PasswordUse, load_signer};
 use iroh::{Endpoint, RelayUrl};
@@ -876,10 +875,11 @@ pub(crate) async fn bundle_pull(
 
     // Delegated adoption: `--capability`/`--capability-file` names a pool the
     // caller does NOT own and a capability authorizing this client's key to
-    // spend against it (every entry pulls from that one pool). `None` => the
-    // unchanged self-owned pool path; a delegated grant also zeroes the working
-    // deposit in `chain`, so its funding recovery step has nothing to add.
-    let grant = fetch::resolve_delegation_grant(common, &mut chain)?;
+    // spend against it (every entry pulls from that one pool, on the contract
+    // whose owner signed it). `None` => the unchanged self-owned pool path; a
+    // delegation also zeroes the working deposit in `chain`, so its funding
+    // recovery step has nothing to add.
+    let delegation = fetch::resolve_delegation(common, &mut chain).await?;
 
     // Same guard as the blob route, for the same reason and before the same
     // password prompt: a node's data dir is a buy target only when the
@@ -898,7 +898,7 @@ pub(crate) async fn bundle_pull(
         dest,
         uri,
         &chain,
-        grant,
+        delegation,
         &store,
         &endpoint,
         &relays,
@@ -921,7 +921,7 @@ async fn pull_over(
     dest: &Destination,
     uri: &DecdnUri,
     chain: &fetch::ResolvedChain,
-    grant: Option<CapabilityGrant>,
+    delegation: Option<fetch::Delegation>,
     store: &Arc<dyn BuyerPoolStore>,
     endpoint: &Endpoint,
     relays: &[RelayUrl],
@@ -946,7 +946,7 @@ async fn pull_over(
         &args.common,
         PullerBuyer {
             chain,
-            grant: grant.as_ref(),
+            delegation: delegation.as_ref(),
             store,
             signer: None,
         },
@@ -993,7 +993,7 @@ pub(crate) struct PullerBuyer<'a> {
     /// The chain the run pays on, and its site.
     pub(crate) chain: &'a fetch::ResolvedChain,
     /// The delegation, when the run pays from another owner's pool.
-    pub(crate) grant: Option<&'a CapabilityGrant>,
+    pub(crate) delegation: Option<&'a fetch::Delegation>,
     /// The buyer-pool store.
     pub(crate) store: &'a Arc<dyn BuyerPoolStore>,
     /// The buyer key a caller already unlocked; with none, the keystore
@@ -1010,7 +1010,7 @@ async fn open_puller(
     common: &ClientFetchArgs,
     PullerBuyer {
         chain,
-        grant,
+        delegation,
         store,
         signer,
     }: PullerBuyer<'_>,
@@ -1031,7 +1031,7 @@ async fn open_puller(
         Some(signer) => signer,
         None => load_buyer_signer(chain)?,
     };
-    let funding = match grant {
+    let funding = match delegation {
         None => Funding::SelfOwned {
             owner: signer,
             deposit: DepositPolicy {
@@ -1039,8 +1039,9 @@ async fn open_puller(
                 ..chain.deposit_policy(false)?
             },
         },
-        Some(grant) => Funding::Delegated {
-            slot: fetch::delegated_slot(grant, signer)?,
+        Some(delegation) => Funding::Delegated {
+            slot: fetch::delegated_slot(&delegation.grant, signer)?,
+            pool: delegation.pool,
         },
     };
     let builder = BundlePuller::builder(
@@ -1089,7 +1090,7 @@ pub(crate) async fn fetch_manifest_paid(
     // No bars: a manifest fetch reports no run totals. Warnings and pool
     // notes still print.
     let observer = Arc::new(PullObserver::new(true, run_label(out), None));
-    let puller = open_puller(
+    let mut puller = open_puller(
         common,
         buyer,
         (endpoint, relays),
@@ -1222,7 +1223,7 @@ async fn until_interrupted<T>(
 /// `--overwrite`. [`Planned::Nothing`] means the manifest is empty after
 /// filtering.
 async fn obtain_manifest(
-    puller: &BundlePuller,
+    puller: &mut BundlePuller,
     (args, out): (&GetArgs, &Path),
     uri: &DecdnUri,
     filter: &EntryFilter,

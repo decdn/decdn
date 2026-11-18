@@ -156,16 +156,33 @@ pub struct DiscoveryPeer {
 }
 
 /// Blockchain section of the config file.
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// The section's own fields name the **governance chain**: the chain that runs
+/// `CapacityBond`, `SlashJudge`, `ContentBlacklist` and the other protocol
+/// contracts, whose chain id binds every slash, stream, attestation, bind-node
+/// and pointer signature. Payments run on one or more **payment
+/// chains**, each a `[[blockchain.payment_chains]]` entry naming its own RPC
+/// endpoint, chain id and the `PaymentPool` contracts this node accepts there
+/// ([`PaymentChainConfig`]).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockchainConfig {
-    /// JSON-RPC endpoint URL.
+    /// Governance-chain JSON-RPC endpoint URL.
     pub rpc_url: Option<String>,
     /// Ethereum keystore file path.
     pub eth_keystore: Option<PathBuf>,
-    /// `PaymentPool` contract address — the shared payment pool this node
-    /// registers against for buyer and seller flows alike.
-    pub payment_pool_address: Option<String>,
+    /// The payment chains and the `PaymentPool` contracts on each. At least
+    /// one entry, each with at least one pool; no pool appears twice.
+    #[serde(default)]
+    pub payment_chains: Vec<PaymentChainConfig>,
+    /// `CctpSweepReceiver` contract address on the governance chain: where a
+    /// payment pool's CCTP sweep lands. Optional; read only by the CLI command
+    /// that submits attested sweeps.
+    pub cctp_sweep_receiver_address: Option<String>,
+    /// Base URL of Circle's CCTP attestation service (Iris), such as
+    /// `https://iris-api.circle.com`. Optional; read only by the CLI command
+    /// that submits attested sweeps, which defaults to the known target's.
+    pub cctp_iris_url: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
     /// `OriginAssignment` contract address. Optional: when set, the node runs the
@@ -206,16 +223,14 @@ pub struct BlockchainConfig {
     /// startup completes the initial global + operator-scope replay before any
     /// ALPN accepts connections (ADR 011/019/031).
     pub content_blacklist_address: Option<String>,
-    /// Seconds between the blacklist watcher's periodic replay + re-scope pass
-    /// (ADR 011 §Polling cadence). This backstop is what catches scope changes
-    /// with no `ContentBlacklist` event — an operator region/ripening
-    /// transition. Absent =>
-    /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (600s). Only
+    /// Seconds between two blacklist mutation-ledger polls (ADR 011 § Following
+    /// the mutation ledger), 1 to 300. Absent =>
+    /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (300s). Only
     /// consulted when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: Option<u64>,
     /// Seconds the node may go without a successful chain read before it stops
     /// serving (ADR 011 § Serving while chain-stale). While the blacklist
-    /// watcher cannot reach the RPC, every chain-derived serve guard — the
+    /// sync cannot reach the RPC, every chain-derived serve guard — the
     /// deny-set, pool solvency, per-signer caps — answers from stale state, so a
     /// takedown that lands during the outage would go unenforced and serving it
     /// past the compliance window is slashable. Past this window the serve
@@ -225,43 +240,30 @@ pub struct BlockchainConfig {
     /// 30 min). Must not be `0` (that would refuse every serve). Only consulted
     /// when `content_blacklist_address` is set.
     pub chain_staleness_grace_sec: Option<u64>,
-    /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
-    /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
-    /// network target — matches the chain id bound on the runtime signer).
+    /// Governance-chain EIP-712 `chainId`, bound into every `slash_sig`,
+    /// attestation, bind-node and pointer domain separator. Absent =>
+    /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial network
+    /// target — matches the chain id bound on the runtime signer).
     pub chain_id: Option<u64>,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the
     /// watchdog entirely; absent => default (30s). Non-zero values below
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC` are rejected at config resolution.
     pub rpc_watchdog_interval_sec: Option<u64>,
-    /// Milliseconds between chain-event poll ticks (#1011, #1106). Drives two
-    /// unrelated consumers: the `eth_getLogs` tick cadence of every chain
-    /// watcher, and alloy's pending-transaction receipt heartbeat (see
-    /// `ResolvedBlockchain::event_poll_interval_ms`). The heartbeat is why this
-    /// overrides alloy's own default, which is 250 ms for a localhost RPC (it
-    /// auto-detects `127.0.0.1`/`localhost`) and 7000 ms otherwise — the 250 ms
-    /// local default hammers a dev anvil. Absent => default
-    /// (`DEFAULT_EVENT_POLL_INTERVAL_MS`, 7000 ms, matching alloy's non-local
-    /// cadence so live-RPC load is unchanged). Values below
-    /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
-    pub event_poll_interval_ms: Option<u64>,
-    /// Maximum block span of one chain-watcher `eth_getLogs` request. Set it to
-    /// the RPC provider's actual `eth_getLogs` range limit: the lowest `span`
-    /// the poller reaches while rejections keep coming (the shrink `warn!` and
-    /// the `decdn_chain_get_logs_span` gauge show it). A provider's documented
-    /// or quoted limit can be wrong. The poller also shrinks its window on its own when the provider
-    /// rejects a range, and grows it back toward this ceiling, so this is a
-    /// ceiling, not a hard requirement. Absent =>
-    /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`;
-    /// rejected at config resolution.
+    /// Milliseconds between alloy's pending-transaction receipt polls (#1011;
+    /// see `ResolvedBlockchain::receipt_poll_interval_ms`). This overrides
+    /// alloy's own default, which is 250 ms for a localhost RPC (it auto-detects
+    /// `127.0.0.1`/`localhost`) and 7000 ms otherwise — the 250 ms local
+    /// default hammers a dev anvil. Absent => default
+    /// (`DEFAULT_RECEIPT_POLL_INTERVAL_MS`, 7000 ms). Values below
+    /// `MIN_RECEIPT_POLL_INTERVAL_MS` are rejected at config resolution.
+    pub receipt_poll_interval_ms: Option<u64>,
+    /// Maximum block span of one `eth_getLogs` request of the CLI's chain scans
+    /// (`decdn receipt settle`, `decdn node earnings --address`). Set it to the
+    /// RPC provider's `eth_getLogs` range limit; a scan also halves its window
+    /// when the provider rejects a range. Absent =>
+    /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`.
+    /// The node reads no event log and ignores it.
     pub get_logs_max_block_span: Option<u64>,
-    /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
-    /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). This is the
-    /// safety-net cadence *in addition to* the `SharesUpdated` event
-    /// subscription (which follows [`Self::event_poll_interval_ms`]); it
-    /// reconciles any log the event tail missed. Absent =>
-    /// [`super::DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
-    /// be `0` (that would poll every tick); rejected at config resolution.
-    pub fee_shares_poll_interval_sec: Option<u64>,
     /// Per-chunk redemption floor (base units, `µUSDC`, ADR 003 § Operator
     /// early withdrawal). The node submits an on-chain redemption
     /// transaction for a chunk of lanes only once the aggregate un-redeemed
@@ -319,12 +321,23 @@ pub struct BlockchainConfig {
     /// scale; sizing this precisely per ADR 003 is governance/ops policy, not a
     /// build-time constant.
     pub pool_min_remaining_deposit_micro_usdc: Option<u64>,
-    /// USDC settlement-token contract address — the ERC-20 clients spend on
-    /// deposits into a payment pool. Declared here so a client config that names
-    /// it passes `decdn config validate` under this section's
-    /// `deny_unknown_fields`; the running client resolves the token at runtime
-    /// from `PaymentPool.usdc()`.
-    pub usdc_address: Option<String>,
+}
+
+/// One `[[blockchain.payment_chains]]` entry: a payment chain and the
+/// `PaymentPool` contracts this node accepts payment through on it. The
+/// settlement token is each pool's own `usdc()`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentChainConfig {
+    /// The payment chain's JSON-RPC endpoint URL.
+    pub rpc_url: Option<String>,
+    /// The payment chain's EIP-155 chain id, bound into the voucher and
+    /// capability EIP-712 domains of its pools.
+    pub chain_id: Option<u64>,
+    /// The `PaymentPool` contract addresses on this chain, EIP-55 checksummed.
+    /// At least one.
+    #[serde(default)]
+    pub payment_pools: Vec<String>,
 }
 
 /// Cache section of the config file.

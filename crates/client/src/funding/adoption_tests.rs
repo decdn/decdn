@@ -173,7 +173,7 @@ async fn a_lost_row_adopts_the_live_pool_and_resumes_from_the_chain_watermark() 
          below it would redeem nothing"
     );
     let row = store
-        .get_by_owner(owner)
+        .get_by_owner(DEPLOYMENT, owner)
         .unwrap()
         .expect("adopted row is recorded");
     assert_eq!(row.pool_id, older);
@@ -199,7 +199,12 @@ async fn a_faulted_enumeration_refuses_rather_than_opening() {
         format!("{err:#}").contains("refusing to open one blind"),
         "expected the deliberate refusal, got: {err:#}"
     );
-    assert!(store.get_by_owner(signer.address()).unwrap().is_none());
+    assert!(
+        store
+            .get_by_owner(DEPLOYMENT, signer.address())
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// #2675: a buy that may not open a pool, with no row and no live pool on
@@ -232,7 +237,12 @@ async fn a_refused_open_with_no_pool_sends_nothing() {
         crate::Fault::Fatal(crate::FatalScope::Command)
     );
     assert!(drained, "the getPools read ran");
-    assert!(store.get_by_owner(signer.address()).unwrap().is_none());
+    assert!(
+        store
+            .get_by_owner(DEPLOYMENT, signer.address())
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// #2675: the open gate leaves a tracked open pool alone. The lane build
@@ -292,7 +302,14 @@ async fn a_refused_open_still_adopts_a_live_pool() {
     let (ctx, _) = result.expect("the live pool is adopted");
     assert_eq!(ctx.pool_id, id);
     assert!(drained);
-    assert_eq!(store.get_by_owner(owner).unwrap().unwrap().pool_id, id);
+    assert_eq!(
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_id,
+        id
+    );
 }
 
 /// A stored pool meeting a new provider resumes that lane from the chain,
@@ -497,7 +514,10 @@ async fn a_node_data_dir_never_adopts_the_daemons_pool() {
         "a node dir went down the adoption path: {err:#}"
     );
     assert!(
-        store.get_by_owner(signer.address()).unwrap().is_none(),
+        store
+            .get_by_owner(DEPLOYMENT, signer.address())
+            .unwrap()
+            .is_none(),
         "nothing may be adopted into a node dir's client store"
     );
 }
@@ -825,7 +845,10 @@ async fn a_wallet_short_of_usdc_keeps_the_lane_while_the_pool_can_still_pay() {
         (U256::from(LIVE_LANES[0] * 1000), U256::from(LIVE_LANES[0])),
         "the lane resumes from its own recorded progress"
     );
-    let row = store.get_by_owner(signer.address()).unwrap().unwrap();
+    let row = store
+        .get_by_owner(DEPLOYMENT, signer.address())
+        .unwrap()
+        .unwrap();
     assert_eq!(row.deposit, U256::from(WORKING), "nothing was credited");
     assert_eq!(row.committed_amount(), U256::from(8_655_000u64));
     let shortfall = funding.shortfall().expect("the shortfall is recorded");
@@ -990,7 +1013,7 @@ async fn a_reused_adopted_row_keeps_the_pools_redeemed_spend() {
         lane_spend(2_000_000, false)
     );
     let row = store
-        .get_by_owner(owner)
+        .get_by_owner(DEPLOYMENT, owner)
         .unwrap()
         .expect("adopted row is recorded");
     assert_eq!(row.redeemed_elsewhere(), U256::from(2_000_000u64));
@@ -1018,6 +1041,7 @@ async fn a_reused_adopted_row_keeps_the_pools_redeemed_spend() {
     let a = lane_key(id, lane_of(&store, &signer), PROVIDER);
     let outcome = store
         .advance_progress(
+            DEPLOYMENT,
             owner,
             id,
             a,
@@ -1027,7 +1051,11 @@ async fn a_reused_adopted_row_keeps_the_pools_redeemed_spend() {
         .unwrap();
     assert_matches!(outcome, AdvanceOutcome::Advanced);
     assert_eq!(
-        store.get_by_owner(owner).unwrap().unwrap().pool_spend(),
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .unwrap()
+            .pool_spend(),
         U256::from(3_500_000u64)
     );
 }
@@ -1984,10 +2012,9 @@ async fn delegated_ctx(
         .layer(SendLegLayer)
         .connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc);
-    let chain = ChainConfig {
+    let governance = crate::session::GovernanceChain {
         rpc_url: "http://config:8545".to_string(),
         chain_id: DEPLOYMENT.chain_id,
-        payment_pool: PP,
         slash_judge: Address::repeat_byte(0x44),
         capacity_bond: None,
     };
@@ -2001,7 +2028,7 @@ async fn delegated_ctx(
         delegate,
         &DEPLOYMENT.voucher_domain(),
         PROVIDER,
-        &chain,
+        (&governance, DEPLOYMENT),
         &endpoint,
         grant,
     )
@@ -2021,65 +2048,74 @@ impl BuyerPoolStore for UnreadableDelegateLanes {
     fn record(&self, state: &BuyerPoolState) -> Result<(), decdn_incentive::StoreError> {
         self.0.record(state)
     }
-    fn forget(&self, owner: Address) -> Result<(), decdn_incentive::StoreError> {
-        self.0.forget(owner)
+    fn forget(&self, d: Deployment, owner: Address) -> Result<(), decdn_incentive::StoreError> {
+        self.0.forget(d, owner)
     }
     fn get_by_pool_id(
         &self,
+        d: Deployment,
         pool_id: PoolId,
     ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
-        self.0.get_by_pool_id(pool_id)
+        self.0.get_by_pool_id(d, pool_id)
     }
     fn forget_if_pool(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
     ) -> Result<bool, decdn_incentive::StoreError> {
-        self.0.forget_if_pool(owner, pool_id)
+        self.0.forget_if_pool(d, owner, pool_id)
     }
     fn get_by_owner(
         &self,
+        d: Deployment,
         owner: Address,
     ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
-        self.0.get_by_owner(owner)
+        self.0.get_by_owner(d, owner)
     }
     fn advance_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         bytes: U256,
         amount: U256,
     ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
-        self.0.advance_progress(owner, pool_id, lane, bytes, amount)
+        self.0
+            .advance_progress(d, owner, pool_id, lane, bytes, amount)
     }
     fn rebase_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         anchor: decdn_incentive::BuyerLaneProgress,
         totals: decdn_incentive::BuyerLaneProgress,
     ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
-        self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
+        self.0
+            .rebase_progress(d, owner, pool_id, lane, anchor, totals)
     }
     fn seed_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         bytes: U256,
         amount: U256,
     ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
-        self.0.seed_progress(owner, pool_id, lane, bytes, amount)
+        self.0.seed_progress(d, owner, pool_id, lane, bytes, amount)
     }
     fn add_deposit(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         additional: U256,
     ) -> Result<decdn_incentive::DepositOutcome, decdn_incentive::StoreError> {
-        self.0.add_deposit(owner, pool_id, additional)
+        self.0.add_deposit(d, owner, pool_id, additional)
     }
     fn delegate_lanes(
         &self,
@@ -2691,33 +2727,37 @@ impl BuyerPoolStore for StoreFaults {
             }
         }
     }
-    fn forget(&self, owner: Address) -> Result<(), decdn_incentive::StoreError> {
-        self.inner.forget(owner)
+    fn forget(&self, d: Deployment, owner: Address) -> Result<(), decdn_incentive::StoreError> {
+        self.inner.forget(d, owner)
     }
     fn get_by_pool_id(
         &self,
+        d: Deployment,
         pool_id: PoolId,
     ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
         if self.credited.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(None);
         }
-        self.inner.get_by_pool_id(pool_id)
+        self.inner.get_by_pool_id(d, pool_id)
     }
     fn forget_if_pool(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
     ) -> Result<bool, decdn_incentive::StoreError> {
-        self.inner.forget_if_pool(owner, pool_id)
+        self.inner.forget_if_pool(d, owner, pool_id)
     }
     fn get_by_owner(
         &self,
+        d: Deployment,
         owner: Address,
     ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
-        self.inner.get_by_owner(owner)
+        self.inner.get_by_owner(d, owner)
     }
     fn advance_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -2725,10 +2765,11 @@ impl BuyerPoolStore for StoreFaults {
         amount: U256,
     ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
         self.inner
-            .advance_progress(owner, pool_id, lane, bytes, amount)
+            .advance_progress(d, owner, pool_id, lane, bytes, amount)
     }
     fn rebase_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -2736,10 +2777,11 @@ impl BuyerPoolStore for StoreFaults {
         totals: decdn_incentive::BuyerLaneProgress,
     ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
         self.inner
-            .rebase_progress(owner, pool_id, lane, anchor, totals)
+            .rebase_progress(d, owner, pool_id, lane, anchor, totals)
     }
     fn seed_progress(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
@@ -2747,10 +2789,11 @@ impl BuyerPoolStore for StoreFaults {
         amount: U256,
     ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
         self.inner
-            .seed_progress(owner, pool_id, lane, bytes, amount)
+            .seed_progress(d, owner, pool_id, lane, bytes, amount)
     }
     fn add_deposit(
         &self,
+        d: Deployment,
         owner: Address,
         pool_id: PoolId,
         additional: U256,
@@ -2759,10 +2802,10 @@ impl BuyerPoolStore for StoreFaults {
         match self.fault {
             StoreFault::Credit => Err(Self::lost(pool_id, "deposit credit")),
             StoreFault::None | StoreFault::Record => {
-                self.inner.add_deposit(owner, pool_id, additional)
+                self.inner.add_deposit(d, owner, pool_id, additional)
             }
             StoreFault::RowAfterCredit => {
-                let credited = self.inner.add_deposit(owner, pool_id, additional);
+                let credited = self.inner.add_deposit(d, owner, pool_id, additional);
                 self.credited
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 credited
@@ -2939,7 +2982,12 @@ async fn a_fresh_open_after_the_fetch_ended_sends_nothing() {
     ended_before_send(&err);
     assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
     assert!(!rpc.calls_drained(), "the refusal reads no token");
-    assert!(store.get_by_owner(signer.address()).unwrap().is_none());
+    assert!(
+        store
+            .get_by_owner(DEPLOYMENT, signer.address())
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// #2513: a refill whose fetch ends during its allowance leg sends no `topUp`
@@ -3002,7 +3050,12 @@ async fn an_open_that_ends_during_its_allowance_leg_sends_nothing() {
     ended_before_send(&err);
     assert!(rpc.calls_drained(), "the open read its allowance");
     assert!(rpc.sent_nonces().is_empty(), "no openPool was sent");
-    assert!(store.get_by_owner(signer.address()).unwrap().is_none());
+    assert!(
+        store
+            .get_by_owner(DEPLOYMENT, signer.address())
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// #2513: a refill already past its `topUp` send when the fetch ends runs to
@@ -3420,7 +3473,10 @@ async fn an_open_with_no_pool_opened_event_is_untracked() {
         "{err:#}"
     );
     assert!(
-        store.get_by_owner(signer.address()).unwrap().is_none(),
+        store
+            .get_by_owner(DEPLOYMENT, signer.address())
+            .unwrap()
+            .is_none(),
         "no row names the pool"
     );
 

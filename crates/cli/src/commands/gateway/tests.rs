@@ -109,20 +109,16 @@ fn hold_capability(gateway: &Gateway, pool: u8) -> Address {
     let mut delegates = gateway.delegates();
     let signer = delegates.pending();
     delegates
-        .register(grant(signer, pool, u64::MAX), None)
+        .register(grant(signer, pool, u64::MAX), TEST_POOL, None)
         .unwrap();
     signer
 }
 
-#[test]
-fn a_capability_must_be_signed_by_its_pools_on_chain_owner() {
-    let owner = PrivateKeySigner::random().address();
-    let other = PrivateKeySigner::random().address();
-    let pool = alloy::primitives::B256::ZERO;
-    assert!(owner_matches(owner, owner, pool).is_ok());
-    assert!(owner_matches(owner, other, pool).is_err());
-    assert!(owner_matches(Address::ZERO, owner, pool).is_err());
-}
+/// The one `PaymentPool` contract a test gateway is configured with.
+const TEST_POOL: Deployment = Deployment {
+    chain_id: 421_614,
+    payment_pool: Address::repeat_byte(1),
+};
 
 /// A pull backend for gateways whose requests all stop before a pull.
 struct NoPulls;
@@ -212,17 +208,22 @@ async fn test_gateway_cached(
     cache: Option<CacheEngine>,
 ) -> Arc<Gateway> {
     assert_eq!(matches!(sites, SiteDomain::Public { .. }), public.is_some());
-    let chain = ChainConfig {
-        // Nothing here reaches the chain: every request below stops first.
-        rpc_url: "http://127.0.0.1:1".to_owned(),
-        chain_id: 421_614,
-        payment_pool: Address::repeat_byte(1),
-        slash_judge: Address::repeat_byte(2),
-        capacity_bond: None,
-    };
+    // Nothing here reaches the chain: every request below stops first.
+    let chain = ChainConfig::new(
+        decdn_client::session::GovernanceChain {
+            rpc_url: "http://127.0.0.1:1".to_owned(),
+            chain_id: 421_614,
+            slash_judge: Address::repeat_byte(2),
+            capacity_bond: None,
+        },
+        vec![decdn_client::session::PaymentPoolChain {
+            rpc_url: "http://127.0.0.1:1".to_owned(),
+            deployment: TEST_POOL,
+        }],
+    )
+    .unwrap();
     Arc::new(Gateway {
         common,
-        domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: std::sync::Mutex::default(),
         pulls: PullWorker::start(backend, worker_slots).await.unwrap(),
@@ -317,7 +318,7 @@ async fn the_pending_key_answers_anyone_until_a_capability_claims_it() {
     assert_eq!(pending_address(&gateway).await, pending, "one pending key");
     gateway
         .delegates()
-        .register(grant(pending, 1, u64::MAX), None)
+        .register(grant(pending, 1, u64::MAX), TEST_POOL, None)
         .unwrap();
     let next = pending_address(&gateway).await;
     assert_ne!(next, pending, "a claimed key is no longer pending");
@@ -1607,7 +1608,7 @@ fn hold(gateway: &Gateway, pointer: SignedPointer, signer: Address) {
 #[tokio::test]
 async fn a_known_signer_has_its_own_lookup_budget_per_namespace() {
     let (gateway, _logs, _) = public_gateway().await;
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
     let owner = PrivateKeySigner::random();
     let public = gateway.public.as_ref().unwrap();
     hold(&gateway, unsigned_pointer(7, BLOB, 1), owner.address());
@@ -1698,7 +1699,7 @@ async fn put_pointer_refuses_a_bad_body_before_the_chain() {
 async fn put_pointer_refuses_a_stale_seq_from_the_same_signer_before_the_chain() {
     let (gateway, _logs, _) = public_gateway().await;
     let owner = PrivateKeySigner::random();
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
     hold(&gateway, unsigned_pointer(7, BLOB, 5), owner.address());
     for seq in [5, 4] {
         let pointer = SignedPointer::sign(&owner, 7, OTHER, seq, &domain).unwrap();
@@ -1723,7 +1724,7 @@ async fn put_pointer_refuses_a_stale_seq_from_the_same_signer_before_the_chain()
 #[tokio::test]
 async fn put_pointer_owner_lookups_are_budgeted() {
     let (gateway, _logs, _) = public_gateway().await;
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
     let signer = PrivateKeySigner::random();
     let public = gateway.public.as_ref().unwrap();
     // One lookup reaches the chain; the rest of the minute's budget is
@@ -1765,7 +1766,7 @@ async fn put_pointer_owner_lookups_are_budgeted() {
 async fn put_pointer_with_a_valid_signature_asks_the_chain() {
     let (gateway, _logs, _) = public_gateway().await;
     let owner = PrivateKeySigner::random();
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
     let pointer = SignedPointer::sign(&owner, 7, BLOB, 1, &domain).unwrap();
     let body = serde_json::to_string(&pointer).unwrap();
     // On the bare host, and on the gateway's own listen address.
@@ -2963,8 +2964,8 @@ async fn the_capability_list_keeps_its_shape() {
         let signer = delegates.pending();
         let mut held = grant(signer, 0x01, 1_900_000_000);
         held.spending_cap = 5_000;
-        delegates.register(held.clone(), None).unwrap();
-        delegates.retire(signer, held.pool_id);
+        delegates.register(held.clone(), TEST_POOL, None).unwrap();
+        delegates.retire(signer, TEST_POOL, held.pool_id);
         signer
     };
     let answer = send(&gateway, Method::GET, "127.0.0.1:8484", "/_capability", &[]).await;
@@ -3151,7 +3152,7 @@ impl worker::Backend for Pools {
     async fn pools(
         &self,
         (): &(),
-        _delegates: &[(PoolId, Address)],
+        _delegates: &[worker::DelegateKey],
     ) -> anyhow::Result<worker::PoolSnapshot> {
         anyhow::ensure!(
             !self.fail,
@@ -3254,7 +3255,13 @@ async fn status_spells_addresses_eip55_and_hashes_bare() {
     assert_eq!(status["pointers"][0]["root"], alloy::hex::encode(BLOB));
     assert_eq!(
         status["payment_pool"],
-        gateway.chain.payment_pool.to_string()
+        gateway
+            .chain
+            .first_pool()
+            .unwrap()
+            .deployment
+            .payment_pool
+            .to_string()
     );
 }
 
@@ -3838,7 +3845,7 @@ async fn a_scoped_capability_pays_only_on_its_namespace_host() {
         let mut delegates = gateway.delegates();
         let signer = delegates.pending();
         delegates
-            .register(grant(signer, 1, u64::MAX), Some(vec![7]))
+            .register(grant(signer, 1, u64::MAX), TEST_POOL, Some(vec![7]))
             .unwrap();
     }
     let served = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
@@ -3868,12 +3875,12 @@ async fn a_loopback_scoped_capability_pays_for_the_namespace_its_uri_names() {
     let (gateway, _) = site_gateway().await;
     {
         let mut delegates = gateway.delegates();
-        for (pool, signer) in delegates.lanes() {
-            delegates.retire(signer, pool);
+        for (pool, pool_id, signer) in delegates.lanes() {
+            delegates.retire(signer, pool, pool_id);
         }
         let signer = delegates.pending();
         delegates
-            .register(grant(signer, 1, u64::MAX), Some(vec![7]))
+            .register(grant(signer, 1, u64::MAX), TEST_POOL, Some(vec![7]))
             .unwrap();
     }
     let other = alloy::hex::encode(OTHER);
@@ -3922,7 +3929,7 @@ async fn signed_grant(gateway: &Arc<Gateway>, owner: &PrivateKeySigner) -> Capab
         pool_id: alloy::primitives::B256::repeat_byte(1),
         expiry: now_secs() + 86_400,
     };
-    let signed = capability.sign(owner, &gateway.domain).unwrap();
+    let signed = capability.sign(owner, &TEST_POOL.voucher_domain()).unwrap();
     CapabilityGrant::from_signed_capability(&signed)
 }
 
@@ -3945,7 +3952,7 @@ async fn a_scope_is_checked_before_the_chain_is_read() {
     let gateway = test_gateway().await;
     let owner = PrivateKeySigner::random();
     let grant = signed_grant(&gateway, &owner).await;
-    let domain = scope::scope_domain(gateway.chain.chain_id, gateway.chain.payment_pool);
+    let domain = scope::scope_domain(TEST_POOL.chain_id, TEST_POOL.payment_pool);
 
     let empty = serde_json::json!({ "namespaces": [], "signature": "0x00" });
     let (status, body) = put_scoped(&gateway, &grant, empty).await;

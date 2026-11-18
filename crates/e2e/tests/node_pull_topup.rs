@@ -12,11 +12,10 @@
 //!   1. A real on-chain `topUp` receipt. `decdn_client::buyer_pool::top_up`
 //!      submits and awaits `get_receipt()`; here that transaction actually mines
 //!      and raises the pool's escrow.
-//!   2. The upstream's chain-watcher lag. The serving provider refuses to serve the
-//!      resumed leg until ITS watcher observes the raised deposit
-//!      (`event_poll_interval_ms`, 500ms in this fixture), so the resume budget
-//!      is spent against a real watcher rather than an immediately-accepting
-//!      double.
+//!   2. The upstream's pool-read lag. The serving provider refuses to serve the
+//!      resumed leg until ITS `getPool` read shows the raised deposit (a read
+//!      lives for 30 s), so the resume budget is spent against a real pool
+//!      read rather than an immediately-accepting double.
 //!   3. The seller-side pre-serve deposit gate (#1518), which is what the whole
 //!      buyer↔provider handshake rides through as the deposit is topped up.
 //!

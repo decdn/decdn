@@ -3,6 +3,35 @@ source: crates/protocol/tests/public_api.rs
 expression: public_api.to_string()
 ---
 pub mod decdn_protocol
+pub mod decdn_protocol::chain_id
+pub enum decdn_protocol::chain_id::ChainIdError
+pub decdn_protocol::chain_id::ChainIdError::BadNamespace
+pub decdn_protocol::chain_id::ChainIdError::BadReference
+pub decdn_protocol::chain_id::ChainIdError::MissingColon
+pub decdn_protocol::chain_id::ChainIdError::TooLong
+pub decdn_protocol::chain_id::ChainIdError::TooLong::len: usize
+pub struct decdn_protocol::chain_id::ChainId
+impl decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::as_str(&self) -> &str
+pub fn decdn_protocol::chain_id::ChainId::eip155(u64) -> Self
+pub fn decdn_protocol::chain_id::ChainId::eip155_id(&self) -> core::option::Option<u64>
+pub fn decdn_protocol::chain_id::ChainId::new(&str) -> core::result::Result<Self, decdn_protocol::chain_id::ChainIdError>
+impl core::cmp::Ord for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::cmp(&self, &Self) -> core::cmp::Ordering
+impl core::cmp::PartialOrd for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for decdn_protocol::chain_id::ChainId
+pub type decdn_protocol::chain_id::ChainId::Err = decdn_protocol::chain_id::ChainIdError
+pub fn decdn_protocol::chain_id::ChainId::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+pub const decdn_protocol::chain_id::MAX_CHAIN_ID_LEN: usize
 pub mod decdn_protocol::client
 pub enum decdn_protocol::client::ClientMessage
 pub decdn_protocol::client::ClientMessage::ChunkData(decdn_protocol::client::ChunkData)
@@ -71,6 +100,7 @@ pub decdn_protocol::client::StreamRequest::byte_len: u64
 pub decdn_protocol::client::StreamRequest::byte_offset: u64
 pub decdn_protocol::client::StreamRequest::hash: [u8; 32]
 pub decdn_protocol::client::StreamRequest::namespace_id: [u8; 32]
+pub decdn_protocol::client::StreamRequest::payment_pool: decdn_protocol::pool_account::PoolAccount
 pub decdn_protocol::client::StreamRequest::pool_id: [u8; 32]
 pub decdn_protocol::client::StreamRequest::timestamp_us: u64
 pub struct decdn_protocol::client::StreamRequestExt
@@ -93,13 +123,17 @@ pub struct decdn_protocol::client::StreamResponseExt
 pub decdn_protocol::client::StreamResponseExt::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::client::StreamResponseExt::origin_attestation: core::option::Option<decdn_protocol::dht::OriginAttestation>
 pub decdn_protocol::client::StreamResponseExt::outcome: decdn_protocol::client::StreamOutcome
+pub decdn_protocol::client::StreamResponseExt::payment_pools: core::option::Option<alloc::vec::Vec<decdn_protocol::pool_account::PoolAccount>>
 impl decdn_protocol::client::StreamResponseExt
 pub fn decdn_protocol::client::StreamResponseExt::consistent_with(&self, &decdn_protocol::client::StreamResponseBody, u64, u64) -> bool
+pub fn decdn_protocol::client::StreamResponseExt::declines_pool(&self, &decdn_protocol::pool_account::PoolAccount) -> bool
 pub const fn decdn_protocol::client::StreamResponseExt::error(&self) -> core::option::Option<&decdn_protocol::client::StreamError>
+pub fn decdn_protocol::client::StreamResponseExt::pool_declined(alloc::vec::Vec<decdn_protocol::pool_account::PoolAccount>) -> Self
 pub const fn decdn_protocol::client::StreamResponseExt::refused(decdn_protocol::client::StreamError, decdn_protocol::coverage::Coverage) -> Self
 pub const fn decdn_protocol::client::StreamResponseExt::served(decdn_protocol::size_proof::SizeProof, core::option::Option<decdn_protocol::dht::OriginAttestation>, decdn_protocol::coverage::Coverage) -> Self
 pub const fn decdn_protocol::client::StreamResponseExt::size_proof(&self) -> core::option::Option<&decdn_protocol::size_proof::SizeProof>
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+pub fn decdn_protocol::client::StreamResponseExt::with_payment_pools(self, alloc::vec::Vec<decdn_protocol::pool_account::PoolAccount>) -> Self
 pub struct decdn_protocol::client::Voucher
 pub decdn_protocol::client::Voucher::amount: u64
 pub decdn_protocol::client::Voucher::bytes_delivered: u64
@@ -304,6 +338,37 @@ pub decdn_protocol::message::MessageValidationError::VoucherRejectedInResponse
 pub const decdn_protocol::message::EMPTY_ROOT: [u8; 32]
 pub const decdn_protocol::message::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::message::SLASH_SIG_LEN: usize
+pub mod decdn_protocol::pool_account
+pub enum decdn_protocol::pool_account::PoolAccountError
+pub decdn_protocol::pool_account::PoolAccountError::BadAddress
+pub decdn_protocol::pool_account::PoolAccountError::Chain(decdn_protocol::chain_id::ChainIdError)
+pub decdn_protocol::pool_account::PoolAccountError::MissingAddress
+pub decdn_protocol::pool_account::PoolAccountError::TooLong
+pub decdn_protocol::pool_account::PoolAccountError::TooLong::len: usize
+pub struct decdn_protocol::pool_account::PoolAccount
+impl decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::address(&self) -> &str
+pub const fn decdn_protocol::pool_account::PoolAccount::chain_id(&self) -> decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::pool_account::PoolAccount::eip155(u64, [u8; 20]) -> Self
+pub fn decdn_protocol::pool_account::PoolAccount::eip155_address(&self) -> core::option::Option<[u8; 20]>
+pub fn decdn_protocol::pool_account::PoolAccount::new(&str) -> core::result::Result<Self, decdn_protocol::pool_account::PoolAccountError>
+impl core::cmp::Ord for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::cmp(&self, &Self) -> core::cmp::Ordering
+impl core::cmp::PartialOrd for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for decdn_protocol::pool_account::PoolAccount
+pub type decdn_protocol::pool_account::PoolAccount::Err = decdn_protocol::pool_account::PoolAccountError
+pub fn decdn_protocol::pool_account::PoolAccount::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+pub const decdn_protocol::pool_account::MAX_PAYMENT_POOLS: usize
+pub const decdn_protocol::pool_account::MAX_POOL_ACCOUNT_LEN: usize
 pub mod decdn_protocol::region
 pub struct decdn_protocol::region::InvalidRegion
 impl core::error::Error for decdn_protocol::region::InvalidRegion
@@ -336,6 +401,12 @@ pub const fn decdn_protocol::size_proof::SizeProof::size(&self) -> u64
 pub struct decdn_protocol::size_proof::SizeProofTooLong
 pub decdn_protocol::size_proof::SizeProofTooLong::len: usize
 pub const decdn_protocol::size_proof::MAX_SIZE_PROOF_BYTES: usize
+pub enum decdn_protocol::ChainIdError
+pub decdn_protocol::ChainIdError::BadNamespace
+pub decdn_protocol::ChainIdError::BadReference
+pub decdn_protocol::ChainIdError::MissingColon
+pub decdn_protocol::ChainIdError::TooLong
+pub decdn_protocol::ChainIdError::TooLong::len: usize
 pub enum decdn_protocol::ClientMessage
 pub decdn_protocol::ClientMessage::ChunkData(decdn_protocol::client::ChunkData)
 pub decdn_protocol::ClientMessage::ChunkPreimage(decdn_protocol::client::ChunkPreimage)
@@ -383,6 +454,12 @@ pub decdn_protocol::MessageValidationError::RateTooLarge
 pub decdn_protocol::MessageValidationError::RateTooLarge::rate: u64
 pub decdn_protocol::MessageValidationError::StreamErrorWithOk
 pub decdn_protocol::MessageValidationError::VoucherRejectedInResponse
+pub enum decdn_protocol::PoolAccountError
+pub decdn_protocol::PoolAccountError::BadAddress
+pub decdn_protocol::PoolAccountError::Chain(decdn_protocol::chain_id::ChainIdError)
+pub decdn_protocol::PoolAccountError::MissingAddress
+pub decdn_protocol::PoolAccountError::TooLong
+pub decdn_protocol::PoolAccountError::TooLong::len: usize
 pub enum decdn_protocol::StreamError
 pub decdn_protocol::StreamError::Declined
 pub decdn_protocol::StreamError::NotFound
@@ -418,6 +495,27 @@ pub decdn_protocol::BatchStoreAck::results: alloc::vec::Vec<bool>
 pub struct decdn_protocol::BatchStoreRequest
 pub decdn_protocol::BatchStoreRequest::entries: alloc::vec::Vec<(decdn_protocol::identity::ContentHash, decdn_protocol::coverage::Coverage, decdn_protocol::dht::OriginAttestation)>
 pub decdn_protocol::BatchStoreRequest::holder: decdn_protocol::identity::NodeId
+pub struct decdn_protocol::ChainId
+impl decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::as_str(&self) -> &str
+pub fn decdn_protocol::chain_id::ChainId::eip155(u64) -> Self
+pub fn decdn_protocol::chain_id::ChainId::eip155_id(&self) -> core::option::Option<u64>
+pub fn decdn_protocol::chain_id::ChainId::new(&str) -> core::result::Result<Self, decdn_protocol::chain_id::ChainIdError>
+impl core::cmp::Ord for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::cmp(&self, &Self) -> core::cmp::Ordering
+impl core::cmp::PartialOrd for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for decdn_protocol::chain_id::ChainId
+pub type decdn_protocol::chain_id::ChainId::Err = decdn_protocol::chain_id::ChainIdError
+pub fn decdn_protocol::chain_id::ChainId::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::chain_id::ChainId::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub struct decdn_protocol::ChunkData
 impl decdn_protocol::client::ChunkData
 pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
@@ -506,6 +604,28 @@ pub decdn_protocol::OriginAttestation::timestamp_us: u64
 impl decdn_protocol::dht::OriginAttestation
 pub fn decdn_protocol::dht::OriginAttestation::from_response(&decdn_protocol::client::StreamResponse) -> core::option::Option<Self>
 pub const fn decdn_protocol::dht::OriginAttestation::signed_body(&self, [u8; 32]) -> decdn_protocol::client::StreamResponseBody
+pub struct decdn_protocol::PoolAccount
+impl decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::address(&self) -> &str
+pub const fn decdn_protocol::pool_account::PoolAccount::chain_id(&self) -> decdn_protocol::chain_id::ChainId
+pub fn decdn_protocol::pool_account::PoolAccount::eip155(u64, [u8; 20]) -> Self
+pub fn decdn_protocol::pool_account::PoolAccount::eip155_address(&self) -> core::option::Option<[u8; 20]>
+pub fn decdn_protocol::pool_account::PoolAccount::new(&str) -> core::result::Result<Self, decdn_protocol::pool_account::PoolAccountError>
+impl core::cmp::Ord for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::cmp(&self, &Self) -> core::cmp::Ordering
+impl core::cmp::PartialOrd for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for decdn_protocol::pool_account::PoolAccount
+pub type decdn_protocol::pool_account::PoolAccount::Err = decdn_protocol::pool_account::PoolAccountError
+pub fn decdn_protocol::pool_account::PoolAccount::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for decdn_protocol::pool_account::PoolAccount
+pub fn decdn_protocol::pool_account::PoolAccount::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub struct decdn_protocol::Provider
 pub decdn_protocol::Provider::attestation: decdn_protocol::dht::OriginAttestation
 pub decdn_protocol::Provider::coverage: decdn_protocol::coverage::Coverage
@@ -548,6 +668,7 @@ pub decdn_protocol::StreamRequest::byte_len: u64
 pub decdn_protocol::StreamRequest::byte_offset: u64
 pub decdn_protocol::StreamRequest::hash: [u8; 32]
 pub decdn_protocol::StreamRequest::namespace_id: [u8; 32]
+pub decdn_protocol::StreamRequest::payment_pool: decdn_protocol::pool_account::PoolAccount
 pub decdn_protocol::StreamRequest::pool_id: [u8; 32]
 pub decdn_protocol::StreamRequest::timestamp_us: u64
 pub struct decdn_protocol::StreamRequestExt
@@ -570,13 +691,17 @@ pub struct decdn_protocol::StreamResponseExt
 pub decdn_protocol::StreamResponseExt::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::StreamResponseExt::origin_attestation: core::option::Option<decdn_protocol::dht::OriginAttestation>
 pub decdn_protocol::StreamResponseExt::outcome: decdn_protocol::client::StreamOutcome
+pub decdn_protocol::StreamResponseExt::payment_pools: core::option::Option<alloc::vec::Vec<decdn_protocol::pool_account::PoolAccount>>
 impl decdn_protocol::client::StreamResponseExt
 pub fn decdn_protocol::client::StreamResponseExt::consistent_with(&self, &decdn_protocol::client::StreamResponseBody, u64, u64) -> bool
+pub fn decdn_protocol::client::StreamResponseExt::declines_pool(&self, &decdn_protocol::pool_account::PoolAccount) -> bool
 pub const fn decdn_protocol::client::StreamResponseExt::error(&self) -> core::option::Option<&decdn_protocol::client::StreamError>
+pub fn decdn_protocol::client::StreamResponseExt::pool_declined(alloc::vec::Vec<decdn_protocol::pool_account::PoolAccount>) -> Self
 pub const fn decdn_protocol::client::StreamResponseExt::refused(decdn_protocol::client::StreamError, decdn_protocol::coverage::Coverage) -> Self
 pub const fn decdn_protocol::client::StreamResponseExt::served(decdn_protocol::size_proof::SizeProof, core::option::Option<decdn_protocol::dht::OriginAttestation>, decdn_protocol::coverage::Coverage) -> Self
 pub const fn decdn_protocol::client::StreamResponseExt::size_proof(&self) -> core::option::Option<&decdn_protocol::size_proof::SizeProof>
 pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+pub fn decdn_protocol::client::StreamResponseExt::with_payment_pools(self, alloc::vec::Vec<decdn_protocol::pool_account::PoolAccount>) -> Self
 pub struct decdn_protocol::TestBlockSizeGuard
 impl core::ops::drop::Drop for decdn_protocol::coverage::TestBlockSizeGuard
 pub fn decdn_protocol::coverage::TestBlockSizeGuard::drop(&mut self)
@@ -599,11 +724,14 @@ pub const decdn_protocol::DISCOVERY_BLOCK_BYTES: u64
 pub const decdn_protocol::EMPTY_ROOT: [u8; 32]
 pub const decdn_protocol::ID_LEN: usize
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
+pub const decdn_protocol::MAX_CHAIN_ID_LEN: usize
 pub const decdn_protocol::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::MAX_CHUNK_FRAME: u32
 pub const decdn_protocol::MAX_CLIENT_CONTROL_FRAME: u32
 pub const decdn_protocol::MAX_CLOSER_NODES: usize
 pub const decdn_protocol::MAX_DHT_FRAME: u32
+pub const decdn_protocol::MAX_PAYMENT_POOLS: usize
+pub const decdn_protocol::MAX_POOL_ACCOUNT_LEN: usize
 pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::MAX_SIZE_PROOF_BYTES: usize

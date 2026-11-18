@@ -399,6 +399,10 @@ pub struct PullThroughStatus {
 /// pool) saturates rather than wraps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneSnapshot {
+    /// The `PaymentPool` contract the lane pays through, as a CAIP-10 account
+    /// (`eip155:<chainId>:0x<address>`, lowercase hex). [`Self::pool_id`]
+    /// names a pool inside this contract.
+    pub pool: String,
     /// Lowercase hex of the on-chain `PaymentPool` id (`LaneKey::pool_id`),
     /// `0x`-prefixed — same 32-byte encoding `alloy`'s `B256` `Display`
     /// produces. Shared by every lane drawing from the same pool.
@@ -519,8 +523,8 @@ pub struct EarningsResponse {
     /// The time the figures cover from, Unix seconds: no settlement landed
     /// before it is counted. On the daemon this is when the node's settlement
     /// ledger started recording, or the earliest ledger row for this operator
-    /// when that row is earlier (a landing the watcher backfilled, or a skewed
-    /// clock). The ledger records every settlement from then on, apart from
+    /// when that row is earlier (a landing recovered from a sent hash after a
+    /// restart, or a skewed clock). The ledger records every settlement from then on, apart from
     /// the rows it drops on a failure, which the node logs and counts. Built
     /// from the chain (`decdn node earnings --address`) it is the block time of
     /// the scan's first block, and every settlement from that block on is
@@ -543,6 +547,37 @@ pub struct EarningsResponse {
     /// figures were built from the chain alone (`decdn node earnings
     /// --address`), which sees no lane state.
     pub pending: Option<PendingRedeem>,
+    /// One entry per `PaymentPool` contract, in configured order: what the
+    /// settlements through it paid and the protocol share it holds for the
+    /// operator until a sweep.
+    pub pools: Vec<PoolEarnings>,
+}
+
+/// The earnings through one `PaymentPool` contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolEarnings {
+    /// The contract, as a CAIP-10 account (`eip155:<chainId>:0x<address>`,
+    /// lowercase hex).
+    pub pool: String,
+    /// Every settlement through this contract that the figures cover, summed.
+    /// Its `from_unix` is [`EarningsResponse::covered_from_unix`].
+    pub settled: EarningsPeriod,
+    /// The operator's protocol share the contract holds until a sweep
+    /// (`PaymentPool.pending(operator)`), with the smallest share a sweep
+    /// sends. `None` when the read failed or the node has no operator.
+    pub protocol_share: Option<ProtocolShare>,
+}
+
+/// The pending protocol share of one operator in one `PaymentPool`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolShare {
+    /// Micro-USDC waiting for a sweep (`pending(operator).usdcAmount`).
+    pub pending_micro_usdc: u64,
+    /// The paid-proportional bytes that ride with it
+    /// (`pending(operator).servedBytes`).
+    pub pending_bytes: u64,
+    /// The smallest share `sweep` sends (`minSweep()`), micro-USDC.
+    pub min_sweep_micro_usdc: u64,
 }
 
 /// The settlements landed in one period, summed.
@@ -554,15 +589,15 @@ pub struct EarningsPeriod {
     /// shorter span than it names; the CLI says so in the row label.
     pub from_unix: u64,
     /// Micro-USDC the operator actually received: the sum of the USDC
-    /// transfers from the `FeeRouter` to the operator, one per settlement.
+    /// transfers from a `PaymentPool` to the operator, one per settlement.
     pub net_micro_usdc: u64,
-    /// Micro-USDC routed before the fee split: the sum of
-    /// `FeeRouter.Settled.amount`. `net` is `gross` minus the buyback and
-    /// treasury buckets.
+    /// Micro-USDC the settlements paid before the pool kept the protocol
+    /// share: each settlement's net scaled by `10000 / operatorBps`, rounded
+    /// up. `gross − net` is the protocol share the pool holds until a sweep.
     pub gross_micro_usdc: u64,
-    /// Bytes the settlements paid for: the sum of
-    /// `FeeRouter.Settled.bytesDelivered`. Bytes served but not yet redeemed
-    /// are not in this figure.
+    /// Bytes the settlements paid for: the sum of the `bytesPaid` of the
+    /// operator's `PoolRedeemed` lanes. Bytes served but not yet redeemed are
+    /// not in this figure.
     pub bytes_settled: u64,
     /// How many `redeemMany` transactions landed in the period.
     pub settlements: u64,
@@ -720,18 +755,12 @@ pub struct SlashRecordDto {
     pub offense_type: u8,
     /// Bond amount slashed, in TOKEN base units, as a decimal string (`uint256`).
     pub amount: String,
-    /// `keccak256` evidence digest from the `Slashed` event (ADR 014),
-    /// `0x`-prefixed 32-byte hex.
+    /// `keccak256` evidence digest from the `CapacityBond` slash record (ADR
+    /// 014), `0x`-prefixed 32-byte hex.
     pub evidence_hash: String,
-    /// Block number the `Slashed` log was mined in, or `None` if the log was
-    /// still pending when observed (rare; live logs carry a block number).
-    pub block_number: Option<u64>,
-    /// **Nominal** appeal-window close (Unix seconds): the `Slashed` block
-    /// timestamp + 30 days, or `None` if the block read failed. This is a cheap
-    /// client-side hint, NOT read from the `CapacityBond` slash record, and it
-    /// ignores protocol-pause extensions — which only ever move the real
-    /// deadline *later* (`markAppealOpen` adds `pausedTotal`). Safe to file
-    /// before this; a keeper must not treat a just-past value as final.
+    /// Appeal-window close (Unix seconds) the contract enforces: the slash
+    /// record's base `appealWindowClose` plus the global `pausedTotal` at the
+    /// last read. A later protocol pause only moves it later.
     pub appeal_window_close: Option<u64>,
 }
 

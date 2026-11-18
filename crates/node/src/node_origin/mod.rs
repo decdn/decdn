@@ -44,6 +44,8 @@
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
 mod backend_source;
+mod buyer_route;
+pub use buyer_route::BuyerPool;
 mod funder;
 mod pull_leg;
 mod ranged_pull;
@@ -540,14 +542,11 @@ pub struct NodeOriginConfig {
     /// above it, and every pull refuses a stream quote above it (folded with the
     /// serve-economics buy cap under the `margin` policy) before paying.
     pub max_rate_per_mb: u64,
-    /// How often this node's chain watcher polls for events
-    /// (`blockchain.event_poll_interval_ms`), used to size the settle window
-    /// after a funding recovery step's top-up (#1530).
-    ///
-    /// The wait is for the UPSTREAM's watcher, not ours, but every node in the
-    /// network runs the same default cadence and this is the only local reading of
-    /// it we have. See `funder::settle_wait_budget`.
-    pub event_poll_interval: Duration,
+    /// How often an upstream re-reads a live pool's `getPool`
+    /// (`pool_view::POOL_REFRESH_INTERVAL`), used to size the settle window
+    /// after a funding recovery step's top-up (#1530). See
+    /// `funder::settle_wait_budget`.
+    pub upstream_pool_refresh: Duration,
     /// DHT lookup tuning.
     pub lookup: LookupConfig,
     /// This node's self-attested region (`identity.region`), or `None` when
@@ -560,10 +559,9 @@ pub struct NodeOriginConfig {
     /// per MB, on a cache-miss relay leg. `select_policy(&cfg.cache.serve_economics)`
     /// picks `OffPolicy` (no ceiling) or `MarginPolicy` at construction.
     pub serve_economics: Arc<dyn crate::serve_economics::ServeEconomicsPolicy>,
-    /// Live operator fee-share (basis points) from `FeeRouter.getShares()[0]`,
-    /// the `(1 - f)` numerator the `margin` serve-economics policy amortizes
-    /// over. Seeded from chain at startup and kept current by the fee-shares
-    /// watcher (`crate::fee_shares_watcher::route`).
+    /// Operator fee-share (basis points), the `(1 - f)` numerator the `margin`
+    /// serve-economics policy amortizes over: the lowest immutable
+    /// `PaymentPool.operatorBps()` of the accepted pools, read at startup.
     pub operator_shares: crate::fee_shares::OperatorShares,
     /// ADR 040 shared frequency estimator, when built (`cache.eviction_policy`
     /// / `cache.admission_policy` == `"tinylfu"`, or `cache.serve_economics.policy`
@@ -672,6 +670,10 @@ pub struct NodeOriginDeps {
     /// Buyer-side payment-pool service (opens/reuses this node's pool and pins a lane per
     /// provider).
     pub buyer: Arc<dyn PoolOpener>,
+    /// The `PaymentPool` the buyer pays through, and the route over this
+    /// node's accepted pools that chose it (ADR 005 § Payment pool routing).
+    /// An upstream is paid only when the route sends it to this pool.
+    pub buyer_pool: BuyerPool,
     /// This node's DHT id, the lookup requester.
     pub self_id: DhtNodeId,
     /// EIP-712 domain verifying the delivery `slash_sig` (ADR 014 §1).
@@ -992,7 +994,7 @@ impl Origin for NodeOrigin {
                 // and the candidates of both walks that refused this node's
                 // funding: the ones the step asks again.
                 let gate = Arc::new(RecoveryGate::with_settle(settle_window(
-                    deps.config.event_poll_interval,
+                    deps.config.upstream_pool_refresh,
                 )));
                 // The deposit this fill starts at. A sibling fill's step that
                 // lands above it serves this fill too.
@@ -1365,6 +1367,9 @@ enum OpenDrop {
     Unverifiable,
     /// The peer quoted above this node's `max_rate_per_mb`.
     OverCeiling,
+    /// The peer's `payment_pools` hint does not route it to the buyer's pool,
+    /// so it refuses that pool as `Declined`.
+    PoolNotAccepted,
 }
 
 /// What the discovery rounds of one miss saw (#2366): the counts a
@@ -1397,7 +1402,8 @@ impl OpenTally {
             | OpenDrop::TimestampRejected
             | OpenDrop::NoAddress
             | OpenDrop::Unverifiable
-            | OpenDrop::OverCeiling => &mut self.dropped,
+            | OpenDrop::OverCeiling
+            | OpenDrop::PoolNotAccepted => &mut self.dropped,
         };
         *slot = slot.saturating_add(1);
     }
@@ -1975,7 +1981,9 @@ enum Opened {
 /// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable peer that holds no
 /// block is recorded in the negative cache, unless it is an `assigned_origin`
 /// that answered `NotFound`: that answer means it needs a fill, not that the
-/// blob is absent, so it is returned as [`Opened::Cold`] instead.
+/// blob is absent, so it is returned as [`Opened::Cold`] instead. A peer whose
+/// `payment_pools` hint does not route it to the buyer pool is dropped as
+/// [`OpenDrop::PoolNotAccepted`].
 // Straight-line open → classify → build; the tracing macros and the sequential
 // drop conditions inflate the cognitive-complexity metric past the threshold
 // (same inflation noted in `chain_staker_set`), and splitting the classification
@@ -2066,6 +2074,14 @@ async fn open_candidate(
             return Err(OpenDrop::Unreachable);
         }
     };
+    // The open names the buyer's pool. A peer that does not route to it
+    // refuses that pool as `Declined` and says nothing about the blob, so it
+    // is dropped before its answer reads as a miss (ADR 005 § Payment pool
+    // routing).
+    if opened.declines_pool() || !deps.buyer_pool.pays(opened.ext().payment_pools.as_deref()) {
+        opened.cancel();
+        return Err(OpenDrop::PoolNotAccepted);
+    }
     let served = opened.served();
     let holds_nothing = !served && opened.coverage().is_empty();
     let error = opened.ext().error().cloned();
@@ -2635,8 +2651,8 @@ async fn try_pull(
 ///
 /// The first step of a fill is always allowed; a further step only after a
 /// byte verified since the last one. A step that tops the pool up opens the
-/// gate's settle window: a candidate that still refuses inside it is the
-/// upstream's chain watcher lagging the new deposit, so the fill waits a
+/// gate's settle window: a candidate that still refuses inside it holds a
+/// pool read older than the new deposit, so the fill waits a
 /// [`SETTLE_POLL_STEP`] and asks again instead of taking another step. A fill
 /// that can take no step ends "funding needed" ([`PullMiss::FundingNeeded`]),
 /// which still answers the client `NotFound`.

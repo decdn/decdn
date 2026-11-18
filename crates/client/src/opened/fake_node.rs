@@ -59,6 +59,14 @@ pub(crate) enum Answer {
         /// The blob the node holds.
         blob: Vec<u8>,
     },
+    /// A signed `Declined` of the request's payment pool, naming the pools
+    /// the node accepts instead.
+    DeclinePool {
+        /// The pools the node accepts.
+        accepted: Vec<decdn_protocol::PoolAccount>,
+        /// The per-MiB rate it signs.
+        rate: u64,
+    },
 }
 
 /// What a [`FakeNode`] saw.
@@ -249,6 +257,9 @@ async fn answer_stream(
             StreamResponseExt::refused(StreamError::NotFound, coverage),
         ),
         Answer::Inconsistent { blob } => (true, 10, served(&blob, false)?),
+        Answer::DeclinePool { accepted, rate } => {
+            (false, rate, StreamResponseExt::pool_declined(accepted))
+        }
     };
     let body = StreamResponseBody {
         hash: req.hash,

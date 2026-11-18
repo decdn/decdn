@@ -27,6 +27,10 @@ use crate::gate::{Gate, html_escape};
 use crate::net::ClientIpSource;
 use crate::state::{self, AppState};
 
+/// The governance chain id of [`test_config`]: distinct from the pool chain
+/// of [`test_info`], so a test sees which chain each value names.
+pub const TEST_GOVERNANCE_CHAIN_ID: u64 = 11_155_111;
+
 /// The [`Info`] every fake daemon reports.
 pub const fn test_info() -> Info {
     Info {
@@ -48,7 +52,9 @@ pub fn test_config() -> OnrampConfig {
         public_url: "https://up.example.org".into(),
         daemon_url: "http://127.0.0.1:8090".into(),
         daemon_token: "t".repeat(32).as_str().into(),
-        rpc_url: "https://rpc.example".into(),
+        governance_rpc_url: "https://governance-rpc.example".into(),
+        governance_chain_id: TEST_GOVERNANCE_CHAIN_ID,
+        pool_rpc_url: "https://rpc.example".into(),
         capacity_bond: Address::repeat_byte(0x33),
         slash_judge: None,
         spending_cap: None,

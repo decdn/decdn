@@ -100,7 +100,7 @@ Privileged view of specific interaction channels.
 
 ##### RPC provider (P-15)
 
-Observes all on-chain queries: registry lookups, blacklist polling, rate-bounds checks — revealing which nodes a client or node is interested in. [architecture.md](architecture.md#architecture-overview) trust assumptions already document this and plan multi-source bootstrap for production.
+Observes all on-chain queries: registry lookups, blacklist polling, rate-bounds checks — revealing which nodes a client or node is interested in. A client and a node use a governance-chain RPC and a payment-chain RPC, and each provider sees only the queries for its own chain. [architecture.md](architecture.md#architecture-overview) trust assumptions already document this and plan multi-source bootstrap for production.
 
 ##### Relay (P-17)
 

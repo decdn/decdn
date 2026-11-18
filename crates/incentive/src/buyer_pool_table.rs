@@ -58,10 +58,12 @@ use crate::store::StoreError;
 /// Callers supply the `Database` (the one thing they legitimately differ
 /// on) and nothing else.
 ///
-/// The primary key is `pool_id` (32 bytes); the value carries the
-/// [`Deployment`] the pool lives on (chain id and `PaymentPool` address), a
-/// variable-length per-lane progress table, and the redeemed spend no tracked
-/// lane accounts for ([`BuyerPoolState::redeemed_elsewhere`]). The exact-match
+/// The primary key is `deployment ‖ pool_id` (`28 + 32` bytes,
+/// [`Deployment::to_bytes`] first): a `pool_id` repeats across `PaymentPool`
+/// deployments, so the deployment is part of the identity. The value repeats
+/// both, which decode checks against the key, and carries a variable-length
+/// per-lane progress table and the redeemed spend no tracked lane accounts for
+/// ([`BuyerPoolState::redeemed_elsewhere`]). The exact-match
 /// `schema_version` refuses a row in any other layout, and a point lookup that
 /// errors fails the fetch, where a missing table reads as no row.
 ///
@@ -76,21 +78,69 @@ use crate::store::StoreError;
 /// no rows. The caller (the node, or `decdn get`) then
 /// re-adopts a live pool on the configured contract from chain where its
 /// adoption rules allow.
-const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
-    TableDefinition::new("buyer_pool_state_v1");
+const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; POOL_KEY_LEN], &'static [u8]> =
+    TableDefinition::new("buyer_pool_state_v2");
 
-/// Secondary index: `owner (20 bytes) → pool_id (32 bytes)`. Maintained
-/// alongside [`BUYER_POOL_TABLE`] on every `record`/`forget`/
-/// `forget_if_pool` so `get_by_owner` — the open-pool trigger's reuse-lookup
-/// hot path — stays a one-hop lookup instead of a table scan.
+/// Secondary index: `deployment ‖ owner (28 + 20 bytes) → pool_id (32
+/// bytes)`. Maintained alongside [`BUYER_POOL_TABLE`] on every `record`/
+/// `forget`/`forget_if_pool` so `get_by_owner` — the open-pool trigger's
+/// reuse-lookup hot path — stays a one-hop lookup instead of a table scan.
+/// One owner holds one indexed pool per deployment.
 ///
-/// **This is a reuse hint, not an enumeration.** If two pools ever share an
-/// owner (e.g. mid-rotate), the index holds only the most-recently-recorded
-/// `pool_id`; the other pool still exists in [`BUYER_POOL_TABLE`] and is
-/// only visible via [`BuyerPoolTable::load_all`] (the reclaim sweep's path)
-/// — never via [`BuyerPoolTable::get_by_owner`].
-const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8; 32]> =
-    TableDefinition::new("buyer_pool_owner_index_v1");
+/// **This is a reuse hint, not an enumeration.** If two pools on one
+/// deployment ever share an owner (e.g. mid-rotate), the index holds only the
+/// most-recently-recorded `pool_id`; the other pool still exists in
+/// [`BUYER_POOL_TABLE`] and is only visible via [`BuyerPoolTable::load_all`]
+/// (the reclaim sweep's path) — never via [`BuyerPoolTable::get_by_owner`].
+const BUYER_OWNER_INDEX_TABLE: TableDefinition<
+    'static,
+    &'static [u8; OWNER_KEY_LEN],
+    &'static [u8; POOL_ID_LEN],
+> = TableDefinition::new("buyer_pool_owner_index_v2");
+
+/// Byte width of a [`BUYER_POOL_TABLE`] key: the deployment and the `pool_id`.
+const POOL_KEY_LEN: usize = Deployment::ENCODED_LEN + POOL_ID_LEN;
+
+/// Byte width of a [`BUYER_OWNER_INDEX_TABLE`] key: the deployment and the
+/// owner.
+const OWNER_KEY_LEN: usize = Deployment::ENCODED_LEN + ADDRESS_LEN;
+
+/// The [`BUYER_POOL_TABLE`] key of `pool_id` on `deployment`.
+fn pool_key(deployment: Deployment, pool_id: PoolId) -> [u8; POOL_KEY_LEN] {
+    let mut out = [0u8; POOL_KEY_LEN];
+    for (slot, byte) in out
+        .iter_mut()
+        .zip(deployment.to_bytes().into_iter().chain(pool_id.0))
+    {
+        *slot = byte;
+    }
+    out
+}
+
+/// The [`BUYER_OWNER_INDEX_TABLE`] key of `owner` on `deployment`.
+fn owner_key(deployment: Deployment, owner: Address) -> [u8; OWNER_KEY_LEN] {
+    let mut out = [0u8; OWNER_KEY_LEN];
+    for (slot, byte) in out
+        .iter_mut()
+        .zip(deployment.to_bytes().into_iter().chain(owner.into_array()))
+    {
+        *slot = byte;
+    }
+    out
+}
+
+/// Split a [`BUYER_POOL_TABLE`] key into its deployment and `pool_id`.
+fn pool_key_parts(key: &[u8; POOL_KEY_LEN]) -> Result<(Deployment, PoolId), StoreError> {
+    let (deployment, pool_id) = key.split_at(Deployment::ENCODED_LEN);
+    let pool_id: [u8; POOL_ID_LEN] = pool_id.try_into().map_err(|_| StoreError::Corrupt {
+        pool_id: None,
+        detail: "buyer pool key has the wrong width".to_owned(),
+    })?;
+    Ok((Deployment::from_bytes(deployment)?, PoolId::from(pool_id)))
+}
+
+// The keys are frozen on-disk identifiers: a width change fails the build here.
+const _: () = assert!(POOL_KEY_LEN == 60 && OWNER_KEY_LEN == 48);
 
 /// The buyer-record `schema_version` this binary reads and writes.
 ///
@@ -391,16 +441,24 @@ fn encode_record(state: &BuyerPoolState) -> Result<Vec<u8>, StoreError> {
 }
 
 /// Decode one buyer record into a [`BuyerPoolState`], validating that the
-/// embedded `pool_id` matches the table's primary key (additive-forward-compat
-/// via `take_from_bytes`; bounded trailing-bytes warning).
-fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<BuyerPoolState, StoreError> {
-    let pool_id = PoolId::from(key_bytes);
+/// embedded deployment and `pool_id` match the table's primary key
+/// (additive-forward-compat via `take_from_bytes`; bounded trailing-bytes
+/// warning).
+fn decode_record(
+    key: &[u8; POOL_KEY_LEN],
+    value_bytes: &[u8],
+) -> Result<BuyerPoolState, StoreError> {
+    let (deployment, pool_id) = pool_key_parts(key)?;
     let (stored, remainder): (StoredBuyerPoolState, &[u8]) = postcard::take_from_bytes(value_bytes)
         .map_err(|err| StoreError::Corrupt {
             pool_id: Some(pool_id),
             detail: format!("buyer record postcard decode failed (pool_id {pool_id}): {err}"),
         })?;
-    if stored.pool_id != key_bytes {
+    let stored_deployment = Deployment {
+        chain_id: u64::from_be_bytes(stored.chain_id),
+        payment_pool: Address::from(stored.payment_pool),
+    };
+    if stored.pool_id != pool_id.0 || stored_deployment != deployment {
         return Err(StoreError::Corrupt {
             pool_id: Some(pool_id),
             detail: format!("buyer record pool_id {pool_id} does not match table key"),
@@ -449,11 +507,11 @@ pub(crate) fn load_all_from<D: ReadableDatabase>(db: &D) -> Result<BuyerLoad, St
     for entry in iter {
         let (key_guard, value_guard) =
             entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
-        let key_bytes: [u8; 32] = *key_guard.value();
-        match decode_record(key_bytes, value_guard.value()) {
+        let key: [u8; POOL_KEY_LEN] = *key_guard.value();
+        match decode_record(&key, value_guard.value()) {
             Ok(state) => out.push(state),
             Err(err) => {
-                let pool_id = PoolId::from(key_bytes);
+                let pool_id = pool_key_parts(&key).map_or(PoolId::ZERO, |(_, id)| id);
                 skipped.push(pool_id);
                 tracing::error!(
                     %pool_id,
@@ -548,9 +606,9 @@ impl<'a> BuyerPoolTable<'a> {
     }
 
     /// Persist (insert or overwrite) the state for one pool, keyed by
-    /// `state.pool_id` (primary), maintaining `state.owner →
-    /// state.pool_id` in the secondary reuse index. Durable (fsynced)
-    /// before returning `Ok`.
+    /// `(state.deployment, state.pool_id)` (primary), maintaining
+    /// `(state.deployment, state.owner) → state.pool_id` in the secondary
+    /// reuse index. Durable (fsynced) before returning `Ok`.
     ///
     /// Creates both tables if absent — unlike the no-row operations, this
     /// one intends to write. If a *different* `pool_id` was previously
@@ -567,8 +625,9 @@ impl<'a> BuyerPoolTable<'a> {
     /// the write or fsync fails.
     pub fn record(&self, state: &BuyerPoolState) -> Result<(), StoreError> {
         let encoded = encode_record(state)?;
-        let primary_key: [u8; 32] = state.pool_id.into();
-        let index_key: [u8; 20] = state.owner.into();
+        let primary_key = pool_key(state.deployment, state.pool_id);
+        let index_key = owner_key(state.deployment, state.owner);
+        let pool_id: [u8; POOL_ID_LEN] = state.pool_id.into();
 
         let write_txn = self.begin_durable_write()?;
         {
@@ -584,7 +643,7 @@ impl<'a> BuyerPoolTable<'a> {
                 .open_table(BUYER_OWNER_INDEX_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
             index
-                .insert(&index_key, &primary_key)
+                .insert(&index_key, &pool_id)
                 .map_err(|err| StoreError::Backend(format!("insert (index): {err}")))?;
         }
         write_txn
@@ -593,18 +652,18 @@ impl<'a> BuyerPoolTable<'a> {
         Ok(())
     }
 
-    /// Drop the persisted entry the owner index currently maps `owner` to,
-    /// removing it from both the primary table and the index. A no-op if no
-    /// index entry exists for `owner`, or if neither table was ever
-    /// written. An actual deletion is committed durably.
+    /// Drop the persisted entry the owner index currently maps `(deployment,
+    /// owner)` to, removing it from both the primary table and the index. A
+    /// no-op if no index entry exists, or if neither table was ever written.
+    /// An actual deletion is committed durably.
     ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] if the delete or durable commit fails.
-    pub fn forget(&self, owner: Address) -> Result<(), StoreError> {
-        let index_key: [u8; 20] = owner.into();
+    pub fn forget(&self, deployment: Deployment, owner: Address) -> Result<(), StoreError> {
+        let index_key = owner_key(deployment, owner);
         let write_txn = self.begin_durable_write()?;
-        let primary_key = {
+        let pool_id = {
             let mut index = write_txn
                 .open_table(BUYER_OWNER_INDEX_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
@@ -614,19 +673,19 @@ impl<'a> BuyerPoolTable<'a> {
             else {
                 return Ok(());
             };
-            let primary_key: [u8; 32] = *value_guard.value();
+            let pool_id: [u8; POOL_ID_LEN] = *value_guard.value();
             drop(value_guard);
             index
                 .remove(&index_key)
                 .map_err(|err| StoreError::Backend(format!("remove (index): {err}")))?;
-            primary_key
+            pool_id
         };
         {
             let mut table = write_txn
                 .open_table(BUYER_POOL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
-                .remove(&primary_key)
+                .remove(&pool_key(deployment, PoolId::from(pool_id)))
                 .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
         }
         write_txn
@@ -646,8 +705,12 @@ impl<'a> BuyerPoolTable<'a> {
     ///
     /// [`StoreError::Backend`] if unreadable, [`StoreError::Corrupt`] /
     /// [`StoreError::UnsupportedSchema`] if the record cannot be decoded.
-    pub fn get_by_pool_id(&self, pool_id: PoolId) -> Result<Option<BuyerPoolState>, StoreError> {
-        let key: [u8; 32] = pool_id.into();
+    pub fn get_by_pool_id(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+    ) -> Result<Option<BuyerPoolState>, StoreError> {
+        let key = pool_key(deployment, pool_id);
         let read_txn = self
             .db
             .begin_read()
@@ -663,19 +726,23 @@ impl<'a> BuyerPoolTable<'a> {
         else {
             return Ok(None);
         };
-        Ok(Some(decode_record(key, value_guard.value())?))
+        Ok(Some(decode_record(&key, value_guard.value())?))
     }
 
-    /// Point-lookup the live pool for `owner` via the secondary reuse index
-    /// (one hop to the `pool_id`, then a primary lookup), or `None` if none
-    /// is tracked.
+    /// Point-lookup the live pool for `owner` on `deployment` via the
+    /// secondary reuse index (one hop to the `pool_id`, then a primary
+    /// lookup), or `None` if none is tracked.
     ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] if unreadable, [`StoreError::Corrupt`] /
     /// [`StoreError::UnsupportedSchema`] if the record cannot be decoded.
-    pub fn get_by_owner(&self, owner: Address) -> Result<Option<BuyerPoolState>, StoreError> {
-        let index_key: [u8; 20] = owner.into();
+    pub fn get_by_owner(
+        &self,
+        deployment: Deployment,
+        owner: Address,
+    ) -> Result<Option<BuyerPoolState>, StoreError> {
+        let index_key = owner_key(deployment, owner);
         let read_txn = self
             .db
             .begin_read()
@@ -691,7 +758,7 @@ impl<'a> BuyerPoolTable<'a> {
         else {
             return Ok(None);
         };
-        let primary_key: [u8; 32] = *idx_guard.value();
+        let primary_key = pool_key(deployment, PoolId::from(*idx_guard.value()));
         drop(idx_guard);
         let table = match read_txn.open_table(BUYER_POOL_TABLE) {
             Ok(t) => t,
@@ -704,7 +771,7 @@ impl<'a> BuyerPoolTable<'a> {
         else {
             return Ok(None);
         };
-        Ok(Some(decode_record(primary_key, value_guard.value())?))
+        Ok(Some(decode_record(&primary_key, value_guard.value())?))
     }
 
     /// Compare-and-delete inside a single write transaction: remove
@@ -721,9 +788,15 @@ impl<'a> BuyerPoolTable<'a> {
     ///
     /// [`StoreError::Backend`] if the read, delete, or durable commit
     /// fails.
-    pub fn forget_if_pool(&self, owner: Address, pool_id: PoolId) -> Result<bool, StoreError> {
-        let index_key: [u8; 20] = owner.into();
-        let primary_key: [u8; 32] = pool_id.into();
+    pub fn forget_if_pool(
+        &self,
+        deployment: Deployment,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<bool, StoreError> {
+        let index_key = owner_key(deployment, owner);
+        let indexed: [u8; POOL_ID_LEN] = pool_id.into();
+        let primary_key = pool_key(deployment, pool_id);
         let write_txn = self.begin_durable_write()?;
         {
             let mut index = write_txn
@@ -738,7 +811,7 @@ impl<'a> BuyerPoolTable<'a> {
             else {
                 return Ok(false);
             };
-            let matches = *value_guard.value() == primary_key;
+            let matches = *value_guard.value() == indexed;
             drop(value_guard);
             if !matches {
                 return Ok(false);
@@ -776,13 +849,14 @@ impl<'a> BuyerPoolTable<'a> {
     /// failure.
     pub fn advance_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         bytes: U256,
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError> {
-        self.write_lane(owner, pool_id, |state| {
+        self.write_lane(deployment, owner, pool_id, |state| {
             state.advance_lane(lane, bytes, amount)
         })
     }
@@ -797,13 +871,14 @@ impl<'a> BuyerPoolTable<'a> {
     /// failure.
     pub fn rebase_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         anchor: BuyerLaneProgress,
         totals: BuyerLaneProgress,
     ) -> Result<AdvanceOutcome, StoreError> {
-        self.write_lane(owner, pool_id, |state| {
+        self.write_lane(deployment, owner, pool_id, |state| {
             state.rebase_lane(lane, anchor, totals);
             Ok(())
         })
@@ -819,13 +894,38 @@ impl<'a> BuyerPoolTable<'a> {
     /// failure.
     pub fn seed_progress(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         lane: LaneKey,
         bytes: U256,
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError> {
-        self.write_lane(owner, pool_id, |state| state.seed_lane(lane, bytes, amount))
+        self.write_lane(deployment, owner, pool_id, |state| {
+            state.seed_lane(lane, bytes, amount)
+        })
+    }
+
+    /// Inside `write_txn`, whether the owner index maps `(deployment, owner)`
+    /// to `pool_id`: `None` when it does, else whether the index holds no
+    /// entry (`Some(true)`) or another pool (`Some(false)`).
+    fn index_mismatch(
+        write_txn: &redb::WriteTransaction,
+        deployment: Deployment,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<Option<bool>, StoreError> {
+        let index = write_txn
+            .open_table(BUYER_OWNER_INDEX_TABLE)
+            .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
+        let Some(idx_guard) = index
+            .get(&owner_key(deployment, owner))
+            .map_err(|err| StoreError::Backend(format!("get (index): {err}")))?
+        else {
+            return Ok(Some(true));
+        };
+        let mapped: [u8; POOL_ID_LEN] = *idx_guard.value();
+        Ok((mapped != pool_id.0).then_some(false))
     }
 
     /// The shared body of [`Self::advance_progress`],
@@ -833,28 +933,17 @@ impl<'a> BuyerPoolTable<'a> {
     /// committed row and write it back, all in one durable write transaction.
     fn write_lane(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         apply: impl FnOnce(&mut BuyerPoolState) -> Result<(), BuyerProgressError>,
     ) -> Result<AdvanceOutcome, StoreError> {
-        let index_key: [u8; 20] = owner.into();
-        let primary_key: [u8; 32] = pool_id.into();
+        let primary_key = pool_key(deployment, pool_id);
         let write_txn = self.begin_durable_write()?;
-        {
-            let index = write_txn
-                .open_table(BUYER_OWNER_INDEX_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
-            let Some(idx_guard) = index
-                .get(&index_key)
-                .map_err(|err| StoreError::Backend(format!("get (index): {err}")))?
-            else {
-                return Ok(AdvanceOutcome::UnknownPool);
-            };
-            let mapped: [u8; 32] = *idx_guard.value();
-            drop(idx_guard);
-            if mapped != primary_key {
-                return Ok(AdvanceOutcome::PoolMismatch);
-            }
+        match Self::index_mismatch(&write_txn, deployment, owner, pool_id)? {
+            Some(true) => return Ok(AdvanceOutcome::UnknownPool),
+            Some(false) => return Ok(AdvanceOutcome::PoolMismatch),
+            None => {}
         }
         {
             let mut table = write_txn
@@ -869,7 +958,7 @@ impl<'a> BuyerPoolTable<'a> {
             else {
                 return Ok(AdvanceOutcome::UnknownPool);
             };
-            let mut state = decode_record(primary_key, value_guard.value())?;
+            let mut state = decode_record(&primary_key, value_guard.value())?;
             // Drop the borrow of `table` held by `value_guard` before
             // mutating.
             drop(value_guard);
@@ -896,28 +985,17 @@ impl<'a> BuyerPoolTable<'a> {
     /// failure.
     pub fn add_deposit(
         &self,
+        deployment: Deployment,
         owner: Address,
         pool_id: PoolId,
         additional: U256,
     ) -> Result<DepositOutcome, StoreError> {
-        let index_key: [u8; 20] = owner.into();
-        let primary_key: [u8; 32] = pool_id.into();
+        let primary_key = pool_key(deployment, pool_id);
         let write_txn = self.begin_durable_write()?;
-        {
-            let index = write_txn
-                .open_table(BUYER_OWNER_INDEX_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
-            let Some(idx_guard) = index
-                .get(&index_key)
-                .map_err(|err| StoreError::Backend(format!("get (index): {err}")))?
-            else {
-                return Ok(DepositOutcome::UnknownPool);
-            };
-            let mapped: [u8; 32] = *idx_guard.value();
-            drop(idx_guard);
-            if mapped != primary_key {
-                return Ok(DepositOutcome::PoolMismatch);
-            }
+        match Self::index_mismatch(&write_txn, deployment, owner, pool_id)? {
+            Some(true) => return Ok(DepositOutcome::UnknownPool),
+            Some(false) => return Ok(DepositOutcome::PoolMismatch),
+            None => {}
         }
         let new_deposit = {
             let mut table = write_txn
@@ -929,7 +1007,7 @@ impl<'a> BuyerPoolTable<'a> {
             else {
                 return Ok(DepositOutcome::UnknownPool);
             };
-            let mut state = decode_record(primary_key, value_guard.value())?;
+            let mut state = decode_record(&primary_key, value_guard.value())?;
             drop(value_guard);
             state.deposit = state.deposit.saturating_add(additional);
             let encoded = encode_record(&state)?;
@@ -1162,8 +1240,13 @@ impl<'a> BuyerPoolTable<'a> {
     ///
     /// [`StoreError::Backend`] if the write or durable commit fails.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn insert_raw(&self, pool_id: PoolId, bytes: &[u8]) -> Result<(), StoreError> {
-        let key: [u8; 32] = pool_id.into();
+    pub fn insert_raw(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let key = pool_key(deployment, pool_id);
         let write_txn = self.begin_durable_write()?;
         {
             let mut table = write_txn

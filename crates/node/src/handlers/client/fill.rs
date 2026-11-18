@@ -3,7 +3,7 @@
 use decdn_protocol::{Coverage, byte_range_blocks, num_blocks};
 
 use super::{
-    Arc, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneDeliveryState, LaneKey, Mutex,
+    Arc, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneDeliveryState, LaneId, Mutex,
     StreamRequest,
 };
 use tracing::Instrument as _;
@@ -44,9 +44,9 @@ impl ClientHandler {
     /// so no fill fronts USDC or origin egress on a blacklisted funder's
     /// behalf.
     pub(super) fn pull_authorized(
-        lane_key: Option<LaneKey>,
+        lane_key: Option<LaneId>,
         known_lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
-    ) -> Option<(LaneKey, &Arc<Mutex<LaneDeliveryState>>)> {
+    ) -> Option<(LaneId, &Arc<Mutex<LaneDeliveryState>>)> {
         lane_key.zip(known_lane)
     }
 

@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::credit::SendGuards;
 use super::outcome::ServeEnd;
 use super::{
-    Address, Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, Hash,
-    LaneDeliveryState, LaneKey, Mutex, PublicKey, RecvStream, SendStream, ServeRejectReason,
+    Address, Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, Deployment,
+    Hash, LaneDeliveryState, LaneId, Mutex, PublicKey, RecvStream, SendStream, ServeRejectReason,
     StreamRequest, StreamRequestExt,
 };
 use crate::load_shed::{RequestClass, ShedSlot};
@@ -52,14 +52,17 @@ pub(super) struct Funding {
 /// gates need when the payer's first proof arrives. It holds its stream's
 /// [`UnadmittedSlot`] until admission consumes it or the stream ends.
 pub(super) struct DeferredAdmission {
-    /// The stream's request.
-    req: StreamRequest,
+    /// The stream's request. Boxed: its pool account makes it the largest
+    /// part of the admission.
+    req: Box<StreamRequest>,
     /// The request's extension, for its capability.
     ext: StreamRequestExt,
+    /// The accepted `PaymentPool` contract the request names.
+    deployment: Deployment,
     /// The verified client binding the request resolved, if any.
     verified_client: Option<Address>,
     /// The lane the request names, or `None` when it carries no binding.
-    lane_key: Option<LaneKey>,
+    lane_key: Option<LaneId>,
     /// The requesting peer, for the refusal logs.
     peer: PublicKey,
     /// The quoted price.
@@ -78,11 +81,12 @@ impl DeferredAdmission {
     /// The admission an open that answered before admission runs at its first
     /// proof.
     #[allow(clippy::too_many_arguments)]
-    pub(super) const fn new(
+    pub(super) fn new(
         req: StreamRequest,
         ext: StreamRequestExt,
+        deployment: Deployment,
         verified_client: Option<Address>,
-        lane_key: Option<LaneKey>,
+        lane_key: Option<LaneId>,
         peer: PublicKey,
         rate_per_mb: u64,
         total_bytes: u64,
@@ -91,8 +95,9 @@ impl DeferredAdmission {
         slot: Option<UnadmittedSlot>,
     ) -> Self {
         Self {
-            req,
+            req: Box::new(req),
             ext,
+            deployment,
             verified_client,
             lane_key,
             peer,
@@ -109,7 +114,7 @@ impl DeferredAdmission {
 /// before each send.
 pub(super) struct Admitted {
     /// The lane's key.
-    pub(super) lane_key: LaneKey,
+    pub(super) lane_key: LaneId,
     /// The lane.
     pub(super) lane: Arc<Mutex<LaneDeliveryState>>,
     /// The takedown, pool and signer checks that run before each send.
@@ -215,33 +220,36 @@ impl UnadmittedSlot {
 
 impl ClientHandler {
     /// The funding gates up to the deposit gate, for a request that names
-    /// `lane_key` (ADR 003 § Pool solvency, § Capability delegation): the pool
-    /// status, the signer's authorization, the funder deny, capability intake,
-    /// the lane and its registration clamp, a closing pool and a capability
-    /// inside the expiry margin. Returns what they read, or the refusal.
+    /// `lane_key` on the accepted pool `deployment` (ADR 003 § Pool solvency,
+    /// § Capability delegation): the pool status, the signer's authorization,
+    /// the funder deny, capability intake, the lane and its registration
+    /// clamp, a closing pool and a capability inside the expiry margin.
+    /// Returns what they read, or the refusal.
     ///
-    /// With no pool view wired (dev/test) the pool gates pass and no lane
-    /// registers from a capability.
+    /// With no pool view wired for `deployment` (dev/test) the pool gates pass
+    /// and no lane registers from a capability.
     pub(super) async fn funding_gates(
         &self,
         req: &StreamRequest,
         ext: &StreamRequestExt,
+        deployment: Deployment,
         verified_client: Option<Address>,
-        lane_key: Option<LaneKey>,
+        lane_key: Option<LaneId>,
         rate_per_mb: u64,
     ) -> Result<Funding, ServeRejectReason> {
         let pool_id = B256::from(req.pool_id);
+        let pool_view = self.pool_view(deployment);
         // The pool's `getPool` view (owner, remaining, lifecycle), read once and
         // reused by every gate below. The wired view answers from its projection
         // and confirms a pool it has not folded with one `getPool`. `None` with a
         // view wired means the pool does not exist, is closed, or the read
         // faulted, so the node refuses rather than serve a pool it cannot
         // confirm.
-        let pool_status = match self.pool_view.as_ref() {
+        let pool_status = match pool_view {
             Some(view) => view.status(pool_id).await,
             None => None,
         };
-        if self.pool_view.is_some() && pool_status.is_none() {
+        if pool_view.is_some() && pool_status.is_none() {
             return Err(ServeRejectReason::PoolUnconfirmed);
         }
 
@@ -252,7 +260,7 @@ impl ClientHandler {
         // the lane below. A `getAuthorization` fault with no earlier registered
         // read refuses as unconfirmed, never as an exhausted cap.
         let mut registered_terms: Option<(u64, u64)> = None;
-        if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
+        if let (Some(view), Some(signer)) = (pool_view, verified_client) {
             let floor_micro = decdn_incentive::min_payment(CHUNK_BYTES, rate_per_mb);
             let auth = view.signer_authorization(pool_id, signer).await;
             if let Some(SignerAuthorization::Registered { cap, expiry, .. }) = auth {
@@ -282,7 +290,7 @@ impl ClientHandler {
         if let (Some(signer), Some(capability), Some(status)) =
             (verified_client, ext.capability.as_ref(), pool_status)
         {
-            self.intake_capability(pool_id, signer, status.owner, capability);
+            self.intake_capability(deployment, pool_id, signer, status.owner, capability);
         }
 
         // The request's one lane read, after intake, so a lane its own
@@ -298,7 +306,8 @@ impl ClientHandler {
         // Hold the signer's registered terms on the lane: the voucher path
         // refuses past the lane's `cap` and `expiry`.
         if let (Some(lane), Some((cap, expiry))) = (known_lane.as_ref(), registered_terms) {
-            self.clamp_lane_to_registration(lane, cap, expiry).await;
+            self.clamp_lane_to_registration(deployment, lane, cap, expiry)
+                .await;
         }
 
         // A `Closing` pool takes no top-up, and its redemption ends at the
@@ -365,6 +374,7 @@ impl ClientHandler {
             .funding_gates(
                 &adm.req,
                 &adm.ext,
+                adm.deployment,
                 adm.verified_client,
                 adm.lane_key,
                 adm.rate_per_mb,

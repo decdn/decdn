@@ -1540,7 +1540,11 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     slash_sig: vec![0u8; 65],
                 };
                 let ext = StreamResponseExt::refused(StreamError::Unfunded, Coverage::empty());
-                return Err(UpstreamRefused::open(resp, &ext));
+                return Err(UpstreamRefused::open(
+                    resp,
+                    &ext,
+                    &decdn_protocol::PoolAccount::eip155(1, [0; 20]),
+                ));
             }
             self.inner.open(hash, range).await
         })

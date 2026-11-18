@@ -1377,6 +1377,57 @@ fn an_open_whose_coverage_disagrees_is_a_source_fault() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `Declined` refusal of the request's payment pool hands the caller the
+/// pools the node accepts; any other refusal hands none.
+#[test]
+fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
+    use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
+    use decdn_protocol::{PoolAccount, StreamResponseExt};
+
+    use super::UpstreamRefused;
+
+    let response = StreamResponse {
+        body: StreamResponseBody {
+            hash: [0x5Au8; 32],
+            ok: false,
+            rate_per_mb: 10,
+            timestamp_us: 1_700_000_000_000_000,
+        },
+        slash_sig: vec![0; 65],
+    };
+    let requested = PoolAccount::eip155(8_453, [0xa1; 20]);
+    let accepted = vec![PoolAccount::eip155(8_453, [0xb1; 20])];
+    let declined = UpstreamRefused::open(
+        response.clone(),
+        &StreamResponseExt::pool_declined(accepted.clone()),
+        &requested,
+    );
+    let refused = declined
+        .downcast_ref::<UpstreamRefused>()
+        .ok_or_else(|| anyhow::anyhow!("a typed refusal: {declined:#}"))?;
+    anyhow::ensure!(*refused.error() == StreamError::Declined);
+    anyhow::ensure!(refused.accepted_pools() == Some(accepted.as_slice()));
+
+    // A `Declined` whose list names the requested pool refuses the blob,
+    // not the pool, and so does one with no list.
+    for ext in [
+        StreamResponseExt::pool_declined(vec![requested]),
+        StreamResponseExt::refused(StreamError::Declined, decdn_protocol::Coverage::empty()),
+    ] {
+        let plain = UpstreamRefused::open(response.clone(), &ext, &requested);
+        let refused = plain
+            .downcast_ref::<UpstreamRefused>()
+            .ok_or_else(|| anyhow::anyhow!("a typed refusal: {plain:#}"))?;
+        anyhow::ensure!(refused.accepted_pools().is_none());
+    }
+    anyhow::ensure!(
+        UpstreamRefused::mid_stream(StreamError::Declined)
+            .accepted_pools()
+            .is_none()
+    );
+    Ok(())
+}
+
 #[test]
 fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
@@ -1409,7 +1460,11 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
     response.validate()?;
     response_ext.validate(response.body.ok)?;
 
-    let err = UpstreamRefused::open(response, &response_ext);
+    let err = UpstreamRefused::open(
+        response,
+        &response_ext,
+        &decdn_protocol::PoolAccount::eip155(1, [0; 20]),
+    );
     let refused = err
         .downcast_ref::<UpstreamRefused>()
         .ok_or_else(|| anyhow::anyhow!("open() must stay a typed UpstreamRefused: {err:#}"))?;
@@ -1469,7 +1524,11 @@ fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {
         None,
         decdn_protocol::Coverage::empty(),
     );
-    let err = UpstreamRefused::open(response, &served);
+    let err = UpstreamRefused::open(
+        response,
+        &served,
+        &decdn_protocol::PoolAccount::eip155(1, [0; 20]),
+    );
     assert!(
         err.downcast_ref::<UpstreamRefused>().is_none(),
         "a response with no error code must not become a typed refusal"

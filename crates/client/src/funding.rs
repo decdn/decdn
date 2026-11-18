@@ -31,7 +31,7 @@ use crate::buyer_pool::{
 };
 use crate::fault::PoolOpenRefused;
 use crate::lanes::LaneDeps;
-use crate::session::{ChainAdoption, ChainConfig, DepositPolicy, PoolOpen};
+use crate::session::{ChainAdoption, DepositPolicy, GovernanceChain, PoolOpen};
 use crate::source::{Funder, SourceFuture};
 use crate::{NoAffordableSource, PoolContext, PoolLedger, PoolReplaced, Recovery};
 
@@ -63,8 +63,7 @@ pub fn cached_pool_token(
     deployment: Deployment,
 ) -> anyhow::Result<Option<Address>> {
     Ok(store
-        .get_by_owner(self_address)?
-        .filter(|state| state.is_on(deployment))
+        .get_by_owner(deployment, self_address)?
         .map(|state| state.token))
 }
 
@@ -537,7 +536,8 @@ where
             // and the pool, and is fatal ([`grade_deposit_credit`]).
             let effect = topped_up_effect(pool_id, credited);
             let new_deposit = match grade_deposit_credit(
-                self.store.add_deposit(self.owner, pool_id, credited),
+                self.store
+                    .add_deposit(self.deployment, self.owner, pool_id, credited),
                 &effect,
                 tx,
             ) {
@@ -699,7 +699,7 @@ where
     /// The deposit the buyer store records for `pool_id`, or `None` when it
     /// holds no row or cannot be read.
     fn recorded_deposit(&self, pool_id: PoolId) -> Option<U256> {
-        match self.store.get_by_pool_id(pool_id) {
+        match self.store.get_by_pool_id(self.deployment, pool_id) {
             Ok(row) => row.map(|row| row.deposit),
             Err(error) => {
                 tracing::warn!(
@@ -739,7 +739,7 @@ where
         // The settle step escrows nothing, so an estimate is safe here: it only
         // names the deposit the nodes are asked again at.
         let estimate = || remaining.saturating_add(self.funding.pool_spent().unwrap_or(U256::ZERO));
-        let deposit = match self.store.get_by_pool_id(pool_id) {
+        let deposit = match self.store.get_by_pool_id(self.deployment, pool_id) {
             Ok(Some(row)) => row.deposit,
             Ok(None) => estimate(),
             Err(error) => {
@@ -900,7 +900,7 @@ pub async fn discovery_ctx<P>(
     store: &dyn BuyerPoolStore,
     contract: &PaymentPool::PaymentPoolInstance<P>,
     payer: crate::lanes::LanePayer<'_>,
-    chain: &ChainConfig,
+    (governance, deployment): (&GovernanceChain, Deployment),
     endpoint: &Endpoint,
     voucher_dom: &Eip712Domain,
     known_pool: Option<PoolId>,
@@ -921,9 +921,8 @@ where
         }
         crate::lanes::LanePayer::Owned(payer) => {
             let owner = payer.owner().address();
-            let deployment = chain.deployment();
             let recorded = store
-                .get_by_owner(owner)
+                .get_by_owner(deployment, owner)
                 .map_err(|e| {
                     anyhow::anyhow!("read this wallet's buyer pool from the buyer store: {e}")
                         .context(crate::LocalPullFault)
@@ -941,7 +940,7 @@ where
             crate::buyer_pool::self_owned_open_ctx(pool_id, payer, voucher_dom)?
         }
     };
-    attach_client_binding(ctx, chain, endpoint)
+    attach_client_binding(ctx, governance, endpoint)
 }
 
 /// The id `PaymentPool.openPool` gives `owner`'s pool at `nonce`:
@@ -975,7 +974,7 @@ where
             signer,
             voucher_dom,
             provider,
-            deps.chain,
+            (&deps.chain.governance, deps.pool.deployment),
             deps.endpoint,
             grant,
         )
@@ -1014,13 +1013,13 @@ where
         deps.funding,
         payer,
         provider,
-        deps.chain.deployment(),
+        deps.pool.deployment,
         deps.deposit,
         ended,
     )
     .await?;
     Ok((
-        attach_client_binding(ctx, deps.chain, deps.endpoint)?,
+        attach_client_binding(ctx, &deps.chain.governance, deps.endpoint)?,
         spend,
     ))
 }
@@ -1049,7 +1048,7 @@ pub(crate) async fn build_delegated_pool_ctx<P>(
     signer: &Arc<PrivateKeySigner>,
     voucher_dom: &Eip712Domain,
     provider: Address,
-    chain: &ChainConfig,
+    (governance, deployment): (&GovernanceChain, Deployment),
     endpoint: &Endpoint,
     grant: &CapabilityGrant,
 ) -> anyhow::Result<PoolContext>
@@ -1068,14 +1067,14 @@ where
     anyhow::ensure!(
         pool.owner != Address::ZERO,
         "pool {pool_id} named by the capability does not exist on this PaymentPool contract \
-         ({}) — wrong --payment-pool-address/chain, or a stale token",
-        chain.payment_pool,
+         ({}): a capability for another payment pool (--pool), or a stale token",
+        deployment.payment_pool,
     );
 
     // A store that cannot be read is this machine's fault: it fails the
     // command rather than retrying the lane build as a chain-side fault.
     let (prior_bytes, prior_amount) = store
-        .delegate_lanes(chain.deployment(), pool_id, self_address)
+        .delegate_lanes(deployment, pool_id, self_address)
         .map_err(|e| {
             anyhow::anyhow!(
                 "read this key's delegate-lane watermarks for pool {pool_id} from the buyer \
@@ -1101,7 +1100,7 @@ where
         .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     let state = BuyerPoolState::new(
         pool_id,
-        chain.deployment(),
+        deployment,
         pool.owner,
         token,
         U256::from(pool.deposit),
@@ -1109,7 +1108,7 @@ where
     let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
         .with_provider(provider, prior_bytes, prior_amount)
         .with_capability(signed_capability);
-    attach_client_binding(ctx, chain, endpoint)
+    attach_client_binding(ctx, governance, endpoint)
 }
 
 /// Attach the ADR 005 client identity binding to an already-built
@@ -1122,19 +1121,20 @@ where
 /// itself around [`open_or_reuse_pool`] — can attach the same binding outside
 /// that critical section.
 ///
-/// No binding when `chain.capacity_bond` is unset — see [`build_pool_ctx`]'s
-/// docs for why that is silent.
+/// The binding domain is the governance chain's `CapacityBond`. No binding
+/// when `governance.capacity_bond` is unset — see [`build_pool_ctx`]'s docs
+/// for why that is silent.
 pub(crate) fn attach_client_binding(
     ctx: PoolContext,
-    chain: &ChainConfig,
+    governance: &GovernanceChain,
     endpoint: &Endpoint,
 ) -> anyhow::Result<PoolContext> {
-    let Some(capacity_bond) = chain.capacity_bond else {
+    let Some(capacity_bond) = governance.capacity_bond else {
         return Ok(ctx);
     };
     ctx.bind_endpoint(
         endpoint,
-        &bind_node_id_domain(chain.chain_id, capacity_bond),
+        &bind_node_id_domain(governance.chain_id, capacity_bond),
     )
 }
 
@@ -1232,13 +1232,9 @@ where
 /// The pool this buy reuses, if any, and what that pool has already paid out
 /// beyond what its row's lanes account for.
 ///
-/// A tracked row is reused only if it is on `deployment` — the same chain and
-/// the same `PaymentPool` address. A row from another deployment is not this
-/// contract's pool, whatever its id says: `pool_id` is
-/// `keccak256(owner, ownerPoolNonce)` and a redeploy restarts that nonce, so the
-/// id alone will eventually name an existing, unrelated pool here, and its lane
-/// progress would seed the first voucher at a cumulative this pool has never
-/// redeemed against. It is treated as no row.
+/// The tracked row is the one the store indexes under `(deployment, owner)`:
+/// a row of another `PaymentPool` deployment is another key, so it never
+/// answers here.
 ///
 /// A tracked row is reused only while its pool is open. Only the owner closes a
 /// pool, but the owner key can close it from another machine, and anyone can
@@ -1273,22 +1269,7 @@ async fn pool_to_reuse<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let tracked = match store.get_by_owner(self_address)? {
-        Some(state) if state.is_on(deployment) => Some(state),
-        Some(state) => {
-            tracing::warn!(
-                pool_id = %state.pool_id,
-                foreign_payment_pool = %state.deployment.payment_pool,
-                foreign_chain_id = state.deployment.chain_id,
-                configured_payment_pool = %deployment.payment_pool,
-                configured_chain_id = deployment.chain_id,
-                "ignoring a tracked buyer pool from another PaymentPool deployment; its deposit, \
-                 if any, is recoverable only against `foreign_payment_pool`"
-            );
-            None
-        }
-        None => None,
-    };
+    let tracked = store.get_by_owner(deployment, self_address)?;
     // A lane of this run already pays from the pool, so its first build read it.
     let tracked = match tracked {
         Some(state) if funding.pool_id() != Some(state.pool_id) => {
@@ -1424,8 +1405,9 @@ fn seed_lane(
         return Ok((state, bytes, amount));
     }
     let pool_id = state.pool_id;
+    let deployment = state.deployment;
     let outcome = store
-        .seed_progress(state.owner, pool_id, lane, bytes, amount)
+        .seed_progress(deployment, state.owner, pool_id, lane, bytes, amount)
         .with_context(|| {
             format!(
                 "record the on-chain watermark of lane {} in pool {pool_id}",
@@ -1441,7 +1423,7 @@ fn seed_lane(
             Ok((state, bytes, amount))
         }
         AdvanceOutcome::Regressed(_) => {
-            let row = store.get_by_pool_id(pool_id)?.ok_or_else(|| {
+            let row = store.get_by_pool_id(deployment, pool_id)?.ok_or_else(|| {
                 anyhow::anyhow!("buyer row for pool {pool_id} vanished during a lane seed")
             })?;
             let progress = row.lane_progress(lane).ok_or_else(|| {
@@ -1658,7 +1640,7 @@ where
             // (`PoolFunder::recover`).
             let effect = topped_up_effect(state.pool_id, credited);
             if let Err(err) = grade_deposit_credit(
-                store.add_deposit(self_address, state.pool_id, credited),
+                store.add_deposit(state.deployment, self_address, state.pool_id, credited),
                 &effect,
                 tx,
             ) {
@@ -1670,7 +1652,7 @@ where
             // condition, not something to paper over with the pre-top-up
             // snapshot. A read that fails leaves the committed credit
             // standing.
-            return match store.get_by_pool_id(state.pool_id) {
+            return match store.get_by_pool_id(state.deployment, state.pool_id) {
                 Ok(Some(row)) => {
                     unrecorded.recorded();
                     Ok(row)

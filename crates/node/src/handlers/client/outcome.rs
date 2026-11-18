@@ -88,6 +88,7 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
     match reason {
         ServeRejectReason::Withdrawn => "withdrawn",
         ServeRejectReason::CacheMiss => "cache_miss",
+        ServeRejectReason::UnacceptedPool => "unaccepted_pool",
         ServeRejectReason::InternalError => "internal_error",
         ServeRejectReason::UnknownLane => "unknown_lane",
         ServeRejectReason::OwnerMismatch => "owner_mismatch",
@@ -225,6 +226,7 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
             metrics.serve_stream_rejected_withdrawn();
         }
         ServeRejectReason::CacheMiss => metrics.serve_stream_rejected_cache_miss(),
+        ServeRejectReason::UnacceptedPool => metrics.serve_stream_rejected_unaccepted_pool(),
         ServeRejectReason::InternalError => metrics.serve_stream_rejected_internal_error(),
         ServeRejectReason::UnknownLane => {
             metrics.serve_stream_rejected_unknown_lane();

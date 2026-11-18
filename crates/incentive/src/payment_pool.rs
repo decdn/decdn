@@ -14,8 +14,11 @@
 //! cache-miss path (the node opens and tops up its own pool as a paying
 //! client on the upstream leg):
 //!
-//! - reads: `usdc()` and `feeRouter()` (immutables/governable addresses),
-//!   `getPool(poolId)` (owner, status, deposit, dispute deadline,
+//! - immutables: `usdc()`, `operatorBps()` (the redeemer's same-transaction
+//!   share), `minSweep()`, `minDeposit()`, `disputeWindow()`, `pauser()`, and
+//!   the CCTP sweep route `tokenMessenger()`, `sweepRecipient()` and
+//!   `sweepDomain()`;
+//! - reads: `getPool(poolId)` (owner, status, deposit, dispute deadline,
 //!   totalRedeemed), `getAuthorization(poolId, signer)` (spending cap,
 //!   expiry, spent), `getAuthorizations(poolIds, signers)` (the batch
 //!   companion to `getAuthorization`, one read per pair in input order),
@@ -25,8 +28,8 @@
 //!   `getWatermark`, one read per triple in input order),
 //!   `ownerPoolNonce(owner)` (next
 //!   nonce used to derive a pool id), `getPools(owner, offset, limit)` (page
-//!   of an owner's pool ids), and `getRateBounds()` (the governable per-MB
-//!   delivery-rate floor);
+//!   of an owner's pool ids), and `pending(operator)` (the operator's unswept
+//!   protocol share and the served bytes that ride with it);
 //! - owner writes: `openPool` (escrow a deposit and derive a fresh
 //!   `poolId`), `topUp` (add funds to an open pool), `closePool` (start the
 //!   grace-window close — `redeem` stays callable until the dispute
@@ -37,14 +40,17 @@
 //!   signer's capability in the same call) and `redeemMany` (register a
 //!   batch of capabilities, then redeem a batch of vouchers, in one
 //!   transaction — the node's redeem sweep collapses a tick's redemptions
-//!   into one tx);
-//! - events: `PoolOpened`, `PoolToppedUp` (→ raise the tracked deposit so
-//!   post-top-up vouchers are not wrongly rejected), `PoolRedeemed` (a node
-//!   filters on its own `provider` topic as the single write path for the
-//!   paid side), `PoolCloseInitiated` (the owner started the grace-window
+//!   into one tx), and `sweep(operators)` (anyone may send the pending
+//!   protocol shares of up to `MAX_SWEEP_BATCH()` operators over CCTP to the
+//!   governance chain's `CctpSweepReceiver` in one transfer once the batch
+//!   total reaches `minSweep`);
+//! - events: `PoolOpened` (the buyer decodes its pool id from the open
+//!   receipt), `PoolToppedUp`, `PoolRedeemed` (one per pool group of a
+//!   `redeemMany`; the seller decodes its paid watermarks from its own
+//!   receipts), `PoolCloseInitiated` (the owner started the grace-window
 //!   close), `PoolReclaimed` (the residual was refunded and the pool is now
-//!   closed), and `RateBoundsUpdated` (governance changed the redemption-time
-//!   delivery-rate floor).
+//!   closed), `Swept` (one per operator whose pending share left for the
+//!   governance chain) and `SweepSent` (one per batch: its total and fee).
 //!
 //! The capability/voucher EIP-712 domain (name `"PaymentPool"`, version
 //! `"1"`) lives in [`crate::voucher`]; the `capability` argument to `redeem`
@@ -182,8 +188,38 @@ mod sol_types {
             /// Immutable settlement token (USDC).
             function usdc() external view returns (address);
 
-            /// Governance-re-pointable settlement router target.
-            function feeRouter() external view returns (address);
+            /// Immutable share of each redemption paid to the redeemer in the
+            /// same transaction, in basis points of `10_000`.
+            function operatorBps() external view returns (uint256);
+
+            /// Immutable smallest pending protocol share `sweep` sends, in
+            /// USDC base units.
+            function minSweep() external view returns (uint64);
+
+            /// Immutable minimum credited `openPool` deposit, in USDC base
+            /// units. `0` leaves the floor dormant.
+            function minDeposit() external view returns (uint64);
+
+            /// Immutable grace window in seconds between `closePool` and
+            /// `reclaim`.
+            function disputeWindow() external view returns (uint32);
+
+            /// Immutable address that may pause `openPool` and `topUp`.
+            function pauser() external view returns (address);
+
+            /// Immutable local CCTP `TokenMessengerV2` the sweep burns through.
+            function tokenMessenger() external view returns (address);
+
+            /// Immutable governance-chain `CctpSweepReceiver` every sweep
+            /// mints to.
+            function sweepRecipient() external view returns (address);
+
+            /// Immutable CCTP domain of the governance chain.
+            function sweepDomain() external view returns (uint32);
+
+            /// The operator's unswept protocol share and the paid-proportional
+            /// served bytes that ride with it.
+            function pending(address operator) external view returns (uint256 servedBytes, uint256 usdcAmount);
 
             /// Full on-chain pool record.
             function getPool(bytes32 poolId) external view returns (Pool memory);
@@ -230,13 +266,6 @@ mod sol_types {
                 external
                 view
                 returns (Lane[] memory);
-
-            /// Governable per-megabyte delivery-rate floor (ADR 003). A soft
-            /// floor: `redeem` settles a sub-floor voucher in full and clamps
-            /// only the byte count it credits toward governance vote weight. It
-            /// is not a quote gate — nodes never read it to bound their own
-            /// rate — so this getter is governance-observability only.
-            function getRateBounds() external view returns (uint256 floor);
 
             /// Per-owner monotonic pool counter (public mapping getter). The
             /// *next* nonce `openPool` will assign to `owner`; the resulting
@@ -287,9 +316,30 @@ mod sol_types {
             /// skipped rather than reverting. Grouping by pool is what makes
             /// the pool's status gate and its `totalRedeemed` write happen
             /// once per group instead of once per lane. Every voucher is
-            /// redeemed for `msg.sender`, so the whole call's payout settles
-            /// through `FeeRouter.routeSettlement` in one go.
+            /// redeemed for `msg.sender`: `operatorBps` of the total pays the
+            /// caller in the same transaction, and the rest accrues in
+            /// `pending(msg.sender)`.
             function redeemMany(PoolBatch[] calldata batches) external returns (uint256 totalPaid);
+
+            /// One swept operator's entry in a sweep's CCTP hook data,
+            /// `abi.encode(SweepShare[])`, in `sweep` input order. Field
+            /// order is part of the ABI tuple; do not rearrange.
+            struct SweepShare {
+                address operator;
+                uint256 servedBytes;
+                uint256 amount;
+            }
+
+            /// Most operators one `sweep` carries.
+            function MAX_SWEEP_BATCH() external view returns (uint256);
+
+            /// Permissionless: send the pending protocol shares and served
+            /// bytes of 1 to `MAX_SWEEP_BATCH` operators over CCTP to the
+            /// governance chain's `CctpSweepReceiver` in one transfer. Skips
+            /// an operator with nothing pending. Reverts `BadSweepBatch` on
+            /// an empty or over-long list, and `BelowMinSweep` when the batch
+            /// total is zero or under `minSweep`.
+            function sweep(address[] calldata operators) external;
 
             // -----------------------------------------------------------------
             // Events
@@ -321,9 +371,7 @@ mod sol_types {
             /// A node cashed vouchers against one pool: one event per pool
             /// group, with an entry per lane that actually paid. Emitting
             /// once for the group rather than once per lane is what keeps
-            /// the log base and its topics off the per-lane cost. A node
-            /// follows this event, filtered on its own `provider`, as the
-            /// single write path for the paid side.
+            /// the log base and its topics off the per-lane cost.
             event PoolRedeemed(bytes32 indexed poolId, address indexed provider, LaneSettled[] lanes);
 
             /// The owner started the grace-window close on `poolId`.
@@ -334,43 +382,92 @@ mod sol_types {
             /// to `owner` and the pool is now `Closed`.
             event PoolReclaimed(bytes32 indexed poolId, address indexed owner, uint256 ownerRefund);
 
-            /// Governance changed the per-MB delivery-rate floor. The floor is
-            /// redemption-time contract state (the soft vote-weight credit
-            /// clamp); this event announces the change to on-chain observers. No
-            /// `indexed` params — matches `setRateBounds`.
-            event RateBoundsUpdated(uint256 newDeliveryFloor);
+            /// `sweep` sent `amount` and `servedBytes` for `operator` to the
+            /// governance chain. One per swept operator in the batch.
+            event Swept(address indexed operator, uint256 servedBytes, uint256 amount);
+
+            /// `sweep` burned the batch total `amount` over CCTP. `maxFee` is
+            /// the bridge fee the sweep allowed. One per batch.
+            event SweepSent(uint256 amount, uint256 maxFee);
+
+            /// A sweep batch total is zero or under `minSweep`.
+            error BelowMinSweep(uint256 total, uint256 minSweep);
+
+            /// A sweep batch is empty or longer than `MAX_SWEEP_BATCH`.
+            error BadSweepBatch(uint256 length);
         }
     }
 
     alloy::sol! {
         #[sol(rpc)]
         contract FeeRouter {
-            /// Current fee split, as `[operator, buyback, treasury]` basis
-            /// points summing to `BPS_DENOMINATOR`. Mirrors
-            /// `contracts/src/FeeRouter.sol`.
-            function getShares() external view returns (uint256[3]);
+            /// Governance-chain entry for one swept protocol share: pulls
+            /// `amount` USDC from the caller, pays the rebate to an active
+            /// `operator`, splits the rest into buyback and treasury, and
+            /// credits `servedBytes` toward the operator's vote weight.
+            /// Mirrors `contracts/src/FeeRouter.sol`.
+            function deposit(address operator, uint256 servedBytes, uint256 amount) external;
 
-            /// Governance retuned the fee split. The fee-shares watcher
-            /// decodes the new split and stores the operator bucket into the
-            /// node's live cell so a governance retune reaches running nodes
-            /// without a restart.
-            event SharesUpdated(uint256[3] newShares);
+            /// Share of each deposit rebated to an active operator, in bps.
+            function rebateBps() external view returns (uint256);
 
-            /// One `redeemMany` routed its payout to `operator`: `amount` is
-            /// the gross USDC before the `[operator, buyback, treasury]`
-            /// split, `bytesDelivered` the bytes the batch paid for, and
-            /// `epoch` the router's `block.timestamp / epochLength`. Emitted
-            /// once per transaction, in the same transaction as the
-            /// `PaymentPool.PoolRedeemed` events that triggered it. The
-            /// operator receives `amount` minus the buyback and treasury
-            /// buckets; that net figure is on the USDC `Transfer` from the
-            /// router to the operator in the same transaction.
-            event Settled(address indexed operator, uint256 bytesDelivered, uint256 amount, uint64 indexed epoch);
+            /// Share of each deposit sent to the buyback, in bps.
+            function buybackBps() external view returns (uint256);
+
+            /// USDC per MiB that prices a deposit's vote-weight byte credit.
+            function deliveryFloor() external view returns (uint256);
+
+            /// One deposit landed. `credit` is the bytes added to the
+            /// operator's epoch counter; `epoch` is the arrival epoch.
+            event Deposited(
+                address indexed depositor,
+                address indexed operator,
+                uint256 amount,
+                uint256 servedBytes,
+                uint256 credit,
+                uint64 indexed epoch
+            );
+        }
+    }
+
+    alloy::sol! {
+        #[sol(rpc)]
+        contract CctpSweepReceiver {
+            /// Receive one attested CCTP sweep batch and deposit the minted
+            /// USDC into `FeeRouter`, pro rata, for each operator in the hook
+            /// data. Permissionless. Mirrors `contracts/src/CctpSweepReceiver.sol`.
+            function receiveSweep(bytes calldata message, bytes calldata attestation) external;
+
+            /// The `FeeRouter` every sweep is deposited into.
+            function feeRouter() external view returns (address);
+
+            /// The local CCTP `MessageTransmitterV2` that verifies each
+            /// attestation and marks its nonce used.
+            function messageTransmitter() external view returns (address);
+
+            /// One operator's entry of a sweep batch landed. `pool` is the
+            /// burn's `messageSender` and `amount` the USDC deposited into
+            /// `FeeRouter` for `operator`.
+            event SweepReceived(uint32 indexed sourceDomain, address indexed pool, address indexed operator, uint256 amount);
+        }
+    }
+
+    alloy::sol! {
+        #[sol(rpc)]
+        contract MessageTransmitterV2 {
+            /// Circle CCTP V2: nonzero once the message with this nonce was
+            /// received. The testnet `LoopbackCctp` answers a `bool`, which
+            /// decodes to the same word.
+            function usedNonces(bytes32 nonce) external view returns (uint256);
+
+            /// Circle CCTP V2: a message left this chain. A sweep's
+            /// transaction carries one, whose header names the source domain.
+            event MessageSent(bytes message);
         }
     }
 }
 
-pub use sol_types::{FeeRouter, PaymentPool};
+pub use sol_types::{CctpSweepReceiver, FeeRouter, MessageTransmitterV2, PaymentPool};
 
 /// Narrow a USDC amount, or a byte count, to the `uint64` the `PaymentPool`
 /// carries in its packed fields.

@@ -21,6 +21,7 @@ fn answer(seed: u8, operator: u8, rtt_ms: f64, rate_per_mb: u64, has_blob: bool)
         has_blob,
         total_bytes: has_blob.then_some(ProvenSize::assume_for_tests(10 * MIB)),
         coverage: decdn_protocol::Coverage::empty(),
+        payment_pools: None,
     }
 }
 
@@ -243,6 +244,7 @@ fn tally_sorts_outcomes_by_hash() {
             rate_per_mb: 17,
             total_bytes: Some(ProvenSize::assume_for_tests(99)),
             coverage: decdn_protocol::Coverage::empty(),
+            payment_pools: None,
         },
         (node_key(1), 12.0, 17),
     );
@@ -252,6 +254,7 @@ fn tally_sorts_outcomes_by_hash() {
             eth_address: Address::repeat_byte(2),
             rtt_ms: 8.0,
             multiaddrs: alloy::primitives::Bytes::new(),
+            payment_pools: None,
         },
         (node_key(2), 8.0, 21),
     );
@@ -443,13 +446,13 @@ async fn a_census_opens_each_node_and_cancels_every_stream() -> anyhow::Result<(
     use crate::session::PinnedNode;
     use std::sync::Arc;
 
-    let chain = ChainConfig {
-        rpc_url: "http://127.0.0.1:1".to_owned(),
-        chain_id: 31_337,
-        payment_pool: Address::repeat_byte(0x01),
-        slash_judge: Address::repeat_byte(0x02),
-        capacity_bond: None,
-    };
+    let chain: ChainConfig = crate::session::test_support::one_chain(
+        "http://127.0.0.1:1".to_owned(),
+        31_337,
+        Address::repeat_byte(0x01),
+        Address::repeat_byte(0x02),
+        None,
+    );
     let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
     let hash = *blake3::hash(&blob).as_bytes();
     let node = FakeNode::spawn(
@@ -457,7 +460,7 @@ async fn a_census_opens_each_node_and_cancels_every_stream() -> anyhow::Result<(
             blob: blob.clone(),
             rate: 9,
         },
-        slash_judge_domain(chain.chain_id, chain.slash_judge),
+        slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge),
     )
     .await?;
     let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
@@ -469,7 +472,7 @@ async fn a_census_opens_each_node_and_cancels_every_stream() -> anyhow::Result<(
         alloy::primitives::B256::repeat_byte(0x11),
         U256::ZERO,
         Arc::new(alloy::signers::local::PrivateKeySigner::random()),
-        decdn_incentive::voucher_domain(chain.chain_id, chain.payment_pool),
+        chain.first_pool()?.deployment.voucher_domain(),
     );
     let site_dir = tempfile::tempdir()?;
     let site = PullSite {

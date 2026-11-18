@@ -327,8 +327,9 @@ async fn get_passes_the_gate_and_runs_decdn_with_the_capability() {
         [format!(
             "get {uri} -o out dir --capability dcap1:FAKE1 \
              --keystore {}/keystore.json --keystore-password-file {}/password \
-             --data-dir {} --rpc-url https://rpc.example --payment-pool-address {pool} \
-             --capacity-bond-address {bond} --chain-id 421614",
+             --data-dir {} --governance-rpc-url https://governance-rpc.example \
+             --governance-chain-id 11155111 --capacity-bond-address {bond} \
+             --pool eip155:421614:{pool} --pool-rpc-url https://rpc.example",
             state.display(),
             state.display(),
             shared.display(),
@@ -392,7 +393,10 @@ async fn every_argument_after_the_uri_reaches_decdn_as_given() {
     ];
     for (call, start) in calls.iter().zip(&expected) {
         assert!(call.starts_with(start), "{call}");
-        assert!(call.ends_with(" --chain-id 421614"), "{call}");
+        assert!(
+            call.ends_with(" --pool-rpc-url https://rpc.example"),
+            "{call}"
+        );
     }
 }
 

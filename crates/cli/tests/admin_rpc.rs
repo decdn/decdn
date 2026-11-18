@@ -44,7 +44,7 @@ use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
 };
 use decdn_node::metrics::Metrics;
-use decdn_node::pool_view::PoolProjection;
+use decdn_node::pool_view::{Lifecycle, PoolProjection, PoolStatus};
 use decdn_protocol::{ContentHash, Coverage};
 use jsonrpsee::RpcModule;
 use jsonrpsee::core::ClientError;
@@ -237,11 +237,19 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     store.record(&mk(1, 0xAA, 2_000_000))?;
     store.record(&mk(2, 0xBB, 100_000))?;
 
-    // The node has seen pool 1 open. Pool 2 is not in its pool view, and this
-    // state wires no chain source to read it from, so its owner is unknown.
+    // The node holds a read of pool 1. Pool 2 is not in its pool view, and
+    // this state wires no chain source to read it from, so its owner is
+    // unknown.
     let owner = Address::repeat_byte(0x0F);
     let pool_view = PoolProjection::new();
-    pool_view.record_opened(pool_id(1), owner, U256::from(10_000_000u64));
+    pool_view.record_read(
+        pool_id(1),
+        PoolStatus {
+            owner,
+            remaining: U256::from(10_000_000u64),
+            lifecycle: Lifecycle::Open,
+        },
+    );
 
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
@@ -253,10 +261,16 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
         Arc::new(Metrics::new()),
     )
     .with_lanes(LaneStatusHandles {
-        pool_store: store as Arc<dyn PoolStateStore>,
+        pools: vec![decdn_node::admin::AdminPool {
+            deployment: decdn_incentive::Deployment {
+                chain_id: 31_337,
+                payment_pool: Address::repeat_byte(0x34),
+            },
+            store: store as Arc<dyn PoolStateStore>,
+            owners: PoolOwners::new(pool_view, None),
+        }],
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
-        pool_owners: PoolOwners::new(pool_view, None),
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -1152,11 +1166,14 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
         .as_secs();
     let ledger = Arc::new(MemorySettlementLedger::default());
     let row = |block: u64, landed_at: u64, net: u64| SettlementRecord {
+        deployment: decdn_incentive::Deployment {
+            chain_id: 31_337,
+            payment_pool: Address::repeat_byte(0x9c),
+        },
         block_number: block,
         log_index: 0,
         tx_hash: B256::repeat_byte(u8::try_from(block).unwrap_or(0)),
         landed_at_unix: landed_at,
-        epoch: 1,
         gross_micro_usdc: net * 10 / 6,
         net_micro_usdc: net,
         bytes_delivered: 1_000 * block,
@@ -1193,9 +1210,10 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
     .with_operator_address(Address::repeat_byte(0xEE))
     .with_earnings(EarningsHandles {
         ledger: ledger as Arc<dyn SettlementLedger>,
-        pool_store: store as Arc<dyn PoolStateStore>,
-        schedule: RedeemSchedule::default(),
+        pool_stores: vec![store as Arc<dyn PoolStateStore>],
+        schedules: vec![RedeemSchedule::default()],
         ledger_started_at_unix: now - 50 * 86_400,
+        pools: Vec::new(),
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 

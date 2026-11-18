@@ -3,10 +3,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::*;
 
-/// The poison-recovery arms in [`with_read`] / [`with_write`] /
-/// [`mutate_gauged`] had no coverage before the consolidation (#1255). Poison
-/// the lock, then confirm every accessor still returns the inner state rather
-/// than propagating the panic into the read/apply hot path.
+/// Poison the lock, then confirm [`with_read`] and [`with_write`] still
+/// return the inner state rather than propagating the panic into the
+/// read/apply hot path.
 #[test]
 fn accessors_recover_a_poisoned_lock() {
     let state = RwLock::new(HashSet::<u8>::from([1, 2]));
@@ -21,27 +20,12 @@ fn accessors_recover_a_poisoned_lock() {
     // Read recovers.
     assert_eq!(with_read(&state, "test", HashSet::len), 2);
 
-    // Mutate + gauge recovers, and only fires on a real change.
-    let mut gauged = None;
-    let mutated = mutate_gauged(
-        &state,
-        "test",
-        |s| s.insert(3).then_some(s.len()),
-        |n| gauged = Some(n),
-    );
-    assert!(mutated);
-    assert_eq!(gauged, Some(3));
-
-    // A no-op re-insert leaves the gauge unpublished.
-    let mut gauged_noop = None;
-    let mutated_noop = mutate_gauged(
-        &state,
-        "test",
-        |s| s.insert(3).then_some(s.len()),
-        |n| gauged_noop = Some(n),
-    );
-    assert!(!mutated_noop);
-    assert_eq!(gauged_noop, None);
+    // Write recovers.
+    let len = with_write(&state, "test", |s| {
+        s.insert(3);
+        s.len()
+    });
+    assert_eq!(len, 3);
 }
 
 /// [`with_lock`] recovers a poisoned `Mutex` the same way, including through

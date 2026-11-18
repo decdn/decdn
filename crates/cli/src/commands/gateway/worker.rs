@@ -129,6 +129,10 @@ impl DelegateLanes {
     }
 }
 
+/// One delegate key's lanes in one pool: the `PaymentPool` contract, the pool
+/// on it, and the key.
+pub(super) type DelegateKey = (Deployment, PoolId, Address);
+
 /// Narrow a ledger's `U256` to the snapshot's `u64`, saturating.
 fn narrow(value: U256) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
@@ -138,9 +142,10 @@ fn narrow(value: U256) -> u64 {
 enum Request {
     /// A pull to run.
     Pull(Box<Job>),
-    /// Read the store: its pools, and the lanes of each `(pool, signer)`.
+    /// Read the store: its pools, and the lanes of each `(contract, pool,
+    /// signer)`.
     Pools {
-        delegates: Vec<(PoolId, Address)>,
+        delegates: Vec<DelegateKey>,
         reply: oneshot::Sender<anyhow::Result<PoolSnapshot>>,
     },
     /// The size a pull verified for a blob.
@@ -179,12 +184,12 @@ pub(super) trait Backend: Send + 'static {
     }
 
     /// What `host`'s store holds: its pools, and the lanes of each
-    /// `(pool, signer)` in `delegates`. A backend without a store holds
-    /// nothing.
+    /// `(contract, pool, signer)` in `delegates`. A backend without a store
+    /// holds nothing.
     async fn pools(
         &self,
         host: &Self::Host,
-        delegates: &[(PoolId, Address)],
+        delegates: &[DelegateKey],
     ) -> anyhow::Result<PoolSnapshot> {
         let _ = (host, delegates);
         Ok(PoolSnapshot::default())
@@ -247,13 +252,11 @@ impl Backend for FetchBackend {
     async fn pools(
         &self,
         host: &Self::Host,
-        delegates: &[(PoolId, Address)],
+        delegates: &[DelegateKey],
     ) -> anyhow::Result<PoolSnapshot> {
         let store = host.store();
-        let deployment = host.deployment();
         let queries = delegates.to_vec();
-        tokio::task::spawn_blocking(move || read_pools(store.as_ref(), deployment, &queries))
-            .await?
+        tokio::task::spawn_blocking(move || read_pools(store.as_ref(), &queries)).await?
     }
 
     fn live_lanes(&self, payer: &Payer) -> Vec<(LaneKey, Cumulative)> {
@@ -265,21 +268,20 @@ impl Backend for FetchBackend {
     }
 }
 
-/// What `store` holds on `deployment`: its pool rows, and the delegate lanes
-/// of each `(pool, signer)` in `queries`.
+/// What `store` holds: its pool rows on every contract, and the delegate
+/// lanes of each `(contract, pool, signer)` in `queries`.
 ///
 /// # Errors
 ///
 /// The store cannot be read, or a record does not decode.
 pub(super) fn read_pools(
     store: &dyn BuyerPoolStore,
-    deployment: Deployment,
-    queries: &[(PoolId, Address)],
+    queries: &[DelegateKey],
 ) -> anyhow::Result<PoolSnapshot> {
     let pools = BuyerPoolsResponse::from(store.load_all()?);
     let delegate_lanes = queries
         .iter()
-        .map(|&(pool_id, signer)| {
+        .map(|&(deployment, pool_id, signer)| {
             let lanes = store
                 .delegate_lanes(deployment, pool_id, signer)?
                 .into_iter()
@@ -360,15 +362,13 @@ impl PullWorker {
     }
 
     /// What the store holds: its pools, and the lanes of each
-    /// `(pool, signer)` in `delegates`. Answered beside the pulls in flight.
+    /// `(contract, pool, signer)` in `delegates`. Answered beside the pulls
+    /// in flight.
     ///
     /// # Errors
     ///
     /// The worker has stopped, or the store cannot be read.
-    pub(super) async fn pools(
-        &self,
-        delegates: Vec<(PoolId, Address)>,
-    ) -> anyhow::Result<PoolSnapshot> {
+    pub(super) async fn pools(&self, delegates: Vec<DelegateKey>) -> anyhow::Result<PoolSnapshot> {
         let (reply, answer) = oneshot::channel();
         self.jobs
             .send(Request::Pools { delegates, reply })
@@ -410,13 +410,13 @@ impl PullWorker {
 }
 
 /// Whose payer a pull runs under: a held capability, by the delegate key it
-/// was issued to and the pool it spends. One key holds at most one
-/// capability per pool.
-type PayerId = (Address, PoolId);
+/// was issued to, the pool it spends, and that pool's `PaymentPool`
+/// contract. One key holds at most one capability per pool.
+type PayerId = (Address, Deployment, PoolId);
 
 /// The capability `paying` names.
 fn payer_id(paying: &Credential) -> PayerId {
-    (paying.signer.address(), paying.grant.pool_id)
+    (paying.signer.address(), paying.pool, paying.grant.pool_id)
 }
 
 /// The payers of the pulls in flight, by the capability that pays.

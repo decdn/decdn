@@ -274,7 +274,7 @@ fn rpc_request_series_export_at_zero_and_record_per_label() {
     assert_eq!(RpcOutcome::ALL.len(), 6, "extend the outcome list above");
 
     metrics.rpc_request(
-        RpcMethod::EthGetLogs,
+        RpcMethod::EthGetTransactionReceipt,
         RpcOutcome::RateLimited,
         Some(Duration::from_millis(40)),
     );
@@ -286,12 +286,15 @@ fn rpc_request_series_export_at_zero_and_record_per_label() {
             &format!("decdn_rpc_requests_total{{method=\"{method}\",outcome=\"{outcome}\"}}"),
         )
     };
-    assert_eq!(requests("eth_getLogs", "rate_limited"), Some(1));
-    assert_eq!(requests("eth_getLogs", "ok"), Some(0));
+    assert_eq!(
+        requests("eth_getTransactionReceipt", "rate_limited"),
+        Some(1)
+    );
+    assert_eq!(requests("eth_getTransactionReceipt", "ok"), Some(0));
     assert_eq!(requests("eth_call", "timeout"), Some(1));
     assert!(has_metric_line(
         &text,
-        "decdn_rpc_request_duration_seconds_bucket{method=\"eth_getLogs\",le=\"0.05\"}",
+        "decdn_rpc_request_duration_seconds_bucket{method=\"eth_getTransactionReceipt\",le=\"0.05\"}",
         1
     ));
     assert!(has_metric_line(
@@ -385,9 +388,9 @@ fn adr_registry_names_are_exported() {
             continue;
         };
         // Documentation forms, not single series: label suffixes and
-        // brace-expanded shorthand (`..._{per_peer,global}_total`), and the
-        // per-watcher templates (`decdn_<watcher>_task_panicked_total`),
-        // which stand in for one row per watcher rather than naming one.
+        // brace-expanded shorthand (`..._{per_peer,global}_total`), and
+        // `<...>` templates, which stand in for one row per instance rather
+        // than naming one.
         if name.contains('{') || name.contains('<') {
             continue;
         }
@@ -904,7 +907,6 @@ fn observability_counters_export_at_zero() {
         "decdn_pool_redemptions_total",
         "decdn_vouchers_received_total",
         "decdn_preimage_reveals_received_total",
-        "decdn_pool_grace_closes_total",
         "decdn_onchain_tx_landed_total",
         "decdn_onchain_tx_reverted_total",
         "decdn_onchain_tx_send_failed_total",
@@ -913,8 +915,6 @@ fn observability_counters_export_at_zero() {
         "decdn_onchain_tx_timeout_total",
         "decdn_onchain_tx_receipt_recovered_total",
         "decdn_chain_boot_read_retries_total",
-        "decdn_chain_get_logs_retries_total",
-        "decdn_chain_get_logs_deferred_total",
         "decdn_dht_findvalue_queries_total",
         "decdn_dht_lookup_round_timeouts_total",
         "decdn_dht_lookup_dial_timeouts_total",
@@ -923,10 +923,6 @@ fn observability_counters_export_at_zero() {
         "decdn_dht_routing_table_size",
         "decdn_dht_bucket_refresh_failures_total",
         "decdn_dht_bootstrap_find_node_failures_total",
-        "decdn_fee_shares_watcher_poll_failures_total",
-        "decdn_fee_shares_watcher_restarts_total",
-        "decdn_fee_shares_watcher_down_seconds",
-        "decdn_fee_shares_watcher_unregistered",
         "decdn_config_reload_failures_total",
         "decdn_receipt_write_failures_total",
         "decdn_serve_stream_midstream_pool_exhausted_total",
@@ -1071,272 +1067,59 @@ fn warming_credits_applied_metric_starts_at_zero_and_increments() {
 }
 
 #[test]
-fn staker_set_watcher_metrics_start_at_zero_and_increment() {
-    // #783. The struct field is `staker_set_watcher_restarts`; the
-    // OpenMetrics encoder appends `_total`, so the exported name is
-    // `decdn_staker_set_watcher_restarts_total` — the operator-visible
-    // name any alert references. Asserting the suffixed form locks it in:
-    // re-naming the field to include `_total` would emit `..._total_total`
-    // (the same footgun the cache GC counters guard against).
+fn chain_refresh_metrics_start_at_zero_and_move() {
+    // The OpenMetrics encoder appends `_total` to counters, so the exported
+    // names below are the operator-visible ones any alert references.
     let metrics = Metrics::new();
     let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_restarts_total", 0),
-        "watcher restart counter should be exposed at zero on a fresh registry:\n{text}"
-    );
-    // Both gauges are exposed at zero so dashboards don't render `(no
-    // data)` before the watcher's first event. `down_seconds` reads 0
-    // before any cycle is established (a quiet "not yet up").
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
-        "watcher down-seconds gauge should start at zero:\n{text}"
-    );
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_active_count", 0),
-        "active-count gauge should start at zero:\n{text}"
-    );
-
-    // The resolve-failure counter (#788) is also exposed at zero.
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_resolve_failures_total", 0),
-        "resolve-failure counter should start at zero:\n{text}"
-    );
-
-    // Two distinct drift windows (each `backoff_started` is an edge into
-    // the error state; `cycle_established` between them closes the first).
-    metrics.staker_set_watcher_backoff_started();
-    metrics.staker_set_watcher_cycle_established();
-    metrics.staker_set_watcher_backoff_started();
-    metrics.staker_set_watcher_resolve_failure();
-    metrics.staker_set_active_count(7);
-
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_restarts_total", 2),
-        "expected 2 restart events:\n{text}"
-    );
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_resolve_failures_total", 1),
-        "expected 1 resolve failure:\n{text}"
-    );
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_active_count", 7),
-        "expected active-count gauge to report 7:\n{text}"
-    );
-}
-
-#[test]
-fn staker_set_watcher_down_seconds_reads_zero_across_a_long_healthy_cycle() {
-    // CRITICAL-fix regression guard (#788): `down_seconds` measures true
-    // downtime, NOT cycle age. A healthy poll loop persists
-    // indefinitely, so the gauge must read 0 for the entire life of an
-    // established cycle — even when the node has been up (and the cycle
-    // live) for a while. We simulate "a while" by backdating the metrics'
-    // `started_at` well into the past: under the OLD age-based model the
-    // gauge climbed with cycle age and would read ~3600 here; under the
-    // downtime model `down_since` is `None`, so it stays 0.
-    let mut metrics = Metrics::new();
-    metrics.started_at = Instant::now()
-        .checked_sub(Duration::from_hours(1))
-        .unwrap_or_else(Instant::now);
-    metrics.staker_set_watcher_cycle_established();
-
-    let text = metrics.encode().unwrap();
-    // Sanity: the node really is "old" (uptime reflects the backdate), so a
-    // gauge that tracked age would be non-zero.
-    assert!(
-        has_metric_line(&text, "decdn_node_uptime_seconds", 3600),
-        "uptime should reflect the backdated start:\n{text}"
-    );
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
-        "down-seconds must read 0 across a long healthy cycle (true downtime, not age):\n{text}"
-    );
-
-    // An error opens the drift window: down-seconds is now driven by
-    // `down_since` (not cycle age). An immediate scrape reads ~0s of
-    // *downtime*; backdating `down_since` proves it then climbs.
-    metrics.staker_set_watcher_backoff_started();
-    if let Ok(mut down_since) = metrics.staker_set_watcher_down_since.lock() {
-        *down_since = Instant::now().checked_sub(Duration::from_secs(150));
-    }
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 150),
-        "down-seconds should climb to the downtime depth once in backoff:\n{text}"
-    );
-
-    // Re-establishing the cycle clears the window back to 0.
-    metrics.staker_set_watcher_cycle_established();
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
-        "down-seconds should reset to 0 once filters re-establish:\n{text}"
-    );
-}
-
-#[test]
-fn slash_watcher_down_seconds_tracks_true_downtime() {
-    // Mirrors the staker-set guard for the slash watcher (#1032): the gauge
-    // measures downtime, not cycle age, so a long healthy cycle reads 0, a
-    // backoff window climbs, and re-establishing clears it.
-    let mut metrics = Metrics::new();
-    metrics.started_at = Instant::now()
-        .checked_sub(Duration::from_hours(1))
-        .unwrap_or_else(Instant::now);
-    metrics.slash_watcher_cycle_established();
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_slash_watcher_down_seconds", 0),
-        "down-seconds must read 0 across a long healthy cycle:\n{text}"
-    );
-
-    metrics.slash_watcher_backoff_started();
-    if let Ok(mut down_since) = metrics.slash_watcher_down_since.lock() {
-        *down_since = Instant::now().checked_sub(Duration::from_secs(150));
-    }
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_slash_watcher_down_seconds", 150),
-        "down-seconds should climb to the downtime depth once in backoff:\n{text}"
-    );
-    // The restart counter bumps exactly once per drift window (edge-triggered).
-    metrics.slash_watcher_backoff_started();
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_slash_watcher_restarts_total", 1),
-        "restarts must bump once per drift window, not per call:\n{text}"
-    );
-
-    metrics.slash_watcher_cycle_established();
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_slash_watcher_down_seconds", 0),
-        "down-seconds should reset to 0 once the cycle re-establishes:\n{text}"
-    );
-}
-
-#[test]
-#[allow(clippy::panic)] // deliberately poison the lock, mirroring `dispatch::tests`.
-fn poisoned_down_since_reports_i64_max_not_zero() {
-    // The load-bearing invariant of the down-seconds gauges: a poisoned
-    // `down_since` must report `i64::MAX`, never `0`, because reporting `0`
-    // would MASK an in-progress outage (#783/#1032). The watchers'
-    // scrape recompute goes through one shared `refresh_watcher_down_seconds`
-    // template, so poisoning any single lock exercises that conservative-alerting
-    // fallback for all of them.
-    let metrics = Arc::new(Metrics::new());
-    let for_thread = Arc::clone(&metrics);
-    // Poison `slash_watcher_down_since` from a panicking thread holding the
-    // lock (the house pattern — see `dispatch::tests`).
-    let join = std::thread::spawn(move || {
-        let _g = for_thread.slash_watcher_down_since.lock().unwrap();
-        panic!("intentional");
-    });
-    let _ = join.join();
-    assert!(metrics.slash_watcher_down_since.is_poisoned());
-
-    let i64_max = u64::try_from(i64::MAX).unwrap();
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_slash_watcher_down_seconds", i64_max),
-        "a poisoned down_since must report i64::MAX, not 0:\n{text}"
-    );
-    // The two healthy watchers still read 0 in the same scrape — the poison
-    // is isolated to its own row of the shared recompute.
-    assert!(
-        has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
-        "a poisoned slash lock must not perturb the staker-set gauge:\n{text}"
-    );
-    // The watchers brought to down-family parity (#1283/#1316) share
-    // the same recompute row, so they too read a clean 0 under the poison.
     for name in [
-        "decdn_blacklist_watcher_down_seconds",
-        "decdn_settlement_watcher_down_seconds",
+        "decdn_staker_set_active_count",
+        "decdn_capacity_bond_registry_resync_failures_total",
+        "decdn_slash_resync_failures_total",
+        "decdn_blacklist_ledger_poll_failures_total",
+        "decdn_blacklist_enforcement_failures_total",
     ] {
         assert!(
             has_metric_line(&text, name, 0),
-            "a poisoned slash lock must not perturb {name}:\n{text}"
+            "{name} should be exposed at zero:\n{text}"
         );
+    }
+    metrics.staker_set_active_count(7);
+    metrics.capacity_bond_registry_resync_failure();
+    metrics.slash_resync_failure();
+    metrics.blacklist_ledger_poll_failure();
+    metrics.blacklist_enforcement_failure(2);
+    let text = metrics.encode().unwrap();
+    for (name, value) in [
+        ("decdn_staker_set_active_count", 7),
+        ("decdn_capacity_bond_registry_resync_failures_total", 1),
+        ("decdn_slash_resync_failures_total", 1),
+        ("decdn_blacklist_ledger_poll_failures_total", 1),
+        ("decdn_blacklist_enforcement_failures_total", 2),
+    ] {
+        assert!(has_metric_line(&text, name, value), "{name}:\n{text}");
     }
 }
 
 #[test]
-fn watcher_liveness_gauges_stamp_wall_clock_on_tick() {
-    // The `*_watcher_tick` recorders (the `on_tick_success` hooks) stamp a
-    // wall-clock timestamp, so a live watcher's gauge is non-zero and a dead
-    // one's stays 0 — the positive liveness signal the error-triggered
-    // down-seconds gauge cannot provide (#1316/#1320).
+fn chain_refresh_liveness_gauges_stamp_wall_clock() {
+    // The liveness recorders stamp a wall-clock timestamp, so a live refresh
+    // loop's gauge is non-zero and a dead one's stays put (#1316/#1320).
     let metrics = Metrics::new();
     let before = unix_now_secs();
 
-    metrics.slash_watcher_tick();
-    metrics.staker_set_watcher_tick();
     metrics.blacklist_watcher_tick();
-    metrics.settlement_watcher_tick();
+    metrics.capacity_bond_registry_resync();
 
     let text = metrics.encode().unwrap();
     for name in [
-        "decdn_slash_watcher_last_tick_timestamp_seconds",
-        "decdn_staker_set_watcher_last_tick_timestamp_seconds",
         "decdn_blacklist_watcher_last_tick_timestamp_seconds",
-        "decdn_settlement_watcher_last_tick_timestamp_seconds",
+        "decdn_capacity_bond_registry_last_resync_timestamp_seconds",
     ] {
         let floor = u64::try_from(before).unwrap();
         assert!(
             metric_value(&text, name).is_some_and(|stamped| stamped >= floor),
             "liveness gauge {name} must be exported and stamped with the current time:\n{text}"
-        );
-    }
-}
-
-#[test]
-#[allow(clippy::type_complexity)] // a compact table of (recorder, recorder, gauge, counter).
-fn new_watchers_down_seconds_track_true_downtime() {
-    // The watchers brought to down-family parity (#1283/#1316) share
-    // the `watcher_downtime_recorders!` template, so one compact pass per
-    // watcher confirms the wiring: healthy reads 0, backoff climbs, one
-    // restart per drift window, re-establish clears.
-    let cases: [(fn(&Metrics), fn(&Metrics), &str, &str); 3] = [
-        (
-            Metrics::blacklist_watcher_cycle_established,
-            Metrics::blacklist_watcher_backoff_started,
-            "decdn_blacklist_watcher_down_seconds",
-            "decdn_blacklist_watcher_restarts_total",
-        ),
-        (
-            Metrics::settlement_watcher_cycle_established,
-            Metrics::settlement_watcher_backoff_started,
-            "decdn_settlement_watcher_down_seconds",
-            "decdn_settlement_watcher_restarts_total",
-        ),
-        (
-            Metrics::fee_shares_watcher_cycle_established,
-            Metrics::fee_shares_watcher_backoff_started,
-            "decdn_fee_shares_watcher_down_seconds",
-            "decdn_fee_shares_watcher_restarts_total",
-        ),
-    ];
-    for (established, backoff, down_seconds, restarts) in cases {
-        let metrics = Metrics::new();
-        established(&metrics);
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, down_seconds, 0),
-            "{down_seconds} must read 0 on a healthy cycle:\n{text}"
-        );
-        backoff(&metrics);
-        backoff(&metrics); // second call: same drift window, no extra restart.
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, restarts, 1),
-            "{restarts} must bump once per drift window:\n{text}"
-        );
-        established(&metrics);
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, down_seconds, 0),
-            "{down_seconds} must reset to 0 once re-established:\n{text}"
         );
     }
 }

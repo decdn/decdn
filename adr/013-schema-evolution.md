@@ -32,12 +32,12 @@ Each read has a frame ceiling. The ceiling is at least the largest legitimate me
 
 | Ceiling | Value | Reads | Largest legitimate message |
 | --- | --- | --- | --- |
-| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding, a capability and the pull-through flag: 302 B |
-| `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a refusal code, an origin attestation, a full size proof and a coverage bitmap: under 5 KiB |
+| `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding, a capability, the pull-through flag and a payment pool: 474 B |
+| `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a full size proof, an origin attestation, a coverage bitmap and 8 payment pools: 6,272 B. The widest refusal is 1,944 B |
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |
 | `MAX_DHT_FRAME` | 64 KiB | Every `cdn/dht/v1` read, request and response | `BatchStoreRequest` with 256 entries: 59,939 B |
 
-The sizes use 65-byte EOA signatures, full-width varints and 200-byte coverage bitmaps. Every signature on the wire is a 65-byte EOA signature. A test beside each ceiling encodes the largest message and fails if the message outgrows the ceiling. The headroom is for Tier-1 extension fields. A message that needs more than its ceiling is a wire change: the same change updates the constant and this table.
+The sizes use 65-byte EOA signatures, full-width varints, 200-byte coverage bitmaps and 170-byte pool accounts. Every signature on the wire is a 65-byte EOA signature. A test beside each ceiling encodes the largest message and fails if the message outgrows the ceiling. The headroom is for Tier-1 extension fields. A message that needs more than its ceiling is a wire change: the same change updates the constant and this table.
 
 **DoS note:** `read_frame` allocates `len` bytes. A peer can send a length prefix, send most of the payload, and then stall. The receiver holds the buffer until the read timeout. The ceiling bounds this buffer for each stream.
 
@@ -281,7 +281,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `timestamp_us` | `outcome` (`Served(size_proof)` or `Refused(error)`), `origin_attestation`, `coverage` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `timestamp_us` | `outcome` (`Served(size_proof)` or `Refused(error)`), `origin_attestation`, `coverage`, `payment_pools` |
 
 An unsigned field is a fact when a proof that the receiver checks makes it one. `size_proof` is such a field: it holds the blob size and proves it against the signed `hash` ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)), so it needs no signature, and no signed field repeats the size. Its decode bounds the proof bytes at 4,480. A `StreamResponse` with `ok = true` must have a served outcome, so it always carries its size proof; a receiver refuses one that does not.
 
@@ -312,6 +312,7 @@ struct StreamResponseExt {
     outcome: StreamOutcome,          // Served(SizeProof) | Refused(StreamError)
     origin_attestation: Option<OriginAttestation>,
     coverage: Coverage,
+    payment_pools: Option<Vec<PoolAccount>>,  // at most 8 CAIP-10 pool accounts; a hint
 }
 ```
 
