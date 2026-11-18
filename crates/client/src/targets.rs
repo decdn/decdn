@@ -588,9 +588,11 @@ fn warming_candidate(cand: &NodeCandidate, rtt_ms: f64) -> discovery::WarmingCan
 }
 
 /// Open `hash` on `cand` for discovery ([`crate::discovery_open`]) as `spec`
-/// says, with no pull-through unless `pull_through` is set. A span that starts
-/// past the blob's end serves nothing, so it is opened again for the whole
-/// blob: the answer still proves the size and names the node a holder.
+/// says, with no pull-through unless `pull_through` is set. A span the node
+/// cannot serve as asked (one that starts past the blob's end, which a node
+/// refuses `Declined` with no size, or that the answer proves past the end)
+/// is opened once more for the whole blob: the answer still proves the size
+/// and names the node a holder, and a range error then comes from that size.
 pub(crate) async fn open_candidate(
     cand: &NodeCandidate,
     relay: Option<RelayUrl>,
@@ -627,10 +629,22 @@ pub(crate) async fn open_at(
             Duration::from_millis(SELECT_OPEN_TIMEOUT_MS),
         )
     };
-    match open(spec.span).await {
-        Err(e) if spec.span != (0, 0) && crate::is_range_past_end(&e) => open((0, 0)).await,
-        other => other,
+    let first = open(spec.span).await;
+    let ask_whole = spec.span != (0, 0)
+        && match &first {
+            Ok(opened) => {
+                !opened.served()
+                    && opened.ext().error() == Some(&decdn_protocol::client::StreamError::Declined)
+            }
+            Err(e) => crate::is_range_past_end(e),
+        };
+    if !ask_whole {
+        return first;
     }
+    if let Ok(opened) = first {
+        opened.cancel();
+    }
+    open((0, 0)).await
 }
 
 /// Classify `cand`'s discovery open result `res`. The answer was verified
@@ -1536,6 +1550,14 @@ impl std::fmt::Debug for ResolvedTargets {
 }
 
 impl ResolvedTargets {
+    /// The blob size the resolve proved, or `None` when nothing proved one
+    /// (see the `size_hint` field).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn size_hint(&self) -> Option<crate::ProvenSize> {
+        self.size_hint
+    }
+
     /// Each candidate's signed per-MiB rate, in failover order: the rate its
     /// answer in this resolve signed, else the rate the peer store last
     /// recorded for it ([`crate::quote::store_rate`]). A candidate with

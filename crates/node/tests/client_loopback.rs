@@ -16221,6 +16221,68 @@ async fn an_unusable_origin_range_is_refused_after_admission() -> anyhow::Result
     Ok(())
 }
 
+/// A client discovery open for a span that starts past the blob's end meets
+/// the real handler's refusal: `Declined`, with no size. The client asks the
+/// node once more for the whole blob, so the node still reads as a holder and
+/// its answer proves the size, from which a range error then comes. Without
+/// that second open the node would read as declining the blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_discovery_open_past_the_end_asks_for_the_whole_blob() -> anyhow::Result<()> {
+    let payload = vec![0x7Cu8; 64 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task, _metrics) =
+        spawn_open_server(cache, store, None, 16).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = pool_context(&client_ep, signer, deposit);
+    let conns = decdn_client::Connections::new(client_ep.clone());
+    let socket = target
+        .ip_addrs()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("the server has a socket"))?;
+    let multiaddrs = decdn_incentive::node_register::pack_multiaddrs(&[format!(
+        "/ip4/{}/udp/{}/quic-v1",
+        socket.ip(),
+        socket.port()
+    )])?;
+    let candidate = decdn_client::discovery::NodeCandidate {
+        node_id: target.id,
+        eth_address: server_eth.address(),
+        region_hint: None,
+        multiaddrs: alloy::primitives::Bytes::from(multiaddrs),
+    };
+    let total = payload.len() as u64;
+    let resolved = decdn_client::targets::open_and_order(
+        std::slice::from_ref(&candidate),
+        None,
+        *hash.as_bytes(),
+        decdn_client::targets::OpenSpec {
+            conns: &conns,
+            ctx: &ctx,
+            namespace_id: decdn_protocol::client::NO_NAMESPACE,
+            span: (total + (1 << 20), 1024),
+            max_rate_per_mb: 0,
+        },
+        decdn_client::session::ProxyWarmingParams {
+            enabled: false,
+            rtt_threshold_ms: 150.0,
+            margin_ms: 30.0,
+        },
+        &slash_domain(),
+        decdn_client::targets::OpenRound::Settle,
+    )
+    .await?;
+    anyhow::ensure!(
+        resolved.size_hint().map(decdn_client::ProvenSize::get) == Some(total),
+        "the whole-blob answer proves the size, got {:?}",
+        resolved.size_hint()
+    );
+
+    client_ep.close().await;
+    shutdown([server_task], [&server_ep]).await?;
+    Ok(())
+}
+
 /// A miss whose request does not set `pull_through` answers `NotFound` at
 /// once: no pool or signer read and no paid pull. The same miss with the flag
 /// runs the pull-through path, which reads the pool and attempts the pull.
