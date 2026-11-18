@@ -94,13 +94,12 @@ pub(crate) use proof_wait::PROOF_WAIT_CEILING;
 /// explicit and testable.
 pub const MAX_CLIENT_STREAMS: usize = 100;
 
-/// Per-connection cap on streams that have not yet passed funding admission,
-/// counted from the moment a stream is accepted. An open beyond it resets with
-/// `RATE_LIMITED` before its request is read. Without it, one peer pins many blobs with
-/// unpaid opens and blocks capacity eviction for paid fills. Twice the
-/// client's `SELECT_K` (5), so a payer that opens one stream per candidate
-/// stays well inside it.
-pub const MAX_UNADMITTED_STREAMS_PER_CONNECTION: usize = 10;
+/// Node-wide budget of blob pins held by streams that have not passed funding
+/// admission (ADR 005 § Open-stream pin). An open past it answers without a
+/// pin, and its blob stays evictable until the stream is admitted. One pin per
+/// connection handler at the default `max_concurrent_handlers` (256), so unpaid
+/// opens across every connection hold no more blobs than one open per handler.
+pub const MAX_UNADMITTED_PINS: usize = 256;
 
 // Per-stage timeouts so a stalled peer cannot pin a stream task indefinitely.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -109,6 +108,8 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`proof_wait::PROOF_WAIT_CEILING`] in total, from the chunk's first proof
 /// wait (see [`proof_wait`]). Traffic on sibling streams of the same
 /// connection counts as progress, so it can hold a wait up to that ceiling.
+/// The first proof of a stream that has not passed admission waits at most
+/// this long from the answer: no progress extends it.
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// After a clean `StreamEnd`, how long the serve waits for the client's FIN while
 /// draining its send half (see [`drain_recv_to_fin`]). A conforming client
@@ -845,6 +846,9 @@ pub struct ClientHandlerDeps {
     /// a capability expires ([`decdn_common::config::capability_expiry_margin_secs`],
     /// ADR 003 §Revocation). Defaults to the config default.
     pub redeem_interval_secs: u64,
+    /// The node-wide budget of blob pins held by streams that have not passed
+    /// funding admission. Defaults to [`MAX_UNADMITTED_PINS`].
+    pub unadmitted_pin_budget: usize,
 }
 
 impl std::fmt::Debug for ClientHandlerDeps {
@@ -908,6 +912,7 @@ impl ClientHandlerDeps {
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             coarse_clock: None,
             redeem_interval_secs: decdn_common::config::DEFAULT_REDEEM_INTERVAL_SECS,
+            unadmitted_pin_budget: MAX_UNADMITTED_PINS,
         }
     }
 }
@@ -1211,6 +1216,9 @@ pub struct ClientHandler {
     /// accepting vouchers, in seconds: one redeem interval plus the redeemer's
     /// landing slack ([`decdn_common::config::capability_expiry_margin_secs`]).
     capability_expiry_margin_secs: u64,
+    /// The node's blob pins held by streams that have not passed funding
+    /// admission, under [`ClientHandlerDeps::unadmitted_pin_budget`].
+    unadmitted_pins: Arc<admission::Places>,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -1306,6 +1314,7 @@ impl ClientHandler {
             capability_expiry_margin_secs: decdn_common::config::capability_expiry_margin_secs(
                 deps.redeem_interval_secs,
             ),
+            unadmitted_pins: Arc::new(admission::Places::new(deps.unadmitted_pin_budget)),
         })
     }
 

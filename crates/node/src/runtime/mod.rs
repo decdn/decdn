@@ -1447,6 +1447,7 @@ async fn build_chain_and_handlers(
         coarse_clock: Some(coarse_clock),
         // The capability-expiry margin covers one sweep of the redeemer below.
         redeem_interval_secs: cfg.blockchain.redeem_interval_secs,
+        unadmitted_pin_budget: crate::handlers::client::MAX_UNADMITTED_PINS,
     };
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 

@@ -432,3 +432,75 @@ async fn a_narrowed_pull_pays_only_up_to_its_prefix() -> anyhow::Result<()> {
     ep.close().await;
     Ok(())
 }
+
+/// Every open on one node's connection holds a place until its first
+/// voucher, so this map never holds more streams with no voucher than a node
+/// accepts on one connection. Adopted discovery streams keep their places,
+/// lane opens take the rest, and the open past the bound waits. A held pull's
+/// first voucher frees its place, and the waiting open answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_open_holds_its_place_until_its_first_voucher() -> anyhow::Result<()> {
+    use crate::connection::{MAX_DISCOVERY_OPENS_PER_NODE, MAX_OPENS_PER_NODE};
+    let blob = blob();
+    let hash = hash_of(&blob);
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 7,
+        },
+        domain(),
+    )
+    .await?;
+    let (ep, conns) = client().await?;
+    let ctx = ctx(1);
+    let deadlines = PullDeadlines::new(OPEN, OPEN, 0)?;
+    let ledger = Arc::new(ctx.new_ledger());
+    let mut pulls = Vec::new();
+    for _ in 0..MAX_DISCOVERY_OPENS_PER_NODE {
+        let opened = open_on(&node, &conns, &ctx, hash).await?;
+        pulls.push(
+            opened
+                .into_pull(&ctx, Arc::clone(&ledger), 0, 0, deadlines)?
+                .1,
+        );
+    }
+    let slash = domain();
+    let source = crate::PeerSource::new(
+        &ep,
+        node.addr.clone(),
+        Arc::new(std::sync::Mutex::new(ctx.clone())),
+        Arc::clone(&ledger),
+        &slash,
+        node.operator_address(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        crate::RateCeiling::new(0),
+        deadlines,
+        Some(conns.clone()),
+    );
+    for _ in MAX_DISCOVERY_OPENS_PER_NODE..MAX_OPENS_PER_NODE {
+        pulls.push(source.open_span(hash, 0, 0).await?.1);
+    }
+    anyhow::ensure!(Seen::count(&node.seen.opens) == MAX_OPENS_PER_NODE);
+
+    let next = source.open_span(hash, 0, 0);
+    tokio::pin!(next);
+    anyhow::ensure!(
+        tokio::time::timeout(Duration::from_millis(300), &mut next)
+            .await
+            .is_err(),
+        "the open past the bound waits for a place"
+    );
+    anyhow::ensure!(Seen::count(&node.seen.opens) == MAX_OPENS_PER_NODE);
+
+    // The node sends no chunk, so the read times out after the voucher.
+    let first = pulls
+        .first_mut()
+        .ok_or_else(|| anyhow::anyhow!("a held pull"))?;
+    let _ = tokio::time::timeout(Duration::from_millis(300), first.next_chunk()).await;
+    let (_, waited) = tokio::time::timeout(OPEN, next).await??;
+    anyhow::ensure!(Seen::count(&node.seen.opens) == MAX_OPENS_PER_NODE + 1);
+    drop((waited, pulls));
+    ep.close().await;
+    Ok(())
+}

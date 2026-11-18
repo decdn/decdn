@@ -181,16 +181,60 @@ pub struct Connections {
     inner: Arc<ConnectionsInner>,
 }
 
-/// The most discovery opens ([`crate::discovery_open`]) one map keeps on one
-/// node's connection at once, from the open until the stream is adopted or
-/// ends. A node holds at most 10 streams per connection that have sent no
-/// voucher, and resets every stream past that. A paid lane's open counts
-/// toward that bound until its first voucher too, so the map leaves room for
-/// two of those beside its discovery opens. A caller that discovers many
-/// hashes at once on one node (a price census, a bundle's entries, the
-/// gateway's concurrent requests) waits for a permit rather than having its
-/// opens reset.
+/// The most streams one map keeps open on one node's connection that have
+/// sent no voucher, from the open until the stream sends its first voucher,
+/// is cancelled or fails. A node resets every stream past
+/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`] such streams on one connection
+/// with `RATE_LIMITED`, so the map holds the same bound: an open past it waits
+/// for a place rather than having the node reset it. Every open on the map
+/// holds one: discovery opens, lane opens, gap fills and retries, and a node's
+/// upstream opens.
+///
+/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]: decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION
+pub(crate) const MAX_OPENS_PER_NODE: usize =
+    decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION;
+
+/// The most of a node's [`MAX_OPENS_PER_NODE`] places that discovery opens
+/// ([`crate::discovery_open`]) hold at once. The rest stay for paid lanes, so a
+/// caller that discovers many hashes at once on one node (a price census, a
+/// bundle's entries, the gateway's concurrent requests) never starves its own
+/// lanes of a place.
 pub(crate) const MAX_DISCOVERY_OPENS_PER_NODE: usize = 8;
+
+const _: () = assert!(
+    MAX_DISCOVERY_OPENS_PER_NODE < MAX_OPENS_PER_NODE,
+    "discovery opens leave lanes a place on every node"
+);
+
+/// One open's place on its node's connection ([`MAX_OPENS_PER_NODE`]), and a
+/// discovery open's place among the discovery opens
+/// ([`MAX_DISCOVERY_OPENS_PER_NODE`]). The stream holds it until it sends its
+/// first voucher, is cancelled or fails.
+#[derive(Debug)]
+pub(crate) struct OpenPermit {
+    /// The place among the discovery opens, for a discovery open.
+    _discovery: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The place among every open on the node's connection.
+    _open: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// A node's open permits: every open, and the discovery opens among them.
+#[derive(Debug)]
+struct NodeOpens {
+    /// [`MAX_OPENS_PER_NODE`] places.
+    all: Arc<tokio::sync::Semaphore>,
+    /// [`MAX_DISCOVERY_OPENS_PER_NODE`] places.
+    discovery: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for NodeOpens {
+    fn default() -> Self {
+        Self {
+            all: Arc::new(tokio::sync::Semaphore::new(MAX_OPENS_PER_NODE)),
+            discovery: Arc::new(tokio::sync::Semaphore::new(MAX_DISCOVERY_OPENS_PER_NODE)),
+        }
+    }
+}
 
 /// A node's connection slot. The async lock makes concurrent callers for one
 /// node wait on one dial.
@@ -238,8 +282,9 @@ struct ConnectionsInner {
     /// on the caller's.
     dial_runtime: Option<Handle>,
     slots: Mutex<HashMap<PublicKey, Slot>>,
-    /// Each node's discovery-open permits ([`MAX_DISCOVERY_OPENS_PER_NODE`]).
-    opens: Mutex<HashMap<PublicKey, Arc<tokio::sync::Semaphore>>>,
+    /// Each node's open permits ([`MAX_OPENS_PER_NODE`],
+    /// [`MAX_DISCOVERY_OPENS_PER_NODE`]).
+    opens: Mutex<HashMap<PublicKey, Arc<NodeOpens>>>,
     /// How many dials this map has made.
     #[cfg(any(test, feature = "test-util"))]
     dials: std::sync::atomic::AtomicU64,
@@ -381,31 +426,61 @@ impl Connections {
         }
     }
 
-    /// One of `node`'s discovery-open permits, waiting while the map holds
-    /// [`MAX_DISCOVERY_OPENS_PER_NODE`] of them. The caller holds the permit
-    /// for as long as its open stream has sent no voucher.
-    ///
-    /// # Errors
-    ///
-    /// Never in practice: the map never closes a node's permits.
-    pub(crate) async fn discovery_permit(
-        &self,
-        node: PublicKey,
-    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
-        let permits = Arc::clone(
+    /// `node`'s open permits.
+    fn node_opens(&self, node: PublicKey) -> Arc<NodeOpens> {
+        Arc::clone(
             self.inner
                 .opens
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .entry(node)
-                .or_insert_with(|| {
-                    Arc::new(tokio::sync::Semaphore::new(MAX_DISCOVERY_OPENS_PER_NODE))
-                }),
-        );
-        permits
+                .or_default(),
+        )
+    }
+
+    /// A place for one open on `node`'s connection, waiting while the map
+    /// holds [`MAX_OPENS_PER_NODE`] of them. The caller holds it until its
+    /// stream sends its first voucher, is cancelled or fails.
+    ///
+    /// # Errors
+    ///
+    /// Never in practice: the map never closes a node's permits.
+    pub(crate) async fn open_permit(&self, node: PublicKey) -> anyhow::Result<OpenPermit> {
+        let opens = self.node_opens(node);
+        let open = Arc::clone(&opens.all)
             .acquire_owned()
             .await
-            .map_err(|_| anyhow::anyhow!("the discovery-open permits of node {node} closed"))
+            .map_err(|_| anyhow::anyhow!("the open permits of node {node} closed"))?;
+        Ok(OpenPermit {
+            _discovery: None,
+            _open: open,
+        })
+    }
+
+    /// A place for one discovery open on `node`'s connection: one of the
+    /// [`MAX_DISCOVERY_OPENS_PER_NODE`] discovery places, then one of the
+    /// [`MAX_OPENS_PER_NODE`] places of every open, waiting for each. The
+    /// caller holds both until its stream sends its first voucher, is
+    /// cancelled or fails.
+    ///
+    /// # Errors
+    ///
+    /// Never in practice: the map never closes a node's permits.
+    pub(crate) async fn discovery_permit(&self, node: PublicKey) -> anyhow::Result<OpenPermit> {
+        let opens = self.node_opens(node);
+        let closed = |_| anyhow::anyhow!("the open permits of node {node} closed");
+        let discovery = Arc::clone(&opens.discovery)
+            .acquire_owned()
+            .await
+            .map_err(closed)?;
+        let open = Arc::clone(&opens.all)
+            .acquire_owned()
+            .await
+            .map_err(closed)?;
+        Ok(OpenPermit {
+            _discovery: Some(discovery),
+            _open: open,
+        })
     }
 
     /// How many dials this map has made.

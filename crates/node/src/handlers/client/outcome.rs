@@ -49,7 +49,7 @@ pub(super) enum ResetCause {
     StreamCapFull,
     /// The connection held its cap of streams that have not passed admission
     /// (`RATE_LIMITED`,
-    /// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`](super::MAX_UNADMITTED_STREAMS_PER_CONNECTION)).
+    /// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`](decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION)).
     UnadmittedCapFull,
     /// The `[serve.rate_limit]` limiter refused the stream at this layer
     /// (`RATE_LIMITED`, ADR 005 §Request rate limiting).

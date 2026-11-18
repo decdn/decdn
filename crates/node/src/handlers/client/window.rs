@@ -759,6 +759,7 @@ impl ClientHandler {
             lane,
             guards,
             shed: _shed,
+            pin: _pin,
         } = match self.admit_on_first_proof(adm).await {
             Ok(admitted) => admitted,
             Err(reason) => return self.refuse_admission(&mut send, reason).await,

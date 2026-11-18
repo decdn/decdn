@@ -3046,6 +3046,10 @@ pub struct UpstreamPull {
     /// The wire byte the pull pays ahead up to: [`Self::expected_wire_bytes`],
     /// or the end of the prefix a narrowed pull serves.
     pay_end: u64,
+    /// The stream's place on its node's connection
+    /// ([`connection::OpenPermit`]), held until the first voucher is sent: the
+    /// node counts the stream as unadmitted until then.
+    open_permit: Option<connection::OpenPermit>,
 }
 
 impl std::fmt::Debug for UpstreamPull {
@@ -3490,7 +3494,8 @@ impl UpstreamPull {
     /// [`Self::next_chunk`] / [`Self::finish`], not awaited here.
     async fn pay_one(&mut self, chunks: u64, residual: u64) -> anyhow::Result<()> {
         let ledger = Arc::clone(&self.ledger);
-        self.meter
+        let paid = self
+            .meter
             .pay(
                 &mut self.send,
                 &self.ctx,
@@ -3500,7 +3505,11 @@ impl UpstreamPull {
                 residual,
                 &mut self.paid,
             )
-            .await
+            .await;
+        // The first voucher admits the stream at the node, so its place on the
+        // node's connection frees for the next open.
+        drop(self.open_permit.take());
+        paid
     }
 
     /// Read one message under the persistent throughput floor (#1797). Wraps `recv` in a

@@ -269,6 +269,15 @@ pub struct StreamRequest {
     pub timestamp_us: u64,
 }
 
+/// The most streams on one `cdn/client/v1` connection that have not passed
+/// funding admission (ADR 005 § Open-stream pin). A node counts a stream from
+/// its accept until its admission: at its funding gates for a miss that pulls
+/// through, else at the payer's first voucher. It resets every stream past the
+/// cap with `RATE_LIMITED`. A requester holds at most this many streams on one
+/// node's connection until each has sent its first voucher, so its own opens
+/// never reach the reset.
+pub const MAX_UNADMITTED_STREAMS_PER_CONNECTION: usize = 10;
+
 /// The reserved "no namespace" [`StreamRequest::namespace_id`] value (all-zero
 /// big-endian `uint256`): content published without a namespace, served
 /// best-effort from cache / DHT with no authorized origins (ADR 002 §Namespace 0).

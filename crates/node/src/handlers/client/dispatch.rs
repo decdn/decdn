@@ -15,7 +15,7 @@ use tokio::task::{JoinError, JoinSet};
 use futures_util::FutureExt as _;
 use tracing::Instrument as _;
 
-use super::admission::{Admission, Admitted, DeferredAdmission, UnadmittedSlot, UnadmittedStreams};
+use super::admission::{Admission, Admitted, DeferredAdmission, Places, UnadmittedSlot};
 use super::outcome::{ErrEnd, ResetCause, ServeEnd};
 use crate::load_shed::RequestClass;
 use crate::metrics::FirstByteClock;
@@ -140,7 +140,9 @@ impl ClientHandler {
         let bound_addr: Arc<ArcSwapOption<Address>> = Arc::new(ArcSwapOption::empty());
         // The connection's streams that have not passed admission
         // (`MAX_UNADMITTED_STREAMS_PER_CONNECTION`).
-        let unadmitted = Arc::new(UnadmittedStreams::default());
+        let unadmitted = Arc::new(Places::new(
+            decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION,
+        ));
         let peer = conn.remote_id();
 
         let idle_timeout = self.idle_timeout.unwrap_or(APP_IDLE_TIMEOUT);
@@ -155,8 +157,10 @@ impl ClientHandler {
                         // Reserved before the request is read, so a burst of
                         // opens cannot pass the cap. A stream the stream cap
                         // resets reserves none.
-                        let unadmitted_slot =
-                            permit.as_ref().and_then(|_| unadmitted.try_take());
+                        let unadmitted_slot = permit
+                            .as_ref()
+                            .and_then(|_| unadmitted.try_take())
+                            .map(UnadmittedSlot::new);
                         let this = Arc::clone(&self);
                         // Boxed: the serve future is large (clippy::large_futures),
                         // and spawning the boxed future keeps it off the accept
@@ -309,6 +313,24 @@ impl ClientHandler {
                 "client stream ended with error"
             );
         }
+    }
+
+    /// Pin `hash` against capacity eviction for an open that has not passed
+    /// funding admission, counting the pin in `slot` against the node's pin
+    /// budget ([`super::MAX_UNADMITTED_PINS`]). Past the budget the open takes
+    /// no pin, and its blob stays evictable until admission pins it.
+    fn pin_unadmitted(
+        &self,
+        hash: Hash,
+        slot: &mut Option<UnadmittedSlot>,
+    ) -> Option<decdn_cache::InUse> {
+        let slot = slot.as_mut()?;
+        let Some(place) = self.unadmitted_pins.try_take() else {
+            tracing::debug!(%hash, "unadmitted pin budget spent; the open takes no pin");
+            return None;
+        };
+        slot.count_pin(place);
+        Some(self.cache.hold_in_use(hash))
     }
 
     /// Serve one delivery stream end to end. Returns how the stream ended
@@ -637,7 +659,7 @@ impl ClientHandler {
         // (`InUse`), so an open that answers before admission still has its
         // blob when the payer's first proof arrives. A takedown `evict` still
         // removes a held blob. A miss drops the hold below: it holds nothing.
-        let mut pin = Some(self.cache.hold_in_use(hash));
+        let mut pin = self.pin_unadmitted(hash, &mut unadmitted_slot);
 
         // Blob availability gate. A store fault is NOT an absence: an
         // `Unavailable` audit means the node genuinely lacks the blob (NotFound
@@ -722,6 +744,9 @@ impl ClientHandler {
             // A miss holds nothing to pin. A fill below that lands the blob
             // takes a new hold before delivery.
             drop(pin.take());
+            if let Some(slot) = unadmitted_slot.as_mut() {
+                slot.release_pin();
+            }
             // The miss sibling of the two hit counters above, on the same
             // pre-shed footing: the gate cannot satisfy this request from held
             // bytes. It records that classification only — the pull-through
@@ -882,6 +907,9 @@ impl ClientHandler {
                         .await;
                 }
             }
+            // Admitted at its funding gates: the stream leaves the unadmitted
+            // count before the gates read the chain.
+            drop(unadmitted_slot.take());
             let funding = match self
                 .funding_gates(&req, &ext, verified_client, lane_key, rate_per_mb)
                 .await
@@ -893,8 +921,6 @@ impl ClientHandler {
                         .await;
                 }
             };
-            // Admitted at open: the stream no longer counts as unadmitted.
-            drop(unadmitted_slot.take());
             let pool_status = funding.pool_status;
 
             // Node-to-node cache-miss pull-through (#831). Fronting upstream
@@ -1221,8 +1247,10 @@ impl ClientHandler {
                     lane_key,
                     lane,
                     guards,
-                    // The fn-scope `_shed_slot` holds this stream's slot.
+                    // The fn-scope `_shed_slot` and `_pin` hold this stream's
+                    // slot and pin.
                     shed: None,
+                    pin: None,
                 })
             }
             // An open that does no fill work answers before admission, which

@@ -76,10 +76,11 @@ pub struct OpenedStream {
     pub(crate) rtt: Option<PathRtt>,
     /// When the answer arrived.
     pub(crate) answered_at: tokio::time::Instant,
-    /// A discovery open's permit on its node's connection
-    /// ([`Connections::discovery_permit`]), released when the stream is
-    /// adopted or ends; `None` for a pull's open.
-    pub(crate) permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The open's place on its node's connection
+    /// ([`Connections::open_permit`], [`Connections::discovery_permit`]): an
+    /// adopting pull holds it until its first voucher, and it frees when the
+    /// stream ends. `None` for an open on a connection of its own.
+    pub(crate) permit: Option<crate::connection::OpenPermit>,
 }
 
 impl std::fmt::Debug for OpenedStream {
@@ -247,6 +248,7 @@ impl OpenedStream {
             hash,
             byte_offset,
             byte_len,
+            permit,
             ..
         } = self;
         let Some(proven) = proven_size.filter(|_| resp.body.ok) else {
@@ -325,6 +327,7 @@ impl OpenedStream {
             opened_at: tokio::time::Instant::now(),
             narrowed: false,
             pay_end: expected_wire_bytes,
+            open_permit: permit,
         };
         Ok((header, pull))
     }
@@ -530,10 +533,11 @@ async fn open_on_warm(
 /// work the node did before it answered.
 ///
 /// `open` bounds the dial, and again the exchange. Before either, the open
-/// waits for one of the target's discovery-open permits in `conns`, which the
-/// stream holds until it is adopted or ends: a node resets the streams past
-/// its bound on one connection's streams with no voucher yet, so a caller
-/// that discovers many hashes at once on one node queues instead.
+/// waits for a discovery place on the target's connection in `conns`. The
+/// stream holds it until it ends, or
+/// until its adopting pull sends its first voucher: a node resets the streams
+/// past its bound on one connection's streams with no voucher yet, so a
+/// caller that discovers many hashes at once on one node queues instead.
 ///
 /// # Errors
 ///

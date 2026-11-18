@@ -364,7 +364,8 @@ open `cdn/client/v1` stream for the life of the stream, per [ADR 005 §
 Open-stream pin](005-protocol.md#open-stream-pin). An in-use hash is exempt
 from cache-pressure eviction regardless of segment or frequency, even when it
 is deny-listed. `CacheEngine::evict` still removes it. The per-connection cap
-on unadmitted streams bounds the blobs that unpaid opens pin.
+on unadmitted streams, the node-wide budget of their pins and the fixed wait
+for their first voucher bound the blobs that unpaid opens pin.
 
 Reputation does not factor into admission or eviction. The unified
 reputation score governs peer *selection*

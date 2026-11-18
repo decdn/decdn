@@ -21,18 +21,19 @@
 //! paid serves. The empty blob sells no byte and skips admission.
 //!
 //! The node holds the blob (`InUse`) for the whole stream, so an open that
-//! waits for its first proof keeps its blob. [`UnadmittedStreams`] bounds how
-//! many streams one connection holds before admission.
+//! waits for its first proof keeps its blob. [`Places`] bounds how many
+//! streams one connection holds before admission, and how many pins such
+//! streams hold across the node; an open past the pin budget answers with no
+//! pin, and admission pins its blob.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::credit::SendGuards;
 use super::outcome::ServeEnd;
-use super::proof_wait::ChunkProofs;
 use super::{
     Address, Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, Hash,
-    LaneDeliveryState, LaneKey, MAX_UNADMITTED_STREAMS_PER_CONNECTION, Mutex, PublicKey,
-    RecvStream, SendStream, ServeRejectReason, StreamRequest, StreamRequestExt,
+    LaneDeliveryState, LaneKey, Mutex, PublicKey, RecvStream, SendStream, ServeRejectReason,
+    StreamRequest, StreamRequestExt,
 };
 use crate::load_shed::{RequestClass, ShedSlot};
 use crate::pool_view::{Lifecycle, PoolStatus};
@@ -70,7 +71,7 @@ pub(super) struct DeferredAdmission {
     /// The requesting peer's node id, the load-shed gate's per-client key.
     client_node_id: B256,
     /// The connection's slot for this unadmitted stream.
-    _slot: Option<UnadmittedSlot>,
+    slot: Option<UnadmittedSlot>,
 }
 
 impl DeferredAdmission {
@@ -99,7 +100,7 @@ impl DeferredAdmission {
             total_bytes,
             class,
             client_node_id,
-            _slot: slot,
+            slot,
         }
     }
 }
@@ -116,6 +117,10 @@ pub(super) struct Admitted {
     /// The load-shed slot admission took, held for the rest of the stream, or
     /// `None` when the stream holds its slot elsewhere.
     pub(super) shed: Option<ShedSlot>,
+    /// The blob pin admission took for the rest of the stream, or `None` when
+    /// the stream holds its pin elsewhere. An open past the node's pin budget
+    /// answered without one, so its pin starts here.
+    pub(super) pin: Option<decdn_cache::InUse>,
 }
 
 /// Where a serve loop's stream stands on admission.
@@ -126,44 +131,87 @@ pub(super) enum Admission {
     OnFirstProof(DeferredAdmission),
 }
 
-/// The count of one connection's streams that have not yet passed admission.
-/// The accept path reserves a slot for every stream before it reads the
-/// request, and resets the stream when the count is at
-/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]. A stream frees its slot when it
-/// is admitted (at open, or at its first proof) or ends. The bound is exact: a
-/// burst of opens cannot pass it.
-#[derive(Debug, Default)]
-pub(super) struct UnadmittedStreams {
-    /// Live [`UnadmittedSlot`]s.
+/// A count of places under a fixed cap: one connection's streams that have
+/// not passed admission ([`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]), or the
+/// node's blob pins held by such streams
+/// ([`MAX_UNADMITTED_PINS`](super::MAX_UNADMITTED_PINS)). A place is held
+/// until the returned [`Place`] drops. The bound is exact: a burst of takes
+/// cannot pass it.
+///
+/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]: decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION
+#[derive(Debug)]
+pub(super) struct Places {
+    /// Live [`Place`]s.
     count: AtomicUsize,
+    /// The most places held at once.
+    cap: usize,
 }
 
-impl UnadmittedStreams {
-    /// Reserve a slot for one more unadmitted stream, held until the returned
-    /// slot drops, or `None` when the connection holds its cap.
-    pub(super) fn try_take(self: &Arc<Self>) -> Option<UnadmittedSlot> {
+impl Places {
+    /// No place held, under `cap`.
+    pub(super) const fn new(cap: usize) -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// Take one place, held until the returned place drops, or `None` when
+    /// the count is at its cap.
+    pub(super) fn try_take(self: &Arc<Self>) -> Option<Place> {
         self.count
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_UNADMITTED_STREAMS_PER_CONNECTION).then(|| count.saturating_add(1))
+                (count < self.cap).then(|| count.saturating_add(1))
             })
             .ok()?;
-        Some(UnadmittedSlot {
-            streams: Arc::clone(self),
+        Some(Place {
+            places: Arc::clone(self),
         })
     }
 }
 
-/// One unadmitted stream's place in its connection's [`UnadmittedStreams`].
-/// Dropping it frees the place, on every exit of the stream.
+/// One place in a [`Places`] count. Dropping it frees the place.
 #[derive(Debug)]
-pub(super) struct UnadmittedSlot {
-    /// The connection's count.
-    streams: Arc<UnadmittedStreams>,
+pub(super) struct Place {
+    /// The count it holds a place in.
+    places: Arc<Places>,
 }
 
-impl Drop for UnadmittedSlot {
+impl Drop for Place {
     fn drop(&mut self) {
-        self.streams.count.fetch_sub(1, Ordering::AcqRel);
+        self.places.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One unadmitted stream's place in its connection's count of such streams,
+/// and the place its blob pin holds in the node's pin budget, if it took one.
+/// The stream accepts with the first and takes the second when it pins its
+/// blob. Both free when the stream is admitted or ends.
+#[derive(Debug)]
+pub(super) struct UnadmittedSlot {
+    /// The stream's place among its connection's unadmitted streams.
+    _stream: Place,
+    /// The place its blob pin holds in the node's pin budget.
+    pin: Option<Place>,
+}
+
+impl UnadmittedSlot {
+    /// The slot of a stream that holds `stream`, with no pin yet.
+    pub(super) const fn new(stream: Place) -> Self {
+        Self {
+            _stream: stream,
+            pin: None,
+        }
+    }
+
+    /// Count this stream's blob pin against the node's budget.
+    pub(super) fn count_pin(&mut self, pin: Place) {
+        self.pin = Some(pin);
+    }
+
+    /// Free the pin budget this stream holds: it holds no pin any more.
+    pub(super) fn release_pin(&mut self) {
+        self.pin = None;
     }
 }
 
@@ -292,8 +340,13 @@ impl ClientHandler {
     /// lane existence.
     pub(super) async fn admit_on_first_proof(
         &self,
-        adm: DeferredAdmission,
+        mut adm: DeferredAdmission,
     ) -> Result<Admitted, ServeRejectReason> {
+        // The payer's first proof admits the stream: it leaves its
+        // connection's unadmitted streams, and its pin leaves the node's pin
+        // budget. A paid stream keeps its blob pinned for its life.
+        drop(adm.slot.take());
+        let pin = self.cache.hold_in_use(Hash::from_bytes(adm.req.hash));
         let shed = match self.shed.try_admit(adm.class, adm.client_node_id) {
             Ok(slot) => slot,
             Err(reason) => {
@@ -362,12 +415,15 @@ impl ClientHandler {
             lane,
             guards,
             shed: Some(shed),
+            pin: Some(pin),
         })
     }
 
     /// Wait until the payer's first proof is buffered on `reader`, under the
-    /// proof wait's no-progress timeout and ceiling ([`super::proof_wait`]).
-    /// The proof stays buffered for the serve loop.
+    /// fixed first-proof deadline
+    /// ([`await_first_proof`](super::proof_wait::await_first_proof)), which
+    /// traffic on sibling streams does not extend. The proof stays buffered
+    /// for the serve loop.
     ///
     /// # Errors
     ///
@@ -378,11 +434,9 @@ impl ClientHandler {
         recv: &mut RecvStream,
         reader: &mut BufferedProofReader,
     ) -> anyhow::Result<()> {
-        let proofs = ChunkProofs::start();
-        Box::pin(super::proof_wait::await_proof(
+        Box::pin(super::proof_wait::await_first_proof(
             reader.fill_one(recv),
             conn,
-            &proofs,
         ))
         .await
         .map_err(|e| e.context("waiting for the payer's first proof"))

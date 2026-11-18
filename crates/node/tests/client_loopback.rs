@@ -2196,9 +2196,9 @@ struct VoucherTotals {
 /// credit, so with a payload well under one chunk the server waits for the one
 /// voucher that pays the whole `expected_wire` delivery — the stall is a
 /// protocol-level rendezvous, not a race, and it holds until the test pays or
-/// the handler's proof wait ends it. The stream adds no transport progress: the
-/// wait ends after 10s (`VOUCHER_READ_TIMEOUT`) when the connection carries
-/// nothing else, and up to 30s while sibling streams on it keep sending.
+/// the handler's proof wait ends it. The first-proof wait is a fixed 10s
+/// (`VOUCHER_READ_TIMEOUT`) from the answer, whatever sibling streams on the
+/// connection send.
 async fn stall_delivery_at_closing_voucher(
     conn: &Connection,
     hash: [u8; 32],
@@ -16438,14 +16438,173 @@ async fn an_open_that_times_out_releases_its_pin() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The node-wide budget of pins held by unadmitted streams binds across
+/// connections. With a budget of one, a second connection's open past it still
+/// answers `ok: true`, but takes no pin: its blob stays evictable. When the
+/// first open ends, its place in the budget frees, and a new open pins again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_past_the_pin_budget_answers_without_a_pin() -> anyhow::Result<()> {
+    let (pinned_payload, spare_payload) = (vec![0x78u8; 64 * 1024], vec![0x79u8; 64 * 1024]);
+    let (cache, pinned, spare, _cache_tmp) =
+        cache_with_two_blobs(&pinned_payload, &spare_payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let handler = build_handler_limited_configured(
+        server_id,
+        &operator_signer(),
+        &metrics,
+        permissive_limiter(&metrics),
+        cache.clone(),
+        store,
+        RATE_PER_MB,
+        16,
+        |deps| deps.unadmitted_pin_budget = 1,
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // Serve each connection on its own task: `spawn_server` serves one
+    // connection at a time, and both stay open here.
+    let accept_ep = server_ep.clone();
+    let server_task = tokio::spawn(async move {
+        while let Some(incoming) = accept_ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move {
+                let _ = ClientProtocol::new(handler).accept(conn).await;
+            });
+        }
+    });
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let wire = support::bao_wire_len_whole(64 * 1024);
+
+    let mut conns = Vec::new();
+    let mut eps = Vec::new();
+    for _ in 0..2 {
+        let client_sk = fresh_key();
+        let client_node_id = B256::from(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conn = client_ep
+            .connect(target.clone(), ALPN_CLIENT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        conns.push((conn, binding_ext(&signer, client_node_id)?));
+        eps.push(client_ep);
+    }
+    let [(first_conn, first_ext), (second_conn, second_ext)] = conns.as_slice() else {
+        anyhow::bail!("two connections");
+    };
+
+    let mut holder =
+        stall_delivery_at_closing_voucher(first_conn, *pinned.as_bytes(), wire, Some(first_ext))
+            .await?;
+    anyhow::ensure!(cache.is_in_use(pinned), "the first open pins its blob");
+    let _past =
+        stall_delivery_at_closing_voucher(second_conn, *spare.as_bytes(), wire, Some(second_ext))
+            .await?;
+    anyhow::ensure!(
+        !cache.is_in_use(spare),
+        "an open past the budget answers and takes no pin"
+    );
+    anyhow::ensure!(
+        cache.release_for_eviction(spare).await? > 0,
+        "capacity eviction releases the unpinned blob"
+    );
+
+    holder.send.reset(0u32.into())?;
+    let _ = holder.recv.stop(0u32.into());
+    anyhow::ensure!(
+        eventually(Duration::from_secs(5), || !cache.is_in_use(pinned)).await,
+        "the cancelled open frees its pin"
+    );
+    let _again =
+        stall_delivery_at_closing_voucher(second_conn, *pinned.as_bytes(), wire, Some(second_ext))
+            .await?;
+    anyhow::ensure!(
+        cache.is_in_use(pinned),
+        "a freed place in the budget pins the next open"
+    );
+
+    first_conn.close(0u32.into(), b"done");
+    second_conn.close(0u32.into(), b"done");
+    let [first_ep, second_ep] = eps.as_slice() else {
+        anyhow::bail!("two client endpoints");
+    };
+    shutdown([server_task], [first_ep, second_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The first-proof wait of an unadmitted stream is a fixed deadline: a
+/// sibling stream that sends on the same connection every half second does
+/// not hold the open past the no-progress budget (`VOUCHER_READ_TIMEOUT`, 10
+/// s), well short of the 30 s proof-wait ceiling.
+#[tokio::test(flavor = "multi_thread")]
+async fn sibling_traffic_does_not_extend_the_first_proof_wait() -> anyhow::Result<()> {
+    let (held_payload, sibling_payload) = (vec![0x7Au8; 64 * 1024], vec![0x7Bu8; 64 * 1024]);
+    let (cache, held, sibling, _cache_tmp) =
+        cache_with_two_blobs(&held_payload, &sibling_payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_open_server(cache.clone(), store, None, 64).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+    let wire = support::bao_wire_len_whole(64 * 1024);
+
+    let _open =
+        stall_delivery_at_closing_voucher(&conn, *held.as_bytes(), wire, Some(&ext)).await?;
+    let opened_at = tokio::time::Instant::now();
+    anyhow::ensure!(cache.is_in_use(held));
+    // Sibling traffic: an open every half second, each answered with a
+    // STREAM frame and then cancelled.
+    let siblings = {
+        let (conn, ext) = (conn.clone(), ext.clone());
+        tokio::spawn(async move {
+            loop {
+                if let Ok(mut open) =
+                    stall_delivery_at_closing_voucher(&conn, *sibling.as_bytes(), wire, Some(&ext))
+                        .await
+                {
+                    let _ = open.send.reset(0u32.into());
+                    let _ = open.recv.stop(0u32.into());
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    };
+    let released = eventually(Duration::from_secs(16), || !cache.is_in_use(held)).await;
+    siblings.abort();
+    anyhow::ensure!(
+        released,
+        "the open must end at its fixed first-proof deadline despite sibling traffic"
+    );
+    anyhow::ensure!(
+        opened_at.elapsed() < Duration::from_secs(16),
+        "the open ended {:?} after its answer",
+        opened_at.elapsed()
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// A connection holds at most
-/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`](decdn_node::handlers::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION)
+/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`](decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION)
 /// opens that wait for their first proof. The next open resets with
 /// `RATE_LIMITED` before its request is read; once one open is admitted, a new
 /// one answers again.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_unadmitted_cap_resets_the_open_past_it() -> anyhow::Result<()> {
-    let cap = decdn_node::handlers::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION;
+    let cap = decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION;
     let payload = vec![0x76u8; 64 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;
@@ -16510,7 +16669,7 @@ async fn the_unadmitted_cap_resets_the_open_past_it() -> anyhow::Result<()> {
 /// exactly one resets with `RATE_LIMITED` and the rest answer.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_burst_of_opens_cannot_pass_the_unadmitted_cap() -> anyhow::Result<()> {
-    let cap = decdn_node::handlers::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION;
+    let cap = decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION;
     let payload = vec![0x77u8; 64 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;

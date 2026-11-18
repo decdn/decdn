@@ -132,6 +132,7 @@ pub const decdn_protocol::client::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::client::MAX_CHUNK_FRAME: u32
 pub const decdn_protocol::client::MAX_CLIENT_CONTROL_FRAME: u32
 pub const decdn_protocol::client::MAX_STREAM_RESPONSE_FRAME: u32
+pub const decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION: usize
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize

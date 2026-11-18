@@ -477,6 +477,11 @@ impl<'a> PeerSource<'a> {
         byte_offset: u64,
         byte_len: u64,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        // A place on the node's connection, held until the pull's first
+        // voucher, so this command's opens never pass the node's bound on
+        // streams with no voucher. Taken before the timestamp is stamped: a
+        // wait for a place must not age the request.
+        let permit = connections.open_permit(self.target.id).await?;
         let args = crate::opened::OpenArgs {
             ctx,
             slash_domain: self.slash_domain,
@@ -491,8 +496,9 @@ impl<'a> PeerSource<'a> {
             // misses.
             pull_through: true,
         };
-        let opened =
+        let mut opened =
             crate::opened::open_shared(connections, &self.target, args, false, false).await?;
+        opened.permit = Some(permit);
         self.adopt_with(ctx, opened)
     }
 

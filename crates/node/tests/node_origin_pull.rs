@@ -127,6 +127,22 @@ impl decdn_node::pool_view::PoolView for StubPoolView {
     }
 }
 
+/// A [`PoolView`](decdn_node::pool_view::PoolView) whose every read waits
+/// `delay`, then answers `status` for any pool: a slow chain RPC.
+#[derive(Debug)]
+struct SlowPoolView {
+    status: decdn_node::pool_view::PoolStatus,
+    delay: Duration,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for SlowPoolView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        tokio::time::sleep(self.delay).await;
+        Some(self.status)
+    }
+}
+
 /// A buyer pool opener that stands in for the chain-backed
 /// `BuyerPoolService`, so the test exercises the pull without a chain.
 ///
@@ -16786,5 +16802,132 @@ async fn a_requester_holder_does_not_hide_the_cold_origin() -> Result<()> {
         o_cache_metrics.origin_fetches.get()
     );
     shutdown([task_s, task_l, task_o], [&ep_s, &ep_l, &ep_o]).await?;
+    Ok(())
+}
+
+/// More concurrent misses than a node accepts unadmitted streams on one
+/// connection, all for one upstream with a slow chain view: every miss opens
+/// on the node's one shared connection to it. The client side holds each
+/// open's place until its first voucher, and the upstream frees a stream's
+/// slot at that voucher, before its funding reads. So the upstream never
+/// resets one with `RATE_LIMITED`: the opens past its bound queue, and every
+/// miss fills.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn more_concurrent_misses_than_the_unadmitted_cap_share_one_upstream() -> Result<()> {
+    let misses = decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION + 4;
+    let payloads: Vec<Vec<u8>> = (0..misses)
+        .map(|i| vec![u8::try_from(i).unwrap_or(u8::MAX); 64 * 1024])
+        .collect();
+    let hashes: Vec<Hash> = payloads.iter().map(support::register_payload).collect();
+    let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+    let (cache_a, _tmp_a) = cache_with_blobs(&refs).await?;
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let pool_id = B256::repeat_byte(0xA4);
+    let store_a = Arc::new(MemoryPoolStateStore::new());
+    store_a.record(&LaneState::hydrate(
+        pool_id,
+        b_buyer.address(),
+        a_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        u64::MAX,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    // A slow chain view: every pool read takes a while, so a node that counted
+    // streams as unadmitted through their funding reads would hold every
+    // concurrent miss's stream in the count at once.
+    let pool_view = Arc::new(SlowPoolView {
+        status: decdn_node::pool_view::PoolStatus {
+            owner: b_buyer.address(),
+            remaining: U256::from(DEPOSIT_MICRO_USDC),
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        },
+        delay: Duration::from_millis(300),
+    }) as Arc<dyn decdn_node::pool_view::PoolView>;
+    let handler_a = support::build_handler_full_configured(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        permissive_limiter(&metrics_a),
+        cache_a,
+        store_a as Arc<dyn PoolStateStore>,
+        RATE,
+        &domains,
+        4 * misses,
+        |deps| deps.pool_view = Some(pool_view),
+    )?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
+
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let (_providers, addr_map) = one_provider(a_dht, a_eth.address());
+    let buyer = Arc::new(StubOpener {
+        pool_id,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    let (origin, engine, _engine_tmp) = build_origin_multi_hash(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        &hashes,
+        buyer,
+        &local_rep,
+        &b_metrics,
+        &[a_dht],
+        addr_map,
+        DEFAULT_TEST_PULL_DEADLINES.0,
+        DEFAULT_TEST_PULL_DEADLINES.1,
+    )
+    .await;
+
+    let fetched = tokio::time::timeout(
+        Duration::from_mins(1),
+        futures_util::future::join_all(
+            hashes
+                .iter()
+                .map(|&hash| Origin::fetch(&origin, hash, u64::MAX)),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the concurrent misses hung"))?;
+    for (i, got) in fetched.into_iter().enumerate() {
+        let got = got.map_err(|e| anyhow::anyhow!("miss {i} failed: {e}"))?;
+        anyhow::ensure!(
+            matches!(got, OriginFetch::AlreadyAdmitted),
+            "miss {i} returned {got:?}"
+        );
+    }
+    for (hash, payload) in hashes.iter().zip(&payloads) {
+        anyhow::ensure!(engine.get(*hash).await?.as_ref() == payload.as_slice());
+    }
+    anyhow::ensure!(
+        counter_value(
+            &metrics_a,
+            "serve_stream_rejected_unadmitted_cap_full_total"
+        )? == 0,
+        "the upstream reset no open with RATE_LIMITED"
+    );
+
+    shutdown([task_a], [&ep_b, &ep_a]).await?;
     Ok(())
 }

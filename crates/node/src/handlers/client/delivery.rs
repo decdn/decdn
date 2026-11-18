@@ -343,6 +343,7 @@ impl ClientHandler {
             lane,
             mut guards,
             shed: _shed,
+            pin: _pin,
         } = admitted;
         let lane = &lane;
 
