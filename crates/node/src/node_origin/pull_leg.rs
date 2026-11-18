@@ -67,11 +67,11 @@ use super::ranged_pull::{AssembleOutcome, RecoveryEnd, RunOutcome, RunSink, asse
 use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
     Discovery, EconGate, HeldOpen, NodeOrigin, NodeOriginDeps, OpenGather, OpenSpec, OpenStreams,
-    OpenTally, PullMiss, PullOutcome, PullVerdict, SettleOnDrop, assigned_origins,
-    bind_upstream_ctx, cached_candidates, classify_pool_open_arm, classify_pull_failure, count_u16,
-    coverage_spans, discover, discovery_ctx, economic_ceiling, heat_of, lane_ledger, mb_of,
-    open_and_rank, record_backpressure_exhausted, record_backpressure_refusal, record_outcome,
-    record_pool_open_failure,
+    OpenTally, PullMiss, PullOutcome, PullVerdict, SettleOnDrop, append_cold_tail,
+    assigned_origins, bind_upstream_ctx, cached_candidates, classify_pool_open_arm,
+    classify_pull_failure, count_u16, coverage_spans, discover, discovery_ctx, economic_ceiling,
+    heat_of, lane_ledger, mb_of, open_and_rank, record_backpressure_exhausted,
+    record_backpressure_refusal, record_outcome, record_pool_open_failure, usable_holder,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
@@ -885,6 +885,17 @@ impl NodeOrigin {
         .await;
         tally.fold_into(&mut trail);
         ranked.retain(|candidate| candidate.node_id != requester);
+        // The cold tail joins when no holder the walk can use served the span:
+        // decided after the requester is gone and under the buy cap.
+        let heat = heat_of(deps, hash_bytes);
+        let cold = append_cold_tail(
+            &mut ranked,
+            cold.into_iter()
+                .filter(|candidate| candidate.node_id != requester)
+                .collect(),
+            |candidate| usable_holder(deps, heat, candidate),
+            hash_bytes,
+        );
         // The requester can answer the directory supplement's open as a
         // holder; the walk drops it, so the trail counts what the walk has.
         trail.holders = count_u16(ranked.len());
@@ -1113,10 +1124,15 @@ impl NodeOrigin {
 
         // The candidate's discovery stream served the span every open asked for.
         if let Some(opened) = discovered.take() {
-            let total_bytes = opened
-                .proven_size()
-                .map(decdn_client::ProvenSize::get)
-                .unwrap_or_default();
+            // A served answer proves its size; one that does not is no
+            // handshake, and the walk moves to the next candidate rather than
+            // commit a size nobody proved.
+            let Some(total_bytes) = opened.proven_size().map(decdn_client::ProvenSize::get) else {
+                drop(stream_guard);
+                opened.cancel();
+                debug!(%provider_addr, "node-origin: a served discovery answer proved no size");
+                return Err(HandshakeFault::clean("unproven_size"));
+            };
             let leg = prime.and_then(|prime| {
                 prime
                     .predicted_leg(

@@ -308,3 +308,36 @@ fn a_handshake_range_needs_no_proven_size() {
         None
     );
 }
+
+/// Once the size is proven, a cold target covers every block of the blob; a
+/// holder keeps the coverage it answered.
+#[test]
+fn a_cold_target_covers_every_block_once_the_size_is_proven() {
+    let total = 3 * DISCOVERY_BLOCK_BYTES;
+    let partial = Coverage::from_block_indices(num_blocks(total), [0].into_iter());
+    let candidate = |id: u8, coverage: Coverage| crate::selection::Candidate {
+        node_id: [id; 32],
+        rate_per_mb: 1,
+        rtt_ms: 1,
+        reputation: 1.0,
+        region: String::new(),
+        stake: 0,
+        coverage,
+        total_bytes_hint: None,
+    };
+    let mut ranked = vec![
+        candidate(1, partial.clone()),
+        candidate(2, Coverage::empty()),
+    ];
+    super::cover_cold(&mut ranked, &[[2; 32]], total);
+    let coverages: Vec<Coverage> = ranked.iter().map(|c| c.coverage.clone()).collect();
+    assert_eq!(
+        coverages,
+        vec![partial, Coverage::full(num_blocks(total))],
+        "a holder keeps its coverage, the cold target covers every block"
+    );
+    // No cold target: nothing changes.
+    let mut untouched = vec![candidate(3, Coverage::empty())];
+    super::cover_cold(&mut untouched, &[], total);
+    assert!(untouched.iter().all(|c| c.coverage == Coverage::empty()));
+}

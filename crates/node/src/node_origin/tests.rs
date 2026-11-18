@@ -1172,3 +1172,69 @@ fn trail_counts_saturate() {
     tally.record(OpenDrop::NoAddress);
     assert_eq!(tally.dropped, u16::MAX);
 }
+
+/// Candidate `id` over a path of `rtt_ms`, whose answer proved
+/// `total_bytes_hint` (a served holder) or no size.
+fn candidate(id: u8, rtt_ms: u32, total_bytes_hint: Option<u64>) -> Candidate {
+    Candidate {
+        node_id: [id; 32],
+        rtt_ms,
+        total_bytes_hint,
+        ..holder(Coverage::empty(), None)
+    }
+}
+
+/// The assigned origins are the attested ones, plus the providers only when
+/// they are the origin directory's fallback: a DHT answer's holders are not
+/// origins.
+#[test]
+fn assigned_origins_take_the_providers_only_from_the_directory() {
+    let node = |b: u8| DhtNodeId::from_bytes([b; 32]);
+    let attested = [node(1)];
+    let providers = [node(1), node(2)];
+    assert_eq!(
+        assigned_origins(&attested, CandidateSource::Dht, &providers),
+        vec![node(1)]
+    );
+    assert_eq!(
+        assigned_origins(&attested, CandidateSource::Directory, &providers),
+        vec![node(1), node(2)],
+        "a provider already attested is listed once"
+    );
+    assert_eq!(
+        assigned_origins(&[], CandidateSource::None, &[]),
+        Vec::<DhtNodeId>::new()
+    );
+}
+
+/// The cold tail joins only when no holder is usable, nearest first, and the
+/// ids it returns are the targets it appended.
+#[test]
+fn the_cold_tail_joins_only_without_a_usable_holder_nearest_first() {
+    let hash = [5u8; 32];
+    let cold = || vec![candidate(7, 300, None), candidate(8, 20, None)];
+
+    // A usable holder keeps the cold targets out.
+    let mut ranked = vec![candidate(1, 10, Some(4096))];
+    let ids = append_cold_tail(&mut ranked, cold(), |c| c.total_bytes_hint.is_some(), hash);
+    assert!(ids.is_empty());
+    assert_eq!(ranked.len(), 1);
+
+    // A holder the walk cannot use (here: above the buy cap) does not.
+    let mut ranked = vec![candidate(1, 10, Some(4096))];
+    let ids = append_cold_tail(&mut ranked, cold(), |_| false, hash);
+    assert_eq!(ids, vec![[8; 32], [7; 32]], "nearest first");
+    let order: Vec<[u8; 32]> = ranked.iter().map(|c| c.node_id).collect();
+    assert_eq!(order, vec![[1; 32], [8; 32], [7; 32]], "after the holders");
+
+    // A partial holder serves no span, so the cold targets join after it.
+    let mut ranked = vec![candidate(2, 10, None)];
+    let ids = append_cold_tail(&mut ranked, cold(), |c| c.total_bytes_hint.is_some(), hash);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ranked.len(), 3);
+
+    // No cold target: nothing joins.
+    let mut ranked = Vec::new();
+    assert!(append_cold_tail(&mut ranked, Vec::new(), |_| false, hash).is_empty());
+    assert!(ranked.is_empty());
+}

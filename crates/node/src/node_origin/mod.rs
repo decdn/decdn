@@ -1101,9 +1101,9 @@ impl Origin for NodeOrigin {
                 let assigned =
                     assigned_origins(&discovered.attested, discovered.source, &providers);
                 let Discovery {
-                    ranked,
+                    mut ranked,
                     mut streams,
-                    ..
+                    cold,
                 } = open_and_rank(
                     deps,
                     providers,
@@ -1115,6 +1115,15 @@ impl Origin for NodeOrigin {
                     &mut OpenTally::default(),
                 )
                 .await;
+                // The cold tail joins when no holder the walk can buy from
+                // served the span.
+                let heat = heat_of(deps, hash_bytes);
+                append_cold_tail(
+                    &mut ranked,
+                    cold,
+                    |c| usable_holder(deps, heat, c),
+                    hash_bytes,
+                );
                 let outcome = try_pull(
                     &deps_lock,
                     deps,
@@ -1516,19 +1525,18 @@ async fn discovery_ctx(deps: &NodeOriginDeps) -> Result<PoolContext, (PullMiss, 
     })
 }
 
-/// What one miss's discovery found: the candidates in the order the pull
-/// walks them, the streams of the holders that served the span, and the node
-/// ids of the cold pull-through targets at the tail of `ranked`.
+/// What one miss's discovery found: the ranked holders, the streams of those
+/// that served the span, and the cold pull-through targets.
 pub(super) struct Discovery {
-    /// The ranked holders, then the cold targets, nearest first.
+    /// The ranked holders, partial holders included.
     pub(super) ranked: Vec<Candidate>,
     /// The served holders' streams ([`OpenStreams`]).
     pub(super) streams: OpenStreams,
-    /// The cold targets in `ranked`: assigned origins that answered `NotFound`
-    /// with no block, kept only when no holder served the span. They hold
+    /// Assigned origins that answered `NotFound` with no block. They hold
     /// nothing yet, so they carry no coverage and no size until a pull-through
-    /// open proves the size.
-    pub(super) cold: Vec<[u8; 32]>,
+    /// open proves the size. The caller appends them to `ranked`
+    /// ([`append_cold_tail`]) once it knows no usable holder remains.
+    pub(super) cold: Vec<Candidate>,
 }
 
 /// The answers one discovery's rounds collected.
@@ -1551,10 +1559,9 @@ struct Gathered {
 /// attested origins and the origin directory's. An assigned origin that
 /// answers `NotFound` with no block holds nothing yet but serves the blob from
 /// its own backend once asked to fill it: it is a cold pull-through target,
-/// not an absent peer, so it is not negative-cached. When no holder serves the
-/// span, the cold targets join the ranked list as its tail, nearest first, as
-/// the client's cold order puts them; the pull opens them with the
-/// pull-through flag. While a holder serves the span they are not used.
+/// not an absent peer, so it is not negative-cached. It is returned apart from
+/// the holders, and joins their walk only when no usable holder remains
+/// ([`append_cold_tail`]); the pull opens it with the pull-through flag.
 ///
 /// Under [`OpenGather::CoverageUnion`], a round whose holders cannot span the
 /// blob also opens the `attested` origins and the origin directory's
@@ -1640,10 +1647,8 @@ async fn open_and_rank(
     } = gathered;
     tally.holders = count_u16(candidates.len());
     tally.spans = coverage_spans(hash_bytes, &candidates);
-    let served = candidates.iter().any(|c| c.total_bytes_hint.is_some());
-    let mut ranked = rank(candidates);
+    let ranked = rank(candidates);
     cache_holders(deps, target, &ranked);
-    let cold = append_cold_tail(&mut ranked, cold, served, hash_bytes);
     Discovery {
         ranked,
         streams,
@@ -1679,17 +1684,19 @@ fn cache_holders(deps: &NodeOriginDeps, target: DhtHash, ranked: &[Candidate]) {
     );
 }
 
-/// Append the `cold` targets to `ranked`, nearest first, when no holder
-/// `served` the span, and return their node ids; else drop them.
-fn append_cold_tail(
+/// Append the `cold` targets to `ranked`, nearest first (the client's cold
+/// order, #1911), when no holder in `ranked` is `usable`, and return their
+/// node ids; else drop them. Call it after `ranked` has lost every candidate
+/// the walk never tries (the requester), so a holder the walk would skip does
+/// not hide the cold targets. The cold targets are never cached: they hold
+/// nothing.
+pub(super) fn append_cold_tail(
     ranked: &mut Vec<Candidate>,
     mut cold: Vec<Candidate>,
-    served: bool,
+    usable: impl Fn(&Candidate) -> bool,
     hash_bytes: [u8; 32],
 ) -> Vec<[u8; 32]> {
-    // The cold tail, only when no holder served the span: nearest first, the
-    // client's cold order (#1911). It is never cached: it holds nothing.
-    if served || cold.is_empty() {
+    if cold.is_empty() || ranked.iter().any(usable) {
         return Vec::new();
     }
     cold.sort_by_key(|c| c.rtt_ms);
@@ -2438,6 +2445,27 @@ enum EconGate {
         rate_ceiling: u64,
         speculative: bool,
     },
+}
+
+/// Whether `candidate` is a holder the walk can use: its answer served the
+/// span (it proved the size), and its quote is within this node's buy cap for
+/// the hash's `heat` — the decision [`economic_ceiling`] makes, with none of its
+/// metrics or logs.
+pub(super) fn usable_holder(deps: &NodeOriginDeps, heat: u32, candidate: &Candidate) -> bool {
+    if candidate.total_bytes_hint.is_none() {
+        return false;
+    }
+    let source = crate::warming_allowance::SourceId::from(candidate.node_id);
+    let ctx = crate::serve_economics::ServeEconomicsCtx {
+        sell_rate_per_mb: deps.config.sell_rate_base,
+        operator_bps: deps.config.operator_shares.bps(),
+        heat_estimate: heat,
+        warming_available: deps.config.warming.available(source),
+    };
+    deps.config
+        .serve_economics
+        .max_buy_per_mb(&ctx)
+        .is_none_or(|max_buy| candidate.rate_per_mb <= max_buy)
 }
 
 /// The ADR 041 buy ceiling for one candidate: derive this node's sell rate and the

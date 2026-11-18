@@ -16579,3 +16579,212 @@ async fn a_refusal_at_admission_of_the_adopted_stream_is_backpressure() -> Resul
     shutdown([task_s, task_h], [&leaf_ep, &ep_s, &ep_h]).await?;
     Ok(())
 }
+
+/// Spin up an assigned origin O for `payload`: its store starts empty and only
+/// its filesystem origin holds the blob, with a size proof and no outboard. So
+/// O answers a voucher-less discovery open `NotFound` and serves the blob only
+/// when an open asks it to pull through, which fills its store from its origin
+/// (#1116). Seeds S's lane on `ab_pool_id` keyed by `s_buyer_addr`.
+async fn spawn_fs_origin_node(
+    payload: &[u8],
+    ab_pool_id: B256,
+    s_buyer_addr: Address,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Address,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<CacheMetrics>,
+)> {
+    let (cache, _hash, cache_metrics, origin_tmp, cache_tmp) =
+        cache_with_fs_origin_only(payload).await?;
+    std::mem::forget(origin_tmp);
+    std::mem::forget(cache_tmp);
+    let sk = fresh_key();
+    let id = sk.public();
+    let eth = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        ab_pool_id,
+        s_buyer_addr,
+        eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        u64::MAX,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler = build_handler_full_configured(
+        id,
+        &eth,
+        &metrics,
+        limiter,
+        cache,
+        store as Arc<dyn PoolStateStore>,
+        RATE,
+        &domains,
+        16,
+        |deps| deps.local_populate = Some(Duration::from_secs(20)),
+    )?;
+    let (ep, addr) = local_endpoint(sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task = spawn_a_server(ep.clone(), handler);
+    Ok((id, addr, eth.address(), ep, task, cache_metrics))
+}
+
+/// The serve-miss pull leg reaches a directory origin that needs a fill (#1117
+/// on the ranged path): O answers S's discovery open `NotFound`, S keeps it as
+/// a cold pull-through target rather than negative-caching it, its handshake
+/// pulls through and proves the size, and the run plans every block on it. The
+/// leaf's paid delivery completes and O fills from its origin once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_serve_miss_pulls_through_a_directory_origin_that_needs_a_fill() -> Result<()> {
+    let spans = support::capture_spans();
+    let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let hash = support::register_payload(&payload);
+    let total_bytes = u64::try_from(payload.len())?;
+    let ab_pool_id = B256::repeat_byte(0xA7);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+    let (o_id, o_addr, o_eth, ep_o, task_o, o_cache_metrics) =
+        spawn_fs_origin_node(&payload, ab_pool_id, s_buyer.address()).await?;
+    let o_dht = DhtNodeId::from_bytes(*o_id.as_bytes());
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_pool_id = B256::repeat_byte(0x7A);
+    let (handler_s, s_target, ep_s, _recorded, cache_s, s_operator, _s_metrics, origin_s) =
+        build_serving_node(
+            ab_pool_id,
+            &s_buyer,
+            FixtureDiscovery::directory_only(vec![o_dht], U256::ZERO),
+            CandidateCache::new(),
+            HashMap::from([(o_dht, o_eth)]),
+            &[(o_id, o_addr)],
+            &[(leaf_pool_id, leaf_eth.address())],
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        s_target,
+        leaf_node_id,
+        &leaf_eth,
+        s_operator,
+        leaf_pool_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+    anyhow::ensure!(
+        outcome.completed && outcome.hash_ok && outcome.received == total_bytes,
+        "the leaf's paid delivery must complete through the cold origin"
+    );
+    anyhow::ensure!(
+        cache_s.has(hash).await?,
+        "S must promote the blob on a complete delivery"
+    );
+    anyhow::ensure!(
+        o_cache_metrics.origin_fetches.get() == 1,
+        "O must fill from its origin exactly once, got {}",
+        o_cache_metrics.origin_fetches.get()
+    );
+    anyhow::ensure!(
+        !origin_s.is_suppressed(o_id, hash),
+        "an assigned origin's discovery NotFound must not be negative-cached"
+    );
+    let o = o_id.to_string();
+    let discovery = spans
+        .matching("discovery_open", "hash", &hash.to_string())
+        .into_iter()
+        .filter(|s| {
+            s.fields.get("peer") == Some(&o)
+                && s.fields.get("pull_through").map(String::as_str) == Some("false")
+        })
+        .count();
+    anyhow::ensure!(
+        discovery == 1,
+        "S asks O once without pull-through, got {discovery}"
+    );
+    shutdown([task_s, task_o], [&leaf_ep, &ep_s, &ep_o]).await?;
+    Ok(())
+}
+
+/// A holder that the walk drops does not hide the cold origins. The leaf L is
+/// itself a full holder and S's directory lists it beside the origin O, which
+/// needs a fill. S never pulls from its requester, so once L is gone no usable
+/// holder remains, and O joins as the cold pull-through target that serves the
+/// leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requester_holder_does_not_hide_the_cold_origin() -> Result<()> {
+    let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 241) as u8).collect();
+    let hash = support::register_payload(&payload);
+    let total_bytes = u64::try_from(payload.len())?;
+    let ab_pool_id = B256::repeat_byte(0xA8);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+    let (l_id, l_addr, l_eth, ep_l, task_l, _store_l) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::full(decdn_protocol::num_blocks(total_bytes)),
+        0,
+    )
+    .await?;
+    let (o_id, o_addr, o_eth, ep_o, task_o, o_cache_metrics) =
+        spawn_fs_origin_node(&payload, ab_pool_id, s_buyer.address()).await?;
+    let l_dht = DhtNodeId::from_bytes(*l_id.as_bytes());
+    let o_dht = DhtNodeId::from_bytes(*o_id.as_bytes());
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_pool_id = B256::repeat_byte(0x8A);
+    let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, _s_metrics, _) =
+        build_serving_node(
+            ab_pool_id,
+            &s_buyer,
+            FixtureDiscovery::directory_only(vec![l_dht, o_dht], U256::ZERO),
+            CandidateCache::new(),
+            HashMap::from([(l_dht, l_eth), (o_dht, o_eth)]),
+            &[(l_id, l_addr), (o_id, o_addr)],
+            &[(leaf_pool_id, leaf_eth.address())],
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    // The leaf is L: S's requester, so never S's candidate.
+    let outcome = leaf_paced_pull(
+        &ep_l,
+        s_target,
+        B256::from(*l_id.as_bytes()),
+        &leaf_eth,
+        s_operator,
+        leaf_pool_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+    anyhow::ensure!(
+        outcome.completed && outcome.hash_ok && outcome.received == total_bytes,
+        "the requester's delivery must complete through the cold origin"
+    );
+    anyhow::ensure!(
+        o_cache_metrics.origin_fetches.get() == 1,
+        "O must fill from its origin exactly once, got {}",
+        o_cache_metrics.origin_fetches.get()
+    );
+    shutdown([task_s, task_l, task_o], [&ep_s, &ep_l, &ep_o]).await?;
+    Ok(())
+}
