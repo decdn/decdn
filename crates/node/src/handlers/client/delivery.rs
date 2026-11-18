@@ -262,7 +262,7 @@ impl ClientHandler {
         reader: &mut BufferedProofReader,
         client_node_id: B256,
         rate_per_mb: u64,
-        first_byte: FirstByteClock,
+        mut first_byte: FirstByteClock,
         paid: &mut u64,
     ) -> anyhow::Result<ServeEnd> {
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
@@ -324,8 +324,14 @@ impl ClientHandler {
                     .await;
             }
             Admission::OnFirstProof(adm) => {
-                let (data, ()) =
-                    tokio::try_join!(export, self.await_first_proof(conn, recv, reader))?;
+                // The wait for the proof is the payer's: the first-byte clock
+                // leaves it out. The export's setup that outlasts it stays in.
+                let proof = async {
+                    self.await_first_proof(conn, recv, reader).await?;
+                    anyhow::Ok(std::time::Instant::now())
+                };
+                let (data, proof_at) = tokio::try_join!(export, proof)?;
+                first_byte.mark_first_proof_at(proof_at);
                 match self.admit_on_first_proof(adm).await {
                     Ok(admitted) => (data, admitted),
                     Err(reason) => return self.refuse_admission(send, reason).await,

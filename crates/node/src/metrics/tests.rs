@@ -128,6 +128,58 @@ fn first_byte_clock_records_each_phase_once() {
     }
 }
 
+/// The payer's wait for its first proof is not this node's latency. A hit
+/// that answers before admission and waits ten seconds for the payer's first
+/// proof records only the node's own time: 2 ms to the tier pick, 3 ms to the
+/// response, and 5 ms of admission and first frame after the proof.
+#[test]
+fn first_byte_clock_leaves_out_the_payers_wait() {
+    let metrics = Metrics::new();
+    let ms = Duration::from_millis;
+    let decoded = Instant::now();
+    let mut hit = FirstByteClock::new(decoded, decoded + ms(2), RequestClass::CacheHit);
+    hit.mark_responded_at(decoded + ms(5));
+    hit.mark_first_proof_at(decoded + ms(5) + Duration::from_secs(10));
+    hit.record_at(&metrics, decoded + ms(10) + Duration::from_secs(10));
+
+    let text = metrics.encode().unwrap();
+    for (name, sum) in [
+        ("decdn_serve_first_byte_hit_seconds_sum", 0.01),
+        ("decdn_serve_admission_seconds_sum", 0.002),
+        ("decdn_serve_response_hit_seconds_sum", 0.003),
+        ("decdn_serve_first_frame_hit_seconds_sum", 0.005),
+    ] {
+        let got = text
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.trim().parse::<f64>().ok())
+            .unwrap_or(f64::NAN);
+        assert!((got - sum).abs() < 1e-9, "{name}: {got} != {sum}");
+    }
+    // 10 ms lands in the 0.01 bucket, far below the payer's ten seconds.
+    assert!(has_metric_line(
+        &text,
+        "decdn_serve_first_byte_hit_seconds_bucket{le=\"0.01\"}",
+        1
+    ));
+}
+
+/// A serve with no response mark has no payer wait to leave out.
+#[test]
+fn first_byte_clock_without_a_response_ignores_a_proof_mark() {
+    let metrics = Metrics::new();
+    let decoded = Instant::now();
+    let mut clock = FirstByteClock::new(decoded, decoded, RequestClass::CacheMiss);
+    clock.mark_first_proof_at(decoded + Duration::from_secs(1));
+    clock.record_at(&metrics, decoded + Duration::from_millis(40));
+
+    let text = metrics.encode().unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l == "decdn_serve_first_byte_miss_seconds_sum 0.04"),
+        "the total keeps its 40 ms"
+    );
+}
+
 /// A client waits on a cache miss for at most the outer pull deadline, so a
 /// first byte at the default timeouts must land in a finite bucket.
 #[test]

@@ -1626,14 +1626,13 @@ pub struct DecdnMetrics {
     pub serve_cache_miss: Counter,
     /// `decdn_serve_first_byte_hit_seconds`: time to first byte of a paid serve
     /// the availability gate classed as a hit (complete or partial), from the
-    /// decoded request to the first `ChunkData` frame written. The node sends no
-    /// byte before a proof pays for it, and a hit runs funding admission at the
-    /// payer's first proof. So the window holds the payer's time to that proof
-    /// (a round trip at least, and for an adopted discovery open the requester's
-    /// choice among its candidates), then the load-shed admit and the `getPool`
-    /// and `getAuthorization` chain reads on a view miss. A stream that ends
-    /// before any frame records nothing. Sibling of
-    /// `serve_first_byte_miss_seconds` on the cache-class axis.
+    /// decoded request to the first `ChunkData` frame written. It measures this
+    /// node's latency only. A hit answers before funding admission and waits
+    /// for the payer's first proof; the clock leaves that wait out
+    /// (`FirstByteClock`). The admission after the proof stays in: the
+    /// load-shed admit and the `getPool` and `getAuthorization` chain reads on a
+    /// view miss. A stream that ends before any frame records nothing. Sibling
+    /// of `serve_first_byte_miss_seconds` on the cache-class axis.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_byte_hit_seconds: Histogram,
     /// `decdn_serve_first_byte_miss_seconds`: time to first byte of a paid serve
@@ -1641,7 +1640,8 @@ pub struct DecdnMetrics {
     /// `serve_first_byte_hit_seconds`, which here also covers the upstream or
     /// origin fill that produces the first frame. A pull-through miss runs
     /// funding admission and discovery before it answers. An own-origin serve
-    /// answers first and admits at the payer's first proof, as a hit does. A
+    /// answers first and admits at the payer's first proof, as a hit does, and
+    /// the clock leaves its wait for that proof out. A
     /// window-paced fill streams its first frame early; a buffered fill
     /// completes the whole blob first, so on that tier the value grows with
     /// blob size.
@@ -1690,19 +1690,19 @@ pub struct DecdnMetrics {
     pub serve_response_miss_seconds: Histogram,
     /// `decdn_serve_first_frame_hit_seconds`: the first-frame phase of a paid
     /// hit, from the `StreamResponse` written to the first `ChunkData` frame
-    /// written. It covers the wait for the payer's first proof, funding
-    /// admission at that proof (the load-shed admit, and the chain reads on a
-    /// view miss), and the read and encode of the whole first frame. The wait
-    /// is the payer's: a round trip at least, and for an adopted discovery open
-    /// the requester's choice among its candidates.
+    /// written, less the wait for the payer's first proof, which is the
+    /// payer's time. It covers funding admission at that proof (the load-shed
+    /// admit, and the chain reads on a view miss) and the read and encode of
+    /// the whole first frame.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_frame_hit_seconds: Histogram,
     /// `decdn_serve_first_frame_miss_seconds`: the first-frame phase of a paid
     /// miss, from the `StreamResponse` written to the first `ChunkData` frame
-    /// written. It covers the wait for the payer's first proof. An own-origin
-    /// serve runs funding admission at that proof. On a window-paced fill the
-    /// phase also covers the pull leg filling the whole first frame from
-    /// upstream or origin.
+    /// written. An own-origin serve runs funding admission at the payer's first
+    /// proof, and the phase leaves out its wait for that proof. A pull-through
+    /// miss is admitted before it answers. On a window-paced fill the phase
+    /// covers the pull leg filling the whole first frame from upstream or
+    /// origin.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_frame_miss_seconds: Histogram,
     /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
@@ -4085,11 +4085,20 @@ impl Drop for ConnectionGuard<'_> {
 /// pull-through miss and in the first-frame phase on every other serve, at the
 /// payer's first proof. Each phase records into its own histogram, and a
 /// `debug` event carries all three.
+///
+/// The clock measures this node's latency only. An open that answers before
+/// admission waits for the payer's first proof, and that wait is the payer's:
+/// a round trip at least, and for a discovery open the requester's choice
+/// among its candidates. [`Self::mark_first_proof_at`] takes the span from the
+/// response written to the proof out of the first-frame phase and the total.
 #[derive(Debug)]
 pub(crate) struct FirstByteClock {
     started: Instant,
     admitted: Instant,
     responded: Option<Instant>,
+    /// The payer's wait for an open that answers before admission: from the
+    /// response written to the payer's first proof. Zero for any other serve.
+    payer_wait: Duration,
     class: RequestClass,
 }
 
@@ -4101,28 +4110,58 @@ impl FirstByteClock {
             started,
             admitted,
             responded: None,
+            payer_wait: Duration::ZERO,
             class,
         }
     }
 
     /// Mark the signed `StreamResponse` written.
     pub(crate) fn mark_responded(&mut self) {
-        self.responded = Some(Instant::now());
+        self.mark_responded_at(Instant::now());
+    }
+
+    /// Mark the signed `StreamResponse` written at `at`.
+    pub(crate) const fn mark_responded_at(&mut self, at: Instant) {
+        self.responded = Some(at);
+    }
+
+    /// Mark the payer's first proof arrived, for an open that answered before
+    /// admission. See [`Self::mark_first_proof_at`].
+    pub(crate) fn mark_first_proof(&mut self) {
+        self.mark_first_proof_at(Instant::now());
+    }
+
+    /// Mark the payer's first proof arrived at `at`, for an open that answered
+    /// before admission. The span from the response written to `at` is the
+    /// payer's, so the clock leaves it out of the first-frame phase and the
+    /// total. The deferred admission that runs after the proof stays in. Without
+    /// a response mark, there is no wait to leave out.
+    pub(crate) fn mark_first_proof_at(&mut self, at: Instant) {
+        if let Some(responded) = self.responded {
+            self.payer_wait = at.saturating_duration_since(responded);
+        }
     }
 
     /// Record the time since the clock started and each phase: the first frame
     /// is written. Without a response mark, only the admission phase and the
     /// total record.
     pub(crate) fn record(self, metrics: &Metrics) {
-        let now = Instant::now();
-        let total = now.saturating_duration_since(self.started);
+        self.record_at(metrics, Instant::now());
+    }
+
+    /// [`Self::record`] with the first frame written at `now`.
+    fn record_at(self, metrics: &Metrics, now: Instant) {
+        let total = now
+            .saturating_duration_since(self.started)
+            .saturating_sub(self.payer_wait);
         let admission = self.admitted.saturating_duration_since(self.started);
         let m = &metrics.decdn;
         m.serve_admission_seconds.observe(admission.as_secs_f64());
         let phases = self.responded.map(|responded| {
             (
                 responded.saturating_duration_since(self.admitted),
-                now.saturating_duration_since(responded),
+                now.saturating_duration_since(responded)
+                    .saturating_sub(self.payer_wait),
             )
         });
         let (first_byte, response, first_frame) = match self.class {

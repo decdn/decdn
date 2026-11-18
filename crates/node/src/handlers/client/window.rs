@@ -725,6 +725,9 @@ impl ClientHandler {
         if let Err(e) = self.await_first_proof(conn, &mut recv, &mut reader).await {
             return Err(super::wire::tag_frame_seen(e, &reader));
         }
+        // The wait for the proof is the payer's: the first-byte clock leaves it
+        // out.
+        first_byte.mark_first_proof();
         let Admitted {
             lane_key,
             lane,
