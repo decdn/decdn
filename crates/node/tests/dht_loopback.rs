@@ -449,8 +449,7 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
 // a deliberately malformed/unsupported request and assert the server
 // closes the stream with the expected QUIC application error code. The
 // codes themselves are protocol-wide constants in
-// `crates/protocol/src/lib.rs` and `crates/node/src/handlers/probe.rs`;
-// the mapping for `cdn/dht/v1` lives in `handlers/dht.rs::frame_err_code`
+// `crates/protocol/src/lib.rs`; the mapping for `cdn/dht/v1` lives in `handlers/dht.rs::frame_err_code`
 // + `read_dht_request`.
 
 mod adr_013_error_codes {

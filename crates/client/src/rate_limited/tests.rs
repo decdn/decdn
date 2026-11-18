@@ -101,7 +101,7 @@ fn transport_error_types_a_shed_and_keeps_plain_text_otherwise() -> anyhow::Resu
         "open_bi failed",
         app_close(APP_ERR_RATE_LIMITED, b"global-full"),
     )
-    .context("probe candidate");
+    .context("discovery open");
     let sentinel = shed
         .downcast_ref::<UpstreamRateLimited>()
         .ok_or_else(|| anyhow::anyhow!("sentinel lost: {shed:#}"))?;
@@ -118,11 +118,11 @@ fn transport_error_types_a_shed_and_keeps_plain_text_otherwise() -> anyhow::Resu
 /// its `Display` names the clock.
 #[test]
 fn a_timestamp_refusal_is_typed_through_every_chain_shape() {
-    let close = timestamp_rejected(&app_close(APP_ERR_TIMESTAMP_SKEW, b"probe-error"));
+    let close = timestamp_rejected(&app_close(APP_ERR_TIMESTAMP_SKEW, b"open-error"));
     assert_eq!(
         close,
         Some(UpstreamTimestampRejected {
-            label: Some("probe-error".to_owned())
+            label: Some("open-error".to_owned())
         })
     );
     let reset = ReadError::Reset(VarInt::from_u32(APP_ERR_TIMESTAMP_SKEW));
@@ -152,9 +152,9 @@ fn transport_error_types_a_timestamp_refusal_and_leaves_unknown_codes_plain() ->
 {
     let rejected = transport_error(
         "read response",
-        app_close(APP_ERR_TIMESTAMP_SKEW, b"probe-error"),
+        app_close(APP_ERR_TIMESTAMP_SKEW, b"open-error"),
     )
-    .context("probe candidate");
+    .context("discovery open");
     rejected
         .downcast_ref::<UpstreamTimestampRejected>()
         .ok_or_else(|| anyhow::anyhow!("sentinel lost: {rejected:#}"))?;

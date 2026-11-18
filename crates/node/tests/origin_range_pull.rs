@@ -339,10 +339,9 @@ fn decode_bao_range(
     Ok(slice.to_vec())
 }
 
-/// The CLI's header-only open ahead of a multi-source fetch
-/// (`probe_admitted_total`): a bound `(0, 0)` request,
-/// read the signed `StreamResponse` for `total_bytes`, then close the connection
-/// without paying or reading a byte. Returns the advertised total.
+/// The CLI's header-only open ahead of a multi-source fetch: a bound `(0, 0)`
+/// request, read the signed `StreamResponse` for `total_bytes`, then close the
+/// connection without paying or reading a byte. Returns the advertised total.
 async fn throwaway_open(
     client_ep: &iroh::Endpoint,
     target: EndpointAddr,
@@ -3362,9 +3361,9 @@ async fn a_bounded_miss_seeds_only_the_held_ranges_inside_it() -> anyhow::Result
 }
 
 /// SERVE-LEVEL NO-HANG: an origin fetch failure on the own-origin serve-miss path
-/// must FAIL the serve, not hang it. Dispatch confirms serviceability (origin size,
-/// published outboard and the ranged first-group probe succeed) and signs `ok:true`,
-/// but the ranged data GET the
+/// must FAIL the serve, not hang it. Dispatch signs `ok:true` from the origin size
+/// and the outboard's `HEAD`, admission's ranged first-group probe succeeds, but
+/// the ranged data GET the
 /// local pull leg draws returns `500` — so `origin_range_wire` errors, the pull
 /// leg records a terminal `pull_result`/`pull_ended`, and the serve leg races that
 /// terminal against its present-range watch and FAILS the gap it is waiting on. The
@@ -3391,8 +3390,8 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
         )
         .mount(&server)
         .await;
-    // (2) outboard GET SUCCEEDS: the outboard half of serviceability. With the
-    //     range probe below, dispatch signs `ok:true` and commits to the two-leg
+    // (2) outboard HEAD and GET SUCCEED: dispatch signs `ok:true` from the
+    //     HEAD, and with the range probe below admission commits to the two-leg
     //     serve.
     mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))

@@ -556,7 +556,7 @@ impl<P, F, O> Streamer<'_, P, F, O> {
     }
 
     /// Start the stream from `holders`, in preference order, instead of
-    /// discovering them. A probe's measured holders go here.
+    /// discovering them. A discovery round's measured holders go here.
     #[must_use]
     pub fn holders(mut self, holders: Vec<Holder>) -> Self {
         self.holders = holders;

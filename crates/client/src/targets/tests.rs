@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use iroh::Endpoint;
 use std::sync::Arc;
 
-/// [`no_serve_target_error`] over the five counts a probe round tallies.
+/// [`no_serve_target_error`] over the five counts a discovery round tallies.
 fn nst(
     asked: usize,
     unreachable: usize,
@@ -40,7 +40,7 @@ fn no_serve_target_error_names_rate_limited_nodes_apart_from_silent_ones() {
     assert!(msg.contains("3 did not answer, 0 answered"), "{msg}");
 }
 
-/// When at least three probed nodes, and most of them, refuse this machine's
+/// When at least three opened nodes, and most of them, refuse this machine's
 /// timestamp, the failure is a [`ResolveConfigFault`] that names the clock and
 /// ends the command. Below that threshold any node can send the unsigned code
 /// at will, so one or two refusals stay the ordinary error, which counts them
@@ -48,15 +48,15 @@ fn no_serve_target_error_names_rate_limited_nodes_apart_from_silent_ones() {
 #[test]
 fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp() {
     assert_eq!(CLOCK_SKEW_FATAL_MIN, 3);
-    for (probed, unreachable, skewed) in [(3, 0, 3), (4, 1, 3), (5, 0, 4)] {
-        let err = nst(probed, unreachable, 0, 0, skewed);
+    for (opened, unreachable, skewed) in [(3, 0, 3), (4, 1, 3), (5, 0, 4)] {
+        let err = nst(opened, unreachable, 0, 0, skewed);
         assert!(
             err.downcast_ref::<ResolveConfigFault>().is_some(),
-            "{skewed} of {probed} clock refusals is this machine's fault: {err:#}"
+            "{skewed} of {opened} clock refusals is this machine's fault: {err:#}"
         );
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("{skewed} of {probed} asked node(s) refused")),
+            msg.contains(&format!("{skewed} of {opened} asked node(s) refused")),
             "{msg}"
         );
         assert!(msg.contains("Check this machine's clock"), "{msg}");
@@ -72,11 +72,11 @@ fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp(
 
     // One or two refusers never end the command, even as a majority; three
     // that are not a majority do not either.
-    for (probed, unreachable, skewed) in [(1, 0, 1), (2, 0, 2), (3, 1, 2), (4, 3, 1), (7, 4, 3)] {
-        let err = nst(probed, unreachable, 0, 0, skewed);
+    for (opened, unreachable, skewed) in [(1, 0, 1), (2, 0, 2), (3, 1, 2), (4, 3, 1), (7, 4, 3)] {
+        let err = nst(opened, unreachable, 0, 0, skewed);
         assert!(
             err.downcast_ref::<ResolveConfigFault>().is_none(),
-            "{skewed} of {probed} refusals must not end the command: {err:#}"
+            "{skewed} of {opened} refusals must not end the command: {err:#}"
         );
         let msg = err.to_string();
         assert!(
@@ -111,52 +111,52 @@ fn a_round_tallies_a_timestamp_refusal_apart_from_silence() {
     );
 }
 
-/// A probe outcome after `ms` on the paused clock: `(id, holder)`.
+/// An open outcome after `ms` on the paused clock: `(id, holder)`.
 async fn answer_after(ms: u64, id: u32, holder: bool) -> (u32, bool) {
     tokio::time::sleep(Duration::from_millis(ms)).await;
     (id, holder)
 }
 
-/// Every probe that answers within the grace after the first holder is kept.
+/// Every open that answers within the grace after the first holder is kept.
 #[tokio::test(start_paused = true)]
 async fn settle_keeps_every_answer_inside_the_grace() {
     let grace = Duration::from_millis(250);
-    let probes = vec![
+    let opens = vec![
         answer_after(20, 1, true),
         answer_after(150, 2, false),
         answer_after(260, 3, true),
     ];
-    let (mut got, tail) = settle_opens(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(opens, grace, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false), (3, true)]);
     assert!(tail.is_empty());
 }
 
-/// A probe still pending at the first holder's answer plus the grace is
+/// An open still pending at the first holder's answer plus the grace is
 /// left in the tail, and the round ends at that moment.
 #[tokio::test(start_paused = true)]
 async fn settle_leaves_a_straggler_past_the_grace_in_the_tail() {
     let grace = Duration::from_millis(250);
     let started = tokio::time::Instant::now();
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, true),
         answer_after(170, 2, false),
         answer_after(1850, 3, true),
     ];
-    let (mut got, tail) = settle_opens(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(opens, grace, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false)]);
     assert_eq!(tail.len(), 1);
     assert_eq!(started.elapsed(), Duration::from_millis(275));
 }
 
-/// With no holder, the round waits for every probe.
+/// With no holder, the round waits for every open.
 #[tokio::test(start_paused = true)]
-async fn settle_waits_for_every_probe_without_a_holder() {
+async fn settle_waits_for_every_open_without_a_holder() {
     let grace = Duration::from_millis(250);
     let started = tokio::time::Instant::now();
-    let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
-    let (got, tail) = settle_opens(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let opens = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+    let (got, tail) = settle_opens(opens, grace, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got.len(), 2);
     assert!(tail.is_empty());
     assert_eq!(started.elapsed(), Duration::from_millis(1850));
@@ -168,12 +168,12 @@ async fn settle_waits_for_every_probe_without_a_holder() {
 async fn settle_streams_from_the_first_holder() {
     use futures_util::StreamExt as _;
     let started = tokio::time::Instant::now();
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, true),
         answer_after(170, 2, false),
         answer_after(1850, 3, true),
     ];
-    let (got, mut tail) = settle_opens(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+    let (got, mut tail) = settle_opens(opens, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, true)]);
     assert_eq!(started.elapsed(), Duration::from_millis(25));
     let mut late = Vec::new();
@@ -187,12 +187,12 @@ async fn settle_streams_from_the_first_holder() {
 /// left in the tail.
 #[tokio::test(start_paused = true)]
 async fn settle_collects_answers_ready_with_the_first_holder() {
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, true),
         answer_after(25, 2, false),
         answer_after(900, 3, true),
     ];
-    let (mut got, tail) = settle_opens(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(opens, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false)]);
     assert_eq!(tail.len(), 1);
@@ -256,12 +256,12 @@ async fn late_opens_stop_when_dropped() {
     assert_eq!(*answered.lock().unwrap(), None);
 }
 
-/// Without a cold cutoff, a round with no holder waits for every probe and
+/// Without a cold cutoff, a round with no holder waits for every open and
 /// leaves no tail.
 #[tokio::test(start_paused = true)]
-async fn settle_without_a_cold_cutoff_waits_for_every_probe() {
-    let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
-    let (got, tail) = settle_opens(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+async fn settle_without_a_cold_cutoff_waits_for_every_open() {
+    let opens = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+    let (got, tail) = settle_opens(opens, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got.len(), 2);
     assert!(tail.is_empty());
 }
@@ -272,13 +272,13 @@ async fn settle_without_a_cold_cutoff_waits_for_every_probe() {
 async fn settle_cold_cutoff_returns_the_non_holders_in_hand() {
     use futures_util::StreamExt as _;
     let started = tokio::time::Instant::now();
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, false),
         answer_after(100, 2, false),
         answer_after(1850, 3, true),
     ];
     let cold = Some(Duration::from_millis(250));
-    let (got, mut tail) = settle_opens(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+    let (got, mut tail) = settle_opens(opens, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, false), (2, false)]);
     assert_eq!(started.elapsed(), Duration::from_millis(275));
     assert_eq!(tail.next().await, Some((3, true)));
@@ -289,33 +289,27 @@ async fn settle_cold_cutoff_returns_the_non_holders_in_hand() {
 #[tokio::test(start_paused = true)]
 async fn settle_cold_cutoff_yields_to_a_holder() {
     let started = tokio::time::Instant::now();
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, false),
         answer_after(120, 2, true),
         answer_after(1850, 3, false),
     ];
     let cold = Some(Duration::from_millis(250));
-    let (got, tail) = settle_opens(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+    let (got, tail) = settle_opens(opens, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, false), (2, true)]);
     assert_eq!(started.elapsed(), Duration::from_millis(120));
     assert_eq!(tail.len(), 1);
 }
 
-/// Only a verified answer opens the cold window: a failed probe does not.
+/// Only a verified answer opens the cold window: a failed open does not.
 #[tokio::test(start_paused = true)]
-async fn settle_cold_cutoff_ignores_failed_probes() {
+async fn settle_cold_cutoff_ignores_failed_opens() {
     let started = tokio::time::Instant::now();
-    // `(id, holder)`; id 9 stands for a failed probe.
-    let probes = vec![answer_after(10, 9, false), answer_after(600, 1, false)];
+    // `(id, holder)`; id 9 stands for a failed open.
+    let opens = vec![answer_after(10, 9, false), answer_after(600, 1, false)];
     let cold = Some(Duration::from_millis(250));
-    let (got, tail) = settle_opens(
-        probes,
-        Duration::ZERO,
-        cold,
-        |&(_, h)| h,
-        |&(id, _)| id != 9,
-    )
-    .await;
+    let (got, tail) =
+        settle_opens(opens, Duration::ZERO, cold, |&(_, h)| h, |&(id, _)| id != 9).await;
     assert_eq!(got.len(), 2);
     assert!(tail.is_empty());
     assert_eq!(started.elapsed(), Duration::from_millis(600));
@@ -488,13 +482,15 @@ fn harvest_candidate(b: u8) -> NodeCandidate {
 async fn harvest_persists_identity_and_stats() {
     let dir = tempfile::tempdir().expect("tempdir");
     let regs = vec![harvest_candidate(1), harvest_candidate(2)];
-    let probed = vec![(harvest_key(1), 42.0_f64, 9_u64)];
-    let handle = spawn_harvest(dir.path(), regs, probed);
+    let discovered = vec![(harvest_key(1), 42.0_f64, 9_u64)];
+    let handle = spawn_harvest(dir.path(), regs, discovered);
     handle.await.expect("harvest task join");
 
     let store = crate::PeerStore::open(dir.path());
     assert!(store.get(&harvest_key(2)).is_some());
-    let r = store.get(&harvest_key(1)).expect("probed peer persisted");
+    let r = store
+        .get(&harvest_key(1))
+        .expect("discovered peer persisted");
     assert_eq!(r.latency_ms, Some(42.0));
     assert_eq!(r.rate_per_mb, Some(9));
 }
@@ -506,9 +502,9 @@ fn harvest_counts_every_write_the_store_refuses() {
     std::fs::write(dir.path().join("peers"), b"").expect("block the store dir");
     let store = crate::PeerStore::open(dir.path());
     let regs = vec![harvest_candidate(1), harvest_candidate(2)];
-    let probed = vec![(harvest_key(1), 42.0_f64, 9_u64)];
+    let discovered = vec![(harvest_key(1), 42.0_f64, 9_u64)];
     let cfg = crate::StoreConfig::default();
-    let tally = harvest(&store, &regs, probed, now_secs(), &cfg);
+    let tally = harvest(&store, &regs, discovered, now_secs(), &cfg);
     assert_eq!(
         tally,
         HarvestTally {
@@ -547,7 +543,7 @@ fn select_with_widening_widens_when_allowlist_starves() {
 
 /// `identity_fresh_candidates` gathers cached peers whose identity is fresh
 /// (within the refresh horizon) and not suppressed/prunable, regardless of
-/// latency freshness — the set the registry-read-skip path re-probes.
+/// latency freshness — the set the registry-read-skip path re-opens.
 #[test]
 fn identity_fresh_candidates_gathers_latency_stale_peers() -> anyhow::Result<()> {
     let cfg = crate::StoreConfig::default();
@@ -635,9 +631,9 @@ fn a_pinned_open_hints_only_a_verified_holder_size() {
 
 /// `store_fast_path` ranks selectable records by latency and excludes a
 /// suppressed one, and refuses to engage below `min_fresh_candidates`. It
-/// probes nothing, so it carries no size hint (#2218).
+/// opens nothing, so it carries no size hint (#2218).
 /// It takes no [`Endpoint`], so it structurally cannot issue a network
-/// probe — this is the probe-less fast path itself, not merely tested
+/// open — this is the open-less fast path itself, not merely tested
 /// without one.
 #[test]
 fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
@@ -666,7 +662,7 @@ fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
     assert_eq!(targets.opened.len(), 0, "the fast path opens nothing");
     assert!(
         targets.size_hint.is_none(),
-        "nothing was probed, so the first claim comes from a header open"
+        "nothing was opened, so the first claim comes from a header open"
     );
 
     // Only two selectable records -> below min_fresh_candidates -> None.
@@ -923,7 +919,7 @@ fn failover_order_empty_when_no_holder_and_no_non_holder() {
 /// `failover_order`'s `coverage_by_node` carries each holder's REAL measured
 /// coverage (#1506) — not `Coverage::full` for every lane: disjoint
 /// per-holder coverage {block0}/{block1} survives into the map keyed by
-/// `node_id`, and a node that was never probed (e.g. a proxy) has no entry
+/// `node_id`, and a node that was never opened (e.g. a proxy) has no entry
 /// at all.
 #[test]
 fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
@@ -939,7 +935,7 @@ fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
     // Sanity: the two holders' coverage is genuinely different, not both
     // collapsed to the same (e.g. full) value.
     assert_ne!(h1.coverage, h2.coverage);
-    // A node that was never probed has no entry.
+    // A node that was never opened has no entry.
     assert!(!out.coverage_by_node.contains_key(&node_key(99)));
 }
 
@@ -952,7 +948,7 @@ fn rate_hints_prefer_the_answer_then_the_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = crate::PeerStore::open(dir.path());
     let cfg = crate::StoreConfig::default();
-    // The store knows b at 40; a's probe sample (1) wins over its store rate.
+    // The store knows b at 40; a's discovery sample (1) wins over its store rate.
     store.record_sample(&node_a.node_id, 10.0, 99, now_secs(), &cfg)?;
     store.record_sample(&node_b.node_id, 20.0, 40, now_secs(), &cfg)?;
     targets.samples = vec![(node_a.node_id, 10.0, 1)];
@@ -960,7 +956,7 @@ fn rate_hints_prefer_the_answer_then_the_store() -> anyhow::Result<()> {
     let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
     assert_eq!(got, vec![(node_a.eth_address, 1), (node_b.eth_address, 40)]);
 
-    // A node neither probed nor recorded gives no hint.
+    // A node neither opened nor recorded gives no hint.
     let empty = tempfile::tempdir()?;
     let hints = targets.rate_hints(&crate::PeerStore::open(empty.path()));
     let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
@@ -1316,13 +1312,13 @@ async fn a_late_answer_keeps_its_facts_and_cancels_its_stream() -> anyhow::Resul
         .take()
         .ok_or_else(|| anyhow::anyhow!("a streamed tail"))?;
     match late.tail.next().await {
-        Some(OpenOutcome::Holder(probed, _)) => {
+        Some(OpenOutcome::Holder(discovered, _)) => {
             assert_eq!(
-                probed.total_bytes.map(ProvenSize::get),
+                discovered.total_bytes.map(ProvenSize::get),
                 Some(u64::try_from(blob.len())?)
             );
-            assert_eq!(probed.rate_per_mb, 4);
-            assert!(!probed.coverage.is_empty());
+            assert_eq!(discovered.rate_per_mb, 4);
+            assert!(!discovered.coverage.is_empty());
         }
         _ => anyhow::bail!("the late holder keeps its facts"),
     }
@@ -1452,9 +1448,9 @@ async fn a_not_found_with_held_blocks_is_a_partial_holder() -> anyhow::Result<()
     )
     .await;
     match classify_open(&partial_cand, res, 0) {
-        (OpenOutcome::Holder(probed, _), None) => {
-            assert_eq!(probed.coverage, held);
-            assert!(probed.total_bytes.is_none(), "a refusal proves no size");
+        (OpenOutcome::Holder(discovered, _), None) => {
+            assert_eq!(discovered.coverage, held);
+            assert!(discovered.total_bytes.is_none(), "a refusal proves no size");
         }
         _ => anyhow::bail!("a NotFound with held blocks is a partial holder with no stream"),
     }
@@ -1484,7 +1480,7 @@ async fn a_not_found_with_held_blocks_is_a_partial_holder() -> anyhow::Result<()
         .iter()
         .find(|h| h.provider == partial_cand.eth_address)
         .ok_or_else(|| anyhow::anyhow!("the partial holder is a holder"))?;
-    assert!(partial_holder.probed_holder);
+    assert!(partial_holder.discovered_holder);
     assert_eq!(partial_holder.coverage.as_ref(), Some(&held));
     client.close().await;
     Ok(())

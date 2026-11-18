@@ -317,7 +317,7 @@ pub(crate) fn refuses_timestamp(err: &anyhow::Error) -> bool {
 /// Whether `err` is a source saying it does not hold the blob. On the wire the
 /// same `NotFound` also means load shed or a pool the node cannot confirm yet,
 /// so a [`crate::SourceSet`] counts it against a pull-through target only
-/// ([`crate::Holder::probed_holder`]).
+/// ([`crate::Holder::discovered_holder`]).
 #[must_use]
 pub fn says_absent(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamRefused>()

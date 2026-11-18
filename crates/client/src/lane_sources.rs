@@ -1136,27 +1136,27 @@ pub(crate) fn late_join(
 /// `connect`, or `None` when `nodes` already has a node of the join's
 /// operator: one node per operator, and the node the set already has answered
 /// first, as in [`holders_from`]. A holder carries its answered coverage; a
-/// warming proxy carries none and is not a probed holder.
+/// warming proxy carries none and is not a discovered holder.
 pub(crate) fn admit_late(
     nodes: &mut HashMap<Address, NodeCandidate>,
     join: LateJoin,
 ) -> Option<Holder> {
     let (candidate, holder) = match join {
-        LateJoin::Holder(probed) => {
+        LateJoin::Holder(discovered) => {
             let holder = Holder {
-                provider: probed.candidate.eth_address,
-                coverage: Some(probed.coverage),
-                rtt_ms: probed.rtt_ms,
-                probed_holder: true,
+                provider: discovered.candidate.eth_address,
+                coverage: Some(discovered.coverage),
+                rtt_ms: discovered.rtt_ms,
+                discovered_holder: true,
             };
-            (probed.candidate, holder)
+            (discovered.candidate, holder)
         }
         LateJoin::Proxy(proxy) => {
             let holder = Holder {
                 provider: proxy.eth_address,
                 coverage: None,
                 rtt_ms: proxy.rtt_ms,
-                probed_holder: false,
+                discovered_holder: false,
             };
             let candidate = NodeCandidate {
                 node_id: proxy.node_id,
@@ -1180,7 +1180,7 @@ pub(crate) fn admit_late(
 /// Each holder carries its answered coverage (`None`, a full holder, when
 /// nothing was measured) and its measured RTT, or its rank in the order when
 /// it was not asked. A candidate with measured coverage, and a pinned
-/// `--node-id`, is a probed holder ([`Holder::probed_holder`]); a
+/// `--node-id`, is a discovered holder ([`Holder::discovered_holder`]); a
 /// pull-through or proxy-warming target and a peer-store fast-path candidate
 /// are not. Each holder's node goes into `nodes`, keyed by provider, and
 /// replaces the node a rediscovery found for that operator before, so the next
@@ -1216,7 +1216,7 @@ pub(crate) fn holders_from(
         let coverage = targets.coverage_by_node.get(&candidate.node_id).cloned();
         holders.push(Holder {
             provider: candidate.eth_address,
-            probed_holder: targets.pinned || coverage.is_some(),
+            discovered_holder: targets.pinned || coverage.is_some(),
             coverage,
             rtt_ms,
         });

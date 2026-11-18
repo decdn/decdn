@@ -2,7 +2,7 @@
 //! *part* of a blob must serve a `cdn/client/v1` request that falls entirely
 //! within its cached ranges directly from cache, without attempting any
 //! fill/pull-through — the counterpart to the will-serve coverage a partial
-//! holder now advertises (probe/DHT, #1506 tasks 2-3). Before this gate,
+//! holder now advertises (discovery opens and the DHT, #1506 tasks 2-3). Before this gate,
 //! `serve_audit` is `Complete`-only, so a partial holder always fell into the
 //! miss path and terminated `NotFound` even for bytes it already has.
 //!

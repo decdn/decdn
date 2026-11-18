@@ -6,7 +6,7 @@
 //! delivery
 //! like any other: a source that faults cools and another is tried, a lane
 //! build that fails backs off, a pull-through target that keeps saying it
-//! lacks the blob is marked absent ([`crate::Holder::probed_holder`]), and
+//! lacks the blob is marked absent ([`crate::Holder::discovered_holder`]), and
 //! discovery runs when nothing can start. The open ends on a
 //! header, a fatal fault, a unanimous verdict of the sources, or the stop
 //! policy. A lane build still in flight when the open ends is awaited for a

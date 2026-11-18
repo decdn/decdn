@@ -224,11 +224,11 @@ async fn a_rejection_healed_past_the_budget_moves_the_open() -> anyhow::Result<(
     Ok(())
 }
 
-/// Pull-through targets (not probed holders) that each say `NotFound`
+/// Pull-through targets (not discovered holders) that each say `NotFound`
 /// often enough are absent, and the open ends.
 #[tokio::test(start_paused = true)]
 async fn every_source_saying_not_found_ends_with_no_source_has_blob() -> anyhow::Result<()> {
-    let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?.not_probed();
+    let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?.undiscovered();
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
     let err = open_first(&mut set, &policy(None), |_lane| async {
         Err::<(), _>(not_found())
@@ -240,10 +240,10 @@ async fn every_source_saying_not_found_ends_with_no_source_has_blob() -> anyhow:
     Ok(())
 }
 
-/// A sole probed holder that says `NotFound` twice (a load shed, say) and
+/// A sole discovered holder that says `NotFound` twice (a load shed, say) and
 /// then answers is waited for, not marked absent.
 #[tokio::test(start_paused = true)]
-async fn a_probed_holder_saying_not_found_twice_then_answers() -> anyhow::Result<()> {
+async fn a_discovered_holder_saying_not_found_twice_then_answers() -> anyhow::Result<()> {
     let sources = StaticSources::new(vec![lane(0xA1)])?;
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
     let calls = AtomicU32::new(0);

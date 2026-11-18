@@ -52,7 +52,7 @@ impl ClientHandler {
 
     /// Attempt to fill a cache miss by pulling from an upstream node (#831). The
     /// cache engine's `NodeOrigin` (last in the origin chain) does the discovery
-    /// → probe → ranked paid pull → populate; here we trigger it via
+    /// → discovery opens → ranked paid pull → populate; here we trigger it via
     /// `cache.populate` (which fills the store WITHOUT returning the blob or
     /// bumping `bytes_returned` — this is an internal fill, not client egress),
     /// bounded by `timeout` so a slow upstream can't pin the delivery path. The

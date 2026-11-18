@@ -859,7 +859,7 @@ fn a_rate_limit_shed_is_suppressed_not_scored() {
 /// unreachable on the strength of a local fault.
 #[test]
 fn a_timestamp_refusal_is_not_scored_unreachable() {
-    for label in [Some("probe-error".to_owned()), None] {
+    for label in [Some("open-error".to_owned()), None] {
         let refused = anyhow::Error::new(UpstreamTimestampRejected { label })
             .context("read response")
             .context("pull from candidate");

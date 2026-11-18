@@ -276,7 +276,7 @@ pub struct AcquireTarget<'a, St> {
     pub store: &'a St,
     /// The blob's BLAKE3 root.
     pub hash: [u8; 32],
-    /// The blob's proven size: a probe answer's or a header's. The store
+    /// The blob's proven size: a discovery answer's or a header's. The store
     /// records it as proven before the first leg opens.
     pub total_bytes: crate::ProvenSize,
     /// The `(offset, len)` byte ranges to fill. A range with a zero length is
@@ -885,7 +885,7 @@ struct Work {
     /// Per-lane block coverage: what a lane prefers to pick, and the only
     /// ranges it steals from ([`Work::pick`]).
     coverage: Vec<Coverage>,
-    /// `measured[i]` is `true` when lane `i`'s coverage is a probed bitmap.
+    /// `measured[i]` is `true` when lane `i`'s coverage is a answered bitmap.
     /// A lane without one holds the whole blob, so its coverage follows the
     /// bound when a proven size moves it ([`Work::grow_coverage`]).
     measured: Vec<bool>,
@@ -912,7 +912,7 @@ struct Work {
     /// The blob the work fetches. Steal logs name it.
     hash: [u8; 32],
     /// The furthest byte the requested ranges reach ([`Want::reach`]). A lane
-    /// without a probed bitmap covers the blocks up to it, not the whole
+    /// without a answered bitmap covers the blocks up to it, not the whole
     /// proven size, so a small window of a huge blob sizes no huge bitmap.
     coverage_reach: u64,
 }
@@ -967,7 +967,7 @@ impl Work {
         }
     }
 
-    /// Set lane `lane`'s probed coverage, and its extra workers', to
+    /// Set lane `lane`'s answered coverage, and its extra workers', to
     /// `coverage`. A lane that holds the whole blob keeps its coverage.
     fn set_coverage(&mut self, lane: usize, coverage: &Coverage) {
         for i in 0..self.coverage.len() {
@@ -992,7 +992,7 @@ impl Work {
     }
 
     /// Give a new lane a stable slot, alive and holding nothing. Returns the
-    /// slot. `coverage` is the lane's probed bitmap, or `None` for a lane that
+    /// slot. `coverage` is the lane's answered bitmap, or `None` for a lane that
     /// holds the whole blob of `total_bytes`.
     fn add_lane(&mut self, coverage: Option<Coverage>, total_bytes: u64) -> usize {
         let slot = self.in_flight.len();
@@ -1150,7 +1150,7 @@ impl Work {
         wanted
     }
 
-    /// Size every lane without a probed bitmap to the whole blob of
+    /// Size every lane without a answered bitmap to the whole blob of
     /// `total_bytes`, up to the requested reach.
     fn grow_coverage(&mut self, total_bytes: u64) {
         let whole = self.whole_coverage(total_bytes);
@@ -3245,7 +3245,7 @@ where
 /// # The size is proven
 ///
 /// `target.total_bytes` is the first size, `C0`: a size a node proved (a
-/// probe answer or a header). The loop records it as proven
+/// discovery answer or a header). The loop records it as proven
 /// ([`IngestStore::prove_size`]) before any leg opens, so a resumed record
 /// with another size takes `C0`. Every paid leg's header carries the size its
 /// proof proves, which for the same hash is `C0`.
@@ -3942,7 +3942,7 @@ where
             // A range a lane still connecting or building covers is not
             // uncovered: its holder is known, and the lane serves it once
             // built. So a store-routed fetch whose first lanes are still
-            // building asks for no probe round (ADR 039 § Source set and
+            // building asks for no discovery round (ADR 039 § Source set and
             // selection).
             if discovering.is_none() && arrivals.is_none() {
                 let w = work.lock().await;
@@ -4128,7 +4128,7 @@ where
                             tracing::debug!(
                                 provider = %holder.provider,
                                 rtt_ms = holder.rtt_ms,
-                                probed_holder = holder.probed_holder,
+                                discovered_holder = holder.discovered_holder,
                                 "a late holder joined"
                             );
                             sources.holders_arrived(vec![holder]);

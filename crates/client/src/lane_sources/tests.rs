@@ -134,8 +134,8 @@ fn one_operator_yields_one_holder_the_nearer_by_rank() {
     let holders = holders_from(&targets, &mut nodes);
     assert_eq!(holders.len(), 1, "one holder per operator");
     assert!(
-        holders.iter().all(|h| !h.probed_holder),
-        "no probe reported the blob"
+        holders.iter().all(|h| !h.discovered_holder),
+        "no discovery answer reported the blob"
     );
     assert_eq!(
         nodes.get(&Address::repeat_byte(0xAA)).map(|n| n.node_id),
@@ -163,9 +163,9 @@ fn holders_carry_coverage_and_rtt_and_index_their_nodes() {
     assert_eq!(
         a_holder,
         Some(targets.coverage_by_node.get(&a.node_id).cloned()),
-        "a probed holder carries its measured coverage"
+        "a discovered holder carries its measured coverage"
     );
-    assert!(holders.iter().all(|h| h.probed_holder));
+    assert!(holders.iter().all(|h| h.discovered_holder));
 }
 
 /// A holder the order ranks ahead of a nearer one (a cheaper quote in the
@@ -282,7 +282,7 @@ fn a_late_node_joins_only_for_a_new_operator() -> anyhow::Result<()> {
         anyhow::bail!("a late holder joins");
     };
     let holder = admit_late(&mut nodes, LateJoin::Holder(other));
-    assert!(holder.as_ref().is_some_and(|h| h.probed_holder));
+    assert!(holder.as_ref().is_some_and(|h| h.discovered_holder));
     assert!(nodes.contains_key(&Address::repeat_byte(6)));
     Ok(())
 }
@@ -355,21 +355,21 @@ async fn claim_of(targets: &crate::targets::ResolvedTargets) -> anyhow::Result<(
     ))
 }
 
-/// Holders whose probe gave a size hint take it as the first claim, with
+/// Holders whose discovery answer gave a size hint take it as the first claim, with
 /// no whole-blob open for the header (#2218).
 #[tokio::test]
-async fn the_first_claim_comes_from_the_probe_hint_without_a_whole_blob_open() -> anyhow::Result<()>
-{
+async fn the_first_claim_comes_from_the_discovery_hint_without_a_whole_blob_open()
+-> anyhow::Result<()> {
     let (targets, _, _) = crate::targets::tests_support::two_holder_targets();
     let hint = targets
         .size_hint
-        .ok_or_else(|| anyhow::anyhow!("the fixture's probe gives a hint"))?;
+        .ok_or_else(|| anyhow::anyhow!("the fixture's discovery answer gives a hint"))?;
     assert_eq!(claim_of(&targets).await?, (hint.get(), 0));
     Ok(())
 }
 
-/// A pinned `--node-id` whose probe gave no size, or a pinned bundle entry with
-/// a size from neither its manifest nor a probe, opens one pull for the
+/// A pinned `--node-id` whose discovery answer gave no size, or a pinned bundle entry with
+/// a size from neither its manifest nor a discovery answer, opens one pull for the
 /// header's size.
 #[tokio::test]
 async fn a_pinned_node_without_a_hint_opens_for_the_header() -> anyhow::Result<()> {
@@ -383,20 +383,20 @@ async fn a_pinned_node_without_a_hint_opens_for_the_header() -> anyhow::Result<(
 /// A pinned `--node-id` counts as a holder: its `NotFound` never marks it
 /// absent.
 #[test]
-fn a_pinned_node_is_a_probed_holder() {
+fn a_pinned_node_is_a_discovered_holder() {
     let (mut targets, _, _) = crate::targets::tests_support::two_holder_targets();
     targets.coverage_by_node.clear();
     let mut nodes = std::collections::HashMap::new();
     assert!(
         holders_from(&targets, &mut nodes)
             .iter()
-            .all(|h| !h.probed_holder)
+            .all(|h| !h.discovered_holder)
     );
     targets.pinned = true;
     assert!(
         holders_from(&targets, &mut nodes)
             .iter()
-            .all(|h| h.probed_holder)
+            .all(|h| h.discovered_holder)
     );
 }
 
@@ -1289,7 +1289,7 @@ async fn a_size_lookup_takes_the_answers_size_with_no_lane() -> anyhow::Result<(
     Ok(())
 }
 
-/// A late holder joins the running fetch as a probed holder with its
+/// A late holder joins the running fetch as a discovered holder with its
 /// answered coverage.
 #[tokio::test]
 async fn a_late_holder_joins_with_its_answered_coverage() -> anyhow::Result<()> {
@@ -1316,7 +1316,7 @@ async fn a_late_holder_joins_with_its_answered_coverage() -> anyhow::Result<()> 
         .await
         .ok_or_else(|| anyhow::anyhow!("the late holder joins"))?;
     anyhow::ensure!(joined.provider == Address::repeat_byte(6));
-    anyhow::ensure!(joined.probed_holder);
+    anyhow::ensure!(joined.discovered_holder);
     anyhow::ensure!(joined.coverage == Some(decdn_protocol::Coverage::full(4)));
     drop(arrivals);
     drop(sources);

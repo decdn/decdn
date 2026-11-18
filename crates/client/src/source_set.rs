@@ -54,16 +54,16 @@ pub struct Holder {
     /// The measured round-trip time, raised where needed so the holders start
     /// in failover order. Lower starts first.
     pub rtt_ms: f64,
-    /// Whether a probe reported that this provider holds the blob. A probed
+    /// Whether a discovery answer reported that this provider holds the blob. A discovered
     /// holder is never marked absent: on the wire a `NotFound` also means load
     /// shed, a per-signer cap, or a pool the node cannot confirm yet. To a
     /// whole holder it is a delivery fault only. A partial holder's counts
     /// toward dropping the refused blocks from its coverage (inside it) or
-    /// barring it from pull-through (outside it), each for a while. A provider the probe did not report as a holder (a
+    /// barring it from pull-through (outside it), each for a while. A provider discovery did not report as a holder (a
     /// pull-through or proxy-warming target) counts as absent after
     /// [`ABSENT_AFTER_NOT_FOUND`] such answers with no verified byte between
     /// them.
-    pub probed_holder: bool,
+    pub discovered_holder: bool,
 }
 
 /// The range a lane held when it faulted ([`SourceSet::record_fault`]).
@@ -107,20 +107,20 @@ pub struct LaneRange {
     /// The range as the lane picked it holds a chunk outside the coverage of
     /// the lane: the lane took it for its node to serve that part by
     /// pull-through, as a pending chunk no running lane covers or as a slow-victim steal's
-    /// tail. A `NotFound` for such a range from a probed partial holder
+    /// tail. A `NotFound` for such a range from a discovered partial holder
     /// counts toward barring that holder from pull-through
     /// ([`SourceSet::no_pull_through`]).
     ///
     /// Only a lane built with measured coverage can hold an uncovered range.
-    /// A lane built without it (a pinned holder, or a provider the probe did
+    /// A lane built without it (a pinned holder, or a provider discovery did
     /// not report as a holder) covers the whole blob, so this is always
     /// `false` there, and `false` never says that the node holds the range.
     pub uncovered: bool,
 }
 
 /// How many `NotFound` answers in a row, with no verified byte between them,
-/// mark a provider that is not a probed holder as absent. The same count of
-/// `NotFound` answers for ranges outside a probed partial holder's coverage
+/// mark a provider that is not a discovered holder as absent. The same count of
+/// `NotFound` answers for ranges outside a discovered partial holder's coverage
 /// bars it from pull-through ([`SourceSet::no_pull_through`]), and for one
 /// block inside it drops that block from its coverage for a while.
 pub const ABSENT_AFTER_NOT_FOUND: u32 = 3;
@@ -128,7 +128,7 @@ pub const ABSENT_AFTER_NOT_FOUND: u32 = 3;
 /// How long a bar from pull-through set by `NotFound` answers lasts. A node
 /// also answers `NotFound` when it sheds miss load or its chain view is stale,
 /// so the bar ends after the longest cooldown and the holder takes one
-/// uncovered range again as a probe. It is also how long a block dropped from
+/// uncovered range again as a trial. It is also how long a block dropped from
 /// a partial holder's coverage stays out, and the quiet time after which a
 /// block's count of covered refusals starts again.
 pub(crate) const PULL_THROUGH_BAR: Duration = crate::health::COOL_CAP;
@@ -139,7 +139,7 @@ pub trait SourceProvider: Send + Sync {
     /// The paid source a built lane fetches from.
     type Source: BlobSource;
 
-    /// Find and probe the current holders of `hash`.
+    /// Find the current holders of `hash` and open them.
     fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>>;
 
     /// Holders found after the set started, pushed as they are found. The
@@ -376,15 +376,15 @@ pub struct SourceSet<'p, P: SourceProvider> {
     absent: HashSet<Address>,
     /// Each non-holder's `NotFound` answers since its last verified byte.
     not_found: HashMap<Address, u32>,
-    /// Each probed partial holder's `NotFound` answers for ranges outside its
+    /// Each discovered partial holder's `NotFound` answers for ranges outside its
     /// coverage since it last served such a range.
     pull_through_not_found: HashMap<Address, u32>,
-    /// When each probed partial holder last said `NotFound` to a range
+    /// When each discovered partial holder last said `NotFound` to a range
     /// outside its coverage. A verified byte outside its coverage clears its
     /// count and bar only when it lands after this, so a worker that ends
     /// late cannot lift a bar set after its byte.
     pull_through_refused_at: HashMap<Address, Instant>,
-    /// When each probed partial holder last served a verified byte outside its
+    /// When each discovered partial holder last served a verified byte outside its
     /// coverage. A `NotFound` for such a range that came before this is stale
     /// and does not count, so the order in which the loop takes worker ends
     /// cannot change the bar. A tie goes to the refusal.
@@ -394,7 +394,7 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// the time its bar ends ([`PULL_THROUGH_BAR`] after the refusal that set
     /// it). Each one serves only the blocks it covers until then.
     no_pull_through: HashMap<Address, Instant>,
-    /// Each probed partial holder's `NotFound` answers for ranges inside its
+    /// Each discovered partial holder's `NotFound` answers for ranges inside its
     /// coverage, keyed by every discovery block the refused part of a range
     /// touches, with the time of the last one counted. Answers within
     /// [`crate::health::COOL_BASE`] of the last one count once, a count whose
@@ -402,7 +402,7 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// byte in the block clears it ([`SourceSet::record_covered_served`]). So
     /// transient refusals (load shed, a stale chain view) do not add up.
     covered_not_found: HashMap<(Address, u32), (u32, Option<Instant>)>,
-    /// Blocks each probed partial holder advertised but refused
+    /// Blocks each discovered partial holder advertised but refused
     /// [`ABSENT_AFTER_NOT_FOUND`] times, each with the time its drop ends
     /// ([`PULL_THROUGH_BAR`] after the refusal that set it). Its coverage
     /// claim for them is likely stale (evicted, or a record wider than its
@@ -411,10 +411,10 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// The coverage each holder with a dropped block last advertised: what
     /// its coverage returns to as each drop ends.
     advertised: HashMap<Address, Coverage>,
-    /// How many times in a row each probed partial holder has been barred
+    /// How many times in a row each discovered partial holder has been barred
     /// from pull-through. A first bar can come from transient refusals that
     /// also read as `NotFound` (load shed, a stale chain view), so only a
-    /// holder barred again after its probe counts as one that cannot serve
+    /// holder barred again after its trial counts as one that cannot serve
     /// the work left.
     pull_through_bars: HashMap<Address, u32>,
     /// Discovered partial holders that refused a range outside their coverage
@@ -641,7 +641,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// ([`crate::LaneWiden`]) for `range`, given at `at`, while the lane's own
     /// worker runs or the node is already charged for this outage. The node
     /// does not cool for it. A `NotFound` for a range outside the coverage of
-    /// a probed partial holder counts toward barring it from pull-through,
+    /// a discovered partial holder counts toward barring it from pull-through,
     /// and a `Declined` refusal or an unhealed voucher rejection declines it
     /// at once, as on its own stream. The scheduler passes only uncovered
     /// ranges here: an extra stream's covered `NotFound` is most often a
@@ -676,7 +676,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// carries the provider, the blob, the lane's `range` when it held one
     /// (the held range after any steal, the bytes of it that landed and the
     /// bytes it re-queued, and the range as the lane picked it), the error,
-    /// and the provider's record in the set when the fault is logged: `probed_holder` and its
+    /// and the provider's record in the set when the fault is logged: `discovered_holder` and its
     /// `coverage` as block runs (`whole blob` with none measured, `unknown`
     /// for a provider the set has no record of). A rediscovery can change the record after the lane
     /// started. A fetch that recovers reports no lane fault, so this line is
@@ -692,11 +692,11 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     ) -> Fault {
         let fault = classify(err);
         let hash = blake3::Hash::from_bytes(self.hash).to_hex();
-        let (probed_holder, coverage) = self.holder(provider).map_or_else(
+        let (discovered_holder, coverage) = self.holder(provider).map_or_else(
             || (false, "unknown".to_owned()),
             |holder| {
                 (
-                    holder.probed_holder,
+                    holder.discovered_holder,
                     holder
                         .coverage
                         .as_ref()
@@ -728,7 +728,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 picked_len,
                 past_end,
                 uncovered,
-                probed_holder,
+                discovered_holder,
                 %coverage,
                 ?fault,
                 error = %decdn_common::redact::sanitize_err_chain(err),
@@ -739,7 +739,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 fault.warns(),
                 %provider,
                 %hash,
-                probed_holder,
+                discovered_holder,
                 %coverage,
                 ?fault,
                 error = %decdn_common::redact::sanitize_err_chain(err),
@@ -899,9 +899,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Count a `NotFound` from `provider` for a piece below the end the fetch
-    /// knows ([`LaneRange::past_end`]). A provider that is not a probed
+    /// knows ([`LaneRange::past_end`]). A provider that is not a discovered
     /// holder is marked absent once its count reaches
-    /// [`ABSENT_AFTER_NOT_FOUND`]. A probed holder is never marked absent.
+    /// [`ABSENT_AFTER_NOT_FOUND`]. A discovered holder is never marked absent.
     /// For a partial holder, an answer for a range that holds a chunk outside
     /// its coverage ([`LaneRange::uncovered`]) counts toward barring it from
     /// pull-through, and one for a range wholly inside it counts toward
@@ -917,7 +917,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         let Some(holder) = self.holder(provider) else {
             return;
         };
-        if holder.probed_holder {
+        if holder.discovered_holder {
             if holder.coverage.is_some() {
                 match range {
                     Some(range) if range.uncovered => {
@@ -974,7 +974,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         left
     }
 
-    /// Count a `NotFound` from probed partial holder `provider` for `range`,
+    /// Count a `NotFound` from discovered partial holder `provider` for `range`,
     /// which its coverage claims, given at `at`. The node refuses the whole
     /// range at its first chunk it does not hold, and the refusal does not say
     /// which chunk that is, so the count goes to every block `range` touches.
@@ -1067,7 +1067,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         }
     }
 
-    /// Count a `NotFound` from probed partial holder `provider` for a range
+    /// Count a `NotFound` from discovered partial holder `provider` for a range
     /// outside its coverage, given at `at`. At [`ABSENT_AFTER_NOT_FOUND`]
     /// answers the holder is barred from pull-through. An answer older than
     /// the holder's last verified byte outside its coverage is stale and does
@@ -1103,7 +1103,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
 
     /// Lift each `NotFound` bar from pull-through whose time ended by `now`,
     /// and restart its holder's count of refusals. The holder takes one
-    /// uncovered range again as a probe; [`ABSENT_AFTER_NOT_FOUND`] more
+    /// uncovered range again as a trial; [`ABSENT_AFTER_NOT_FOUND`] more
     /// refusals bar it again. A held-bytes cap bar does not end. Each block
     /// dropped from a holder's coverage whose time ended returns to it the
     /// same way, with its count restarted.
@@ -1184,7 +1184,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.pull_through_bars.remove(&provider);
     }
 
-    /// Whether `provider` is barred from pull-through: a probed partial
+    /// Whether `provider` is barred from pull-through: a discovered partial
     /// holder that said `NotFound` to [`ABSENT_AFTER_NOT_FOUND`] ranges
     /// outside its coverage, with no such range served since and its bar not
     /// yet ended ([`Self::expire_pull_through_bars`]), or that refused such a
@@ -1384,7 +1384,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// absent, it declined this fetch, or `only_uncovered_left` says
     /// no work left lies inside the coverage of a barred holder and the holder
     /// is barred for good: by a `Declined` refusal, or by `NotFound` again
-    /// after the probe that followed its first bar.
+    /// after the trial that followed its first bar.
     fn cannot_serve(&self, provider: Address, only_uncovered_left: bool) -> bool {
         let barred_for_good = self.declined_pull_through.contains(&provider)
             || (self.no_pull_through.contains_key(&provider)
@@ -1405,18 +1405,18 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         )
     }
 
-    /// Add new holders and update known ones. A provider a probe now reports
-    /// as a holder loses its absent mark and its `NotFound` count. A probe
-    /// that reports a block the holder did not cover before also clears its
+    /// Add new holders and update known ones. A provider a discovery answer now reports
+    /// as a holder loses its absent mark and its `NotFound` count. A discovery
+    /// answer that reports a block the holder did not cover before also clears its
     /// pull-through count and bar: the block it refused may be one it now
     /// holds.
     ///
     /// A block a holder's coverage claimed but it refused
-    /// ([`Self::record_covered_refusal`]) stays out of the coverage a probe
+    /// ([`Self::record_covered_refusal`]) stays out of the coverage a discovery answer
     /// reports again until its drop ends: the record that claimed it is the
     /// likely stale one.
     ///
-    /// A probe that reports a holder as whole replaces its partial record, so
+    /// A discovery answer that reports a holder as whole replaces its partial record, so
     /// it also ends every block drop and count of covered refusals it had.
     fn merge(&mut self, holders: Vec<Holder>) {
         for mut holder in holders {
@@ -1433,7 +1433,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 self.advertised.insert(holder.provider, coverage.clone());
                 holder.coverage = Some(without_blocks(coverage, |b| stale.contains_key(&b)));
             }
-            if holder.probed_holder {
+            if holder.discovered_holder {
                 self.absent.remove(&holder.provider);
                 self.not_found.remove(&holder.provider);
                 let wider = self.holder(holder.provider).is_some_and(|known| {
@@ -1511,7 +1511,7 @@ impl<S> std::fmt::Debug for StaticSources<S> {
 
 impl<S> StaticSources<S> {
     /// Wrap `candidates`, keyed by each one's on-chain provider. Each one is
-    /// a probed holder ([`Holder::probed_holder`]).
+    /// a discovered holder ([`Holder::discovered_holder`]).
     ///
     /// # Errors
     ///
@@ -1535,7 +1535,7 @@ impl<S> StaticSources<S> {
                 provider,
                 coverage: candidate.coverage.clone(),
                 rtt_ms,
-                probed_holder: true,
+                discovered_holder: true,
             });
             anyhow::ensure!(
                 lanes.insert(provider, candidate).is_none(),
@@ -1554,13 +1554,13 @@ impl<S> StaticSources<S> {
         self.holders.clone()
     }
 
-    /// The same sources, with no probe reporting any of them as a holder:
+    /// The same sources, with no discovery answer reporting any of them as a holder:
     /// pull-through targets.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn not_probed(mut self) -> Self {
+    pub(crate) fn undiscovered(mut self) -> Self {
         for holder in &mut self.holders {
-            holder.probed_holder = false;
+            holder.discovered_holder = false;
         }
         self
     }

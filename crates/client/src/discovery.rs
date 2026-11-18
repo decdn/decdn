@@ -161,8 +161,8 @@ pub fn with_dial_addrs(mut target: iroh::EndpointAddr, cand: &NodeCandidate) -> 
 /// returns per entry (registered AND bond ≥ minBond AND no unbonding AND not
 /// ejected) — NOT the raw `NodeInfo.active` registration flag, which stays
 /// `true` for an operator mid-unbonding. Filtering on the strict predicate drops
-/// stale-active nodes up front rather than paying a probe round-trip to a node
-/// that is on its way out. The downstream probe-and-rank step is still the final
+/// stale-active nodes up front rather than paying a discovery open to a node
+/// that is on its way out. The downstream open-and-rank step is still the final
 /// arbiter of who can actually serve.
 fn candidate_from(info: &CapacityBond::NodeInfo, is_active: bool) -> Option<NodeCandidate> {
     if !is_active {
@@ -555,9 +555,9 @@ pub async fn bootstrap_nodes(
         })?
 }
 
-/// Candidates probed before ranking (decision 3): shuffle, order region-first,
-/// take K, then probe those K for liveness + blob-holding. At `PoC` scale a
-/// small K keeps the probe fan-out cheap while still giving the ranker a choice.
+/// Candidates opened before ranking (decision 3): shuffle, order region-first,
+/// take K, then open those K for liveness + blob-holding. At `PoC` scale a
+/// small K keeps the open fan-out cheap while still giving the ranker a choice.
 #[doc(hidden)]
 pub const SELECT_K: usize = 5;
 
@@ -575,7 +575,7 @@ pub const SELECT_K: usize = 5;
 /// peer-store fallback or the store's identity-fresh set arrives in
 /// whatever order the filesystem returns the `<node-id>.json` entries in,
 /// stable across runs for that client. Truncating any of them as-is hands
-/// out the probe slots by registration timing or filename. The shuffle is the same requester-side
+/// out the open slots by registration timing or filename. The shuffle is the same requester-side
 /// defense the node's DHT lookup applies (ADR 022 § `FIND_VALUE` Flow,
 /// *Lookup integrity*). It runs on the client, the party it protects, so no
 /// node can patch it out.
@@ -615,7 +615,7 @@ pub fn select_candidates(
 /// dropped; a candidate with `region_hint == None` is kept. An empty `allow`
 /// is a no-op. Ranking is unchanged (region is a self-attested hint, never a
 /// ranking key) — this only narrows which candidates are eligible to be
-/// probed/discovered at all, independent of the peer store.
+/// discovered at all, independent of the peer store.
 #[must_use]
 #[doc(hidden)]
 pub fn select_candidates_filtered(

@@ -15,7 +15,7 @@
 //! fetch. A write failure prints a warning that names the path and never fails
 //! the pull. A real pull under `--overwrite` skips the read to force a fresh
 //! fetch. The cache also lets `decdn get --dry-run` list a bundle's entries
-//! with no paid manifest fetch (its price comes from an unpaid probe round);
+//! with no paid manifest fetch (its price comes from an unpaid discovery round);
 //! the dry run reads it even under `--overwrite`, because verified bytes equal
 //! what a fresh fetch returns, and it fails on a cache file it cannot use,
 //! because it lists no plan without one.

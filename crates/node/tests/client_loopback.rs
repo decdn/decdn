@@ -12,7 +12,7 @@
 //!
 //! Delivery/authorization gates also covered: the buyer-side received-byte
 //! ceiling (#1895, `BlobTooLarge` on bytes that actually arrive), the
-//! `Declined` refusal of a blob evicted between probe and stream, the client-binding
+//! `Declined` refusal of a blob evicted between open and delivery, the client-binding
 //! mismatch reset and the binding-does-not-own-pool `NotFound` (both driven
 //! by a small [`raw_request`] client, since the honest requester never sends a
 //! binding), and per-lane voucher serialization under concurrency.
@@ -12924,7 +12924,7 @@ async fn assert_stream_finished(recv: &mut RecvStream) -> anyhow::Result<()> {
 }
 
 /// Assert `recv` observes a QUIC reset (or connection close) carrying `code`,
-/// with no readable frame first. Mirrors the probe suite's reset assertion: the
+/// with no readable frame first. The
 /// stream-cap shed resets with [`decdn_protocol::APP_ERR_RATE_LIMITED`] and signs
 /// no `StreamResponse`, so a returned frame is itself the failure.
 async fn assert_stream_reset(recv: &mut RecvStream, code: u32) -> anyhow::Result<()> {

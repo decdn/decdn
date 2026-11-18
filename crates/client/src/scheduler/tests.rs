@@ -3943,11 +3943,11 @@ fn a_barred_lane_takes_only_what_it_covers() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #2281: narrowing a probed lane's coverage reaches its extra workers and
+/// #2281: narrowing a discovered lane's coverage reaches its extra workers and
 /// leaves a whole-blob lane alone, and widening it again when a block's
 /// drop ends hands the lane the block's range once more.
 #[test]
-fn set_coverage_narrows_and_restores_a_probed_lane_and_its_extras() -> anyhow::Result<()> {
+fn set_coverage_narrows_and_restores_a_discovered_lane_and_its_extras() -> anyhow::Result<()> {
     use std::collections::VecDeque;
 
     use decdn_bao_range::align_range;
@@ -4243,8 +4243,8 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
     Ok(())
 }
 
-/// A sole partial holder barred from the only block left gets one probe
-/// once its bar ends, and ends the item when the probe draws the bar
+/// A sole partial holder barred from the only block left gets one trial
+/// once its bar ends, and ends the item when the trial draws the bar
 /// again and a discovery finds no one else, as a unanimous `NotFound`
 /// does.
 #[tokio::test(start_paused = true)]
@@ -4293,7 +4293,7 @@ async fn a_sole_barred_partial_holder_ends_only_the_item() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A pull-through target (not a probed holder) that keeps saying
+/// A pull-through target (not a discovered holder) that keeps saying
 /// `NotFound` ends the item, and the stop carries the refusal.
 #[tokio::test(start_paused = true)]
 async fn unanimous_not_found_ends_only_the_item() -> anyhow::Result<()> {
@@ -4306,7 +4306,7 @@ async fn unanimous_not_found_ends_only_the_item() -> anyhow::Result<()> {
         });
     let (root, total) = (a.root(), a.total_bytes());
     let (store, _dir) = fresh_store(root, total);
-    let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?.not_probed();
+    let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?.undiscovered();
     let err = run_acquire(
         &store,
         &provider,
@@ -4326,10 +4326,10 @@ async fn unanimous_not_found_ends_only_the_item() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A sole probed holder that says `NotFound` twice (a load shed, say) and
+/// A sole discovered holder that says `NotFound` twice (a load shed, say) and
 /// then serves completes the fetch: its `NotFound` only cools it.
 #[tokio::test(start_paused = true)]
-async fn a_probed_holder_saying_not_found_twice_then_serving_completes() -> anyhow::Result<()> {
+async fn a_discovered_holder_saying_not_found_twice_then_serving_completes() -> anyhow::Result<()> {
     let data = blob(1024 * 1024);
     let la = Arc::new(PoolLedger::new(Cumulative::default()));
     let a = ScriptedSource::new(data.clone())?
@@ -6112,7 +6112,7 @@ impl crate::SourceProvider for SlowBuilds<'_> {
     }
 }
 
-/// A store-routed start: every holder holds the whole blob, no probe round
+/// A store-routed start: every holder holds the whole blob, no discovery round
 /// is pending, and every lane is still building on the first pass. The
 /// building lanes cover every missing range, so the fetch asks for no
 /// discovery (#2677).
@@ -7380,7 +7380,7 @@ impl SlotSources {
             provider: Address::repeat_byte(SLOT_PROVIDER),
             coverage: None,
             rtt_ms: 0.0,
-            probed_holder: true,
+            discovered_holder: true,
         }
     }
 
@@ -7962,7 +7962,7 @@ async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_o
         provider: a_provider,
         coverage: None,
         rtt_ms: 0.0,
-        probed_holder: true,
+        discovered_holder: true,
     }];
     holders.extend(inner.holders().into_iter().map(|holder| crate::Holder {
         rtt_ms: 1.0,
@@ -8000,7 +8000,7 @@ async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_o
     Ok(())
 }
 
-/// A lane without a probed bitmap covers the blocks up to the requested
+/// A lane without a answered bitmap covers the blocks up to the requested
 /// reach, not the whole proven size: a 1 MiB window of a 2^60-byte blob
 /// sizes a one-block bitmap.
 #[test]

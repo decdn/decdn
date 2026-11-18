@@ -1721,7 +1721,7 @@ pub const LOW_WATER_DIVISOR: u64 = 5;
 /// keeps a busy pool from topping up on every reuse.
 ///
 /// The exact cost of the *next* fetch is not known at refill time (the per-MB
-/// `rate` is only learned from the provider's probe / `StreamResponse`), so this
+/// `rate` is only learned from the provider's signed `StreamResponse`), so this
 /// uses a rate-independent low-water refill: keep at least `low_water` of headroom,
 /// and refill to a full `target_deposit` when it runs low.
 #[must_use]

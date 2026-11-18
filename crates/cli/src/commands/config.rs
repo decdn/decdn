@@ -1124,7 +1124,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [client]
 # `decdn get` discovery pre-filter (independent of the
 # node-scoped [network.discovery] address discovery above). Narrows which
-# registered nodes are probed/discovered; never ranks them. Absent/empty =>
+# registered nodes discovery opens; never ranks them. Absent/empty =>
 # no filter, every registered node is eligible.
 # region_allowlist = ["US", "DE"]
 

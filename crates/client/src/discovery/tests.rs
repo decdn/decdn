@@ -465,7 +465,7 @@ fn admit_sources_zero_max_returns_empty() {
     assert_eq!(admit_sources(ranked, 0), Vec::new());
 }
 
-/// A [`DiscoveredHolder`] holder carries the coverage its probe reported, and a
+/// A [`DiscoveredHolder`] holder carries the coverage its answer reported, and a
 /// **partial** holder (a proper subset of the blob's blocks) is admitted
 /// exactly like a full one: `admit_sources` operates on `NodeCandidate`
 /// rank order and operator identity only, so it has no way to see —
@@ -480,7 +480,7 @@ fn partial_holders_carry_their_own_coverage_and_are_admitted_like_full_holders()
 
     // op1 holds only block 0; op2 holds only block 1 — both partial, of a
     // 2-block blob, and disjoint.
-    let probed = [
+    let discovered = [
         DiscoveredHolder {
             candidate: op1.clone(),
             rtt_ms: 10.0,
@@ -506,16 +506,16 @@ fn partial_holders_carry_their_own_coverage_and_are_admitted_like_full_holders()
         "a partial holder is admitted exactly like a full holder"
     );
 
-    // Each admitted candidate's own probed coverage is still its own —
+    // Each admitted candidate's own answered coverage is still its own —
     // never full, never the other holder's block.
     let cov = |node_id: PublicKey| {
-        probed
+        discovered
             .iter()
             .find(|p| p.candidate.node_id == node_id)
             .map(|p| p.coverage.clone())
     };
-    let cov1 = cov(pk(1)).expect("op1 was probed");
-    let cov2 = cov(pk(2)).expect("op2 was probed");
+    let cov1 = cov(pk(1)).expect("op1 was opened");
+    let cov2 = cov(pk(2)).expect("op2 was opened");
     assert!(cov1.covers(0) && !cov1.covers(1), "op1 holds only block 0");
     assert!(cov2.covers(1) && !cov2.covers(0), "op2 holds only block 1");
     assert_ne!(cov1, Coverage::full(2), "op1 is a partial holder, not full");

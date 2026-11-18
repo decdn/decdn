@@ -301,8 +301,8 @@ fn failure_then_success_clears_stamp() -> anyhow::Result<()> {
 }
 
 /// A stream open (#2196) files its quote and clears the failure stamp, but
-/// its time-to-first-byte is not a distance measure, so the probe RTT and
-/// its freshness clock stay exactly as the last probe left them.
+/// its time-to-first-byte is not a distance measure, so the measured RTT and
+/// its freshness clock stay exactly as the last discovery open left them.
 #[test]
 fn record_open_files_rate_and_clears_failure_without_touching_latency() -> anyhow::Result<()> {
     let cfg = StoreConfig::default();
@@ -323,10 +323,10 @@ fn record_open_files_rate_and_clears_failure_without_touching_latency() -> anyho
     Ok(())
 }
 
-/// Concurrent writers never lose a probe sample: a stream open that races
+/// Concurrent writers never lose a discovery sample: a stream open that races
 /// the harvest must not write back a record read before the sample landed.
 #[test]
-fn concurrent_opens_never_drop_a_probe_sample() -> anyhow::Result<()> {
+fn concurrent_opens_never_drop_a_discovery_sample() -> anyhow::Result<()> {
     const ROUNDS: u32 = 25;
     const WRITERS: u32 = 4;
     let cfg = StoreConfig::default();

@@ -21,7 +21,7 @@ pub struct ChainConfig {
     pub chain_id: u64,
     /// The `PaymentPool` the pull's pool lives on.
     pub payment_pool: Address,
-    /// The `SlashJudge` whose domain every probe answer and stream response
+    /// The `SlashJudge` whose domain every discovery answer and stream response
     /// verifies against.
     pub slash_judge: Address,
     /// The `CapacityBond` registry discovery reads, and the domain of the
@@ -51,7 +51,7 @@ pub struct PullSite {
     /// The client's region, for region-first discovery ordering. `None` skips
     /// the ordering.
     pub region: Option<String>,
-    /// The regions a fetch's discovery may probe. Empty allows every region.
+    /// The regions a fetch's discovery may open. Empty allows every region.
     /// It narrows the candidates and never ranks them, and widens back to
     /// every region when too few candidates remain. A bundle pull applies it
     /// to each entry's sample of the run's registry list, with the same
