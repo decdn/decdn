@@ -387,7 +387,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 | `cdn/client/v1` | All delivery is paid; DHT affects only how providers are discovered. A node that serves a hash forwards the origin attestation it holds in `StreamResponseExt.origin_attestation` ([§ Origin Attestation](#origin-attestation)). A client ignores the field. |
 | Proxy warming ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)) | Reactive window-paced pull-through warms a regional copy on real paid demand. STORE-on-commit makes a completed warmed copy discoverable through the normal FIND_VALUE path. |
 | Reputation system ([ADR 008](008-reputation.md#adr-008-reputation-system)) | A node publishing a false STORE record fails at the discovery open → reputation penalty → fewer pulling nodes select it. No new slash condition needed. |
-| Eviction hold ([ADR 005](005-protocol.md#adr-005-wire-protocol)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
+| Cache eviction ([ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
 | Client discovery ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) | Clients do not query the DHT. A client picks a node from its peer store or the on-chain registry by measured RTT ([ADR 039 § Source set and selection](039-multi-source-parallel-fetch.md#source-set-and-selection)); the node it picks resolves holders through FIND_VALUE and the origin-directory fallback on its own pull leg. |
 
 ### Schema Evolution

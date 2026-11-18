@@ -201,8 +201,8 @@ impl ClientHandler {
     /// The partial-serve gate (#1506): whether `[byte_offset, byte_offset +
     /// byte_len)` is already fully present in the LOCAL cache of a blob
     /// `serve_audit` reports unserveable (not `Complete`) — the counterpart
-    /// to the will-serve coverage a partial holder now advertises (probe/DHT
-    /// tasks 2-3). Returns the blob's total size when so, letting the caller
+    /// to the will-serve coverage a partial holder advertises in its discovery
+    /// answers and DHT records. Returns the blob's total size when so, letting the caller
     /// skip straight to the size gate + delivery instead of running the
     /// miss-path fill legs; `None` otherwise.
     ///

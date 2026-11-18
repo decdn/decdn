@@ -132,7 +132,7 @@ Query `CapacityBond.getRegisteredNodes(offset=0, limit=100)` to bootstrap the lo
 
 This registry snapshot is the initial node view. The node subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to keep the view fresh ([ADR 001 § Node Discovery (Registry)](001-network.md#node-discovery-registry)).
 
-If the read fails, the node retries it as [Boot-time chain reads](#boot-time-chain-reads) describes. If the retries do not succeed, the node cannot start: without a node view it cannot take part in DHT lookups or probing.
+If the read fails, the node retries it as [Boot-time chain reads](#boot-time-chain-reads) describes. If the retries do not succeed, the node cannot start: without a node view it cannot take part in DHT lookups or send discovery opens.
 
 #### Boot-time chain reads
 

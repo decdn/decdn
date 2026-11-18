@@ -112,8 +112,8 @@ This ADR specifies the contract surface at the semantic level — function signa
 
 ```solidity
 // On SlashAppeal. `slashId` is allocated by CapacityBond.slash (ADR 014 §
-// SlashJudge → CapacityBond) — globally monotonic, single counter across
-// both offense types. `evidenceBundleHash` references the off-chain bundle.
+// SlashJudge → CapacityBond) — globally monotonic, one counter for every
+// slash. `evidenceBundleHash` references the off-chain bundle.
 function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external; // posts APPEAL_BOND, calls markAppealOpen
 function fastTrackAppeal(uint256 slashId) external onlyEmergencyMultisig;
 function rejectAppeal(uint256 slashId) external onlyEmergencyMultisig;   // uphold, burn full appeal bond
@@ -133,7 +133,7 @@ function finalizeUnappealedSlash(uint256 slashId) external; // after the filing 
 
 **Multisig capability scope.** `fastTrackAppeal` and `rejectAppeal` are gated by `SlashAppeal.EMERGENCY_MULTISIG_ROLE`, the same 3-of-5 emergency multisig as [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig). The threshold and signing semantics are unchanged from [ADR 009](009-governance.md#emergency-multisig).
 
-**Dependency on slash identifiers.** The `slashId` argument refers to the slash record minted by `CapacityBond.slash` (driven by `SlashJudge` per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) — a globally monotonic non-zero counter across both offense types. Without a minted slash record, no appeal can be filed.
+**Dependency on slash identifiers.** The `slashId` argument refers to the slash record minted by `CapacityBond.slash` (driven by `SlashJudge` per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) — a globally monotonic non-zero counter across every slash. Without a minted slash record, no appeal can be filed.
 
 A standalone `SlashAppeal` contract (rather than inlining the appeal logic into `CapacityBond`) keeps `CapacityBond` comfortably under the 24 KB EIP-170 limit and isolates the dispute-policy surface from the escrow custodian; the cross-contract coupling is the narrow `SLASH_APPEAL_ROLE` hook set above.
 

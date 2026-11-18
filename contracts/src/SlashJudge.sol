@@ -131,8 +131,8 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     ///         a mempool copy of the reveal (#854).
     mapping(bytes32 => uint64) public commitments;
 
-    /// @notice Total seconds this contract has spent paused. The reveal paths
-    ///         are `whenNotPaused`, so `_checkStaleness` takes this, plus
+    /// @notice Total seconds this contract has spent paused. The commit and
+    ///         the reveal are `whenNotPaused`, so `_checkStaleness` takes this, plus
     ///         `CapacityBond.pausedTotal` (a paused `slash` blocks a reveal too),
     ///         off the evidence age: a pause never voids a pending offense.
     ///         Conservative: a pause before the evidence was signed still counts,
