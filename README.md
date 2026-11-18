@@ -192,8 +192,9 @@ decdn --config ~/.decdn/client.toml get decdn:<blake3-hash> -o ./blob.bin --rece
 decdn receipt verify ./blob.receipt.json
 ```
 
-`quote` prices the pull from the rates the nodes sign in their probe answers, and pays
-nothing for a blob; a bundle with no cached manifest costs one small paid pull for it,
+`quote` prices the pull from the rates the nodes sign when it opens an unpaid stream to
+each, and pays nothing for a blob. It unlocks your keystore, because each open names your
+pool; a bundle with no cached manifest costs one small paid pull for it,
 from your open pool. With no open pool, `quote` stops before it opens one: add
 `--open-pool` to let it, which escrows the working deposit (10 USDC by default) and pays
 gas, or fund a pool first with `decdn pool open`. With or without the flag, an open pool
@@ -229,7 +230,8 @@ has a new hash, so it lands in its own directory; to update the old directory in
 `-o <the old bundle's directory>`: the pull replaces the files that changed and skips the
 rest. `--overwrite` fetches every file again.
 
-`get` probes bonded nodes and picks one that holds the blob. When none does, it tries
+`get` opens an unpaid stream to bonded nodes and pays on the one that holds the blob,
+nearest first, cancelling the rest. When none holds it, `get` tries
 bonded non-holders nearest first. Each fills the miss from its own origin, or from a peer
 if it has pull-through on. A node with neither answers not-found, and `get` moves to
 the next. One pool pays every provider, so there is no per-provider setup. Use
@@ -371,9 +373,9 @@ daemon and its onramp are two more ([`docs/sponsord/`](docs/sponsord/README.md))
 | `config {init,validate}` | Write a config file; check one before the daemon reads it |
 | `setup` | Guided operator onboarding over `key-gen`, `node bond`, and `node register` |
 | `node {…}` | Admin of a running daemon (`health`, `status`, `lanes`, `pools`, `top`, `evict`, `reload`, `drain`, `slashes`); the on-chain lifecycle (`bond`, `unbond`, `register`, `deregister`, `rotate-key`, `update-multiaddrs`, `update-region`); diagnostics (`doctor`, `lookup`) |
-| `probe` | Probe a node over `cdn/probe/v1` |
+| `probe` | Open one unpaid `cdn/client/v1` stream to a node and print its signed answer: the quote, the proven size and the coverage |
 | `get` | Paid pull over `cdn/client/v1` of what a `decdn:` URI names: a blob, a directory bundle, or one file of a bundle ([appendix](adr/appendix-bundles.md)) |
-| `quote` | Price a pull of a `decdn:` URI from the rates the nodes sign in their probe answers, before any paid byte |
+| `quote` | Price a pull of a `decdn:` URI from the rates the nodes sign in their answers to unpaid stream opens, before any paid byte |
 | `receipt {verify,settle}` | Check the pull receipt `get --receipt` wrote, offline; add the on-chain redemptions that settle it ([appendix](adr/appendix-pull-receipts.md#appendix-pull-receipts)) |
 | `pool {…}` | Client payment-pool lifecycle: `list`, `open`, `top-up`, `close`, `reclaim`, `assign` |
 | `publish {…}` | Publisher control plane: `namespace create`; seat and unseat authorized origins with `assign` and `revoke` |
@@ -399,8 +401,7 @@ and [`adr/architecture.md`](adr/architecture.md) is the living overview.
 
 | ALPN | Purpose |
 |------|---------|
-| `cdn/probe/v1` | Latency and availability probing |
-| `cdn/client/v1` | All paid delivery, client→node and node→node |
+| `cdn/client/v1` | All discovery and paid delivery, client→node and node→node; a discovery open is a stream that carries no voucher |
 | `cdn/dht/v1` | Content discovery between nodes via a Kademlia DHT ([ADR 022](adr/022-content-discovery.md)) |
 
 </details>
@@ -453,7 +454,7 @@ how they interact.
 | Delivery | A large fetch spreads disjoint byte ranges across several holders, at most one per operator, and reassigns ranges as sources finish or stall. Cache admission and eviction are node-local. A node refuses a cache miss whose upstream price leaves no margin after the fee split. | [039](adr/039-multi-source-parallel-fetch.md), [040](adr/040-cache-policy.md), [041](adr/041-refuse-to-serve.md) |
 | Payments | A client funds one shared `PaymentPool` and pays each provider with cumulative off-chain vouchers. Only the provider redeems its own vouchers, so a pool owner's close cannot understate what a node earned. A close starts a grace window in which nodes keep redeeming, and each node's periodic sweep redeems well inside it. | [003](adr/003-payments.md) |
 | Tokenomics | USDC pays for bytes. Operators bond TOKEN on a governance-tunable curve over declared bandwidth (super-linear at the default exponent), with a flat `minBond` floor. Fee-split buckets are governance-tunable. Protocol-owned liquidity is a Uniswap V3 50/50 TOKEN/USDC pool that governance seeds after launch. | [026](adr/026-tokenomics.md), [016](adr/016-contract-interactions.md), [018](adr/018-liquidity-strategy.md) |
-| Enforcement | Every `ProbeResponse` and `StreamResponse` carries a secp256k1 EIP-712 `slash_sig`, so a node's quotes and deliveries are on-chain evidence; the Ed25519 NodeId authenticates connections and the registration proof, never slash evidence. A challenge is a commit–reveal that resolves on-chain at reveal time. Slashed TOKEN sits in escrow for a 30-day appeal window. Governance blacklists content hashes. Reputation is a local per-peer EWMA. | [014](adr/014-on-chain-verification.md), [028](adr/028-slashing-appeals.md), [011](adr/011-content-takedown.md), [008](adr/008-reputation.md) |
+| Enforcement | Every `StreamResponse` carries a secp256k1 EIP-712 `slash_sig`, so serving a blacklisted hash — the one slashable offense — leaves on-chain evidence. There is no rate slash: the client signs the price into each voucher; the Ed25519 NodeId authenticates connections and the registration proof, never slash evidence. A challenge is a commit–reveal that resolves on-chain at reveal time. Slashed TOKEN sits in escrow for a 30-day appeal window. Governance blacklists content hashes. Reputation is a local per-peer EWMA. | [014](adr/014-on-chain-verification.md), [028](adr/028-slashing-appeals.md), [011](adr/011-content-takedown.md), [008](adr/008-reputation.md) |
 | Governance | `DecdnGovernor` with a `TimelockController`. No TOKEN balance carries a vote. Vote weight is trailing-window served bytes, capped per epoch by declared capacity and overall by a per-operator share, ramped by tenure since first bond, and zeroed by a standing slash inside the trailing window. The process moves from admin key to bootstrap multisig to DAO; the contract set stays the same. | [009](adr/009-governance.md), [036](adr/036-served-bytes-voting-weight.md) |
 | Evolution | Varint-length framing, protocol enums, and a three-tier schema-evolution model. Production targets Arbitrum One. | [013](adr/013-schema-evolution.md), [L2 appendix](adr/appendix-l2-deployment.md) |
 

@@ -408,9 +408,9 @@ The rules below apply to every pull:
   co-stream. Distinct lanes proceed in parallel. Every entry runs the
   acquire loop of
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)
-  over its probed holders. A whole-file entry fetches the whole blob. A
+  over the holders that answer its discovery opens. A whole-file entry fetches the whole blob. A
   range-dedup entry fetches only the ranges that no donor supplies, through
-  the same loop. The entry probes its holders once and uses them for each
+  the same loop. The entry opens its holders once and uses them for each
   fetch of its ranges. A lane of a range-dedup entry can go to a
   proxy-warming non-holder, as for a whole-file entry, and `--max-sources`
   counts such a node as one of its sources. The loop admits one node per
@@ -503,9 +503,10 @@ The rules below apply to every pull:
   destination to stderr before the pull starts. A blob URI without `-o`
   writes the blob to `./<hash>`, in lowercase hex.
 - **`--dry-run`** reports the plan and its price, and pays nothing. It
-  sends no transaction and opens no keystore. It reads the node registry
-  when the peer store cannot supply it, and it sends one unpaid
-  `cdn/probe/v1` round, which `decdn quote` also runs. The plan lists
+  sends no transaction. It unlocks the keystore and names the pool, as a
+  pull does, because each discovery open carries the pool and the client
+  binding. It reads the node registry when the peer store cannot supply it,
+  and it sends one round of discovery opens, which `decdn quote` also runs. The plan lists
   entries only when an earlier pull or `decdn quote` into the same output
   directory cached the bundle manifest under `.decdn-bundles/`. Without
   that cache, the dry run prints only the bundle hash and the output
@@ -609,6 +610,6 @@ on-wire bytes.
 
 ### Deferred
 
-- Coverage is limited to the region-nearest candidate set probed per
-  distinct blob; a blob no probed node holds fails every entry naming it
+- Coverage is limited to the region-nearest candidate set opened per
+  distinct blob; a blob no opened node holds fails every entry naming it
   (re-runnable). Broadening beyond that set is a follow-up.

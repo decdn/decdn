@@ -22,16 +22,15 @@ Per [ADR 013 § Decision](013-schema-evolution.md#adr-013-schema-evolution), eac
 
 Tier-independent: this applies to every restart — a Tier 1 pull-and-restart, a config change, host maintenance — not just to protocol upgrades.
 
-A node that answered `has_blob: true` to a probe and then answers the follow-up `StreamRequest` with `StreamResponse { ok: false }` has advertised a blob it could not serve — an availability/reputation failure with the requester ([ADR 008](008-reputation.md#adr-008-reputation-system)), scored against this node's local standing. The probe-triggered eviction hold keeps a just-advertised blob resident so the follow-up pull succeeds ([ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold)), but eviction holds are in-process state and do not survive a restart — so a restart that drops just-advertised blobs turns those pending pulls into `ok: false` refusals.
+A requester pays on the stream that its discovery open opened, and the node pins the blob of each open stream until the stream ends ([ADR 005 § Open-stream pin](005-protocol.md#open-stream-pin)). A restart ends every open stream. A requester that was about to pay on one loses that answer and goes to another node — an availability/reputation failure with the requester ([ADR 008](008-reputation.md#adr-008-reputation-system)), scored against this node's local standing.
 
 1. **Stop new inbound connections** at your load balancer or firewall. This is the step `decdn node drain` cannot do for you — drain is graceful *shutdown* (the `admin_v1_drain` call in [`appendix-local-admin-http.md`](appendix-local-admin-http.md#appendix-local-admin-http-surface), equivalent to SIGTERM), not a stop-accepting mode, so anything it takes down is already committed.
-2. **Wait for both gauges to reach zero** on `/metrics` (canonical registry: [`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics)):
-   - `decdn_probe_hold_slots_used == 0` — every outstanding probe commitment has aged out, so the restart breaks none of them. This is the gauge that matters; it has no admin-RPC equivalent.
-   - `decdn_streams_active{direction="inbound"} == 0` — no delivery in flight.
+2. **Wait for the inbound stream gauge to reach zero** on `/metrics` (canonical registry: [`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics)):
+   - `decdn_streams_active{direction="inbound"} == 0` — no delivery and no unpaid open in flight, so the restart breaks no answer that a requester is about to pay on.
 3. **Shut down** with `decdn node drain --wait`, which polls `admin_v1_health` for `in_flight_streams == 0` rather than returning the moment the trigger fires.
 4. **Upgrade and restart.** Confirm with `decdn node health`, then re-enable inbound at the load balancer.
 
-Stopping without step 1 is not itself slashable — an unanswered connection is not evidence — but it leaves the window above open for as long as a peer holds a fresh positive probe result for a blob you come back without.
+Stopping without step 1 is not itself slashable — an unanswered connection is not evidence — but it leaves the window above open for every stream that a peer opens before the stop.
 
 ## Tier 1 and Tier 2 operator checklists
 
@@ -68,6 +67,6 @@ The current runtime supports the `…/v1` identifiers documented by the protocol
 ## Cross-ADR Impact
 
 - [ADR 013 — Schema Evolution: framing, enum discipline, evolution tiers, and signed-field freezing](013-schema-evolution.md#adr-013-schema-evolution)
-- [ADR 005 — Probe-Triggered Eviction Hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
+- [ADR 005 — Open-stream pin (drain prerequisite)](005-protocol.md#open-stream-pin)
 - [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md#appendix-local-admin-http-surface)
 - [`appendix-observability.md` — metrics referenced in the restart and Tier 2 checklists](appendix-observability.md#appendix-observability-and-metrics)

@@ -20,7 +20,7 @@ Organized by adversary capability. Each tier subsumes the tier below it.
 | Tier | Adversary | Capabilities | Real-World Examples |
 |------|-----------|-------------|---------------------|
 | T1 | Passive network observer | Observes QUIC connection metadata (IP pairs, timing, volume), on-chain transactions and events | ISP, nation-state passive surveillance, blockchain analytics firm |
-| T2 | Active protocol participant | All of T1 plus: operates staked nodes, sends probes, opens payment pools, observes probe responses | Competing CDN, curious node operator, researcher |
+| T2 | Active protocol participant | All of T1 plus: operates staked nodes, sends discovery opens, opens payment pools, observes discovery answers | Competing CDN, curious node operator, researcher |
 | T3 | Infrastructure operator | All of T2 plus: operates an RPC endpoint or iroh relay | RPC provider (Alchemy, Infura), relay operator |
 | T4 | Compromised endpoint | Has memory or disk access to a specific client or node | Device theft, malware, law enforcement with warrant |
 
@@ -32,12 +32,12 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 |----|---------|-------------|-----------|------------|
 | P-02 | On-chain payment pools | Pool IDs, owner Ethereum address, signer and provider addresses (revealed at redemption), deposit amounts, redemption events | T1 | [003](003-payments.md#adr-003-payment-model) |
 | P-03 | On-chain staking registry | `nodeId`, `ethAddress`, `multiaddrs`, `regionHint`, registration timestamps | T1 | [001](001-network.md#adr-001-network-topology-and-peer-mesh), [architecture.md](architecture.md#architecture-overview) |
-| P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`) | T1 | [005](005-protocol.md#adr-005-wire-protocol) |
+| P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/client/v1`, `cdn/dht/v1`) | T1 | [005](005-protocol.md#adr-005-wire-protocol) |
 | P-07 | Node earnings inference | Redemption and pool-close amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md#adr-003-payment-model) |
 | P-08 | BLAKE3 hash as global identifier | Same content always produces the same hash; repeated requests for a hash are correlatable | T1 | [002](002-content-addressing.md#adr-002-content-addressing) |
-| P-09 | Probe content leakage | All probed nodes (the DHT-returned candidate set) learn which content hash the requester wants | T2 | [005](005-protocol.md#adr-005-wire-protocol) § Probe |
-| P-10 | Cache miss detection | Probes triggered by cache misses are visible to the targeted DHT candidate set, plus DHT FIND_VALUE traffic is visible to nodes close to the hash in keyspace — both reveal regionally uncommon content | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh) § Content Discovery |
-| P-11 | Probe cache timing correlation | 15-second probe cache ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) means the interval between probe and subsequent `StreamRequest` is trivially observable | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh), [005](005-protocol.md#adr-005-wire-protocol) |
+| P-09 | Discovery-open content leakage | Every node that gets a discovery open (the candidate set) learns which content hash the requester wants, and the pool and payer address that the open names | T2 | [005](005-protocol.md#discovery-opens) § Discovery opens |
+| P-10 | Cache miss detection | Discovery opens triggered by cache misses are visible to the targeted DHT candidate set, plus DHT FIND_VALUE traffic is visible to nodes close to the hash in keyspace — both reveal regionally uncommon content | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh) § Content Discovery |
+| P-11 | Discovery-to-delivery correlation | The winner's discovery open becomes its paid stream, and a pull from the 30-second candidate cache ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) follows a recent discovery round, so the link between discovery and delivery is trivially observable | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh), [005](005-protocol.md#adr-005-wire-protocol) |
 | P-12 | Registry node enumeration | Reading the on-chain `CapacityBond` active set (`getRegisteredNodes`) enumerates every active node with its self-reported `regionHint` | T1 | [001](001-network.md#adr-001-network-topology-and-peer-mesh), [003](003-payments.md#adr-003-payment-model) |
 | P-13 | GeoIP inference | Self-reported `regionHint` combined with IP addresses from `multiaddrs` enables geolocation | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 | P-15 | RPC provider query visibility | Registry queries, blacklist polling, and rate-bounds lookups are visible to the RPC provider | T3 | [architecture.md](architecture.md#architecture-overview) § Trust Assumptions |
@@ -45,7 +45,7 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 | P-18 | Unencrypted iroh key (PoC) | Client's Ed25519 secret key stored at `~/.decdn/iroh_key` with `0600` permissions, no encryption | T4 | [012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) § iroh Identity Key |
 | P-21 | Permanent client NodeId | Ed25519 identity is persistent across sessions; all content requests are correlatable under one identity | T2 | [012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) § iroh Identity Key |
 | P-22 | On-chain settlement volume leakage | Cumulative amount and byte count at `redeem` reveal per-lane delivery volume; their spacing across redemptions reveals session granularity | T1 | [003](003-payments.md#adr-003-payment-model) § Redemption and Close |
-| P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on `ProbeResponse` with `has_blob: true` constitutes non-repudiable cryptographic proof that the node held specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) § slash_sig |
+| P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on a `StreamResponse` with `ok: true`, the answer to a discovery open included, constitutes non-repudiable cryptographic proof that the node served specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) § slash_sig |
 | P-24 | Origin attestation in DHT records | Every DHT record carries the signed `StreamResponse` of the seated origin that served the hash, so anyone who runs FIND_VALUE for a known hash learns which origin operator served it, the blob size, the origin's rate and the time of that serve. The origin's seats make the hash-to-namespace link inferable | T2 | [022](022-content-discovery.md#origin-attestation) § Origin Attestation |
 
 ### Analysis by Adversary Tier
@@ -68,19 +68,19 @@ At each on-chain redemption the lane's cumulative amount and byte count are publ
 
 ##### Protocol fingerprinting (P-04)
 
-ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection is a probe, paid stream, or key delivery session, letting a network observer classify connections by type. Standard for any QUIC multi-protocol system; not a significant concern — the protocols are not secret.
+ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection carries `cdn/client/v1` streams or `cdn/dht/v1` queries, letting a network observer classify connections by type. A discovery open and a paid stream share `cdn/client/v1`, so the ALPN does not tell them apart. Standard for any QUIC multi-protocol system; not a significant concern — the protocols are not secret.
 
 ##### Registry enumeration (P-12)
 
-The on-chain registry active set is public, so a T1 observer reads it without probing or connecting to any node. See [§ Network enumeration (P-12, P-13)](#network-enumeration-p-12-p-13) for the full analysis.
+The on-chain registry active set is public, so a T1 observer reads it without connecting to any node. See [§ Network enumeration (P-12, P-13)](#network-enumeration-p-12-p-13) for the full analysis.
 
 #### T2: Active Protocol Participant
 
-Can probe nodes, read the on-chain registry, and observe responses to its own interactions. Primary added concern: content access pattern leakage.
+Can send discovery opens to nodes, read the on-chain registry, and observe responses to its own interactions. Primary added concern: content access pattern leakage.
 
-##### Probe content leakage (P-09, P-10, P-11)
+##### Discovery-open content leakage (P-09, P-10, P-11)
 
-Probing peers for a hash tells all probed nodes what is requested. Cache-miss probes are visible to the targeted DHT-candidate set, and DHT FIND_VALUE queries to keyspace-close nodes — both reveal regionally uncommon or newly requested content. The 15-second probe cache creates a tight timing correlation between probe and subsequent `StreamRequest`. Probes are explicitly public ([ADR 005](005-protocol.md#adr-005-wire-protocol)): node identities are in a public registry, content availability is discoverable via probing, pricing is revealed by design. The delivering node fundamentally must know the requested hash; mitigating leakage to non-delivering nodes (e.g., dummy probes) adds bandwidth cost without changing the fundamental property.
+A discovery open for a hash tells every candidate what is requested. It also names the pool and carries the client binding, so every candidate learns the payer address, as the delivering node does. Cache-miss discovery opens are visible to the targeted DHT-candidate set, and DHT FIND_VALUE queries to keyspace-close nodes — both reveal regionally uncommon or newly requested content. The winner's discovery open becomes its paid stream, so discovery and delivery are trivially linked. Discovery answers are explicitly public ([ADR 005 § Discovery opens](005-protocol.md#discovery-opens)): node identities are in a public registry, content availability is discoverable via discovery opens, pricing is revealed by design. The delivering node fundamentally must know the requested hash; mitigating leakage to non-delivering nodes (e.g., dummy discovery opens) adds bandwidth cost without changing the fundamental property.
 
 ##### Network enumeration (P-12, P-13)
 
@@ -88,11 +88,11 @@ The on-chain registry active set is enumerable; reading it reveals all active no
 
 ##### `slash_sig` as content inventory proof (P-23)
 
-Every `ProbeResponse` carries a `slash_sig` — an EIP-712 secp256k1 signature binding the node's Ethereum address to specific content hashes and timestamps ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). Any T2 prober collects non-repudiable, EVM-verifiable, individually attributable proof that the node committed to having (or not having) specific content at a specific time. Systematic probing builds a cryptographic per-node content inventory keyed by Ethereum address. Inherent to the on-chain slashing design — `slash_sig` exists to make node commitments provable; removing it eliminates on-chain slashability.
+Every `StreamResponse` carries a `slash_sig` — an EIP-712 secp256k1 signature binding the node's Ethereum address to specific content hashes and timestamps ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). The answer to a discovery open is a `StreamResponse` too. Any T2 participant that sends discovery opens collects non-repudiable, EVM-verifiable, individually attributable proof that the node committed to serving (or refused) specific content at a specific time. Systematic discovery opens build a cryptographic per-node content inventory keyed by Ethereum address. Inherent to the on-chain slashing design — `slash_sig` exists to make node commitments provable; removing it eliminates on-chain slashability.
 
 ##### Cross-session client tracking (P-21)
 
-A persistent client NodeId exposes a stable transport identifier to every node the client connects to. Rotating it does not provide cross-session unlinkability: the serving node must resolve the signer's Ethereum address to attribute vouchers and redeem them on-chain, and a T1 observer correlates that same address across public payment-pool activity (P-02). Rotation only obscures the client from non-serving T2 probers — participants that learn a NodeId by completing a handshake but are never selected for delivery — and that residual is already leaked as content demand through the accepted P-08 and P-10 surfaces. Details in [§ Client NodeId Rotation (P-21)](#client-nodeid-rotation-p-21).
+A persistent client NodeId exposes a stable transport identifier to every node the client connects to. Rotating it does not provide cross-session unlinkability: the serving node must resolve the signer's Ethereum address to attribute vouchers and redeem them on-chain, and a T1 observer correlates that same address across public payment-pool activity (P-02). Rotation only obscures the client from T2 participants that learn a NodeId by completing a handshake and get no request from it. A candidate that gets a discovery open sees the pool and the payer address, as the serving node does. The residual is already leaked as content demand through the accepted P-08 and P-10 surfaces. Details in [§ Client NodeId Rotation (P-21)](#client-nodeid-rotation-p-21).
 
 #### T3: Infrastructure Operator
 
@@ -123,15 +123,15 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 | P-04 | ALPN protocol identification | Accept | Standard QUIC behavior; protocols are not secret | — |
 | P-07 | Node earnings inference | Accept | Inherent to on-chain settlement; no mitigation without breaking dispute model | — |
 | P-08 | BLAKE3 global identifier | Accept | Fundamental to content-addressed delivery; no alternative without breaking the architecture | — |
-| P-09 | Probe content leakage | Accept | Probes are public by design ([ADR 005](005-protocol.md#adr-005-wire-protocol)); delivering node must know the hash | — |
-| P-10 | Cache miss detection | Accept | Inherent to probing and DHT lookups for cache-miss pulls | — |
-| P-11 | Probe cache timing | Accept | 15-second window is an optimization tradeoff; attacker already sees the probe | — |
+| P-09 | Discovery-open content leakage | Accept | Discovery answers are public by design ([ADR 005 § Discovery opens](005-protocol.md#discovery-opens)); delivering node must know the hash | — |
+| P-10 | Cache miss detection | Accept | Inherent to discovery opens and DHT lookups for cache-miss pulls | — |
+| P-11 | Discovery-to-delivery correlation | Accept | The paid stream reuses the discovery stream to save a round trip; the attacker already sees the discovery open | — |
 | P-12 | Registry node enumeration | Accept | Inherent to any system with discoverable nodes | — |
 | P-13 | GeoIP inference | Accept | Self-reported region is intentionally public for client selection | — |
 | P-15 | RPC provider visibility | Mitigate | Operational guidance reduces single-provider trust | Pre-mainnet |
 | P-17 | Relay connection metadata | Accept | Standard relay behavior; traffic is E2E encrypted | — |
 | P-18 | Unencrypted iroh key | Mitigate | Already planned: platform keychain in production | Pre-mainnet |
-| P-21 | Permanent client NodeId | Accept | Serving nodes and T1 observers link sessions by the stable Ethereum address the payment model requires (P-02); the residual non-serving-prober benefit is already leaked through accepted P-08 and P-10 | — |
+| P-21 | Permanent client NodeId | Accept | Serving nodes and T1 observers link sessions by the stable Ethereum address the payment model requires (P-02); the residual benefit against participants that get no request is already leaked through accepted P-08 and P-10 | — |
 | P-22 | Settlement volume leakage | Accept | Inherent to on-chain settlement; settlement amount must be public for dispute resolution | — |
 | P-23 | `slash_sig` content inventory | Accept | Required for on-chain accountability; removing `slash_sig` eliminates slashability | — |
 | P-24 | Origin attestation in DHT records | Accept | Required so that every cached copy traces to a vetted origin. The attestation names no pool, payer or client, and an origin's seats and rate are public already | — |
@@ -142,11 +142,11 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 
 **Available capability:** [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents production rotation: generate a new iroh key, reconnect, and sign a fresh `BindNodeId` with the same Ethereum key. Open payment pools remain valid because they are keyed by `(owner_ethereum_address, poolNonce)`, not by NodeId. Rotation is not supported for PoC — deleting the key file and restarting generates a new identity, but that is a side effect, not a rotation procedure.
 
-**Privacy effect:** Rotation replaces the stable transport identifier, obscuring cross-session correlation by non-serving T2 probers — participants that learn a NodeId by completing a handshake but are never selected for delivery, and so never see a `StreamRequest`. It does not help against a T1 passive observer: P-21 is a T2 surface because the iroh identity is exchanged under TLS handshake encryption, leaving only the ALPN visible in the clear (P-04), so a passive observer correlates by IP regardless of rotation.
+**Privacy effect:** Rotation replaces the stable transport identifier, obscuring cross-session correlation by T2 participants that learn a NodeId by completing a handshake and never see a `StreamRequest`. A discovery open is a `StreamRequest`, so every candidate that gets one sees the pool and the payer address. It does not help against a T1 passive observer: P-21 is a T2 surface because the iroh identity is exchanged under TLS handshake encryption, leaving only the ALPN visible in the clear (P-04), so a passive observer correlates by IP regardless of rotation.
 
 **Limitation:** Rotation does not provide cross-session unlinkability. Every request carries `pool_id = keccak256(owner, poolNonce)` ([ADR 003](003-payments.md#adr-003-payment-model)) in the base `StreamRequest`, and the serving node must resolve the signer's Ethereum address to attribute vouchers and redeem them on-chain — from the on-chain binding for a registered client, or from the `ethereum_address` field in `StreamRequestExt` for an off-chain one ([ADR 005](005-protocol.md#adr-005-wire-protocol)). A T1 observer then correlates that address across public payment-pool activity. This limitation is scale-independent because every serving relationship exposes the stable payment identity regardless of node count.
 
-**Disposition:** Accept. P-02 is what defeats rotation — the payment model requires a stable client address visible to both the serving node and any on-chain observer — and the remaining non-serving-prober benefit is already leaked as content demand through the accepted P-08 and P-10 surfaces. Production rotation remains an optional identity-lifecycle capability, not a privacy roadmap commitment.
+**Disposition:** Accept. P-02 is what defeats rotation — the payment model requires a stable client address visible to both the serving node and any on-chain observer — and the remaining benefit against participants that get no request is already leaked as content demand through the accepted P-08 and P-10 surfaces. Production rotation remains an optional identity-lifecycle capability, not a privacy roadmap commitment.
 
 #### Operational RPC Guidance (P-15)
 
@@ -158,11 +158,11 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 
 **Current state:** [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) already specifies platform keychain for production. No additional design needed — already planned.
 
-#### Dummy Probes (Not Recommended)
+#### Dummy Discovery Opens (Not Recommended)
 
-**Purpose:** Obscure requested content by mixing real probes with decoy probes for random hashes.
+**Purpose:** Obscure requested content by mixing real discovery opens with decoy opens for random hashes.
 
-**Assessment:** Probes are explicitly public ([ADR 005](005-protocol.md#adr-005-wire-protocol)). The delivering node must know the requested hash — dummy probes only hide requests from non-delivering nodes. Benefit is marginal relative to cost: 3-5x more probe traffic, added latency (wait for dummy responses or accept a timing side-channel), more node CPU. Probes are free (no USDC cost), but bandwidth and compute costs are non-trivial at scale.
+**Assessment:** Discovery answers are explicitly public ([ADR 005 § Discovery opens](005-protocol.md#discovery-opens)). The delivering node must know the requested hash — dummy opens only hide requests from non-delivering nodes, and each open still names the pool and the payer address. Benefit is marginal relative to cost: 3-5x more open traffic, added latency (wait for dummy answers or accept a timing side-channel), more node CPU. Opens are free (no USDC cost), but bandwidth and compute costs are non-trivial at scale.
 
 **Disposition:** Defer post-mainnet. Revisit only if content access pattern privacy becomes a product requirement.
 
@@ -180,7 +180,7 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 |----------|-----------|-------|--------|--------|
 | 1 | Client iroh key encryption ([§ Client iroh Key Encryption (P-18)](#client-iroh-key-encryption-p-18)) | Pre-mainnet | Low | Medium — protects identity from T4 on client devices |
 | 2 | Operational RPC guidance ([§ Operational RPC Guidance (P-15)](#operational-rpc-guidance-p-15)) | Pre-mainnet | Minimal | Medium — documents trust boundary as privacy concern |
-| 3 | Dummy probes ([§ Dummy Probes (Not Recommended)](#dummy-probes-not-recommended)) | Post-mainnet | Medium | Low — probes are public by design |
+| 3 | Dummy discovery opens ([§ Dummy Discovery Opens (Not Recommended)](#dummy-discovery-opens-not-recommended)) | Post-mainnet | Medium | Low — discovery answers are public by design |
 | 4 | Payment pool mixing ([§ Payment Pool Mixing (Not Recommended)](#payment-pool-mixing-not-recommended)) | Post-mainnet | High | Medium — requires regulatory analysis first |
 
 ## Consequences
@@ -202,10 +202,10 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 
 ## References
 
-- [ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh): registry enumeration, DHT-candidate probing
+- [ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh): registry enumeration, discovery opens to DHT candidates
 - [ADR 002 — Content Addressing](002-content-addressing.md#adr-002-content-addressing): BLAKE3 as global content identifier
-- [ADR 003 — Payment Model](003-payments.md#adr-003-payment-model): payment pool on-chain visibility, probe fishing rate limits
-- [ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol): probe publicity statement, ALPN definitions
+- [ADR 003 — Payment Model](003-payments.md#adr-003-payment-model): payment pool on-chain visibility, discovery-open load limits
+- [ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol): discovery-open publicity statement, ALPN definitions
 - [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model): client NodeId, key storage, rotation
 - [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence): on-chain verification data surface
 - [Architecture Overview](architecture.md#architecture-overview): trust assumptions (NTP, RPC provider, relay), system diagram

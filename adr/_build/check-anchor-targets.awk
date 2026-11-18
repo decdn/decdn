@@ -16,8 +16,8 @@
 #   * A stripped character leaves its surrounding spaces behind, so `## Tier 1
 #     — Minor` slugs to `tier-1--minor` (double hyphen). Approximating the
 #     algorithm would flag correct links.
-#   * Punctuation vanishes rather than splitting a word: `` ### `cdn/probe/v1`
-#     — latency probe `` slugs to `cdnprobev1--latency-probe`.
+#   * Punctuation vanishes rather than splitting a word: `` ### `cdn/client/v1`
+#     — paid delivery protocol `` slugs to `cdnclientv1--paid-delivery-protocol`.
 #
 # Run under LC_ALL=C so the character class is byte-oriented and every awk
 # (mawk in CI, gawk/BSD awk locally) strips multibyte punctuation identically.

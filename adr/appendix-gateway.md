@@ -164,7 +164,8 @@ needs no pull.
 
 Before it answers a raw blob of unknown size, the gateway learns its size. It
 resolves the holders of the blob and takes the first size that one of them
-proves: a probe answer, or the header of an open of the blob's first byte.
+proves: the answer to a discovery open, or the header of an open of the
+blob's first byte.
 That open pays for one chunk group at most. The gateway keeps the size as a
 verified size. A
 response whose pull passes `--max-blob-mb` answers 413 before any pull. The

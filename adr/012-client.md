@@ -31,7 +31,7 @@ This ADR targets **desktop and server clients** — POSIX or Windows hosts with 
 A client is a lightweight QUIC endpoint that streams content and pays per MB. It is **not** a bonded node and has no on-chain registration requirement. Capabilities:
 
 - Opens `cdn/client/v1` connections to nodes for paid content delivery
-- Picks the node to stream from out of the bonded set it already knows — its persisted peer store, or the on-chain registry — and probes candidates over `cdn/probe/v1` ([ADR 039 § Source set and selection](039-multi-source-parallel-fetch.md#source-set-and-selection)). It issues no `cdn/dht/v1` lookup: a node that lacks the blob resolves holders on the client's behalf through its own pull leg ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
+- Picks the node to stream from out of the bonded set it already knows — its persisted peer store, or the on-chain registry — and sends a discovery open to each candidate over `cdn/client/v1` ([ADR 005 § Discovery opens](005-protocol.md#discovery-opens), [ADR 039 § Source set and selection](039-multi-source-parallel-fetch.md#source-set-and-selection)). It issues no `cdn/dht/v1` lookup: a node that lacks the blob resolves holders on the client's behalf through its own pull leg ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
 - Ranks candidates by measured RTT only ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)); it keeps no reputation score and shares no observations with anyone
 - Maintains a local peer store: registry-fed identity plus a per-peer latency EWMA and a failure-suppression stamp ([ADR 037 § Client RTT map](037-regional-proxy-warming.md#client-rtt-map-and-latency-discovery))
 - Signs vouchers authorizing off-chain USDC payments, from a capability-authorized signer key the pool owner delegates (by default, a key the client derives for each data dir from the owner key)
@@ -85,7 +85,7 @@ Startup sequence from first launch to ready state:
 
 The peer store is a directory of per-node JSON files under the resolved client data dir — `--data-dir`, else `[identity] data_dir`, defaulting to `~/.decdn/client` — so it moves with the rest of the client's state rather than living at a fixed path.
 
-The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. The peer store's identity half — the last registry snapshot — covers a transient RPC outage. That snapshot includes each peer's last-seen `multiaddrs`, so an outage-fallback dial reaches a reachable peer directly, without iroh discovery ([ADR 001 § Node Discovery](001-network.md#node-discovery-registry)); a stale cached address loses the iroh path race but never fails a dial, so the store only ever speeds a fetch. The store's stats half — round-trip latency sampled from probes, and quoted price from probes and stream responses — lets a client route a fetch without probing when it holds enough fresh candidates, going straight to a `StreamRequest` and taking price from the node's `StreamResponse`. The two halves of a record age on independent clocks: identity refreshes and prunes on the registry's own horizon (the periodic registry refresh of step 8), while stats age against the RTT map's own staleness TTL ([ADR 037 § Client RTT map and latency discovery](037-regional-proxy-warming.md#client-rtt-map-and-latency-discovery), `LATENCY_TTL_SECS`) — a record can carry fresh identity with stale stats, or the reverse. A client stays online only long enough to fetch, so it holds no long-lived network role. The store persists across invocations, so a later run can skip both the registry read and the probe.
+The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. The peer store's identity half — the last registry snapshot — covers a transient RPC outage. That snapshot includes each peer's last-seen `multiaddrs`, so an outage-fallback dial reaches a reachable peer directly, without iroh discovery ([ADR 001 § Node Discovery](001-network.md#node-discovery-registry)); a stale cached address loses the iroh path race but never fails a dial, so the store only ever speeds a fetch. The store's stats half — path RTT sampled from discovery opens, and quoted price from stream responses — lets a client route a fetch without a discovery round when it holds enough fresh candidates, going straight to a `StreamRequest` with `pull_through` set and taking price from the node's `StreamResponse`. The two halves of a record age on independent clocks: identity refreshes and prunes on the registry's own horizon (the periodic registry refresh of step 8), while stats age against the RTT map's own staleness TTL ([ADR 037 § Client RTT map and latency discovery](037-regional-proxy-warming.md#client-rtt-map-and-latency-discovery), `LATENCY_TTL_SECS`) — a record can carry fresh identity with stale stats, or the reverse. A client stays online only long enough to fetch, so it holds no long-lived network role. The store persists across invocations, so a later run can skip both the registry read and the discovery round.
 
 Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.2](019-node-onboarding.md#step-32--build-initial-node-view-from-on-chain-registry).
 
@@ -95,7 +95,7 @@ Clients manage two independent cryptographic keys.
 
 #### iroh Identity Key (Ed25519)
 
-- **Purpose:** Defines the client's `NodeId` in the peer mesh. Used for QUIC connection authentication on `cdn/client/v1` and `cdn/probe/v1`.
+- **Purpose:** Defines the client's `NodeId` in the peer mesh. Used for QUIC connection authentication on `cdn/client/v1`.
 - **Generation:** Created at first startup via `iroh::SecretKey::generate()`.
 - **Storage (PoC):** File at `~/.decdn/iroh_key`, permissions `0600`. No encryption — the file contains the raw 32-byte secret key.
 - **Storage (production):** Platform keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service API).
@@ -153,7 +153,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 - **Content integrity:** BLAKE3 hash verification on every received blob. A malicious node cannot serve corrupted data.
 - **Voucher binding:** EIP-712 signatures on vouchers are produced by a capability-authorized signer key. The owner controls how much it authorizes (the `spending_cap`) and — since it issues the capability — who may sign and until when (`expiry`).
-- **Rate commitment:** `StreamResponse` carries a `slash_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. A rate mismatch vs. the probe response within 30 seconds is slashable ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
+- **Rate commitment:** `StreamResponse` carries a `slash_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. The client signs that rate into each voucher as `chunk_price`, and the node refuses a voucher at another price ([ADR 005 § Rate self-enforcement](005-protocol.md#rate-self-enforcement)). There is no rate slash: the client protects itself.
 - **Node identity:** QUIC handshake authenticates the remote NodeId (Ed25519). The client knows it is communicating with the registered node.
 - **Payment pool state:** On-chain, publicly verifiable. The owner can always close and reclaim; a node can always redeem its lanes.
 
@@ -164,9 +164,9 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 #### Not trusted — the client does not rely on these
 
-- Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim only shortlists which registry candidates the client probes; it is never a rank key. The failover order is measured RTT, which a node cannot forge ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)).
+- Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim only shortlists which registry candidates the client opens; it is never a rank key. The failover order is measured RTT, which a node cannot forge ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)).
 - Reputation reported by other peers. The client ranks nodes solely from its own measured RTT and failure history; it consumes no reputation score, its own or anyone else's.
-- Node availability promises beyond signed probe responses.
+- Node availability promises beyond signed stream responses.
 
 ### Client Configuration
 
@@ -230,8 +230,8 @@ in current schema terms:
 - `[blockchain]` — `rpc_url`, `eth_keystore`, `chain_id`, plus the `payment_pool_address` /
   `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
   and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
-- `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
-  probing to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull
+- `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery opens
+  to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull
   applies it to each entry's candidate sample, with the same widening rule as a single fetch.
 
 The voucher byte-accounting granularity is a fixed protocol constant that every client and node

@@ -6,7 +6,8 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 
 Local per-peer reputation scoring
 ([ADR 008](https://github.com/decdn/decdn/blob/main/adr/008-reputation.md)): an exponentially weighted moving average over
-observed delivery outcomes, used to rank candidate peers. Probes record nothing.
+observed delivery outcomes, used to rank candidate peers. A discovery open records only
+reachability and region-latency outcomes.
 
 Scores are strictly local. There is no gossip aggregation and no shared reputation state — a
 node's view is built only from what it has itself observed, and it lives in memory only.

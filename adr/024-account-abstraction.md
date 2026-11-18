@@ -7,7 +7,7 @@
 
 Three independent design pressures bear on wallet choice and signature verification:
 
-1. **High-frequency signing needs a hot key.** A hash chain meters delivery between signatures ([ADR 003 § Hash-chain metering (PayWord)](003-payments.md#hash-chain-metering-payword)), so a 100 MB download needs two EIP-712 voucher signatures rather than 25. That removes the per-interval signature but not the requirement: a payer still signs at stream open, at each 255 MiB rollover, and at close, and nodes sign a `slash_sig` on every `ProbeResponse` / `StreamResponse`. A hardware wallet requires a physical confirmation (2–5 seconds) per signature, so hardware-wallet-only operation is infeasible at this signing frequency, whatever the wallet model. [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) identified this and explored a derived hot key (HKDF from a hardware-wallet signature) as a narrow workaround.
+1. **High-frequency signing needs a hot key.** A hash chain meters delivery between signatures ([ADR 003 § Hash-chain metering (PayWord)](003-payments.md#hash-chain-metering-payword)), so a 100 MB download needs two EIP-712 voucher signatures rather than 25. That removes the per-interval signature but not the requirement: a payer still signs at stream open, at each 255 MiB rollover, and at close, and nodes sign a `slash_sig` on every `StreamResponse`. A hardware wallet requires a physical confirmation (2–5 seconds) per signature, so hardware-wallet-only operation is infeasible at this signing frequency, whatever the wallet model. [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) identified this and explored a derived hot key (HKDF from a hardware-wallet signature) as a narrow workaround.
 
 2. **Multisig custody is desirable for staked funds.** Nodes stake significant TOKEN and accumulate USDC earnings. A single EOA controlling staked funds is a single point of compromise, and Safe multisig wallets are the industry standard for protocol-managed funds. But multisig only helps on the infrequent cold paths (bond, withdraw, pool open/close): a quorum cannot be reached per message at `slash_sig` wire speed. So the requirement is that a Safe be *possible*, not that it be required or tooled.
 
@@ -57,10 +57,9 @@ The EIP-712 domain separators, typed data hashes, and voucher formats are the sa
 
 | Function | Verification |
 | --- | --- |
-| `submitRateChallenge` | ECDSA recovery of `probeDigest` and `streamDigest`, each compared against `challengedNode` |
 | `submitBlacklistChallenge` | ECDSA recovery of `digest`, compared against `challengedNode` |
 
-The challenger supplies the `challengedNode` address; the contract recovers the signer of each evidence digest and compares it against that address, then confirms the address is slashable. `SlashJudge` is the one contract that does not use `SignatureChecker`: `slash_sig` is re-verified later as evidence, so its validity must not depend on code at the operator's address. Code an operator attaches to an EOA (an EIP-7702 delegate) is never consulted, and a smart-account operator cannot serve ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)).
+The challenger supplies the `challengedNode` address; the contract recovers the signer of the evidence digest and compares it against that address, then confirms the address is slashable. `SlashJudge` is the one contract that does not use `SignatureChecker`: `slash_sig` is re-verified later as evidence, so its validity must not depend on code at the operator's address. Code an operator attaches to an EOA (an EIP-7702 delegate) is never consulted, and a smart-account operator cannot serve ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)).
 
 #### Gas Impact
 
@@ -80,7 +79,7 @@ deCDN recommends none of them. A 1-of-1 Safe carries the same trust posture as t
 
 **An EOA keystore on the signing host is the default.**
 
-- **Hot signing (`slash_sig`) — the binding constraint.** Nodes sign a `slash_sig` on every `ProbeResponse` / `StreamResponse`. A paying client verifies the `StreamResponse` signature **off-chain**, recovering the signer and comparing it against the delivering node's registered address; the probe leg is shape-checked only today, with full attribution left to the on-chain `SlashJudge`. A Safe owner-key signature recovers to the *owner*, not to the Safe, so a Safe-addressed operator's stream responses are rejected — the node can be probed but cannot be paid. Multi-owner thresholds are separately infeasible here: `SignatureChecker` → Safe's `checkSignatures` cannot reach a quorum at wire speed, and pre-approving every digest via `signMessage` is impractical. Closing this gap is [§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving).
+- **Hot signing (`slash_sig`) — the binding constraint.** Nodes sign a `slash_sig` on every `StreamResponse`. A requester verifies the `StreamResponse` signature **off-chain**, recovering the signer and comparing it against the node's registered address, on a discovery open and on a paid stream alike. A Safe owner-key signature recovers to the *owner*, not to the Safe, so a Safe-addressed operator's stream responses are rejected — the node is neither discovered nor paid. Multi-owner thresholds are separately infeasible here: `SignatureChecker` → Safe's `checkSignatures` cannot reach a quorum at wire speed, and pre-approving every digest via `signMessage` is impractical. Closing this gap is [§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving).
 - **Cold paths are wallet-agnostic.** Bond management (`CapacityBond.bond(...)` + `declareMbps(...)`, `registerNode()`, `deregisterNode()`, `requestUnbond(...)`, `unbond()`) and node-to-node pool operations (`openPool()`, `closePool()`, `topUp()`) are all on-chain and infrequent, so `SignatureChecker` accepts an EOA or a Safe of any threshold. But the registered address is also the address a node serves under — `registerNode` binds `msg.sender` — so there is no split where a Safe custodies the bond while an EOA serves. Holding the on-chain identity in a Safe today means holding a **non-serving** identity: the bond and earnings are multisig-protected, and the node cannot complete a paid delivery.
 
 #### Clients
@@ -112,19 +111,19 @@ ERC-1271 validity is not a property of a keypair; it is `isValidSignature(digest
 | Class | Signatures | ERC-1271 safe? | Why |
 | --- | --- | --- | --- |
 | **Consumed at call time** | bond, `registerNode` / `bindNodeId`, `redeem` voucher + capability, pool close, buyer capability grant | Yes — this is what `SignatureChecker` already does | The question is "is it valid *now*?", answered and consumed in the same transaction |
-| **Re-verified later as evidence** | `slash_sig` on `ProbeResponse` / `StreamResponse`, and anything else `SlashJudge` re-verifies to punish an offense | **No** | The attacker controls validity in the gap between taking payment and the on-chain slash |
+| **Re-verified later as evidence** | `slash_sig` on `StreamResponse`, and anything else `SlashJudge` re-verifies to punish an offense | **No** | The attacker controls validity in the gap between taking payment and the on-chain slash |
 
 The slashing model ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) assumes the incriminating signature is the same signature that authorized the paid action and that it stays provably valid until it reaches `SlashJudge`. Smart-account signers break both assumptions. `slash_sig` sits in the second class, so it cannot move to ERC-1271.
 
 #### Hazards a future design must answer
 
-1. **Selective validator.** The operator's `isValidSignature` returns the magic value for serve / voucher / probe digests — so the node is paid and serves — but invalid for the exact rate-challenge and blacklist digests `SlashJudge` re-verifies. The function receives only a digest and a signature; the operator does not need caller context, only to mark the evidence digests invalid. The node serves, collects, and is categorically un-slashable.
+1. **Selective validator.** The operator's `isValidSignature` returns the magic value for serve / voucher digests — so the node is paid and serves — but invalid for the exact blacklist digests `SlashJudge` re-verifies. The function receives only a digest and a signature; the operator does not need caller context, only to mark the evidence digests invalid. The node serves, collects, and is categorically un-slashable.
 
 2. **Post-payment revocation.** Simpler, and needs no per-digest cunning: the client verifies off-chain and pays *now*; the operator flips a storage flag or revokes the signing session *after*, and the later on-chain re-verification returns invalid. First-class, immediate revocation — the very property a session-key module advertises as a feature — is here the attack: it is exactly what defeats "verify now, slash later."
 
 3. **Gas-bomb on the slash path.** `SlashJudge` → `SignatureChecker` → an external call into the challenged node's contract. A malicious validator burns all forwarded gas or reverts, so the *challenger's* slash transaction fails. `SignatureChecker` puts no gas cap on the ERC-1271 call. Slashing-evasion by denial of service. Any on-chain re-verification of a smart-account signer in a slash path must cap the gas it forwards.
 
-4. **Off-chain ERC-1271 is unsound as evidence.** An off-chain verifier could probe the signer for code and, when present, call `isValidSignature` over an L2 RPC round-trip. But that answers "valid as of block N", and validity is mutable after N. Caching *code presence* is safe (it does not change post-deployment); caching *validity* is not. Fail-open accepts forged signatures; fail-closed makes serving depend on RPC liveness. The recovery-only off-chain path pays none of this.
+4. **Off-chain ERC-1271 is unsound as evidence.** An off-chain verifier could check the signer for code and, when present, call `isValidSignature` over an L2 RPC round-trip. But that answers "valid as of block N", and validity is mutable after N. Caching *code presence* is safe (it does not change post-deployment); caching *validity* is not. Fail-open accepts forged signatures; fail-closed makes serving depend on RPC liveness. The recovery-only off-chain path pays none of this.
 
 #### The direction, not the design
 

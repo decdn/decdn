@@ -7,7 +7,7 @@
 
 All wire messages are serialized with [postcard](https://docs.rs/postcard) — a compact, no-std, serde-based binary format standard in the iroh ecosystem ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Postcard is positional: fields are encoded in declaration order with no field tags, per-field length delimiters, or schema versioning. `postcard::from_bytes` silently ignores trailing bytes; `postcard::take_from_bytes` returns the unconsumed remainder. Neither fails on trailing bytes, but a QUIC byte stream has no message boundaries from which a receiver can determine where one message ends. Explicit framing is required.
 
-`StreamRequest` already separates its frozen base from a separately encoded trailing `StreamRequestExt` ([ADR 005](005-protocol.md#adr-005-wire-protocol)). That two-phase pattern handles compatible optional growth. It needs to be uniform across the three ALPNs (`cdn/probe/v1`, `cdn/client/v1`, `cdn/dht/v1`).
+`StreamRequest` already separates its frozen base from a separately encoded trailing `StreamRequestExt` ([ADR 005](005-protocol.md#adr-005-wire-protocol)). That two-phase pattern handles compatible optional growth. It needs to be uniform across the two ALPNs (`cdn/client/v1`, `cdn/dht/v1`).
 
 Several messages contain cryptographically signed fields ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Signatures are a byte-level commitment: appending a field to a signed struct makes old verifiers compute the signature over fewer bytes than the signer intended, causing verification failure. Signed field sets must be explicitly frozen per protocol version.
 
@@ -28,12 +28,10 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 
 The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128).
 
-Each read has a frame ceiling. The ceiling is at least the largest legitimate message that can arrive at that read. The probe, client control and DHT ceilings add headroom. `MAX_CHUNK_FRAME` is exactly one full `ChunkData` frame. The receiver refuses a length prefix above the ceiling before it allocates, and it does not wait for the payload. A sender MUST NOT send a frame above the ceiling of the read that receives it. The ceilings are protocol constants in `decdn-protocol`:
+Each read has a frame ceiling. The ceiling is at least the largest legitimate message that can arrive at that read. The client control, stream response and DHT ceilings add headroom. `MAX_CHUNK_FRAME` is exactly one full `ChunkData` frame. The receiver refuses a length prefix above the ceiling before it allocates, and it does not wait for the payload. A sender MUST NOT send a frame above the ceiling of the read that receives it. The ceilings are protocol constants in `decdn-protocol`:
 
 | Ceiling | Value | Reads | Largest legitimate message |
 | --- | --- | --- | --- |
-| `MAX_PROBE_REQUEST_FRAME` | 1 KiB | `ProbeRequest`, which the node reads | `ProbeRequest`: 43 B |
-| `MAX_PROBE_FRAME` | 8 KiB | `ProbeResponse`, which the requester reads | `ProbeResponse` with its extension and a full size proof: 4,807 B |
 | `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding, a capability and the pull-through flag: 302 B |
 | `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a refusal code, an origin attestation, a full size proof and a coverage bitmap: under 5 KiB |
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |
@@ -45,7 +43,7 @@ The sizes use 65-byte EOA signatures, full-width varints and 200-byte coverage b
 
 The transport also buffers stream data below the reader. A peer can send the later bytes of a stream and hold back its first bytes. The transport keeps the out-of-order bytes until the stream ends. QUIC flow control bounds these bytes. The node sets a connection receive window of 8 MiB (`QUIC_CONNECTION_RECEIVE_WINDOW`). This window bounds the unread stream data of one connection, across all of its streams and on every ALPN. The window for each stream stays at the transport default of 1.25 MB.
 
-The node bounds the number of connections with `security.max_concurrent_handlers` (default 256). Each `cdn/client/v1` connection admits at most 100 streams (`MAX_CLIENT_STREAMS`, [ADR 005 § Concurrent stream limits](005-protocol.md#concurrent-stream-limits)). The node refuses an over-cap stream before it reads the request. `cdn/probe/v1` and `cdn/dht/v1` serve one stream at a time on each connection. At the default handler cap, stalled peers can hold at most:
+The node bounds the number of connections with `security.max_concurrent_handlers` (default 256). Each `cdn/client/v1` connection admits at most 100 streams (`MAX_CLIENT_STREAMS`, [ADR 005 § Concurrent stream limits](005-protocol.md#concurrent-stream-limits)). The node refuses an over-cap stream before it reads the request. `cdn/dht/v1` serves one stream at a time on each connection. At the default handler cap, stalled peers can hold at most:
 
 - 2 GiB of unread transport data (256 connections × 8 MiB).
 - 200 MiB of `cdn/client/v1` reader buffers (256 × 100 streams × 8 KiB). Each stream holds a request of at most one ceiling, or a partial proof frame of at most one ceiling plus one 4 KiB read.
@@ -92,13 +90,6 @@ These are low-level framing helpers. Application-layer deserialization is separa
 Each ALPN defines a single top-level enum wrapping all message types for that protocol, serialized as the outermost postcard value inside the length-prefixed frame. Postcard encodes enum variants with a varint discriminant (1 byte for variants 0–127), providing explicit, extensible message type tags on the wire.
 
 ```rust
-/// cdn/probe/v1
-#[derive(Serialize, Deserialize)]
-enum ProbeMessage {
-    Request(ProbeRequest),    // discriminant 0
-    Response(ProbeResponse),  // discriminant 1
-}
-
 /// cdn/client/v1
 #[derive(Serialize, Deserialize)]
 enum ClientMessage {
@@ -290,41 +281,41 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
-| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `coverage`, `size_proof` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `timestamp_us` | `outcome` (`Served(size_proof)` or `Refused(error)`), `origin_attestation` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `timestamp_us` | `outcome` (`Served(size_proof)` or `Refused(error)`), `origin_attestation`, `coverage` |
 
 An unsigned field is a fact when a proof that the receiver checks makes it one. `size_proof` is such a field: it holds the blob size and proves it against the signed `hash` ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)), so it needs no signature, and no signed field repeats the size. Its decode bounds the proof bytes at 4,480. A `StreamResponse` with `ok = true` must have a served outcome, so it always carries its size proof; a receiver refuses one that does not.
 
 #### Implementation note — separating signed and unsigned fields
 
-A signed message holds its signed fields in a dedicated inner struct (e.g., `ProbeResponseBody`). The signature is an EIP-712 typed-data signature over that field set — **not** over the struct's postcard bytes. The distinction matters: the split isolates a *field set*, not a byte range, so where an unsigned field sits on the wire has no bearing on signature validity. Unsigned fields nonetheless live outside the frozen base, in a separately encoded extension, because that is what makes a later addition decodable by an older peer:
+A signed message holds its signed fields in a dedicated inner struct (e.g., `StreamResponseBody`). The signature is an EIP-712 typed-data signature over that field set — **not** over the struct's postcard bytes. The distinction matters: the split isolates a *field set*, not a byte range, so where an unsigned field sits on the wire has no bearing on signature validity. Unsigned fields nonetheless live outside the frozen base, in a separately encoded extension, because that is what makes a later addition decodable by an older peer:
 
 ```rust
 /// Signed portion — field set is frozen per protocol version.
 #[derive(Serialize, Deserialize)]
-struct ProbeResponseBody {
+struct StreamResponseBody {
     hash: Hash,
-    has_blob: bool,
+    ok: bool,
     rate_per_mb: u64,
     timestamp_us: u64,
 }
 
 /// Frozen base — the signed body and the signature over it, nothing else.
 #[derive(Serialize, Deserialize)]
-struct ProbeResponse {
-    body: ProbeResponseBody,
+struct StreamResponse {
+    body: StreamResponseBody,
     slash_sig: Bytes,
 }
 
 /// Unsigned fields — a separate postcard value appended after the base.
 #[derive(Serialize, Deserialize, Default)]
-struct ProbeResponseExt {
+struct StreamResponseExt {
+    outcome: StreamOutcome,          // Served(SizeProof) | Refused(StreamError)
+    origin_attestation: Option<OriginAttestation>,
     coverage: Coverage,
-    size_proof: Option<SizeProof>,
 }
 ```
 
-Unsigned extension fields trail `body + signature` as their own postcard value and are decoded two-phase (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `StreamResponse` and to `cdn/dht/v1`, so all three ALPNs carry the seam.
+Unsigned extension fields trail `body + signature` as their own postcard value and are decoded two-phase (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `StreamRequest` and to `cdn/dht/v1`, so both ALPNs carry the seam.
 
 A cross-half invariant — one that relates a signed field to an unsigned one, such as `StreamResponse`'s `ok` agreeing with its `error` — belongs on the extension's validator, which takes the signed value as an argument. Neither half can check it alone, so a receiver MUST run both validators.
 
@@ -342,12 +333,12 @@ QUIC application error codes used by this ADR:
 | `0x01` | `UNSUPPORTED_MESSAGE` | Received an unknown protocol enum variant |
 | `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix above the frame ceiling of the read ([Wire Framing](#wire-framing)). The node sends it when it refuses a request read. A reader that refuses a later frame on an open stream ends the stream without this code. |
 | `0x03` | `MALFORMED_MESSAGE` | Frame failed application-layer decoding: postcard deserialization failure or varint parse error. Transport-level read failures (truncation, peer reset) are reported as `0x00` instead — the framing layer surfaces them as a distinct error variant (`FrameError::Io` vs `FrameError::Varint`/`Decode`), so a receiver does not have to collapse the two. The node also sends it for a client binding that fails to verify ([ADR 005 § Client identity binding](005-protocol.md#client-identity-binding)): the request decodes, but its proof of identity does not hold. |
-| `0x04` | `TIMESTAMP_SKEW` | Request refused because its `timestamp_us` differs from the node's clock by more than the 30-second bound ([ADR 005](005-protocol.md#adr-005-wire-protocol)). The signed response bodies echo the requester timestamp into the slash-evidence set, so the node refuses before it signs anything. The node sends it as `RESET_STREAM` on `cdn/client/v1` and as `CONNECTION_CLOSE` on `cdn/probe/v1`. The usual cause is the requester's clock. If only one node refuses, that node's clock is wrong. `decdn-client` types this code as `UpstreamTimestampRejected` so the failure names the clock. A peer that does not know the code treats it as a generic transport error, which is safe. Peers MUST NOT apply the `0x03` protocol-fault penalty to it. The node-to-node pull path records no reputation outcome for it and suppresses the `(peer, hash)` pair for a short window, as for `0x10`. |
+| `0x04` | `TIMESTAMP_SKEW` | Request refused because its `timestamp_us` differs from the node's clock by more than the 30-second bound ([ADR 005](005-protocol.md#adr-005-wire-protocol)). The signed response bodies echo the requester timestamp into the slash-evidence set, so the node refuses before it signs anything. The node sends it as `RESET_STREAM` on `cdn/client/v1`. The usual cause is the requester's clock. If only one node refuses, that node's clock is wrong. `decdn-client` types this code as `UpstreamTimestampRejected` so the failure names the clock. A peer that does not know the code treats it as a generic transport error, which is safe. Peers MUST NOT apply the `0x03` protocol-fault penalty to it. The node-to-node pull path records no reputation outcome for it and suppresses the `(peer, hash)` pair for a short window, as for `0x10`. |
 | `0x10` | `RATE_LIMITED` | Connection or stream rejected by a concurrency cap or a rate limiter. A node that sheds a whole connection, before any application stream exists, sends `CONNECTION_CLOSE`. The close-frame reason bytes carry a short layer label (e.g. `global-full`, `per_peer`) so peers can pick an appropriate backoff. A node that sheds one stream on an open connection (the `cdn/client/v1` stream cap or request limiter) sends `RESET_STREAM`, which carries no reason bytes. Peers that receive this code SHOULD back off before reconnecting; they MUST NOT treat it as a protocol error. The requester reads this code: `decdn-client` types a `0x10` close or stream reset as `UpstreamRateLimited`, and the node-to-node pull path suppresses the `(peer, hash)` pair for a short window and records no reputation outcome (the same treatment as a handler-level `NotFound` refusal). |
 
 #### Scope
 
-These codes SHOULD be delivered via `RESET_STREAM` / `STOP_SENDING` so that other streams multiplexed on the same QUIC connection are unaffected. An ALPN that guarantees a 1:1 connection:stream topology (e.g. `cdn/probe/v1`) MAY additionally mirror the same code in the application-level `CONNECTION_CLOSE` frame so the peer observes a deterministic error code even when a stream reset races connection teardown. ALPNs that multiplex multiple streams per connection MUST NOT surface these codes at the connection level, as doing so would tear down unrelated streams.
+These codes SHOULD be delivered via `RESET_STREAM` / `STOP_SENDING` so that other streams multiplexed on the same QUIC connection are unaffected. An ALPN that guarantees a 1:1 connection:stream topology MAY additionally mirror the same code in the application-level `CONNECTION_CLOSE` frame so the peer observes a deterministic error code even when a stream reset races connection teardown. ALPNs that multiplex multiple streams per connection MUST NOT surface these codes at the connection level, as doing so would tear down unrelated streams.
 
 Additional application error codes defined by other ADRs are unaffected. The codes above occupy the low range `0x00`–`0x0F`; ADRs allocating new codes SHOULD use `0x10` and above to avoid collisions.
 
@@ -364,8 +355,8 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 
 ### Negative
 
-- Varint length prefix adds 1–5 bytes per message. Negligible against a `ChunkData` payload, which a sender sizes at up to one `CHUNK_BYTES` payment interval; ~5% on a `ProbeRequest` (~40 bytes), which is small in absolute terms
+- Varint length prefix adds 1–5 bytes per message. Negligible against a `ChunkData` payload, which a sender sizes at up to one `CHUNK_BYTES` payment interval; a few percent on a small control frame such as a `StreamRequest`, which is small in absolute terms
 - `take_from_bytes` is marginally slower than `from_bytes` (tracks consumed position); negligible for this protocol's message sizes (sub-microsecond)
 - Minor evolution can accumulate "dead weight" — added fields no longer useful, with no removal mechanism short of a major version bump. Unlikely to matter at this protocol's message sizes
-- Signed field freezing means even minor improvements to signed structs (e.g., adding a field to `ProbeResponse`'s signed set) require a full ALPN version bump. Conservative by design — the unsigned outer fields pattern mitigates this for fields that need not be signed
+- Signed field freezing means even minor improvements to signed structs (e.g., adding a field to `StreamResponse`'s signed set) require a full ALPN version bump. Conservative by design — the unsigned outer fields pattern mitigates this for fields that need not be signed
 - The signed `Body` + unsigned outer-fields split is more complex than the flat message sketches used in other ADRs; wire implementations must preserve the split

@@ -7,7 +7,7 @@
 
 Existing ADRs specify individual node-lifecycle components in isolation — staking in [ADR 026](026-tokenomics.md#adr-026-tokenomics), on-chain registration in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), NodeId bindings and payment pools in [ADR 003](003-payments.md#adr-003-payment-model), blacklist sync in [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), contract deployment order in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model). No single document describes the complete ordered procedure from "operator has a server" to "actively accepting paid delivery requests."
 
-This blocks PoC testnet participation: operators have no canonical reference, and missing or mis-ordered steps produce silent protocol failures (probe and slash timestamps rejected because the clock is unsynchronized; connections refused because the blacklist was not fetched). This ADR defines the authoritative onboarding flow.
+This blocks PoC testnet participation: operators have no canonical reference, and missing or mis-ordered steps produce silent protocol failures (stream and slash timestamps rejected because the clock is unsynchronized; connections refused because the blacklist was not fetched). This ADR defines the authoritative onboarding flow.
 
 ## Decision
 
@@ -29,7 +29,7 @@ Before any on-chain or protocol activity:
 
 1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month egress. See [ADR 026 § Operator economics](026-tokenomics.md#operator-economics) for operator economics.
 
-2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. A correct clock underpins voucher freshness and the probe and slashing timestamp windows: vouchers carry timestamps, and probe-derived slash evidence is bounded by a maximum evidence age ([ADR 005](005-protocol.md#adr-005-wire-protocol), [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). A skewed clock produces stale vouchers and out-of-window slash timestamps.
+2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. A correct clock underpins voucher freshness and the request and slashing timestamp windows: a node refuses a request whose timestamp is more than 30 seconds from its clock, and slash evidence is bounded by a maximum evidence age ([ADR 005](005-protocol.md#adr-005-wire-protocol), [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). A skewed clock produces stale vouchers and out-of-window slash timestamps.
 
 3. **Generate iroh identity.** Run the node binary's `keys generate` (or equivalent) subcommand. This produces an **ed25519 key pair** whose public key is the iroh `NodeId`. The private key MUST be stored securely:
    - **PoC:** encrypted file on disk (passphrase-protected or operator-managed).
@@ -149,11 +149,11 @@ The fee-share reads (`PaymentPool.feeRouter()` and `FeeRouter.getShares()`) use 
 
 #### Step 3.3 — Configure local rate
 
-Set the node's `rate_per_mb`, satisfying `rate_per_mb ≤ MAX_RATE_PER_MB`. This rate is advertised verbatim in `ProbeResponse` messages; the node never raises it to the delivery floor. The floor is a redemption-time credit clamp, not a quote gate ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)): a rate below the floor still sells and settles, and only its vote-weight byte credit is clamped. An operator that wants full vote-weight credit sets `rate_per_mb` at or above the current `deliveryFloor`, but this is a revenue choice, not a protocol requirement. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
+Set the node's `rate_per_mb`, satisfying `rate_per_mb ≤ MAX_RATE_PER_MB`. This rate is advertised verbatim in every `StreamResponse`; the node never raises it to the delivery floor. The floor is a redemption-time credit clamp, not a quote gate ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)): a rate below the floor still sells and settles, and only its vote-weight byte credit is clamped. An operator that wants full vote-weight credit sets `rate_per_mb` at or above the current `deliveryFloor`, but this is a revenue choice, not a protocol requirement. Discovery opens are the canonical rate-discovery channel; a rate change reaches each requester in the next signed answer ([ADR 005 § Rate self-enforcement](005-protocol.md#rate-self-enforcement)).
 
 ### Phase 4 — Accepting Paid Delivery
 
-After Phases 1–3, the node is fully operational and should accept traffic. On-chain registration alone makes the node discoverable: peers reading the `CapacityBond` active set find it and begin probing it for content.
+After Phases 1–3, the node is fully operational and should accept traffic. On-chain registration alone makes the node discoverable: peers reading the `CapacityBond` active set find it and begin sending it discovery opens for content.
 
 After Phase 3, the node can accept connections immediately, even before every peer's registry view reflects the new registration. Sub-second L2 block times keep that convergence window small.
 
@@ -169,8 +169,7 @@ After Phase 3, the node can accept connections immediately, even before every pe
 
 A node satisfying all five criteria is ready to:
 
-- Respond to `ProbeRequest` messages on `cdn/probe/v1`
-- Accept `StreamRequest` messages on `cdn/client/v1`
+- Answer discovery opens and accept paid `StreamRequest` messages on `cdn/client/v1`
 - Earn USDC via voucher-based payment pools opened by clients and other nodes
 
 #### How criterion 1 is enforced

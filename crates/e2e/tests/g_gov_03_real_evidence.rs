@@ -39,8 +39,8 @@
 //! - the real response replayed after a successful slash is rejected
 //!   (`EvidenceAlreadyUsed`);
 //! - a failed challenge moves no TOKEN. ADR 014 § Bond Handling: "a
-//!   `submit*Challenge` that fails on-chain verification reverts and the
-//!   challenger pays only gas; the bond is not transferred for failed
+//!   `submitBlacklistChallenge` that fails on-chain verification reverts and
+//!   the challenger pays only gas; the bond is not transferred for failed
 //!   verifications." There is no second-stage dispute that could claw it back
 //!   after the fact. So the assertion is the behaviour of record: nothing is
 //!   pulled, and no slash is minted.
