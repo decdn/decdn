@@ -1003,8 +1003,9 @@ pub(crate) struct PullerBuyer<'a> {
 
 /// The run's puller: its node selection, its buyer key and funding, and
 /// its pull settings, with `observer`, the receipt `evidence` when there is
-/// one, and `escrows` attached. `buyer` names who pays. `lanes` is the `--jobs` and `--max-lane-streams` pair. `open`
-/// says whether a self-owned run may open a pool when it has none.
+/// one, and `escrows` attached. `buyer` names who pays. `lanes` is the
+/// `--jobs` and `--max-lane-streams` pair. `open` says whether a self-owned
+/// run may open a pool when it has none.
 async fn open_puller(
     common: &ClientFetchArgs,
     PullerBuyer {

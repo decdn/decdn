@@ -648,11 +648,10 @@ struct Primed<R> {
 /// range ([`BlobSource::narrow`]): a narrowed pull pays only up to the open's
 /// end and stops there instead of draining to its own. A source that cannot
 /// narrow adopts by equality alone. Call [`clear`](Self::clear) once the drive
-/// returns, so a pull no open
-/// took is closed at once rather than left idle. A pull parked with
-/// [`prime_next`](Self::prime_next) is the next open's alone: an open of another
-/// range closes it before the wrapped source opens, so the peer never holds it
-/// beside the leg that replaces it.
+/// returns, so a pull no open took is closed at once rather than left idle. A
+/// pull parked with [`prime_next`](Self::prime_next) is the next open's alone:
+/// an open of another range closes it before the wrapped source opens, so the
+/// peer never holds it beside the leg that replaces it.
 #[doc(hidden)]
 pub struct PrimedSource<S: BlobSource> {
     inner: S,

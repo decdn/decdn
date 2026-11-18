@@ -33,9 +33,10 @@ use crate::load_shed::RequestClass;
 
 /// Bucket upper bounds of `decdn_open_collection_latency_seconds`, per the
 /// registry row in `adr/appendix-observability.md`. One open has a 2.5 s
-/// ceiling (`selection::OPEN_CEILING`), so the top finite bucket is that
-/// ceiling.
-const OPEN_COLLECTION_BUCKETS: [f64; 8] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+/// ceiling (`selection::OPEN_CEILING`), and a round that reaches it lands a
+/// little past it. So a 5 s bucket sits above the ceiling, and a round at
+/// the ceiling does not fall into `+Inf`.
+const OPEN_COLLECTION_BUCKETS: [f64; 9] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 
 /// Bucket upper bounds shared by the time-to-first-byte histograms. A cache hit
 /// resolves in the low buckets. A serve miss includes discovery and an upstream

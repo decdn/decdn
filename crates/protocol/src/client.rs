@@ -218,9 +218,8 @@ impl ClientMessage {
 /// `timestamp_us` is a requester-generated microsecond timestamp echoed back in
 /// [`StreamResponseBody::timestamp_us`]; it both correlates the response and
 /// dates the signed evidence of blacklist-violation slashing (ADR 005,
-/// ADR 014). `byte_offset` supports
-/// seek/resume on failover — the requester reconnects to another node and
-/// resumes from the last BLAKE3-verified byte.
+/// ADR 014). `byte_offset` supports seek/resume on failover — the requester
+/// reconnects to another node and resumes from the last BLAKE3-verified byte.
 ///
 /// This struct holds **only the frozen base fields** (ADR 013 §Tier 1). The
 /// optional [`StreamRequestExt`] is carried as **separate trailing bytes** after

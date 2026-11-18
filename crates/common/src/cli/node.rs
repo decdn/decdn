@@ -943,8 +943,9 @@ pub struct LookupArgs {
     #[arg(long, value_name = "CODE")]
     pub region: Option<String>,
 
-    /// Open one `cdn/client/v1` stream to each matching candidate (at most
-    /// five, sampled) and sort ascending by the measured round-trip time.
+    /// Open one `cdn/client/v1` stream to each of a sample of the matching
+    /// candidates (as many as one discovery round asks) and sort ascending by
+    /// the measured round-trip time.
     /// Each open asks about a blob no node holds, so the node answers a
     /// signed `NotFound` at once; the stream is cancelled before any voucher,
     /// and nothing is paid. The opens sign under a throwaway key made for

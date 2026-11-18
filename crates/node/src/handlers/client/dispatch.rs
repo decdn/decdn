@@ -1106,10 +1106,10 @@ impl ClientHandler {
         let _shed_slot = shed_slot;
         let _pin = pin;
 
-        // Size gate. A plain cache hit
-        // carries its size from the `serve_audit` above (#1789 item 7 part B),
-        // so it skips the redundant `inspect` store hop entirely — including a
-        // genuinely empty blob, which audits as serveable at size 0.
+        // Size gate. A plain cache hit carries its size from the `serve_audit`
+        // above (#1789 item 7 part B), so it skips the redundant `inspect`
+        // store hop entirely — including a genuinely empty blob, which audits
+        // as serveable at size 0.
         //
         // The remaining branch is a miss the fill legs above just completed, so
         // the blob is on disk now: an `inspect` error — or a `None` size

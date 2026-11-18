@@ -132,13 +132,11 @@ pub(super) enum Admission {
 }
 
 /// A count of places under a fixed cap: one connection's streams that have
-/// not passed admission ([`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]), or the
-/// node's blob pins held by such streams
-/// ([`MAX_UNADMITTED_PINS`](super::MAX_UNADMITTED_PINS)). A place is held
-/// until the returned [`Place`] drops. The bound is exact: a burst of takes
-/// cannot pass it.
-///
-/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]: decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION
+/// not passed admission (`decdn_protocol`'s
+/// `MAX_UNADMITTED_STREAMS_PER_CONNECTION`), or the node's blob pins held by
+/// such streams ([`MAX_UNADMITTED_PINS`](super::MAX_UNADMITTED_PINS)). A place
+/// is held until the returned [`Place`] drops. The bound is exact: a burst of
+/// takes cannot pass it.
 #[derive(Debug)]
 pub(super) struct Places {
     /// Live [`Place`]s.

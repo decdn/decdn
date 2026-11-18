@@ -183,14 +183,12 @@ pub struct Connections {
 
 /// The most streams one map keeps open on one node's connection that have
 /// sent no voucher, from the open until the stream sends its first voucher,
-/// is cancelled or fails. A node resets every stream past
-/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`] such streams on one connection
-/// with `RATE_LIMITED`, so the map holds the same bound: an open past it waits
-/// for a place rather than having the node reset it. Every open on the map
-/// holds one: discovery opens, lane opens, gap fills and retries, and a node's
+/// is cancelled or fails. A node resets every stream past `decdn_protocol`'s
+/// `MAX_UNADMITTED_STREAMS_PER_CONNECTION` such streams on one connection with
+/// `RATE_LIMITED`, so the map holds the same bound: an open past it waits for
+/// a place rather than having the node reset it. Every open on the map holds
+/// one: discovery opens, lane opens, gap fills and retries, and a node's
 /// upstream opens.
-///
-/// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`]: decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION
 pub(crate) const MAX_OPENS_PER_NODE: usize =
     decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION;
 

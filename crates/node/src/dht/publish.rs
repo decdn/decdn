@@ -1295,11 +1295,15 @@ async fn publish_hash(
 /// blocking on it; the hash stays scheduled and retries next cycle via the
 /// `cache_still_holds` due-time gate. Coverage the node cannot size under a
 /// size proof is no coverage: the node serves no blob it cannot prove the
-/// size of (ADR 005 § Bounded byte ranges), so it advertises none.
+/// size of (ADR 005 § Bounded byte ranges), so it advertises none. The
+/// coverage is cut for the wire ([`Coverage::for_wire`]), so the record of a
+/// blob past `MAX_DISCOVERABLE_BLOB_BYTES` still decodes.
 async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> Coverage {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
     match cache.coverage_sized(h).await {
-        Ok((coverage, Some(size))) if cache.size_proof(h, size).await.is_some() => coverage,
+        Ok((coverage, Some(size))) if cache.size_proof(h, size).await.is_some() => {
+            Coverage::for_wire(decdn_protocol::num_blocks(size), coverage.covered_blocks())
+        }
         Ok(_) => Coverage::empty(),
         Err(err) => {
             tracing::debug!(

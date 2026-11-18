@@ -11045,10 +11045,10 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
 }
 
 /// Build a cache holding a blob that the local STORE has already accepted (a
-/// past import) but whose backing filesystem origin no longer exists — the
-/// backend genuinely does not hold it anymore, so a fresh
-/// `CacheEngine::origin_probe_size` reads `None` (a transport error against
-/// the now-deleted origin directory) even though `cache.has` is `true`. Used
+/// past import) but whose backing filesystem origin is deleted — the backend
+/// does not hold it, so a fresh `CacheEngine::origin_probe_presence` finds no
+/// blob there (a fault against the deleted origin directory) even though
+/// `cache.has` is `true`. Used
 /// to prove the origin-only gate (#1759) sits ABOVE the cache-hit branch: a
 /// foreign hash already sitting in the store is still declined.
 async fn cache_with_foreign_blob_imported(

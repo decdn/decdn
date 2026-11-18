@@ -2219,9 +2219,10 @@ fn spawn_a_voucher_rejecting_server_with_counters(
 
 /// Spawn a provider that HARD-FAILS every client stream at the transport: it
 /// accepts the connection and immediately closes it, so the buyer's open errors
-/// on connect/read rather than stalling to a timeout. Models a genuine reachability failure (NOT a `PullTimeout`,
-/// `UpstreamVoucherRejected`, or `HashMismatch`) — the #857 regression guard that
-/// such failures must STILL score `Unreachable` and the fix did not over-exonerate.
+/// on connect/read rather than stalling to a timeout. Models a genuine
+/// reachability failure (NOT a `PullTimeout`, `UpstreamVoucherRejected`, or
+/// `HashMismatch`) — the #857 regression guard that such failures must STILL
+/// score `Unreachable` and the fix did not over-exonerate.
 fn spawn_a_dead_server(ep: iroh::Endpoint) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {

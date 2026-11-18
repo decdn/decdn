@@ -1558,3 +1558,31 @@ fn entry_ordering_is_due_us_first() {
     };
     assert!(b < a);
 }
+
+/// A blob with more discovery blocks than a coverage bitmap names on the wire
+/// still publishes a record that decodes: its coverage is cut to the first
+/// `MAX_COVERAGE_BLOCKS` blocks. Tiny blocks stand in for a blob past 100 GiB.
+#[tokio::test]
+async fn an_oversized_blobs_record_coverage_is_cut_for_the_wire() -> anyhow::Result<()> {
+    let _blocks = decdn_protocol::override_discovery_block_bytes_for_test(1024);
+    let blocks = decdn_protocol::coverage::MAX_COVERAGE_BLOCKS + 8;
+    let payload: &'static [u8] =
+        Box::leak(vec![0x5Au8; usize::try_from(blocks)? * 1024].into_boxed_slice());
+    let hash = decdn_cache::Hash::new(payload);
+    let tmp = tempfile::tempdir()?;
+    let cache =
+        decdn_cache::CacheEngine::open(tmp.path(), vec![stub_origin(payload, true)], 16).await?;
+    cache.get(hash).await?;
+
+    let coverage = fetch_coverage(&cache, ContentHash::from_bytes(*hash.as_bytes())).await;
+    assert!(coverage.covers(0), "the held blob is advertised");
+    assert!(coverage.covers(decdn_protocol::coverage::MAX_COVERAGE_BLOCKS - 1));
+    assert!(
+        !coverage.covers(decdn_protocol::coverage::MAX_COVERAGE_BLOCKS),
+        "a block past the wire bound is left out"
+    );
+    let wire = postcard::to_allocvec(&coverage)?;
+    let decoded: Coverage = postcard::from_bytes(&wire)?;
+    assert_eq!(decoded, coverage, "the record's coverage decodes");
+    Ok(())
+}

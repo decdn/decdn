@@ -3,10 +3,11 @@
 //!
 //! A one-shot client pull that dials a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discovers one, #936) and pays
-//! per-MB from the caller's own `PaymentPool` deposit. The pool is **auto-opened and reused**: the pull
-//! looks up the caller's live pool in its persistent buyer-pool store, resuming
-//! its per-`(signer, provider)` lane watermark for the chosen provider; if none
-//! exists it opens (and funds) one on-chain and records it. One pool fans out
+//! per-MB from the caller's own `PaymentPool` deposit. The pool is
+//! **auto-opened and reused**: the pull looks up the caller's live pool in its
+//! persistent buyer-pool store, resuming its per-`(signer, provider)` lane
+//! watermark for the chosen provider; if none exists it opens (and funds) one
+//! on-chain and records it. One pool fans out
 //! to every provider the caller pays (ADR 003) — there is no per-provider open.
 //!
 //! The on-chain coordinates (RPC, contract addresses, chain id, keystore, data
