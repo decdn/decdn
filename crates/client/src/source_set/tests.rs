@@ -397,6 +397,50 @@ async fn every_holder_declining_ends_the_item_with_its_reasons() -> anyhow::Resu
     Ok(())
 }
 
+/// A stream quoted above its node's rate ceiling is refused unpaid, and the
+/// node leaves the fetch with no failure stamp, as a decline does. Once every
+/// holder did, the item ends naming the ceiling.
+#[tokio::test(start_paused = true)]
+async fn a_rate_above_the_ceiling_leaves_the_fetch() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), holder(B, 20.0)],
+    );
+    let now = Instant::now();
+    let above = || {
+        let ceiling = crate::RateCeiling::quoted(0, 5);
+        ceiling
+            .admit(6)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("6 is above 5"))
+    };
+    let fault = set.record_fault(A, &above()?, None, now, U256::ZERO);
+    assert_eq!(fault, Fault::Source);
+    assert!(
+        p.faults.lock().is_ok_and(|f| f.is_empty()),
+        "no failure stamp"
+    );
+    let later = now + Duration::from_hours(1);
+    assert_eq!(
+        set.next_to_start(later, U256::ZERO, &HashSet::new())
+            .map(|h| h.provider),
+        Some(B)
+    );
+    set.record_fault(B, &above()?, None, now, U256::ZERO);
+    let err = set
+        .exhausted(U256::ZERO, false)
+        .ok_or_else(|| anyhow::anyhow!("every holder left"))?;
+    let stop = err
+        .downcast_ref::<super::NoNodeWillServe>()
+        .ok_or_else(|| anyhow::anyhow!("expected NoNodeWillServe, got {err:#}"))?;
+    assert_eq!(stop.reasons, vec![super::DeclineReason::RateAboveCeiling]);
+    assert!(err.to_string().contains("above its rate ceiling"), "{err}");
+    Ok(())
+}
+
 /// A `Declined` refusal from one holder and a funding refusal from the
 /// other: the set is not all-declined, so the funding rule decides.
 #[tokio::test(start_paused = true)]

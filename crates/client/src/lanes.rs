@@ -27,7 +27,7 @@ use crate::receipt::ReceiptEvidence;
 use crate::session::{ChainConfig, DepositPolicy, FetchMarks, PullSite};
 use crate::{
     Connections, CredentialSlot, Cumulative, LaneHandle, LaneLedgers, PeerSource, PoolContext,
-    PoolLedger, PullDeadlines, VoucherProgress,
+    PoolLedger, PullDeadlines, RateCeiling, VoucherProgress,
 };
 
 /// Settles a drive that is dropped before it returns, as a Ctrl-C does.
@@ -173,7 +173,9 @@ pub struct LaneDeps<'a, P> {
     /// The ADR 005 namespace routing hint every request carries.
     pub namespace_id: [u8; 32],
     /// The most a lane pays per MiB; `0` sets no ceiling. A node that quotes
-    /// above it is left out of discovery, and a lane refuses its stream.
+    /// above it is left out of discovery, and a lane refuses its stream. Each
+    /// lane's ceiling is also its node's first quote in the fetch
+    /// ([`crate::RateCeiling`]).
     pub max_rate_per_mb: u64,
     /// The largest blob a lane accepts.
     pub max_blob_bytes: u64,
@@ -305,8 +307,8 @@ pub(crate) fn lane_target(
 /// seed a ledger from that lane's persisted cumulative, and wrap a
 /// [`PeerSource`] over it.
 ///
-/// The lane refuses to pay a stream rate above `deps.max_rate_per_mb`, `0`
-/// for no ceiling.
+/// The lane refuses to pay a stream rate above `rate_ceiling`: the node's
+/// first quote in the fetch, under `deps.max_rate_per_mb`.
 ///
 /// `open_lock`, when `Some`, serializes the pool open-or-reuse inside
 /// [`build_ctx_for_fetch`]: across one fetch's concurrently built lanes, which
@@ -325,6 +327,7 @@ pub(crate) async fn build_multi_lane<'a, P>(
     voucher_dom: &Eip712Domain,
     provider: Address,
     target: EndpointAddr,
+    rate_ceiling: RateCeiling,
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
     ended: &CancellationToken,
@@ -386,6 +389,7 @@ where
         Arc::clone(&ctx),
         Arc::clone(&ledger),
         provider,
+        rate_ceiling,
     );
     if let Some(marks) = deps.marks {
         marks.lane_built();
@@ -402,7 +406,7 @@ where
 }
 
 /// `provider`'s lane source at `target`, paying through `ctx` and `ledger`,
-/// refusing a stream quote above `deps.max_rate_per_mb` (`0` for no ceiling).
+/// refusing a stream quote above `rate_ceiling`.
 /// Every open takes a stream on the command's connection to `target`
 /// ([`LaneDeps::connections`]).
 fn lane_source<'a, P>(
@@ -411,6 +415,7 @@ fn lane_source<'a, P>(
     ctx: Arc<Mutex<PoolContext>>,
     ledger: Arc<PoolLedger>,
     provider: Address,
+    rate_ceiling: RateCeiling,
 ) -> PeerSource<'a> {
     PeerSource::new(
         deps.endpoint,
@@ -421,7 +426,7 @@ fn lane_source<'a, P>(
         provider,
         deps.namespace_id,
         deps.max_blob_bytes,
-        deps.max_rate_per_mb,
+        rate_ceiling,
         deps.deadlines,
         Some(deps.connections.clone()),
     )

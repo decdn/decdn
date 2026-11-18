@@ -60,8 +60,9 @@
 //!    ([`PoolContext::bind_endpoint`]). A node that misses the blob in its
 //!    cache serves an unbound lane nothing. Create its ledger with
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
-//!    [`StreamCandidate::new`]. Cap the lane's rate at the most you pay per
-//!    MiB.
+//!    [`StreamCandidate::new`]. Cap the lane's rate with a [`RateCeiling`]:
+//!    the holder's discovery quote ([`RateCeiling::quoted`]), under the most
+//!    you pay per MiB.
 //! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`], over
 //!    a [`StaticSources`] of the lanes. Every lane streams at once unless
 //!    [`Downloader::max_lanes`] caps it.
@@ -80,8 +81,10 @@
 //!   lying node is paid for the bytes before its first bad group and for
 //!   nothing after, never for the size it claimed.
 //! - **Quotes are checked against your ceiling.** A stream response whose
-//!   signed rate exceeds the `max_rate_per_mb` given to [`PeerSource::new`] is
-//!   refused before any payment ([`RateAboveCeiling`]).
+//!   signed rate exceeds the [`RateCeiling`] given to [`PeerSource::new`] is
+//!   refused before any payment ([`RateAboveCeiling`]): the node's first
+//!   verified quote, under your `max_rate_per_mb`. A later rate never prices a
+//!   byte verified before it.
 //! - **Recovery is free.** Every lane draws on one shared pool. A source that
 //!   faults cools and returns, and its range goes to another holder meanwhile.
 //!   A fetch ends on done, a fatal fault, or the stop policy
@@ -115,8 +118,9 @@
 //! - **One candidate per provider.** Each [`StreamCandidate`] pays one
 //!   `(signer, provider)` lane. Two candidates for one provider sign competing
 //!   vouchers on the same lane.
-//! - **Always set a rate ceiling.** A `max_rate_per_mb` of `0` means no
-//!   ceiling, so a lane pays whatever rate a node signs.
+//! - **Always set a rate ceiling.** A [`RateCeiling`] with no first quote and
+//!   a `max_rate_per_mb` of `0` takes the first stream's quote as its ceiling,
+//!   whatever rate the node signs there.
 //! - **Never resume a lane below its on-chain watermark.** A voucher at or below
 //!   the watermark redeems nothing, so the provider streams bytes it can never
 //!   cash. A self-owned lane the buyer store has not seen resumes from the
@@ -248,6 +252,8 @@ pub mod provider;
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
 #[doc(hidden)]
 pub mod ranged_store;
+/// The per-MiB rate a lane pays its node at most in one fetch.
+mod rate_ceiling;
 /// The `APP_ERR_RATE_LIMITED` (`0x10`) transport shed, typed for the pull
 /// orchestrator (ADR 013 §Application Error Codes).
 pub(crate) mod rate_limited;
@@ -302,6 +308,7 @@ pub use driver::PoolExhausted;
 pub use fault::PoolOpenRefused;
 pub use ledger::{Cumulative, PoolLedger};
 pub use opened::{OpenedStream, UnverifiedAnswer, discovery_open};
+pub use rate_ceiling::RateCeiling;
 pub use recovery::RecoveryGate;
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{Funder, PeerSource, PoolReplaced, Recovery, SourceFuture};
@@ -924,10 +931,11 @@ impl std::fmt::Display for BlobTooLarge {
 impl std::error::Error for BlobTooLarge {}
 
 /// Typed sentinel for a node that signed an open-stage `StreamResponse`
-/// (`ok == true`) quoting a per-MB `rate_per_mb` above the payer's ceiling
-/// (`max_rate_per_mb`, #1375). The payer refuses the stream **before paying**:
-/// the quote rides the signed answer, so the payer sees it before any byte,
-/// and every voucher signs the rate it pays.
+/// (`ok == true`) quoting a per-MB `rate_per_mb` above the payer's ceiling: the
+/// absolute `max_rate_per_mb` (#1375), or the node's first verified quote in the
+/// fetch ([`RateCeiling`]). The payer refuses the stream **before paying**: the
+/// quote rides the signed answer, so the payer sees it before any byte, and
+/// every voucher signs the rate it pays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateAboveCeiling {
     quoted_rate_per_mb: u64,
@@ -961,8 +969,8 @@ impl std::fmt::Display for RateAboveCeiling {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "node quoted {} per MB, above the --max-rate-per-mb ceiling of {} per MB \
-             (RateAboveCeiling)",
+            "node quoted {} per MB, above this lane's ceiling of {} per MB: its first \
+             quote in this fetch, or --max-rate-per-mb (RateAboveCeiling)",
             self.quoted_rate_per_mb, self.ceiling_rate_per_mb
         )
     }
@@ -3093,21 +3101,6 @@ impl std::fmt::Debug for UpstreamPull {
 /// `byte_offset`, `peer` and `local_node_id` fields match the serving node's
 /// `serve_stream` span, with `peer` and `local_node_id` swapped.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(
-    name = "open_progressive_pull",
-    skip_all,
-    fields(
-        error = tracing::field::Empty,
-        otel.status_code = tracing::field::Empty,
-        otel.kind = "client",
-        peer = %target.id,
-        local_node_id = %endpoint.id(),
-        hash = %decdn_protocol::ContentHash::from_bytes(hash),
-        pool_id = %ctx.pool_id,
-        byte_offset = byte_offset,
-        byte_len = byte_len,
-    )
-)]
 #[doc(hidden)]
 pub async fn open_progressive_pull(
     endpoint: &Endpoint,
@@ -3125,6 +3118,59 @@ pub async fn open_progressive_pull(
     deadlines: PullDeadlines,
     byte_len: u64,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+    open_dialled_pull(
+        endpoint,
+        target,
+        ctx,
+        ledger,
+        slash_domain,
+        expected_signer,
+        hash,
+        namespace_id,
+        byte_offset,
+        timestamp_us,
+        max_blob_size_bytes,
+        &RateCeiling::new(max_rate_per_mb),
+        deadlines,
+        byte_len,
+    )
+    .await
+}
+
+/// [`open_progressive_pull`] under a lane's `rate_ceiling`
+/// ([`RateCeiling`]) in place of an absolute `max_rate_per_mb`.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "open_progressive_pull",
+    skip_all,
+    fields(
+        error = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        otel.kind = "client",
+        peer = %target.id,
+        local_node_id = %endpoint.id(),
+        hash = %decdn_protocol::ContentHash::from_bytes(hash),
+        pool_id = %ctx.pool_id,
+        byte_offset = byte_offset,
+        byte_len = byte_len,
+    )
+)]
+pub(crate) async fn open_dialled_pull(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &PoolContext,
+    ledger: Arc<PoolLedger>,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    namespace_id: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    max_blob_size_bytes: u64,
+    rate_ceiling: &RateCeiling,
+    deadlines: PullDeadlines,
+    byte_len: u64,
+) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     open_progressive_pull_impl(
         ConnSource::Dial { endpoint, target },
         // One-shot dial: the pull owns this connection and closes it on teardown.
@@ -3138,7 +3184,7 @@ pub async fn open_progressive_pull(
         byte_offset,
         timestamp_us,
         max_blob_size_bytes,
-        max_rate_per_mb,
+        rate_ceiling,
         deadlines,
         byte_len,
     )
@@ -3201,7 +3247,7 @@ pub(crate) async fn open_progressive_pull_on(
         byte_offset,
         timestamp_us,
         max_blob_size_bytes,
-        max_rate_per_mb,
+        &RateCeiling::new(max_rate_per_mb),
         deadlines,
         byte_len,
     )
@@ -3232,7 +3278,7 @@ async fn open_progressive_pull_impl(
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
-    max_rate_per_mb: u64,
+    rate_ceiling: &RateCeiling,
     deadlines: PullDeadlines,
     // Upper bound on the requested range: `[byte_offset, byte_offset + byte_len)`.
     // `0` means "to end" (the whole tail, which every non-gap caller requests).
@@ -3264,7 +3310,7 @@ async fn open_progressive_pull_impl(
         };
         opened::open_answer(source, owner, args, false, false)
             .await?
-            .into_pull(ctx, ledger, max_blob_size_bytes, max_rate_per_mb, deadlines)
+            .into_pull_under(ctx, ledger, max_blob_size_bytes, rate_ceiling, deadlines)
     }
     .await;
     record_open_result(&tracing::Span::current(), &result);
@@ -3366,7 +3412,8 @@ impl UpstreamPull {
     pub(crate) fn mark_verified(&mut self, wire: u64) {
         let wire = wire.min(self.cumulative);
         if wire > self.verified {
-            self.ledger.note_verified(wire - self.verified);
+            self.ledger
+                .note_verified(wire - self.verified, self.rate_per_mb);
             self.verified = wire;
         }
     }

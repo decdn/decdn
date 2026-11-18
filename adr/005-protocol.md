@@ -116,9 +116,11 @@ The requester protects itself against the price. It needs no slash for this:
 
 - The quote is in the signed answer, so the requester sees the price before it pays anything.
 - A requester refuses a quote above its own ceiling (`max_rate_per_mb`). A client drops such a node from discovery, and a lane refuses such a stream. This is local policy. No governance ceiling is necessary.
+- Each lane has a rate ceiling for the fetch. The ceiling is the first verified quote of the lane's node in the fetch. This is the node's discovery answer. If no discovery answer quoted the node, it is the first stream that a lane opens on the node. When `max_rate_per_mb` is set, the ceiling is the lower of the two. A later stream on the lane (a stripe leg, a gap fill, a retry or a resume) that quotes above the ceiling is refused unpaid. The node then leaves the fetch, and the other sources take its ranges. So a node cannot win ranking at one quote and then charge a higher rate for the rest of the fetch.
 - The requester signs the price into each voucher as `chunk_price`. The node refuses a voucher whose `chunk_price` is not its quote (`ChunkPriceMismatch`), and a voucher that pays below its quote for the span that the voucher adds (`Underpaid`). See [`VoucherRejected` semantics](#voucherrejected-semantics).
+- A rebase never moves a lane below the price of the bytes that it verified. Each verified byte has the price of the stream that verified it. A later rate never prices an earlier byte.
 
-So a requester pays only a rate that it saw in a signed answer and accepted. There is no rate slash and no reprice wait: the client protects itself by signing the price into each voucher.
+So a requester pays only a rate that it saw in a signed answer and accepted. There is no rate slash: the client protects itself by its lane ceiling and by signing the price into each voucher.
 
 #### Client identity binding
 

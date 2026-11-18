@@ -1061,9 +1061,12 @@ impl NodeOrigin {
         // ceiling BEFORE opening or reusing the pool. A skip folds into the walk as
         // `BelowMargin`.
         let heat = heat_of(deps, hash_bytes);
+        // The lane's ceiling: the candidate's discovery quote, under the buy cap.
         let rate_ceiling =
             match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
-                EconGate::Allow { rate_ceiling, .. } => rate_ceiling,
+                EconGate::Allow { rate_ceiling, .. } => {
+                    decdn_client::RateCeiling::quoted(rate_ceiling, candidate.rate_per_mb)
+                }
                 EconGate::Skip => {
                     return Err(HandshakeFault {
                         miss: PullMiss::BelowMargin,
@@ -1850,10 +1853,14 @@ impl PeerRunSink<'_> {
             heat,
             candidate.rate_per_mb,
         ) {
+            // The lane's ceiling: the source's discovery quote, under the buy cap.
             EconGate::Allow {
                 rate_ceiling,
                 speculative,
-            } => (rate_ceiling, speculative),
+            } => (
+                decdn_client::RateCeiling::quoted(rate_ceiling, candidate.rate_per_mb),
+                speculative,
+            ),
             EconGate::Skip => return RunOutcome::Reassign,
         };
         let ctx = match self

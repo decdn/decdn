@@ -36,7 +36,7 @@ use iroh::{Endpoint, EndpointAddr};
 
 use crate::sink::PullReader;
 use crate::{
-    Connections, OpenedStream, PoolContext, PoolLedger, PullDeadlines, UpstreamPull,
+    Connections, OpenedStream, PoolContext, PoolLedger, PullDeadlines, RateCeiling, UpstreamPull,
     UpstreamPullHeader, VoucherProgress,
 };
 
@@ -280,7 +280,9 @@ pub struct PeerSource<'a> {
     expected_signer: Address,
     namespace_id: [u8; 32],
     max_blob_size_bytes: u64,
-    max_rate_per_mb: u64,
+    /// The most each stream to the target may quote: the node's first quote
+    /// in the fetch, under the payer's absolute ceiling.
+    rate_ceiling: RateCeiling,
     deadlines: PullDeadlines,
     /// The command's shared connection per node, or `None` to dial per open.
     connections: Option<Connections>,
@@ -295,7 +297,7 @@ impl std::fmt::Debug for PeerSource<'_> {
             .field("expected_signer", &self.expected_signer)
             .field("namespace_id", &self.namespace_id)
             .field("max_blob_size_bytes", &self.max_blob_size_bytes)
-            .field("max_rate_per_mb", &self.max_rate_per_mb)
+            .field("rate_ceiling", &self.rate_ceiling)
             .field("deadlines", &self.deadlines)
             .finish_non_exhaustive()
     }
@@ -303,9 +305,11 @@ impl std::fmt::Debug for PeerSource<'_> {
 
 impl<'a> PeerSource<'a> {
     /// Build a source for one gap-driven fetch against `target`, paid out of
-    /// `ledger` over `ctx`'s lane. `namespace_id`, `max_rate_per_mb`, and
-    /// `deadlines` are the same buyer-side policy knobs
-    /// [`crate::open_progressive_pull`] takes directly — see its docs.
+    /// `ledger` over `ctx`'s lane. `namespace_id` and `deadlines` are the same
+    /// buyer-side policy knobs [`crate::open_progressive_pull`] takes directly
+    /// — see its docs. `rate_ceiling` is the target's ceiling in this fetch:
+    /// every stream that quotes above it is refused unpaid, and a clone of it
+    /// held by another source of the same node shares its first quote.
     /// `max_blob_size_bytes` is the cap on bytes held for one blob (#1895): each
     /// stream carries at most that much content, and the driver reads it back via
     /// [`BlobSource::max_blob_size_bytes`] to end a fill that would hold more;
@@ -328,7 +332,7 @@ impl<'a> PeerSource<'a> {
         expected_signer: Address,
         namespace_id: [u8; 32],
         max_blob_size_bytes: u64,
-        max_rate_per_mb: u64,
+        rate_ceiling: RateCeiling,
         deadlines: PullDeadlines,
         connections: Option<Connections>,
     ) -> Self {
@@ -341,17 +345,16 @@ impl<'a> PeerSource<'a> {
             expected_signer,
             namespace_id,
             max_blob_size_bytes,
-            max_rate_per_mb,
+            rate_ceiling,
             deadlines,
             connections,
         }
     }
 
-    /// The stream-rate ceiling this source refuses a quote above (`0` = no
-    /// ceiling): what the lane build passed as `max_rate_per_mb`.
+    /// The stream-rate ceiling this source refuses a quote above.
     #[cfg(test)]
-    pub(crate) const fn rate_ceiling(&self) -> u64 {
-        self.max_rate_per_mb
+    pub(crate) const fn rate_ceiling(&self) -> &RateCeiling {
+        &self.rate_ceiling
     }
 
     /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end)
@@ -411,7 +414,7 @@ impl<'a> PeerSource<'a> {
             self.open_shared(connections, &ctx, hash, byte_offset, byte_len)
                 .await
         } else {
-            crate::open_progressive_pull(
+            crate::open_dialled_pull(
                 self.endpoint,
                 self.target.clone(),
                 &ctx,
@@ -423,7 +426,7 @@ impl<'a> PeerSource<'a> {
                 byte_offset,
                 micros_now(),
                 self.max_blob_size_bytes,
-                self.max_rate_per_mb,
+                &self.rate_ceiling,
                 self.deadlines,
                 byte_len,
             )
@@ -527,11 +530,11 @@ impl<'a> PeerSource<'a> {
         ctx: &PoolContext,
         opened: OpenedStream,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-        opened.into_pull(
+        opened.into_pull_under(
             ctx,
             Arc::clone(&self.ledger),
             self.max_blob_size_bytes,
-            self.max_rate_per_mb,
+            &self.rate_ceiling,
             self.deadlines,
         )
     }

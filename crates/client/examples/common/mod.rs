@@ -295,8 +295,8 @@ impl Buyer {
                 // No received-byte ceiling beyond the proven size.
                 0,
                 // Refuse a stream quote above the rate the node signed in its
-                // discovery answer. `0` would set no ceiling at all.
-                holder.rate_per_mb,
+                // discovery answer.
+                decdn_client::RateCeiling::quoted(0, holder.rate_per_mb),
                 deadlines,
                 None,
             );

@@ -38,7 +38,7 @@ use crate::targets::{
 };
 use crate::{
     CredentialSlot, Holder, LaneLease, LaneLedgers, OpenedStream, PeerHealth, PeerSource,
-    PoolContext, RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate,
+    PoolContext, RateCeiling, RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate,
     UpstreamPullHeader, first_open, is_range_past_end,
 };
 
@@ -262,6 +262,10 @@ pub struct LaneSources<'a, P> {
     /// ([`ResolvedTargets::late`]), until [`SourceProvider::arrivals`] takes
     /// them.
     late: Mutex<Option<LateOpens>>,
+    /// Each provider's rate ceiling in this fetch, keyed by its on-chain
+    /// address: its first verified quote, under the fetch's
+    /// `max_rate_per_mb`. Every lane built for the provider holds a clone.
+    ceilings: Mutex<HashMap<Address, RateCeiling>>,
 }
 
 impl<P> std::fmt::Debug for LaneSources<'_, P> {
@@ -308,13 +312,26 @@ where
             parked: Mutex::new(HashMap::new()),
             size_hint: Mutex::new(None),
             late: Mutex::new(None),
+            ceilings: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `provider`'s rate ceiling in this fetch ([`RateCeiling`]).
+    fn rate_ceiling(&self, provider: Address) -> RateCeiling {
+        self.ceilings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(provider)
+            .or_insert_with(|| RateCeiling::new(self.deps.max_rate_per_mb))
+            .clone()
     }
 
     /// The holders `targets` names, indexing each one's node for `connect`.
     /// A proven size is kept for [`Self::first_claim`], the holders' open
     /// streams for the first claim to adopt, and a streamed round's pending
-    /// opens for [`SourceProvider::arrivals`].
+    /// opens for [`SourceProvider::arrivals`]. Each holder's verified quote
+    /// in `targets` is its first quote in the fetch, unless it has one
+    /// ([`RateCeiling`]).
     pub fn holders_from(&self, targets: &ResolvedTargets) -> Vec<Holder> {
         if let Some(hint) = targets.size_hint {
             *self
@@ -329,7 +346,18 @@ where
         if !opened.is_empty() {
             self.opened.replace(opened);
         }
-        holders_from(targets, &mut self.lock_nodes())
+        let holders = holders_from(targets, &mut self.lock_nodes());
+        for holder in &holders {
+            let Some(node_id) = self.lock_nodes().get(&holder.provider).map(|n| n.node_id) else {
+                continue;
+            };
+            if let Some(&(_, _, rate_per_mb)) =
+                targets.samples.iter().find(|(id, _, _)| *id == node_id)
+            {
+                self.rate_ceiling(holder.provider).note_quote(rate_per_mb);
+            }
+        }
+        holders
     }
 
     /// The context and span a discovery open of this fetch sends: the payer's
@@ -356,7 +384,14 @@ where
     /// The [`Holder`] for a late `join` ([`admit_late`]), counted as joined.
     /// `None` when the join's operator is already in the set.
     fn register_late(&self, join: LateJoin) -> Option<Holder> {
+        let quote = match &join {
+            LateJoin::Holder(holder) => Some(holder.rate_per_mb),
+            LateJoin::Proxy(_) => None,
+        };
         let holder = admit_late(&mut self.lock_nodes(), join)?;
+        if let Some(rate_per_mb) = quote {
+            self.rate_ceiling(holder.provider).note_quote(rate_per_mb);
+        }
         if let Some(marks) = self.deps.marks {
             marks.holder_joined();
         }
@@ -834,6 +869,7 @@ where
             self.voucher_dom,
             holder.provider,
             target,
+            self.rate_ceiling(holder.provider),
             self.open_lock,
             self.ledgers,
             ended,

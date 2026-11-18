@@ -44,6 +44,16 @@ pub(crate) enum Answer {
         /// The per-MiB rate it signs.
         rate: u64,
     },
+    /// `ok` as [`Answer::Serve`], at `first` for the node's first open and
+    /// at `then` for every later one: a node that raises its rate.
+    Reprice {
+        /// The blob the node holds.
+        blob: Vec<u8>,
+        /// The per-MiB rate of its first answer.
+        first: u64,
+        /// The per-MiB rate of every later answer.
+        then: u64,
+    },
     /// `ok` with no coverage: an answer whose coverage disagrees with it.
     Inconsistent {
         /// The blob the node holds.
@@ -60,6 +70,8 @@ pub(crate) struct Seen {
     pub(crate) resets: AtomicUsize,
     /// Streams on which a frame followed the answer.
     pub(crate) paid: AtomicUsize,
+    /// `ok` streams that ended after the answer, however they ended.
+    pub(crate) ended: AtomicUsize,
     /// Every request, with its extension.
     pub(crate) requests: Mutex<Vec<(StreamRequest, StreamRequestExt)>>,
     /// Every connection the node accepted.
@@ -212,12 +224,20 @@ async fn answer_stream(
         anyhow::bail!("expected a request");
     };
     let ext = decdn_protocol::parse_stream_request_ext(tail)?;
-    seen.requests
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((req.clone(), ext));
+    let nth = {
+        let mut requests = seen
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        requests.push((req.clone(), ext));
+        requests.len()
+    };
     let (ok, rate, resp_ext) = match answer {
         Answer::Serve { blob, rate } => (true, rate, served(&blob, true)?),
+        Answer::Reprice { blob, first, then } => {
+            let rate = if nth == 1 { first } else { then };
+            (true, rate, served(&blob, true)?)
+        }
         Answer::Refuse { error, rate } => (
             false,
             rate,
@@ -257,6 +277,7 @@ async fn answer_stream(
         }
         _ => {}
     }
+    seen.ended.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }
 

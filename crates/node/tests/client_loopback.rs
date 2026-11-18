@@ -587,7 +587,7 @@ async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Res
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        u64::MAX,
+        decdn_client::RateCeiling::new(u64::MAX),
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
         Some(connections.clone()),
     );
@@ -714,7 +714,7 @@ async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        u64::MAX,
+        decdn_client::RateCeiling::new(u64::MAX),
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
         None,
     );
@@ -7944,7 +7944,7 @@ async fn a_pull_stopped_at_a_split_pays_within_one_window_and_the_lane_pulls_on(
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        u64::MAX,
+        decdn_client::RateCeiling::new(u64::MAX),
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
         None,
     );
@@ -8049,7 +8049,7 @@ async fn gap_scoped_leg_bounds_its_received_bytes_by_the_cap_from_its_own_offset
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         ceiling,
-        u64::MAX,
+        decdn_client::RateCeiling::new(u64::MAX),
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
         None,
     );
@@ -14489,7 +14489,7 @@ async fn a_stop_counts_the_frames_it_reads_past_the_split_as_wire_bytes() -> any
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        u64::MAX,
+        decdn_client::RateCeiling::new(u64::MAX),
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
         None,
     );
@@ -15596,7 +15596,7 @@ async fn drive_against_stop_send_server(
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        u64::MAX,
+        decdn_client::RateCeiling::new(u64::MAX),
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
         None,
     );

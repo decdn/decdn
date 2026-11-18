@@ -256,6 +256,10 @@ pub enum DeclineReason {
     /// (`APP_ERR_TIMESTAMP_SKEW`): its clock and this machine's differ by more
     /// than 30 seconds.
     ClockSkew,
+    /// The node quoted a stream above its rate ceiling in this fetch: its
+    /// first verified quote, or the payer's `max_rate_per_mb`
+    /// ([`crate::RateCeiling`]). The client refused the stream unpaid.
+    RateAboveCeiling,
 }
 
 /// Every known source declined this fetch (ADR 039 §Failure handling). The
@@ -275,11 +279,20 @@ impl std::fmt::Display for NoNodeWillServe {
             .iter()
             .filter_map(|r| match r {
                 DeclineReason::Voucher(reason) => Some(format!("{reason:?}")),
-                DeclineReason::Refused | DeclineReason::ClockSkew => None,
+                DeclineReason::Refused
+                | DeclineReason::ClockSkew
+                | DeclineReason::RateAboveCeiling => None,
             })
             .collect();
         let refused = self.reasons.contains(&DeclineReason::Refused);
         let clock = self.reasons.contains(&DeclineReason::ClockSkew);
+        let repriced = self.reasons.contains(&DeclineReason::RateAboveCeiling);
+        if repriced && !clock && !refused && vouchers.is_empty() {
+            return f.write_str(
+                "no node will serve this: every node quoted a stream above its rate ceiling for \
+                 this fetch (its first quote, or --max-rate-per-mb)",
+            );
+        }
         if clock && !refused && vouchers.is_empty() {
             return f.write_str(
                 "no node will serve this: every node refused this machine's request timestamp \
@@ -306,6 +319,9 @@ impl std::fmt::Display for NoNodeWillServe {
             f.write_str(
                 "; some refused this machine's request timestamp, so check this machine's clock",
             )?;
+        }
+        if repriced {
+            f.write_str("; some quoted a stream above their rate ceiling for this fetch")?;
         }
         Ok(())
     }
@@ -745,6 +761,13 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                     && range.as_ref().is_none_or(|r| r.verified == 0) =>
             {
                 self.record_declined(provider, DeclineReason::ClockSkew, None)
+            }
+            // A stream quoted above the node's rate ceiling was refused unpaid.
+            // The node leaves this hash for the fetch, and the other sources
+            // take its ranges. Its quote is its policy, not a delivery fault,
+            // so its peer-store record keeps no failure stamp.
+            Fault::Source if err.downcast_ref::<crate::RateAboveCeiling>().is_some() => {
+                self.record_declined(provider, DeclineReason::RateAboveCeiling, None)
             }
             Fault::Source => match crate::fault::declining_rejection(err) {
                 Some(reason) => {

@@ -550,14 +550,23 @@ pub struct PoolLedger {
     /// The `ChunkData` payload bytes this lane's streams read, verified or
     /// not ([`Self::wire_bytes`]).
     wire: AtomicU64,
-    /// Bytes this lane's streams verified since the ledger was built. A rebase
-    /// never moves the ledger below their price ([`Self::verified_floor`]).
-    lane_verified: AtomicU64,
-    /// The rate a stream of this lane was last quoted, in base units per MiB.
-    quoted_rate: AtomicU64,
+    /// Bytes this lane's streams verified since the ledger was built, each
+    /// priced at the rate of the stream that verified it. A rebase never moves
+    /// the ledger below their price ([`Self::verified_floor`]).
+    lane_verified: std::sync::Mutex<VerifiedValue>,
     /// The track record of the node operator this lane pays, shared with every
     /// other lane at that operator ([`Self::attach_trust`]).
     trust: OnceLock<Arc<NodeTrust>>,
+}
+
+/// The bytes a lane's streams verified, and their value: the sum over each
+/// stream of its verified bytes times its quoted per-MiB rate.
+#[derive(Debug, Default, Clone, Copy)]
+struct VerifiedValue {
+    /// The verified bytes.
+    bytes: u64,
+    /// The sum of verified bytes times the per-MiB rate of their stream.
+    rate_bytes: u128,
 }
 
 /// What a lane can prove it was paid: the signed anchor its vouchers last
@@ -632,8 +641,7 @@ impl PoolLedger {
             send_deadline: VOUCHER_SEND_DEADLINE,
             evidence: OnceLock::new(),
             wire: AtomicU64::new(0),
-            lane_verified: AtomicU64::new(0),
-            quoted_rate: AtomicU64::new(0),
+            lane_verified: std::sync::Mutex::new(VerifiedValue::default()),
             trust: OnceLock::new(),
         }
     }
@@ -653,34 +661,38 @@ impl PoolLedger {
         self.trust.get_or_init(NodeTrust::detached)
     }
 
-    /// Record the rate a stream of this lane was quoted, which prices the
-    /// verified bytes a rebase never moves the ledger below
+    /// Record `n` bytes a stream of this lane verified at the stream's quoted
+    /// `rate_per_mb`: they feed the node's verified count, and their price at
+    /// that rate is part of the floor a rebase keeps
     /// ([`Self::verified_floor`]).
-    pub(crate) fn note_rate(&self, rate_per_mb: u64) {
-        self.quoted_rate.store(rate_per_mb, Ordering::Relaxed);
-    }
-
-    /// Record `n` bytes a stream of this lane verified: they feed the node's
-    /// verified count.
-    pub(crate) fn note_verified(&self, n: u64) {
-        self.lane_verified
-            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                v.saturating_add(n)
-            });
+    pub(crate) fn note_verified(&self, n: u64, rate_per_mb: u64) {
+        {
+            let mut verified = self
+                .lane_verified
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            verified.bytes = verified.bytes.saturating_add(n);
+            verified.rate_bytes = verified
+                .rate_bytes
+                .saturating_add(u128::from(n).saturating_mul(u128::from(rate_per_mb)));
+        }
         self.trust().note_verified(n);
     }
 
     /// The least claim a rebase may leave the ledger at: the bytes this lane
-    /// verified and their price at the rate the node quoted. A lane's cumulative
-    /// claim covers every byte it ever verified, so a watermark below this
-    /// would have the payer pay again for delivered bytes.
+    /// verified and their price, each byte at the rate of the stream that
+    /// verified it. A later stream's rate never prices an earlier byte. A
+    /// lane's cumulative claim covers every byte it ever verified, so a
+    /// watermark below this would have the payer pay again for delivered
+    /// bytes.
     fn verified_floor(&self) -> Cumulative {
-        let verified = u128::from(self.lane_verified.load(Ordering::Relaxed));
-        let rate = u128::from(self.quoted_rate.load(Ordering::Relaxed));
-        let mb = u128::from(MB_BYTES);
-        let price = (verified * rate).div_ceil(mb);
+        let verified = *self
+            .lane_verified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let price = verified.rate_bytes.div_ceil(u128::from(MB_BYTES));
         Cumulative {
-            bytes: U256::from(verified),
+            bytes: U256::from(verified.bytes),
             amount: U256::from(price),
         }
     }

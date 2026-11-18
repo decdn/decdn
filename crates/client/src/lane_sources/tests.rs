@@ -1122,6 +1122,120 @@ async fn a_multi_holder_download_adopts_the_winners_stream() -> anyhow::Result<(
     Ok(())
 }
 
+/// Record `err` from `faulted` in `set`, then list the providers it starts an
+/// hour later, one at a time, with each started one still running.
+fn fault_and_next<P: crate::SourceProvider>(
+    set: &mut crate::SourceSet<'_, P>,
+    faulted: Address,
+    err: &anyhow::Error,
+) -> Vec<Address> {
+    let now = tokio::time::Instant::now();
+    set.record_fault(faulted, err, None, now, alloy::primitives::U256::ZERO);
+    let later = now + std::time::Duration::from_secs(3600);
+    let mut running = std::collections::HashSet::new();
+    while let Some(next) = set
+        .next_to_start(later, alloy::primitives::U256::ZERO, &running)
+        .map(|h| h.provider)
+    {
+        running.insert(next);
+    }
+    running.into_iter().collect()
+}
+
+/// A node wins the fetch at its discovery quote, then raises its rate on its
+/// lane's next leg. The lane refuses that leg unpaid: the node sees no frame
+/// on it, and the lane's ledger pays nothing. The node leaves the fetch, so
+/// the other holder starts next (ADR 005 § Rate self-enforcement).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leg_quoted_above_the_first_quote_is_refused_unpaid_and_fails_over() -> anyhow::Result<()>
+{
+    use crate::SourceProvider as _;
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+
+    let fx = LaneFixture::delegated(1).await?;
+    let deps = fx.deps(0)?;
+    let sources = fx.sources(&deps);
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let raiser = FakeNode::spawn(
+        Answer::Reprice {
+            blob: blob.clone(),
+            first: 5,
+            then: 50,
+        },
+        fx.slash_dom.clone(),
+    )
+    .await?;
+    let honest = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 9,
+        },
+        fx.slash_dom.clone(),
+    )
+    .await?;
+    let targets = discover_on(
+        &sources,
+        &fx,
+        &[&honest, &raiser],
+        hash,
+        crate::targets::OpenRound::Settle,
+        super::FirstLeg::Whole,
+    )
+    .await?;
+    let holders = sources.holders_from(&targets);
+    let health = std::sync::Arc::new(crate::PeerHealth::default());
+    let claim = sources
+        .first_claim(
+            hash,
+            holders,
+            super::FirstLeg::Whole,
+            &health,
+            &minute_stop(),
+        )
+        .await?;
+    let lane = sources
+        .built(raiser.operator_address())
+        .ok_or_else(|| anyhow::anyhow!("the cheaper quote wins, and its lane is parked"))?;
+    anyhow::ensure!(lane.source.inner().rate_ceiling().bound() == Some(5));
+
+    // The lane's next leg: the node now quotes 50.
+    let err = lane
+        .source
+        .inner()
+        .open_span(hash, 0, 0)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a leg quoted above the first quote is refused"))?;
+    let refused = err
+        .downcast_ref::<crate::RateAboveCeiling>()
+        .ok_or_else(|| anyhow::anyhow!("expected RateAboveCeiling, got {err:#}"))?;
+    anyhow::ensure!(refused.quoted_rate_per_mb() == 50 && refused.ceiling_rate_per_mb() == 5);
+    anyhow::ensure!(Seen::count(&raiser.seen.opens) == 2, "the leg was answered");
+    anyhow::ensure!(
+        lane.ledger.committed().amount.is_zero(),
+        "the lane paid nothing"
+    );
+
+    // The node leaves the fetch: the other holder starts, now and later.
+    let mut set = crate::SourceSet::new(&sources, hash, health, claim.holders);
+    let next = fault_and_next(&mut set, raiser.operator_address(), &err);
+    anyhow::ensure!(next == vec![honest.operator_address()], "{next:?}");
+    drop(lane);
+    eventually("both of the node's streams end", || {
+        Seen::count(&raiser.seen.ended) == 2
+    })
+    .await?;
+    anyhow::ensure!(
+        Seen::count(&raiser.seen.paid) == 0,
+        "no frame followed either answer"
+    );
+    drop(set);
+    drop(sources);
+    fx.ep.close().await;
+    Ok(())
+}
+
 /// A size lookup takes the size the winner's answer proves with no lane and
 /// no open: the chain sees no read, and every stream is reset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1210,8 +1324,8 @@ async fn a_late_holder_joins_with_its_answered_coverage() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A built lane refuses a stream quote above the fetch's `--max-rate-per-mb`,
-/// whatever discovery measured: the splice from the deps through
+/// A built lane's ceiling is its node's discovery quote under the fetch's
+/// `--max-rate-per-mb`: the splice from the deps and the answer through
 /// `build_fresh` and `lane_source` into the [`crate::PeerSource`] the lane
 /// pays on.
 #[tokio::test]
@@ -1242,10 +1356,10 @@ async fn a_built_lane_carries_the_fetch_rate_ceiling() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("the candidate is a holder"))?;
     let ended = tokio_util::sync::CancellationToken::new();
     let lane = sources.connect(holder, &ended).await?;
+    let ceiling = lane.source.inner().rate_ceiling();
     anyhow::ensure!(
-        lane.source.inner().rate_ceiling() == 25,
-        "the lane's ceiling is the fetch's: {}",
-        lane.source.inner().rate_ceiling()
+        ceiling.max_rate_per_mb() == 25 && ceiling.bound() == Some(7),
+        "the lane's ceiling is the discovery quote under the fetch's cap: {ceiling:?}"
     );
     drop(lane);
     drop(sources);

@@ -102,7 +102,7 @@ use crate::selection::{
 use decdn_client::buyer_pool::ProgressWrite;
 use decdn_client::{
     BlobTooLarge, Cumulative, HashMismatch, LegNoProgress, LocalPullFault, PoolContext, PoolLedger,
-    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd,
+    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, RateCeiling, ResumeOffsetPastEnd,
     UpstreamRateLimited, UpstreamRefused, UpstreamTimestampRejected, UpstreamVoucherRejected,
     VoucherProgress, sign_client_binding,
 };
@@ -2889,12 +2889,17 @@ async fn pull_from_candidate_in_span(
     // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy ceiling
     // BEFORE opening or reusing the pool. A skip folds into the walk as `BelowMargin`.
     let heat = heat_of(deps, hash_bytes);
+    // The lane's ceiling: the candidate's discovery quote, under the buy cap. A
+    // later stream to it that quotes above is refused unpaid.
     let (rate_ceiling, speculative) =
         match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
             EconGate::Allow {
                 rate_ceiling,
                 speculative,
-            } => (rate_ceiling, speculative),
+            } => (
+                RateCeiling::quoted(rate_ceiling, candidate.rate_per_mb),
+                speculative,
+            ),
             EconGate::Skip => return Err(PullMiss::BelowMargin),
         };
     let ctx = match deps
@@ -2983,8 +2988,9 @@ async fn pull_from_candidate_in_span(
     // range again. The candidate's discovery stream, when it served the whole
     // blob, is that pull: it is adopted on this lane, and no second stream opens.
     // Otherwise the handshake opens one. `NO_NAMESPACE`, as this hash-only
-    // populate path carries no served-client namespace. `rate_ceiling` folds the
-    // ADR 041 buy cap in (computed above with the skip decision). Either stream
+    // populate path carries no served-client namespace. `rate_ceiling` is the
+    // candidate's discovery quote with the ADR 041 buy cap folded in (computed
+    // above with the skip decision). Either stream
     // runs on the node's shared connection to the upstream, whose driver runs on
     // the main runtime and outlives the pull thread that adopts the pull.
     let handshake_source = PeerSource::new(
@@ -2996,7 +3002,7 @@ async fn pull_from_candidate_in_span(
         provider_addr,
         NO_NAMESPACE,
         deps.config.max_blob_size_bytes,
-        rate_ceiling,
+        rate_ceiling.clone(),
         deadlines,
         Some(deps.connections.clone()),
     );

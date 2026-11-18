@@ -27,7 +27,7 @@ use crate::connection::ConnOwner;
 use crate::path_rtt::{DIRECT_PATH_GRACE, PathRtt, path_rtt};
 use crate::{
     BlobTooLarge, ConnSource, Connections, PoolContext, PoolLedger, ProvenSize, PullDeadlines,
-    PullTimeout, RateAboveCeiling, StreamMeter, UpstreamPull, UpstreamPullHeader, UpstreamRefused,
+    PullTimeout, RateCeiling, StreamMeter, UpstreamPull, UpstreamPullHeader, UpstreamRefused,
     aligned_wire_len, exchange, progress, served_wire_len, stall_sample_period, verify_response,
 };
 
@@ -189,7 +189,7 @@ impl OpenedStream {
     /// # Errors
     ///
     /// - [`UpstreamRefused`] for a signed refusal;
-    /// - [`RateAboveCeiling`] for a quote above `max_rate_per_mb`;
+    /// - [`crate::RateAboveCeiling`] for a quote above `max_rate_per_mb`;
     /// - [`crate::ResumeOffsetPastEnd`] or a range-alignment fault for a span
     ///   past the proven size;
     /// - [`BlobTooLarge`] for a stream whose wire runs past the cap;
@@ -200,6 +200,31 @@ impl OpenedStream {
         ledger: Arc<PoolLedger>,
         max_blob_size_bytes: u64,
         max_rate_per_mb: u64,
+        deadlines: PullDeadlines,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        self.into_pull_under(
+            ctx,
+            ledger,
+            max_blob_size_bytes,
+            &RateCeiling::new(max_rate_per_mb),
+            deadlines,
+        )
+    }
+
+    /// [`Self::into_pull`] under a lane's `rate_ceiling`: a quote above the
+    /// ceiling in force is refused unpaid, and the first quote the ceiling
+    /// admits becomes its first quote when it has none.
+    ///
+    /// # Errors
+    ///
+    /// The errors [`Self::into_pull`] lists, with [`crate::RateAboveCeiling`] for a
+    /// quote above `rate_ceiling`.
+    pub(crate) fn into_pull_under(
+        self,
+        ctx: &PoolContext,
+        ledger: Arc<PoolLedger>,
+        max_blob_size_bytes: u64,
+        rate_ceiling: &RateCeiling,
         deadlines: PullDeadlines,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
         anyhow::ensure!(
@@ -227,13 +252,8 @@ impl OpenedStream {
         let Some(proven) = proven_size.filter(|_| resp.body.ok) else {
             return Err(UpstreamRefused::open(resp, &resp_ext));
         };
-        // A quote above the payer's ceiling (`0`: none) is refused unpaid.
-        if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
-            return Err(RateAboveCeiling::over_ceiling(
-                resp.body.rate_per_mb,
-                max_rate_per_mb,
-            ));
-        }
+        // A quote above the lane's ceiling is refused unpaid.
+        rate_ceiling.admit(resp.body.rate_per_mb)?;
         // The node accepted at a rate this pull pays: its signed answer is
         // receipt evidence for the lane (#2599).
         if let Some(evidence) = ledger.evidence() {
@@ -277,7 +297,6 @@ impl OpenedStream {
         };
         let window = deadlines.window;
         let (progress_counter, floor, sampler) = throughput_floor(deadlines);
-        ledger.note_rate(rate_per_mb);
         let pull = UpstreamPull {
             window,
             progress_counter,
