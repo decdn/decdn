@@ -16091,8 +16091,129 @@ async fn an_open_on_an_origin_held_blob_answers_full_coverage_and_fills_nothing(
         "an open fetches no origin object"
     );
     anyhow::ensure!(
+        cache_metrics.pull_through_bytes.get() == 0,
+        "an open reads no outboard and no range window: only memoised HEADs"
+    );
+    anyhow::ensure!(
         counter(&metrics, "decdn_local_outboard_serves_total")? == 1,
         "the open takes the own-origin spine"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A filesystem origin that publishes outboards but declines every ranged
+/// read: an origin whose range a serve finds unusable.
+#[derive(Debug)]
+struct RangelessOrigin(decdn_cache::FilesystemOrigin);
+
+/// A boxed origin future, as every [`decdn_cache::Origin`] method returns.
+type OriginFuture<'a, T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<T, decdn_cache::OriginPullError>> + Send + 'a>,
+>;
+
+impl decdn_cache::Origin for RangelessOrigin {
+    fn fetch(
+        &self,
+        hash: decdn_cache::Hash,
+        max_bytes: u64,
+    ) -> OriginFuture<'_, decdn_cache::origin::OriginFetch> {
+        self.0.fetch(hash, max_bytes)
+    }
+
+    fn fetch_outboard(
+        &self,
+        hash: decdn_cache::Hash,
+        outboard_max_bytes: u64,
+    ) -> OriginFuture<'_, decdn_cache::origin::OutboardFetch> {
+        self.0.fetch_outboard(hash, outboard_max_bytes)
+    }
+
+    fn has_outboard(&self, hash: decdn_cache::Hash) -> OriginFuture<'_, bool> {
+        self.0.has_outboard(hash)
+    }
+
+    fn fetch_size_proof(&self, hash: decdn_cache::Hash) -> OriginFuture<'_, Option<bytes::Bytes>> {
+        self.0.fetch_size_proof(hash)
+    }
+
+    fn size(&self, hash: decdn_cache::Hash) -> OriginFuture<'_, Option<u64>> {
+        self.0.size(hash)
+    }
+
+    fn kind(&self) -> decdn_cache::OriginKind {
+        self.0.kind()
+    }
+}
+
+/// An open on a blob the node's own origin holds, but whose ranges the origin
+/// declines, answers `ok: true` with no origin read past the memoised `HEAD`s.
+/// Admission at the first proof reads the range and refuses the stream before
+/// any chunk. The next open of the hash takes the degrade: `NotFound` with no
+/// block.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unusable_origin_range_is_refused_after_admission() -> anyhow::Result<()> {
+    let payload = vec![0x74u8; 300_000];
+    let origin_dir = tempfile::tempdir()?;
+    let hash = support::seed_origin_object(origin_dir.path(), &payload)?;
+    let encoded = decdn_bao_range::encode_outboard(payload.as_slice(), payload.len() as u64)?;
+    std::fs::write(
+        origin_dir
+            .path()
+            .join(encoded.shard())
+            .join(encoded.obao4_name()),
+        &encoded.outboard,
+    )?;
+    let origin = RangelessOrigin(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache_dir = tempfile::tempdir()?;
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![Arc::new(origin) as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_open_server(cache, store, None, 16).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = StreamRequestExt {
+        pull_through: false,
+        ..binding_ext(&signer, client_node_id)?
+    };
+    let req = whole_blob_request(*hash.as_bytes());
+
+    let (_s, _r, resp, _) = open_and_read_answer(&conn, &req, Some(&ext)).await?;
+    anyhow::ensure!(resp.body.ok, "the open answers from the published outboard");
+    anyhow::ensure!(
+        cache_metrics.pull_through_bytes.get() == 0,
+        "the unpaid open reads no outboard"
+    );
+    let refusal = request_refused_at_first_proof(&conn, &req, Some(&ext), &signer).await?;
+    anyhow::ensure!(
+        refusal == StreamError::NotFound,
+        "an unusable range is refused before any chunk, got {refusal:?}"
+    );
+    let (resp, resp_ext) = open_expecting_refusal_with(&conn, &req, Some(&ext)).await?;
+    anyhow::ensure!(
+        !resp.body.ok
+            && resp_ext.error() == Some(&StreamError::NotFound)
+            && resp_ext.coverage.is_empty(),
+        "the next open degrades: NotFound with no block, got {:?}",
+        resp_ext.error()
     );
 
     conn.close(0u32.into(), b"done");

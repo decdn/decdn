@@ -89,7 +89,13 @@ The coverage bitmap holds at most `MAX_COVERAGE_BLOCKS` blocks (1,600 blocks, 10
 - **`false`.** A node that does not hold the span answers at once with a signed `ok: false` (`NotFound`). It does no DHT lookup, no upstream open and no origin fill for the request. A node that serves the span from its own origin with a proven size answers `ok: true`, whatever the flag.
 - **`true`.** On a miss, the node runs funding admission first. Then it runs its miss path: DHT discovery, an upstream open and an origin fill ([ADR 037 § Node serving](037-regional-proxy-warming.md#node-serving-window-paced-pull-through)). It answers when it can serve, or when the miss path fails.
 
-A discovery open does not set the flag. A paid leg sets it. So a discovery fan-out costs each candidate at most one store lookup, one origin size check and one signature.
+A discovery open does not set the flag. A paid leg sets it. Before admission, an open without the flag reads only this:
+
+- one store lookup;
+- for a blob that the node serves from its own origin, three origin reads that the node memoises per hash: a `HEAD` of the data object, the `{H}.sizeproof` object, and a `HEAD` of the `{H}.obao4` outboard;
+- one signature.
+
+So repeats of a hash reach the origin at most once per memo TTL, and an unpaid open never costs origin egress in proportion to the blob. The node reads the outboard and the first range window only after admission at the first voucher. If the origin cannot serve the range, the node refuses the stream with a `StreamError` before any `ChunkData`. It then memoises the hash as having no outboard, and the next open of the hash degrades: `NotFound` without the flag, or the buffered origin fill with it. An origin without an outboard answers `NotFound` with an empty coverage.
 
 #### Deferred admission
 

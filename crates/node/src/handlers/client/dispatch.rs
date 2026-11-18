@@ -750,23 +750,26 @@ impl ClientHandler {
             // chunk groups, so a bounded request costs exactly its aligned span
             // in origin egress.
             //
-            // Serviceability is confirmed before the response is signed, by
-            // `origin_probe_presence` (a probe of the data object, memoised per
-            // hash, so repeats of a hash reach the origin once per TTL), the
-            // origin's
-            // `{H}.sizeproof` (ADR 005 § Bounded byte ranges: the node serves an
-            // origin blob only under a size its origin proves; the engine keeps
-            // a proof it read and remembers an origin that serves none), and
-            // `origin_range_serviceable` (an origin publishes the outboard AND
-            // serves ranged reads of the data). The range half reads one chunk
-            // group until the origin has served a clean range window once, then
-            // reads nothing. So an origin that publishes an outboard but declines
-            // `Range` degrades here instead of failing a signed stream.
+            // Before the response is signed, the node reads only what it can
+            // memoise per hash, so repeats of a hash reach the origin once per
+            // TTL and an open the payer never takes costs no egress in
+            // proportion to the blob:
+            // `origin_probe_presence` (a `HEAD` of the data object), the
+            // origin's `{H}.sizeproof` (ADR 005 § Bounded byte ranges: the node
+            // serves an origin blob only under a size its origin proves; the
+            // engine keeps a proof it read and remembers an origin that serves
+            // none), and `origin_outboard_published` (a `HEAD` of the
+            // `{H}.obao4` outboard). The outboard read and the range window run
+            // only after admission at the first proof, in
+            // `serve_via_backend_origin`; a range they find unusable refuses
+            // the stream before any chunk, and the next open of the hash
+            // degrades here.
             //
             // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
-            // published outboard / no ranged reads => the buffered local populate
-            // below, for a request that pulls through. No origin size or no proof
-            // of it => nothing is served from the origin.
+            // published outboard => the buffered local populate below, for a
+            // request that pulls through, and `NotFound` for one that does not.
+            // No origin size or no proof of it => nothing is served from the
+            // origin.
             // Once serviceable, `serve_via_backend_origin` claims the fill itself
             // (`CacheEngine::claim_fill`) after admission: the first same-hash miss
             // OWNS the local origin pull; a concurrent one ATTACHES as an observer
@@ -778,7 +781,7 @@ impl ClientHandler {
                     if self.cache.size_proof(hash, total).await.is_none() => {}
                 decdn_cache::OriginPresence::Present(total) => {
                     origin_proven = true;
-                    match self.cache.origin_range_serviceable(hash, total).await {
+                    match self.cache.origin_outboard_published(hash, total).await {
                         Ok(true) => {
                             let adm = DeferredAdmission::new(
                                 req.clone(),
@@ -808,17 +811,17 @@ impl ClientHandler {
                             ))
                             .await;
                         }
-                        // Size proven but no origin publishes the outboard and
-                        // serves ranges. Degrade to the buffered local populate
-                        // below.
+                        // Size proven but no origin publishes the outboard, or
+                        // a serve found its ranges unusable. Degrade to the
+                        // buffered local populate below.
                         Ok(false) => {}
-                        // A genuine origin fault while probing the outboard or
-                        // the first range window. Latch it (#1129) so a
-                        // later-tier miss reports InternalError not NotFound,
-                        // then fall through — another source may still serve.
+                        // A genuine origin fault while probing the outboard.
+                        // Latch it (#1129) so a later-tier miss reports
+                        // InternalError not NotFound, then fall through —
+                        // another source may still serve.
                         Err(e) => {
                             self.metrics.node_pull_through_error();
-                            tracing::warn!(%hash, error = %e.display_chain(), "own-origin range probe faulted; falling through");
+                            tracing::warn!(%hash, error = %e.display_chain(), "own-origin outboard probe faulted; falling through");
                             fault_seen = true;
                         }
                     }

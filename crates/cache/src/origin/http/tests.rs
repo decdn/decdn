@@ -387,3 +387,40 @@ fn new_outside_a_runtime_is_an_error() -> anyhow::Result<()> {
     anyhow::ensure!(HttpOrigin::new(url).is_err(), "built outside a runtime");
     Ok(())
 }
+
+/// The outboard-presence probe is a `HEAD`: a 200 is an outboard, a 404 or a
+/// deterministic decline is none, and a 503 is a transient fault. No `GET`
+/// reaches the server.
+#[tokio::test]
+async fn has_outboard_heads_the_sibling_and_classifies_its_status() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let statuses = [
+        (200u16, Some(true)),
+        (404, Some(false)),
+        (403, Some(false)),
+        (503, None),
+    ];
+    for (status, _) in statuses {
+        let hash = Hash::new(format!("http-has-outboard-{status}").as_bytes());
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{}.obao4", hash.to_hex())))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+    for (status, want) in statuses {
+        let hash = Hash::new(format!("http-has-outboard-{status}").as_bytes());
+        match (origin.has_outboard(hash).await, want) {
+            (Ok(got), Some(want)) => anyhow::ensure!(got == want, "{status}: got {got}"),
+            (Err(err), None) => anyhow::ensure!(err.is_transient(), "{status}: {err}"),
+            (got, _) => anyhow::bail!("{status}: unexpected {got:?}"),
+        }
+    }
+    Ok(())
+}

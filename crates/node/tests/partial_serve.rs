@@ -445,7 +445,12 @@ async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Res
         .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", total.to_string()))
         .mount(&server)
         .await;
-    // sibling outboard GET.
+    // sibling outboard: a HEAD before the answer, a GET after admission.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.to_vec()))

@@ -618,6 +618,32 @@ impl ClientHandler {
         serve_result
     }
 
+    /// Whether the node's own origin serves the outboard and ranged reads of
+    /// `hash`, a `total_bytes`-byte blob, for a stream admission just passed
+    /// ([`decdn_cache::CacheEngine::origin_range_serviceable`]). The refusal
+    /// class when it does not: `CacheMiss` (wire `NotFound`) for an origin that
+    /// serves no usable range, and `InternalError` (wire `Declined`) for an
+    /// origin fault.
+    async fn origin_range_usable(
+        &self,
+        hash: Hash,
+        total_bytes: u64,
+    ) -> Result<(), ServeRejectReason> {
+        match self.cache.origin_range_serviceable(hash, total_bytes).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ServeRejectReason::CacheMiss),
+            Err(e) => {
+                self.metrics.node_pull_through_error();
+                tracing::warn!(
+                    %hash,
+                    error = %e.display_chain(),
+                    "own-origin range probe faulted after admission; refusing the stream"
+                );
+                Err(ServeRejectReason::InternalError)
+            }
+        }
+    }
+
     /// Serve a cache miss from the node's OWN configured fs/http/s3 origin by
     /// running the two decoupled serve-miss legs — the LOCAL twin
     /// of [`Self::serve_via_window_pull_through`] with every paid-upstream axis
@@ -738,6 +764,16 @@ impl ClientHandler {
             Err(reason) => return self.refuse_admission(&mut send, reason).await,
         };
         let lane = &lane;
+
+        // (4b) The origin serves the outboard and ranged reads of the data: the
+        // outboard read and one chunk group, until the origin served a clean
+        // range window once. They run only now, after admission, so an open the
+        // payer never takes costs no origin egress. An unusable range refuses
+        // the stream before any chunk, and the next open of the hash degrades
+        // before it answers.
+        if let Err(reason) = self.origin_range_usable(hash, total_bytes).await {
+            return self.refuse_admission(&mut send, reason).await;
+        }
 
         // (5) The two decoupled legs (ADR 037). Identical coordination
         // shape to the peer twin: the SERVE leg runs HERE on the accept task (it must

@@ -320,6 +320,11 @@ struct Inner {
     /// than one per probe. Restart-configured; swapped in wholesale by
     /// [`CacheEngine::set_origin_probe_config`] at bring-up.
     origin_probe_memo: Mutex<OriginProbeMemo>,
+    /// Memo of [`CacheEngine::origin_outboard_published`]: whether an origin
+    /// publishes a hash's `{H}.obao4` outboard, under the same TTLs as
+    /// `origin_probe_memo`. An origin whose ranges a serve finds unusable is
+    /// memoised as publishing none ([`CacheEngine::origin_range_serviceable`]).
+    outboard_probe_memo: Mutex<OriginProbeMemo>,
     /// Hashes this node refuses to serve, announce, or acquire because the
     /// operator's own `[content] denied_hashes` names them, and which a later
     /// config reload can UN-refuse (ADR 011 § Local Denylist). The governance
@@ -1691,6 +1696,7 @@ impl CacheEngine {
                 origin_held: ArcSwap::from(Arc::new(OriginHeldIndex::default())),
                 rescan_slot: AtomicU8::new(RESCAN_IDLE),
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
+                outboard_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
                 evicted: MonotoneHashSet::new(evicted),
@@ -2397,6 +2403,99 @@ impl CacheEngine {
     /// so the value need not thread through every test constructor.
     pub fn set_origin_probe_config(&self, policy: OriginProbePolicy) {
         *self.probe_memo_lock() = OriginProbeMemo::new(policy);
+        *self.outboard_memo_lock() = OriginProbeMemo::new(policy);
+    }
+
+    /// Lock the outboard-presence memo, recovering a poisoned mutex as
+    /// [`Self::probe_memo_lock`] does.
+    fn outboard_memo_lock(&self) -> std::sync::MutexGuard<'_, OriginProbeMemo> {
+        self.inner
+            .outboard_probe_memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether an origin publishes the `{H}.obao4` outboard of `hash`, a
+    /// `total_bytes`-byte blob, learnt without reading it: a memoised answer,
+    /// a cached copy, or an [`Origin::has_outboard`] probe of each origin in
+    /// turn. The serve-miss path asks before it answers an open from its own
+    /// origin, so an open the payer has not taken reads no outboard and no
+    /// data. The outboard read and the range window run after admission
+    /// ([`Self::origin_range_serviceable`]).
+    ///
+    /// Answers memoise per hash under the origin-probe TTLs
+    /// ([`Self::set_origin_probe_config`]), so repeats of a hash reach the
+    /// origin once per TTL. A size claim past the blob cap answers `false`
+    /// with no read, as the outboard read does.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::OriginError`] when no origin publishes the outboard and at
+    /// least one probe faulted or the walk overran the probe timeout, or such
+    /// a fault is memoised.
+    pub async fn origin_outboard_published(
+        &self,
+        hash: Hash,
+        total_bytes: u64,
+    ) -> CacheResult<bool> {
+        if total_bytes > self.inner.max_blob_bytes {
+            return Ok(false);
+        }
+        let fault = |cause: String| CacheError::OriginError {
+            hash,
+            source: anyhow::anyhow!(cause),
+        };
+        let now = Instant::now();
+        let timeout = {
+            let mut memo = self.outboard_memo_lock();
+            match memo.get(hash, now) {
+                Some(Presence::Present(_)) => return Ok(true),
+                Some(Presence::Absent) => return Ok(false),
+                Some(Presence::Fault) => {
+                    return Err(fault("an origin outboard probe faulted (memoised)".into()));
+                }
+                None => memo.timeout(),
+            }
+        };
+        // A cached copy answers with no origin read. The memo goes first: it
+        // holds a hash whose ranges a serve found unusable.
+        if self
+            .inner
+            .outboards
+            .get(hash, expected_outboard_len(total_bytes))
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let walk = async {
+            let mut last_fault = None;
+            for origin in &self.inner.origins {
+                match origin.has_outboard(hash).await {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            %hash,
+                            kind = ?origin.kind(),
+                            error = %format_args!("{e:#}"),
+                            "origin outboard probe faulted; checking remaining origins",
+                        );
+                        last_fault = Some(format!("{:?} origin: {e:#}", origin.kind()));
+                    }
+                }
+            }
+            last_fault.map_or(Ok(false), Err)
+        };
+        let answer = tokio::time::timeout(timeout, walk)
+            .await
+            .unwrap_or_else(|_| Err(format!("the outboard probe walk overran {timeout:?}")));
+        let presence = match &answer {
+            Ok(true) => Presence::Present(total_bytes),
+            Ok(false) => Presence::Absent,
+            Err(_) => Presence::Fault,
+        };
+        self.outboard_memo_lock().insert(hash, presence, now);
+        answer.map_err(fault)
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -3830,9 +3929,9 @@ impl CacheEngine {
     ///
     /// This is the outboard half of the own-origin serviceability probe
     /// ([`Self::origin_range_serviceable`]), which the serve-miss path runs
-    /// before it signs a `StreamResponse`, so a blob no origin can prove is
-    /// never advertised as serviceable. A cached copy answers without an origin
-    /// read.
+    /// after admission. Before it signs a `StreamResponse`, that path learns
+    /// only whether the outboard exists ([`Self::origin_outboard_published`]).
+    /// A cached copy answers without an origin read.
     /// The returned outboard is UNTRUSTED until it verifies against the root `H`
     /// (the range encode in [`Self::origin_range_wire`] is where that happens).
     ///
@@ -3958,15 +4057,16 @@ impl CacheEngine {
         OriginRangeWire::spawn(cursor, aligned, permit, self.inner.outboards.clone()).map(Some)
     }
 
-    /// The own-origin serviceability probe the serve-miss path runs before it
-    /// signs a `StreamResponse`: whether an origin furnishes both the `{H}.obao4`
-    /// outboard for `hash` (a `total_bytes`-byte blob) and ranged reads of its
-    /// data. `false` sends the caller to the buffered whole-blob degrade
-    /// (ADR 037 §"Fallback is always correct"), so an origin that publishes an
-    /// outboard but declines `Range` does not have a signed stream fail on its
-    /// first draw. The exception is an origin that served ranges earlier and
-    /// has stopped since: it fails its draw like any other mid-life origin
-    /// fault.
+    /// The own-origin serviceability probe the serve-miss path runs once the
+    /// payer's first proof admits a stream it answered from its own origin:
+    /// whether an origin furnishes both the `{H}.obao4` outboard for `hash` (a
+    /// `total_bytes`-byte blob) and ranged reads of its data. `false` refuses
+    /// that stream before any chunk, and memoises the hash as publishing no
+    /// outboard ([`Self::origin_outboard_published`]), so the next open of the
+    /// hash takes the buffered whole-blob degrade before it answers
+    /// (ADR 037 §"Fallback is always correct"). An origin that served ranges
+    /// earlier and has stopped since fails its draw like any other mid-life
+    /// origin fault.
     ///
     /// The range half reads the first chunk group through the same origin
     /// chain a draw walks, starting at the origin that served the outboard. It
@@ -3985,6 +4085,17 @@ impl CacheEngine {
         hash: Hash,
         total_bytes: u64,
     ) -> CacheResult<bool> {
+        let serviceable = self.range_serviceable(hash, total_bytes).await?;
+        if !serviceable {
+            // The next open of the hash takes the degrade before it answers.
+            self.outboard_memo_lock()
+                .insert(hash, Presence::Absent, Instant::now());
+        }
+        Ok(serviceable)
+    }
+
+    /// The body of [`Self::origin_range_serviceable`].
+    async fn range_serviceable(&self, hash: Hash, total_bytes: u64) -> CacheResult<bool> {
         let Some((outboard, ix)) = self.outboard_with_origin(hash, total_bytes).await? else {
             return Ok(false);
         };

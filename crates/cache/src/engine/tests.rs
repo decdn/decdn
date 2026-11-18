@@ -3583,6 +3583,8 @@ struct RangeStubOrigin {
     fault_outboard: bool,
     /// Calls to [`Origin::fetch_outboard`] so far.
     outboard_fetches: AtomicUsize,
+    /// Calls to [`Origin::has_outboard`] so far.
+    outboard_heads: AtomicUsize,
     /// When true, [`Origin::fetch_outboard`] waits on `gate`.
     gate_outboard: bool,
     /// Calls to [`Origin::fetch_range_data`] so far, shared so a test can
@@ -3608,6 +3610,7 @@ impl RangeStubOrigin {
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
             fault_outboard: false,
             outboard_fetches: AtomicUsize::new(0),
+            outboard_heads: AtomicUsize::new(0),
             gate_outboard: false,
             range_fetches: Arc::new(AtomicUsize::new(0)),
         }
@@ -3631,6 +3634,7 @@ impl RangeStubOrigin {
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
             fault_outboard: true,
             outboard_fetches: AtomicUsize::new(0),
+            outboard_heads: AtomicUsize::new(0),
             gate_outboard: false,
             range_fetches: Arc::new(AtomicUsize::new(0)),
         }
@@ -3663,6 +3667,21 @@ impl Origin for RangeStubOrigin {
     {
         let out = (hash == self.hash).then_some(self.size);
         Box::pin(async move { Ok(out) })
+    }
+
+    fn has_outboard(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, crate::OriginPullError>> + Send + '_>> {
+        self.outboard_heads.fetch_add(1, Ordering::SeqCst);
+        let answer = if self.fault_outboard && hash == self.hash {
+            Err(crate::OriginPullError::Transient(anyhow::anyhow!(
+                "stub outboard transport fault"
+            )))
+        } else {
+            Ok(self.outboard.is_some() && hash == self.hash)
+        };
+        Box::pin(async move { answer })
     }
 
     fn fetch_outboard(
@@ -3813,8 +3832,65 @@ async fn origin_range_serviceable_probes_one_group_then_latches() -> anyhow::Res
     Ok(())
 }
 
+/// The outboard-presence probe reads no outboard: it asks each origin once,
+/// and answers the next ask from its memo with no origin call.
+#[tokio::test]
+async fn origin_outboard_published_heads_once_and_reads_no_outboard() -> anyhow::Result<()> {
+    let (data, hash, origin, _) = multi_window_stub();
+    let total = u64::try_from(data.len())?;
+    let origin = Arc::new(origin);
+    let tmp = tempfile::tempdir()?;
+    let engine =
+        CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 64).await?;
+    anyhow::ensure!(engine.origin_outboard_published(hash, total).await?);
+    anyhow::ensure!(engine.origin_outboard_published(hash, total).await?);
+    anyhow::ensure!(
+        origin.outboard_heads.load(Ordering::SeqCst) == 1,
+        "one probe, then the memo"
+    );
+    anyhow::ensure!(
+        origin.outboard_fetches.load(Ordering::SeqCst) == 0,
+        "no outboard is read"
+    );
+    anyhow::ensure!(
+        origin.range_fetches.load(Ordering::SeqCst) == 0,
+        "no data window is read"
+    );
+    Ok(())
+}
+
+/// A faulting outboard probe is an error, not an absence.
+#[tokio::test]
+async fn origin_outboard_published_faults_on_a_faulting_origin() -> anyhow::Result<()> {
+    let hash = Hash::from([7u8; 32]);
+    let (engine, _tmp) = stub_engine(vec![RangeStubOrigin::outboard_faulting(hash, 4096)]).await?;
+    let probed = engine.origin_outboard_published(hash, 4096).await;
+    anyhow::ensure!(
+        matches!(probed, Err(CacheError::OriginError { .. })),
+        "a fault must surface, got {probed:?}"
+    );
+    Ok(())
+}
+
+/// A range a serve finds unusable memoises the hash as publishing no
+/// outboard, so the next open degrades before it answers.
+#[tokio::test]
+async fn an_unusable_range_memoises_the_outboard_as_absent() -> anyhow::Result<()> {
+    let (data, hash, mut origin, _) = multi_window_stub();
+    let total = u64::try_from(data.len())?;
+    origin.support_range = false;
+    let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    anyhow::ensure!(engine.origin_outboard_published(hash, total).await?);
+    anyhow::ensure!(!engine.origin_range_serviceable(hash, total).await?);
+    anyhow::ensure!(
+        !engine.origin_outboard_published(hash, total).await?,
+        "the next open sees no usable outboard"
+    );
+    Ok(())
+}
+
 /// An origin that publishes the outboard but declines ranges is not
-/// serviceable, so the caller degrades before it signs.
+/// serviceable, so the caller refuses the admitted stream before any chunk.
 #[tokio::test]
 async fn origin_range_serviceable_is_false_without_range_support() -> anyhow::Result<()> {
     let (data, hash, mut origin, _) = multi_window_stub();
