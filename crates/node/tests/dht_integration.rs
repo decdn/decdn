@@ -900,7 +900,7 @@ async fn find_providers_stops_suppressing_once_the_negative_entry_expires() -> a
     client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
 
-    // The production defaults: ADR 001 § Probe cache's 1024 entries and
+    // The production defaults: ADR 001 §Candidate cache's 1024 entries and
     // 5-minute TTL. Nothing this test does comes near that window, so the
     // suppression assertion below does not ride on how long a lookup takes.
     let neg = NegativeProbeCache::new();

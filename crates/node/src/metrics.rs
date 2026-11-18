@@ -31,10 +31,11 @@ use tokio::sync::{Semaphore, oneshot};
 use crate::chain_events::resumable_watcher::WatcherHook;
 use crate::load_shed::RequestClass;
 
-/// Bucket upper bounds of `decdn_probe_collection_latency_seconds`, per the
-/// registry row in `adr/appendix-observability.md`. The collection window has a
-/// 1 s ceiling, so the top finite bucket leaves room for a slow scheduler.
-const PROBE_COLLECTION_BUCKETS: [f64; 8] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+/// Bucket upper bounds of `decdn_open_collection_latency_seconds`, per the
+/// registry row in `adr/appendix-observability.md`. One open has a 2.5 s
+/// ceiling (`selection::OPEN_CEILING`), so the top finite bucket is that
+/// ceiling.
+const OPEN_COLLECTION_BUCKETS: [f64; 8] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
 
 /// Bucket upper bounds shared by the time-to-first-byte histograms. A cache hit
 /// resolves in the low buckets. A serve miss includes discovery and an upstream
@@ -1249,37 +1250,39 @@ pub struct DecdnMetrics {
     /// (DHT plus the origin-directory fallback) surfaced no provider — the blob
     /// is unavailable on the network, not a pull failure.
     pub node_pull_no_providers: Counter,
-    /// `decdn_probe_cache_hits_total` (#1165): cache-miss pulls whose candidate
-    /// walk STARTED from a live ADR 001 §Probe cache entry with at least one
-    /// still-selectable provider. The DHT lookup and probe fanout are skipped —
-    /// unless every cached provider fails, in which case the same fetch either
-    /// falls through to a fresh lookup + probe (if attempt budget remains) or
-    /// returns a clean miss (if the cached providers exhausted the budget first,
-    /// the common case since an entry holds up to 10 providers but the budget is
-    /// 3) — either way it stays counted here (the hit is "the cache had
-    /// something worth trying", not "the cache delivered"). Field has no
-    /// `_total` suffix because the
-    /// `OpenMetrics` encoder appends it. With `probe_cache_misses` this is the
-    /// hit ratio the TTL exists to buy; a ratio near zero means the TTL is
-    /// shorter than the request inter-arrival time for hot blobs and the cache
-    /// is pure overhead.
-    pub probe_cache_hits: Counter,
-    /// `decdn_probe_cache_misses_total` (#1165): cache-miss pulls that had to run
-    /// a fresh DHT lookup + probe. Counts an entry that was absent, expired, OR
-    /// fully suppressed (every cached provider negative-cached, wedged, no longer
-    /// an active staker, or otherwise unselectable), and on the ranged pull leg an
-    /// entry whose providers do not cover every block of the blob (#2195) — all
-    /// cost the same network work, which is what this measures.
-    pub probe_cache_misses: Counter,
-    /// `decdn_probe_collection_latency_seconds` (ADR 001 §Probe response
-    /// collection): the time from the start of the concurrent probes, dials
-    /// included, to the end of collection — the early stop once enough holders
-    /// answer, or the drain of the probe set, which `PROBE_TIMEOUT` bounds per
-    /// probe. A round that sends no probe records nothing. Each probe round
-    /// records one sample, so a ranged miss whose holders do not span the blob,
-    /// and that then probes origin-directory candidates, records two (#2195).
-    #[default(Histogram::new(PROBE_COLLECTION_BUCKETS.to_vec()))]
-    pub probe_collection_latency_seconds: Histogram,
+    /// `decdn_candidate_cache_hits_total` (#1165): cache-miss pulls whose
+    /// candidate walk STARTED from a live ADR 001 §Candidate cache entry with
+    /// at least one still-selectable provider. The DHT lookup and the discovery
+    /// fan-out are skipped — unless every cached provider fails, in which case
+    /// the same fetch either falls through to a fresh lookup and discovery (if
+    /// attempt budget remains) or returns a clean miss (if the cached providers
+    /// exhausted the budget first, the common case since an entry holds up to
+    /// 10 providers but the budget is 3) — either way it stays counted here
+    /// (the hit is "the cache had something worth trying", not "the cache
+    /// delivered"). Field has no `_total` suffix because the `OpenMetrics`
+    /// encoder appends it. With `candidate_cache_misses` this is the hit ratio
+    /// the TTL exists to buy; a ratio near zero means the TTL is shorter than
+    /// the request inter-arrival time for hot blobs and the cache is pure
+    /// overhead.
+    pub candidate_cache_hits: Counter,
+    /// `decdn_candidate_cache_misses_total` (#1165): cache-miss pulls that had
+    /// to run a fresh DHT lookup and discovery. Counts an entry that was
+    /// absent, expired, OR fully suppressed (every cached provider
+    /// negative-cached, wedged, no longer an active staker, or otherwise
+    /// unselectable), and on the ranged pull leg an entry whose providers do
+    /// not cover every block of the blob (#2195) — all cost the same network
+    /// work, which is what this measures.
+    pub candidate_cache_misses: Counter,
+    /// `decdn_open_collection_latency_seconds` (ADR 001 §Open response
+    /// collection): the time from the start of the concurrent discovery opens,
+    /// dials included, to the end of collection — the early stop once enough
+    /// holders answer, or the drain of the open set, which `OPEN_CEILING`
+    /// bounds per open. A round that sends no open records nothing. Each open
+    /// round records one sample, so a ranged miss whose holders do not span the
+    /// blob, and that then opens origin-directory candidates, records two
+    /// (#2195).
+    #[default(Histogram::new(OPEN_COLLECTION_BUCKETS.to_vec()))]
+    pub open_collection_latency_seconds: Histogram,
     /// `decdn_dht_lookup_round_ceiling_total` (#1145 review): a `find_providers` lookup was
     /// TRUNCATED at `MAX_LOOKUP_ROUNDS` while still finding closer nodes.
     ///
@@ -3446,19 +3449,19 @@ recorders! {
     /// A cache miss surfaced no provider from discovery (#831).
     node_pull_no_providers => node_pull_no_providers.inc();
 
-    /// A cache-miss pull was served from the ADR 001 probe cache: no DHT lookup,
-    /// no probe fanout (#1165).
-    probe_cache_hit => probe_cache_hits.inc();
+    /// A cache-miss pull was served from the ADR 001 candidate cache: no DHT
+    /// lookup, no discovery fan-out (#1165).
+    candidate_cache_hit => candidate_cache_hits.inc();
 
-    /// A cache-miss pull found no usable probe-cache entry and ran a fresh
-    /// lookup + probe (#1165).
-    probe_cache_miss => probe_cache_misses.inc();
+    /// A cache-miss pull found no usable candidate-cache entry and ran a fresh
+    /// lookup and discovery (#1165).
+    candidate_cache_miss => candidate_cache_misses.inc();
 
-    /// One probe round's collection window ended (ADR 001 §Probe response
-    /// collection): `elapsed` runs from the start of the concurrent probes to
+    /// One discovery round's collection window ended (ADR 001 §Open response
+    /// collection): `elapsed` runs from the start of the concurrent opens to
     /// the end of collection.
-    probe_collection_latency(elapsed: Duration) =>
-        probe_collection_latency_seconds.observe(elapsed.as_secs_f64());
+    open_collection_latency(elapsed: Duration) =>
+        open_collection_latency_seconds.observe(elapsed.as_secs_f64());
 
     /// One node-to-node pull leg read its first bao bytes `elapsed` after its
     /// open started.

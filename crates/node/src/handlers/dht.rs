@@ -11,7 +11,7 @@
 //!   `providers` leave out a record whose attesting origin lost its seat;
 //!   its `closer_nodes` name only bonded peers (ADR 022 §Routing Table); per
 //!   ADR 022 §Lookup integrity the requester-side filters (XOR-distance,
-//!   active-staker, negative-probe-cache, randomisation) stay the
+//!   active-staker, negative-cache, randomisation) stay the
 //!   requester's job and live in the iterative-lookup module
 //!   ([`crate::dht::lookup`]).
 //! - `BatchStore` admission (ADR 022 §Batch token accounting, #648):
@@ -765,7 +765,7 @@ impl DhtHandler {
     /// the responder returns its known holders for `hash` plus the
     /// K-closest bonded peers from the routing table. Per ADR 022 §Lookup
     /// integrity, requester-side filtering (XOR-distance check, active-
-    /// staker filter, negative-probe-cache consultation, randomisation)
+    /// staker filter, negative-cache consultation, randomisation)
     /// stays the requester's job: this node filters only its own
     /// `closer_nodes` against its staker set, and does not filter `providers`.
     fn handle_find_value(&self, req: wire::FindValueRequest) -> wire::FindValueResponse {

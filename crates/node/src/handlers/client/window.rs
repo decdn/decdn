@@ -217,7 +217,7 @@ impl ClientHandler {
         // can still return `Owner`; that branch opens the pull leg LATE (step 6b) —
         // it alone needs a `target`. The namespace (ADR 005 §Namespace routing)
         // drives the origin-directory reads — the fallback inside `discover` on a
-        // total DHT miss, and the supplement in `probe_and_rank` when the discovered
+        // total DHT miss, and the supplement in `open_and_rank` when the discovered
         // holders do not span the blob — and is threaded onto the node-to-node leg so
         // a directory-discovered cold origin's own pull-through gate resolves (#1401);
         // big-endian to the on-chain `uint256` shape.

@@ -10,7 +10,7 @@
 //! ## Termination
 //!
 //! Stops as soon as **either**:
-//! - `providers.len() >= k` (saturation — caller has enough to probe), OR
+//! - `providers.len() >= k` (saturation — caller has enough to open), OR
 //! - a full round completes without surfacing any candidate strictly
 //!   closer to `target` than the current best queried node
 //!   (convergence — no further progress possible).
@@ -28,9 +28,9 @@
 //! 2. **Active-staker** — drop non-staked `NodeId`s from both
 //!    `closer_nodes` and `providers`. The DHT routing pool is
 //!    restricted to staked nodes by spec.
-//! 3. **Negative probe cache** — drop `(provider, target)` pairs the
-//!    requester has already observed returning `has_blob: false`
-//!    within the cache TTL. Only applies to `providers`, never to
+//! 3. **Negative cache** — drop `(provider, target)` pairs the
+//!    requester has already observed answering a discovery open with
+//!    `NotFound` within the cache TTL. Only applies to `providers`, never to
 //!    `closer_nodes`.
 //! 4. **Origin attestation** — drop a provider whose attestation does
 //!    not recover to a seated origin (ADR 022 § Origin Attestation). This
@@ -74,7 +74,7 @@ pub struct Lookup {
     /// coverage hint.
     pub providers: Vec<(NodeId, Coverage)>,
     /// The seated origins the valid attestations in the answers name, in the
-    /// order the lookup first saw them. The requester's fallback probes these
+    /// order the lookup first saw them. The requester's fallback opens these
     /// before it reads a namespace's origin directory (ADR 022 § `FIND_VALUE`
     /// Flow).
     pub origins: Vec<Address>,
@@ -550,7 +550,7 @@ fn filter_active_stakers(nodes: Vec<NodeId>, staker_set: &dyn StakerSet) -> Vec<
 }
 
 /// Filter 3: drop `(provider, target)` pairs already present in the
-/// negative probe cache. Only applies to `providers` — a peer that
+/// negative cache. Only applies to `providers` — a peer that
 /// previously denied holding `target` may still legitimately route
 /// `closer_nodes` for it.
 #[must_use]

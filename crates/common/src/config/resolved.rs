@@ -339,9 +339,10 @@ pub struct ResolvedCache {
     /// is relaying. Explicit config overrides either default. Node-local;
     /// `cache.*` is restart-required.
     pub relay_foreign_namespaces: bool,
-    /// Providers probed before ranking on a node-to-node pull (#831). Default
-    /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`].
-    pub node_pull_probe_fanout: usize,
+    /// Providers a node-to-node pull opens a discovery stream on before
+    /// ranking (#831). Default
+    /// [`crate::config::DEFAULT_NODE_PULL_OPEN_FANOUT`].
+    pub node_pull_open_fanout: usize,
     /// Per-pull wall-clock timeout in seconds for a node-to-node miss fill
     /// (#831). Default [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`].
     ///

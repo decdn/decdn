@@ -446,7 +446,7 @@ pub(super) fn record_stream_error(detail: impl std::fmt::Display) {
 /// refusal. `reason` is the same snake-case value the `serve_stream` span
 /// records; `namespace_id` is the request's, as a decimal. A pull-leg miss adds
 /// its `cause` and the walk's trail (`source`, `discovered`, `skipped`,
-/// `probed`, `unreachable`, `absent`, `dropped`, `holders`, `spans`,
+/// `opened`, `unreachable`, `absent`, `dropped`, `holders`, `spans`,
 /// `handshakes`, `last_fault`; #2366); a coverage-gate refusal adds the pull
 /// range, the candidate count and the first uncovered chunk; a throttled line
 /// adds the count of lines it `suppressed`. An absent field is not recorded.
@@ -471,7 +471,7 @@ fn log_miss_refusal(req: &StreamRequest, refusal: MissRefusal, suppressed: Optio
         source = trail.map(|t| t.source.as_str()),
         discovered = trail.map(|t| t.discovered),
         skipped = trail.map(|t| t.skipped),
-        probed = trail.map(|t| t.probed),
+        opened = trail.map(|t| t.opened),
         unreachable = trail.map(|t| t.unreachable),
         absent = trail.map(|t| t.absent),
         dropped = trail.map(|t| t.dropped),

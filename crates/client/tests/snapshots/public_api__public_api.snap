@@ -1112,6 +1112,8 @@ impl core::fmt::Display for decdn_client::UnverifiedAnswer
 pub fn decdn_client::UnverifiedAnswer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::UpstreamRefused
 impl decdn_client::UpstreamRefused
+pub const fn decdn_client::UpstreamRefused::at_admission(decdn_protocol::client::StreamError) -> Self
+pub const fn decdn_client::UpstreamRefused::before_delivery(&self) -> bool
 pub const fn decdn_client::UpstreamRefused::error(&self) -> &decdn_protocol::client::StreamError
 pub fn decdn_client::UpstreamRefused::evidence(&self) -> core::option::Option<&decdn_protocol::client::StreamResponse>
 pub const fn decdn_client::UpstreamRefused::mid_stream(decdn_protocol::client::StreamError) -> Self

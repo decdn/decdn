@@ -599,13 +599,13 @@ pub struct CacheConfig {
     /// configured, `true` (relay) when none is. Set this explicitly to
     /// override either default. Node-local; `cache.*` is restart-required.
     pub relay_foreign_namespaces: Option<bool>,
-    /// Number of discovered providers to probe before ranking on a
-    /// node-to-node pull (#831). Absent =>
-    /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`] (5). Higher widens
-    /// provider choice at the cost of more probe round trips per miss; `0`
-    /// probes none, so no pull can succeed (a way to disable the pull while
+    /// Number of discovered providers a node-to-node pull opens a
+    /// voucher-less discovery stream on before ranking (#831). Absent =>
+    /// [`crate::config::DEFAULT_NODE_PULL_OPEN_FANOUT`] (5). Higher widens
+    /// provider choice at the cost of more discovery opens per miss; `0`
+    /// opens none, so no pull can succeed (a way to disable the pull while
     /// keeping the feature flag on).
-    pub node_pull_probe_fanout: Option<usize>,
+    pub node_pull_open_fanout: Option<usize>,
     /// Wall-clock timeout in seconds for the STREAM-OPEN stage of a single upstream pull
     /// on a node-to-node miss (#831) — connect, handshake, and the
     /// signed `StreamResponse`. It does NOT bound the buyer pool open, which precedes
@@ -636,7 +636,7 @@ pub struct CacheConfig {
     ///
     /// "Longer" is multiplied, not added. A silent candidate costs one full window of this,
     /// and the derived outer deadline budgets that for EVERY candidate, so a second here is
-    /// ~3 seconds of worst-case client wait on a total miss (168 s at defaults).
+    /// ~3 seconds of worst-case client wait on a total miss (169.5 s at defaults).
     ///
     /// It also sets the head start of the time budget for each own-origin range-pull read
     /// (ADR 037): one `{H}.obao4` fetch or one data window of at most 4 MiB. That budget is

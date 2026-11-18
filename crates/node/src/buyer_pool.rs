@@ -1580,14 +1580,42 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         provider_addr: Address,
         budget: Duration,
     ) -> Result<PoolContext> {
+        let (state, reused) = self.live_pool(budget).await?;
+        // A fresh pool has no lane to seed; a reused one may hold this lane's
+        // watermark only on chain.
+        let state = if reused {
+            self.reseed_lane_from_chain(state, provider_addr).await?
+        } else {
+            state
+        };
+        pin_ctx(&state, &self.signer, &self.voucher_domain, provider_addr)
+    }
+
+    /// Return the [`PoolContext`] a discovery open sends: the node's pool, its
+    /// lane key and its self-issued capability, pinned to no provider. Opens or
+    /// reuses the pool exactly as [`Self::open_or_reuse_pool`] does, and seeds
+    /// no lane: a discovery open pays nothing, and the pull that adopts its
+    /// stream pays through the lane the provider's own context seeds.
+    ///
+    /// # Errors
+    ///
+    /// The pool-open errors of [`Self::open_or_reuse_pool`], or a
+    /// capability-signing fault.
+    pub async fn discovery_ctx(&self, budget: Duration) -> Result<PoolContext> {
+        let (state, _) = self.live_pool(budget).await?;
+        pin_ctx(&state, &self.signer, &self.voucher_domain, Address::ZERO)
+    }
+
+    /// The live pool row: reused (`true`), or opened under `budget` (`false`).
+    /// The bounds and errors are [`Self::open_or_reuse_pool`]'s.
+    async fn live_pool(&self, budget: Duration) -> Result<(BuyerPoolState, bool)> {
         // Fast path: reuse the live pool. A below-low-water pool kicks off a
         // detached refill (#1146) and hands THIS pull the current deposit
         // immediately — the refill must not sit in the hot path behind an on-chain
         // `topUp`.
         if let Some(state) = self.reuse_or_report()? {
             self.spawn_refill_if_low(&state);
-            let state = self.reseed_lane_from_chain(state, provider_addr).await?;
-            return pin_ctx(&state, &self.signer, &self.voucher_domain, provider_addr);
+            return Ok((state, true));
         }
 
         let open = self.unless_held(self.join_or_spawn_open(None));
@@ -1613,7 +1641,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                     .context(OpenReported)
                     .context(LocalPullFault)
                 })?;
-                pin_ctx(&state, &self.signer, &self.voucher_domain, provider_addr)
+                Ok((state, false))
             }
         }
     }
@@ -2518,6 +2546,20 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         budget: Duration,
     ) -> Result<PoolContext>;
 
+    /// Open or reuse the node's buyer pool and return the [`PoolContext`] a
+    /// voucher-less discovery open sends, pinned to no provider. See
+    /// [`BuyerPoolService::discovery_ctx`].
+    ///
+    /// Defaults to [`Self::open_or_reuse_pool`] for the zero address, so a test
+    /// double need not override it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_or_reuse_pool`].
+    async fn discovery_ctx(&self, budget: Duration) -> Result<PoolContext> {
+        self.open_or_reuse_pool(Address::ZERO, budget).await
+    }
+
     /// Persist one lane's voucher progress on the `(signer, provider)` lane of
     /// `pool_id`. See [`BuyerPoolService::record_progress`].
     ///
@@ -2562,6 +2604,10 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         budget: Duration,
     ) -> Result<PoolContext> {
         BuyerPoolService::open_or_reuse_pool(self, provider_addr, budget).await
+    }
+
+    async fn discovery_ctx(&self, budget: Duration) -> Result<PoolContext> {
+        BuyerPoolService::discovery_ctx(self, budget).await
     }
 
     fn record_progress(

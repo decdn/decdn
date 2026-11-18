@@ -6,7 +6,7 @@
 # runs until the CI job itself times out, burning a whole runner for hours. A cap
 # turns that into a bounded, reported failure within minutes.
 #
-# The cap sits well above the slowest legitimate test — the ~168s outer pull
+# The cap sits well above the slowest legitimate test — the ~170s outer pull
 # deadline (`selection::outer_pull_deadline` at defaults) — and far below the
 # multi-hour wedge it replaces.
 

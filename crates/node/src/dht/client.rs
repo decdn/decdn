@@ -61,8 +61,8 @@ pub const DHT_CLIENT_TIMEOUT: Duration = Duration::from_secs(8);
 /// It is well under the lookup's round timeout
 /// ([`super::lookup::DEFAULT_ROUND_TIMEOUT`]), so a dead peer costs a lookup
 /// one dial budget, not a whole round, and the lookup learns which peer it was
-/// (#2532). The probe path budgets 1 s for a dial and an exchange
-/// ([`crate::selection::PROBE_TIMEOUT`]).
+/// (#2532). A discovery open budgets 1 s for a dial and again for its
+/// exchange ([`crate::selection::OPEN_TIMEOUT`]).
 pub const DHT_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The QUIC dial of an outbound DHT exchange did not complete within

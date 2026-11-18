@@ -536,8 +536,25 @@ impl<'a> PeerSource<'a> {
         )
     }
 
+    /// [`Self::adopt`], with the pull wrapped as the reader a drive reads: for
+    /// a caller outside this crate that parks the pull for its drive
+    /// ([`PrimedSource::prime`]).
+    ///
+    /// # Errors
+    ///
+    /// Any error [`Self::adopt`] returns.
+    #[doc(hidden)]
+    pub fn adopt_reader(
+        &self,
+        opened: OpenedStream,
+    ) -> anyhow::Result<(UpstreamPullHeader, PullReader)> {
+        let (header, pull) = self.adopt(opened)?;
+        Ok((header, PullReader::new(pull)))
+    }
+
     /// Whether this source's lane can pay `opened` ([`OpenedStream::paid_by`]).
-    pub(crate) fn can_adopt(&self, opened: &OpenedStream) -> bool {
+    #[doc(hidden)]
+    pub fn can_adopt(&self, opened: &OpenedStream) -> bool {
         opened.peer() == self.target.id && self.ctx.lock().is_ok_and(|ctx| opened.paid_by(&ctx))
     }
 }

@@ -205,7 +205,7 @@ fn default_config_template_covers_every_wired_field() {
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
         relay_foreign_namespaces,
-        node_pull_probe_fanout,
+        node_pull_open_fanout,
         node_pull_timeout_sec,
         node_pull_stall_window_sec,
         node_pull_min_throughput_bps,
@@ -268,7 +268,7 @@ fn default_config_template_covers_every_wired_field() {
             "relay_foreign_namespaces =",
             relay_foreign_namespaces.is_none(),
         ),
-        ("node_pull_probe_fanout =", node_pull_probe_fanout.is_none()),
+        ("node_pull_open_fanout =", node_pull_open_fanout.is_none()),
         ("node_pull_timeout_sec =", node_pull_timeout_sec.is_none()),
         (
             "node_pull_stall_window_sec =",

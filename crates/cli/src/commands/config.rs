@@ -268,8 +268,8 @@ pub fn write_validate_summary<W: std::io::Write>(
     if resolved.cache.node_to_node_pull_through_enabled {
         writeln!(
             w,
-            "  node_to_node_pull:        enabled (probe_fanout={}, pull_timeout_sec={}, stall_window_sec={}, min_throughput_bps={})",
-            resolved.cache.node_pull_probe_fanout,
+            "  node_to_node_pull:        enabled (open_fanout={}, pull_timeout_sec={}, stall_window_sec={}, min_throughput_bps={})",
+            resolved.cache.node_pull_open_fanout,
             resolved.cache.node_pull_timeout_sec,
             resolved.cache.node_pull_stall_window_sec,
             resolved.cache.node_pull_min_throughput_bps
@@ -1059,9 +1059,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
 # node_to_node_pull_through_enabled = true # paid cache-miss pull from upstream nodes (#831, ADR 001/022); default is role-derived — off when a [cache.origin]/[[cache.origins]] backend is configured, on when none is; set explicitly to override
 # relay_foreign_namespaces = true          # relay content this node's own backend does not hold (#1759); default is role-derived — origin-only (false) when a [cache.origin]/[[cache.origins]] backend is configured, relay (true) when none is; set explicitly to override
-# node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
+# node_pull_open_fanout = 5                # providers a node-to-node pull opens a discovery stream on before ranking (#831)
 # node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the pool open, which has its own 5s budget. The overall pull-through deadline is derived from this, the pool-open budget, and the stall window, so every ranked upstream can be tried before falling back (#831, #859)
-# node_pull_stall_window_sec = 20          # per-upstream THROUGHPUT-FLOOR window while streaming (#1797); bytes are counted off the stream sub-frame, so it trips only when throughput falls below the floor — not on a large blob or a big frame. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (168s at defaults); also the head start of each own-origin range-pull read's time budget (ADR 037)
+# node_pull_stall_window_sec = 20          # per-upstream THROUGHPUT-FLOOR window while streaming (#1797); bytes are counted off the stream sub-frame, so it trips only when throughput falls below the floor — not on a large blob or a big frame. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (169.5s at defaults); also the head start of each own-origin range-pull read's time budget (ADR 037)
 # node_pull_min_throughput_bps = 4096      # minimum sustained upstream throughput (bytes/sec) over node_pull_stall_window_sec (#1797); catches a slow-drip wedge. 0 = idle detection only (one byte per window). The abort is requester-local and does not score the upstream's reputation; also the average throughput each own-origin range-pull read ({H}.obao4 or one data window) must sustain after that head start, 0 = those reads unbounded
 # eviction_policy = "lru"                  # ADR 040: "lru" or "tinylfu"; restart-required
 # admission_policy = "always"              # ADR 040: "always" or "tinylfu"; restart-required

@@ -403,10 +403,11 @@ pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE
 /// operator opt-in.
 pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 
-/// Default providers probed before ranking on a node-to-node cache-miss pull
-/// (#831). Five is enough to find a healthy upstream in a tens-of-nodes
-/// network without spending the miss-latency budget on a wide probe fan-out.
-pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
+/// Default providers a node-to-node cache-miss pull opens a voucher-less
+/// discovery stream on before ranking (#831). Five is enough to find a
+/// healthy upstream in a tens-of-nodes network without spending the
+/// miss-latency budget on a wide open fan-out.
+pub const DEFAULT_NODE_PULL_OPEN_FANOUT: usize = 5;
 /// Default wall-clock bound (seconds) on the STREAM-OPEN stage of a single upstream
 /// pull during a node-to-node cache-miss fill (#831) — connect, handshake, signed
 /// `StreamResponse`. Matches the integration-test budget; a slow upstream is abandoned
@@ -438,7 +439,7 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// candidates — otherwise a single silent peer eats the whole deadline and the fallback
 /// loop never reaches the others (#859, and the reason this knob is an argument to that
 /// function). So each second added here adds ~3 to the worst-case wait a client can see on
-/// a total miss: 168 s at defaults.
+/// a total miss: 169.5 s at defaults.
 pub const DEFAULT_NODE_PULL_STALL_WINDOW_SEC: u64 = 20;
 /// Default minimum sustained upstream throughput (bytes/sec) over
 /// [`DEFAULT_NODE_PULL_STALL_WINDOW_SEC`] (#1797). At ~40× a 100 B/s drip and far below any
@@ -1439,7 +1440,7 @@ fn resolve_blockchain_into(
         .and_then(|b| b.origin_directory_cache_capacity)
         .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY);
     // No `!= 0` rejection: a `0` TTL is a valid "disable caching" choice
-    // (every entry reads as already-expired, matching `probe_cache`'s
+    // (every entry reads as already-expired, matching `candidate_cache`'s
     // documented zero-TTL behavior), and the cache clamps capacity to `>= 1`
     // itself.
 
@@ -1905,9 +1906,9 @@ fn resolve_cache_into(
         // its own namespace; a node with no origin is a pure relay edge and relays.
         // Explicit config overrides either way.
         .unwrap_or(origins.is_empty());
-    let node_pull_probe_fanout = file
-        .and_then(|c| c.node_pull_probe_fanout)
-        .unwrap_or(DEFAULT_NODE_PULL_PROBE_FANOUT);
+    let node_pull_open_fanout = file
+        .and_then(|c| c.node_pull_open_fanout)
+        .unwrap_or(DEFAULT_NODE_PULL_OPEN_FANOUT);
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
@@ -2094,7 +2095,7 @@ fn resolve_cache_into(
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
         relay_foreign_namespaces,
-        node_pull_probe_fanout,
+        node_pull_open_fanout,
         node_pull_timeout_sec,
         node_pull_stall_window_sec,
         node_pull_min_throughput_bps,

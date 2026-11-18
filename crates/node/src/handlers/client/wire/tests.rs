@@ -142,7 +142,7 @@ fn a_miss_refusal_logs_one_info_line_with_hash_range_reason_path_and_cause() {
 }
 
 /// A pull-leg miss names the walk that ended without a target (#2366): where
-/// the candidates came from, how many were skipped, probed, unreachable,
+/// the candidates came from, how many were skipped, opened, unreachable,
 /// absent or dropped, how many holders the round admitted and whether they
 /// span the blob, how many handshakes ran, and why the last one failed. A
 /// walk that ran no handshake records no `last_fault`.
@@ -152,7 +152,7 @@ fn a_pull_leg_miss_logs_the_walk_that_found_no_target() {
         source: CandidateSource::Directory,
         discovered: 1,
         skipped: 2,
-        probed: 1,
+        opened: 1,
         unreachable: 1,
         absent: 0,
         dropped: 0,
@@ -176,7 +176,7 @@ fn a_pull_leg_miss_logs_the_walk_that_found_no_target() {
     for field in [
         "discovered=1",
         "skipped=2",
-        "probed=1",
+        "opened=1",
         "unreachable=1",
         "absent=0",
         "dropped=0",
@@ -196,7 +196,7 @@ fn a_pull_leg_miss_names_the_fault_of_its_last_handshake() {
         source: CandidateSource::Dht,
         discovered: 3,
         skipped: 0,
-        probed: 3,
+        opened: 3,
         unreachable: 0,
         absent: 1,
         dropped: 0,
@@ -237,7 +237,7 @@ fn a_coverage_gate_refusal_logs_its_shortfall() {
     assert!(line.contains("first_uncovered_chunk=48"), "{line}");
     assert!(!line.contains("cause="), "{line}");
     assert!(!line.contains("source="), "{line}");
-    assert!(!line.contains("probed="), "{line}");
+    assert!(!line.contains("opened="), "{line}");
 }
 
 /// A throttled no-lane line counts the lines it stands for.

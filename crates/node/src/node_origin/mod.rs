@@ -10,10 +10,13 @@
 //!
 //! 1. discovers providers for the hash (DHT [`crate::dht::find_providers`],
 //!    with the origin-directory fallback),
-//! 2. probes each candidate for rate + RTT and ranks them by the combined
-//!    local+network reputation score ([`crate::selection::rank_candidates`]),
-//! 3. opens (or reuses) the node's buyer pool, pays the best candidate on its lane, and streams
-//!    the whole blob straight into the local cache via the gap-driven
+//! 2. opens a voucher-less `cdn/client/v1` stream on each candidate, which
+//!    answers with its signed quote, its proven size of the blob and its
+//!    coverage, and ranks them by the quote, the path RTT and the local
+//!    reputation score ([`crate::selection::rank_candidates`]),
+//! 3. pins the best candidate's lane on the node's buyer pool, adopts its
+//!    discovery stream as the first leg, and streams the whole blob straight
+//!    into the local cache via the gap-driven
 //!    [`decdn_client::drive`] loop (#1682 — resumable, so a pool that
 //!    runs dry mid-blob is topped up and the pull continues at the paid frontier;
 //!    no whole-blob buffer is ever held in RAM), falling back through up to
@@ -61,7 +64,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
@@ -88,15 +91,15 @@ use crate::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
-    LookupConfig, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
-    ProbedProvider, StakerSet,
+    CachedCandidate, CandidateCache, LookupConfig, NegativeProbeCache, NodeAddressResolver,
+    OriginDirectory, StakerSet,
 };
 use crate::metrics::Metrics;
 use crate::selection::{
-    Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_EARLY_EXIT_CANDIDATES, PROBE_TIMEOUT, rank_candidates,
+    Candidate, MAX_PROVIDER_ATTEMPTS, OPEN_CEILING, OPEN_EARLY_EXIT_CANDIDATES, OPEN_TIMEOUT,
+    POOL_OPEN_CALLER_BUDGET, rank_candidates,
 };
 use decdn_client::buyer_pool::ProgressWrite;
-use decdn_client::probe::probe_once;
 use decdn_client::{
     BlobTooLarge, Cumulative, HashMismatch, LegNoProgress, LocalPullFault, PoolContext, PoolLedger,
     PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd,
@@ -105,10 +108,10 @@ use decdn_client::{
 };
 
 /// The lower of two per-MB rate ceilings, `0` meaning "unbounded" on each
-/// input: the rate the candidate quoted and the node's own bound. Returns `0`
-/// only when both are unbounded.
-const fn effective_rate_ceiling(candidate: u64, bound: u64) -> u64 {
-    match (candidate, bound) {
+/// input: the node's configured `max_rate_per_mb` and the serve-economics buy
+/// cap. Returns `0` only when both are unbounded.
+const fn lower_rate_ceiling(a: u64, b: u64) -> u64 {
+    match (a, b) {
         (0, b) => b,
         (c, 0) => c,
         (c, b) if c < b => c,
@@ -117,8 +120,8 @@ const fn effective_rate_ceiling(candidate: u64, bound: u64) -> u64 {
 }
 
 /// Throttle for the `warn!` on an upstream that refused this node's request
-/// timestamp (`APP_ERR_TIMESTAMP_SKEW`). Process-wide: every pull and probe
-/// shares one window, because a wrong local clock trips it on every
+/// timestamp (`APP_ERR_TIMESTAMP_SKEW`). Process-wide: every pull and
+/// discovery open shares one window, because a wrong local clock trips it on every
 /// candidate at once. Each event also counts into
 /// `decdn_node_upstream_timestamp_rejected_total`.
 static UPSTREAM_TIMESTAMP_WARN: crate::warn_throttle::WarnThrottle =
@@ -163,50 +166,51 @@ fn record_upstream_timestamp_rejected(
     }
 }
 
-/// How a probe round decides it has collected enough holders (#1506).
+/// How a discovery round decides it has collected enough holders (#1506).
 #[derive(Clone, Copy)]
-pub(crate) enum ProbeGather {
-    /// Single-source failover: stop once [`PROBE_EARLY_EXIT_CANDIDATES`] holders
+pub(crate) enum OpenGather {
+    /// Single-source failover: stop once [`OPEN_EARLY_EXIT_CANDIDATES`] holders
     /// answer, because the single-source pull loop tries at most that many.
     EarlyExit,
     /// Ranged assembly: stop once the admitted holders' coverage UNION spans the
     /// blob, so a set of partial holders whose fastest answers all cover the same
-    /// discovery block is not mistaken for enough. A holder that reports its blob
-    /// size (`ProbeResponseExt.total_bytes`) pins the block count the union must
-    /// span; absent any size the round drains to the probe-fanout ceiling. The
-    /// empty root has no block, so its first admitted holder spans it (#2526).
+    /// discovery block is not mistaken for enough. A holder whose answer proves
+    /// the blob size pins the block count the union must span; absent any size
+    /// the round drains to the open fan-out ceiling. The empty root has no
+    /// block, so its first admitted holder spans it (#2526).
     ///
     /// A round whose holders cannot span the blob is followed by a second round
-    /// over the namespace's origin-directory candidates it did not probe (#2195).
+    /// over the namespace's origin-directory candidates it did not open (#2195).
     /// An origin advertises every block, so its answer normally closes the union.
-    /// Each round takes its own `probe_fanout`, so a gather sends at most twice
-    /// that many probes and stays bounded.
+    /// Each round takes its own `open_fanout`, so a gather sends at most twice
+    /// that many opens and stays bounded.
     CoverageUnion,
 }
 
-/// The coverage union of a set of probed holders, and whether it spans the blob
-/// (#1506).
+/// The coverage union of a set of discovered holders, and whether it spans
+/// the blob (#1506).
 ///
-/// A holder's own reported size pins how many blocks the blob has. Its coverage
-/// bits past that count are ignored, because an untrusted wire bitmap may set
-/// spurious high bits (see `Coverage`). A holder that reports no size adds
-/// nothing, and the union spans nothing until some holder reports one.
+/// A served answer proves the blob size, and that size pins how many blocks
+/// the blob has. Such a holder's coverage bits past that count are ignored,
+/// because an untrusted wire bitmap may set spurious high bits (see
+/// `Coverage`). A partial holder's refusal proves no size, so its blocks join
+/// the union as they stand. The union spans the blob only once some holder has
+/// proved a size, and only the blocks below that size count.
 ///
 /// The empty blob ([`decdn_protocol::EMPTY_ROOT`]) spans zero blocks, so no
 /// holder reports a block for the union to cover. For that hash the union
 /// spans the blob once one holder is admitted (#2526). The rule keys on the
-/// requested hash, never on a holder's stated `total_bytes`.
-/// `ProbeResponseExt::consistent_with` keys on the hash the same way. A holder
-/// that reports `Some(0)` for a real blob therefore closes nothing.
+/// requested hash, never on a holder's stated size. A holder that proves a
+/// size of zero for a real blob therefore closes nothing.
 struct CoverageUnionTracker {
     /// Whether the requested hash is [`decdn_protocol::EMPTY_ROOT`].
     empty_root: bool,
-    /// Holders admitted so far, a holder that stated no size included. Read
+    /// Holders admitted so far, a holder that proved no size included. Read
     /// only when `empty_root` is set.
     holders: usize,
     /// Covered discovery blocks seen so far.
     blocks: std::collections::BTreeSet<u32>,
-    /// The largest block count any holder has reported for this blob.
+    /// The largest block count any holder has proved for this blob.
     target: u32,
 }
 
@@ -233,11 +237,11 @@ impl CoverageUnionTracker {
     /// Fold `candidate`'s coverage into the union.
     fn add(&mut self, candidate: &Candidate) {
         self.holders += 1;
-        let Some(bytes) = candidate.total_bytes_hint else {
-            return;
-        };
-        let holder_blocks = decdn_protocol::num_blocks(bytes);
-        self.target = self.target.max(holder_blocks);
+        let holder_blocks = candidate.total_bytes_hint.map_or(u32::MAX, |bytes| {
+            let blocks = decdn_protocol::num_blocks(bytes);
+            self.target = self.target.max(blocks);
+            blocks
+        });
         self.blocks.extend(
             candidate
                 .coverage
@@ -247,7 +251,7 @@ impl CoverageUnionTracker {
     }
 
     /// Every block `0..target` is in the union. False while no holder has
-    /// reported a size. For the empty root, true once one holder is admitted.
+    /// proved a size. For the empty root, true once one holder is admitted.
     fn spans(&self) -> bool {
         if self.empty_root {
             return self.holders > 0;
@@ -383,9 +387,12 @@ fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
 #[allow(clippy::cognitive_complexity)]
 fn record_pool_open_failure(
     deps: &NodeOriginDeps,
-    provider_addr: Address,
+    provider: Option<Address>,
     err: &anyhow::Error,
 ) -> PullMiss {
+    // The provider whose lane the open pinned; `None` for a discovery context,
+    // which pins none.
+    let provider_addr = provider.unwrap_or(Address::ZERO);
     // Not a failure at all: the open ran past our per-candidate budget and is still
     // going in the background (#1143). Meter it apart from real failures — a sustained rate
     // means this node's chain lane is too slow for `POOL_OPEN_CALLER_BUDGET`, which is a
@@ -500,8 +507,9 @@ fn record_pool_open_failure(
 /// Tuning knobs for the node-to-node pull, resolved from `[cache]` config.
 #[derive(Debug, Clone)]
 pub struct NodeOriginConfig {
-    /// How many discovered providers to probe before ranking.
-    pub probe_fanout: usize,
+    /// How many discovered providers to open a discovery stream on before
+    /// ranking.
+    pub open_fanout: usize,
     /// Wall-clock bound on the STREAM-OPEN stage of a single upstream pull: connect,
     /// handshake, and the signed `StreamResponse`. Bounded work, so a slow one is a stall.
     ///
@@ -528,10 +536,9 @@ pub struct NodeOriginConfig {
     /// are stored, never on the peer's `total_bytes` (#1895).
     pub max_blob_size_bytes: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling (`cache.max_rate_per_mb`), `0` =
-    /// unlimited (#1375). Combined via `effective_rate_ceiling` with the
-    /// probe-relative bound (the rate the chosen candidate advertised) so the node
-    /// refuses a stream quote that exceeds the lower of the two before paying — and
-    /// retains the signed over-quote as rate-manipulation evidence.
+    /// unlimited (#1375). Discovery excludes a holder whose open answer quotes
+    /// above it, and every pull refuses a stream quote above it (folded with the
+    /// serve-economics buy cap under the `margin` policy) before paying.
     pub max_rate_per_mb: u64,
     /// How often this node's chain watcher polls for events
     /// (`blockchain.event_poll_interval_ms`), used to size the settle window
@@ -544,8 +551,8 @@ pub struct NodeOriginConfig {
     /// DHT lookup tuning.
     pub lookup: LookupConfig,
     /// This node's self-attested region (`identity.region`), or `None` when
-    /// unset. Used to apply the ADR 030 latency-vs-claim penalty: a probed peer
-    /// that claims *this* region yet answers slower than the latency ceiling
+    /// unset. Used to apply the ADR 030 latency-vs-claim penalty: a discovered
+    /// peer that claims *this* region yet answers slower than the latency ceiling
     /// (`REGION_LATENCY_MAX_MS`) is a region-spoofing signal. `None` disables the
     /// penalty (nothing to compare against).
     pub own_region: Option<String>,
@@ -565,7 +572,7 @@ pub struct NodeOriginConfig {
     pub frequency_estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>>,
     /// This node's configured served rate per MB (`payment.rate_per_mb`) — the
     /// sell rate `P_sell`, the serve-economics policy's other input. The same
-    /// base value the probe handler is constructed with.
+    /// base value the client handler quotes.
     pub sell_rate_base: u64,
     /// ADR 041 per-source warming allowance: bounds the loss from speculative
     /// above-floor buys per upstream source node. The buy loop reads
@@ -578,24 +585,21 @@ pub struct NodeOriginConfig {
 }
 
 /// ADR 030 default heuristic (RTT > 150ms to a same-claimed-region node). The
-/// value compared against it is `probe_once`'s RTT: the request/response
-/// exchange on the open connection, or the direct path's RTT when hole punching
-/// selects one in time and it is lower. It never spans the connect. An RTT with
-/// no direct path behind it ([`ProbeRtt::direct`] is `false`) is compared too:
-/// the peer controls whether hole punching succeeds, so exempting a relay RTT
-/// would let a region spoofer escape the penalty by refusing direct paths. The
-/// cost is that an honest in-region peer stuck on a distant relay can read past
-/// 150ms. The threshold is a documented constant, deliberately not yet a
-/// governance knob per ADR 030 (which defers threshold/sample/decay tuning to a
-/// later ADR 008 revision).
-///
-/// [`ProbeRtt::direct`]: decdn_client::probe::ProbeRtt::direct
+/// value compared against it is a discovery open's path RTT: the direct path's
+/// QUIC estimate when hole punching selects one in time, else the selected
+/// (relay) path's. It is never the time to the answer. An RTT with no direct
+/// path behind it is compared too: the peer controls whether hole punching
+/// succeeds, so exempting a relay RTT would let a region spoofer escape the
+/// penalty by refusing direct paths. The cost is that an honest in-region peer
+/// stuck on a distant relay can read past 150ms. The threshold is a documented
+/// constant, deliberately not yet a governance knob per ADR 030 (which defers
+/// threshold/sample/decay tuning to a later ADR 008 revision).
 const REGION_LATENCY_MAX_MS: u32 = 150;
 
-/// Whether the ADR 030 latency-vs-claim penalty applies to a probed peer.
+/// Whether the ADR 030 latency-vs-claim penalty applies to a discovered peer.
 ///
 /// It fires only when the peer self-attests the observer's *own* region
-/// (`own_region`) yet the observed probe latency exceeds [`REGION_LATENCY_MAX_MS`]
+/// (`own_region`) yet the observed open latency exceeds [`REGION_LATENCY_MAX_MS`]
 /// — the canonical region-spoofing signal. An unset own region (`None`) or an
 /// unknown peer region (empty) disables it: there is nothing to contradict.
 fn region_latency_penalty_applies(own_region: Option<&str>, claimed: &str, rtt_ms: u32) -> bool {
@@ -633,19 +637,19 @@ impl NodeOriginConfig {
 /// completes (see the module docs). Built and handed to [`NodeOrigin::provision`]
 /// by the runtime.
 pub struct NodeOriginDeps {
-    /// The node's shared iroh endpoint (dials probes).
+    /// The node's shared iroh endpoint, whose id the client binding signs.
     pub endpoint: Endpoint,
     /// The node's pooled `cdn/client/v1` connections: one per upstream, shared
-    /// by every pull leg. Each leg opens its own stream on the upstream's
-    /// connection.
+    /// by every discovery open and every pull leg. Each opens its own stream on
+    /// the upstream's connection.
     ///
     /// The map dials on the node's main runtime, which outlives `endpoint`'s
     /// close. A pull leg runs on its own current-thread runtime, which drops
     /// when the leg returns. A connection dialled there would lose its QUIC
     /// driver with that runtime, never reach QUIC's draining state, and hang
     /// `Endpoint::close` at shutdown. Every upstream pull dial goes through this
-    /// map, so every driver lives on the main runtime. Probes dial one-shot on
-    /// `endpoint`, on the serve task.
+    /// map, so every driver lives on the main runtime. Discovery opens run on
+    /// the serve task, on the main runtime, so they dial on this map too.
     pub connections: Connections,
     /// The node's pooled `cdn/dht/v1` connections (one per peer, dialled on
     /// the main runtime), shared with the DHT background tasks.
@@ -660,7 +664,8 @@ pub struct NodeOriginDeps {
     /// the attestation its upstream offers.
     pub attestations: Arc<crate::attestations::Attestations>,
     /// On-chain origin directory: the fallback when the DHT returns no providers,
-    /// and the supplement when a ranged pull's probed holders do not span the blob.
+    /// and the supplement when a ranged pull's discovered holders do not span the
+    /// blob.
     pub origin_directory: Arc<dyn OriginDirectory>,
     /// Resolves a provider `NodeId` to its bonded operator Ethereum address.
     pub addr_resolver: Arc<dyn NodeAddressResolver>,
@@ -681,16 +686,16 @@ pub struct NodeOriginDeps {
     pub bind_domain: Eip712Domain,
     /// Local per-peer reputation score store (folded on each pull outcome).
     pub local_rep: Arc<LocalReputation>,
-    /// Requester-side negative-probe cache (drops known-absent providers).
+    /// Requester-side negative cache (drops known-absent providers).
     pub negative_cache: NegativeProbeCache,
-    /// Requester-side positive probe cache (ADR 001 §Probe cache): lets a repeat
-    /// miss for a hash inside the TTL skip the DHT lookup and probe fanout
-    /// (#1165). Beside the negative cache, and by value for the same reason:
+    /// Requester-side candidate cache (ADR 001 §Candidate cache): lets a repeat
+    /// miss for a hash inside the TTL skip the DHT lookup and the discovery
+    /// fan-out (#1165). Beside the negative cache, and by value for the same reason:
     /// `NodeOrigin` holds its deps behind `Arc<OnceLock<NodeOriginDeps>>`, so
     /// every concurrent pull already shares one instance through that `Arc`, and
     /// the cache's own `Mutex` gives it interior mutability behind `&self`. A
     /// second `Arc` here would buy nothing but a pointer chase.
-    pub probe_cache: PositiveProbeCache,
+    pub candidate_cache: CandidateCache,
     /// Node metrics for the paid-pull observability counters (#831).
     pub metrics: Arc<Metrics>,
     /// The `CapacityBond` registry's `NodeId → regionHint` projection (ADR 030),
@@ -709,7 +714,7 @@ pub struct NodeOriginDeps {
     /// rankable again (#1145 review). The horizon is a fixed
     /// `WEDGED_PROVIDER_SUPPRESSION_SECS` window, not a lane deadline: the buyer pool is
     /// shared across every provider, so it carries no per-provider expiry to key one on.
-    /// Keyed by the peer's [`DhtNodeId`], so `probe_and_rank` can skip a wedged provider for
+    /// Keyed by the peer's [`DhtNodeId`], so `open_and_rank` can skip a wedged provider for
     /// ALL hashes, not just the one that wedged it. In-memory: on restart the first miss
     /// re-wedges and re-suppresses within one pull.
     pub wedged_providers: Arc<Mutex<HashMap<DhtNodeId, u64>>>,
@@ -730,7 +735,7 @@ impl std::fmt::Debug for NodeOriginDeps {
 
 impl NodeOriginDeps {
     /// Suppress `pk` from ranking for [`WEDGED_PROVIDER_SUPPRESSION_SECS`], so
-    /// `probe_and_rank` and `cached_candidates` skip the provider for ALL hashes until that
+    /// `open_and_rank` and `cached_candidates` skip the provider for ALL hashes until that
     /// window elapses (#1145 review). The window is owned here rather than passed in because
     /// it is the same for every lane-terminal reason: the pool the lane draws on has no
     /// per-provider deadline to key one on, so there is nothing for a caller to vary it by.
@@ -943,6 +948,9 @@ impl Default for NodeOrigin {
 }
 
 impl Origin for NodeOrigin {
+    // One fetch: the cached walk, then discovery and the cold walk, sharing one
+    // attempt budget. Splitting it would scatter the budget across helpers.
+    #[allow(clippy::too_many_lines)]
     fn fetch(
         &self,
         hash: Hash,
@@ -972,7 +980,7 @@ impl Origin for NodeOrigin {
                 // `node_pull_attempts` counts pull ORCHESTRATIONS ("found ≥1 candidate
                 // to try"), and is the denominator for the success / corruption /
                 // unreachable rates. One `fetch` is one orchestration however many
-                // candidate lists it walks, so a probe-cache hit that exhausts its
+                // candidate lists it walks, so a candidate-cache hit that exhausts its
                 // providers and falls through to the cold path must still meter
                 // exactly once — otherwise every such fetch inflates the denominator
                 // and quietly deflates every rate built on it.
@@ -991,15 +999,24 @@ impl Origin for NodeOrigin {
                 let seen = deps.buyer.pool_deposit().unwrap_or(U256::ZERO);
                 let mut unfunded: Vec<Candidate> = Vec::new();
 
-                // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
-                // cache first; if a valid entry exists, it skips DHT lookup and goes
-                // straight to selection."
+                // ADR 001 §Candidate cache: "On a cache miss the requester checks the
+                // candidate cache first; if a valid entry exists, it skips DHT lookup
+                // and goes straight to selection."
                 if let Some(cached) = cached_candidates(deps, target).await {
-                    deps.metrics.probe_cache_hit();
+                    deps.metrics.candidate_cache_hit();
                     deps.metrics.node_pull_attempt();
                     attempt_metered = true;
-                    let outcome =
-                        try_pull(&deps_lock, deps, &cached, hash_bytes, budget, &gate).await;
+                    // A cache hit opened no stream: each pull opens its own.
+                    let outcome = try_pull(
+                        &deps_lock,
+                        deps,
+                        &cached,
+                        hash_bytes,
+                        budget,
+                        &gate,
+                        &mut OpenStreams::default(),
+                    )
+                    .await;
                     match outcome.payload {
                         Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
                         Err(failed) => miss = miss.or(failed),
@@ -1008,14 +1025,14 @@ impl Origin for NodeOrigin {
                     budget = budget.saturating_sub(outcome.attempts);
                     // Every cached provider we had budget to try failed to deliver.
                     // The entry has been disproved by the only evidence that outranks
-                    // a probe — actual pulls — so drop it rather than let it keep
+                    // an answer — actual pulls — so drop it rather than let it keep
                     // hitting for the rest of its TTL. Any untried tail beyond
-                    // `budget` is forfeited with it: a fresh probe is cheaper than
-                    // trusting a list whose top-ranked members just failed.
-                    deps.probe_cache.invalidate(&target);
+                    // `budget` is forfeited with it: a fresh discovery is cheaper
+                    // than trusting a list whose top-ranked members just failed.
+                    deps.candidate_cache.invalidate(&target);
                     if budget == 0 {
                         // The cached candidates ate the whole fetch-wide budget.
-                        // Running a fresh lookup + probe now would either exceed the
+                        // Running a fresh lookup and discovery now would either exceed the
                         // worst case `outer_pull_deadline` is sized for, or discover
                         // providers it has no attempts left to try. The entry is gone,
                         // so the next fetch goes cold.
@@ -1023,17 +1040,18 @@ impl Origin for NodeOrigin {
                         // Answered through `miss_answer` like the cold-path arm below,
                         // so an exhausted budget spent on OUR faults is not signed to a
                         // client as an absent blob (#1560).
-                        debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
+                        debug!(%hash, "node-origin: candidate-cache candidates exhausted the attempt budget");
                         return recover_unfunded(
                             &deps_lock, deps, hash_bytes, unfunded, miss, &gate, seen,
                         )
                         .await;
                     }
                 } else {
-                    deps.metrics.probe_cache_miss();
+                    deps.metrics.candidate_cache_miss();
                 }
 
-                // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
+                // ADR 001 §Candidate cache: "if all fail, run a fresh DHT lookup and
+                // discovery."
                 // This is the generic `Origin::fetch` path (the buffered `populate` fill),
                 // a hash-only pull with no client namespace, so it takes no on-chain
                 // origin-directory fallback (`NO_NAMESPACE`), and no requester to
@@ -1060,19 +1078,47 @@ impl Origin for NodeOrigin {
                 if !attempt_metered {
                     deps.metrics.node_pull_attempt();
                 }
-                // Writes the probe cache at its tail. The buffered fill is a
-                // single-source pull (`try_pull`), so one working holder is enough.
-                let ranked = probe_and_rank(
+                let ctx = match discovery_ctx(deps).await {
+                    Ok(ctx) => ctx,
+                    Err((failed, _)) => {
+                        return recover_unfunded(
+                            &deps_lock,
+                            deps,
+                            hash_bytes,
+                            unfunded,
+                            miss.or(failed),
+                            &gate,
+                            seen,
+                        )
+                        .await;
+                    }
+                };
+                // Writes the candidate cache at its tail. The buffered fill is a
+                // single-source whole-blob pull (`try_pull`), so one working holder
+                // is enough, and each open asks for the whole blob: the stream a
+                // holder serves is the pull's first leg.
+                let spec = OpenSpec::new(ctx, NO_NAMESPACE, (0, 0));
+                let (ranked, mut streams) = open_and_rank(
                     deps,
                     providers,
                     &discovered.attested,
                     hash_bytes,
-                    ProbeGather::EarlyExit,
+                    OpenGather::EarlyExit,
                     U256::ZERO,
-                    &mut ProbeTally::default(),
+                    &spec,
+                    &mut OpenTally::default(),
                 )
                 .await;
-                let outcome = try_pull(&deps_lock, deps, &ranked, hash_bytes, budget, &gate).await;
+                let outcome = try_pull(
+                    &deps_lock,
+                    deps,
+                    &ranked,
+                    hash_bytes,
+                    budget,
+                    &gate,
+                    &mut streams,
+                )
+                .await;
                 match outcome.payload {
                     Ok(()) => Ok(OriginFetch::AlreadyAdmitted),
                     Err(failed) => {
@@ -1155,10 +1201,10 @@ fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
 
 /// A discovery's answer: the providers and where they came from (#2366).
 struct Discovered {
-    /// The providers to probe.
+    /// The providers to open.
     providers: Vec<DhtNodeId>,
     /// The seated origins the lookup's valid attestations name, for the
-    /// coverage supplement in [`probe_and_rank`].
+    /// coverage supplement in [`open_and_rank`].
     attested: Vec<DhtNodeId>,
     /// [`CandidateSource::Dht`] for a lookup answer that is non-empty once the
     /// requester is dropped, [`CandidateSource::Directory`] for a non-empty
@@ -1169,9 +1215,9 @@ struct Discovered {
 /// Discover candidate providers for `hash`: the DHT iterative lookup first,
 /// falling back to the on-chain origin directory keyed on `namespace_id` when the
 /// lookup converges empty (ADR 022 §`FIND_VALUE` Flow). On the ranged pull leg
-/// ([`ProbeGather::CoverageUnion`]), a non-empty DHT answer whose holders cannot
-/// span the blob gets the directory's origins in [`probe_and_rank`] instead,
-/// because only a probe reports the blob size that decides it.
+/// ([`OpenGather::CoverageUnion`]), a non-empty DHT answer whose holders cannot
+/// span the blob gets the directory's origins in [`open_and_rank`] instead,
+/// because only a discovery open's answer proves the blob size that decides it.
 ///
 /// `requester` is the node the serve answers, when there is one. It is never a
 /// candidate (ADR 037 § Node serving), so both lists drop it here, before the
@@ -1181,7 +1227,7 @@ struct Discovered {
 ///
 /// `namespace_id` is the namespace the serving node received on the client
 /// `StreamRequest`. Within the pull it is consumed at the two directory reads:
-/// the fallback here and the supplement in [`probe_and_rank`]. A DHT-discovered
+/// the fallback here and the supplement in [`open_and_rank`]. A DHT-discovered
 /// *holder* already has the bytes and needs no namespace, but a
 /// directory-discovered *cold origin* is then reached with this same namespace so
 /// its own pull-through gate resolves (#1401, threaded by the progressive
@@ -1198,11 +1244,11 @@ async fn discover(
     // `find_providers` carries each holder's range-keyed `Coverage` alongside
     // its `NodeId` (ADR 039-adjacent partial-holder discovery) — a STALE
     // DHT-lookup hint, not a live observation. It is dropped here rather than
-    // used to prune candidates before probing: the authoritative coverage a
-    // ranked candidate carries onward comes from its fresh `ProbeResponseExt`
-    // instead (`probe_candidate`, #1506). A later task may use this hint to
-    // skip probing a candidate whose stale coverage already misses the whole
-    // pull range; today every discovered candidate is still probed.
+    // used to prune candidates before opening them: the authoritative coverage
+    // a ranked candidate carries onward comes from its fresh answer to a
+    // discovery open instead (`open_candidate`, #1506). A later task may use
+    // this hint to skip a candidate whose stale coverage already misses the
+    // whole pull range; today every discovered candidate is still opened.
     let lookup = crate::dht::find_providers(
         &deps.dht_connections,
         &deps.routing_table,
@@ -1267,40 +1313,42 @@ async fn fallback_origins(
     origins
 }
 
-/// Why one probe admitted no candidate (#2366). The side effects of each arm
-/// (reputation, negative cache, metrics) run at the drop site in
-/// [`probe_candidate`]; this is what the round tallies.
+/// Why one discovery open admitted no candidate (#2366). The side effects of
+/// each arm (reputation, negative cache, metrics) run at the drop site in
+/// [`open_candidate`]; this is what the round tallies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbeDrop {
-    /// The probe failed: a timeout, a failed dial, a dropped connection.
+enum OpenDrop {
+    /// The open failed: a timeout, a failed dial, a dropped connection, or
+    /// the open's ceiling.
     Unreachable,
-    /// The peer answered `has_blob: false`.
+    /// The peer refused the open and holds no block of the blob.
     Absent,
-    /// The peer shed the probe with `APP_ERR_RATE_LIMITED`.
+    /// The peer shed the open with `APP_ERR_RATE_LIMITED`.
     RateLimited,
-    /// The peer refused the probe's timestamp with `APP_ERR_TIMESTAMP_SKEW`.
+    /// The peer refused the open's timestamp with `APP_ERR_TIMESTAMP_SKEW`.
     TimestampRejected,
     /// The peer has no resolvable operator address, or its id does not decode.
     NoAddress,
-    /// The response failed shape, correlation or `slash_sig` recovery.
+    /// The answer failed verification: its shape, its echoed fields, its
+    /// `slash_sig` recovery, its size proof, or its coverage.
     Unverifiable,
-    /// The response's `has_blob` and coverage disagree.
-    Inconsistent,
+    /// The peer quoted above this node's `max_rate_per_mb`.
+    OverCeiling,
 }
 
-/// What the probe rounds of one discovery saw (#2366): the counts a
+/// What the discovery rounds of one miss saw (#2366): the counts a
 /// [`PullLegTrail`] records. Counts saturate at `u16::MAX`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct ProbeTally {
-    /// Peers skipped before probing: suppressed for the hash, or wedged.
+struct OpenTally {
+    /// Peers skipped before opening: suppressed for the hash, or wedged.
     skipped: u16,
-    /// Probes sent.
-    probed: u16,
-    /// Probes that failed.
+    /// Opens sent.
+    opened: u16,
+    /// Opens that failed.
     unreachable: u16,
-    /// Probes answered `has_blob: false`.
+    /// Opens refused by a peer that holds no block of the blob.
     absent: u16,
-    /// Probes dropped on this node's own policy.
+    /// Opens dropped on this node's own policy.
     dropped: u16,
     /// Candidates admitted.
     holders: u16,
@@ -1308,17 +1356,17 @@ struct ProbeTally {
     spans: bool,
 }
 
-impl ProbeTally {
-    /// Count one dropped probe under its arm.
-    const fn record(&mut self, drop: ProbeDrop) {
+impl OpenTally {
+    /// Count one dropped open under its arm.
+    const fn record(&mut self, drop: OpenDrop) {
         let slot = match drop {
-            ProbeDrop::Unreachable => &mut self.unreachable,
-            ProbeDrop::Absent => &mut self.absent,
-            ProbeDrop::RateLimited
-            | ProbeDrop::TimestampRejected
-            | ProbeDrop::NoAddress
-            | ProbeDrop::Unverifiable
-            | ProbeDrop::Inconsistent => &mut self.dropped,
+            OpenDrop::Unreachable => &mut self.unreachable,
+            OpenDrop::Absent => &mut self.absent,
+            OpenDrop::RateLimited
+            | OpenDrop::TimestampRejected
+            | OpenDrop::NoAddress
+            | OpenDrop::Unverifiable
+            | OpenDrop::OverCeiling => &mut self.dropped,
         };
         *slot = slot.saturating_add(1);
     }
@@ -1326,7 +1374,7 @@ impl ProbeTally {
     /// Copy the counts into `trail`.
     const fn fold_into(self, trail: &mut PullLegTrail) {
         trail.skipped = self.skipped;
-        trail.probed = self.probed;
+        trail.opened = self.opened;
         trail.unreachable = self.unreachable;
         trail.absent = self.absent;
         trail.dropped = self.dropped;
@@ -1340,31 +1388,152 @@ fn count_u16(len: usize) -> u16 {
     u16::try_from(len).unwrap_or(u16::MAX)
 }
 
-/// Probe up to `probe_fanout` providers for rate + RTT, build a [`Candidate`]
-/// for each that reports holding the blob, and rank them by the combined
-/// reputation-weighted selection score. `tally` receives what the rounds saw.
+/// What every discovery open of one miss asks for: the context its request
+/// carries, the namespace, and the span.
+#[derive(Clone)]
+pub(super) struct OpenSpec {
+    /// The miss's discovery context ([`discovery_ctx`]).
+    ctx: PoolContext,
+    /// The served client's namespace, big-endian.
+    namespace_id: [u8; 32],
+    /// `(byte_offset, byte_len)`, a `byte_len` of `0` running to the end.
+    span: (u64, u64),
+}
+
+impl OpenSpec {
+    /// Opens of `span` under `ctx`, for the namespace `namespace_id`.
+    pub(super) const fn new(ctx: PoolContext, namespace_id: [u8; 32], span: (u64, u64)) -> Self {
+        Self {
+            ctx,
+            namespace_id,
+            span,
+        }
+    }
+}
+
+/// The live streams of one miss's discovery: each holder's voucher-less open
+/// whose served answer is in hand, keyed by node id. A pull adopts its
+/// candidate's stream ([`Self::take`]) instead of opening the same range again.
+/// Every stream still held when this drops is cancelled, so the upstream
+/// releases its pin and its unadmitted slot at once.
+#[derive(Default)]
+pub(super) struct OpenStreams(HashMap<[u8; 32], decdn_client::OpenedStream>);
+
+impl OpenStreams {
+    /// Hold `stream`, the served open on `node_id`.
+    fn insert(&mut self, node_id: [u8; 32], stream: decdn_client::OpenedStream) {
+        if let Some(replaced) = self.0.insert(node_id, stream) {
+            replaced.cancel();
+        }
+    }
+
+    /// Take the served open on `node_id`, if one is held.
+    pub(super) fn take(&mut self, node_id: &[u8; 32]) -> HeldOpen {
+        HeldOpen(self.0.remove(node_id))
+    }
+
+    /// Cancel every stream still held.
+    pub(super) fn cancel_all(&mut self) {
+        for (_, stream) in self.0.drain() {
+            stream.cancel();
+        }
+    }
+}
+
+impl Drop for OpenStreams {
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
+/// One candidate's discovery stream, taken for its pull to adopt. A stream
+/// the pull does not adopt is cancelled when this drops.
+pub(super) struct HeldOpen(Option<decdn_client::OpenedStream>);
+
+impl HeldOpen {
+    /// Take the stream, leaving nothing to cancel.
+    pub(super) const fn take(&mut self) -> Option<decdn_client::OpenedStream> {
+        self.0.take()
+    }
+}
+
+impl Drop for HeldOpen {
+    fn drop(&mut self) {
+        if let Some(stream) = self.0.take() {
+            stream.cancel();
+        }
+    }
+}
+
+/// The context every discovery open of one miss sends: this node's buyer pool,
+/// its lane key and self-issued capability, and the ADR 005 client binding over
+/// this node's own `NodeId` (#1117). An open carries a pool and a verified
+/// binding like any stream. It pays nothing, so it names no provider: each
+/// candidate's pull pins its own lane later.
 ///
-/// Under [`ProbeGather::CoverageUnion`], a round whose holders cannot span the
-/// blob also probes the `attested` origins and the origin directory's
+/// Built once, before the fan-out. A failure ends the miss: no candidate can be
+/// opened without it. The `&str` names the failure on the pull-leg trail.
+async fn discovery_ctx(deps: &NodeOriginDeps) -> Result<PoolContext, (PullMiss, &'static str)> {
+    let ctx = match deps.buyer.discovery_ctx(POOL_OPEN_CALLER_BUDGET).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            let why = classify_pool_open_arm(&err).as_str();
+            return Err((record_pool_open_failure(deps, None, &err), why));
+        }
+    };
+    bind_upstream_ctx(deps, ctx).map_err(|err| {
+        // A binding is signed with the buyer key, so a failure is this node's
+        // own signer: metered and logged as the pull path's local faults are.
+        deps.metrics.node_pull_local_fault();
+        warn!(
+            error = %format_args!("{err:#}"),
+            "node-origin: LOCAL fault signing the discovery binding — this node cannot \
+             open any upstream"
+        );
+        (PullMiss::LocalFault, PullVerdict::OurLocalFault.as_str())
+    })
+}
+
+/// Open up to `open_fanout` providers with voucher-less `cdn/client/v1`
+/// streams of `spec`, build a [`Candidate`] for each that answers as a holder,
+/// and rank them by the combined reputation-weighted selection score. Returns
+/// the ranked candidates and the streams of those that served the span.
+/// `tally` receives what the rounds saw.
+///
+/// Under [`OpenGather::CoverageUnion`], a round whose holders cannot span the
+/// blob also opens the `attested` origins and the origin directory's
 /// candidates for `namespace_id` that the first round did not resolve (ADR 022
-/// §`FIND_VALUE` Flow, #2195). A DHT answer can
-/// hold only partial holders, and the ranged assembly needs a candidate set that
-/// covers every block. An origin past the first round's `probe_fanout` cut is
-/// probed here even when `providers` named it; an origin the first round skipped
-/// as suppressed or wedged is not asked again.
-async fn probe_and_rank(
+/// §`FIND_VALUE` Flow, #2195). A DHT answer can hold only partial holders, and
+/// the ranged assembly needs a candidate set that covers every block. An
+/// origin past the first round's `open_fanout` cut is opened here even when
+/// `providers` named it; an origin the first round skipped as suppressed or
+/// wedged is not asked again.
+#[allow(clippy::too_many_arguments)]
+async fn open_and_rank(
     deps: &NodeOriginDeps,
     providers: Vec<DhtNodeId>,
     attested: &[DhtNodeId],
     hash_bytes: [u8; 32],
-    gather: ProbeGather,
+    gather: OpenGather,
     namespace_id: U256,
-    tally: &mut ProbeTally,
-) -> Vec<Candidate> {
+    spec: &OpenSpec,
+    tally: &mut OpenTally,
+) -> (Vec<Candidate>, OpenStreams) {
     let target = DhtHash::from_bytes(hash_bytes);
     let mut candidates: Vec<Candidate> = Vec::new();
-    let resolved = probe_round(deps, &providers, hash_bytes, gather, &mut candidates, tally).await;
-    if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
+    let mut streams = OpenStreams::default();
+    let resolved = open_round(
+        deps,
+        &providers,
+        hash_bytes,
+        gather,
+        spec,
+        &mut candidates,
+        &mut streams,
+        tally,
+    )
+    .await;
+    if matches!(gather, OpenGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
         // The supplement can list the requester; the pull leg drops it from the
         // ranked list after this round.
         let directory = fallback_origins(deps, namespace_id, attested, None).await;
@@ -1381,11 +1550,21 @@ async fn probe_and_rank(
                 %namespace_id,
                 holders,
                 listed,
-                "node-origin: probed holders do not span the blob and the origin directory \
-                 adds no unprobed candidate"
+                "node-origin: discovered holders do not span the blob and the origin directory \
+                 adds no unopened candidate"
             );
         } else {
-            probe_round(deps, &origins, hash_bytes, gather, &mut candidates, tally).await;
+            open_round(
+                deps,
+                &origins,
+                hash_bytes,
+                gather,
+                spec,
+                &mut candidates,
+                &mut streams,
+                tally,
+            )
+            .await;
             debug!(
                 %hash,
                 %namespace_id,
@@ -1393,7 +1572,7 @@ async fn probe_and_rank(
                 origins = origins.len(),
                 admitted = candidates.len().saturating_sub(holders),
                 spans = coverage_spans(hash_bytes, &candidates),
-                "node-origin: probed holders did not span the blob; probed origin-directory \
+                "node-origin: discovered holders did not span the blob; opened origin-directory \
                  candidates"
             );
         }
@@ -1401,21 +1580,22 @@ async fn probe_and_rank(
     tally.holders = count_u16(candidates.len());
     tally.spans = coverage_spans(hash_bytes, &candidates);
     let ranked = rank(candidates);
-    // ADR 001 §Probe cache: retain the top 10 by selection score, so a repeat
-    // miss for this hash inside the TTL skips the lookup and the probe fanout.
-    // `insert` does the truncation; `ranked` is already in selection order,
-    // which is the ordering that claim depends on.
+    // ADR 001 §Candidate cache: retain the top 10 by selection score, so a
+    // repeat miss for this hash inside the TTL skips the lookup and the
+    // discovery fan-out. `insert` does the truncation; `ranked` is already in
+    // selection order, which is the ordering that claim depends on.
     //
-    // The triple plus the probe's UNSIGNED coverage is stored (#1506) — never
-    // the signed `ProbeResponse` (its `slash_sig` is another node's slashable
-    // statement, and #1165's "no evidence retention" is that this cache must not
-    // become an evidence locker; coverage carries no such author), and never
-    // `reputation`, which `cached_candidates` recomputes.
-    deps.probe_cache.insert(
+    // The triple plus the answer's UNSIGNED coverage and proven size is stored
+    // — never the signed `StreamResponse` (its `slash_sig` is another node's
+    // slashable statement, and #1165's "no evidence retention" is that this
+    // cache must not become an evidence locker; coverage and size carry no
+    // such author), and never `reputation`, which `cached_candidates`
+    // recomputes.
+    deps.candidate_cache.insert(
         target,
         ranked
             .iter()
-            .map(|c| ProbedProvider {
+            .map(|c| CachedCandidate {
                 node_id: DhtNodeId::from_bytes(c.node_id),
                 rate_per_mb: c.rate_per_mb,
                 rtt_ms: c.rtt_ms,
@@ -1424,42 +1604,46 @@ async fn probe_and_rank(
             })
             .collect(),
     );
-    ranked
+    (ranked, streams)
 }
 
-/// One concurrent probe round over `peers`, pushing each holder into
-/// `candidates` until `gather`'s stop condition holds or the round drains.
-/// Returns the peers the round resolved: those it probed, and those the
-/// negative-cache and wedged filters skipped. A peer past the `probe_fanout`
-/// cut is in neither, so a later round can probe it. `tally` counts the peers
-/// the filters skipped, the probes sent, and each probe that admitted no
-/// candidate; a probe still pending when the stop condition holds counts as
-/// sent and nothing else.
+/// One concurrent discovery round over `peers`, pushing each holder into
+/// `candidates`, and the stream of each holder that served the span into
+/// `streams`, until `gather`'s stop condition holds or the round drains.
+/// Returns the peers the round resolved: those it opened, and those the
+/// negative-cache and wedged filters skipped. A peer past the `open_fanout`
+/// cut is in neither, so a later round can open it. `tally` counts the peers
+/// the filters skipped, the opens sent, and each open that admitted no
+/// candidate; an open still pending when the stop condition holds counts as
+/// sent and nothing else, and is dropped unanswered.
 ///
-/// Under [`ProbeGather::CoverageUnion`] the stop condition counts the holders
+/// Under [`OpenGather::CoverageUnion`] the stop condition counts the holders
 /// already in `candidates`, so a second round stops as soon as its answers close
 /// the union the first round left open.
-async fn probe_round(
+#[allow(clippy::too_many_arguments)]
+async fn open_round(
     deps: &NodeOriginDeps,
     peers: &[DhtNodeId],
     hash_bytes: [u8; 32],
-    gather: ProbeGather,
+    gather: OpenGather,
+    spec: &OpenSpec,
     candidates: &mut Vec<Candidate>,
-    tally: &mut ProbeTally,
+    streams: &mut OpenStreams,
+    tally: &mut OpenTally,
 ) -> Vec<DhtNodeId> {
     use futures_util::stream::StreamExt;
     let mut union = CoverageUnionTracker::from_candidates(hash_bytes, candidates);
     let now_secs = crate::payment_settlement::unix_now();
     let target = DhtHash::from_bytes(hash_bytes);
-    // Probe candidates CONCURRENTLY so the probe phase is bounded by a single
-    // `PROBE_TIMEOUT` rather than `fanout × PROBE_TIMEOUT`: a few slow or
+    // Open candidates CONCURRENTLY so the discovery phase is bounded by a single
+    // `OPEN_CEILING` rather than `fanout × OPEN_CEILING`: a few slow or
     // unreachable peers must not burn the whole pull budget before a healthy
-    // provider is even tried. `probe_candidate`'s side effects (reputation
+    // provider is even tried. `open_candidate`'s side effects (reputation
     // record, negative-cache insert) are all behind locks, so concurrent runs
     // are safe; ranking afterwards makes result order irrelevant.
     //
-    // The collection window opens here: every probe, dial included, starts at once on
-    // the first poll.
+    // The collection window opens here: every open, dial included, starts at
+    // once on the first poll.
     let collection_started = Instant::now();
     let (unsuppressed, skipped): (Vec<DhtNodeId>, Vec<DhtNodeId>) = peers
         .iter()
@@ -1472,7 +1656,7 @@ async fn probe_round(
         // is (#1145 review). This is the one chokepoint every candidate passes through
         // regardless of how it was found.
         //
-        // Filtered BEFORE `take`, so a suppressed peer does not consume a probe-fanout
+        // Filtered BEFORE `take`, so a suppressed peer does not consume an open-fanout
         // slot that a viable provider could have used.
         // Also drop WEDGED providers, for ALL hashes until the suppression window elapses
         // (#1145 review): a provider whose voucher we just failed to pay on lane-terminal terms
@@ -1488,46 +1672,49 @@ async fn probe_round(
     tally.skipped = tally.skipped.saturating_add(count_u16(skipped.len()));
     let selected: Vec<DhtNodeId> = unsuppressed
         .into_iter()
-        .take(deps.config.probe_fanout)
+        .take(deps.config.open_fanout)
         .collect();
-    tally.probed = tally.probed.saturating_add(count_u16(selected.len()));
-    let mut probes: futures_util::stream::FuturesUnordered<_> = selected
+    tally.opened = tally.opened.saturating_add(count_u16(selected.len()));
+    let mut opens: futures_util::stream::FuturesUnordered<_> = selected
         .iter()
-        .map(|&peer| probe_candidate(deps, peer, hash_bytes))
+        .map(|&peer| open_candidate(deps, peer, hash_bytes, spec))
         .collect();
-    // A round that sends no probe has no collection window to record.
-    let sent_any = !probes.is_empty();
+    // A round that sends no open has no collection window to record.
+    let sent_any = !opens.is_empty();
     // Collect answers as they arrive and stop early once enough good candidates are in
-    // hand: waiting on `join_all` would pace the whole round to the SLOWEST probe — a dead
-    // peer that only resolves at its `PROBE_TIMEOUT` — even when the fastest few already
-    // answered. `PROBE_TIMEOUT` still bounds each probe, so a sparse round that never reaches
+    // hand: waiting on `join_all` would pace the whole round to the SLOWEST open — a dead
+    // peer that only resolves at its `OPEN_CEILING` — even when the fastest few already
+    // answered. `OPEN_CEILING` still bounds each open, so a sparse round that never reaches
     // the stop condition simply drains to the ceiling; a healthy round selects at the speed
     // of its fastest good answers.
     //
-    // The stop condition depends on `gather`: [`ProbeGather::EarlyExit`] stops at a fixed
-    // count of holders (single-source failover), while [`ProbeGather::CoverageUnion`] stops
+    // The stop condition depends on `gather`: [`OpenGather::EarlyExit`] stops at a fixed
+    // count of holders (single-source failover), while [`OpenGather::CoverageUnion`] stops
     // once the admitted holders' coverage union spans the blob (ranged assembly, #1506) — a
     // set of partial holders whose fastest answers all cover the same block must not stop
     // short of the holders that cover the rest.
-    while let Some(result) = probes.next().await {
-        let candidate = match result {
-            Ok(candidate) => candidate,
+    while let Some(result) = opens.next().await {
+        let (candidate, stream) = match result {
+            Ok(admitted) => admitted,
             Err(drop) => {
                 tally.record(drop);
                 continue;
             }
         };
+        if let Some(stream) = stream {
+            streams.insert(candidate.node_id, stream);
+        }
         let done = match gather {
-            ProbeGather::EarlyExit => {
+            OpenGather::EarlyExit => {
                 candidates.push(candidate);
-                candidates.len() >= PROBE_EARLY_EXIT_CANDIDATES
+                candidates.len() >= OPEN_EARLY_EXIT_CANDIDATES
             }
-            ProbeGather::CoverageUnion => {
+            OpenGather::CoverageUnion => {
                 // `union` also carries every holder an earlier round admitted.
                 union.add(&candidate);
                 candidates.push(candidate);
-                // With no holder-reported size this stays false and the round
-                // drains to the probe-fanout ceiling.
+                // With no proven size this stays false and the round drains
+                // to the open-fanout ceiling.
                 union.spans()
             }
         };
@@ -1535,34 +1722,36 @@ async fn probe_round(
             break;
         }
     }
-    // Cancel any probes still pending: the loop has enough (or the set is drained). Their
-    // reputation / negative-cache side effects simply do not run for peers we never needed.
-    drop(probes);
+    // Drop any open still pending: the loop has enough (or the set is drained). Their
+    // reputation / negative-cache side effects simply do not run for peers we never
+    // needed, and the upstream sees each such stream end unanswered.
+    drop(opens);
     if sent_any {
         deps.metrics
-            .probe_collection_latency(collection_started.elapsed());
+            .open_collection_latency(collection_started.elapsed());
     }
     let mut resolved = selected;
     resolved.extend(skipped);
     resolved
 }
 
-/// Read one probe's RTT as evidence about the peer's region claim.
+/// Read one discovery open's path RTT as evidence about the peer's region
+/// claim.
 ///
 /// ADR 030 canonical latency-vs-claim penalty: a peer that self-attests THIS
 /// node's own region yet answers slower than the latency ceiling is spoofing
 /// its region. A local-only signal — folded straight into the local EWMA — so
-/// it self-corrects as fast as we probe and needs no new protocol surface. An
+/// it self-corrects as fast as we open and needs no new protocol surface. An
 /// RTT with no direct path behind it (`direct == false`) can be the relay
 /// detour. It still counts as evidence, because the peer controls whether a
 /// direct path forms; the logs carry `direct` so an operator can tell a relay
 /// reading from a direct one.
-fn score_probe_latency(deps: &NodeOriginDeps, pk: PublicKey, region: &str, rtt: u32, direct: bool) {
+fn score_open_latency(deps: &NodeOriginDeps, pk: PublicKey, region: &str, rtt: u32, direct: bool) {
     if !direct {
         debug!(
             peer = %pk,
             rtt_ms = rtt,
-            "node-origin: probe RTT has no direct path behind it; ranking on the exchange RTT"
+            "node-origin: open RTT has no direct path behind it; ranking on the relay path's RTT"
         );
     }
     if region_latency_penalty_applies(deps.config.own_region.as_deref(), region, rtt) {
@@ -1576,7 +1765,7 @@ fn score_probe_latency(deps: &NodeOriginDeps, pk: PublicKey, region: &str, rtt: 
             rtt_ms = rtt,
             direct,
             ceiling_ms = REGION_LATENCY_MAX_MS,
-            "node-origin: same-region claim contradicted by probe latency; \
+            "node-origin: same-region claim contradicted by open latency; \
              applying ADR 030 latency penalty"
         );
         deps.metrics.node_region_latency_penalty();
@@ -1585,8 +1774,8 @@ fn score_probe_latency(deps: &NodeOriginDeps, pk: PublicKey, region: &str, rtt: 
 }
 
 /// `rank_candidates` reduced to the best-first `Candidate` list both pull paths
-/// consume. Shared by the cold path and the probe-cache-hit path so a change to
-/// what "ranked" means cannot apply to one and not the other.
+/// consume. Shared by the cold path and the candidate-cache-hit path so a change
+/// to what "ranked" means cannot apply to one and not the other.
 fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
     rank_candidates(candidates)
         .into_iter()
@@ -1594,60 +1783,128 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
         .collect()
 }
 
-/// Probe a single provider, returning a ranked-ready [`Candidate`], carrying
-/// the holder's reported blob size (`ProbeResponseExt.total_bytes`) as its
-/// [`Candidate::total_bytes_hint`], iff it responds, validates, and reports
-/// holding the blob; otherwise the [`ProbeDrop`] that says why not. Side
-/// effects: a failed probe scores the provider [`Outcome::Unreachable`],
-/// except a probe the provider shed with `APP_ERR_RATE_LIMITED`, which suppresses
-/// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986), and a
-/// probe the provider refused with `APP_ERR_TIMESTAMP_SKEW`, which suppresses
-/// the pair the same way, scores nothing and warns about the clock (throttled); a
-/// same-region claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
-/// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable-but-absent provider
-/// is recorded in the negative-probe cache.
-// Straight-line probe → classify → build; the tracing macros and the three
-// sequential drop-conditions inflate the cognitive-complexity metric past the
-// threshold (same inflation noted in `chain_staker_set`), and splitting the
-// validation further would obscure the flow rather than clarify it.
-#[allow(clippy::cognitive_complexity)]
-async fn probe_candidate(
+/// One discovery open of `spec` on `pk`, its answer's `slash_sig` recovering to
+/// the peer's operator address `provider_addr`, the whole open under
+/// [`OPEN_CEILING`]. A span the peer cannot serve as asked — past the blob's
+/// end, or refused `Declined` — is asked once more as the whole blob, so a
+/// holder of a shorter blob still answers as one. `None` when the ceiling
+/// elapsed.
+async fn discovery_answer(
+    deps: &NodeOriginDeps,
+    pk: PublicKey,
+    provider_addr: Address,
+    hash_bytes: [u8; 32],
+    spec: &OpenSpec,
+) -> Option<anyhow::Result<decdn_client::OpenedStream>> {
+    let target = EndpointAddr::new(pk);
+    let open = |span: (u64, u64)| {
+        decdn_client::discovery_open(
+            &deps.connections,
+            &target,
+            provider_addr,
+            &spec.ctx,
+            &deps.slash_domain,
+            hash_bytes,
+            spec.namespace_id,
+            span,
+            // A miss answers at once: discovery asks who holds the blob, and
+            // starts no upstream work on any peer.
+            false,
+            OPEN_TIMEOUT,
+        )
+    };
+    tokio::time::timeout(OPEN_CEILING, async {
+        let first = open(spec.span).await;
+        let declined = |opened: &decdn_client::OpenedStream| {
+            !opened.served() && opened.ext().error() == Some(&StreamError::Declined)
+        };
+        let ask_whole = spec.span != (0, 0)
+            && match &first {
+                Ok(opened) => declined(opened),
+                Err(err) => decdn_client::is_range_past_end(err),
+            };
+        if ask_whole {
+            if let Ok(opened) = first {
+                opened.cancel();
+            }
+            return open((0, 0)).await;
+        }
+        first
+    })
+    .await
+    .ok()
+}
+
+/// Open one provider for discovery: a voucher-less `cdn/client/v1` stream of
+/// `spec` that asks no upstream work of it. Returns a ranked-ready
+/// [`Candidate`], with the open's stream when it served the span, iff the peer
+/// answers as a holder: a served answer, which proves the blob size, or a
+/// `NotFound` that names the blocks the peer holds (a partial holder, with no
+/// stream and no proven size). Otherwise the [`OpenDrop`] that says why not.
+///
+/// The answer's signed `rate_per_mb` is the candidate's quote, and a quote
+/// above `max_rate_per_mb` excludes it. Its RTT is the connection's path RTT,
+/// never the time to the answer.
+///
+/// Side effects: a failed open scores the provider [`Outcome::Unreachable`],
+/// except an open the provider shed with `APP_ERR_RATE_LIMITED`, which
+/// suppresses the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing
+/// (#1986), an open the provider refused with `APP_ERR_TIMESTAMP_SKEW`, which
+/// suppresses the pair the same way, scores nothing and warns about the clock
+/// (throttled), and an open past its ceiling, which scores nothing because the
+/// ceiling also covers this node's own wait for a discovery slot; a same-region
+/// claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
+/// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable peer that holds no
+/// block is recorded in the negative cache.
+// Straight-line open → classify → build; the tracing macros and the sequential
+// drop conditions inflate the cognitive-complexity metric past the threshold
+// (same inflation noted in `chain_staker_set`), and splitting the classification
+// further would obscure the flow rather than clarify it.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+async fn open_candidate(
     deps: &NodeOriginDeps,
     peer: DhtNodeId,
     hash_bytes: [u8; 32],
-) -> Result<Candidate, ProbeDrop> {
+    spec: &OpenSpec,
+) -> Result<(Candidate, Option<decdn_client::OpenedStream>), OpenDrop> {
     let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
         // A staker-filtered routing entry should always decode; a failure
         // implies upstream state corruption — skip rather than panic.
-        return Err(ProbeDrop::NoAddress);
+        return Err(OpenDrop::NoAddress);
     };
-    let probe_ts = now_micros();
-    let (resp, resp_ext, probe_rtt) = match probe_once(
-        &deps.endpoint,
-        EndpointAddr::new(pk),
-        hash_bytes,
-        probe_ts,
-        PROBE_TIMEOUT,
-    )
-    .await
-    {
-        Ok(ok) => ok,
+    // The answer's `slash_sig` must recover to the peer's registered operator
+    // address (ADR 005 §Signer binding, ADR 014 §1). Selection reads the answer's
+    // quote and then PAYS the winner, so an unrecovered signature would let a
+    // node win on a rate it never committed to.
+    let Some(provider_addr) = deps.addr_resolver.address_of(&peer) else {
+        debug!("node-origin: discovered peer has no resolvable operator address; skipping");
+        return Err(OpenDrop::NoAddress);
+    };
+    let Some(answer) = discovery_answer(deps, pk, provider_addr, hash_bytes, spec).await else {
+        debug!(
+            peer = %pk,
+            ceiling = ?OPEN_CEILING,
+            "node-origin: discovery open passed its ceiling; dropping it unscored"
+        );
+        return Err(OpenDrop::Unreachable);
+    };
+    let opened = match answer {
+        Ok(opened) => opened,
         Err(err) => {
             // A `0x10` shed is the peer ANSWERING — "not now" — not the peer being
             // unreachable (#1986). It gets what a handler-level `NotFound` refusal
             // gets in `classify_refusal`: the pair is suppressed for the short TTL so
-            // a retry burst stops re-spending a probe slot on it, and no reputation
-            // outcome is recorded. A `global-full` shed skips the node's close ack-wait
-            // and can still arrive as a bare drop; that residue scores below.
+            // a retry burst stops re-spending an open slot on it, and no reputation
+            // outcome is recorded.
             if err.downcast_ref::<UpstreamRateLimited>().is_some() {
-                debug!(error = %err, "node-origin: probe shed by the upstream's rate limiter; suppressing briefly, not scoring");
+                debug!(error = %err, "node-origin: discovery open shed by the upstream's rate limiter; suppressing briefly, not scoring");
                 deps.metrics.node_upstream_rate_limited();
                 deps.negative_cache.record_failure_with_ttl(
                     peer,
                     DhtHash::from_bytes(hash_bytes),
                     REFUSAL_SUPPRESSION_TTL,
                 );
-                return Err(ProbeDrop::RateLimited);
+                return Err(OpenDrop::RateLimited);
             }
             // A `0x04` refusal is the peer answering too: it refused this node's
             // timestamp. The usual cause is this node's clock, which makes every
@@ -1660,75 +1917,74 @@ async fn probe_candidate(
                     &deps.negative_cache,
                     pk,
                     hash_bytes,
-                    "probe",
+                    "open",
                     &err,
                 );
-                return Err(ProbeDrop::TimestampRejected);
+                return Err(OpenDrop::TimestampRejected);
             }
-            // A failed probe is a reachability signal: the upstream could not be
+            // An answer that does not verify (shape, echoed fields, `slash_sig`
+            // recovery, size proof, coverage) is requester-local policy, never an
+            // attributable fault: dropped without a reputation event, because a
+            // signature that does not recover attributes nothing to anyone (ADR 008).
+            if err
+                .downcast_ref::<decdn_client::UnverifiedAnswer>()
+                .is_some()
+            {
+                debug!(error = %format_args!("{err:#}"), "node-origin: dropping an unverifiable discovery answer");
+                return Err(OpenDrop::Unverifiable);
+            }
+            // A failed open is a reachability signal: the upstream could not be
             // reached for this interaction (ADR 008 §Local Score).
             debug!(
                 peer = %pk,
-                provider_addr = ?deps.addr_resolver.address_of(&peer),
-                error = %err,
-                "node-origin: probe failed; scoring provider unreachable"
+                %provider_addr,
+                error = %format_args!("{err:#}"),
+                "node-origin: discovery open failed; scoring provider unreachable"
             );
             record_outcome(deps, pk, &Outcome::Unreachable);
-            return Err(ProbeDrop::Unreachable);
+            return Err(OpenDrop::Unreachable);
         }
     };
-    // Shape, echoed-field correlation, and `slash_sig` recovery to the peer's
-    // registered operator address (ADR 005 §Signer binding, ADR 014 §1). Selection
-    // reads `has_blob` and `rate_per_mb` off this response and then PAYS the winner,
-    // so an unrecovered signature would let a node win on a rate it never committed
-    // to — and leave nothing to slash when it declines to honour it.
-    //
-    // A failure is requester-local policy, never an attributable fault: dropped
-    // without a reputation event, exactly as for a timeout, because a signature that
-    // does not recover attributes nothing to anyone (ADR 008).
-    let Some(provider_addr) = deps.addr_resolver.address_of(&peer) else {
-        debug!("node-origin: probed peer has no resolvable operator address; skipping");
-        return Err(ProbeDrop::NoAddress);
-    };
-    if let Err(err) = decdn_client::probe::verify_probe_response(
-        &resp,
-        provider_addr,
-        &deps.slash_domain,
-        hash_bytes,
-        probe_ts,
-    ) {
-        debug!(error = %err, "node-origin: dropping an unverifiable probe response");
-        return Err(ProbeDrop::Unverifiable);
+    let served = opened.served();
+    if !served && opened.coverage().is_empty() {
+        // Reachable but holds no block. A `NotFound` is the peer having just
+        // looked, so it suppresses the pair for the cache-wide TTL; so does a
+        // `Declined`, which says "stop asking". Not a reputation event: no
+        // delivery was attempted. Any other refusal is about this node's own
+        // funding and suppresses nothing.
+        let error = opened.ext().error().cloned();
+        opened.cancel();
+        if matches!(error, Some(StreamError::NotFound | StreamError::Declined)) {
+            deps.negative_cache
+                .record_failure(peer, DhtHash::from_bytes(hash_bytes));
+        }
+        return Err(OpenDrop::Absent);
     }
-    // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
-    // construction on an honest responder, except for the empty root, whose
-    // coverage is empty either way (#2471). `coverage` is not in the signed
-    // set, so this mismatch has no attributable author to slash (same
-    // reasoning as an unrecovered `slash_sig` above), and a violation is
-    // dropped rather than scored to reputation.
-    if !resp_ext.consistent_with(&resp.body) {
-        debug!(
-            has_blob = resp.body.has_blob,
-            "node-origin: dropping a probe response with has_blob/coverage mismatch"
+    let rate_per_mb = opened.rate_per_mb();
+    let max_rate = deps.config.max_rate_per_mb;
+    if max_rate > 0 && rate_per_mb > max_rate {
+        // Above this node's configured ceiling, so no pull to it could pay. The
+        // quote is durable for this (peer, hash) — asking again gets the same
+        // rate — so the pair is suppressed briefly, as a pull's `RateCeiling`
+        // is. Reputation-neutral: the ceiling is our policy.
+        opened.cancel();
+        deps.metrics.node_pull_rate_above_ceiling();
+        deps.negative_cache.record_failure_with_ttl(
+            peer,
+            DhtHash::from_bytes(hash_bytes),
+            REFUSAL_SUPPRESSION_TTL,
         );
-        return Err(ProbeDrop::Inconsistent);
+        debug!(%provider_addr, rate_per_mb, max_rate, "node-origin: discovered holder quotes above max_rate_per_mb; excluding it");
+        return Err(OpenDrop::OverCeiling);
     }
-    // A stated size is a fact only with its proof (ADR 005 § Bounded byte
-    // ranges). A size with no valid proof is the holder's fault: drop
-    // the answer before the size can size a coverage union or a pull leg.
-    if let Err(e) = probe_size_proven(hash_bytes, &resp_ext) {
-        debug!(error = %e, "node-origin: dropping a probe response with an unproven size");
-        return Err(ProbeDrop::Inconsistent);
-    }
-    if !resp.body.has_blob {
-        // Reachable but does not hold the blob — not a reputation event (no
-        // delivery attempted); cache the negative so the next lookup for this
-        // hash skips it within the TTL.
-        deps.negative_cache
-            .record_failure(peer, DhtHash::from_bytes(hash_bytes));
-        return Err(ProbeDrop::Absent);
-    }
-    let rtt = ms_to_u32(probe_rtt.ms);
+    let Some((rtt_ms, direct)) = opened.rtt() else {
+        // The connection closed before its path RTT could be read: there is
+        // no path to rank, and nothing to pull on.
+        opened.cancel();
+        debug!(peer = %pk, "node-origin: discovered holder has no open path; dropping it unscored");
+        return Err(OpenDrop::Unreachable);
+    };
+    let rtt = ms_to_u32(rtt_ms);
     // Peer's self-attested region (ADR 030), resolved from the on-chain
     // `CapacityBond` registry projection; empty when the registry has no
     // region hint for this peer.
@@ -1737,14 +1993,14 @@ async fn probe_candidate(
         DhtNodeId::from_bytes(*peer.as_bytes()),
     )
     .unwrap_or_default();
-    score_probe_latency(deps, pk, &region, rtt, probe_rtt.direct);
-    Ok(Candidate {
+    score_open_latency(deps, pk, &region, rtt, direct);
+    let candidate = Candidate {
         node_id: *peer.as_bytes(),
-        rate_per_mb: resp.body.rate_per_mb,
+        rate_per_mb,
         rtt_ms: rtt,
         reputation: peer_reputation(deps, pk),
         // Drives the geo-diversity tie-break tier (selection.rs) and the
-        // latency-vs-claim penalty in `score_probe_latency`.
+        // latency-vs-claim penalty in `score_open_latency`.
         region,
         // No on-chain stake lookup is wired yet (#1470 / ADR 019). `0` is a
         // placeholder here, not an observation — which is exactly why tier 2 is
@@ -1752,63 +2008,53 @@ async fn probe_candidate(
         // must be resolved here (retry, or drop the candidate) rather than
         // passed through as `0`; see `Candidate::stake`.
         stake: 0,
-        // The fresh, probe-confirmed coverage (#1506) — never the stale DHT
-        // hint `discover` drops. The `consistent_with` check above already
-        // guarantees this is non-empty whenever `has_blob` is true (the only
-        // way execution reaches here), except for the empty root: its zero
-        // blocks leave the coverage empty on a holder too (#2471).
-        coverage: resp_ext.coverage,
-        // The holder's blob size, proven above. The coverage-union gather
+        // The fresh, open-confirmed coverage (#1506) — never the stale DHT
+        // hint `discover` drops. The open verified it against the signed `ok`:
+        // a served answer covers the span, and a partial holder's refusal names
+        // blocks that do not.
+        coverage: opened.coverage().clone(),
+        // The blob size a served answer proved. The coverage-union gather
         // (#1506) reads it to know how many discovery blocks the union must
-        // span, and the pull leg cuts its first upstream open from it.
-        total_bytes_hint: resp_ext
-            .size_proof
-            .as_ref()
-            .map(decdn_protocol::SizeProof::size),
-    })
+        // span, and the pull leg cuts its first upstream open from it. A
+        // refusal proves no size.
+        total_bytes_hint: opened.proven_size().map(decdn_client::ProvenSize::get),
+    };
+    if served {
+        Ok((candidate, Some(opened)))
+    } else {
+        // A partial holder: its blocks are in hand, and its pull opens its own
+        // ranges asking it to fill what it lacks.
+        opened.cancel();
+        Ok((candidate, None))
+    }
 }
 
-/// Whether a probe answer's size, when it states one, is proven for `hash`
-/// (ADR 005 § Bounded byte ranges). An answer that states no size
-/// passes.
-///
-/// # Errors
-///
-/// [`decdn_client::UnprovenSize`] when the answer states a size with no
-/// valid proof.
-pub(super) fn probe_size_proven(
-    hash: [u8; 32],
-    ext: &decdn_protocol::ProbeResponseExt,
-) -> Result<(), decdn_client::UnprovenSize> {
-    ext.size_proof.as_ref().map_or(Ok(()), |proof| {
-        decdn_client::check_size_proof(hash, proof).map(drop)
-    })
-}
-
-/// Rebuild ranked [`Candidate`]s from a probe-cache hit (ADR 001 §Probe cache).
+/// Rebuild ranked [`Candidate`]s from a candidate-cache hit (ADR 001 §Candidate
+/// cache).
 ///
 /// `None` means "no usable cached candidate", covering three cases the caller has
 /// no reason to distinguish: no entry, an expired entry, and an entry whose every
-/// provider is currently suppressed. All three cost a fresh lookup + probe and all
-/// three count as `probe_cache_miss` — a hit that saves no network work is not a
-/// hit in any sense a dashboard cares about. The ranged pull leg treats a
-/// returned list whose coverage does not span the blob the same way (#2195): it
-/// cannot complete the ranged assembly, so it costs the same fresh lookup.
+/// provider is currently suppressed. All three cost a fresh lookup and discovery
+/// and all three count as `candidate_cache_miss` — a hit that saves no network
+/// work is not a hit in any sense a dashboard cares about. The ranged pull leg
+/// treats a returned list whose coverage does not span the blob the same way
+/// (#2195): it cannot complete the ranged assembly, so it costs the same fresh
+/// lookup.
 ///
-/// The cache stores the ADR triple plus the probe's unsigned `Coverage`. `reputation`
-/// and `region` are rebuilt here, FRESH, and the result re-ranked. That is what ADR
-/// 001's "goes straight to selection" means: skip discovery and probing — not skip
-/// the selection algorithm. Caching a `Candidate` whole would have been less code and would have
-/// frozen `reputation` for the TTL, letting a node that failed three pulls in
-/// the meantime keep the rank it earned before them; the fields we decline to
-/// cache are the ones that MOVE.
+/// The cache stores the ADR triple plus the answer's unsigned `Coverage` and
+/// proven size. `reputation` and `region` are rebuilt here, FRESH, and the
+/// result re-ranked. That is what ADR 001's "goes straight to selection" means:
+/// skip discovery — not skip the selection algorithm. Caching a `Candidate`
+/// whole would have been less code and would have frozen `reputation` for the
+/// TTL, letting a node that failed three pulls in the meantime keep the rank it
+/// earned before them; the fields we decline to cache are the ones that MOVE.
 async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec<Candidate>> {
-    let providers = deps.probe_cache.get(&target)?;
+    let providers = deps.candidate_cache.get(&target)?;
     let now_secs = crate::payment_settlement::unix_now();
     let mut candidates = Vec::with_capacity(providers.len());
     for provider in providers {
         // An entry can be stale INSIDE its own TTL, so the same two filters
-        // `probe_and_rank` applies are applied here — this is the other
+        // `open_round` applies are applied here — this is the other
         // chokepoint every candidate passes through. A pull-time refusal recorded
         // a negative for this exact (peer, hash) seconds ago
         // (`classify_pull_failure`), and a wedged provider is out of ranking for ANY hash.
@@ -1819,7 +2065,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
         {
             continue;
         }
-        // ADR 001 §Probe cache: "verify the selected node_id is still active in
+        // ADR 001 §Candidate cache: "verify the selected node_id is still active in
         // the local registry cache" before opening `cdn/client/v1`. The cold path
         // applies this inside `find_providers` (`filter_active_stakers`); the hit
         // path bypasses `find_providers`, so re-apply it here. `addr_resolver` is
@@ -1836,7 +2082,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             continue;
         }
         let Ok(pk) = PublicKey::from_bytes(provider.node_id.as_bytes()) else {
-            // Matches `probe_candidate`: a key that does not decode implies
+            // Matches `open_candidate`: a key that does not decode implies
             // upstream state corruption — skip rather than panic.
             continue;
         };
@@ -1844,11 +2090,11 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             crate::dht::capacity_bond_registry::region_of(&deps.registry_regions, provider.node_id)
                 .unwrap_or_default();
         // Deliberately NOT re-running the ADR 030 region-latency penalty here,
-        // unlike `probe_candidate`. That penalty reads a probe's `rtt` as EVIDENCE
+        // unlike `open_candidate`. That penalty reads an open's `rtt` as EVIDENCE
         // against a self-attested region claim, and we already scored this rtt
-        // once — at probe time, when it was evidence. A cache hit performs no
-        // probe and produces no new evidence, so re-recording would charge one
-        // probe's latency to the peer again on every hit inside the TTL: an EWMA
+        // once — at open time, when it was evidence. A cache hit performs no
+        // open and produces no new evidence, so re-recording would charge one
+        // open's latency to the peer again on every hit inside the TTL: an EWMA
         // beaten down by a single stale sample replayed as many times as the
         // blob happens to be requested. Popularity is not guilt.
         candidates.push(Candidate {
@@ -1857,14 +2103,14 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             rtt_ms: provider.rtt_ms,
             reputation: peer_reputation(deps, pk),
             region,
-            // See `probe_candidate` above: `0` is a placeholder, not a lookup.
+            // See `open_candidate` above: `0` is a placeholder, not a lookup.
             stake: 0,
-            // The probe's UNSIGNED coverage, stored in the cache entry alongside
-            // the ADR 001 triple (#1506). ≤15s fresh (the entry's TTL), so a
-            // cache-hit candidate is range-planned against a real holder's
-            // blocks rather than reading as covering nothing. This is not the
-            // evidence-retention the cache's module doc forbids — coverage is
-            // outside the `slash_sig` set and has no author to slash.
+            // The answer's UNSIGNED coverage, stored in the cache entry alongside
+            // the ADR 001 triple (#1506). At most one TTL old, so a cache-hit
+            // candidate is range-planned against a real holder's blocks rather
+            // than reading as covering nothing. This is not the evidence-retention
+            // the cache's module doc forbids — coverage is outside the
+            // `slash_sig` set and has no author to slash.
             coverage: provider.coverage.clone(),
             total_bytes_hint: provider.total_bytes_hint,
         });
@@ -1879,7 +2125,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
 ///
 /// The `attempts` count is the load-bearing half (#1165). [`MAX_PROVIDER_ATTEMPTS`]
 /// is a budget for the whole FETCH, not for each list, and a fetch that hits the
-/// probe cache walks two lists: the cached providers, then — if they all fail — a
+/// candidate cache walks two lists: the cached providers, then — if they all fail — a
 /// freshly discovered one. Handing each list its own [`MAX_PROVIDER_ATTEMPTS`]
 /// would double the worst case to six sequential pulls, silently blowing through
 /// [`crate::selection::outer_pull_deadline`], which budgets for exactly three
@@ -2060,10 +2306,10 @@ enum EconGate {
     /// only failures were economic answers `NotFound` — distinct from a clean
     /// no-provider miss for observability, identical on the wire.
     Skip,
-    /// The candidate is buyable. `rate_ceiling` is the effective per-MB ceiling to
-    /// enforce on the stream (the lower of the candidate's probe rate, the static
-    /// `max_rate_per_mb`, and — under the `margin` policy — the economic buy cap, so
-    /// a bait-and-switch above the cap aborts mid-pull). `speculative` is true when
+    /// The candidate is buyable. `rate_ceiling` is the per-MB ceiling to enforce
+    /// on the stream (the lower of the static `max_rate_per_mb` and — under the
+    /// `margin` policy — the economic buy cap, so a stream quote above the cap is
+    /// refused before paying). `speculative` is true when
     /// the quote sits above the amortized profit-guaranteed floor: a successful pull
     /// then debits the source's warming allowance by the full buy cost.
     Allow {
@@ -2078,7 +2324,7 @@ enum EconGate {
 ///
 /// `source` is the candidate's node id — the warming-allowance key. `heat` is the
 /// ADR 040 frequency estimate for the hash, computed once per miss. `candidate_rate`
-/// is the probe-advertised per-MB rate.
+/// is the per-MB rate the candidate signed on its discovery open's answer.
 ///
 /// With `OffPolicy` (no economic gate) the only bound is the static
 /// `max_rate_per_mb`, and no allowance is touched (never speculative). Under
@@ -2132,7 +2378,7 @@ fn economic_ceiling(
     match ceiling {
         // No economic gate: only the static ceiling applies, no allowance interaction.
         None => EconGate::Allow {
-            rate_ceiling: effective_rate_ceiling(candidate_rate, deps.config.max_rate_per_mb),
+            rate_ceiling: deps.config.max_rate_per_mb,
             speculative: false,
         },
         Some(max_buy) if candidate_rate > max_buy => {
@@ -2153,12 +2399,11 @@ fn economic_ceiling(
             EconGate::Skip
         }
         Some(max_buy) => {
-            // Fold `max_buy` into the pull-commit ceiling so a bait-and-switch above
-            // the cap aborts mid-pull, then take the lower of that and the quote.
-            let bound = effective_rate_ceiling(deps.config.max_rate_per_mb, max_buy);
+            // Fold `max_buy` into the pull-commit ceiling, so a later stream that
+            // quotes above the cap is refused before paying.
             let speculative = candidate_rate > amortized_floor.unwrap_or(candidate_rate);
             EconGate::Allow {
-                rate_ceiling: effective_rate_ceiling(candidate_rate, bound),
+                rate_ceiling: lower_rate_ceiling(deps.config.max_rate_per_mb, max_buy),
                 speculative,
             }
         }
@@ -2187,6 +2432,12 @@ fn heat_of(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> u32 {
 /// fault). `budget` is the fetch-wide [`MAX_PROVIDER_ATTEMPTS`] remainder rather
 /// than the constant itself (see [`PullOutcome`]). Every verified byte counts
 /// toward the fill's funding recovery `gate`.
+///
+/// The first candidate the walk tries adopts its discovery stream from
+/// `streams` as its pull's first leg, when it has one. Every other stream is
+/// cancelled before that pull starts: a whole-blob pull can run long, and an
+/// upstream holds an unpaid stream's blob pinned until the stream ends. A later
+/// candidate opens its own stream.
 async fn try_pull(
     deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
     deps: &NodeOriginDeps,
@@ -2194,13 +2445,16 @@ async fn try_pull(
     hash_bytes: [u8; 32],
     budget: usize,
     gate: &Arc<RecoveryGate>,
+    streams: &mut OpenStreams,
 ) -> PullOutcome<()> {
     let mut attempts = 0;
     let mut miss = PullMiss::Clean;
     let mut unfunded = Vec::new();
     for candidate in ranked.iter().take(budget) {
         attempts += 1;
-        match pull_from_candidate(deps_lock, deps, candidate, hash_bytes, gate).await {
+        let stream = streams.take(&candidate.node_id);
+        streams.cancel_all();
+        match pull_from_candidate(deps_lock, deps, candidate, hash_bytes, gate, stream).await {
             Ok(()) => {
                 return PullOutcome {
                     payload: Ok(()),
@@ -2254,7 +2508,16 @@ async fn recover_unfunded(
                 Err(end) => return miss_answer(miss.or(end)),
             }
         }
-        let outcome = try_pull(deps_lock, deps, &unfunded, hash_bytes, unfunded.len(), gate).await;
+        let outcome = try_pull(
+            deps_lock,
+            deps,
+            &unfunded,
+            hash_bytes,
+            unfunded.len(),
+            gate,
+            &mut OpenStreams::default(),
+        )
+        .await;
         match outcome.payload {
             Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
             Err(failed) => miss = miss.or(failed),
@@ -2412,6 +2675,7 @@ async fn pull_from_candidate(
     candidate: &Candidate,
     hash_bytes: [u8; 32],
     gate: &Arc<RecoveryGate>,
+    stream: HeldOpen,
 ) -> Result<(), PullMiss> {
     let span = tracing::info_span!(
         "upstream_stream",
@@ -2424,9 +2688,11 @@ async fn pull_from_candidate(
         outcome = tracing::field::Empty,
     );
     let opened = AtomicBool::new(false);
-    let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes, &opened, gate)
-        .instrument(span.clone())
-        .await;
+    let result = pull_from_candidate_in_span(
+        deps_lock, deps, candidate, hash_bytes, &opened, gate, stream,
+    )
+    .instrument(span.clone())
+    .await;
     // Only a candidate the pull opened a stream to has a stream outcome; one
     // skipped before that (no address, above the buy ceiling, a pool-open
     // failure) is not a failed stream.
@@ -2456,6 +2722,7 @@ async fn pull_from_candidate_in_span(
     hash_bytes: [u8; 32],
     opened: &AtomicBool,
     gate: &Arc<RecoveryGate>,
+    mut stream: HeldOpen,
 ) -> Result<(), PullMiss> {
     let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
         return Err(PullMiss::Clean);
@@ -2492,7 +2759,7 @@ async fn pull_from_candidate_in_span(
             // provider's fault — don't tar its reputation; just try the next.
             // Whether it is also a fault that must change our WIRE answer is a
             // per-reason question the classifier owns (#1560).
-            return Err(record_pool_open_failure(deps, provider_addr, &err));
+            return Err(record_pool_open_failure(deps, Some(provider_addr), &err));
         }
     };
     // #1117: bind the request so the upstream can chain a reactive pull.
@@ -2552,22 +2819,24 @@ async fn pull_from_candidate_in_span(
     // link speed.
     //
     // The FOREGROUND serve path is still bounded — the delivery handler wraps the
-    // whole `discover → probe → rank → pull` in `outer_pull_deadline`, so a client
+    // whole `discover → open → rank → pull` in `outer_pull_deadline`, so a client
     // never waits longer than that; on expiry it gets a clean miss and nothing
     // continues (#1610 removed the detached warm). So "no hard cap here" does not mean
     // "a client can wait forever".
     let _stream_guard = deps.metrics.outbound_stream_guard();
     opened.store(true, Ordering::Relaxed);
 
-    // Header handshake: a whole-tail open to read the committed `total_bytes`.
-    // The drive below pulls the whole blob, so when this node holds none of it the
-    // drive's first leg is this same open, and it adopts the pull (#2063) rather
-    // than the upstream serving a throwaway open and then the same range again.
-    // `NO_NAMESPACE`, as this hash-only populate path carries no served-client
-    // namespace. `rate_ceiling` folds the ADR 041 buy cap in (computed above with
-    // the skip decision). It opens a stream on the node's shared connection to
-    // the upstream, whose driver runs on the main runtime and outlives the pull
-    // thread that adopts the pull.
+    // Header handshake: a whole-blob pull whose header carries the committed
+    // `total_bytes`. The drive below pulls the whole blob, so when this node holds
+    // none of it the drive's first leg is this same pull, and it adopts the pull
+    // (#2063) rather than the upstream serving a throwaway open and then the same
+    // range again. The candidate's discovery stream, when it served the whole
+    // blob, is that pull: it is adopted on this lane, and no second stream opens.
+    // Otherwise the handshake opens one. `NO_NAMESPACE`, as this hash-only
+    // populate path carries no served-client namespace. `rate_ceiling` folds the
+    // ADR 041 buy cap in (computed above with the skip decision). Either stream
+    // runs on the node's shared connection to the upstream, whose driver runs on
+    // the main runtime and outlives the pull thread that adopts the pull.
     let handshake_source = PeerSource::new(
         &deps.endpoint,
         EndpointAddr::new(pk),
@@ -2581,8 +2850,26 @@ async fn pull_from_candidate_in_span(
         deadlines,
         Some(deps.connections.clone()),
     );
+    let adoptable = match stream.take() {
+        Some(discovered) if handshake_source.can_adopt(&discovered) => Some(discovered),
+        Some(discovered) => {
+            discovered.cancel();
+            None
+        }
+        None => None,
+    };
+    // The drive adopts the pull only while it is fresh: an adopted stream is as
+    // old as its answer.
+    let answered_at = adoptable
+        .as_ref()
+        .map(decdn_client::OpenedStream::answered_at);
     let handshake = timed_open(
-        handshake_source.open_whole(hash_bytes),
+        async {
+            match adoptable {
+                Some(discovered) => handshake_source.adopt_reader(discovered),
+                None => handshake_source.open_whole(hash_bytes).await,
+            }
+        },
         Arc::clone(&deps.metrics),
     );
     let (header, whole) = match handshake.await {
@@ -2603,9 +2890,10 @@ async fn pull_from_candidate_in_span(
             ));
         }
     };
-    // The drive adopts the pull only while it is fresh, measured from here: the
-    // thread and runtime below start before the drive's first open.
-    let opened_at = tokio::time::Instant::now();
+    // The drive adopts the pull only while it is fresh, measured from the
+    // answer of an adopted discovery stream, else from here: the thread and
+    // runtime below start before the drive's first open.
+    let opened_at = answered_at.unwrap_or_else(tokio::time::Instant::now);
     let total_bytes = header.total_bytes;
 
     // Run `drive()` on a dedicated blocking-pool thread with its own current-thread
@@ -2960,8 +3248,9 @@ enum RefusalVerdict {
 /// peer, or that we expect to pass on its own ([`RefusalVerdict::Transient`]).
 ///
 /// Much shorter than the negative cache's own TTL (5 min), and the asymmetry is the
-/// point. A probe's `has_blob: false` is an authoritative statement about content the
-/// peer just checked. A `NotFound` *refusal* is not: `ServeRejectReason::wire_error`
+/// point. A discovery open's `NotFound` with no held block is an authoritative
+/// statement about content the peer just checked. A `NotFound` refusal of a paid
+/// pull is not: `ServeRejectReason::wire_error`
 /// deliberately collapses several reject reasons onto the wire `NotFound` so that a probing
 /// client cannot map out other clients' remaining pool balances — and some of them are ours
 /// or transient: our signer's live floor at its cap on that peer, an `UnknownLane` or an
@@ -2979,7 +3268,10 @@ enum RefusalVerdict {
 /// clears. The assembly may wait and ask the same peer again. It suppresses the
 /// pair only when the peer refuses past the wait budget
 /// ([`record_backpressure_exhausted`]).
-const REFUSAL_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
+///
+/// It is the candidate cache's TTL ([`crate::dht::DISCOVERY_ANSWER_TTL`]), so a
+/// peer's positive and negative answers age on one clock.
+const REFUSAL_SUPPRESSION_TTL: Duration = crate::dht::DISCOVERY_ANSWER_TTL;
 
 // `match_same_arms`: `NotFound` and `Unfunded` both map to `Transient`, but for
 // different reasons; each arm carries its own reasoning, so keep them apart.
@@ -3027,16 +3319,12 @@ enum PullVerdict {
     /// be fine for other nodes with a wider cap. The peer's `total_bytes` claim
     /// never triggers this; only bytes received and stored do.
     Oversize,
-    /// The provider quoted a per-MB rate above the buyer's effective ceiling — the lower
-    /// of its own probe rate and our configured absolute cap (#1375). We refused before
-    /// paying; the signed over-quote is retained on the `RateAboveCeiling` error for a
-    /// caller to replay to `SlashJudge`, but this node does not auto-submit a challenge
-    /// (deferred). Reputation-neutral, and metered + suppressed: an over-*config* quote is
-    /// our tight policy, not proof the provider is bad; an over-*probe* quote is a possible
-    /// bait-and-switch we do not adjudicate here (and it is only slashable when the probe
-    /// bound, not the config bound, was exceeded). Either way the rate is durable for this
-    /// (peer, hash) — re-probing gets the same quote — so we suppress the pair (like
-    /// [`Self::OurDeadline`]) rather than tar the peer, and count it (like
+    /// The provider quoted a per-MB rate above the buyer's ceiling — our configured
+    /// absolute cap, folded with the serve-economics buy cap under the `margin` policy
+    /// (#1375). We refused before paying. Reputation-neutral, and metered + suppressed:
+    /// the ceiling is our policy, not proof the provider is bad. The rate is durable for
+    /// this (peer, hash) — asking again gets the same quote — so we suppress the pair
+    /// (like [`Self::OurDeadline`]) rather than tar the peer, and count it (like
     /// [`Self::Oversize`], which meters but does not suppress).
     RateCeiling,
     /// OUR deadline fired: a possibly mis-sized local budget, not evidence about the peer.
@@ -3140,7 +3428,7 @@ impl PullVerdict {
 ///   only this provider. Two suppressions cover it: a short per-`(peer, hash)` negative-cache
 ///   entry ([`REFUSAL_SUPPRESSION_TTL`]) for the immediate same-blob retry, and a
 ///   provider-wide entry in `wedged_providers` keyed by the peer and held for
-///   [`WEDGED_PROVIDER_SUPPRESSION_SECS`], so `probe_and_rank` drops the provider from
+///   [`WEDGED_PROVIDER_SUPPRESSION_SECS`], so `open_and_rank` drops the provider from
 ///   ranking for every hash until then. The pool has no per-provider deadline to key the
 ///   horizon on — the shared deposit fans out across every provider — so the window is fixed.
 /// - **Score nothing.** The peer behaved correctly; our accounting is what broke.
@@ -3310,7 +3598,7 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     // that is a statement by the peer rather than an absence of one (#1986). Left to the
     // residual it scores `Unreachable` for exactly the condition a handler-level
     // load-shed `NotFound` is exonerated for, and a `global-full` shed scores every
-    // concurrent prober at once.
+    // concurrent requester at once.
     if err.downcast_ref::<UpstreamRateLimited>().is_some() {
         return PullVerdict::RateLimited;
     }
@@ -3391,10 +3679,14 @@ fn is_local_store_fault(err: &anyhow::Error) -> bool {
 /// handshake, or a ranged run — and return its verdict, or `None` when `err` is
 /// not backpressure (#2178).
 ///
-/// Backpressure is an open-stage refusal that usually clears with time: a
-/// transport rate-limit ([`PullVerdict::RateLimited`]), or a signed `NotFound`
-/// answer to the stream open. The leg goes only to a source whose
-/// probe advertised the blob, so a `NotFound` from it is rarely an honest miss. It
+/// Backpressure is a refusal to admit a stream that usually clears with time: a
+/// transport rate-limit ([`PullVerdict::RateLimited`]), or a `NotFound` before
+/// any delivered byte. That `NotFound` is the signed answer to the stream open, or
+/// the frame that answers the stream's first proof: an upstream admits a stream
+/// it serves at once (a hit, a covering partial, its own origin) only at that
+/// proof, and its load shed and per-signer cap refuse there
+/// ([`UpstreamRefused::before_delivery`]). The leg goes only to a source whose
+/// discovery answer named the blob, so a `NotFound` from it is rarely an honest miss. It
 /// is one of the refusals the seller's `ServeRejectReason::wire_error` collapses
 /// onto `NotFound`, and the common ones are a load shed and the seller's
 /// pull-loop guard while its own upstream open for the blob is in progress
@@ -3403,10 +3695,9 @@ fn is_local_store_fault(err: &anyhow::Error) -> bool {
 /// wait budget bounds what those cost.
 ///
 /// Two refusals stay out. `Unfunded`: another provider may reserve a smaller
-/// floor and admit the pool, so the caller moves on. A mid-stream `NotFound`:
-/// the per-signer cap refuses only at admission, and a
-/// source that serves some bytes and then refuses must not reset the wait budget
-/// on every round.
+/// floor and admit the pool, so the caller moves on. A `NotFound` after delivered
+/// bytes: the per-signer cap refuses only at admission, and a source that serves
+/// some bytes and then refuses must not reset the wait budget on every round.
 ///
 /// On `Some`, this meters the refusal exactly as [`classify_pull_failure`] does but
 /// records no `(peer, hash)` suppression (see [`REFUSAL_SUPPRESSION_TTL`]). On
@@ -3434,10 +3725,10 @@ fn backpressure_verdict(err: &anyhow::Error) -> Option<PullVerdict> {
     match verdict {
         PullVerdict::RateLimited => Some(verdict),
         PullVerdict::Refused(RefusalVerdict::Transient) => {
-            let at_open = err.downcast_ref::<UpstreamRefused>().is_some_and(|r| {
-                r.evidence().is_some() && !matches!(r.error(), StreamError::Unfunded)
+            let at_admission = err.downcast_ref::<UpstreamRefused>().is_some_and(|r| {
+                r.before_delivery() && !matches!(r.error(), StreamError::Unfunded)
             });
-            at_open.then_some(verdict)
+            at_admission.then_some(verdict)
         }
         _ => None,
     }
@@ -3530,15 +3821,11 @@ fn classify_pull_failure(
             deps.metrics.node_pull_too_large();
             debug!(%provider_addr, error = %err, "node-origin: pull ended at our cap on bytes held for the blob");
         }
-        // The provider quoted above our effective rate ceiling (#1375). We refused before
-        // paying; the signed over-quote is retained ON the `RateAboveCeiling` error for a
-        // caller to act on, though this handler does not itself submit a challenge
-        // (auto-slashing is deferred). Metered like `Oversize` so the refusal is
-        // operator-visible, then suppressed for the full durable TTL (as `OurDeadline` does,
-        // NOT `Oversize`, which only meters): the quote is a lasting fact about this
-        // (peer, hash) — re-probing gets the same rate. Reputation-neutral: whether it is a
-        // bait-and-switch or just our tight config we do not adjudicate here, so we do not
-        // tar the peer.
+        // The provider quoted above our rate ceiling (#1375). We refused before paying.
+        // Metered like `Oversize` so the refusal is operator-visible, then suppressed (as
+        // `OurDeadline` does, NOT `Oversize`, which only meters): the quote is a lasting
+        // fact about this (peer, hash) — asking again gets the same rate.
+        // Reputation-neutral: the ceiling is our policy, so we do not tar the peer.
         PullVerdict::RateCeiling => {
             deps.metrics.node_pull_rate_above_ceiling();
             suppress(Some(REFUSAL_SUPPRESSION_TTL));
@@ -3548,8 +3835,8 @@ fn classify_pull_failure(
         // (#857). Unscored — but NOT ignored (#1145 review).
         //
         // Exonerating and doing nothing are different things, and collapsing them left the
-        // cheapest griefer in the protocol unanswered. A peer that probes honestly
-        // (`has_blob: true`, low rate, low RTT → ranks #1), accepts the stream, signs a
+        // cheapest griefer in the protocol unanswered. A peer that answers discovery
+        // honestly (a holder, low rate, low RTT → ranks #1), accepts the stream, signs a
         // valid `StreamResponse`, and then sends NOTHING lands here — our deadline fired, so
         // it is `OurDeadline`. It was then neither scored nor suppressed, so it stayed
         // top-ranked and burned a full budget on EVERY subsequent miss, for every hash,
@@ -3637,7 +3924,7 @@ fn classify_pull_failure(
         // saying it lacks a blob as for being dead (#1144).
         //
         // Exonerating it is not the same as ignoring it, though. Every candidate that got
-        // this far answered `has_blob = true` at probe, so a refusal is a peer contradicting
+        // this far answered discovery as a holder, so a refusal is a peer contradicting
         // itself, and recording nothing would let a peer that advertises everything and serves
         // nothing keep winning the ranker and burn a `MAX_PROVIDER_ATTEMPTS` slot on every
         // miss, forever. The negative cache is the right instrument — scoped to (peer, hash),
@@ -3740,13 +4027,13 @@ fn peer_reputation(deps: &NodeOriginDeps, pk: PublicKey) -> f32 {
 /// counters are aggregates; this event names the peer and outcome behind each fold,
 /// including ADR 030 region penalties, which have no counter, and the score the peer
 /// now holds. Idle decay moves scores without an event. It logs at `debug!`, because
-/// a dead peer is re-probed on every cache miss. Enable it alone with
+/// a dead peer is opened again on every cache miss. Enable it alone with
 /// `RUST_LOG=info,decdn::reputation=debug`. `RUST_LOG` applies at startup only: a
 /// config reload replaces the filter with `observability.log_level` and drops the
 /// per-target setting.
 const REPUTATION_LOG_TARGET: &str = "decdn::reputation";
 
-/// Fold a pull/probe outcome into the local EWMA reputation score (ADR 008
+/// Fold a pull or discovery-open outcome into the local EWMA reputation score (ADR 008
 /// §Local Score Calculation) and bump the matching delivery metric.
 fn record_outcome(deps: &NodeOriginDeps, pk: PublicKey, outcome: &Outcome) {
     fold_outcome(&deps.local_rep, &deps.metrics, pk, outcome);
@@ -3785,15 +4072,6 @@ fn ms_to_u32(rtt_ms: f64) -> u32 {
     } else {
         rtt_ms as u32
     }
-}
-
-/// Current Unix time in microseconds for probe/stream request correlation. A
-/// pre-epoch clock saturates to `0` (the server's recency check rejects it)
-/// rather than panicking.
-fn now_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
 /// Count each admitted leg's content into `decdn_bytes_received_total`. For

@@ -560,7 +560,7 @@ fn xor_distance(id: &[u8; 32], target: &[u8; 32]) -> [u8; 32] {
 ///
 /// This is the load-bearing half of the outer-pull-deadline formula, and it had no test at
 /// all. `PULL_THROUGH_OUTER_SLACK` is now DERIVED as
-/// `PROBE_TIMEOUT + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so the slack is only a valid
+/// `OPEN_CEILING + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so the slack is only a valid
 /// budget if the lookup really honours that ceiling. An arithmetic assertion cannot check
 /// that — it would just restate the definition (`A >= A`), which is exactly what the test
 /// this replaces did. The only thing that can break is the LOOP, so the loop is what is

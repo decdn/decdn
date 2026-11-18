@@ -1191,7 +1191,7 @@ async fn build_chain_and_handlers(
     )));
     // Origin directory for the node-origin FIND_VALUE reads — the last-resort
     // fallback when the DHT returns no providers, and the supplement when a ranged
-    // pull's probed holders do not span the blob (ADR 022 §FIND_VALUE Flow; #912,
+    // pull's discovered holders do not span the blob (ADR 022 §FIND_VALUE Flow; #912,
     // #2195) — and for the reactive pull-through gate. When the operator configures the
     // OriginAssignment + PublisherRegistry addresses, use the chain-backed
     // `ChainOriginDirectory` — a lazy TTL cache resolving hash → namespace →
@@ -1371,7 +1371,7 @@ async fn build_chain_and_handlers(
         // The outer deadline bounds how long a miss blocks the delivery path before
         // falling back to `NotFound`. It is *derived* from the per-candidate budget
         // (`node_pull_timeout_sec`) rather than equal to it: the handler wraps the
-        // whole `discover → probe → rank → pull` fetch in one `tokio::time::timeout`,
+        // whole `discover → open → rank → pull` fetch in one `tokio::time::timeout`,
         // so an outer deadline equal to the per-candidate timeout would cancel the
         // fetch the instant candidate #1 stalls, before the `MAX_PROVIDER_ATTEMPTS`
         // fallback loop ever reaches candidates #2..N (#859). `outer_pull_deadline`
@@ -2175,7 +2175,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // once above so an upstream verifies against an identical domain.
     let node_origin_bind_domain = ch.bind_domain.clone();
     let node_origin_config = crate::node_origin::NodeOriginConfig {
-        probe_fanout: cfg.cache.node_pull_probe_fanout,
+        open_fanout: cfg.cache.node_pull_open_fanout,
         pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
         stall_window: std::time::Duration::from_secs(cfg.cache.node_pull_stall_window_sec),
         min_throughput_bps: cfg.cache.node_pull_min_throughput_bps,
@@ -2292,7 +2292,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     bind_domain: node_origin_bind_domain,
                     local_rep: local_reputation_c,
                     negative_cache: crate::dht::NegativeProbeCache::new(),
-                    probe_cache: crate::dht::PositiveProbeCache::new(),
+                    candidate_cache: crate::dht::CandidateCache::new(),
                     metrics: node_metrics_for_origin,
                     registry_regions: registry_regions_c,
                     config: node_origin_config,

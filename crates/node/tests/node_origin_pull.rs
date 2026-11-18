@@ -7,13 +7,15 @@
 //! reputation handles, on a single `Origin::fetch` call:
 //!
 //! 1. discovers upstream A (DHT lookup is empty → origin-directory fallback),
-//! 2. probes A over `cdn/probe/v1` for rate/RTT and ranks it,
+//! 2. opens a voucher-less `cdn/client/v1` stream on A for its signed quote,
+//!    size and coverage, and ranks it on the quote and the path RTT,
 //! 3. opens a buyer pool (stubbed — no chain) and pulls over `cdn/client/v1`,
 //! 4. returns the hash-verified bytes AND records the delivery outcome into the
 //!    local score + the observation buffer (the outbound-report feed, ADR 008).
 //!
-//! A serves both ALPNs from one endpoint (one NodeId): the real
-//! [`ClientHandler`] for the paid pull and a hand-rolled signed probe responder.
+//! A serves `cdn/client/v1` from one endpoint (one NodeId): the real
+//! [`ClientHandler`] answers the discovery open and the paid pull alike, or a
+//! hand-rolled fixture stands in for it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,19 +33,18 @@ use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
 use decdn_client::LocalPullFault;
-use decdn_client::probe::probe_once;
 use decdn_client::{PoolContext, Recovery};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
-    ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
-    min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
+    StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash, min_payment,
+    signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
-    ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
-    ProbedProvider, StakerSet, StaticNodeAddressDirectory, StaticOriginDirectory,
+    CachedCandidate, CandidateCache, ConfigStakerSet, NegativeProbeCache, NodeAddressResolver,
+    OriginDirectory, StakerSet, StaticNodeAddressDirectory, StaticOriginDirectory,
 };
 use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
@@ -54,12 +55,9 @@ use decdn_protocol::client::{
     StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
     encode_stream_response,
 };
-use decdn_protocol::message::{
-    ProbeResponse, ProbeResponseBody, ProbeResponseExt, encode_probe_response,
-};
 use decdn_protocol::{
-    ALPN_CLIENT, ALPN_PROBE, CHUNK_BYTES, ContentHash, Coverage, MB_BYTES, ProbeMessage,
-    decode_message, encode_message, encode_stream_request, read_frame, write_frame,
+    ALPN_CLIENT, CHUNK_BYTES, ContentHash, Coverage, MB_BYTES, decode_message, encode_message,
+    encode_stream_request, read_frame, write_frame,
 };
 use decdn_reputation::{LocalReputation, LocalReputationConfig};
 use iroh::EndpointAddr;
@@ -88,13 +86,13 @@ const RATE: u64 = 10;
 /// A strictly-cheaper quote than [`RATE`] so the stalling provider ranks #1 in
 /// the selection score (#859 fallthrough test).
 const STALL_RATE: u64 = RATE / 2;
-/// A quote that ranks last behind a rate-1 peer under any probe RTTs, for tests
-/// that must rank on a live cold probe and so cannot seed the probe cache.
+/// A quote that ranks last behind a rate-1 peer under any open RTTs, for tests
+/// that must rank on a live cold discovery and so cannot seed the candidate cache.
 ///
-/// The score is `rate × max(rtt_ms, 1) / rep²` (`selection::compute_score`), and a
-/// probe slower than `PROBE_TIMEOUT` (1 s) is dropped. Two accepted probes thus
-/// differ in RTT by less than 1000×, so a 1000× rate gap — the most
-/// `MAX_RATE_PER_MB` allows — outweighs any RTT a loaded runner measures (#2268).
+/// The score is `rate × max(rtt_ms, 1) / rep²` (`selection::compute_score`). The RTT
+/// is the connection's QUIC path estimate, never the time to the answer, so on
+/// loopback it stays a few milliseconds however loaded the runner is, and a 1000× rate
+/// gap — the most `MAX_RATE_PER_MB` allows — outweighs it (#2268).
 const RANK_LAST_RATE: u64 = 1_000;
 
 const fn slash_verifying() -> Address {
@@ -325,79 +323,29 @@ impl PoolOpener for FailingRecordOpener {
     }
 }
 
-/// Answer one `cdn/probe/v1` request with a signed `has_blob: true` response.
-async fn answer_probe(
-    conn: Connection,
-    eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
-    rate: u64,
-    total_bytes: u64,
-) -> Result<()> {
-    // Whole-blob holder: advertises coverage over every discovery block.
-    let coverage = Coverage::full(decdn_protocol::num_blocks(total_bytes));
-    answer_probe_with_coverage(conn, eth, slash, rate, total_bytes, coverage).await
+/// The voucher-less discovery opens the node origin under test sent, read off
+/// the captured `discovery_open` spans: to `peer` (any peer when `None`), for
+/// `hash` (any hash when `None`). Each open is one span, so this counts the
+/// opens on the wire, not what a metric reports.
+fn opens(spans: &support::SpanCapture, peer: Option<iroh::PublicKey>, hash: Option<Hash>) -> usize {
+    let all = match hash {
+        Some(hash) => spans.matching("discovery_open", "hash", &hash.to_string()),
+        None => spans.matching("discovery_open", "otel.kind", "client"),
+    };
+    all.iter()
+        .filter(|span| peer.is_none_or(|peer| span.fields.get("peer") == Some(&peer.to_string())))
+        .count()
 }
 
-/// [`answer_probe`] with an explicit [`Coverage`], so a PARTIAL holder can
-/// advertise only the discovery blocks it serves (#1506 ranged assembly). The
-/// two-holder loopback drives one holder covering block 0 and another block 1.
-/// `has_blob` follows the coverage as a holder's does: an empty coverage is
-/// `has_blob: false`, except for the empty blob (`total_bytes: 0`), whose
-/// coverage is empty on a holder too (#2471).
-async fn answer_probe_with_coverage(
-    conn: Connection,
-    eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
-    rate: u64,
-    total_bytes: u64,
-    coverage: Coverage,
-) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
+/// Teach `ep` where `addr`'s node listens: one `cdn/client/v1` dial, closed
+/// at once. The node origin later dials the node by id alone, on its own
+/// pooled connection.
+async fn learn_addr(ep: &iroh::Endpoint, addr: EndpointAddr) -> Result<()> {
+    let conn = ep
+        .connect(addr, ALPN_CLIENT)
         .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
-    let frame = read_frame(&mut recv, decdn_protocol::MAX_PROBE_FRAME)
-        .await
-        .map_err(|e| anyhow::anyhow!("read probe request: {e}"))?;
-    let (msg, _) = decode_message::<ProbeMessage>(&frame)
-        .map_err(|e| anyhow::anyhow!("decode probe request: {e}"))?;
-    let ProbeMessage::Request(req) = msg else {
-        anyhow::bail!("expected a ProbeMessage::Request");
-    };
-    let has_blob = total_bytes == 0 || !coverage.is_empty();
-    let body = ProbeResponseBody {
-        hash: req.hash,
-        has_blob,
-        rate_per_mb: rate,
-        timestamp_us: req.timestamp_us,
-    };
-    let slash_sig = ProbeSlashData {
-        hash: B256::from(req.hash),
-        has_blob,
-        rate_per_mb: rate,
-        timestamp_us: req.timestamp_us,
-    }
-    .sign(eth.as_ref(), slash)
-    .map_err(|e| anyhow::anyhow!("sign probe slash: {e}"))?
-    .as_bytes()
-    .to_vec();
-    let resp = ProbeResponse { body, slash_sig };
-    let payload = encode_probe_response(
-        &resp,
-        Some(&ProbeResponseExt {
-            coverage,
-            size_proof: Some(support::size_proof_for(req.hash, total_bytes)),
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
-    write_frame(&mut send, &payload)
-        .await
-        .map_err(|e| anyhow::anyhow!("write probe response: {e}"))?;
-    let _ = send.finish();
-    // Hold the connection until the requester has read the response and closed
-    // it, rather than collapsing it out from under the read; spawned
-    // per-connection, so this never stalls the accept loop.
-    conn.closed().await;
+        .map_err(|e| anyhow::anyhow!("learn_addr dial: {e}"))?;
+    conn.close(0u32.into(), b"address learned");
     Ok(())
 }
 
@@ -426,15 +374,11 @@ where
     }
 }
 
-/// Spawn A's accept loop, dispatching each connection by negotiated ALPN: the
-/// real `ClientHandler` for paid pulls, the hand-rolled responder for probes.
+/// Spawn A's accept loop: the real `ClientHandler` on every connection. It
+/// answers B's voucher-less discovery opens and its paid pulls alike.
 fn spawn_a_server(
     ep: iroh::Endpoint,
     client_handler: Arc<decdn_node::handlers::client::ClientHandler>,
-    a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
-    total_bytes: u64,
-    rate: u64,
 ) -> tokio::task::JoinHandle<()> {
     use iroh::protocol::ProtocolHandler;
     tokio::spawn(async move {
@@ -443,61 +387,12 @@ fn spawn_a_server(
                 continue;
             };
             let Ok(conn) = connecting.await else { continue };
-            if conn.alpn() == ALPN_PROBE {
-                let eth = Arc::clone(&a_eth);
-                let dom = slash.clone();
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                let handler = Arc::clone(&client_handler);
-                tokio::spawn(async move {
-                    let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
-                        .accept(conn)
-                        .await;
-                });
-            }
-        }
-    })
-}
-
-/// Like [`spawn_a_server`], but increments `probes` before answering every
-/// `cdn/probe/v1` request — the instrument for the probe-cache tests (#1165). A
-/// probe-cache hit is *defined* as "no probe was sent", so those tests assert on
-/// this counter at the wire rather than trusting `decdn_probe_cache_hits_total`
-/// alone: a broken implementation could increment that counter and probe anyway.
-fn spawn_a_probe_counting_server(
-    ep: iroh::Endpoint,
-    client_handler: Arc<decdn_node::handlers::client::ClientHandler>,
-    a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
-    total_bytes: u64,
-    rate: u64,
-    probes: Arc<AtomicUsize>,
-) -> tokio::task::JoinHandle<()> {
-    use iroh::protocol::ProtocolHandler;
-    tokio::spawn(async move {
-        while let Some(incoming) = ep.accept().await {
-            let Ok(connecting) = incoming.accept() else {
-                continue;
-            };
-            let Ok(conn) = connecting.await else { continue };
-            if conn.alpn() == ALPN_PROBE {
-                let eth = Arc::clone(&a_eth);
-                let dom = slash.clone();
-                let probes = Arc::clone(&probes);
-                tokio::spawn(async move {
-                    probes.fetch_add(1, Ordering::SeqCst);
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                let handler = Arc::clone(&client_handler);
-                tokio::spawn(async move {
-                    let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
-                        .accept(conn)
-                        .await;
-                });
-            }
+            let handler = Arc::clone(&client_handler);
+            tokio::spawn(async move {
+                let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
+                    .accept(conn)
+                    .await;
+            });
         }
     })
 }
@@ -505,7 +400,7 @@ fn spawn_a_probe_counting_server(
 /// Build B's `NodeOrigin` with stubbed discovery (`providers` for `hash` via the
 /// origin directory), a static `addr_map` resolver, a fixed-pool opener, and
 /// real reputation/metrics handles. Tests vary `providers`/`addr_map` to drive
-/// the discovery / resolution / probe / pull branches.
+/// the discovery / resolution / open / pull branches.
 ///
 /// Returns the origin, its `CacheEngine` (so a test can read pulled bytes back
 /// from the store after `AlreadyAdmitted`), and the [`StubOpener`]'s `recorded`
@@ -573,7 +468,7 @@ const DEFAULT_TEST_PULL_DEADLINES: (Duration, Duration) =
 /// `BadSignature` voucher rejection also yields `OurLocalFault` and needs no forged signer,
 /// but it arrives mid-stream — see
 /// `a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers`.) The PAID pull
-/// never reaches the wire under a zero budget; a live probe still may, if the caller wired
+/// never reaches the wire under a zero budget; a live open still may, if the caller wired
 /// one.
 #[allow(clippy::too_many_arguments)]
 async fn provisioned_origin_with_deadlines(
@@ -757,7 +652,7 @@ async fn build_origin_with_negative_cache(
     max_blob_size_bytes: u64,
     negative_cache: NegativeProbeCache,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
-    build_origin_with_probe_caches(
+    build_origin_with_discovery_caches(
         ep_b,
         b_dht,
         hash,
@@ -770,7 +665,7 @@ async fn build_origin_with_negative_cache(
         stall_timeout,
         max_blob_size_bytes,
         negative_cache,
-        PositiveProbeCache::new(),
+        CandidateCache::new(),
         // Buffered/generic path: the directory is keyed under `NO_NAMESPACE`,
         // matching the hash-only `Origin::fetch` lookup (node_origin.rs discover).
         U256::ZERO,
@@ -778,15 +673,15 @@ async fn build_origin_with_negative_cache(
     .await
 }
 
-/// [`build_origin_with_timeout`] with BOTH probe caches injected, so a test can pick each
+/// [`build_origin_with_timeout`] with BOTH candidate caches injected, so a test can pick each
 /// TTL independently.
 ///
 /// The positive cache anchors expiry on `Instant` like its negative twin, so `tokio::time`
 /// cannot fast-forward it and 15s per assertion is not a test suite. Injecting the two
 /// separately is also what makes their INTERACTION observable: a positive entry that
-/// outlives a negative one is how a peer becomes selectable again without a re-probe.
+/// outlives a negative one is how a peer becomes selectable again without a re-open.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
-async fn build_origin_with_probe_caches(
+async fn build_origin_with_discovery_caches(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     _hash: Hash,
@@ -799,7 +694,7 @@ async fn build_origin_with_probe_caches(
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
     negative_cache: NegativeProbeCache,
-    probe_cache: PositiveProbeCache,
+    candidate_cache: CandidateCache,
     // Namespace the directory keys the provider set under. Buffered/generic callers
     // pass `U256::ZERO` (the generic `Origin::fetch` path looks the directory up
     // under `NO_NAMESPACE`); a namespace-aware progressive test passes a non-zero id
@@ -819,7 +714,7 @@ async fn build_origin_with_probe_caches(
         stall_timeout,
         max_blob_size_bytes,
         negative_cache,
-        probe_cache,
+        candidate_cache,
     )
     .await
 }
@@ -828,7 +723,7 @@ async fn build_origin_with_probe_caches(
 /// origin directory answers per namespace, and the DHT peers that seed its
 /// routing table.
 struct FixtureDiscovery {
-    /// Active stakers. A probe-cache HIT re-checks `is_active` and
+    /// Active stakers. A candidate-cache HIT re-checks `is_active` and
     /// `find_providers` drops a non-staked holder, so every provider a test
     /// expects to be pulled from belongs here.
     stakers: HashSet<DhtNodeId>,
@@ -839,8 +734,12 @@ struct FixtureDiscovery {
     /// can dial it by id, and adds each to the active stakers: the lookup
     /// seeds only from bonded routing peers.
     dht_peers: Vec<(iroh::PublicKey, std::net::SocketAddr)>,
-    /// `NodeOriginConfig::probe_fanout`: how many peers one probe round may probe.
-    probe_fanout: usize,
+    /// `NodeOriginConfig::open_fanout`: how many peers one discovery round may
+    /// open.
+    open_fanout: usize,
+    /// `NodeOriginConfig::max_rate_per_mb`: the absolute per-MB ceiling, `0`
+    /// for none.
+    max_rate_per_mb: u64,
 }
 
 impl FixtureDiscovery {
@@ -852,7 +751,8 @@ impl FixtureDiscovery {
             stakers: providers.iter().copied().collect(),
             directory: HashMap::from([(namespace, providers)]),
             dht_peers: Vec::new(),
-            probe_fanout: 5,
+            open_fanout: 5,
+            max_rate_per_mb: 0,
         }
     }
 }
@@ -872,13 +772,14 @@ async fn build_origin_with_discovery(
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
     negative_cache: NegativeProbeCache,
-    probe_cache: PositiveProbeCache,
+    candidate_cache: CandidateCache,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let FixtureDiscovery {
         mut stakers,
         directory,
         dht_peers,
-        probe_fanout,
+        open_fanout,
+        max_rate_per_mb,
     } = discovery;
     let mut routing = RoutingTable::new(b_dht);
     for (peer_id, peer_addr) in dht_peers {
@@ -924,11 +825,11 @@ async fn build_origin_with_discovery(
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
         negative_cache,
-        probe_cache,
+        candidate_cache,
         metrics: Arc::clone(metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
-            probe_fanout,
+            open_fanout,
             // Taken verbatim from the caller. Two fixtures feed the same budgets to
             // `selection::outer_pull_deadline` and assert on what it derives, so a
             // margin applied behind the caller's back would put the config and that
@@ -938,7 +839,7 @@ async fn build_origin_with_discovery(
             stall_window: stall_timeout,
             min_throughput_bps: 0,
             max_blob_size_bytes,
-            max_rate_per_mb: 0,
+            max_rate_per_mb,
             // Short, so a post-recovery settle wait cannot dominate a test's wall
             // clock. The fixtures accept the re-open immediately, so the window is
             // only ever spent when a test deliberately withholds settlement.
@@ -964,12 +865,12 @@ async fn build_origin_with_discovery(
 }
 
 /// [`build_origin_with_timeout`] with a DETERMINISTIC ranked order, by pre-seeding
-/// the positive probe cache so the pull takes the cached-candidates path instead of
+/// the positive candidate cache so the pull takes the cached-candidates path instead of
 /// live probing.
 ///
-/// The live probe measures a real localhost RTT, and RTT is a MULTIPLICATIVE term in
+/// The live open measures a real localhost RTT, and RTT is a MULTIPLICATIVE term in
 /// the selection score (`rate_per_mb × rtt_ms × 1/rep²`, `selection::compute_score`):
-/// on a loaded CI runner one candidate's probe RTT can inflate past another's and flip
+/// on a loaded CI runner one candidate's open RTT can inflate past another's and flip
 /// their relative order. A test that needs a SPECIFIC order — cheap stallers strictly
 /// ahead of a pricier honest fallback — is otherwise racy (a staller ranked BEHIND the
 /// honest node is never tried, so its per-candidate timeout never fires). Seeding every
@@ -980,10 +881,10 @@ async fn build_origin_with_discovery(
 /// load-independent. Equal-rate candidates (the stallers) still tie, and the ranker's geo
 /// / RNG tie-break decides their MUTUAL order, but a distinctly pricier fallback lands in
 /// its own higher-score group and stays strictly last regardless. The real pool-open +
-/// stream fallthrough these tests exercise is untouched — only probe+rank is bypassed.
+/// stream fallthrough these tests exercise is untouched — only open+rank is bypassed.
 ///
 /// `ranked` lists `(provider, quoted rate)`. On a cache hit `cached_candidates` does NOT
-/// re-probe: it rebuilds reputation and region fresh but reuses the cached
+/// re-open: it rebuilds reputation and region fresh but reuses the cached
 /// `(rate_per_mb, rtt_ms)`, then re-runs `rank_candidates` — so the seeded rate + fixed
 /// RTT are what feed the score. The slice order is only the provider set (also used to
 /// build the active staker set the cached path re-checks); the rank is recomputed.
@@ -1000,16 +901,16 @@ async fn build_origin_seeded_ranking(
     pull_timeout: Duration,
     stall_timeout: Duration,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
-    let probe_cache = PositiveProbeCache::new();
-    probe_cache.insert(
+    let candidate_cache = CandidateCache::new();
+    candidate_cache.insert(
         ContentHash::from_bytes(*hash.as_bytes()),
         ranked
             .iter()
-            .map(|&(node_id, rate_per_mb)| ProbedProvider {
+            .map(|&(node_id, rate_per_mb)| CachedCandidate {
                 node_id,
                 rate_per_mb,
                 // Identical across candidates: the ranker's RTT term must not vary,
-                // or a loaded runner's live-probe jitter reappears through the cache.
+                // or a loaded runner's live-open jitter reappears through the cache.
                 rtt_ms: 1,
                 // Whole-blob coverage — these fixtures serve the whole blob, so a
                 // cache-hit candidate must range-plan as covering everything.
@@ -1020,7 +921,7 @@ async fn build_origin_seeded_ranking(
             .collect(),
     );
     let providers = ranked.iter().map(|&(id, _)| id).collect();
-    build_origin_with_probe_caches(
+    build_origin_with_discovery_caches(
         ep_b,
         b_dht,
         hash,
@@ -1033,7 +934,7 @@ async fn build_origin_seeded_ranking(
         stall_timeout,
         0,
         NegativeProbeCache::new(),
-        probe_cache,
+        candidate_cache,
         U256::ZERO,
     )
     .await
@@ -1076,7 +977,7 @@ async fn build_origin_multi_hash(
             Some(tokio::runtime::Handle::current()),
         ),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
-        // Providers are active stakers, matching production (a probe-cache HIT
+        // Providers are active stakers, matching production (a candidate-cache HIT
         // re-checks `is_active`, so an empty set would make every cached provider
         // un-servable on a hit). `find_providers` still returns empty for them —
         // no routing entries — so fetch #1 resolves via the directory as before.
@@ -1092,11 +993,11 @@ async fn build_origin_multi_hash(
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
         negative_cache: NegativeProbeCache::new(),
-        probe_cache: PositiveProbeCache::new(),
+        candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
-            probe_fanout: 5,
+            open_fanout: 5,
             pull_timeout,
             stall_window: stall_timeout,
             min_throughput_bps: 0,
@@ -1279,12 +1180,15 @@ async fn cache_with_fs_origin_only(
 /// lane's buyer key). B receiving the bytes, and A's origin fetching exactly
 /// once, proves the binding propagated across the hop and authorized the chained
 /// pull. Without the binding, A refuses with `NotFound`.
+///
+/// A's origin publishes no outboard, so A cannot serve the blob before its fill,
+/// and it answers a voucher-less discovery open `NotFound`. B reaches it through
+/// a candidate-cache entry instead, whose pull opens with the pull-through flag.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<()> {
     let payload = vec![0x9Eu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A (upstream): blob ONLY in its fs origin; store starts empty. ----
     let (cache_a, hash_a, cache_a_metrics, _origin_tmp_a, _cache_tmp_a) =
@@ -1328,48 +1232,35 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         16,
         |deps| deps.local_populate = Some(Duration::from_secs(20)),
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin (now sends a binding).
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
-    let (providers, addr_map) =
-        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, engine, _recorded, _engine_tmp) = provisioned_origin(
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let (_providers, addr_map) = one_provider(a_dht, a_eth.address());
+    let (buyer, _recorded) = stub_opener(pool_id, &b_buyer);
+    let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
-        pool_id,
-        &b_buyer,
+        buyer,
         &local_rep,
         &b_metrics,
-        providers,
+        &[(a_dht, RATE)],
         addr_map,
+        DEFAULT_TEST_PULL_DEADLINES.0,
+        DEFAULT_TEST_PULL_DEADLINES.1,
     )
     .await;
 
-    // Discover → probe → open (with binding) → A reactively pulls its own origin
+    // Cached candidate → open (with binding) → A reactively pulls its own origin
     // → serve. A held nothing in-store, so a successful pull is proof of the
     // chained reactive fill.
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
@@ -1404,7 +1295,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds the blob; serves probe + client over one endpoint. -----
+    // --- Node A: holds the blob; serves the client protocol. -----
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -1442,32 +1333,17 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    // Prime B's iroh address cache with A's address via one explicit-addr probe,
+    // Prime B's iroh address cache with A's address via one explicit-addr dial,
     // so the orchestration's `EndpointAddr::new(a_id)` (no addr) resolves — the
     // same priming the DHT integration tests rely on for NodeId-only dialing.
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -1486,7 +1362,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     )
     .await;
 
-    // --- The orchestration: discover → probe → rank → open → pull. ------------
+    // --- The orchestration: discover → open → rank → open → pull. ------------
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
@@ -1509,9 +1385,10 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     // Observability: the success + attempt counters moved.
     assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
-    // One probe round, and one pull leg: the drive adopts the header handshake's
-    // whole-blob pull, so the handshake and the leg record once between them.
-    assert_counter(&b_metrics, "probe_collection_latency_seconds_count", 1)?;
+    // One discovery round, and one pull leg: the handshake adopts A's
+    // whole-blob discovery stream and the drive adopts the handshake's pull, so
+    // the open, the handshake and the leg record once between them.
+    assert_counter(&b_metrics, "open_collection_latency_seconds_count", 1)?;
     assert_counter(&b_metrics, "node_pull_first_byte_seconds_count", 1)?;
 
     // #852: the buyer persisted the lane's voucher watermark after the pull.
@@ -1533,7 +1410,9 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     shutdown([task_a], [&ep_b, &ep_a]).await?;
 
     // The pull runs on its own thread and runtime; its spans must still nest
-    // under the fetch: node_pull ⊃ upstream_stream ⊃ open_progressive_pull.
+    // under the fetch: node_pull ⊃ upstream_stream. The only stream is the
+    // discovery open, under node_pull with its range; the pull adopts it, so
+    // no `open_progressive_pull` opens another.
     let key = hash.to_string();
     let pulls = spans.matching("upstream_stream", "hash", &key);
     anyhow::ensure!(
@@ -1541,13 +1420,18 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
             && s.fields.get("outcome").map(String::as_str) == Some("filled")),
         "upstream_stream: {pulls:?}"
     );
-    let opens = spans.matching("open_progressive_pull", "hash", &key);
+    let opens = spans.matching("discovery_open", "hash", &key);
     anyhow::ensure!(
-        !opens.is_empty()
-            && opens.iter().all(|s| s.parent == Some("upstream_stream")
+        opens.len() == 1
+            && opens.iter().all(|s| s.parent == Some("node_pull")
                 && s.fields.contains_key("byte_offset")
                 && s.fields.contains_key("byte_len")),
-        "open_progressive_pull must nest under upstream_stream with its range: {opens:?}"
+        "one discovery_open must nest under node_pull with its range: {opens:?}"
+    );
+    let reopened = spans.matching("open_progressive_pull", "hash", &key);
+    anyhow::ensure!(
+        reopened.is_empty(),
+        "the pull adopts the discovery stream and opens no other: {reopened:?}"
     );
     Ok(())
 }
@@ -1575,7 +1459,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
     let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(LARGE_PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds the blob; serves probe + client over one endpoint. -----
+    // --- Node A: holds the blob; serves the client protocol. -----
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -1613,30 +1497,15 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin, whose own cache is
     // the destination the streaming pull admits into. -------------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -1692,11 +1561,11 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
         negative_cache: NegativeProbeCache::new(),
-        probe_cache: PositiveProbeCache::new(),
+        candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(&b_metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
-            probe_fanout: 5,
+            open_fanout: 5,
             // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
             // runner must not end a pull this fixture is not measuring.
             pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
@@ -1723,7 +1592,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         engine: engine_b.clone(),
     });
 
-    // --- Populate node B's cache: discover → probe → rank → open → stream. ----
+    // --- Populate node B's cache: discover → open → rank → open → stream. ----
     engine_b.populate(hash).await?;
 
     anyhow::ensure!(
@@ -1810,14 +1679,13 @@ async fn serve_wrong_bytes(
     Ok(())
 }
 
-/// Spawn A serving probes truthfully (`has_blob`) but lying on the client
+/// Spawn A answering every open as a holder but lying on the client
 /// stream (wrong bytes), for the corruption-classification test.
 fn spawn_a_lying_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
     slash: Eip712Domain,
     served: Vec<u8>,
-    advertised_bytes: u64,
     rate: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1829,16 +1697,10 @@ fn spawn_a_lying_server(
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
             let served = served.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
-                    async move { serve_wrong_bytes(send, recv, &eth, &dom, &served, rate).await }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
+                async move { serve_wrong_bytes(send, recv, &eth, &dom, &served, rate).await }
+            }));
         }
     })
 }
@@ -1861,9 +1723,9 @@ async fn serve_gated_correct_bytes(
     release: &tokio::sync::Notify,
 ) -> Result<()> {
     // The DECOUPLED serve-miss (#1621) opens its upstream through a header
-    // handshake. When the probe reported the size, that handshake opens the pull
-    // leg's first leg (`byte_len > 0`) and the pull leg adopts it (#2063): one
-    // bi-stream. Without a size it is a whole-tail open (`byte_offset == 0 &&
+    // handshake. A discovery open of the pull leg's first span, served, is that
+    // handshake: the pull leg adopts it (#2063), one bi-stream. A handshake that
+    // pulls through and has no size is a whole-tail open (`byte_offset == 0 &&
     // byte_len == 0`) the buyer ABORTS right after reading `total_bytes` (it pulls
     // no chunk, pays no voucher, records NO watermark), and the real `PeerSource`
     // range pull follows on a SECOND bi-stream of the same connection.
@@ -1884,17 +1746,7 @@ async fn serve_gated_correct_bytes(
         let Ok((mut send, mut recv)) = conn.accept_bi().await else {
             return Ok(());
         };
-        let req_msg = {
-            let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
-                .await
-                .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
-            decode_message::<ClientMessage>(&frame)
-                .map_err(|e| anyhow::anyhow!("decode request: {e}"))?
-                .0
-        };
-        let ClientMessage::StreamRequest(req) = req_msg else {
-            anyhow::bail!("gated upstream: expected a StreamRequest");
-        };
+        let (req, pull_through) = read_open(&mut recv).await?;
         let body = StreamResponseBody {
             hash: req.hash,
             ok: true,
@@ -1911,10 +1763,11 @@ async fn serve_gated_correct_bytes(
         write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
             .await
             .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-        if req.byte_offset == 0 && req.byte_len == 0 {
+        if pull_through && req.byte_offset == 0 && req.byte_len == 0 {
             // Whole-tail header handshake: loop back to accept the real pull's
             // bi-stream. The buyer aborts after the header, so there is no voucher
-            // exchange to await.
+            // exchange to await. A discovery open asks no pull-through: the pull
+            // adopts it, so it is the real pull.
             let _ = send.finish();
             continue;
         }
@@ -1955,7 +1808,7 @@ async fn serve_gated_correct_bytes(
 }
 
 /// Spawn the gated honest upstream (see [`serve_gated_correct_bytes`]). Answers
-/// probes truthfully; gates only the client stream. The returned `received` /
+/// opens truthfully; gates only the client stream. The returned `received` /
 /// `release` notifies coordinate the test's hand-off.
 #[allow(clippy::too_many_arguments)]
 fn spawn_a_gated_server(
@@ -1963,7 +1816,6 @@ fn spawn_a_gated_server(
     a_eth: Arc<PrivateKeySigner>,
     slash: Eip712Domain,
     served: Vec<u8>,
-    advertised_bytes: u64,
     rate: u64,
     received: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
@@ -1977,20 +1829,13 @@ fn spawn_a_gated_server(
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
             let served = served.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
-                });
-            } else {
-                let received = Arc::clone(&received);
-                let release = Arc::clone(&release);
-                tokio::spawn(async move {
-                    let _ = serve_gated_correct_bytes(
-                        conn, &eth, &dom, &served, rate, &received, &release,
-                    )
-                    .await;
-                });
-            }
+            let received = Arc::clone(&received);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                let _ =
+                    serve_gated_correct_bytes(conn, &eth, &dom, &served, rate, &received, &release)
+                        .await;
+            });
         }
     })
 }
@@ -2013,17 +1858,14 @@ async fn spawn_gated_node_a(
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let received = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let advertised_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let task_a = spawn_a_gated_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
         slash_domain(),
         payload.to_vec(),
-        advertised_bytes,
         RATE,
         Arc::clone(&received),
         Arc::clone(&release),
@@ -2217,14 +2059,13 @@ async fn serve_then_error_on_voucher(
     Ok(())
 }
 
-/// Spawn A answering probes truthfully but replying to the buyer's closing voucher with
+/// Spawn A answering every open as a holder but replying to the buyer's closing voucher with
 /// `error` (a non-`VoucherRejected` `StreamError`) — the ack-wait catch-all path (#1145).
 fn spawn_a_voucher_erroring_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
     slash: Eip712Domain,
     served: Vec<u8>,
-    advertised_bytes: u64,
     rate: u64,
     error: StreamError,
 ) -> tokio::task::JoinHandle<()> {
@@ -2238,32 +2079,24 @@ fn spawn_a_voucher_erroring_server(
             let dom = slash.clone();
             let served = served.clone();
             let error = error.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
-                    let error = error.clone();
-                    async move {
-                        serve_then_error_on_voucher(send, recv, &eth, &dom, &served, rate, error)
-                            .await
-                    }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
+                let error = error.clone();
+                async move {
+                    serve_then_error_on_voucher(send, recv, &eth, &dom, &served, rate, error).await
+                }
+            }));
         }
     })
 }
 
-/// Spawn A serving probes truthfully but rejecting the buyer's voucher on the
+/// Spawn A answering every open as a holder but rejecting the buyer's voucher on the
 /// client stream, for the #857 voucher-rejection exoneration test.
 fn spawn_a_voucher_rejecting_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
     slash: Eip712Domain,
     served: Vec<u8>,
-    advertised_bytes: u64,
     rate: u64,
     reason: VoucherRejectReason,
 ) -> tokio::task::JoinHandle<()> {
@@ -2276,25 +2109,18 @@ fn spawn_a_voucher_rejecting_server(
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
             let served = served.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
-                    async move {
-                        serve_then_reject_voucher(send, recv, &eth, &dom, &served, rate, reason)
-                            .await
-                    }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
+                async move {
+                    serve_then_reject_voucher(send, recv, &eth, &dom, &served, rate, reason).await
+                }
+            }));
         }
     })
 }
 
-/// Like [`spawn_a_voucher_rejecting_server`], but counts both `cdn/probe/v1` requests and
-/// `cdn/client/v1` stream attempts — the instrument for the probe-cache wedged-filter test
+/// Like [`spawn_a_voucher_rejecting_server`], but counts its `cdn/client/v1` stream
+/// attempts — the instrument for the candidate-cache wedged-filter test
 /// (#1223 review), which must show this provider is never streamed to again once its
 /// lane wedges, however the candidate list that would have re-selected it was built.
 #[allow(clippy::too_many_arguments)]
@@ -2303,10 +2129,8 @@ fn spawn_a_voucher_rejecting_server_with_counters(
     a_eth: Arc<PrivateKeySigner>,
     slash: Eip712Domain,
     served: Vec<u8>,
-    advertised_bytes: u64,
     rate: u64,
     reason: VoucherRejectReason,
-    probes: Arc<AtomicUsize>,
     streams: Arc<AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2318,88 +2142,50 @@ fn spawn_a_voucher_rejecting_server_with_counters(
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
             let served = served.clone();
-            if conn.alpn() == ALPN_PROBE {
-                let probes = Arc::clone(&probes);
-                tokio::spawn(async move {
-                    probes.fetch_add(1, Ordering::SeqCst);
-                    let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
-                });
-            } else {
-                let streams = Arc::clone(&streams);
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    streams.fetch_add(1, Ordering::SeqCst);
-                    let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
-                    async move {
-                        serve_then_reject_voucher(send, recv, &eth, &dom, &served, rate, reason)
-                            .await
-                    }
-                }));
-            }
+            let streams = Arc::clone(&streams);
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                streams.fetch_add(1, Ordering::SeqCst);
+                let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
+                async move {
+                    serve_then_reject_voucher(send, recv, &eth, &dom, &served, rate, reason).await
+                }
+            }));
         }
     })
 }
 
-/// Spawn a provider that answers probes truthfully but HARD-FAILS the client
-/// stream at the transport: it accepts the connection and immediately closes it,
-/// so the buyer's `open_progressive_pull` errors on connect/read rather than stalling to a
-/// timeout. Models a genuine reachability failure (NOT a `PullTimeout`,
+/// Spawn a provider that HARD-FAILS every client stream at the transport: it
+/// accepts the connection and immediately closes it, so the buyer's open errors
+/// on connect/read rather than stalling to a timeout. Models a genuine reachability failure (NOT a `PullTimeout`,
 /// `UpstreamVoucherRejected`, or `HashMismatch`) — the #857 regression guard that
 /// such failures must STILL score `Unreachable` and the fix did not over-exonerate.
-fn spawn_a_probe_ok_client_dead_server(
-    ep: iroh::Endpoint,
-    a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
-    total_bytes: u64,
-    rate: u64,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_a_dead_server(ep: iroh::Endpoint) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let Ok(connecting) = incoming.accept() else {
                 continue;
             };
             let Ok(conn) = connecting.await else { continue };
-            let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                // Kill the client stream immediately: close the connection before
-                // any `StreamResponse`, so the buyer's read fails at the transport.
-                conn.close(0u32.into(), b"dead");
-            }
+            // Kill the client stream immediately: close the connection before
+            // any `StreamResponse`, so the buyer's read fails at the transport.
+            conn.close(0u32.into(), b"dead");
         }
     })
 }
 
-/// Spawn a provider that answers probes truthfully but *stalls* on the client
-/// stream: it accepts the bidi stream and reads the request, then never sends a
-/// `StreamResponse` and holds the send side open, so the buyer's `open_progressive_pull`
+/// Spawn a provider that *stalls* every client stream: it accepts the bidi
+/// stream and reads the request, then never sends a `StreamResponse` and holds
+/// the send side open, so a discovery open runs to its ceiling and a pull's open
 /// blocks until its per-candidate `pull_timeout` fires. Models the slow-stall
 /// failure shape whose outer-deadline interaction #859 fixes.
-fn spawn_a_stalling_server(
-    ep: iroh::Endpoint,
-    s_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
-    total_bytes: u64,
-    rate: u64,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_a_stalling_server(ep: iroh::Endpoint) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let Ok(connecting) = incoming.accept() else {
                 continue;
             };
             let Ok(conn) = connecting.await else { continue };
-            let eth = Arc::clone(&s_eth);
-            let dom = slash.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, stall_stream));
-            }
+            tokio::spawn(serve_each_stream(conn, stall_stream));
         }
     })
 }
@@ -2409,10 +2195,6 @@ fn spawn_a_stalling_server(
 /// stream on the requester's pooled connection.
 fn spawn_a_counting_stalling_server(
     ep: iroh::Endpoint,
-    s_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
-    total_bytes: u64,
-    rate: u64,
     streams: Arc<AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2421,19 +2203,11 @@ fn spawn_a_counting_stalling_server(
                 continue;
             };
             let Ok(conn) = connecting.await else { continue };
-            let eth = Arc::clone(&s_eth);
-            let dom = slash.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                let streams = Arc::clone(&streams);
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    streams.fetch_add(1, Ordering::SeqCst);
-                    stall_stream(send, recv)
-                }));
-            }
+            let streams = Arc::clone(&streams);
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                streams.fetch_add(1, Ordering::SeqCst);
+                stall_stream(send, recv)
+            }));
         }
     })
 }
@@ -2450,7 +2224,7 @@ async fn stall_stream(
     Ok(())
 }
 
-/// #859: when the best-ranked candidate *stalls* (answers the probe, then never
+/// #859: when the best-ranked candidate *stalls* (answers the open, then never
 /// serves bytes), the per-candidate `pull_timeout` must abandon it and the loop
 /// must fall through to the next ranked candidate, which delivers. This proves
 /// the mechanism the fix relies on — a per-candidate budget that the (separately
@@ -2460,9 +2234,8 @@ async fn stall_stream(
 async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     let payload = vec![0xCDu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Honest node A: holds the blob; serves probe + client at `RATE`. ------
+    // --- Honest node A: holds the blob; serves the client protocol at `RATE`. ------
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -2500,16 +2273,8 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Stalling node S: quotes a CHEAPER rate so it ranks first (strictly
     //     cheaper ⇒ lower selection score ⇒ ranked #1), then stalls on the
@@ -2517,15 +2282,8 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     let s_sk = fresh_key();
     let s_id = s_sk.public();
     let s_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_s, addr_s) =
-        local_endpoint(s_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_s = spawn_a_stalling_server(
-        ep_s.clone(),
-        Arc::clone(&s_eth),
-        slash_domain(),
-        total_bytes,
-        STALL_RATE,
-    );
+    let (ep_s, addr_s) = local_endpoint(s_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_s = spawn_a_stalling_server(ep_s.clone());
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
@@ -2533,14 +2291,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
     // Prime B's iroh address cache for BOTH providers (NodeId-only dialing).
     for (id, addr) in [(a_id, addr_a), (s_id, addr_s)] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(id).with_ip_addr(addr),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
+        learn_addr(&ep_b, EndpointAddr::new(id).with_ip_addr(addr)).await?;
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
@@ -2561,8 +2312,8 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         recorded: Arc::clone(&recorded),
     }) as Arc<dyn PoolOpener>;
     // The staller quotes the cheaper `STALL_RATE` so it ranks ahead of A (`RATE`).
-    // Order is PINNED via a seeded probe cache: RTT is a multiplicative ranker term, so
-    // a loaded runner's live-probe jitter could otherwise float A ahead of the staller,
+    // Order is PINNED via a seeded candidate cache: RTT is a multiplicative ranker term, so
+    // a loaded runner's live-open jitter could otherwise float A ahead of the staller,
     // deliver from A first, and leave the staller untried (no timeout, flake). See
     // `build_origin_seeded_ranking`.
     let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
@@ -2652,7 +2403,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     let payload = vec![0xE1u8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Honest node A: holds the blob, opens instantly, serves it. -----------
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
@@ -2692,19 +2442,11 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Nodes W1 and W2: quote a CHEAPER rate so they rank ahead of A, answer
-    //     probes honestly, and hold the blob — but their pool opens wedge. They
+    //     and hold the blob — but their pool opens wedge. They
     //     are perfectly good providers; our chain lane to them is what is broken.
     //
     //     TWO of them, not one, and that is the point: `MAX_PROVIDER_ATTEMPTS` is 3,
@@ -2714,44 +2456,24 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     let w_sk = fresh_key();
     let w_id = w_sk.public();
     let w_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_w, addr_w) =
-        local_endpoint(w_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // Reuse the stalling server purely as a probe responder: the pull never gets
-    // far enough to open a client stream against it, because the open wedges first.
-    let task_w = spawn_a_stalling_server(
-        ep_w.clone(),
-        Arc::clone(&w_eth),
-        slash_domain(),
-        total_bytes,
-        STALL_RATE,
-    );
+    let (ep_w, addr_w) = local_endpoint(w_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // Reuse the stalling server: the seeded ranking opens no discovery stream, and
+    // the pull never gets far enough to open a client stream against it, because
+    // the pool open wedges first.
+    let task_w = spawn_a_stalling_server(ep_w.clone());
 
     let w2_sk = fresh_key();
     let w2_id = w2_sk.public();
     let w2_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_w2, addr_w2) =
-        local_endpoint(w2_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_w2 = spawn_a_stalling_server(
-        ep_w2.clone(),
-        Arc::clone(&w2_eth),
-        slash_domain(),
-        total_bytes,
-        STALL_RATE,
-    );
+    let (ep_w2, addr_w2) = local_endpoint(w2_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_w2 = spawn_a_stalling_server(ep_w2.clone());
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
     for (id, addr) in [(a_id, addr_a), (w_id, addr_w), (w2_id, addr_w2)] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(id).with_ip_addr(addr),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
+        learn_addr(&ep_b, EndpointAddr::new(id).with_ip_addr(addr)).await?;
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
@@ -2779,8 +2501,8 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     // real value — it is a term of the outer deadline.
     let stall_budget = Duration::from_secs(20);
     let per_candidate = Duration::from_secs(2);
-    // Seeded ranking, not live probes. The score multiplies rate by measured RTT, so
-    // on a loaded runner a wedged node's probe RTT can inflate past A's and flip the
+    // Seeded ranking, not live opens. The score multiplies rate by measured RTT, so
+    // on a loaded runner a wedged node's open RTT can inflate past A's and flip the
     // pricier honest node ahead of it — then only ONE wedged open is tried and the
     // third-attempt assertion below fails for a reason that has nothing to do with
     // the wedge. Seeding every provider at one `rtt_ms` collapses the RTT term to a
@@ -2948,12 +2670,14 @@ async fn pull_through_a_reported_open_failure(local: bool) -> Result<Arc<Metrics
 
 /// The classifier does not restate a failure its raising site already
 /// metered: a node-wide fault (`OpenReported` + `LocalPullFault`) moves the
-/// local-fault counter and leaves the open-failure total alone (#2072).
+/// local-fault counter and leaves the open-failure total alone (#2072). The
+/// fetch meets the fault twice, once per pool open: the cached candidate's
+/// lane, then the cold path's discovery context.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reported_local_open_fault_is_not_metered_again() -> Result<()> {
     let metrics = pull_through_a_reported_open_failure(true).await?;
     assert_counter(&metrics, "node_pull_pool_open_failures_total", 0)?;
-    assert_counter(&metrics, "node_pull_local_fault_total", 1)?;
+    assert_counter(&metrics, "node_pull_local_fault_total", 2)?;
     Ok(())
 }
 
@@ -3042,45 +2766,17 @@ async fn an_origin_directory_entry_for_this_node_is_not_a_candidate() -> Result<
 
 /// A discovered provider with no resolvable operator address is skipped without
 /// tarnishing its reputation (payment-safety: never pay an address we can't
-/// resolve / verify a `slash_sig` against). The probe succeeds, the pull is
-/// skipped, the fetch is a clean `NotFound`, and no outcome is recorded.
+/// resolve / verify a `slash_sig` against). Discovery drops it before any open,
+/// the fetch is a clean `NotFound`, and no outcome is recorded.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> {
     let payload = vec![0x5Au8; 4096];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    let a_sk = fresh_key();
-    let a_id = a_sk.public();
-    let a_eth = Arc::new(PrivateKeySigner::random());
-    // A answers probes (has_blob) but is never paid — the resolver can't map it.
-    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_PROBE.to_vec()]).await?;
-    let task_a = {
-        let ep_a = ep_a.clone();
-        let eth = Arc::clone(&a_eth);
-        tokio::spawn(async move {
-            while let Some(incoming) = ep_a.accept().await {
-                let Ok(connecting) = incoming.accept() else {
-                    continue;
-                };
-                let Ok(conn) = connecting.await else { continue };
-                let eth = Arc::clone(&eth);
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &slash_domain(), RATE, total_bytes).await;
-                });
-            }
-        })
-    };
-
+    let a_id = fresh_key().public();
+    // A is never opened: the resolver cannot map it, so discovery drops it
+    // before any open, and it is never paid.
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     // Provider discovered, but addr_map is EMPTY → unresolvable.
@@ -3108,15 +2804,15 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
         progress_log(&recorded)?.is_empty(),
         "skipped-before-pull ⇒ nothing persisted (#852 guard)"
     );
-    shutdown([task_a], [&ep_b, &ep_a]).await?;
+    shutdown([], [&ep_b]).await?;
     Ok(())
 }
 
-/// A discovered provider that can't be probed (unreachable) is scored
+/// A discovered provider that can't be opened (unreachable) is scored
 /// `Unreachable` (`uptime_observed`: false), the fetch is a clean `NotFound`,
 /// and the unreachable counter moves.
 #[tokio::test(flavor = "multi_thread")]
-async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
+async fn node_origin_open_unreachable_is_scored() -> Result<()> {
     let hash = support::register_payload(b"present-at-a-dead-peer");
     // "A" is a fresh identity with NO server — dialing it fails fast.
     let a_id = fresh_key().public();
@@ -3151,7 +2847,7 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
     );
     anyhow::ensure!(
         progress_log(&recorded)?.is_empty(),
-        "an unprobeable provider is never paid ⇒ nothing persisted (#852 guard)"
+        "an unreachable provider is never paid ⇒ nothing persisted (#852 guard)"
     );
     assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
     shutdown([], [&ep_b]).await?;
@@ -3176,28 +2872,19 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let total_bytes = u64::try_from(served.len()).unwrap_or(u64::MAX);
     let task_a = spawn_a_lying_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
         slash_domain(),
         served,
-        total_bytes,
         RATE,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -3262,29 +2949,19 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_voucher_rejecting_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
         slash_domain(),
         payload.clone(),
-        total_bytes,
         RATE,
         VoucherRejectReason::AmountRegression,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -3338,7 +3015,7 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
 ///
 /// `fetches` drives the pull that many times against the SAME origin. More than one is how
 /// a caller observes suppression: a provider taken out of rotation is filtered before it is
-/// probed, so a second miss must not reach it — and the counters say whether it did.
+/// opened, so a second miss must not reach it — and the counters say whether it did.
 async fn pull_against_a_voucher_rejecting_upstream_n(
     reason: VoucherRejectReason,
     fetches: usize,
@@ -3350,29 +3027,19 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_voucher_rejecting_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
         slash_domain(),
         payload.clone(),
-        total_bytes,
         RATE,
         reason,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -3479,13 +3146,13 @@ async fn node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one(
 /// an absent blob, on the exit that is likelier to fire in production.
 ///
 /// `Origin::fetch` has its own budget-exhaustion arm, and it is the one a broken node
-/// actually reaches: the first cold fetch fills the probe cache, so every subsequent miss is
+/// actually reaches: the first cold fetch fills the candidate cache, so every subsequent miss is
 /// a cache HIT that spends all three attempts on our own signer and leaves through
 /// `miss_answer` at the `budget == 0` short-circuit — never reaching the cold tail the other
 /// tests drive. Without this, reverting that arm to `Ok(OriginFetch::NotFound)` leaves the
 /// whole suite green.
 ///
-/// `candidates` is the seeded probe-cache size, and it selects WHICH exit the walk leaves
+/// `candidates` is the seeded candidate-cache size, and it selects WHICH exit the walk leaves
 /// through — both are driven, because they are different lines with the same job:
 ///
 /// - `MAX_PROVIDER_ATTEMPTS` spends the whole budget and exits at the `budget == 0`
@@ -3493,7 +3160,7 @@ async fn node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one(
 /// - Fewer leaves budget over, so the walk invalidates the cache entry, falls through to a
 ///   discovery that finds nothing (the directory is empty for this hash), and exits at the
 ///   no-providers arm — which must still report the fault the CACHED walk latched. That
-///   cross-walk carry is the part nothing else covers, and a partial probe-cache list is
+///   cross-walk carry is the part nothing else covers, and a partial candidate-cache list is
 ///   routine rather than exotic: `cached_candidates` filters on the negative cache, the
 ///   wedged-provider map, and staker liveness.
 #[tokio::test(flavor = "multi_thread")]
@@ -3505,7 +3172,7 @@ async fn a_buffered_walk_that_exhausts_its_budget_on_local_faults_refuses_rather
     Ok(())
 }
 
-/// One run of the test above, with `candidates` seeded into the probe cache.
+/// One run of the test above, with `candidates` seeded into the candidate cache.
 async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
     let payload = vec![0x5Du8; 4096];
     let hash = support::register_payload(&payload);
@@ -3563,7 +3230,7 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
     );
     // One fault per candidate the walk reached. With a full list that is the whole budget
     // and the fetch never leaves the cached walk; with a short one the cached walk faults,
-    // the entry is invalidated, and the fall-through re-probes providers that do not answer
+    // the entry is invalidated, and the fall-through re-opens providers that do not answer
     // — so the second walk contributes no further faults and the `Err` above can only come
     // from the latch carrying the first walk's verdict across.
     assert_counter(
@@ -3591,7 +3258,7 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
 /// even though the fetch succeeded, because an operator needs to see a node that cannot sign
 /// long before it stops being able to fetch anything at all.
 ///
-/// Order is pinned by a seeded probe cache, not a live probe: RTT is a multiplicative term
+/// Order is pinned by a seeded candidate cache, not a live open: RTT is a multiplicative term
 /// in the ranker, so a loaded runner could otherwise float the honest candidate first and
 /// the local fault would never be reached at all (a green test that proves nothing). See
 /// `build_origin_seeded_ranking`.
@@ -3602,7 +3269,6 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
 
     let payload = vec![0x5Cu8; 4096];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let b_buyer = Arc::new(PrivateKeySigner::random());
 
     // Candidate #1 (F): quotes the cheaper rate so it ranks first, serves the bytes, then
@@ -3610,14 +3276,12 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
     let f_sk = fresh_key();
     let f_id = f_sk.public();
     let f_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_f, addr_f) =
-        local_endpoint(f_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_f, addr_f) = local_endpoint(f_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_f = spawn_a_voucher_rejecting_server(
         ep_f.clone(),
         Arc::clone(&f_eth),
         slash_domain(),
         payload.clone(),
-        total_bytes,
         CHEAP_RATE,
         VoucherRejectReason::BadSignature,
     );
@@ -3660,30 +3324,15 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
     for (id, addr) in [(f_id, addr_f), (a_id, addr_a)] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(id).with_ip_addr(addr),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
+        learn_addr(&ep_b, EndpointAddr::new(id).with_ip_addr(addr)).await?;
     }
 
     let f_dht = DhtNodeId::from_bytes(*f_id.as_bytes());
@@ -3740,8 +3389,8 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
 }
 
 /// #857 regression guard (the over-exoneration direction): a provider that
-/// answers the probe truthfully but then HARD-FAILS the client stream at the
-/// transport (connection closed before any `StreamResponse`) is a GENUINE
+/// HARD-FAILS the client stream at the transport (connection closed before any
+/// `StreamResponse`, the discovery open included) is a GENUINE
 /// reachability failure — not a timeout, voucher rejection, or hash mismatch — so
 /// it MUST still score `Outcome::Unreachable`. This pins the boundary the fix
 /// narrowed: the new exoneration arms must not swallow real transport failures.
@@ -3750,31 +3399,16 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
 async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> {
     let payload = vec![0x44u8; 4096];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_probe_ok_client_dead_server(
-        ep_a.clone(),
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_dead_server(ep_a.clone());
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -3828,15 +3462,85 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
 /// Read the buyer's opening `StreamRequest` off a freshly-accepted client
 /// stream — the first move every hand-rolled upstream below makes.
 async fn read_stream_request(recv: &mut iroh::endpoint::RecvStream) -> Result<StreamRequest> {
+    Ok(read_open(recv).await?.0)
+}
+
+/// Read one `StreamRequest` and whether it asks the node to pull through on a
+/// miss. A request with the flag unset is a voucher-less discovery open: the
+/// node origin opens every candidate this way before it pays anyone.
+async fn read_open(recv: &mut iroh::endpoint::RecvStream) -> Result<(StreamRequest, bool)> {
     let frame = read_frame(recv, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
-    let (msg, _) = decode_message::<ClientMessage>(&frame)
+    let (msg, remainder) = decode_message::<ClientMessage>(&frame)
         .map_err(|e| anyhow::anyhow!("decode request: {e}"))?;
     let ClientMessage::StreamRequest(req) = msg else {
         anyhow::bail!("expected a StreamRequest");
     };
-    Ok(req)
+    let ext = decdn_protocol::client::parse_stream_request_ext(remainder)
+        .map_err(|e| anyhow::anyhow!("decode request ext: {e}"))?;
+    Ok((req, ext.pull_through))
+}
+
+/// Answer the request `req` the way a holder of `coverage` of a `total_bytes`
+/// blob answers it: served (`ok: true`, a size proof, the coverage) when
+/// `coverage` covers every block the requested span touches, else a signed
+/// `NotFound` that names `coverage`. A refusal ends the stream. A served
+/// stream is then refused at its admission: the fixture waits for the payer's
+/// first frame and writes `refusal` before any byte. A node admits a stream it
+/// serves at once (a hit) only at that first proof, so its load shed and
+/// per-signer cap refuse there. Returns whether the answer was served.
+#[allow(clippy::too_many_arguments)]
+async fn answer_open(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    req: &StreamRequest,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    rate: u64,
+    total_bytes: u64,
+    coverage: &Coverage,
+    refusal: StreamError,
+) -> Result<bool> {
+    let blocks = decdn_protocol::num_blocks(total_bytes);
+    let end = if req.byte_len == 0 {
+        total_bytes
+    } else {
+        req.byte_offset
+            .saturating_add(req.byte_len)
+            .min(total_bytes)
+    };
+    let span = decdn_protocol::coverage::byte_range_blocks(req.byte_offset, end);
+    let covers = span.clone().all(|block| {
+        u32::try_from(block).is_ok_and(|block| block < blocks && coverage.covers(block))
+    }) && (total_bytes == 0 || !span.is_empty());
+    let (resp, mut resp_ext) = signed_response(
+        req,
+        eth,
+        slash,
+        rate,
+        total_bytes,
+        (!covers).then_some(StreamError::NotFound),
+    )?;
+    resp_ext.coverage = coverage.clone();
+    write_frame(send, &encode_stream_response(&resp, Some(&resp_ext))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write open answer: {e}"))?;
+    if !covers {
+        let _ = send.finish();
+        return Ok(false);
+    }
+    // The payer's first proof, or the end of a stream it cancelled.
+    if read_frame(recv, decdn_protocol::MAX_CHUNK_FRAME)
+        .await
+        .is_ok()
+    {
+        write_frame(send, &encode_message(&ClientMessage::StreamError(refusal))?)
+            .await
+            .map_err(|e| anyhow::anyhow!("write admission refusal: {e}"))?;
+    }
+    let _ = send.finish();
+    Ok(true)
 }
 
 /// Build the signed `StreamResponse` for `req`. `error: None` ⇒ an accepting
@@ -3959,7 +3663,7 @@ async fn serve_empty_chunks(
     Ok(())
 }
 
-/// Spawn a provider that answers probes truthfully but streams empty
+/// Spawn a provider that answers every open as a holder but streams empty
 /// `ChunkData` frames on the client stream (see [`serve_empty_chunks`], #1088).
 fn spawn_an_empty_chunk_server(
     ep: iroh::Endpoint,
@@ -3976,16 +3680,10 @@ fn spawn_an_empty_chunk_server(
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom) = (Arc::clone(&eth), dom.clone());
-                    async move { serve_empty_chunks(send, recv, &eth, &dom, total_bytes, rate).await }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom) = (Arc::clone(&eth), dom.clone());
+                async move { serve_empty_chunks(send, recv, &eth, &dom, total_bytes, rate).await }
+            }));
         }
     })
 }
@@ -4055,7 +3753,7 @@ fn wire_frames(wire: &[u8], chunks: usize) -> Result<Vec<Vec<u8>>> {
         .collect()
 }
 
-/// Spawn a provider that answers probes truthfully, opens the client stream
+/// Spawn a provider that answers every open as a holder, opens the client stream
 /// honestly, and then goes silent mid-delivery (see [`serve_then_go_silent`]).
 fn spawn_a_mid_stream_silent_server(
     ep: iroh::Endpoint,
@@ -4075,28 +3773,22 @@ fn spawn_a_mid_stream_silent_server(
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
             let wire = Arc::clone(&wire);
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
-                    async move {
-                        serve_then_go_silent(
-                            send,
-                            recv,
-                            &eth,
-                            &dom,
-                            wire,
-                            total_bytes,
-                            rate,
-                            prefix_chunks,
-                        )
-                        .await
-                    }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                async move {
+                    serve_then_go_silent(
+                        send,
+                        recv,
+                        &eth,
+                        &dom,
+                        wire,
+                        total_bytes,
+                        rate,
+                        prefix_chunks,
+                    )
+                    .await
+                }
+            }));
         }
     })
 }
@@ -4164,7 +3856,7 @@ async fn serve_a_paid_interval_then_go_silent(
     Ok(())
 }
 
-/// Spawn a provider that answers probes truthfully, is paid for one full interval,
+/// Spawn a provider that answers every open as a holder, is paid for one full interval,
 /// and then goes silent (see [`serve_a_paid_interval_then_go_silent`]).
 fn spawn_a_paid_then_silent_server(
     ep: iroh::Endpoint,
@@ -4183,27 +3875,21 @@ fn spawn_a_paid_then_silent_server(
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
             let wire = Arc::clone(&wire);
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
-                    async move {
-                        serve_a_paid_interval_then_go_silent(
-                            send,
-                            recv,
-                            &eth,
-                            &dom,
-                            wire,
-                            total_bytes,
-                            rate,
-                        )
-                        .await
-                    }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                async move {
+                    serve_a_paid_interval_then_go_silent(
+                        send,
+                        recv,
+                        &eth,
+                        &dom,
+                        wire,
+                        total_bytes,
+                        rate,
+                    )
+                    .await
+                }
+            }));
         }
     })
 }
@@ -4246,8 +3932,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_paid_then_silent_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
@@ -4259,14 +3944,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -4421,7 +4099,7 @@ async fn serve_then_error_mid_stream(
     Ok(())
 }
 
-/// Spawn a provider that answers probes truthfully, opens honestly, and then fails the
+/// Spawn a provider that answers every open as a holder, opens honestly, and then fails the
 /// delivery with a mid-stream `StreamError` (see [`serve_then_error_mid_stream`]).
 fn spawn_a_mid_stream_error_server(
     ep: iroh::Endpoint,
@@ -4442,38 +4120,44 @@ fn spawn_a_mid_stream_error_server(
             let dom = slash.clone();
             let err = error.clone();
             let wire = Arc::clone(&wire);
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
-                    let err = err.clone();
-                    async move {
-                        serve_then_error_mid_stream(
-                            send,
-                            recv,
-                            &eth,
-                            &dom,
-                            wire,
-                            total_bytes,
-                            rate,
-                            err,
-                        )
-                        .await
-                    }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                let err = err.clone();
+                async move {
+                    serve_then_error_mid_stream(
+                        send,
+                        recv,
+                        &eth,
+                        &dom,
+                        wire,
+                        total_bytes,
+                        rate,
+                        err,
+                    )
+                    .await
+                }
+            }));
         }
     })
 }
 
-/// Spawn an upstream that answers probes truthfully and REFUSES the client
-/// stream with `error` — a signed `StreamResponse` carrying `ok: false` plus the
-/// wire code (#1144). Used for the codes a real `ClientHandler` will not produce
-/// on demand (`InternalError`); the honest-`NotFound` case is driven through a
-/// real handler with an empty cache, so the refusal is genuinely earned.
+/// Where a refusing fixture refuses a voucher-less discovery open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefuseDiscovery {
+    /// At the open, with a signed refusal: the peer holds nothing, which is
+    /// the honest miss.
+    AtOpen,
+    /// At admission: the peer answers as a holder of the whole blob, and
+    /// refuses the pull that adopts the stream at its first proof.
+    AtAdmission,
+}
+
+/// Spawn an upstream that answers discovery as a holder and REFUSES the paid
+/// stream with `error` (#1144): at the admission of an adopted discovery
+/// stream, or with a signed `ok: false` answer to an open that pulls through.
+/// Used for the codes a real `ClientHandler` will not produce on demand
+/// (`InternalError`); the honest-`NotFound` case is driven through a real
+/// handler with an empty cache, so the refusal is genuinely earned.
 fn spawn_a_refusing_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
@@ -4482,35 +4166,42 @@ fn spawn_a_refusing_server(
     rate: u64,
     error: StreamError,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(incoming) = ep.accept().await {
-            let Ok(connecting) = incoming.accept() else {
-                continue;
-            };
-            let Ok(conn) = connecting.await else { continue };
-            let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
-            let error = error.clone();
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, error) = (Arc::clone(&eth), dom.clone(), error.clone());
-                    async move { serve_refusal(send, recv, &eth, &dom, total_bytes, rate, error).await }
-                }));
-            }
-        }
-    })
+    spawn_refusing_server(
+        ep,
+        a_eth,
+        slash,
+        (total_bytes, rate),
+        error,
+        RefuseDiscovery::AtAdmission,
+        None,
+    )
 }
 
-/// Like [`spawn_a_refusing_server`], but counts both `cdn/probe/v1` requests and
-/// `cdn/client/v1` streams — the instrument for the probe-cache
-/// negative-cache-interaction test (#1165), which must show this refusing
-/// provider probed and streamed to exactly ONCE across two fetches. Each pull
-/// attempt is one stream on the requester's pooled connection.
-#[allow(clippy::too_many_arguments)]
+/// Spawn an upstream that holds nothing: it refuses every open, a discovery
+/// open included, with a signed `NotFound`.
+fn spawn_a_missing_server(
+    ep: iroh::Endpoint,
+    a_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    total_bytes: u64,
+    rate: u64,
+) -> tokio::task::JoinHandle<()> {
+    spawn_refusing_server(
+        ep,
+        a_eth,
+        slash,
+        (total_bytes, rate),
+        StreamError::NotFound,
+        RefuseDiscovery::AtOpen,
+        None,
+    )
+}
+
+/// Like [`spawn_a_refusing_server`], but counts all the `cdn/client/v1`
+/// streams — the instrument for the candidate-cache negative-cache-interaction
+/// test (#1165), which must show this refusing provider streamed to exactly
+/// ONCE across two fetches. A pull that adopts its discovery stream opens no
+/// other stream.
 fn spawn_a_refusing_server_with_counters(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
@@ -4518,8 +4209,29 @@ fn spawn_a_refusing_server_with_counters(
     total_bytes: u64,
     rate: u64,
     error: StreamError,
-    probes: Arc<AtomicUsize>,
     streams: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_refusing_server(
+        ep,
+        a_eth,
+        slash,
+        (total_bytes, rate),
+        error,
+        RefuseDiscovery::AtAdmission,
+        Some(streams),
+    )
+}
+
+/// The accept loop of the refusing fixtures: every stream is served by
+/// [`serve_refusal`]. `streams` counts the streams.
+fn spawn_refusing_server(
+    ep: iroh::Endpoint,
+    a_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    (total_bytes, rate): (u64, u64),
+    error: StreamError,
+    discovery: RefuseDiscovery,
+    streams: Option<Arc<AtomicUsize>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
@@ -4530,37 +4242,70 @@ fn spawn_a_refusing_server_with_counters(
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
             let error = error.clone();
-            if conn.alpn() == ALPN_PROBE {
-                let probes = Arc::clone(&probes);
-                tokio::spawn(async move {
-                    probes.fetch_add(1, Ordering::SeqCst);
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                let streams = Arc::clone(&streams);
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+            let streams = streams.clone();
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                if let Some(streams) = &streams {
                     streams.fetch_add(1, Ordering::SeqCst);
-                    let (eth, dom, error) = (Arc::clone(&eth), dom.clone(), error.clone());
-                    async move { serve_refusal(send, recv, &eth, &dom, total_bytes, rate, error).await }
-                }));
-            }
+                }
+                let (eth, dom, error) = (Arc::clone(&eth), dom.clone(), error.clone());
+                async move {
+                    serve_refusal(
+                        send,
+                        recv,
+                        (&eth, &dom),
+                        (total_bytes, rate),
+                        error,
+                        discovery,
+                    )
+                    .await
+                }
+            }));
         }
     })
 }
 
-/// Answer the client stream with a signed refusal (`ok: false`, `error`), then
-/// finish it — the wire shape of every `UpstreamRefused` (#1144).
+/// Refuse the client stream with `error` — the wire shape of every
+/// `UpstreamRefused` (#1144). A voucher-less discovery open is refused where
+/// `discovery` says. Any other open is refused with a signed `ok: false`
+/// answer, then finished.
 async fn serve_refusal(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
-    eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
-    total_bytes: u64,
-    rate: u64,
+    (eth, slash): (&Arc<PrivateKeySigner>, &Eip712Domain),
+    (total_bytes, rate): (u64, u64),
+    error: StreamError,
+    discovery: RefuseDiscovery,
+) -> Result<()> {
+    let (req, pull_through) = read_open(&mut recv).await?;
+    if !pull_through && discovery == RefuseDiscovery::AtAdmission {
+        let full = Coverage::full(decdn_protocol::num_blocks(total_bytes));
+        answer_open(
+            &mut send,
+            &mut recv,
+            &req,
+            eth,
+            slash,
+            rate,
+            total_bytes,
+            &full,
+            error,
+        )
+        .await?;
+        return Ok(());
+    }
+    refuse_at_open(send, &req, (eth, slash), (total_bytes, rate), error).await
+}
+
+/// Answer `req` with a signed refusal (`ok: false`, `error`), then finish the
+/// stream.
+async fn refuse_at_open(
+    mut send: iroh::endpoint::SendStream,
+    req: &StreamRequest,
+    (eth, slash): (&Arc<PrivateKeySigner>, &Eip712Domain),
+    (total_bytes, rate): (u64, u64),
     error: StreamError,
 ) -> Result<()> {
-    let req = read_stream_request(&mut recv).await?;
-    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, Some(error))?;
+    let (resp, resp_ext) = signed_response(req, eth, slash, rate, total_bytes, Some(error))?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
         .await
         .map_err(|e| anyhow::anyhow!("write refusal: {e}"))?;
@@ -4597,19 +4342,12 @@ fn spawn_a_slow_but_healthy_server(
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
             let wire = Arc::clone(&wire);
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
-                    async move {
-                        serve_wire_paced(send, recv, &eth, &dom, &wire, total_bytes, rate, gap)
-                            .await
-                    }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                async move {
+                    serve_wire_paced(send, recv, &eth, &dom, &wire, total_bytes, rate, gap).await
+                }
+            }));
         }
     })
 }
@@ -4650,8 +4388,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_an_empty_chunk_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
@@ -4662,14 +4399,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -4754,8 +4484,7 @@ async fn node_origin_mid_stream_silence_does_not_score_stalled_upstream() -> Res
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     // Three 1 KiB frames: real progress (so this is unambiguously a MID-stream
     // stall, not an open-stage one), but far under the voucher accounting interval, so
     // no voucher round trip intrudes on the silence that follows.
@@ -4771,14 +4500,7 @@ async fn node_origin_mid_stream_silence_does_not_score_stalled_upstream() -> Res
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -4873,8 +4595,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     // ZERO chunks: a signed, honest `StreamResponse`, and then nothing — the shape of a
     // server still grinding through a large `export_bao_range`.
     let task_a = spawn_a_mid_stream_silent_server(
@@ -4889,14 +4610,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -4945,7 +4659,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
 
     // Unscored, but NOT ignored (#1145 review). A SECOND miss must not reach this peer
     // again: exonerating it and doing nothing are different things, and doing nothing left
-    // the cheapest griefer in the protocol unanswered — probe honestly, accept the stream,
+    // the cheapest griefer in the protocol unanswered — open honestly, accept the stream,
     // send nothing, stay top-ranked, and burn a full budget on every miss forever at no
     // cost. Suppression is reputation-neutral, so it costs an honest-but-slow peer one TTL
     // and costs a silent one its free lunch.
@@ -4999,8 +4713,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     // `NotFound` mid-stream: the eviction-race shape. An honest answer from a reachable
     // peer, and the one whose mis-scoring #1144 was filed about.
     let task_a = spawn_a_mid_stream_error_server(
@@ -5015,14 +4728,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -5108,13 +4814,11 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     // mid-stream voucher racing the chunk writes into the ack wait (the #857 test's fixture size).
     let payload = vec![0x4Du8; 4096];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     // `NotFound` in reply to the voucher: a load shed from a reachable peer, the code a
     // stringifying ack-wait catch-all would misread as `Unreachable`.
     let task_a = spawn_a_voucher_erroring_server(
@@ -5122,21 +4826,13 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         Arc::clone(&a_eth),
         slash_domain(),
         payload.clone(),
-        total_bytes,
         RATE,
         StreamError::NotFound,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -5202,7 +4898,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
 /// Without it the only peer-keyed SUPPRESSION is that 30s (peer, hash) entry, which does not
 /// cover a different blob, so the next miss re-selects the provider and re-wedges it.
 ///
-/// Fail-on-revert: drop the `provider_is_wedged` filter in `probe_and_rank` and the second
+/// Fail-on-revert: drop the `provider_is_wedged` filter in `open_and_rank` and the second
 /// pull re-selects A, re-wedging it — `node_pull_pool_wedged_total` becomes 2, not 1.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
@@ -5217,8 +4913,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     // A rejects every closing voucher with `AmountRegression` → wedges on any pull it is
     // selected for. The server loops, so it handles both pulls.
     let task_a = spawn_a_voucher_rejecting_server(
@@ -5226,7 +4921,6 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
         Arc::clone(&a_eth),
         slash_domain(),
         payload1.clone(),
-        u64::try_from(payload1.len()).unwrap_or(u64::MAX),
         RATE,
         VoucherRejectReason::AmountRegression,
     );
@@ -5235,18 +4929,9 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     let b_id = fresh_key().public();
     let b_dht = DhtNodeId::from_bytes(*b_id.as_bytes());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
-    // Probe A for BOTH hashes so it is a live, reachable candidate for each — the filter, not a
-    // failed probe, must be what keeps A out of the second pull.
-    for h in [&hash1, &hash2] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(a_id).with_ip_addr(addr_a),
-            *h.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
-    }
+    // A is a live, reachable candidate for both hashes — the filter, not a failed open,
+    // must be what keeps A out of the second pull.
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -5285,7 +4970,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     anyhow::ensure!(matches!(got1, OriginFetch::NotFound), "pull 1 must refuse");
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
 
-    // Pull 2 (hash2, a DIFFERENT blob): A is wedged provider-wide, so `probe_and_rank` must skip
+    // Pull 2 (hash2, a DIFFERENT blob): A is wedged provider-wide, so `open_and_rank` must skip
     // it. With no other provider, the pull finds no candidate and returns NotFound WITHOUT
     // re-selecting A — so no second wedge.
     let got2 = tokio::time::timeout(
@@ -5339,8 +5024,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remed
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     // `Unfunded` OUTSIDE a voucher round trip: the same code the drained-pool
     // test drives through the ack wait, arriving on the other road.
     let task_a = spawn_a_mid_stream_error_server(
@@ -5358,14 +5042,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remed
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -5479,8 +5156,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     let s1_sk = fresh_key();
     let s1_id = s1_sk.public();
     let s1_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_s1, addr_s1) =
-        local_endpoint(s1_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_s1, addr_s1) = local_endpoint(s1_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let wire = Arc::new(honest_bao_wire(&payload)?);
     let task_s1 = spawn_a_mid_stream_silent_server(
         ep_s1.clone(),
@@ -5495,8 +5171,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     let s2_sk = fresh_key();
     let s2_id = s2_sk.public();
     let s2_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_s2, addr_s2) =
-        local_endpoint(s2_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_s2, addr_s2) = local_endpoint(s2_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_s2 = spawn_a_mid_stream_silent_server(
         ep_s2.clone(),
         Arc::clone(&s2_eth),
@@ -5545,30 +5220,15 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: the requester. ------------------------------------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
     for (id, addr) in [(s1_id, addr_s1), (s2_id, addr_s2), (a_id, addr_a)] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(id).with_ip_addr(addr),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
+        learn_addr(&ep_b, EndpointAddr::new(id).with_ip_addr(addr)).await?;
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
@@ -5590,8 +5250,8 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     }) as Arc<dyn PoolOpener>;
 
     // Both silent candidates quote the cheaper `STALL_RATE`, so they rank ahead of A
-    // (`RATE`). Order is PINNED via a seeded probe cache: RTT is a multiplicative ranker
-    // term, so a loaded runner's live-probe jitter could otherwise float A ahead of a
+    // (`RATE`). Order is PINNED via a seeded candidate cache: RTT is a multiplicative ranker
+    // term, so a loaded runner's live-open jitter could otherwise float A ahead of a
     // silent candidate, deliver from A first, and leave that candidate untried (one
     // stall or none, flake). See `build_origin_seeded_ranking`.
     let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
@@ -5690,8 +5350,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let gap = Duration::from_millis(600);
     let task_a = spawn_a_slow_but_healthy_server(
         ep_a.clone(),
@@ -5705,14 +5364,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -5789,7 +5441,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
 /// answering node exactly as hard for truthfully saying it lacks a blob as for
 /// being dead in its local reputation score. (`NotFound` is
 /// NODE-scoped, not blob-scoped: seven `ServeRejectReason`s collapse onto it so
-/// lane existence cannot be probed, so it is not even reliable evidence about
+/// lane existence cannot be opened, so it is not even reliable evidence about
 /// the blob.)
 ///
 /// The `client_loopback` refusal test is NOT a guard for this: it asserts the
@@ -5801,7 +5453,6 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
 async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     let payload = vec![0x4Eu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let pool_id = B256::repeat_byte(0x4E);
     let domains = HandlerDomains {
@@ -5811,7 +5462,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     };
 
     // --- Node N: a REAL handler with an EMPTY cache, quoting the cheaper rate so
-    //     it ranks #1. It answers the probe (the hand-rolled responder claims the
+    //     it ranks #1. It answers the open (the hand-rolled responder claims the
     //     blob, exactly as an over-optimistic or just-evicted node would) and then
     //     honestly refuses on the client stream: it does not have the blob. ------
     let (cache_n, _tmp_n) = empty_cache().await?;
@@ -5844,16 +5495,8 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_n, addr_n) =
-        local_endpoint(n_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_n = spawn_a_server(
-        ep_n.clone(),
-        handler_n,
-        Arc::clone(&n_eth),
-        slash_domain(),
-        total_bytes,
-        STALL_RATE,
-    );
+    let (ep_n, addr_n) = local_endpoint(n_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_n = spawn_a_server(ep_n.clone(), handler_n);
 
     // --- Node A: holds the blob and serves it. --------------------------------
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
@@ -5885,30 +5528,15 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
     for (id, addr) in [(n_id, addr_n), (a_id, addr_a)] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(id).with_ip_addr(addr),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
+        learn_addr(&ep_b, EndpointAddr::new(id).with_ip_addr(addr)).await?;
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
@@ -5925,7 +5553,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    // Seeded ranking: a live loopback probe can time N slower than A by more than
+    // Seeded ranking: a live loopback open can time N slower than A by more than
     // their 2× rate gap, and A ranked first never asks N at all (#2268).
     let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
@@ -5977,7 +5605,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     );
 
     // …but exonerating N must not mean FORGETTING about it (#1145 review). N answered
-    // `has_blob = true` at probe and then refused the pull, so it contradicted itself;
+    // as a holder at discovery and then refused the pull, so it contradicted itself;
     // with no record of any kind it keeps its neutral score, keeps out-ranking A on
     // rate, and burns one of `MAX_PROVIDER_ATTEMPTS` on every single miss — forever.
     // The refusal is negative-cached against (N, hash), so a second fetch skips N
@@ -6017,12 +5645,12 @@ const TINY_CACHE_TTL: Duration = Duration::from_millis(100);
 const PAST_THE_TINY_TTL: Duration = Duration::from_millis(600);
 
 /// Refuse one pull with `error`, wait `wait`, then pull again — and report whether the
-/// second pull was SUPPRESSED (the peer was never re-probed) or went through.
+/// second pull was SUPPRESSED (the peer was never re-opened) or went through.
 ///
 /// The suppression is observed behaviourally, through `cached_candidates`' filter on a
-/// probe-cache hit, and `probe_and_rank`'s on the cold path — the two chokepoints every
+/// candidate-cache hit, and `open_and_rank`'s on the cold path — the two chokepoints every
 /// candidate passes — rather than by reading the cache directly: a suppressed (peer, hash)
-/// is dropped from the candidate list before it can be probed, so the second fetch never
+/// is dropped from the candidate list before it can be opened, so the second fetch never
 /// becomes a second refusal. That is the property that actually matters — the cache entry
 /// is only the means.
 ///
@@ -6039,8 +5667,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_refusing_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
@@ -6052,14 +5679,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -6099,7 +5719,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
     tokio::time::sleep(wait).await;
 
     // Pull #2: if the suppression is still live the candidate is filtered out before it can
-    // be probed, so no second refusal is ever recorded.
+    // be opened, so no second refusal is ever recorded.
     let _ = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
@@ -6176,8 +5796,7 @@ async fn node_origin_declined_refusal_is_not_scored() -> Result<()> {
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_refusing_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
@@ -6189,14 +5808,7 @@ async fn node_origin_declined_refusal_is_not_scored() -> Result<()> {
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -6298,29 +5910,14 @@ async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint with a sub-blob ceiling. ------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -6365,11 +5962,11 @@ async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -
     Ok(())
 }
 
-/// #2471: the empty blob spans zero discovery blocks, so A's probe answer is
-/// `has_blob: true` over an EMPTY coverage with `total_bytes: 0`. B's probe
-/// consumer must accept that answer for the empty root (it is the one hash whose
-/// holder coverage is empty) and pull through to A, instead of dropping it as a
-/// `has_blob`/coverage mismatch and answering `NotFound` with no provider.
+/// #2471: the empty blob spans zero discovery blocks, so A's open answer is
+/// served over an EMPTY coverage with a proven size of 0. B's discovery must
+/// accept that answer for the empty root (it is the one hash whose holder
+/// coverage is empty) and pull through to A, instead of dropping it as a
+/// coverage mismatch and answering `NotFound` with no provider.
 ///
 /// `max_blob_size_bytes` is the buyer ceiling: `0` leaves it unbounded, and a
 /// positive one must not refuse a 0-byte blob.
@@ -6381,7 +5978,7 @@ async fn empty_blob_fetch_at_ceiling(ceiling: u64) -> Result<()> {
         "fixture must be the empty root"
     );
 
-    // --- Node A: honest server whose probe responder advertises size 0. ------
+    // --- Node A: honest server whose open answer proves size 0. --------------
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -6419,29 +6016,14 @@ async fn empty_blob_fetch_at_ceiling(ceiling: u64) -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        0,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
-    // --- Node B: dial-only endpoint that discovers A through the probe. -------
+    // --- Node B: dial-only endpoint that discovers A through the open. -------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -6468,7 +6050,7 @@ async fn empty_blob_fetch_at_ceiling(ceiling: u64) -> Result<()> {
         matches!(got, OriginFetch::AlreadyAdmitted),
         "the empty blob must be discovered and admitted, got {got:?}"
     );
-    // A was ranked and pulled from: the probe answer was accepted, not dropped.
+    // A was ranked and pulled from: the open answer was accepted, not dropped.
     assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
     assert_counter(&b_metrics, "node_pull_no_providers_total", 0)?;
     assert_counter(&b_metrics, "node_pull_too_large_total", 0)?;
@@ -6478,37 +6060,30 @@ async fn empty_blob_fetch_at_ceiling(ceiling: u64) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn node_origin_discovers_the_empty_blob_by_probe() -> Result<()> {
+async fn node_origin_discovers_the_empty_blob_by_open() -> Result<()> {
     empty_blob_fetch_at_ceiling(0).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn node_origin_discovers_the_empty_blob_by_probe_under_a_ceiling() -> Result<()> {
+async fn node_origin_discovers_the_empty_blob_by_open_under_a_ceiling() -> Result<()> {
     empty_blob_fetch_at_ceiling(1_048_576).await
 }
 
-/// #1375: the buyer-side rate ceiling on the real node pull path — and specifically
-/// its PROBE-RELATIVE bound, with the absolute config ceiling left unbounded (`0`).
-/// Node A probes cheap (`RATE/2`) but its `ClientHandler` signs a stream quote at
-/// the full `RATE` — the "quote low on the probe, quote high on the stream"
-/// bait-and-switch. The buyer's effective ceiling is
-/// `effective_rate_ceiling(candidate.rate = RATE/2, config = 0) = RATE/2`, so the
-/// `RATE` quote is refused BEFORE any voucher, classified `PullVerdict::RateCeiling`.
+/// #1375: the buyer-side rate ceiling on the real node pull path. Node A's
+/// `ClientHandler` signs its discovery answer at `RATE`, above B's configured
+/// `max_rate_per_mb` of `RATE / 2`, so discovery excludes A before any voucher
+/// and the fetch is a clean miss. There is no ceiling relative to an earlier
+/// quote: the signed answer B would pay is the one the ceiling reads.
 ///
-/// This is the only test that pins `candidate.rate_per_mb` is actually bound as the
-/// ceiling (the loopback test passes an explicit ceiling and bypasses
-/// `effective_rate_ceiling`/`node_origin`). Like the oversized-claim sibling it
-/// asserts the provider is NOT scored (buyer policy, not provider fault) and the
-/// dedicated counter moves.
+/// Like the oversized-claim sibling it asserts the provider is NOT scored
+/// (buyer policy, not provider fault) and the dedicated counter moves.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<()> {
     let payload = vec![0xABu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
-    let probe_rate = RATE / 2; // A advertises cheap at probe...
 
-    // --- Node A: holds the blob, probes at `probe_rate` but its handler quotes `RATE`.
+    // --- Node A: holds the blob; its handler quotes `RATE`.
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -6535,7 +6110,6 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
-    // Handler advertises the full RATE, so its signed stream quote is RATE.
     let handler_a = build_handler_full(
         a_id,
         &a_eth,
@@ -6547,49 +6121,37 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // The probe leg answers at the LOWER probe_rate, so the candidate is selected on RATE/2.
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        probe_rate,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
-    // --- Node B: dial-only buyer with an UNBOUNDED absolute rate ceiling (default 0).
+    // --- Node B: dial-only buyer whose absolute rate ceiling is `RATE / 2`.
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    // `0` ceiling => unlimited blob size, so the blob gate cannot fire; the origin's
-    // NodeOriginConfig.max_rate_per_mb defaults to 0, so only the probe-relative
-    // bound applies — exactly what we are exercising.
-    let (origin, _engine, _engine_tmp) = provisioned_origin_with_ceiling(
+    let (buyer, _recorded) = stub_opener(pool_id, &b_buyer);
+    let discovery = FixtureDiscovery {
+        max_rate_per_mb: RATE / 2,
+        ..FixtureDiscovery::directory_only(providers, U256::ZERO)
+    };
+    let (origin, _engine, _engine_tmp) = build_origin_with_discovery(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
-        hash,
-        pool_id,
-        &b_buyer,
+        buyer,
         &local_rep,
         &b_metrics,
-        providers,
+        discovery,
         addr_map,
+        DEFAULT_TEST_PULL_DEADLINES.0,
+        DEFAULT_TEST_PULL_DEADLINES.1,
         0,
+        NegativeProbeCache::new(),
+        CandidateCache::new(),
     )
     .await;
 
@@ -6605,6 +6167,10 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
         "provider score must stay neutral after a rate-ceiling rejection, got {}",
         local_rep.score(a_id)
+    );
+    anyhow::ensure!(
+        origin.is_suppressed(a_id, hash),
+        "the over-ceiling quote is durable for the pair, so it is suppressed briefly"
     );
     assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
     assert_counter(&b_metrics, "node_pull_rate_above_ceiling_total", 1)?;
@@ -6640,7 +6206,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     let hash2 = support::register_payload(&payload2);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds both blobs; serves probe + client over one endpoint. ---
+    // --- Node A: holds both blobs; serves the client protocol. ---
     let (cache_a, _tmp_a) = cache_with_blobs(&[&payload1, &payload2]).await?;
     let a_sk = fresh_key();
     let a_id = a_sk.public();
@@ -6677,31 +6243,14 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    for hash in [hash1, hash2] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(a_id).with_ip_addr(addr_a),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
-    }
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -6800,9 +6349,8 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
 async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<()> {
     let payload = vec![0xABu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds the blob; serves probe + client over one endpoint. -----
+    // --- Node A: holds the blob; serves the client protocol. -----
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -6840,29 +6388,14 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: NodeOrigin wired to an opener whose record_progress fails. ----
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -7527,14 +7060,7 @@ async fn build_node_b_with_store(
     let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     // Prime B's iroh address cache for A so NodeId-only dialing in the pull
     // resolves (same priming the buffered tests use).
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(a_addr),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(a_addr)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -7612,7 +7138,7 @@ async fn build_node_b_with_store(
         16,
         |deps| {
             // Credit-paced pull-through (ADR 037): the deadline accommodates the
-            // full discover→probe→pull, paced by what the downstream lane has
+            // full discover→open→pull, paced by what the downstream lane has
             // paid.
             deps.pull_through = Some(Duration::from_secs(20));
             deps.pull_through_origin = Some(Arc::new(origin));
@@ -7636,7 +7162,7 @@ async fn build_node_b_with_store(
     ))
 }
 
-/// Spin up A (holds the blob, serves probe + client). Returns the pieces the
+/// Spin up A (holds the blob, serves the client protocol). Returns the pieces the
 /// caller needs to build B and run the leaf.
 async fn spawn_node_a(
     payload: &[u8],
@@ -7669,7 +7195,6 @@ async fn spawn_node_a_metered(
     Arc<Metrics>,
 )> {
     let hash = support::register_payload(payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let (cache_a, hash_a, tmp_a) = cache_with_blob(payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     std::mem::forget(tmp_a);
@@ -7706,16 +7231,8 @@ async fn spawn_node_a_metered(
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
     Ok((a_id, addr_a, a_eth, ep_a, task_a, metrics))
 }
 
@@ -7891,30 +7408,27 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
 
     // The ranged pull runs on its own thread and runtime; each run from A is an
     // `upstream_stream` span under the pull thread's `serve_miss_pull`, with the
-    // buffered path's join keys. The first leg is the primed handshake pull,
-    // opened under `serve_stream` before the pull starts; the later leg opens
-    // under the run's span.
+    // buffered path's join keys. The first leg is A's discovery open, opened
+    // under `serve_stream` before the pull starts and adopted as the primed
+    // handshake pull; the later leg opens under the run's span.
     await_run_outcome(&spans, hash, "filled", a_id, ab_pool_id).await?;
+    let discovered = spans.matching("discovery_open", "hash", &hash.to_string());
     let opens = spans.matching("open_progressive_pull", "hash", &hash.to_string());
-    let leg_parent = |offset: &str| {
-        opens
-            .iter()
-            .find(|s| s.fields.get("byte_offset").map(String::as_str) == Some(offset))
-            .and_then(|s| s.parent)
-    };
     anyhow::ensure!(
-        leg_parent("0") == Some("serve_stream")
-            && opens.iter().any(|s| {
-                s.fields.get("byte_offset").map(String::as_str) != Some("0")
-                    && s.parent == Some("upstream_stream")
-            }),
-        "the handshake leg nests under serve_stream, the later leg under upstream_stream: \
-         {opens:?}"
+        discovered.iter().any(|s| {
+            s.fields.get("byte_offset").map(String::as_str) == Some("0")
+                && s.parent == Some("serve_stream")
+        }) && opens.iter().all(|s| {
+            s.fields.get("byte_offset").map(String::as_str) != Some("0")
+                && s.parent == Some("upstream_stream")
+        }) && !opens.is_empty(),
+        "the first leg is the discovery open under serve_stream, the later leg nests under \
+         upstream_stream: {discovered:?} {opens:?}"
     );
     Ok(())
 }
 
-/// The serve-miss handshake is the pull leg's first leg (#2063). A's probe
+/// The serve-miss handshake is the pull leg's first leg (#2063). A's open
 /// reports the blob's size, so B's handshake opens `[0, window)` (the first leg
 /// its paced pull draws) instead of a whole-blob open it would drop, and the pull
 /// leg adopts it. A therefore serves exactly the two paid legs, `[0, window)`
@@ -8262,7 +7776,7 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
     assert_counter(&b_metrics, "serve_stream_rejected_internal_error_total", 1)?;
     assert_counter(&b_metrics, "serve_stream_rejected_cache_miss_total", 0)?;
     // The fault is metered as ours on the pull leg too, and A — which behaved perfectly,
-    // answering B's probe and then never being asked for a paid stream — keeps a clean
+    // answering B's open and then never being asked for a paid stream — keeps a clean
     // record.
     assert_counter(&b_metrics, "node_pull_local_fault_total", 1)?;
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
@@ -8292,19 +7806,17 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
     let ab_pool_id = B256::repeat_byte(0xA2);
     let b_buyer = Arc::new(PrivateKeySigner::random());
 
-    // A answers probes but refuses the paid stream: the honest "I don't have it" answer.
+    // A refuses every open: the honest "I don't have it" answer.
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, a_addr) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_refusing_server(
+    let (ep_a, a_addr) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_missing_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::NotFound,
     );
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
@@ -9398,12 +8910,11 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
     Ok(())
 }
 
-/// Spin up a lying upstream A: it answers probes truthfully (`has_blob`) but
-/// serves wrong bytes of the advertised length on the client stream. Same shape
-/// as [`spawn_node_a`] so it drops into [`build_node_b`].
+/// Spin up a lying upstream A: it answers every open with a valid signed
+/// answer but serves wrong bytes of the answered length on the client stream.
+/// Same shape as [`spawn_node_a`] so it drops into [`build_node_b`].
 async fn spawn_lying_node_a(
     served_wrong: Vec<u8>,
-    advertised_bytes: u64,
 ) -> Result<(
     iroh::PublicKey,
     std::net::SocketAddr,
@@ -9414,14 +8925,12 @@ async fn spawn_lying_node_a(
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_lying_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
         slash_domain(),
         served_wrong,
-        advertised_bytes,
         RATE,
     );
     Ok((a_id, addr_a, a_eth, ep_a, task_a))
@@ -9639,8 +9148,7 @@ async fn spawn_paced_lying_node_a(
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let slash = slash_domain();
     let eth = Arc::clone(&a_eth);
     let accept_ep = ep_a.clone();
@@ -9654,28 +9162,22 @@ async fn spawn_paced_lying_node_a(
             let eth = Arc::clone(&eth);
             let dom = slash.clone();
             let wire = Arc::clone(&wire);
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, RATE, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
-                    async move {
-                        serve_wire_paced(
-                            send,
-                            recv,
-                            &eth,
-                            &dom,
-                            &wire,
-                            total_bytes,
-                            RATE,
-                            Duration::ZERO,
-                        )
-                        .await
-                    }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                async move {
+                    serve_wire_paced(
+                        send,
+                        recv,
+                        &eth,
+                        &dom,
+                        &wire,
+                        total_bytes,
+                        RATE,
+                        Duration::ZERO,
+                    )
+                    .await
+                }
+            }));
         }
     });
     Ok((a_id, addr_a, a_eth, ep_a, task_a))
@@ -9700,12 +9202,10 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
         support::register_payload(&served_wrong) != hash,
         "fixtures must differ"
     );
-    let advertised_bytes = u64::try_from(honest.len()).unwrap_or(u64::MAX);
 
     let ab_pool_id = B256::repeat_byte(0xA6);
     let b_buyer = Arc::new(PrivateKeySigner::random());
-    let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_lying_node_a(served_wrong, advertised_bytes).await?;
+    let (a_id, a_addr, a_eth, ep_a, task_a) = spawn_lying_node_a(served_wrong).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_pool_id = B256::repeat_byte(0x6F);
@@ -10604,8 +10104,7 @@ async fn window_pull_through_leaf_gone_while_the_pull_owes_the_first_byte_ends_t
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, a_addr) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, a_addr) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_mid_stream_silent_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
@@ -11240,7 +10739,7 @@ async fn window_pull_through_over_long_range_on_a_blob_within_the_cap_is_served(
 async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<()> {
     let payload = vec![0xC1u8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    // A second blob of the SAME length: the probe responder quotes one `total_bytes`.
+    // A second blob of the SAME length, so both pulls answer one `total_bytes`.
     let payload2 = vec![0xC2u8; PAYLOAD_LEN];
     let hash2 = support::register_payload(&payload2);
     anyhow::ensure!(hash != hash2, "the two fixtures must be distinct blobs");
@@ -11284,31 +10783,14 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: one origin, both hashes discoverable on A.
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    for h in [hash, hash2] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(a_id).with_ip_addr(addr_a),
-            *h.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
-    }
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -11355,11 +10837,11 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
         negative_cache: NegativeProbeCache::new(),
-        probe_cache: PositiveProbeCache::new(),
+        candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(&b_metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
-            probe_fanout: 5,
+            open_fanout: 5,
             // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
             // runner must not end a pull this fixture is not measuring.
             pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
@@ -11478,21 +10960,21 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
     Ok(())
 }
 
-/// ADR 001 §Probe cache: "On a cache miss the requester checks the probe cache first; if a
+/// ADR 001 §Candidate cache: "On a cache miss the requester checks the candidate cache first; if a
 /// valid entry exists, it skips DHT lookup and goes straight to selection."
 ///
 /// Observed where it is defined — at the WIRE. Asserting on
-/// `decdn_probe_cache_hits_total` alone would pass an implementation that increments the
-/// counter and probes anyway; the counter is the report, the silent probe endpoint is the
+/// `decdn_candidate_cache_hits_total` alone would pass an implementation that increments
+/// the counter and opens anyway; the counter is the report, the absent `discovery_open` is the
 /// property.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> {
+async fn a_second_fetch_inside_the_ttl_skips_discovery_entirely() -> Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x5Cu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds the blob; serves probe + client, counting probes. ------
+    // --- Node A: holds the blob; serves the client protocol. ------
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -11530,34 +11012,15 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let probes = Arc::new(AtomicUsize::new(0));
-    let task_a = spawn_a_probe_counting_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-        Arc::clone(&probes),
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
-    // The priming dial above is itself a real probe against A's counting server
-    // — reset so the counter below measures only the fetches under test.
-    probes.store(0, Ordering::SeqCst);
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
+    // The priming dial opens no stream, so it sends no discovery open.
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -11584,8 +11047,11 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
             && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob"
     );
-    anyhow::ensure!(probes.load(Ordering::SeqCst) == 1, "first fetch must probe");
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    anyhow::ensure!(
+        opens(&spans, Some(a_id), Some(hash)) == 1,
+        "first fetch must open"
+    );
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
 
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -11596,14 +11062,14 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         "second fetch must deliver the blob"
     );
     anyhow::ensure!(
-        probes.load(Ordering::SeqCst) == 1,
-        "the second fetch re-probed — the probe cache saved nothing, which is the entire \
-         point of ADR 001 §Probe cache"
+        opens(&spans, Some(a_id), Some(hash)) == 1,
+        "the second fetch re-opened — the candidate cache saved nothing, which is the entire \
+         point of ADR 001 §Candidate cache"
     );
-    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
-    // The cache hit sends no probe, so it opens no collection window.
-    assert_counter(&b_metrics, "probe_collection_latency_seconds_count", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
+    // The cache hit sends no open, so it opens no collection window.
+    assert_counter(&b_metrics, "open_collection_latency_seconds_count", 1)?;
     // ONE orchestration per fetch, however many candidate lists it walks.
     assert_counter(&b_metrics, "node_pull_attempts_total", 2)?;
 
@@ -11612,17 +11078,17 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
 }
 
 /// The TTL is not decorative. Past it the entry is gone and the fetch pays for a fresh
-/// lookup + probe — which is what bounds how stale a served candidate can be. Uses an
-/// injected 300ms TTL via `build_origin_with_probe_caches`: the real 15s is anchored on
+/// lookup + open — which is what bounds how stale a served candidate can be. Uses an
+/// injected 300ms TTL via `build_origin_with_discovery_caches`: the real 15s is anchored on
 /// `Instant`, so `tokio::time` cannot skip it.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
+async fn a_fetch_past_the_ttl_opens_again() -> Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x7Eu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds the blob; serves probe + client, counting probes. ------
+    // --- Node A: holds the blob; serves the client protocol. ------
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -11660,34 +11126,15 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let probes = Arc::new(AtomicUsize::new(0));
-    let task_a = spawn_a_probe_counting_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-        Arc::clone(&probes),
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
-    // The priming dial above is itself a real probe against A's counting server
-    // — reset so the counter below measures only the fetches under test.
-    probes.store(0, Ordering::SeqCst);
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
+    // The priming dial opens no stream, so it sends no discovery open.
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -11704,7 +11151,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
     // A 300ms positive-cache TTL: short enough that a real sleep past it is not a
     // test-suite hazard, unlike the production 15s (anchored on `Instant`, so
     // `tokio::time::pause` cannot fast-forward it).
-    let (origin, engine, _engine_tmp) = build_origin_with_probe_caches(
+    let (origin, engine, _engine_tmp) = build_origin_with_discovery_caches(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11717,7 +11164,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         Duration::from_secs(20),
         0,
         NegativeProbeCache::new(),
-        PositiveProbeCache::with_capacity_and_ttl(16, Duration::from_millis(300)),
+        CandidateCache::with_capacity_and_ttl(16, Duration::from_millis(300)),
         // Buffered `Origin::fetch` path — directory keyed under `NO_NAMESPACE`.
         U256::ZERO,
     )
@@ -11731,7 +11178,10 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
             && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob"
     );
-    anyhow::ensure!(probes.load(Ordering::SeqCst) == 1, "first fetch must probe");
+    anyhow::ensure!(
+        opens(&spans, Some(a_id), Some(hash)) == 1,
+        "first fetch must open"
+    );
 
     // Sleep well past the 300ms TTL — generous margin, as the negative-cache
     // TTL-inversion tests use.
@@ -11746,12 +11196,12 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         "second fetch must deliver the blob"
     );
     anyhow::ensure!(
-        probes.load(Ordering::SeqCst) == 2,
-        "a fetch past the TTL must probe again — the entry is gone, got {} probes",
-        probes.load(Ordering::SeqCst)
+        opens(&spans, Some(a_id), Some(hash)) == 2,
+        "a fetch past the TTL must open again — the entry is gone, got {} opens",
+        opens(&spans, Some(a_id), Some(hash))
     );
-    assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
-    assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 2)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 0)?;
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
     Ok(())
@@ -11768,29 +11218,28 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
 /// A third fetch then observes the OTHER half of the exhaustion contract: the entry the
 /// second fetch disproved must be INVALIDATED, so the next fetch goes cold rather than
 /// re-walking a list whose every member just failed. Without this fetch, deleting the
-/// `probe_cache.invalidate(&target)` call in `Origin::fetch` left the whole suite green
+/// `candidate_cache.invalidate(&target)` call in `Origin::fetch` left the whole suite green
 /// (#1223 review): nothing distinguished "entry dropped" from "entry kept but every hit
 /// spends the budget the same way" until something asked for the hash a third time.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x3Bu8; 4096];
     let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
-    let probes = Arc::new(AtomicUsize::new(0));
     let streams = Arc::new(AtomicUsize::new(0));
 
-    // --- Three providers: reachable, honest at probe, refuse the pull with
+    // --- Three providers: reachable, honest at discovery, refuse the pull with
     //     `Declined`. B's negative cache runs a zero cache-wide TTL, so the
     //     durable suppression a `Declined` earns lapses at once and all three
-    //     remain in the probe cache for the second fetch to spend its budget on.
+    //     remain in the candidate cache for the second fetch to spend its budget on.
     //     -----------------------------------------------------------------------
     let n0_sk = fresh_key();
     let n0_id = n0_sk.public();
     let n0_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_n0, addr_n0) =
-        local_endpoint(n0_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_n0, addr_n0) = local_endpoint(n0_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_n0 = spawn_a_refusing_server_with_counters(
         ep_n0.clone(),
         Arc::clone(&n0_eth),
@@ -11798,15 +11247,13 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         total_bytes,
         RATE,
         StreamError::Declined,
-        Arc::clone(&probes),
         Arc::clone(&streams),
     );
 
     let n1_sk = fresh_key();
     let n1_id = n1_sk.public();
     let n1_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_n1, addr_n1) =
-        local_endpoint(n1_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_n1, addr_n1) = local_endpoint(n1_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_n1 = spawn_a_refusing_server_with_counters(
         ep_n1.clone(),
         Arc::clone(&n1_eth),
@@ -11814,15 +11261,13 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         total_bytes,
         RATE,
         StreamError::Declined,
-        Arc::clone(&probes),
         Arc::clone(&streams),
     );
 
     let n2_sk = fresh_key();
     let n2_id = n2_sk.public();
     let n2_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_n2, addr_n2) =
-        local_endpoint(n2_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_n2, addr_n2) = local_endpoint(n2_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_n2 = spawn_a_refusing_server_with_counters(
         ep_n2.clone(),
         Arc::clone(&n2_eth),
@@ -11830,7 +11275,6 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         total_bytes,
         RATE,
         StreamError::Declined,
-        Arc::clone(&probes),
         Arc::clone(&streams),
     );
 
@@ -11839,18 +11283,9 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
     for (id, addr) in [(n0_id, addr_n0), (n1_id, addr_n1), (n2_id, addr_n2)] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(id).with_ip_addr(addr),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
+        learn_addr(&ep_b, EndpointAddr::new(id).with_ip_addr(addr)).await?;
     }
-    // The priming dials above are themselves real probes against the counting
-    // servers — reset so the counter below measures only the fetches under test.
-    probes.store(0, Ordering::SeqCst);
+    // The priming dials open no stream, so they send no discovery open.
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -11888,9 +11323,9 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     )
     .await;
 
-    // Fetch #1: cold path. Discovers, probes, and ranks all three; the whole
+    // Fetch #1: cold path. Discovers, opens, and ranks all three; the whole
     // MAX_PROVIDER_ATTEMPTS budget is spent refusing, and the ranked list is
-    // cached at `probe_and_rank`'s tail regardless of the miss.
+    // cached at `open_and_rank`'s tail regardless of the miss.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
@@ -11899,16 +11334,16 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         "all three providers refuse; the first fetch must miss"
     );
     anyhow::ensure!(
-        probes.load(Ordering::SeqCst) == 3,
-        "expected all three providers probed exactly once, got {}",
-        probes.load(Ordering::SeqCst)
+        opens(&spans, None, Some(hash)) == 3,
+        "expected all three providers opened exactly once, got {}",
+        opens(&spans, None, Some(hash))
     );
     assert_counter(&b_metrics, "node_pull_refused_total", 3)?;
 
-    // Fetch #2: the probe-cache hit walks the SAME three cached candidates (none
+    // Fetch #2: the candidate-cache hit walks the SAME three cached candidates (none
     // still negative-cached, none wedged). It must spend
     // exactly the fetch-wide budget of 3 — not hand a fresh lookup three MORE —
-    // and must not re-probe anyone.
+    // and must not re-open anyone.
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
@@ -11917,22 +11352,22 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         "the cached candidates all refuse again; the second fetch must miss too"
     );
     anyhow::ensure!(
-        probes.load(Ordering::SeqCst) == 3,
-        "the second fetch re-probed — the cache hit must supply the whole budget without a \
-         fresh lookup, got {} probes",
-        probes.load(Ordering::SeqCst)
+        opens(&spans, None, Some(hash)) == 3,
+        "the second fetch re-opened — the cache hit must supply the whole budget without a \
+         fresh lookup, got {} opens",
+        opens(&spans, None, Some(hash))
     );
     // Exactly 3 MORE refusals (6 total) — not 6 more (9 total), which is what a
     // fresh lookup on top of the cached attempts would have produced.
     assert_counter(&b_metrics, "node_pull_refused_total", 6)?;
-    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
 
     // Fetch #3: fetch #2 disproved the cached entry by spending the whole budget
     // on it, so it must have been INVALIDATED — none of the three refusers is
     // still negative-cached or wedged, so only the invalidate stands
     // between this fetch and a second hit on the same dead list. It must go COLD:
-    // a fresh lookup that re-probes all three at the wire.
+    // a fresh lookup that re-opens all three at the wire.
     let third = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("third fetch: {e}"))?;
@@ -11941,13 +11376,13 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         "all three providers still refuse; the third fetch must miss too"
     );
     anyhow::ensure!(
-        probes.load(Ordering::SeqCst) == 6,
-        "the third fetch must re-probe all three providers — the exhausted entry was \
-         disproved by real pulls and must not survive to hit again, got {} probes",
-        probes.load(Ordering::SeqCst)
+        opens(&spans, None, Some(hash)) == 6,
+        "the third fetch must re-open all three providers — the exhausted entry was \
+         disproved by real pulls and must not survive to hit again, got {} opens",
+        opens(&spans, None, Some(hash))
     );
-    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 2)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 9)?;
     // Still one orchestration per fetch: cold, hit-exhausted, cold again.
     assert_counter(&b_metrics, "node_pull_attempts_total", 3)?;
@@ -11968,31 +11403,30 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
 /// exercises `fetch`'s `if !attempt_metered` skip. If that guard regressed to always firing,
 /// this exact fetch would double-count `node_pull_attempts_total`.
 ///
-/// Provider N refuses every pull but answers probes honestly, so it is cached after fetch #1
+/// Provider N refuses every pull but answers discovery honestly, so it is cached after fetch #1
 /// yet fails again on fetch #2's cached-phase attempt. Provider H is a real, healthy upstream
 /// that is *unreachable* (no bound endpoint at all, mirroring
-/// `node_origin_probe_unreachable_is_scored`'s "dialing it fails fast") during fetch #1 — so it
-/// is never probed, never becomes a cached candidate, and is never negative-cached — then comes
+/// `node_origin_open_unreachable_is_scored`'s "dialing it fails fast") during fetch #1 — so it
+/// is never opened, never becomes a cached candidate, and is never negative-cached — then comes
 /// online between the two fetches. H quotes rate 1 and N [`RANK_LAST_RATE`], so H always
-/// ranks ahead of N once both are probed fresh, guaranteeing fetch #2's cold path tries H
+/// ranks ahead of N once both are opened fresh, guaranteeing fetch #2's cold path tries H
 /// first and delivers without retrying N.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once() -> Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x1Bu8; 4096];
     let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
-    // --- Provider N: reachable, honest at probe, refuses the pull with
+    // --- Provider N: reachable, honest at discovery, refuses the pull with
     //     `Declined`. As in the shared-budget test, B's negative cache runs a
     //     zero cache-wide TTL, so N stays a cached candidate. ---------------------
-    let probes_n = Arc::new(AtomicUsize::new(0));
     let streams_n = Arc::new(AtomicUsize::new(0));
     let n_sk = fresh_key();
     let n_id = n_sk.public();
     let n_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_n, addr_n) =
-        local_endpoint(n_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_n, addr_n) = local_endpoint(n_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_n = spawn_a_refusing_server_with_counters(
         ep_n.clone(),
         Arc::clone(&n_eth),
@@ -12000,7 +11434,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         total_bytes,
         RANK_LAST_RATE,
         StreamError::Declined,
-        Arc::clone(&probes_n),
         Arc::clone(&streams_n),
     );
 
@@ -12016,19 +11449,9 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
 
-    // Prime ep_b's address book for N only — H has no address to learn yet.
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(n_id).with_ip_addr(addr_n),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
-    // The priming dial above is itself a real probe against N's counting server
-    // — reset so the counters below measure only the fetches under test.
-    probes_n.store(0, Ordering::SeqCst);
-    streams_n.store(0, Ordering::SeqCst);
+    // Prime ep_b's address book for N only — H has no address to learn yet. The
+    // priming dial opens no stream.
+    learn_addr(&ep_b, EndpointAddr::new(n_id).with_ip_addr(addr_n)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -12066,7 +11489,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     .await;
 
     // Fetch #1: cold path (cache empty). H is undiscoverable, so only N is
-    // probed and cached — a SINGLE cached candidate, fewer than
+    // opened and cached — a SINGLE cached candidate, fewer than
     // `MAX_PROVIDER_ATTEMPTS`. N refuses, so the fetch is a clean miss.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -12076,25 +11499,25 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         "H is unreachable and N refuses; the first fetch must miss"
     );
     anyhow::ensure!(
-        probes_n.load(Ordering::SeqCst) == 1,
-        "expected N probed exactly once, got {}",
-        probes_n.load(Ordering::SeqCst)
+        opens(&spans, Some(n_id), Some(hash)) == 1,
+        "expected N opened exactly once, got {}",
+        opens(&spans, Some(n_id), Some(hash))
     );
     anyhow::ensure!(
         streams_n.load(Ordering::SeqCst) == 1,
         "expected N pulled-from exactly once, got {}",
         streams_n.load(Ordering::SeqCst)
     );
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
-    // H's failed probe scores Unreachable; N's refusal proves it reachable and
+    // H's failed open scores Unreachable; N's refusal proves it reachable and
     // scores nothing.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
     assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
 
     // --- Bring H online between the two fetches: a real, healthy upstream
     //     holding the blob, quoting a far cheaper rate so it always outranks N
-    //     once both are probed fresh. -------------------------------------------
+    //     once both are opened fresh. -------------------------------------------
     let (cache_h, hash_h, _tmp_h) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_h == hash, "fixture hash mismatch");
     let store_h = Arc::new(MemoryPoolStateStore::new());
@@ -12128,31 +11551,13 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         &domains,
         16,
     )?;
-    let (ep_h, addr_h) =
-        local_endpoint(h_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let probes_h = Arc::new(AtomicUsize::new(0));
-    let task_h = spawn_a_probe_counting_server(
-        ep_h.clone(),
-        handler_h,
-        Arc::clone(&h_eth),
-        slash_domain(),
-        total_bytes,
-        h_rate,
-        Arc::clone(&probes_h),
-    );
+    let (ep_h, addr_h) = local_endpoint(h_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_h = spawn_a_server(ep_h.clone(), handler_h);
 
     // Prime ep_b's address book for H now that it is listening.
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(h_id).with_ip_addr(addr_h),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
-    // Again, the priming dial is itself a real probe — reset before the fetch
-    // under test.
-    probes_h.store(0, Ordering::SeqCst);
+    learn_addr(&ep_b, EndpointAddr::new(h_id).with_ip_addr(addr_h)).await?;
+    // Fetch #1's open to H went out and failed; count only fetch #2's.
+    let h_opens_before = opens(&spans, Some(h_id), Some(hash));
 
     // Fetch #2: cache hit on N alone. The cached phase spends 1 of the 3-attempt
     // budget on N (refused again), leaving budget > 0, so the fetch falls
@@ -12166,28 +11571,31 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
             && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "the second fetch must deliver the blob via the cold fallthrough"
     );
+    // Three streams: fetch #1's discovery open (adopted, refused), fetch #2's
+    // cached pull, and fetch #2's fresh discovery open, which the walk cancels
+    // once H (ranked first) delivers. No paid pull retries N.
     anyhow::ensure!(
-        streams_n.load(Ordering::SeqCst) == 2,
-        "N must be pulled-from exactly twice total (once per fetch) — the cold path must not \
-         retry it once H (ranked first) delivers, got {}",
+        streams_n.load(Ordering::SeqCst) == 3,
+        "N must be pulled-from once per fetch, plus one cancelled discovery open — the cold \
+         path must not retry it once H (ranked first) delivers, got {}",
         streams_n.load(Ordering::SeqCst)
     );
     anyhow::ensure!(
-        probes_n.load(Ordering::SeqCst) == 2,
-        "N must be re-probed by the fresh cold-path lookup (the cache hit itself never probes), \
+        opens(&spans, Some(n_id), Some(hash)) == 2,
+        "N must be re-opened by the fresh cold-path lookup (the cache hit itself never opens), \
          got {}",
-        probes_n.load(Ordering::SeqCst)
+        opens(&spans, Some(n_id), Some(hash))
     );
     anyhow::ensure!(
-        probes_h.load(Ordering::SeqCst) == 1,
-        "H must be probed exactly once, by the cold-path fallthrough, got {}",
-        probes_h.load(Ordering::SeqCst)
+        opens(&spans, Some(h_id), Some(hash)) == h_opens_before + 1,
+        "H must be opened exactly once by fetch #2, by the cold-path fallthrough, got {}",
+        opens(&spans, Some(h_id), Some(hash)) - h_opens_before
     );
-    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 2)?;
     // Still only fetch #1's unreachable H: N's second refusal and H's successful
-    // cold-path probe and delivery add none.
+    // cold-path open and delivery add none.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
     // THE property under test: one orchestration per fetch, however many
     // candidate lists it walks THIS TIME — 2, not 3. A regressed
@@ -12205,20 +11613,19 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
 /// which is a positive cache that undoes the negative one.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
+async fn a_candidate_cache_hit_still_honours_the_negative_cache() -> Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x9Du8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node N: refuses every pull with NotFound (honest, negative-cacheable),
     //     quoting rate 1 against A's `RANK_LAST_RATE` so it ranks #1 on the live
-    //     cold probe and is always tried first. ----------------------------------
+    //     cold open and is always tried first. ----------------------------------
     let n_sk = fresh_key();
     let n_id = n_sk.public();
     let n_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_n, addr_n) =
-        local_endpoint(n_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let n_probes = Arc::new(AtomicUsize::new(0));
+    let (ep_n, addr_n) = local_endpoint(n_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let n_streams = Arc::new(AtomicUsize::new(0));
     let task_n = spawn_a_refusing_server_with_counters(
         ep_n.clone(),
@@ -12227,11 +11634,10 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         total_bytes,
         1,
         StreamError::NotFound,
-        Arc::clone(&n_probes),
         Arc::clone(&n_streams),
     );
 
-    // --- Node A: holds the blob; serves probe + client honestly. --------------
+    // --- Node A: holds the blob; serves the client protocol honestly. --------------
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
     let a_sk = fresh_key();
@@ -12269,37 +11675,17 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let a_probes = Arc::new(AtomicUsize::new(0));
-    let task_a = spawn_a_probe_counting_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RANK_LAST_RATE,
-        Arc::clone(&a_probes),
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
     for (id, addr) in [(n_id, addr_n), (a_id, addr_a)] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(id).with_ip_addr(addr),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
+        learn_addr(&ep_b, EndpointAddr::new(id).with_ip_addr(addr)).await?;
     }
-    // The priming dials above are themselves real probes against the counting
-    // servers — reset so the counters below measure only the fetches under test.
-    n_probes.store(0, Ordering::SeqCst);
-    a_probes.store(0, Ordering::SeqCst);
+    // The priming dials open no stream, so they send no discovery open.
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -12332,8 +11718,8 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
 
     // Fetch #1: cold path. N is tried first (cheaper rate), refuses NotFound
     // (negative-cached for `REFUSAL_SUPPRESSION_TTL`), and the loop falls
-    // through to A, which delivers. Both are probed once and the ranked [N, A]
-    // pair is cached at `probe_and_rank`'s tail.
+    // through to A, which delivers. Both are opened once and the ranked [N, A]
+    // pair is cached at `open_and_rank`'s tail.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
@@ -12343,9 +11729,9 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         "first fetch must deliver the blob from A"
     );
     anyhow::ensure!(
-        n_probes.load(Ordering::SeqCst) == 1,
-        "N must be probed exactly once, got {}",
-        n_probes.load(Ordering::SeqCst)
+        opens(&spans, Some(n_id), Some(hash)) == 1,
+        "N must be opened exactly once, got {}",
+        opens(&spans, Some(n_id), Some(hash))
     );
     anyhow::ensure!(
         n_streams.load(Ordering::SeqCst) == 1,
@@ -12354,7 +11740,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     );
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
 
-    // Fetch #2: the probe-cache hit walks the cached [N, A] pair, but N is
+    // Fetch #2: the candidate-cache hit walks the cached [N, A] pair, but N is
     // still negative-cached from its refusal seconds ago — `cached_candidates`
     // must filter it out, leaving only A. If it did not, N would be re-tried
     // and re-refuse: exactly the positive cache undoing the negative one.
@@ -12367,9 +11753,9 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         "second fetch must still deliver the blob from A"
     );
     anyhow::ensure!(
-        n_probes.load(Ordering::SeqCst) == 1,
-        "the cache hit re-probed N — the negative cache must be honoured on a hit, got {}",
-        n_probes.load(Ordering::SeqCst)
+        opens(&spans, Some(n_id), Some(hash)) == 1,
+        "the cache hit re-opened N — the negative cache must be honoured on a hit, got {}",
+        opens(&spans, Some(n_id), Some(hash))
     );
     anyhow::ensure!(
         n_streams.load(Ordering::SeqCst) == 1,
@@ -12377,8 +11763,8 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         n_streams.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
-    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
 
     shutdown([task_n, task_a], [&ep_b, &ep_n, &ep_a]).await?;
     Ok(())
@@ -12387,39 +11773,38 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
 /// A cache entry whose EVERY provider is currently suppressed is a miss, not a hit —
 /// `cached_candidates`' `candidates.is_empty() → None` branch (#1223 review).
 ///
-/// The distinction is not cosmetic. A hit meters `probe_cache_hits_total` and — when its
+/// The distinction is not cosmetic. A hit meters `candidate_cache_hits_total` and — when its
 /// (empty) candidate walk "fails" — INVALIDATES the entry; a miss meters
-/// `probe_cache_misses_total` and leaves the entry alone. If the branch regressed to
+/// `candidate_cache_misses_total` and leaves the entry alone. If the branch regressed to
 /// `Some(vec![])`, every fetch inside a suppression window would count a hit that saved no
 /// work (the dashboard lie) and throw away an entry whose providers may be perfectly good
 /// once the suppression lapses (the behavioural one). The negative-cache-interaction test
 /// above cannot see this: its entry keeps a second, unsuppressed provider, so the filtered
 /// list is never empty.
 ///
-/// Sole provider N refuses `Declined` (a blob withdrawn after its probe), which is
+/// Sole provider N refuses `Declined` (a blob withdrawn after its open), which is
 /// durable, so fetch #1 negative-caches
 /// the (peer, hash) for the full cache-wide TTL while the positive entry (written at
-/// `probe_and_rank`'s tail regardless) survives. Fetch #2 finds the entry, filters N out,
-/// and must take the MISS path end to end: no hit metered, and no re-probe or re-stream of
+/// `open_and_rank`'s tail regardless) survives. Fetch #2 finds the entry, filters N out,
+/// and must take the MISS path end to end: no hit metered, and no re-open or re-stream of
 /// N at the wire (the cold path's own fanout filter drops the suppressed peer too — the two
 /// chokepoints agreeing is the point).
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x2Fu8; 4096];
     let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
-    // --- Node N: honest at probe, refuses every pull `Declined`, which is
+    // --- Node N: honest at discovery, refuses every pull `Declined`, which is
     //     durable, so the refusal suppresses this (peer, hash) for the FULL
     //     cache-wide TTL (5 min at defaults), comfortably covering fetch #2. ------
-    let probes_n = Arc::new(AtomicUsize::new(0));
     let streams_n = Arc::new(AtomicUsize::new(0));
     let n_sk = fresh_key();
     let n_id = n_sk.public();
     let n_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_n, addr_n) =
-        local_endpoint(n_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_n, addr_n) = local_endpoint(n_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_n = spawn_a_refusing_server_with_counters(
         ep_n.clone(),
         Arc::clone(&n_eth),
@@ -12427,7 +11812,6 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         total_bytes,
         RATE,
         StreamError::Declined,
-        Arc::clone(&probes_n),
         Arc::clone(&streams_n),
     );
 
@@ -12435,18 +11819,8 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(n_id).with_ip_addr(addr_n),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
-    // The priming dial above is itself a real probe against N's counting server
-    // — reset so the counters below measure only the fetches under test.
-    probes_n.store(0, Ordering::SeqCst);
-    streams_n.store(0, Ordering::SeqCst);
+    learn_addr(&ep_b, EndpointAddr::new(n_id).with_ip_addr(addr_n)).await?;
+    // The priming dial opens no stream, so it sends no discovery open.
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -12475,7 +11849,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     )
     .await;
 
-    // Fetch #1: cold path. N is probed, ranked, cached — and its refusal
+    // Fetch #1: cold path. N is opened, ranked, cached — and its refusal
     // negative-caches (N, hash) for the full TTL, stranding the fresh positive
     // entry with no usable provider.
     let first = Origin::fetch(&origin, hash, u64::MAX)
@@ -12486,22 +11860,22 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         "N refuses; the first fetch must miss"
     );
     anyhow::ensure!(
-        probes_n.load(Ordering::SeqCst) == 1,
-        "expected N probed exactly once, got {}",
-        probes_n.load(Ordering::SeqCst)
+        opens(&spans, Some(n_id), Some(hash)) == 1,
+        "expected N opened exactly once, got {}",
+        opens(&spans, Some(n_id), Some(hash))
     );
     anyhow::ensure!(
         streams_n.load(Ordering::SeqCst) == 1,
         "expected N pulled-from exactly once, got {}",
         streams_n.load(Ordering::SeqCst)
     );
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
 
     // Fetch #2: the entry is found but N — its only provider — is filtered by the
     // negative cache, so `cached_candidates` must return None and the fetch must
     // take the MISS path: no hit metered, and the cold lookup's own fanout filter
-    // drops the suppressed N before it can be re-probed or re-streamed.
+    // drops the suppressed N before it can be re-opened or re-streamed.
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
@@ -12512,16 +11886,16 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     // THE property under test. A regressed `Some(vec![])` would meter this fetch
     // as a hit (1/1 instead of 0/2) — a "hit" that saved no network work — and
     // invalidate an entry the suppression, not the providers, made unusable.
-    assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 0)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 2)?;
     anyhow::ensure!(
-        probes_n.load(Ordering::SeqCst) == 1,
-        "the suppressed N must not be re-probed by either phase of fetch #2, got {}",
-        probes_n.load(Ordering::SeqCst)
+        opens(&spans, Some(n_id), Some(hash)) == 1,
+        "the suppressed N must not be re-opened by either phase of fetch #2, got {}",
+        opens(&spans, Some(n_id), Some(hash))
     );
-    // Fetch #2 reaches the cold probe round, but the round sends no probe, so it
+    // Fetch #2 reaches the cold open round, but the round sends no open, so it
     // opens no collection window.
-    assert_counter(&b_metrics, "probe_collection_latency_seconds_count", 1)?;
+    assert_counter(&b_metrics, "open_collection_latency_seconds_count", 1)?;
     anyhow::ensure!(
         streams_n.load(Ordering::SeqCst) == 1,
         "the suppressed N must not be re-streamed by fetch #2, got {}",
@@ -12538,11 +11912,11 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     Ok(())
 }
 
-/// A probe-cache hit must honour the WEDGED-provider filter, not just the negative cache —
+/// A candidate-cache hit must honour the WEDGED-provider filter, not just the negative cache —
 /// `cached_candidates`' `provider_is_wedged` branch (#1223 review).
 ///
 /// `node_origin_a_wedged_provider_is_skipped_for_other_hashes` guards this filter at
-/// `probe_and_rank` (the cold chokepoint); this test guards it at the other chokepoint. The
+/// `open_and_rank` (the cold chokepoint); this test guards it at the other chokepoint. The
 /// negative-cache-interaction test above cannot: a wedge also negative-caches the SAME
 /// (peer, hash) for 30s, so for the hash that wedged the lane the negative branch
 /// short-circuits and the wedged branch is dead code to it. The hole needs a hash the
@@ -12558,7 +11932,8 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
 /// wire-level assertion is A's stream counter: still exactly one open ever.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<()> {
+async fn a_candidate_cache_hit_still_honours_the_wedged_provider_filter() -> Result<()> {
+    let spans = support::capture_spans();
     // Two distinct single-bao-group blobs (4096B, so the closing voucher fires
     // cleanly — see the ack-wait test): hash1 is the wedge bait A holds, hash2 is
     // the blob whose cached entry is under test.
@@ -12567,24 +11942,20 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     let hash1 = support::register_payload(&payload1);
     let hash2 = support::register_payload(&payload2);
 
-    // --- Node A: honest at probe for everything, serves payload1, then rejects
+    // --- Node A: honest at discovery for everything, serves payload1, then rejects
     //     the closing voucher with `AmountRegression` — the wedge trigger. -------
-    let probes_a = Arc::new(AtomicUsize::new(0));
     let streams_a = Arc::new(AtomicUsize::new(0));
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_voucher_rejecting_server_with_counters(
         ep_a.clone(),
         Arc::clone(&a_eth),
         slash_domain(),
         payload1.clone(),
-        u64::try_from(payload1.len()).unwrap_or(u64::MAX),
         RANK_LAST_RATE,
         VoucherRejectReason::AmountRegression,
-        Arc::clone(&probes_a),
         Arc::clone(&streams_a),
     );
 
@@ -12629,38 +12000,17 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         &domains,
         16,
     )?;
-    let (ep_h, addr_h) =
-        local_endpoint(h_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let probes_h = Arc::new(AtomicUsize::new(0));
-    let task_h = spawn_a_probe_counting_server(
-        ep_h.clone(),
-        handler_h,
-        Arc::clone(&h_eth),
-        slash_domain(),
-        u64::try_from(payload2.len()).unwrap_or(u64::MAX),
-        h_rate,
-        Arc::clone(&probes_h),
-    );
+    let (ep_h, addr_h) = local_endpoint(h_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_h = spawn_a_server(ep_h.clone(), handler_h);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
     for (id, addr) in [(a_id, addr_a), (h_id, addr_h)] {
-        let _ = probe_once(
-            &ep_b,
-            EndpointAddr::new(id).with_ip_addr(addr),
-            *hash2.as_bytes(),
-            1,
-            Duration::from_secs(10),
-        )
-        .await?;
+        learn_addr(&ep_b, EndpointAddr::new(id).with_ip_addr(addr)).await?;
     }
-    // The priming dials above are themselves real probes against the counting
-    // servers — reset so the counters below measure only the fetches under test.
-    probes_a.store(0, Ordering::SeqCst);
-    streams_a.store(0, Ordering::SeqCst);
-    probes_h.store(0, Ordering::SeqCst);
+    // The priming dials open no stream, so they send no discovery open.
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -12694,9 +12044,10 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     )
     .await;
 
-    // Fetch #1 (hash2): cold path. Both are probed and cached in the hash2 entry;
-    // H (cheaper) ranks first and delivers, so A is never pulled — no negative
-    // entry, no wedge, just a live cached candidate.
+    // Fetch #1 (hash2): cold path. Both are opened and cached in the hash2 entry;
+    // H (cheaper) ranks first and delivers, so A is never pulled — its discovery
+    // open is cancelled — no negative entry, no wedge, just a live cached
+    // candidate.
     let first = Origin::fetch(&origin, hash2, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
@@ -12706,12 +12057,13 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         "fetch #1 must deliver hash2 from H"
     );
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 0,
-        "A must not be pulled for hash2 while H (ranked first) delivers, got {}",
+        streams_a.load(Ordering::SeqCst) == 1,
+        "A's only stream for hash2 is its cancelled discovery open while H (ranked first) \
+         delivers, got {}",
         streams_a.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 0)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
 
     // Fetch #2 (hash1): H is tried first and honestly refuses (its cache holds
     // only payload2); A then serves payload1 but rejects the closing voucher —
@@ -12727,26 +12079,26 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         matches!(second, OriginFetch::NotFound),
         "fetch #2 must refuse: H lacks hash1 and A cannot be paid"
     );
-    // One logical pull to A opens ONE stream: `pull_from_candidate`'s
-    // whole-blob header handshake is also the drive's first and only leg, which
-    // adopts it (#2063). One stream here means "A WAS pulled once (the hash1
-    // wedge)".
+    // One logical pull to A opens ONE stream: its whole-blob discovery open is
+    // `pull_from_candidate`'s header handshake and the drive's first and only
+    // leg, which adopt it (#2063). One more stream here means "A WAS pulled
+    // once (the hash1 wedge)".
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 1,
-        "A must be pulled exactly once (the handshake the drive adopts, the hash1 wedge), \
-         got {}",
+        streams_a.load(Ordering::SeqCst) == 2,
+        "A must be pulled exactly once (the discovery open the drive adopts, the hash1 \
+         wedge), got {}",
         streams_a.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 1)?;
-    let probes_a_after_wedge = probes_a.load(Ordering::SeqCst);
+    let opens_a_after_wedge = opens(&spans, Some(a_id), None);
 
     // --- Take H offline: the hash2 entry now reads [H (dead), A (wedged)], and
     //     only the wedged filter keeps fetch #3 from re-selecting A on a lane this
     //     node cannot pay on. ---------------------------------------------------------
     shutdown([task_h], [&ep_h]).await?;
 
-    // Fetch #3 (hash2, inside the entry's TTL): a probe-cache HIT — H survives the
+    // Fetch #3 (hash2, inside the entry's TTL): a candidate-cache HIT — H survives the
     // filters, is dialled, and fails fast. A must NOT be the fallback: it is
     // wedged, and (A, hash2) was never negative-cached, so a regressed
     // `provider_is_wedged` branch in `cached_candidates` re-selects it here and
@@ -12763,34 +12115,34 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         "fetch #3 must miss: H is offline and A is wedged"
     );
     // THE property under test, at the wire: A's only pull ever is the hash1
-    // wedge (the 1 connection above). A climb past 1 here is the hit path
+    // wedge (the second stream above). A climb past 2 here is the hit path
     // re-selecting the wedged provider.
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 1,
+        streams_a.load(Ordering::SeqCst) == 2,
         "the cache hit re-streamed the WEDGED A — `cached_candidates` must filter a wedged \
          provider even when its (peer, hash) pair was never negative-cached, got {}",
         streams_a.load(Ordering::SeqCst)
     );
-    // …and A is not re-probed either: the cold fallthrough's own wedged filter
-    // (guarded by the sibling test) drops it before the probe fanout.
+    // …and A is not opened again either: the cold fallthrough's own wedged
+    // filter (guarded by the sibling test) drops it before the open fan-out.
     anyhow::ensure!(
-        probes_a.load(Ordering::SeqCst) == probes_a_after_wedge,
-        "the wedged A must not be re-probed, got {} (was {probes_a_after_wedge})",
-        probes_a.load(Ordering::SeqCst)
+        opens(&spans, Some(a_id), None) == opens_a_after_wedge,
+        "the wedged A must not be opened again, got {} (was {opens_a_after_wedge})",
+        opens(&spans, Some(a_id), None)
     );
     // No second wedge event — the sibling cold-path test's load-bearing counter,
     // asserted here for the hit path.
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
     // The entry WAS consulted (H survived the filters), so fetch #3 is a hit.
-    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 2)?;
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
     Ok(())
 }
 
 /// A [`StakerSet`] whose active set can be mutated mid-test, so a fetch can eject a
-/// provider between the probe-cache write and a later hit inside the same TTL
+/// provider between the candidate-cache write and a later hit inside the same TTL
 /// (#1223). Models a chain ejection the cold path's `filter_active_stakers` would
 /// deny — the hit path (`cached_candidates`) must deny it too.
 #[derive(Debug)]
@@ -12876,7 +12228,7 @@ impl OriginDirectory for MutableOriginDirectory {
 }
 
 /// A cached entry can be disowned INSIDE its own 15s: a node ejected from the active
-/// set (chain ejection / unbonding) while its probe-cache entry is still live. The
+/// set (chain ejection / unbonding) while its candidate-cache entry is still live. The
 /// cold path denies it via `filter_active_stakers`; the hit path bypasses
 /// `find_providers`, so it must re-apply `staker_set.is_active` itself (#1223). This
 /// proves that re-check FIRES — the ejected provider is skipped on the hit and NOT
@@ -12888,12 +12240,12 @@ impl OriginDirectory for MutableOriginDirectory {
 /// through the unfiltered directory, masking whether the hit-path check ran at all.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
+async fn a_candidate_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0xA7u8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds the blob; serves probe + client, counting BOTH so a hit
+    // --- Node A: holds the blob; serves the client protocol, counting BOTH so a hit
     //     that wrongly re-serves A is visible at the wire. --------------------
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
@@ -12932,21 +12284,11 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let a_probes = Arc::new(AtomicUsize::new(0));
-    let task_a = spawn_a_probe_counting_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-        Arc::clone(&a_probes),
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
     // A's own handler counts every `cdn/client/v1` stream it ends, so the test
     // witnesses AT THE WIRE whether A was asked to serve: the stream count is what
-    // proves a provider dropped on a probe-cache hit sees NO new client stream
+    // proves a provider dropped on a candidate-cache hit sees NO new client stream
     // (#1223). Streams, not connections, because B's pull legs share one pooled
     // connection to A.
     let a_streams = || inbound_streams_ended(&metrics_a);
@@ -12955,17 +12297,9 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    // Prime B's address book so it can dial A by node-id during the fetch; this
-    // dial is itself a real probe, so reset the counters after it.
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
-    a_probes.store(0, Ordering::SeqCst);
+    // Prime B's address book so it can dial A by node-id during the fetch. The
+    // dial opens no stream.
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -13020,11 +12354,11 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
         negative_cache: NegativeProbeCache::new(),
-        probe_cache: PositiveProbeCache::new(),
+        candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(&b_metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
-            probe_fanout: 5,
+            open_fanout: 5,
             // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
             // runner must not end a pull this fixture is not measuring.
             pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
@@ -13055,7 +12389,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     });
 
     // Fetch #1: cold path. `find_providers` is empty (no routing entries), so the
-    // directory fallback returns [A]; A is probed once, cached, and delivers.
+    // directory fallback returns [A]; A is opened once, cached, and delivers.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
@@ -13065,9 +12399,9 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         "first fetch must deliver the blob from A"
     );
     anyhow::ensure!(
-        a_probes.load(Ordering::SeqCst) == 1,
-        "A must be probed exactly once on the cold path, got {}",
-        a_probes.load(Ordering::SeqCst)
+        opens(&spans, Some(a_id), Some(hash)) == 1,
+        "A must be opened exactly once on the cold path, got {}",
+        opens(&spans, Some(a_id), Some(hash))
     );
     // One logical pull to A opens ONE stream: `pull_from_candidate`'s whole-blob
     // header handshake is also the drive's first and only leg, which adopts it
@@ -13086,18 +12420,18 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
          got {}",
         a_streams()?
     );
-    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
-    assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 0)?;
 
     // Eject A inside the live TTL: a chain ejection drops it from BOTH the staker
-    // set and the directory atomically. The probe-cache entry for [A] is untouched
+    // set and the directory atomically. The candidate-cache entry for [A] is untouched
     // and still live, so nothing but the hit-path `is_active` re-check can deny it.
     mutable_staker.remove(&a_dht);
     mutable_dir.remove(U256::ZERO);
 
     // Fetch #2: the entry is still live, so the hit path walks [A] — but A is no
     // longer active, so `cached_candidates` drops it, returns None, and the fetch
-    // records a probe-cache MISS (a hit that serves no one is not a hit). The cold
+    // records a candidate-cache MISS (a hit that serves no one is not a hit). The cold
     // fall-through then finds no providers (routing empty + directory now empty),
     // so the fetch is a clean NotFound. Crucially, A is never re-contacted.
     let second = Origin::fetch(&origin, hash, u64::MAX)
@@ -13116,12 +12450,12 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         a_streams()?
     );
     anyhow::ensure!(
-        a_probes.load(Ordering::SeqCst) == 1,
-        "the ejected A must not be re-probed, got {}",
-        a_probes.load(Ordering::SeqCst)
+        opens(&spans, Some(a_id), Some(hash)) == 1,
+        "the ejected A must not be re-opened, got {}",
+        opens(&spans, Some(a_id), Some(hash))
     );
-    assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
-    assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
+    assert_counter(&b_metrics, "candidate_cache_hits_total", 0)?;
+    assert_counter(&b_metrics, "candidate_cache_misses_total", 2)?;
     assert_counter(&b_metrics, "node_pull_no_providers_total", 1)?;
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
@@ -13531,7 +12865,7 @@ fn payable_interval(sent: u64, settled: u64, done: bool) -> Option<u64> {
     }
 }
 
-/// Spawn a provider that answers probes truthfully and serves under a live deposit
+/// Spawn a provider that answers every open as a holder and serves under a live deposit
 /// ceiling (see [`serve_with_deposit_ceiling`]).
 #[allow(clippy::too_many_arguments)]
 fn spawn_deposit_capped_server(
@@ -13544,12 +12878,9 @@ fn spawn_deposit_capped_server(
     resume_delay: Duration,
     initial_ceiling: U256,
 ) -> tokio::task::JoinHandle<()> {
-    // Same-length blobs only, so the probe's single quoted `total_bytes` is honest
+    // Same-length blobs only, so the open's single quoted `total_bytes` is honest
     // for all of them (`two_concurrent_pulls_...` makes the same choice for the
     // same reason).
-    let total_bytes = payloads
-        .first()
-        .map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX));
     let payloads = Arc::new(payloads);
     // ONE lane, shared by every stream this upstream serves — which is what a
     // lane is: `(pool_id, signer, provider)`, not `(…, stream)`. Concurrent
@@ -13567,35 +12898,29 @@ fn spawn_deposit_capped_server(
             let payloads = Arc::clone(&payloads);
             let deposit = Arc::clone(&deposit);
             let lane = Arc::clone(&lane);
-            if conn.alpn() == ALPN_PROBE {
-                tokio::spawn(async move {
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                tokio::spawn(serve_each_stream(conn, move |send, recv| {
-                    let (eth, dom) = (Arc::clone(&eth), dom.clone());
-                    let (payloads, deposit, lane) = (
-                        Arc::clone(&payloads),
-                        Arc::clone(&deposit),
-                        Arc::clone(&lane),
-                    );
-                    async move {
-                        serve_with_deposit_ceiling(
-                            send,
-                            recv,
-                            &eth,
-                            &dom,
-                            &payloads,
-                            rate,
-                            &deposit,
-                            resume_delay,
-                            initial_ceiling,
-                            &lane,
-                        )
-                        .await
-                    }
-                }));
-            }
+            tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                let (eth, dom) = (Arc::clone(&eth), dom.clone());
+                let (payloads, deposit, lane) = (
+                    Arc::clone(&payloads),
+                    Arc::clone(&deposit),
+                    Arc::clone(&lane),
+                );
+                async move {
+                    serve_with_deposit_ceiling(
+                        send,
+                        recv,
+                        &eth,
+                        &dom,
+                        &payloads,
+                        rate,
+                        &deposit,
+                        resume_delay,
+                        initial_ceiling,
+                        &lane,
+                    )
+                    .await
+                }
+            }));
         }
     })
 }
@@ -13697,8 +13022,7 @@ async fn top_up_fixture_multi_rep(
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_deposit_capped_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
@@ -13712,14 +13036,7 @@ async fn top_up_fixture_multi_rep(
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(rep_config)?);
     let metrics = Arc::new(Metrics::new());
@@ -13739,7 +13056,7 @@ async fn top_up_fixture_multi_rep(
     });
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, engine, engine_tmp) = build_origin_with_probe_caches(
+    let (origin, engine, engine_tmp) = build_origin_with_discovery_caches(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -13752,7 +13069,7 @@ async fn top_up_fixture_multi_rep(
         DEFAULT_TEST_PULL_DEADLINES.1,
         total_bytes.saturating_mul(4),
         NegativeProbeCache::new(),
-        PositiveProbeCache::new(),
+        CandidateCache::new(),
         U256::ZERO,
     )
     .await;
@@ -13872,7 +13189,7 @@ async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> 
 /// the delivery-speed reputation signal (ADR 008) — a slow upstream that served
 /// through a top-up must score slow, not instantaneous (#1602).
 ///
-/// `paid_wait` excludes chain settlement and the re-open probes from `elapsed`, but it
+/// `paid_wait` excludes chain settlement and the re-open opens from `elapsed`, but it
 /// must NOT excuse the streaming of the resumed leg. The bug timed the whole completing
 /// `stream_leg` — open AND `pull_to_sink` — because `note_successful_open` clears
 /// `awaiting_topup_settle` between them, so the flag read at the loop top still said
@@ -14543,10 +13860,10 @@ async fn a_long_pull_recovers_again_after_verified_progress() -> Result<()> {
 // ADR 041 — buy-side serve-economics gate + warming allowance.
 // ===========================================================================
 
-/// Provision B's `NodeOrigin` exactly like [`build_origin_with_probe_caches`] but
+/// Provision B's `NodeOrigin` exactly like [`build_origin_with_discovery_caches`] but
 /// with a caller-chosen ADR 041 serve-economics policy, operator fee-share, base
 /// sell rate, and a SHARED [`decdn_node::warming_allowance::WarmingAllowance`] the
-/// test seeds/spends before the miss. Live probe + fresh caches, single provider.
+/// test seeds/spends before the miss. Live open + fresh caches, single provider.
 /// `frequency_estimator` lets a test pin the `margin` policy's heat input
 /// directly (standing in for the real observe-on-serve heat signal) instead of
 /// driving real traffic to raise it; `None` reads cold (heat 0) like production
@@ -14597,11 +13914,11 @@ async fn build_origin_economics(
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
         negative_cache: NegativeProbeCache::new(),
-        probe_cache: PositiveProbeCache::new(),
+        candidate_cache: CandidateCache::new(),
         metrics: Arc::clone(metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
-            probe_fanout: 5,
+            open_fanout: 5,
             // Generous by intent, like [`DEFAULT_TEST_PULL_DEADLINES`]: a loaded
             // runner must not end a pull this fixture is not measuring.
             pull_timeout: DEFAULT_TEST_PULL_DEADLINES.0,
@@ -14721,29 +14038,14 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        QUOTE_A,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     // --- Node B: buys via NodeOrigin with heat pinned to N_MAX. -------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -14943,7 +14245,6 @@ async fn attack_b_attempt(
     const LEDGER_DEPOSIT: u64 = 1_000_000_000;
     let payload = vec![salt; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
     anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
@@ -14981,28 +14282,13 @@ async fn attack_b_attempt(
         &domains,
         16,
     )?;
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_server(
-        ep_a.clone(),
-        handler_a,
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        quote,
-    );
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(ep_a.clone(), handler_a);
 
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    learn_addr(&ep_b, EndpointAddr::new(a_id).with_ip_addr(addr_a)).await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -15334,16 +14620,17 @@ fn two_providers(
     (vec![a_dht, b_dht], addr_map)
 }
 
-/// Spin up one PARTIAL holder: it holds the whole (tiny) blob in a real cache and
-/// serves any range over the real [`ClientHandler`], but its probe advertises
-/// only `coverage` — the discovery blocks the planner may route to it. Seeds its
-/// seller lane on the SHARED `ab_pool_id` keyed by the buyer's signer and this
-/// holder's own operator address, so a test can read back exactly what this
-/// holder was paid.
+/// Spin up one PARTIAL holder: its real cache holds only the discovery blocks
+/// `coverage` names, and it serves them over the real [`ClientHandler`], whose
+/// answer to an open names exactly those blocks. Seeds its seller lane on the
+/// SHARED `ab_pool_id` keyed by the buyer's signer and this holder's own
+/// operator address, so a test can read back exactly what this holder was
+/// paid.
 ///
 /// The holder answers its first `refuse_client_streams` `cdn/client/v1`
-/// streams with a signed `NotFound` instead of serving — the wire shape of a
-/// seller's collapsed per-signer cap refusal (#2178).
+/// streams as a holder of `coverage`, and refuses each at its admission with
+/// `NotFound` — the wire shape of a seller's collapsed per-signer cap refusal
+/// on a hit (#2178).
 async fn spawn_partial_holder(
     payload: &[u8],
     ab_pool_id: B256,
@@ -15358,31 +14645,47 @@ async fn spawn_partial_holder(
     tokio::task::JoinHandle<()>,
     Arc<MemoryPoolStateStore>,
 )> {
-    let hash = support::register_payload(payload);
-    let (cache, hash_h, tmp) = cache_with_blob(payload).await?;
-    anyhow::ensure!(hash_h == hash, "holder fixture hash mismatch");
-    std::mem::forget(tmp);
-    let (id, addr, eth, ep, task, store, _metrics) = spawn_holder_on(
-        cache,
+    let blocks: Vec<u32> = coverage.covered_blocks().collect();
+    let (id, addr, eth, ep, task, store, _metrics) = spawn_block_holder_refusing(
         payload,
         ab_pool_id,
         s_buyer_addr,
-        coverage,
+        &blocks,
         refuse_client_streams,
     )
     .await?;
     Ok((id, addr, eth, ep, task, store))
 }
 
-/// Spin up a holder whose cache holds ONLY `blocks` of `payload` and whose probe
-/// advertises exactly those blocks: a real partial holder, so a request for any
-/// other block is a miss it refuses. Also returns the holder's metrics, so a test
-/// can count those refusals.
+/// Spin up a holder whose cache holds ONLY `blocks` of `payload` and whose
+/// answers name exactly those blocks: a real partial holder, so a request for
+/// any other block is a miss it refuses. Also returns the holder's metrics, so
+/// a test can count those refusals.
 async fn spawn_block_holder(
     payload: &[u8],
     ab_pool_id: B256,
     s_buyer_addr: Address,
     blocks: &[u32],
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Address,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<MemoryPoolStateStore>,
+    Arc<Metrics>,
+)> {
+    spawn_block_holder_refusing(payload, ab_pool_id, s_buyer_addr, blocks, 0).await
+}
+
+/// [`spawn_block_holder`] that refuses its first `refuse_client_streams`
+/// streams at their admission, as [`spawn_partial_holder`] describes.
+async fn spawn_block_holder_refusing(
+    payload: &[u8],
+    ab_pool_id: B256,
+    s_buyer_addr: Address,
+    blocks: &[u32],
+    refuse_client_streams: usize,
 ) -> Result<(
     iroh::PublicKey,
     std::net::SocketAddr,
@@ -15424,13 +14727,29 @@ async fn spawn_block_holder(
             .admit_bao(hash, aligned.chunk_ranges().clone(), bao)
             .await?;
     }
+    // A holder keeps the size proof its own pull read, so it serves the blocks
+    // it holds under that size before it holds the tail.
+    let proof = decdn_bao_range::encode_outboard(payload, total)?.size_proof;
+    anyhow::ensure!(
+        cache.keep_size_proof(hash, total, &proof).await,
+        "the holder must keep the blob's size proof"
+    );
     let coverage =
         Coverage::from_block_indices(decdn_protocol::num_blocks(total), blocks.iter().copied());
-    spawn_holder_on(cache, payload, ab_pool_id, s_buyer_addr, coverage, 0).await
+    spawn_holder_on(
+        cache,
+        payload,
+        ab_pool_id,
+        s_buyer_addr,
+        coverage,
+        refuse_client_streams,
+    )
+    .await
 }
 
-/// Serve `cache` as a holder of `payload` that advertises `coverage` on probe; the
-/// shared body of [`spawn_partial_holder`] and [`spawn_block_holder`].
+/// Serve `cache` as a holder of `payload` whose refusal streams answer as a
+/// holder of `coverage`; the shared body of [`spawn_block_holder_refusing`].
+#[allow(clippy::too_many_lines)] // one accept loop: the refusal streams, then the handler
 async fn spawn_holder_on(
     cache: CacheEngine,
     payload: &[u8],
@@ -15484,9 +14803,8 @@ async fn spawn_holder_on(
         16,
     )?;
     let holder_metrics = Arc::clone(&metrics);
-    let (ep, addr) = local_endpoint(sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // Accept loop: real `ClientHandler` for the paid pull, a coverage-carrying
-    // probe responder for `cdn/probe/v1`.
+    let (ep, addr) = local_endpoint(sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // Accept loop: the real `ClientHandler`, after the refusal streams.
     let task = {
         use iroh::protocol::ProtocolHandler;
         let ep = ep.clone();
@@ -15502,55 +14820,66 @@ async fn spawn_holder_on(
                     continue;
                 };
                 let Ok(conn) = connecting.await else { continue };
-                if conn.alpn() == ALPN_PROBE {
-                    let eth = Arc::clone(&eth);
-                    let dom = slash.clone();
-                    let coverage = coverage.clone();
-                    tokio::spawn(async move {
-                        let _ = answer_probe_with_coverage(
-                            conn,
-                            &eth,
-                            &dom,
-                            RATE,
-                            total_bytes,
-                            coverage,
-                        )
-                        .await;
-                    });
-                } else {
-                    let handler = Arc::clone(&handler);
-                    let (eth, dom) = (Arc::clone(&eth), slash.clone());
-                    let refused = Arc::clone(&refused);
-                    tokio::spawn(async move {
-                        // Answer this connection's streams with a signed refusal
-                        // while refusals remain, then hand the connection to the
-                        // real handler, which accepts every later stream on it.
-                        // A slot is reserved before the accept, so concurrent
-                        // connections never refuse more than the budget.
-                        while refused.fetch_add(1, Ordering::SeqCst) < refuse_client_streams {
-                            let Ok((send, recv)) = conn.accept_bi().await else {
-                                refused.fetch_sub(1, Ordering::SeqCst);
+                let handler = Arc::clone(&handler);
+                let (eth, dom) = (Arc::clone(&eth), slash.clone());
+                let refused = Arc::clone(&refused);
+                let coverage = coverage.clone();
+                tokio::spawn(async move {
+                    // Refuse this connection's streams while refusals remain:
+                    // an open that pulls through with a signed `NotFound`, a
+                    // discovery open at its admission after answering it as a
+                    // holder of `coverage`. Then hand the connection to the
+                    // real handler, which accepts every later stream on it. A
+                    // slot is reserved before the accept, so concurrent
+                    // connections never refuse more than the budget.
+                    while refused.fetch_add(1, Ordering::SeqCst) < refuse_client_streams {
+                        let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                            refused.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        };
+                        let (eth, dom, coverage) =
+                            (Arc::clone(&eth), dom.clone(), coverage.clone());
+                        let refused = Arc::clone(&refused);
+                        tokio::spawn(async move {
+                            let Ok((req, pull_through)) = read_open(&mut recv).await else {
                                 return;
                             };
-                            let (eth, dom) = (Arc::clone(&eth), dom.clone());
-                            tokio::spawn(async move {
-                                let _ = serve_refusal(
+                            if pull_through {
+                                let _ = refuse_at_open(
                                     send,
-                                    recv,
-                                    &eth,
-                                    &dom,
-                                    total_bytes,
-                                    RATE,
+                                    &req,
+                                    (&eth, &dom),
+                                    (total_bytes, RATE),
                                     StreamError::NotFound,
                                 )
                                 .await;
-                            });
-                        }
-                        let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
-                            .accept(conn)
+                                return;
+                            }
+                            // A discovery open of a span the holder does not
+                            // cover is answered `NotFound` with its blocks: an
+                            // honest answer, not a refusal, so it gives its
+                            // slot back.
+                            let served = answer_open(
+                                &mut send,
+                                &mut recv,
+                                &req,
+                                &eth,
+                                &dom,
+                                RATE,
+                                total_bytes,
+                                &coverage,
+                                StreamError::NotFound,
+                            )
                             .await;
-                    });
-                }
+                            if matches!(served, Ok(false)) {
+                                refused.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        });
+                    }
+                    let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
+                        .accept(conn)
+                        .await;
+                });
             }
         })
     };
@@ -15558,17 +14887,16 @@ async fn spawn_holder_on(
 }
 
 /// Build serving node S: an empty-cache window-paced `ClientHandler` whose
-/// `NodeOrigin` discovers holders through `discovery` (and `probe_cache`, when a
+/// `NodeOrigin` discovers holders through `discovery` (and `candidate_cache`, when a
 /// test seeds it), plus each leaf's own lane in S's seller store (`leaves` is
 /// `(pool_id, owner)` per leaf). A focused twin of [`build_node_b_with_leaves`]
 /// for the multi-holder ranged pull (that helper hardwires a single provider).
 #[allow(clippy::too_many_arguments)]
 async fn build_serving_node(
-    hash: Hash,
     ab_pool_id: B256,
     s_buyer: &Arc<PrivateKeySigner>,
     discovery: FixtureDiscovery,
-    probe_cache: PositiveProbeCache,
+    candidate_cache: CandidateCache,
     addr_map: HashMap<DhtNodeId, Address>,
     holder_dials: &[(iroh::PublicKey, std::net::SocketAddr)],
     leaves: &[(B256, Address)],
@@ -15590,12 +14918,9 @@ async fn build_serving_node(
     // Prime S's iroh address cache for every holder so NodeId-only dialing in the
     // pull resolves each one.
     for (holder_id, holder_addr) in holder_dials {
-        let _ = probe_once(
+        learn_addr(
             &ep_s,
             EndpointAddr::new(*holder_id).with_ip_addr(*holder_addr),
-            *hash.as_bytes(),
-            1,
-            Duration::from_secs(10),
         )
         .await?;
     }
@@ -15615,7 +14940,7 @@ async fn build_serving_node(
         DEFAULT_TEST_PULL_DEADLINES.1,
         0, // max_blob_size_bytes: 0 = unlimited; these tests do not exercise the size ceiling
         NegativeProbeCache::new(),
-        probe_cache,
+        candidate_cache,
     )
     .await;
     let origin_s = Arc::new(origin);
@@ -15747,11 +15072,10 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
     let leaf_pool_id = B256::repeat_byte(0x1F);
     let (handler_s, s_target, ep_s, recorded, cache_s, s_operator, s_metrics, _) =
         build_serving_node(
-            hash,
             ab_pool_id,
             &s_buyer,
             FixtureDiscovery::directory_only(providers, U256::ZERO),
-            PositiveProbeCache::new(),
+            CandidateCache::new(),
             addr_map,
             &[(a_id, a_addr), (b_id, b_addr)],
             &[(leaf_pool_id, leaf_eth.address())],
@@ -15971,13 +15295,13 @@ fn two_block_blob() -> Result<(decdn_protocol::TestBlockSizeGuard, Vec<u8>, Hash
 enum DiscoveryCase {
     /// A DHT lookup returns P alone; the directory lists O.
     DhtPartial,
-    /// A probe-cache entry lists P alone; the DHT is empty; the directory lists O.
+    /// A candidate-cache entry lists P alone; the DHT is empty; the directory lists O.
     CachedPartial,
-    /// A probe-cache entry lists P and O, whose coverage spans the blob together.
+    /// A candidate-cache entry lists P and O, whose coverage spans the blob together.
     CachedSpanning,
     /// A DHT lookup returns O alone; the directory lists P.
     DhtSpanning,
-    /// The DHT is empty; the directory lists P, then O; one probe per round.
+    /// The DHT is empty; the directory lists P, then O; one open per round.
     DirectoryPastFanout,
     /// The DHT is empty; the directory lists P and a dead peer D; no origin.
     NoCoveringCandidate,
@@ -15986,8 +15310,8 @@ enum DiscoveryCase {
 }
 
 impl DiscoveryCase {
-    /// The probe rounds S runs: a second round means the origin supplement ran.
-    const fn probe_rounds(self) -> u64 {
+    /// The open rounds S runs: a second round means the origin supplement ran.
+    const fn open_rounds(self) -> u64 {
         match self {
             Self::CachedSpanning => 0,
             Self::CachedPartial
@@ -16001,8 +15325,8 @@ impl DiscoveryCase {
 
 /// #2195: drive one leaf pull through serving node S under `case` and check that
 /// S either assembles the blob with O's help or refuses before `ok: true`, never
-/// a truncated stream. The probe-round count pins whether the origin supplement
-/// ran, independent of how the live probe RTT ranks P and O.
+/// a truncated stream. The open-round count pins whether the origin supplement
+/// ran, independent of how the live open RTT ranks P and O.
 ///
 /// `byte_len` is the leaf's requested `byte_len` (`0` = whole blob, the shape
 /// every case but the end-past-the-blob one below uses). A `byte_len` that
@@ -16031,9 +15355,9 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
     .await?;
     let p_dht = DhtNodeId::from_bytes(*p_id.as_bytes());
     let o_dht = DhtNodeId::from_bytes(*o_id.as_bytes());
-    // A staked peer with no endpoint: every probe to it fails.
+    // A staked peer with no endpoint: every open to it fails.
     let d_dht = DhtNodeId::from_bytes(*fresh_key().public().as_bytes());
-    let probed = |node_id: DhtNodeId, coverage: Coverage| ProbedProvider {
+    let opened = |node_id: DhtNodeId, coverage: Coverage| CachedCandidate {
         node_id,
         rate_per_mb: RATE,
         rtt_ms: 1,
@@ -16058,27 +15382,28 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
         stakers: HashSet::from([p_dht, o_dht, d_dht]),
         directory: HashMap::from([(U256::ZERO, directory)]),
         dht_peers: Vec::new(),
-        probe_fanout: if case == DiscoveryCase::DirectoryPastFanout {
+        open_fanout: if case == DiscoveryCase::DirectoryPastFanout {
             1
         } else {
             5
         },
+        max_rate_per_mb: 0,
     };
-    let probe_cache = PositiveProbeCache::new();
+    let candidate_cache = CandidateCache::new();
     let target = ContentHash::from_bytes(*hash.as_bytes());
     let dht_record = match case {
         DiscoveryCase::DhtPartial => Some((p_dht, partial.clone())),
         DiscoveryCase::DhtSpanning => Some((o_dht, Coverage::full(2))),
         DiscoveryCase::CachedPartial => {
-            probe_cache.insert(target, vec![probed(p_dht, partial.clone())]);
+            candidate_cache.insert(target, vec![opened(p_dht, partial.clone())]);
             None
         }
         DiscoveryCase::CachedSpanning => {
-            probe_cache.insert(
+            candidate_cache.insert(
                 target,
                 vec![
-                    probed(p_dht, partial.clone()),
-                    probed(o_dht, Coverage::full(2)),
+                    opened(p_dht, partial.clone()),
+                    opened(o_dht, Coverage::full(2)),
                 ],
             );
             None
@@ -16094,17 +15419,21 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
         discovery.dht_peers.push((dht_id, dht_addr));
         dht_server = Some((dht_ep, dht_task));
     }
-    let addr_map = HashMap::from([(p_dht, p_eth), (o_dht, o_eth)]);
+    // D has a bonded operator address, so S opens it, and the open fails.
+    let addr_map = HashMap::from([
+        (p_dht, p_eth),
+        (o_dht, o_eth),
+        (d_dht, Address::repeat_byte(0xD0)),
+    ]);
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_pool_id = B256::repeat_byte(0x2F);
     let (handler_s, s_target, ep_s, _recorded, cache_s, s_operator, s_metrics, _) =
         build_serving_node(
-            hash,
             ab_pool_id,
             &s_buyer,
             discovery,
-            probe_cache,
+            candidate_cache,
             addr_map,
             &[(p_id, p_addr), (o_id, o_addr)],
             &[(leaf_pool_id, leaf_eth.address())],
@@ -16145,9 +15474,9 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
     };
 
     if case == DiscoveryCase::DeadOnly {
-        // The only candidate never answers its probe, so the walk ends with no
+        // The only candidate never answers its open, so the walk ends with no
         // holder and S refuses on the pull-leg path. The refusal line names the
-        // walk: one directory candidate, one probe sent, one unreachable, no
+        // walk: one directory candidate, one open sent, one unreachable, no
         // holder, no handshake (#2366).
         let Err(err) = pulled else {
             anyhow::bail!("S must refuse when its only candidate is unreachable");
@@ -16175,7 +15504,7 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
             ("source", "directory"),
             ("discovered", "1"),
             ("skipped", "0"),
-            ("probed", "1"),
+            ("opened", "1"),
             ("unreachable", "1"),
             ("absent", "0"),
             ("dropped", "0"),
@@ -16255,11 +15584,11 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
             "the origin must have served the block the partial holder lacks"
         );
     }
-    let rounds = counter_value(&s_metrics, "probe_collection_latency_seconds_count")?;
+    let rounds = counter_value(&s_metrics, "open_collection_latency_seconds_count")?;
     anyhow::ensure!(
-        rounds == case.probe_rounds(),
-        "expected {} probe rounds, got {rounds}",
-        case.probe_rounds()
+        rounds == case.open_rounds(),
+        "expected {} open rounds, got {rounds}",
+        case.open_rounds()
     );
     let expected_cache = match case {
         // A cached list that cannot span the blob cannot complete the ranged
@@ -16270,8 +15599,8 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
     };
     if let Some((hits, misses)) = expected_cache {
         let got = (
-            counter_value(&s_metrics, "probe_cache_hits_total")?,
-            counter_value(&s_metrics, "probe_cache_misses_total")?,
+            counter_value(&s_metrics, "candidate_cache_hits_total")?,
+            counter_value(&s_metrics, "candidate_cache_misses_total")?,
         );
         anyhow::ensure!(
             got == (hits, misses),
@@ -16300,12 +15629,12 @@ async fn a_dht_answer_of_partial_holders_only_pulls_in_the_directory_origin() ->
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_partial_only_probe_cache_hit_falls_through_to_the_directory_origin() -> Result<()> {
+async fn a_partial_only_candidate_cache_hit_falls_through_to_the_directory_origin() -> Result<()> {
     serve_miss_discovery_case(DiscoveryCase::CachedPartial, 0).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_spanning_probe_cache_hit_serves_without_probing() -> Result<()> {
+async fn a_spanning_candidate_cache_hit_serves_without_opening() -> Result<()> {
     serve_miss_discovery_case(DiscoveryCase::CachedSpanning, 0).await
 }
 
@@ -16315,7 +15644,7 @@ async fn spanning_dht_holders_skip_the_origin_supplement() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_directory_origin_past_the_probe_fanout_is_probed() -> Result<()> {
+async fn a_directory_origin_past_the_open_fanout_is_opened() -> Result<()> {
     serve_miss_discovery_case(DiscoveryCase::DirectoryPastFanout, 0).await
 }
 
@@ -16331,7 +15660,7 @@ async fn an_unreachable_only_candidate_refuses_with_the_walk_on_the_line() -> Re
     serve_miss_discovery_case(DiscoveryCase::DeadOnly, 0).await
 }
 
-/// A directory origin that answers `has_blob: false` is probed once and then
+/// A directory origin that answers `NotFound` with no block is opened once and then
 /// negative-cached. The next serve for the hash skips it in the first round,
 /// and the origin-directory supplement does not count the skip again: the
 /// refusal line reads `skipped=1`, not `skipped=2` (#2366).
@@ -16341,7 +15670,7 @@ async fn a_negative_cached_only_candidate_is_skipped_once_per_walk() -> Result<(
     let (_block_guard, payload, hash) = two_block_blob()?;
     let ab_pool_id = B256::repeat_byte(0xA4);
     let s_buyer = Arc::new(PrivateKeySigner::random());
-    // A holds no block of the blob, so its probe answers `has_blob: false`.
+    // A holds no block of the blob, so it answers its open `NotFound`.
     let (a_id, a_addr, a_eth, ep_a, task_a, _store_a) = spawn_partial_holder(
         &payload,
         ab_pool_id,
@@ -16357,11 +15686,10 @@ async fn a_negative_cached_only_candidate_is_skipped_once_per_walk() -> Result<(
     let leaf_pool_id = B256::repeat_byte(0x3F);
     let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, _s_metrics, _) =
         build_serving_node(
-            hash,
             ab_pool_id,
             &s_buyer,
             discovery,
-            PositiveProbeCache::new(),
+            CandidateCache::new(),
             addr_map,
             &[(a_id, a_addr)],
             &[(leaf_pool_id, leaf_eth.address())],
@@ -16409,16 +15737,16 @@ async fn a_negative_cached_only_candidate_is_skipped_once_per_walk() -> Result<(
     let field = |line: &std::collections::HashMap<String, String>, name: &str| {
         line.get(name).cloned().unwrap_or_default()
     };
-    for (line, skipped, probed, absent) in [(first, "0", "1", "1"), (second, "1", "0", "0")] {
+    for (line, skipped, opened, absent) in [(first, "0", "1", "1"), (second, "1", "0", "0")] {
         anyhow::ensure!(
             field(line, "source") == "directory"
                 && field(line, "discovered") == "1"
                 && field(line, "skipped") == skipped
-                && field(line, "probed") == probed
+                && field(line, "opened") == opened
                 && field(line, "absent") == absent
                 && field(line, "holders") == "0"
                 && field(line, "handshakes") == "0",
-            "expected skipped={skipped} probed={probed} absent={absent}: {line:?}"
+            "expected skipped={skipped} opened={opened} absent={absent}: {line:?}"
         );
     }
     shutdown([task_s, task_a], [&leaf_ep, &ep_s, &ep_a]).await?;
@@ -16445,7 +15773,7 @@ async fn no_covering_candidate_with_end_past_the_blob_refuses_before_commit() ->
 
 /// The holders a serve-miss discovers before it pulls, and what serving node S
 /// then does with them: the leaf pulls the whole two-block blob through S, whose
-/// probe cache lists `first` ahead of the full holder O.
+/// candidate cache lists `first` ahead of the full holder O.
 struct HolderPull {
     /// Blocks the first-ranked holder holds and advertises.
     first_blocks: &'static [u32],
@@ -16463,9 +15791,9 @@ struct HolderPull {
 /// lists the full holder O in both shapes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HolderDiscovery {
-    /// A probe-cache entry lists the first-ranked holder F and O.
+    /// A candidate-cache entry lists the first-ranked holder F and O.
     CachedBoth,
-    /// The probe cache is empty and the DHT record for the hash names F alone.
+    /// The candidate cache is empty and the DHT record for the hash names F alone.
     DhtNamesFirst,
 }
 
@@ -16521,27 +15849,28 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
     let f_dht = DhtNodeId::from_bytes(*f_id.as_bytes());
     let o_dht = DhtNodeId::from_bytes(*o_id.as_bytes());
     let first_coverage = Coverage::from_block_indices(2, case.first_blocks.iter().copied());
-    let probed = |node_id: DhtNodeId, coverage: Coverage, rtt_ms: u32| ProbedProvider {
+    let opened = |node_id: DhtNodeId, coverage: Coverage, rtt_ms: u32| CachedCandidate {
         node_id,
         rate_per_mb: RATE,
         rtt_ms,
         coverage,
         total_bytes_hint: Some(total_bytes),
     };
-    let probe_cache = PositiveProbeCache::new();
+    let candidate_cache = CandidateCache::new();
     let mut discovery = FixtureDiscovery {
         stakers: HashSet::from([f_dht, o_dht]),
         directory: HashMap::from([(U256::ZERO, vec![o_dht])]),
         dht_peers: Vec::new(),
-        probe_fanout: 5,
+        open_fanout: 5,
+        max_rate_per_mb: 0,
     };
     let mut dht_server = None;
     match case.discovery {
-        HolderDiscovery::CachedBoth => probe_cache.insert(
+        HolderDiscovery::CachedBoth => candidate_cache.insert(
             ContentHash::from_bytes(*hash.as_bytes()),
             vec![
-                probed(f_dht, first_coverage, 1),
-                probed(o_dht, Coverage::full(2), 500),
+                opened(f_dht, first_coverage, 1),
+                opened(o_dht, Coverage::full(2), 500),
             ],
         ),
         HolderDiscovery::DhtNamesFirst => {
@@ -16557,11 +15886,10 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
     let leaf_pool_id = B256::repeat_byte(0x2E);
     let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, _s_metrics, _) =
         build_serving_node(
-            hash,
             ab_pool_id,
             &s_buyer,
             discovery,
-            probe_cache,
+            candidate_cache,
             addr_map,
             &[(f_id, f_addr), (o_id, o_addr)],
             &[(leaf_pool_id, leaf_eth.address())],
@@ -16787,22 +16115,14 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
     let ab_pool_id = B256::repeat_byte(0xA5);
     let s_buyer = Arc::new(PrivateKeySigner::random());
 
-    // Upstream U answers probes, then holds every client stream open unanswered,
+    // Upstream U answers opens, then holds every client stream open unanswered,
     // so each of S's opens for the blob stays in progress for the whole test.
     let u_sk = fresh_key();
     let u_id = u_sk.public();
     let u_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_u, addr_u) =
-        local_endpoint(u_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let (ep_u, addr_u) = local_endpoint(u_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let u_streams = Arc::new(AtomicUsize::new(0));
-    let task_u = spawn_a_counting_stalling_server(
-        ep_u.clone(),
-        Arc::clone(&u_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-        Arc::clone(&u_streams),
-    );
+    let task_u = spawn_a_counting_stalling_server(ep_u.clone(), Arc::clone(&u_streams));
     let u_dht = DhtNodeId::from_bytes(*u_id.as_bytes());
 
     // Four leaves, each on its own lane at S. Leaves 1, 2 and 4 are active
@@ -16831,11 +16151,10 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
 
     let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, s_metrics, _) =
         build_serving_node(
-            hash,
             ab_pool_id,
             &s_buyer,
             discovery,
-            PositiveProbeCache::new(),
+            CandidateCache::new(),
             HashMap::from([(u_dht, u_eth.address())]),
             &[(u_id, addr_u)],
             &[
@@ -16956,7 +16275,7 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
 ///
 /// Holder A covers block 0 only and holder B block 1 only, so B is the sole
 /// coverer of its run. B refuses its first TWO `cdn/client/v1` streams. The
-/// live-probe ranking decides whether S's handshake goes to A or to B, so B's
+/// live-open ranking decides whether S's handshake goes to A or to B, so B's
 /// first stream is either its run or the handshake; with two refusals, B's
 /// run is refused at least once on either order. Dropping B on that refusal
 /// would end the assembly `Unavailable` with block 1 unfetched, and suppressing
@@ -17011,11 +16330,10 @@ async fn sole_coverer_refusal_is_retried(leaves: usize) -> Result<()> {
         .collect();
     let (handler_s, s_target, ep_s, _recorded, cache_s, s_operator, s_metrics, origin_s) =
         build_serving_node(
-            hash,
             ab_pool_id,
             &s_buyer,
             FixtureDiscovery::directory_only(providers, U256::ZERO),
-            PositiveProbeCache::new(),
+            CandidateCache::new(),
             addr_map,
             &[(a_id, a_addr), (b_id, b_addr)],
             &leaf_lanes,
@@ -17122,4 +16440,88 @@ async fn a_sole_coverer_backpressure_refusal_is_retried_not_dropped() -> Result<
 #[tokio::test(flavor = "multi_thread")]
 async fn sibling_streams_survive_a_sole_coverer_backpressure_refusal() -> Result<()> {
     sole_coverer_refusal_is_retried(2).await
+}
+
+/// #2178 at admission: the sole holder answers S's discovery open as a holder,
+/// and its admission refuses the adopted stream at its first proof with a
+/// `NotFound` before any byte — where a node's load shed and per-signer cap
+/// refuse a hit. That refusal is backpressure like one at the open: the run
+/// waits and asks again, the holder is not suppressed, and the leaf's paid
+/// delivery completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_at_admission_of_the_adopted_stream_is_backpressure() -> Result<()> {
+    let block: u64 = 16 * 1024;
+    let _block_guard = decdn_protocol::override_discovery_block_bytes_for_test(block);
+    let payload_len = usize::try_from(2 * block)?;
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let hash = support::register_payload(&payload);
+    let total_bytes = 2 * block;
+
+    let ab_pool_id = B256::repeat_byte(0xA6);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+    // The only holder refuses its first stream: the discovery open S adopts.
+    let (h_id, h_addr, h_eth, ep_h, task_h, _store_h) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::full(2),
+        1,
+    )
+    .await?;
+    let h_dht = DhtNodeId::from_bytes(*h_id.as_bytes());
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_pool_id = B256::repeat_byte(0x6A);
+    let (handler_s, s_target, ep_s, _recorded, cache_s, s_operator, s_metrics, origin_s) =
+        build_serving_node(
+            ab_pool_id,
+            &s_buyer,
+            FixtureDiscovery::directory_only(vec![h_dht], U256::ZERO),
+            CandidateCache::new(),
+            HashMap::from([(h_dht, h_eth)]),
+            &[(h_id, h_addr)],
+            &[(leaf_pool_id, leaf_eth.address())],
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        s_target,
+        leaf_node_id,
+        &leaf_eth,
+        s_operator,
+        leaf_pool_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+    anyhow::ensure!(
+        outcome.completed && outcome.hash_ok && outcome.received == total_bytes,
+        "the leaf's paid delivery must complete after the refused leg is asked again"
+    );
+    anyhow::ensure!(
+        cache_s.has(hash).await?,
+        "S must promote the blob on a complete delivery"
+    );
+    anyhow::ensure!(
+        counter_value(&s_metrics, "node_pull_backpressure_backoffs_total")? >= 1,
+        "the refusal at admission must be waited on as backpressure"
+    );
+    anyhow::ensure!(
+        counter_value(&s_metrics, "node_pull_backpressure_exhausted_total")? == 0,
+        "the refusal cleared inside the wait budget"
+    );
+    anyhow::ensure!(
+        !origin_s.is_suppressed(h_id, hash),
+        "a refusal at admission must not suppress the holder for the hash"
+    );
+    shutdown([task_s, task_h], [&leaf_ep, &ep_s, &ep_h]).await?;
+    Ok(())
 }

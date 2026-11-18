@@ -31,7 +31,7 @@ fn metric_value(text: &str, name: &str) -> Option<u64> {
 #[test]
 fn latency_histograms_export_buckets_sum_and_count() {
     const HISTOGRAMS: [&str; 10] = [
-        "decdn_probe_collection_latency_seconds",
+        "decdn_open_collection_latency_seconds",
         "decdn_serve_first_byte_hit_seconds",
         "decdn_serve_first_byte_miss_seconds",
         "decdn_node_pull_first_byte_seconds",
@@ -64,7 +64,7 @@ fn latency_histograms_export_buckets_sum_and_count() {
 
     // 40 ms: above the 0.025 bucket, inside the 0.05 bucket of both sets.
     let elapsed = Duration::from_millis(40);
-    metrics.probe_collection_latency(elapsed);
+    metrics.open_collection_latency(elapsed);
     metrics.node_pull_first_byte(elapsed);
     let now = Instant::now();
     FirstByteClock::new(now, now, RequestClass::CacheHit).record(&metrics);

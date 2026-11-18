@@ -1551,6 +1551,7 @@ async fn a_gate_stop_keeps_the_reveal_the_node_accepted() -> anyhow::Result<()> 
                 reason,
                 bundle: None,
             },
+            false,
         );
         assert!(
             err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
@@ -1581,6 +1582,7 @@ async fn a_refused_proof_still_rewinds_its_reveal() -> anyhow::Result<()> {
             reason: VoucherRejectReason::CapabilityExpired,
             bundle: None,
         },
+        false,
     );
     assert_eq!(
         ledger.committed().amount,
@@ -1609,11 +1611,22 @@ async fn a_refusal_frame_before_any_chunk_is_a_typed_refusal() -> anyhow::Result
     ] {
         let (ledger, meter) = ledger_with_a_released_reveal().await?;
         let before = ledger.committed();
-        let err = super::voucher_rejection(&ledger, &meter, error.clone());
+        let err = super::voucher_rejection(&ledger, &meter, error.clone(), true);
         let refused = err
             .downcast_ref::<UpstreamRefused>()
             .ok_or_else(|| anyhow::anyhow!("{error:?} must be a typed refusal: {err:#}"))?;
         anyhow::ensure!(*refused.error() == error, "the class survives unchanged");
+        anyhow::ensure!(
+            refused.before_delivery(),
+            "a frame before any chunk is a refusal at admission"
+        );
+        let after = super::voucher_rejection(&ledger, &meter, error.clone(), false);
+        anyhow::ensure!(
+            after
+                .downcast_ref::<UpstreamRefused>()
+                .is_some_and(|r| !r.before_delivery()),
+            "a frame after delivered bytes is a mid-stream refusal"
+        );
         anyhow::ensure!(
             refused.evidence().is_none(),
             "a bare frame carries no signed response"

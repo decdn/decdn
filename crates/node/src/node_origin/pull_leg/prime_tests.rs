@@ -210,3 +210,101 @@ fn a_run_adopts_only_its_own_leg() {
     assert!(!key.answers(1, pool, &ledger, Some(&other)), "another leg");
     assert!(!key.answers(1, pool, &ledger, None), "nothing to open");
 }
+
+/// The span every discovery open asks for is the pull's own range from its
+/// chunk group, cut to the cap on held bytes. It needs no size, and its served
+/// stream starts where the predicted leg starts and runs at least to its end,
+/// so the first run adopts it, narrowed to its leg, whatever the blob's size.
+#[test]
+fn the_open_span_starts_at_the_predicted_leg_and_covers_it() {
+    let hash = [9u8; 32];
+    // A whole-blob pull asks for the whole blob.
+    assert_eq!(PrimeLeg::new(0, 0).open_span(hash, 0), (0, 0));
+    // A mid-group range widens to whole groups from the group its offset is in.
+    assert_eq!(
+        PrimeLeg::new(CHUNK_GROUP_BYTES + 5, 2 * CHUNK_GROUP_BYTES).open_span(hash, 0),
+        (CHUNK_GROUP_BYTES, 3 * CHUNK_GROUP_BYTES)
+    );
+    // The cap on held bytes cuts the span, a whole-blob span included.
+    assert_eq!(
+        PrimeLeg::new(0, 0).open_span(hash, CHUNK_GROUP_BYTES),
+        (0, CHUNK_GROUP_BYTES)
+    );
+    // The empty blob is asked for whole.
+    assert_eq!(
+        PrimeLeg::new(CHUNK_GROUP_BYTES, 1).open_span(decdn_protocol::EMPTY_ROOT, 0),
+        (0, 0)
+    );
+    for total in [
+        CHUNK_GROUP_BYTES / 2,
+        3 * DISCOVERY_BLOCK_BYTES,
+        64 * DISCOVERY_BLOCK_BYTES,
+    ] {
+        let full = Coverage::full(num_blocks(total));
+        for prime in [
+            PrimeLeg::new(0, 0),
+            PrimeLeg::new(0, total / 2),
+            PrimeLeg::new(CHUNK_GROUP_BYTES / 2, 0),
+        ] {
+            let Some(leg) = prime.predicted_leg(total, &full, 0) else {
+                continue;
+            };
+            let pull = super::served_range(prime.open_span(hash, 0), total).unwrap();
+            assert!(
+                super::pull_serves_leg(&pull, &leg),
+                "a {total}-byte blob's open span {pull:?} must serve the leg {leg:?}"
+            );
+        }
+    }
+}
+
+/// A holder serves a span cut at the blob's end; a span that starts past the
+/// end has no range.
+#[test]
+fn a_served_range_is_cut_at_the_blobs_end() {
+    let total = 3 * CHUNK_GROUP_BYTES / 2;
+    assert_eq!(
+        super::served_range((0, 4 * CHUNK_GROUP_BYTES), total),
+        align_range(0, total, total).ok()
+    );
+    assert_eq!(
+        super::served_range((0, 0), total),
+        align_range(0, 0, total).ok()
+    );
+    assert_eq!(super::served_range((2 * CHUNK_GROUP_BYTES, 1), total), None);
+}
+
+/// A pull serves a leg only from the leg's start and through its end.
+#[test]
+fn a_pull_serves_a_leg_from_its_start_through_its_end() {
+    let total = 4 * CHUNK_GROUP_BYTES;
+    let leg = align_range(0, 2 * CHUNK_GROUP_BYTES, total).unwrap();
+    let longer = align_range(0, 0, total).unwrap();
+    let shorter = align_range(0, CHUNK_GROUP_BYTES, total).unwrap();
+    let later = align_range(CHUNK_GROUP_BYTES, 0, total).unwrap();
+    assert!(super::pull_serves_leg(&leg, &leg));
+    assert!(super::pull_serves_leg(&longer, &leg));
+    assert!(!super::pull_serves_leg(&shorter, &leg));
+    assert!(!super::pull_serves_leg(&later, &leg));
+}
+
+/// A partial holder's refusal proves no size, so its handshake range is the
+/// first chunk group of the first block it names; with a proven size the range
+/// stays inside the blob.
+#[test]
+fn a_handshake_range_needs_no_proven_size() {
+    let block = DISCOVERY_BLOCK_BYTES;
+    let second = Coverage::from_block_indices(2, [1].into_iter());
+    assert_eq!(
+        super::covered_handshake_range(&second, None),
+        Some((block, CHUNK_GROUP_BYTES))
+    );
+    assert_eq!(
+        super::covered_handshake_range(&second, Some(block + 100)),
+        Some((block, 100))
+    );
+    assert_eq!(
+        super::covered_handshake_range(&Coverage::empty(), None),
+        None
+    );
+}

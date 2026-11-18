@@ -1127,7 +1127,11 @@ enum Kind {
     /// Mid-stream refusal: a bare [`ClientMessage::StreamError`] frame that
     /// arrived after the open stage. It carries no signature (#1042), so there
     /// is never a signed `StreamResponse` to retain — `None` by construction.
-    MidStream { error: StreamError },
+    /// `at_admission` is set when the frame came before any delivered byte.
+    MidStream {
+        error: StreamError,
+        at_admission: bool,
+    },
 }
 
 impl UpstreamRefused {
@@ -1204,7 +1208,26 @@ impl UpstreamRefused {
     #[must_use]
     pub const fn mid_stream(error: StreamError) -> Self {
         Self {
-            kind: Kind::MidStream { error },
+            kind: Kind::MidStream {
+                error,
+                at_admission: false,
+            },
+        }
+    }
+
+    /// Build the refusal for a [`ClientMessage::StreamError`] frame that a
+    /// served stream sent before any delivered byte. A node admits a stream
+    /// it can serve at once (a hit, a covering partial, its own origin) only
+    /// at the stream's first proof, so its admission refuses the stream there:
+    /// the refusal an open answer would carry, one frame later. Like
+    /// [`Self::mid_stream`], it carries no signature.
+    #[must_use]
+    pub const fn at_admission(error: StreamError) -> Self {
+        Self {
+            kind: Kind::MidStream {
+                error,
+                at_admission: true,
+            },
         }
     }
 
@@ -1215,7 +1238,19 @@ impl UpstreamRefused {
     #[must_use]
     pub const fn error(&self) -> &StreamError {
         match &self.kind {
-            Kind::Open { error, .. } | Kind::MidStream { error } => error,
+            Kind::Open { error, .. } | Kind::MidStream { error, .. } => error,
+        }
+    }
+
+    /// Whether the refusal came before any delivered byte: at the open stage,
+    /// or as the first frame after a served answer ([`Self::at_admission`]).
+    /// Either way the node refused to admit the stream, and no byte of it was
+    /// delivered.
+    #[must_use]
+    pub const fn before_delivery(&self) -> bool {
+        match &self.kind {
+            Kind::Open { .. } => true,
+            Kind::MidStream { at_admission, .. } => *at_admission,
         }
     }
 
@@ -3626,9 +3661,12 @@ impl UpstreamPull {
                 // A mid-stream `StreamError` is either a `VoucherRejected` (our
                 // payment fault, with the self-heal bundle) or a refusal; both
                 // surface as errors.
-                ClientMessage::StreamError(e) => {
-                    Err(voucher_rejection(&self.ledger, &self.meter, e))
-                }
+                ClientMessage::StreamError(e) => Err(voucher_rejection(
+                    &self.ledger,
+                    &self.meter,
+                    e,
+                    self.cumulative == 0,
+                )),
                 ClientMessage::StreamEnd => {
                     self.ended = true;
                     Ok(None)
@@ -3749,9 +3787,12 @@ impl UpstreamPull {
                     Ok(false)
                 }
             }
-            Ok(Ok(ClientMessage::StreamError(e))) => {
-                Err(voucher_rejection(&self.ledger, &self.meter, e))
-            }
+            Ok(Ok(ClientMessage::StreamError(e))) => Err(voucher_rejection(
+                &self.ledger,
+                &self.meter,
+                e,
+                self.cumulative == 0,
+            )),
             Ok(Ok(other)) => Err(write_err.context(format!(
                 "no terminal signal after the voucher write failed; peer sent {}",
                 variant_name(&other)
@@ -3817,7 +3858,12 @@ impl UpstreamPull {
                 // for a late `VoucherRejected` / other `StreamError`, which still
                 // surfaces as an error.
                 ClientMessage::StreamError(e) => {
-                    return Err(voucher_rejection(&self.ledger, &self.meter, e));
+                    return Err(voucher_rejection(
+                        &self.ledger,
+                        &self.meter,
+                        e,
+                        self.cumulative == 0,
+                    ));
                 }
                 other => {
                     anyhow::bail!("unexpected message at stream end: {}", variant_name(&other))
@@ -3913,7 +3959,12 @@ impl UpstreamPull {
                     self.take_in(len);
                 }
                 Ok(ClientMessage::StreamError(e)) => {
-                    return Some(voucher_rejection(&self.ledger, &self.meter, e));
+                    return Some(voucher_rejection(
+                        &self.ledger,
+                        &self.meter,
+                        e,
+                        self.cumulative == 0,
+                    ));
                 }
                 _ => return None,
             }
@@ -4334,11 +4385,14 @@ impl StreamMeter {
 /// instead of treating the rejection as terminal. Any
 /// OTHER `StreamError` is the upstream refusing mid-stream; carry the typed wire
 /// class as [`UpstreamRefused`] so a refusing peer is scored on its real class
-/// rather than the `Unreachable` catch-all (#1145 review).
+/// rather than the `Unreachable` catch-all (#1145 review). `before_delivery`
+/// says the stream had received no byte: the node refused it at its admission
+/// ([`UpstreamRefused::at_admission`]).
 fn voucher_rejection(
     ledger: &PoolLedger,
     meter: &StreamMeter,
     error: StreamError,
+    before_delivery: bool,
 ) -> anyhow::Error {
     match error {
         StreamError::VoucherRejected { reason, bundle } => {
@@ -4361,6 +4415,7 @@ fn voucher_rejection(
                 proof_generation,
             })
         }
+        other if before_delivery => anyhow::Error::new(UpstreamRefused::at_admission(other)),
         other => anyhow::Error::new(UpstreamRefused::mid_stream(other)),
     }
 }
