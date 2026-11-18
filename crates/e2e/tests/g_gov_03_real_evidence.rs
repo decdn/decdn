@@ -1,25 +1,26 @@
 //! G-GOV-03 — real node responses as valid on-chain evidence (issue #1042).
 //!
 //! Every other "signed evidence" path in this harness cheats: it builds a
-//! `ProbeSlashData` / `StreamSlashData` in the test and signs it with
-//! `node.operator()`, because the test holds the operator's key. That proves the
-//! *contract* accepts a well-formed signature — which `SlashJudge.t.sol` already
-//! proves with synthetic ones — and proves nothing about the daemon. This journey
-//! closes that gap for the stream leg: every byte of it came off the wire from a
-//! running `decdn-node`, `slash_sig` included, and is forwarded verbatim. The
-//! node signs no probe answer, so the probe leg is signed here with
-//! `node.operator()` ([`sign_probe`]).
+//! `StreamSlashData` in the test and signs it with `node.operator()`, because
+//! the test holds the operator's key. That proves the *contract* accepts a
+//! well-formed signature — which `SlashJudge.t.sol` already proves with
+//! synthetic ones — and proves nothing about the daemon. This journey closes
+//! that gap: every byte of the evidence came off the wire from a running
+//! `decdn-node`, `slash_sig` included, and is forwarded verbatim.
 //!
-//! One node, one offense — **rate manipulation** — induced through real operator
-//! surfaces. The node answers a probe for a held blob at its configured rate; the
-//! operator raises `payment.rate_per_mb` and restarts the daemon to apply it (the
-//! rate is restart-required); the node's next signed `StreamResponse` for the same
-//! hash *delivers* (`ok: true`) at the higher rate inside the 30s window. The
-//! restart is fast relative to that window, so the probe (before) and stream
-//! (after) both land inside it.
-//! Those two daemon-signed messages are the `submitRateChallenge` pair. A signed
-//! refusal (`ok: false`) is deliberately not usable: rate manipulation requires a
-//! delivery, so only a real `ok: true` response at the raised rate is evidence.
+//! One node, one offense — **blacklist violation**. The node serves a held blob:
+//! its signed `StreamResponse` commits to deliver it (`ok: true`). The blob's
+//! hash is then on the GLOBAL blacklist with an entry that was enforceable
+//! before that response, so the response is a served blacklisted blob — the
+//! `submitBlacklistChallenge` evidence.
+//!
+//! The daemon signs only a request timestamp near its own wall clock, and the
+//! judge slashes only a response stamped after the entry's `effectiveAt`
+//! (`addedAt` plus the compliance window, ADR 011). The journey cannot wait out
+//! the window against the wall clock, so it captures the response first and then
+//! backdates the entry in chain time ([`ChainFixture::add_hash_global_at`]). On
+//! chain, the node served a hash that had been blacklisted for a full compliance
+//! window — exactly what a node that ignores the blacklist does.
 //!
 //! The positive path asserts the full on-chain consequence: the slash lands, the
 //! TOKEN is escrowed (ADR 028 escrow-on-slash) rather than distributed
@@ -30,28 +31,19 @@
 //! Negatives, all built from the *same real* daemon output so they test the
 //! judge and not the test's own forgery skills:
 //!
-//! - a genuine pair whose requester timestamps sit just past the 30s window
-//!   (each one valid against the daemon's clock when it was captured) is
-//!   rejected (`TimestampWindowViolated`) — the window is enforced on real
-//!   evidence;
-//! - the real probe with its signature swapped for one from an unrelated key is
-//!   rejected (`InvalidProbeSignature`);
-//! - the real stream with its signature swapped for a non-operator's is rejected
-//!   (`InvalidStreamSignature`);
-//! - a real, correctly-signed daemon *refusal* (`ok: false`) at the raised rate,
-//!   paired with the node's own base-rate probe for that hash, is rejected
-//!   (`NotRateManipulation`). Every other leg of the predicate passes, so this
-//!   isolates the `stream.ok` guard — the property that lets a node sign
-//!   refusals freely;
-//! - the same real pair replayed after a successful slash is rejected
+//! - the real response with its signature swapped for a non-operator's is
+//!   rejected (`InvalidResponseSignature`);
+//! - a real, correctly-signed daemon *refusal* (`ok: false`) is rejected
+//!   (`NotBlacklistViolation`). Its signature and hash pass, so this isolates the
+//!   `ok` guard — the property that lets a node sign refusals freely;
+//! - the real response replayed after a successful slash is rejected
 //!   (`EvidenceAlreadyUsed`);
-//! - a failed challenge moves no TOKEN. Note the issue text says the challenger
-//!   "forfeits" its bond; the as-built contract does not, and deliberately so —
-//!   ADR 014 § Bond Handling: "a `submit*Challenge` that fails on-chain
-//!   verification reverts and the challenger pays only gas; the bond is not
-//!   transferred for failed verifications." There is no second-stage dispute that
-//!   could claw it back after the fact. So the assertion is the behaviour of
-//!   record: nothing is pulled, and no slash is minted.
+//! - a failed challenge moves no TOKEN. ADR 014 § Bond Handling: "a
+//!   `submit*Challenge` that fails on-chain verification reverts and the
+//!   challenger pays only gas; the bond is not transferred for failed
+//!   verifications." There is no second-stage dispute that could claw it back
+//!   after the fact. So the assertion is the behaviour of record: nothing is
+//!   pulled, and no slash is minted.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and built `decdn-node` + `decdn` binaries:
@@ -70,9 +62,8 @@
     clippy::panic,
     clippy::indexing_slicing,
     clippy::duration_suboptimal_units,
-    // `forged`/`forger`, `stream`/`stream_forger` etc.: the near-identical names
-    // pair a forged artifact with the key that forged it, which reads clearer
-    // than a contrived rename.
+    // `forged`/`forger`: the near-identical names pair a forged artifact with
+    // the key that forged it, which reads clearer than a contrived rename.
     clippy::similar_names
 )]
 
@@ -83,60 +74,18 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_e2e::assert::expect_revert_anyhow;
-use decdn_e2e::bindings::SlashJudgeRate;
-use decdn_e2e::chain::{ChainFixture, EvidencePair, Offense, SignedProbe};
+use decdn_e2e::bindings::SlashJudgeBlacklist;
+use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::time;
+use decdn_incentive::slash_judge_domain;
 use decdn_incentive::stream_sig::StreamSlashData;
-use decdn_incentive::{ProbeSlashData, slash_judge_domain};
-use decdn_node::handlers::timestamp_skew::{MAX_REQUEST_TIMESTAMP_SKEW_US, now_us};
+use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_protocol::client::StreamResponse;
 
 const MIB: usize = 1024 * 1024;
 const DAY: u64 = 24 * 60 * 60;
-
-/// The rendered fixture config's `payment.rate_per_mb`. The bait rate.
-const BASE_RATE_PER_MB: u64 = 10;
-/// The switched-to rate. Comfortably inside the deployed `[1, 1000]` on-chain
-/// delivery band, so the daemon signs it unclamped.
-const SWITCHED_RATE_PER_MB: u64 = 40;
-
-/// `SlashJudge.sol`'s `SLASH_WINDOW_US`: the judge reverts a pair whose
-/// stream timestamp is at least this far after the probe's. Mirrored here so
-/// the out-of-window pair is derived from the bound it must violate.
-const SLASH_WINDOW_US: u64 = 30_000_000;
-
-/// How far in the future the in-window probe is stamped. The daemon admits it
-/// for 50s after the clock read, and every later capture may be stamped up to
-/// this much after the read without leaving the probe's window.
-const PROBE_FUTURE_US: u64 = 20_000_000;
-
-/// How far in the past a post-restart capture is stamped once the probe's
-/// timestamp is older than that: the capture's budget to reach the daemon.
-const CAPTURE_BUDGET_US: u64 = 15_000_000;
-
-/// The timestamp for a capture after the rate-switch restart, read right
-/// before it is sent: the probe's timestamp, or [`CAPTURE_BUDGET_US`] in the
-/// past once that is later. It must stay inside the judge's window after
-/// `probe_ts`, so a restart slower than the window allows fails here, with
-/// the time it took, rather than as an opaque daemon refusal.
-fn capture_ts(probe_ts: u64, probe_clock: std::time::Instant, what: &str) -> anyhow::Result<u64> {
-    let ts = probe_ts.max(now_us() - CAPTURE_BUDGET_US);
-    let since_probe = probe_clock.elapsed().as_secs_f64();
-    tracing::info!(
-        what,
-        since_probe_s = since_probe,
-        "G-GOV-03: stamping a capture"
-    );
-    anyhow::ensure!(
-        ts < probe_ts + SLASH_WINDOW_US,
-        "the {what} capture started {since_probe:.1}s after the probe's clock read, too late \
-         to stamp a timestamp the daemon admits inside the probe's 30s window: the \
-         rate-switch daemon restart was too slow"
-    );
-    Ok(ts)
-}
 
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule). The
 /// journey runs a full deploy, a daemon, and several commit-reveal challenges,
@@ -153,7 +102,6 @@ async fn real_node_responses_are_valid_on_chain_evidence() -> anyhow::Result<()>
 }
 
 #[allow(
-    clippy::cognitive_complexity,
     clippy::too_many_lines,
     reason = "sequential on-chain journey (capture → negatives → positive → finality) sharing one \
               anvil deployment: splitting it would either duplicate a ~60s deploy per stage or \
@@ -170,122 +118,41 @@ async fn run() -> anyhow::Result<()> {
     let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
     let client = ClientFixture::new(&chain).await?;
     let node_id = B256::from_slice(node.node_id().as_bytes());
+    let hash_key = B256::from(*hash.as_bytes());
 
     // A real session: opens + funds a pool and warms `hash`, so the node has
     // observed the lane AND holds the blob — both preconditions for it to sign
     // a real `ok: true` delivery response below.
     let (session, _) = client.open_session(&chain, &node, hash).await?;
 
-    // Anchor evidence timestamps to the host's wall clock, which is the
-    // daemon's clock AND (bar the later commit-reveal warps, which only push
-    // chain time forward and so only age the evidence — the staleness bound
-    // is a day at minimum) anvil's `block.timestamp`. The daemon signs a
-    // request's timestamp only when it sits within its ±30s clock-skew bound
-    // (`MAX_REQUEST_TIMESTAMP_SKEW_US`) of its own clock at the moment the
-    // request arrives. The judge's 30s pairing window is computed purely
-    // between the two evidence timestamps. So each timestamp below uses the
-    // daemon's bound to give the slow step — the rate-switch restart — as much
-    // room as the judge's window allows:
-    //
-    // - the stale probe is stamped 20s in the past (10s of capture budget);
-    // - the probe is stamped 20s in the FUTURE (admitted while the daemon's
-    //   clock is up to 50s past the read);
-    // - the delivery and the refusal after the restart are stamped at the
-    //   probe's timestamp, or 15s in the past once that is later (15s of
-    //   capture budget each). Both must stay inside the probe's 30s window, so
-    //   each capture must start within ~65s of the probe's clock read, restart
-    //   included.
-    //
-    // Every timestamp after the stale probe's sits at least 40s after it, so
-    // the stale probe and the delivery are the out-of-window pair.
-    let stale_probe_ts = now_us() - (MAX_REQUEST_TIMESTAMP_SKEW_US - 10_000_000);
-
-    // Real probes at the CONFIGURED rate, captured before the switch. The stale
-    // one (same content, only the requester timestamp differs) feeds the
-    // out-of-window negative.
-    let stale_probe = sign_probe(&chain, &node, hash, true, stale_probe_ts)?;
-    let probe_clock = std::time::Instant::now();
-    let probe_ts = now_us() + PROBE_FUTURE_US;
-    let probe = sign_probe(&chain, &node, hash, true, probe_ts)?;
-    anyhow::ensure!(
-        probe.body.has_blob && stale_probe.body.has_blob,
-        "node must announce the held blob"
-    );
-    anyhow::ensure!(
-        probe.body.rate_per_mb == BASE_RATE_PER_MB,
-        "node must quote the configured rate before the switch, got {}",
-        probe.body.rate_per_mb
-    );
-
-    // A base-rate probe for a hash the node does NOT hold, feeding the
-    // signed-refusal negative (2c) below. `has_blob: false` is irrelevant to the
-    // rate predicate — what matters is that the probe is real, signed, at the
-    // base rate, and names the same hash the refusal will.
-    let absent = Hash::new(b"g-gov-03: never published, always refused");
-    let absent_probe = sign_probe(&chain, &node, absent, false, probe_ts)?;
-    anyhow::ensure!(
-        !absent_probe.body.has_blob,
-        "the node must not claim a blob it was never given"
-    );
-
-    // The switch: rewrite the operator's config rate and restart the daemon to
-    // apply it (the served rate is restart-required). The client reconnects on the
-    // next request. The raised rate is verified where it becomes evidence — the
-    // signed `rate_per_mb` inside the `StreamResponse` captured below.
-    node.set_rate_per_mb(SWITCHED_RATE_PER_MB).await?;
-
-    // The real signed DELIVERY at the raised rate, for the same hash, inside the
-    // window. `ok: true` is what makes this rate-manipulation evidence: the node
-    // quoted `BASE_RATE_PER_MB` in the probe and now commits to deliver at
-    // `SWITCHED_RATE_PER_MB`. (A refusal here would be inert — rate manipulation
-    // requires a delivery.)
-    let stream_ts = capture_ts(probe_ts, probe_clock, "delivery")?;
+    // The real signed DELIVERY: the node commits to serve `hash`. Stamped from
+    // the wall clock, which is the daemon's clock: the daemon signs a request
+    // timestamp only within its clock-skew bound of its own clock.
+    let stream_ts = now_us();
     let stream = client
         .capture_delivery_response(&session, hash, U256::ZERO, stream_ts)
         .await
-        .with_context(|| {
-            format!(
-                "delivery capture must reach the daemon within 15s of its clock read (skew \
-                 bound); {:.1}s since the probe's clock read",
-                probe_clock.elapsed().as_secs_f64()
-            )
-        })?;
+        .context("capture the daemon's signed delivery")?;
     anyhow::ensure!(stream.body.ok, "the captured delivery must be ok:true");
     anyhow::ensure!(
         stream.body.hash == *hash.as_bytes(),
-        "the delivery must answer for the probed hash"
-    );
-    anyhow::ensure!(
-        stream.body.rate_per_mb > probe.body.rate_per_mb,
-        "the daemon must have signed the raised rate: probe {} vs stream {}",
-        probe.body.rate_per_mb,
-        stream.body.rate_per_mb
+        "the delivery must answer for the requested hash"
     );
 
-    // The real signed REFUSAL feeding negative (2c) below, captured here —
-    // right after the delivery, while the probe's 30s window is still open —
-    // rather than between the challenge legs. The daemon signed `ok: false`
-    // for a hash it does not hold, at the raised rate, against the base-rate
-    // probe it issued for that same hash.
-    let refusal_ts = capture_ts(probe_ts, probe_clock, "refusal")?;
+    // The real signed REFUSAL feeding the `ok`-guard negative: `ok: false` for
+    // a hash the node does not hold.
+    let absent = Hash::new(b"g-gov-03: never published, always refused");
     let refusal = client
-        .refused_stream(&chain, &node, session.pool_id(), absent, refusal_ts)
+        .refused_stream(&chain, &node, session.pool_id(), absent, now_us())
         .await
-        .with_context(|| {
-            format!(
-                "refusal capture must reach the daemon within 15s of its clock read (skew \
-                 bound); {:.1}s since the probe's clock read",
-                probe_clock.elapsed().as_secs_f64()
-            )
-        })?;
+        .context("capture the daemon's signed refusal")?;
     anyhow::ensure!(!refusal.body.ok, "the captured refusal must be ok:false");
-    anyhow::ensure!(
-        refusal.body.rate_per_mb > absent_probe.body.rate_per_mb,
-        "the refusal must quote the raised rate so only the ok-guard can reject: \
-         probe {} vs stream {}",
-        absent_probe.body.rate_per_mb,
-        refusal.body.rate_per_mb
-    );
+
+    // Blacklist `hash` with an entry enforceable a minute before the delivery:
+    // `addedAt` sits a full compliance window plus that minute before it.
+    let window = chain.compliance_window().await?;
+    let added_at = stream_ts / 1_000_000 - window - 60;
+    chain.add_hash_global_at(hash_key, added_at).await?;
 
     // ================================================================
     // Negatives — the judge rejects real-but-inadmissible evidence.
@@ -293,111 +160,47 @@ async fn run() -> anyhow::Result<()> {
 
     let bond = chain.challenge_bond().await?;
 
-    // (1) Outside the 30s window. Both messages are genuine and correctly signed;
-    // only the gap between them is inadmissible.
-    let out_of_window = PrivateKeySigner::random();
-    let err = chain
-        .challenge_with_real_evidence(
-            &out_of_window,
-            node.operator_addr(),
-            node_id,
-            Offense::RateManipulation,
-            EvidencePair {
-                probe: &stale_probe,
-                stream: &stream,
-            },
-            B256::repeat_byte(0x01),
-        )
-        .await
-        .err()
-        .ok_or_else(|| {
-            anyhow::anyhow!("a pair spread past the 30s window must not be slashable")
-        })?;
-    expect_revert_anyhow::<SlashJudgeRate::TimestampWindowViolated>(&err, "out-of-window pair")?;
-    assert_challenge_cost_nothing(&chain, out_of_window.address(), bond).await?;
-
-    // (2) Forged PROBE signature: the real probe body, re-signed by a key that is
-    // not the operator's. `SignatureChecker` recovers a different address.
+    // (1) Forged signature: the real response body, but `slash_sig` re-signed by
+    // a non-operator. The body (hence the evidenceHash) is unchanged, but the
+    // signature check reverts before `_resolve` consults `usedEvidenceHash`, so
+    // the real evidence stays spendable by the positive path below.
     let impostor = PrivateKeySigner::random();
-    let forged = forge_probe_signature(&chain, &probe, &impostor)?;
+    let forged = forge_stream_signature(&chain, &stream, &impostor)?;
     let forger = PrivateKeySigner::random();
     let err = chain
-        .challenge_with_real_evidence(
+        .submit_blacklist_challenge(
             &forger,
             node.operator_addr(),
             node_id,
-            Offense::RateManipulation,
-            EvidencePair {
-                probe: &forged,
-                stream: &stream,
-            },
+            &forged,
             B256::repeat_byte(0x02),
         )
         .await
         .err()
-        .ok_or_else(|| anyhow::anyhow!("a probe signed by a non-operator must not be slashable"))?;
-    expect_revert_anyhow::<SlashJudgeRate::InvalidProbeSignature>(&err, "forged probe signature")?;
+        .ok_or_else(|| anyhow::anyhow!("a response signed by a non-operator must not slash"))?;
+    expect_revert_anyhow::<SlashJudgeBlacklist::InvalidResponseSignature>(
+        &err,
+        "forged response signature",
+    )?;
     assert_challenge_cost_nothing(&chain, forger.address(), bond).await?;
 
-    // (2b) Forged STREAM signature: the real probe with the real stream body, but
-    // the stream `slash_sig` re-signed by a non-operator. `_verifyPair` checks the
-    // probe leg first, so a real probe reaches — and fails at — the stream-leg
-    // check `InvalidStreamSignature`. The forged stream carries the same body, so
-    // its evidenceHash matches the real pair — but the signature check reverts
-    // before `_resolve` consults `usedEvidenceHash`, so the real evidence stays
-    // spendable by the positive path below.
-    let stream_impostor = PrivateKeySigner::random();
-    let forged_stream = forge_stream_signature(&chain, &stream, &stream_impostor)?;
-    let stream_forger = PrivateKeySigner::random();
-    let err = chain
-        .challenge_with_real_evidence(
-            &stream_forger,
-            node.operator_addr(),
-            node_id,
-            Offense::RateManipulation,
-            EvidencePair {
-                probe: &probe,
-                stream: &forged_stream,
-            },
-            B256::repeat_byte(0x06),
-        )
-        .await
-        .err()
-        .ok_or_else(|| {
-            anyhow::anyhow!("a stream signed by a non-operator must not be slashable")
-        })?;
-    expect_revert_anyhow::<SlashJudgeRate::InvalidStreamSignature>(
-        &err,
-        "forged stream signature",
-    )?;
-    assert_challenge_cost_nothing(&chain, stream_forger.address(), bond).await?;
-
-    // (2c) A real, correctly-signed REFUSAL is inert. The refusal (captured
-    // above) is for a hash the daemon does not hold, at the raised rate,
-    // inside the window, against the probe it issued for that same hash at
-    // the base rate. Every other leg of the rate predicate passes — same
-    // hash, same operator, real signatures, and
-    // `stream.ratePerMb > probe.ratePerMb` — so `NotRateManipulation` here
-    // can only be the `!s.ok` guard firing. This is what lets a node sign
-    // refusals freely (ADR 014 § Rate manipulation): you cannot overcharge on
-    // a delivery you declined.
+    // (2) A real, correctly-signed REFUSAL is inert. Its signature recovers to
+    // the operator and its hash matches the challenged blob, so
+    // `NotBlacklistViolation` here can only be the `ok` guard firing: a node
+    // that declined to serve served nothing.
     let refusal_challenger = PrivateKeySigner::random();
     let err = chain
-        .challenge_with_real_evidence(
+        .submit_blacklist_challenge(
             &refusal_challenger,
             node.operator_addr(),
             node_id,
-            Offense::RateManipulation,
-            EvidencePair {
-                probe: &absent_probe,
-                stream: &refusal,
-            },
+            &refusal,
             B256::repeat_byte(0x08),
         )
         .await
         .err()
-        .ok_or_else(|| anyhow::anyhow!("a signed refusal must never be rate-manipulation"))?;
-    expect_revert_anyhow::<SlashJudgeRate::NotRateManipulation>(&err, "signed refusal")?;
+        .ok_or_else(|| anyhow::anyhow!("a signed refusal must never be slashable"))?;
+    expect_revert_anyhow::<SlashJudgeBlacklist::NotBlacklistViolation>(&err, "signed refusal")?;
     assert_challenge_cost_nothing(&chain, refusal_challenger.address(), bond).await?;
 
     // (3) Neither failed challenge minted anything: the operator is still unslashed.
@@ -407,48 +210,34 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ================================================================
-    // Positive — the real pair is admissible.
+    // Positive — the real response is admissible.
     // ================================================================
 
-    let slash = drive_slash(
-        &chain,
-        &node,
-        node_id,
-        Offense::RateManipulation,
-        EvidencePair {
-            probe: &probe,
-            stream: &stream,
-        },
-        B256::repeat_byte(0x03),
-    )
-    .await
-    .context("rate challenge from real daemon evidence")?;
+    let slash = drive_slash(&chain, &node, node_id, &stream, B256::repeat_byte(0x03))
+        .await
+        .context("blacklist challenge from real daemon evidence")?;
 
     // ================================================================
-    // Replay — the same real pair cannot slash twice.
+    // Replay — the same real response cannot slash twice.
     // ================================================================
-    // Resubmitting the exact pair under a *fresh* salt is rejected by
-    // `EvidenceAlreadyUsed` — the dedup guard in `SlashJudge` itself (keyed on the
-    // offense/probe/stream triple), not in `CapacityBond`. The fresh salt rules
-    // out the commit-reveal replay guard as the cause. It reverts at
+    // Resubmitting the exact response under a *fresh* salt is rejected by
+    // `EvidenceAlreadyUsed` — the dedup guard in `SlashJudge` itself (keyed on
+    // the offense, operator and response), not in `CapacityBond`. The fresh
+    // salt rules out the commit-reveal replay guard as the cause. It reverts at
     // `usedEvidenceHash` before the challenge bond is pulled, so it costs nothing.
     let replayer = PrivateKeySigner::random();
     let err = chain
-        .challenge_with_real_evidence(
+        .submit_blacklist_challenge(
             &replayer,
             node.operator_addr(),
             node_id,
-            Offense::RateManipulation,
-            EvidencePair {
-                probe: &probe,
-                stream: &stream,
-            },
+            &stream,
             B256::repeat_byte(0x07),
         )
         .await
         .err()
-        .ok_or_else(|| anyhow::anyhow!("a replayed pair must not slash a second time"))?;
-    expect_revert_anyhow::<SlashJudgeRate::EvidenceAlreadyUsed>(&err, "replayed evidence")?;
+        .ok_or_else(|| anyhow::anyhow!("a replayed response must not slash a second time"))?;
+    expect_revert_anyhow::<SlashJudgeBlacklist::EvidenceAlreadyUsed>(&err, "replayed evidence")?;
     assert_challenge_cost_nothing(&chain, replayer.address(), bond).await?;
 
     // ================================================================
@@ -469,16 +258,14 @@ struct LandedSlash {
     amount: U256,
 }
 
-/// Submit `evidence` as `offense` against `node`, then assert the three
-/// consequences the issue names for the positive path: the slash lands, the TOKEN
-/// is *escrowed* rather than distributed, and the ADR-036 vote-weight watermark
-/// is stamped.
+/// Submit `evidence` against `node`, then assert the three consequences the
+/// issue names for the positive path: the slash lands, the TOKEN is *escrowed*
+/// rather than distributed, and the ADR-036 vote-weight watermark is stamped.
 async fn drive_slash(
     chain: &ChainFixture,
     node: &NodeFixture,
     node_id: B256,
-    offense: Offense,
-    evidence: EvidencePair<'_>,
+    evidence: &StreamResponse,
     salt: B256,
 ) -> anyhow::Result<LandedSlash> {
     let operator = node.operator_addr();
@@ -492,7 +279,7 @@ async fn drive_slash(
     let challenge_bond = chain.challenge_bond().await?;
 
     let slash_id = chain
-        .challenge_with_real_evidence(&challenger, operator, node_id, offense, evidence, salt)
+        .submit_blacklist_challenge(&challenger, operator, node_id, evidence, salt)
         .await?;
 
     // The slash landed and is attributed to this operator.
@@ -570,58 +357,11 @@ async fn assert_fifty_fifty_split(chain: &ChainFixture, slash: &LandedSlash) -> 
     Ok(())
 }
 
-/// A probe leg for `hash` at the configured rate, signed with `node`'s operator
-/// key under the deployment's `SlashJudge` domain.
-fn sign_probe(
-    chain: &ChainFixture,
-    node: &NodeFixture,
-    hash: Hash,
-    has_blob: bool,
-    timestamp_us: u64,
-) -> anyhow::Result<SignedProbe> {
-    let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
-    let body = ProbeSlashData {
-        hash: B256::from(*hash.as_bytes()),
-        has_blob,
-        rate_per_mb: BASE_RATE_PER_MB,
-        timestamp_us,
-    };
-    let sig = body
-        .sign(node.operator(), &domain)
-        .context("sign probe leg")?;
-    Ok(SignedProbe {
-        body,
-        slash_sig: sig.as_bytes().to_vec(),
-    })
-}
-
-/// Re-sign the probe body with `impostor`'s key, leaving every other byte
-/// untouched. The result is a structurally perfect probe leg whose signature
-/// recovers to the wrong address — the forgery a griefer would submit.
-fn forge_probe_signature(
-    chain: &ChainFixture,
-    real: &SignedProbe,
-    impostor: &PrivateKeySigner,
-) -> anyhow::Result<SignedProbe> {
-    let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
-    let sig = real
-        .body
-        .sign(impostor, &domain)
-        .context("forge probe sig")?;
-    let mut forged = real.clone();
-    forged.slash_sig = sig.as_bytes().to_vec();
-    anyhow::ensure!(
-        forged.slash_sig != real.slash_sig,
-        "the forged signature must differ from the daemon's"
-    );
-    Ok(forged)
-}
-
-/// The stream-leg twin of [`forge_probe_signature`]: re-sign the *real*
-/// `StreamResponse` body with `impostor`'s key, leaving every other byte
-/// untouched. The body (hence its EIP-712 struct hash and the pair's
+/// Re-sign the *real* `StreamResponse` body with `impostor`'s key, leaving every
+/// other byte untouched. The body (hence its EIP-712 struct hash and the
 /// `evidenceHash`) is unchanged — only `slash_sig` recovers to the wrong address,
-/// which is exactly what `_verifyPair`'s stream-leg check must reject (#1378).
+/// which is exactly what the judge's signature check must reject (#1378). The
+/// forgery a griefer would submit.
 fn forge_stream_signature(
     chain: &ChainFixture,
     real: &StreamResponse,

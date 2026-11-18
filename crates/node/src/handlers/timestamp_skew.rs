@@ -32,12 +32,6 @@ use crate::warn_throttle::WarnThrottle;
 /// admits stays inside that bound, so its signed evidence never reverts
 /// `EvidenceInFuture`. Wide enough that NTP-disciplined clocks never come
 /// close.
-///
-/// It also sets how long an upward reprice waits. A probe signed at the old
-/// rate can carry a timestamp up to this bound behind real time, and a stream
-/// signed at the new rate one up to this bound ahead. So a node is slashable
-/// for the 30-second pairing window plus twice this bound, 90 seconds of real
-/// time after its last probe at the old rate.
 pub const MAX_REQUEST_TIMESTAMP_SKEW_US: u64 = 30_000_000;
 
 /// `SlashJudge`'s `MAX_FUTURE_SKEW_US`: the furthest ahead of block time a

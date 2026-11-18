@@ -71,7 +71,7 @@ const SLASH_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 pub struct DetectedSlash {
     /// Globally-monotonic on-chain `slashId` (`CapacityBond.slash`).
     pub slash_id: U256,
-    /// Offense taxonomy index (ADR 014): 0=RateManipulation, 1=Blacklist.
+    /// Offense taxonomy index (ADR 014): 0 = Blacklist.
     pub offense_type: u8,
     /// Bond amount slashed, in TOKEN base units.
     pub amount: U256,

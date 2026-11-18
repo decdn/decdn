@@ -19,8 +19,8 @@
 
 use alloy::primitives::U256;
 
-/// 1 `MB` in bytes per ADR 005 §Probe-Triggered Eviction Hold's `MB`
-/// definition.
+/// 1 `MB` in bytes: the unit every `rate_per_mb` prices. deCDN's `MB` is a
+/// mebibyte (2^20 bytes).
 pub const BYTES_PER_MB: u64 = 1_048_576;
 
 /// Basis-points scale: 100% = `10_000` `bps`.

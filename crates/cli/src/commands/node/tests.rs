@@ -700,7 +700,7 @@ fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
             },
             SlashRecordDto {
                 slash_id: "43".to_string(),
-                offense_type: 1,
+                offense_type: 0,
                 amount: "2_500_000".to_string(),
                 evidence_hash: format!("0x{}", "c".repeat(64)),
                 block_number: None,

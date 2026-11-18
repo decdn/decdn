@@ -9,8 +9,9 @@
 //!   `was_present` true→false), then refuses paid delivery `Declined` *for the
 //!   blacklist reason* (its `chain_hash_denied` counter), and refuses a
 //!   voucher-less discovery open. Eviction is durable across a daemon restart.
-//!   Finally, a signed post-entry `ProbeResponse` for `H` is driven through the
-//!   `SlashJudge` commit-reveal to prove serving-after-blacklist is slashable.
+//!   Finally, a signed post-entry `StreamResponse { ok: true }` for `H` is
+//!   driven through the `SlashJudge` commit-reveal to prove
+//!   serving-after-blacklist is slashable.
 //! - **Regional scope (`regional_blacklist_scope`, ties GOV-05):** a US and a DE
 //!   node both hold `H2`; a US-regional entry is evicted by the US node and
 //!   ignored by the DE node. A global sentinel blob (held only by DE, blacklisted
@@ -59,19 +60,16 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256, keccak256};
+use alloy::primitives::{B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolValue;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_common::admin::{AdminRpcClient, EvictRequest};
-use decdn_e2e::bindings::{Erc20, SlashJudge, SlashJudgeBlacklist};
 use decdn_e2e::chain::{ChainFixture, region_key};
 use decdn_e2e::client::{ClientFixture, PoolSession};
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
 use decdn_e2e::time;
-use decdn_incentive::{PROBE_RESPONSE_TYPEHASH, ProbeSlashData, slash_judge_domain};
 use jsonrpsee::http_client::HttpClient;
 
 const MIB: usize = 1024 * 1024;
@@ -92,11 +90,6 @@ const REMOVAL_OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 const CHAIN_HASH_DENIED: &str = "decdn_serve_stream_rejected_chain_hash_denied_total";
 /// The node's refusal counter for a blob it no longer holds after an open.
 const WITHDRAWN: &str = "decdn_serve_stream_rejected_withdrawn_total";
-
-/// `OffenseType.Blacklist` discriminant (`ISlashJudge` enum: Rate, Blacklist).
-const OFFENSE_BLACKLIST: u8 = 1;
-/// The daemon config's quoted rate; echoed into the probe evidence.
-const RATE_PER_MB: u64 = 10;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn global_blacklist_compliance() -> anyhow::Result<()> {
@@ -627,129 +620,32 @@ async fn evict_was_present(admin: &HttpClient, hash: Hash) -> anyhow::Result<boo
     Ok(resp.was_present)
 }
 
-/// Construct a signed post-entry `ProbeResponse` for `hash` and drive it through
+/// Drive a signed post-entry `StreamResponse { ok: true }` for `hash` through
 /// `SlashJudge.submitBlacklistChallenge` (commit-reveal + challenge bond),
 /// asserting the slash lands. Proves serving a blacklisted hash is slashable.
+///
+/// ADR 011 § Compliance Window: the entry is not slashable until
+/// `effectiveAt = addedAt + complianceWindow`, so the fixture steps chain time
+/// past it before stamping evidence. Without that the challenge reverts with
+/// `BlacklistAfterResponse` — the correct behaviour (#1169), so the drive
+/// respects it rather than routing around it.
 async fn drive_blacklist_slash(
     chain: &ChainFixture,
     node: &NodeFixture,
     hash: Hash,
 ) -> anyhow::Result<()> {
-    let hash_key = to_b256(hash);
-    // ADR 011 § Compliance Window: the entry is not slashable until
-    // `effectiveAt = addedAt + complianceWindow`, so step past it before
-    // stamping evidence. Without this the challenge reverts with
-    // `BlacklistAfterResponse` — which is the correct behaviour and exactly what
-    // #1169 added, so the drive has to respect it rather than route around it.
-    // The window is read from the contract, not hardcoded, so a governance
-    // change to the default can't turn this into a no-op.
-    let window = chain.compliance_window().await?;
-    chain.advance_time(window + 60).await?;
-
-    // Evidence timestamp: current chain time (µs), now strictly after the
-    // entry's `effectiveAt` and fresh enough to pass the staleness check.
-    let response_ts_us = chain.head_timestamp().await? * 1_000_000;
-
-    // The signed `slash_sig` — the production probe signer produces exactly the
-    // EIP-712 digest `SlashJudge` verifies.
-    let probe = ProbeSlashData {
-        hash: hash_key,
-        has_blob: true,
-        rate_per_mb: RATE_PER_MB,
-        timestamp_us: response_ts_us,
-    };
-    let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
-    let slash_sig = probe.sign(node.operator(), &domain)?.as_bytes().to_vec();
-
-    // evidenceHash = keccak(abi.encode(uint8(Blacklist), challengedNode, structHash, isStream)),
-    // structHash = keccak(abi.encode(PROBE_TYPEHASH, fields)) — mirrors SlashJudge.
-    let struct_hash = keccak256(
-        (
-            PROBE_RESPONSE_TYPEHASH,
-            hash_key,
-            true,
-            RATE_PER_MB,
-            response_ts_us,
-        )
-            .abi_encode(),
-    );
-    // `uint8(Blacklist)` and `uint256(2)` abi-encode to the same 32-byte word.
-    let evidence_hash = keccak256(
-        (
-            U256::from(OFFENSE_BLACKLIST),
-            node.operator().address(),
-            struct_hash,
-            false,
-        )
-            .abi_encode(),
-    );
-
-    // A funded challenger holding the challenge bond (refunded on success).
     let challenger = PrivateKeySigner::random();
-    let challenger_addr = challenger.address();
-    chain.fund_eth(challenger_addr, 100).await?;
-    let judge = SlashJudge::new(chain.addrs().slash_judge, chain.admin());
-    let bond = judge
-        .challengeBond()
-        .call()
-        .await
-        .context("read challengeBond")?;
-    chain.transfer_token(challenger_addr, bond).await?;
-
-    let cp = chain.provider_for(&challenger);
-    let approve = Erc20::new(chain.addrs().token, &cp)
-        .approve(chain.addrs().slash_judge, bond)
-        .send()
-        .await
-        .context("challenger approve TOKEN")?
-        .get_receipt()
-        .await
-        .context("approve receipt")?;
-    assert!(approve.status(), "challenger TOKEN approve reverted");
-
-    // Commit, mature past MIN_REVEAL_DELAY (1 min), then reveal.
-    let salt = B256::ZERO;
-    let commitment = keccak256((evidence_hash, salt, challenger_addr).abi_encode());
-    let judge_c = SlashJudge::new(chain.addrs().slash_judge, &cp);
-    let commit = judge_c
-        .commitChallenge(commitment)
-        .send()
-        .await
-        .context("commitChallenge send")?
-        .get_receipt()
-        .await
-        .context("commitChallenge receipt")?;
-    assert!(commit.status(), "commitChallenge reverted");
-    time::increase_time(chain.admin(), 61).await?;
-
-    let response_data = SlashJudge::ProbeMsg {
-        hash: hash_key,
-        hasBlob: true,
-        ratePerMb: RATE_PER_MB,
-        timestampUs: response_ts_us,
-    }
-    .abi_encode();
     let node_id = B256::from_slice(node.node_id().as_bytes());
-    let receipt = SlashJudgeBlacklist::new(chain.addrs().slash_judge, &cp)
-        .submitBlacklistChallenge(
-            node.operator_addr(),
-            node_id,
-            hash_key,
-            response_data.into(),
-            slash_sig.into(),
-            false,
-            salt,
-        )
-        .send()
+    let slash_id = chain
+        .slash_operator_via_judge(&challenger, node.operator(), node_id, to_b256(hash))
         .await
-        .context("submitBlacklistChallenge send")?
-        .get_receipt()
-        .await
-        .context("submitBlacklistChallenge receipt")?;
-    assert!(
-        receipt.status(),
-        "submitBlacklistChallenge reverted — serving a blacklisted hash was not slashable"
+        .context("serving a blacklisted hash must be slashable")?;
+    let (operator, _slashed_at, amount) = chain.slash_record(slash_id).await?;
+    anyhow::ensure!(
+        operator == node.operator_addr(),
+        "the slash record must name the serving operator, got {operator}"
     );
+    anyhow::ensure!(amount > U256::ZERO, "the slash must take a non-zero amount");
     Ok(())
 }
 

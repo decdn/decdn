@@ -221,20 +221,32 @@ alloy::sol! {
     /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash
     /// entry point (ADR 014 §Blacklist violation), absent from the re-exported
     /// production `SlashJudge` binding below (the daemon never submits
-    /// challenges). Bound at the `SlashJudge` address; the G-NODE-04 negative
-    /// case drives it with a signed post-window `ProbeResponse` (the production
-    /// binding's `ProbeMsg` as `responseData`) to prove the on-chain
-    /// slashability of serving blacklisted content. `commitChallenge` /
-    /// `challengeBond` come from the production binding.
+    /// challenges). Bound at the `SlashJudge` address; `responseData` is a
+    /// signed `StreamResponse { ok: true }` (the production binding's
+    /// `StreamMsg`). `commitChallenge` / `challengeBond` come from the
+    /// production binding.
+    ///
+    /// The errors are declared so a reverted reveal decodes to a *named* error
+    /// rather than an opaque selector, and so
+    /// [`crate::assert::expect_revert_anyhow`] can match on `E::SELECTOR` —
+    /// compiler-checked against the ABI instead of hand-copied hex.
     #[sol(rpc)]
     contract SlashJudgeBlacklist {
+        /// The `slash_sig` did not recover to the challenged operator.
+        error InvalidResponseSignature();
+        /// The response is a signed refusal (`ok: false`), which delivers
+        /// nothing and so is never evidence of a served blacklisted blob.
+        error NotBlacklistViolation();
+        /// The evidence was already spent by an earlier slash: the dedup guard
+        /// that lives in `SlashJudge` itself, not `CapacityBond`.
+        error EvidenceAlreadyUsed(bytes32 evidenceHash);
+
         function submitBlacklistChallenge(
             address challengedNode,
             bytes32 nodeId,
             bytes32 blobHash,
             bytes responseData,
             bytes slashSig,
-            bool isStreamResponse,
             bytes32 salt
         ) external;
     }
@@ -365,55 +377,6 @@ alloy::sol! {
 }
 
 // Reuse the production `SlashJudge` binding (commit/reveal + `Slashed` + the
-// `ProbeMsg`/`StreamMsg` evidence structs) rather than re-declaring it — the
-// same ABI the daemon slash watcher decodes.
+// `StreamMsg` evidence struct) rather than re-declaring it — the same ABI the
+// daemon slash watcher decodes.
 pub use decdn_incentive::slash_judge::SlashJudge;
-
-// G-GOV-03 (#1042): the rate-manipulation reveal entry point, plus the two
-// `_verifyPair` custom errors the journey's negatives assert on. A separate block
-// because `SlashJudge` itself is `pub use`-d from `decdn-incentive` above rather
-// than declared here, so there is no local block to extend — unlike the escrow
-// reads and `totalSupply`, which fold into `CapacityBond` / `Erc20`.
-alloy::sol! {
-    /// `SlashJudge.submitRateChallenge` — the rate-manipulation reveal entry
-    /// point (omitted by the production binding, which never submits challenges,
-    /// only watches the `Slashed` event). Bound at the `SlashJudge` address;
-    /// `_verifyPair` applies the signature / same-hash / 30s-window / staleness
-    /// checks and then demands `stream.ok && stream.ratePerMb > probe.ratePerMb`.
-    ///
-    /// The two errors are declared so a reverted reveal decodes to a *named*
-    /// error rather than an opaque selector, and so
-    /// [`crate::assert::expect_revert_anyhow`] can match on `E::SELECTOR` —
-    /// compiler-checked against the ABI instead of hand-copied hex.
-    #[sol(rpc)]
-    contract SlashJudgeRate {
-        /// The 30s probe↔stream window, computed between the two evidence
-        /// timestamps (not against `block.timestamp`).
-        error TimestampWindowViolated(uint64 probeTsUs, uint64 streamTsUs);
-        /// The probe `slash_sig` did not recover to the challenged operator.
-        error InvalidProbeSignature();
-        /// The stream `slash_sig` did not recover to the challenged operator —
-        /// the stream-leg twin of `InvalidProbeSignature`, exercised by the
-        /// forged-stream negative (#1378).
-        error InvalidStreamSignature();
-        /// The (offense, probe, stream) triple was already spent by an earlier
-        /// slash. The dedup guard that lives in `SlashJudge` itself (not
-        /// `CapacityBond`), replayed under a fresh salt by the #1378 negative.
-        error EvidenceAlreadyUsed(bytes32 evidenceHash);
-        /// The pair passed every structural check but is not an overcharge:
-        /// either the stream refused (`!ok`) or it did not exceed the probe
-        /// quote. The `!ok` leg is what keeps a signed refusal inert as
-        /// evidence, exercised by the signed-refusal negative.
-        error NotRateManipulation();
-
-        function submitRateChallenge(
-            address challengedNode,
-            bytes32 nodeId,
-            bytes probeResponseData,
-            bytes probeSlashSig,
-            bytes streamResponseData,
-            bytes streamSlashSig,
-            bytes32 salt
-        ) external;
-    }
-}

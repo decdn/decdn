@@ -16,13 +16,13 @@ import { IContentBlacklistHashView } from "./interfaces/IContentBlacklistHashVie
 import { RegionScopeLib } from "./RegionScopeLib.sol";
 
 /// @title SlashJudge
-/// @notice On-chain adjudicator for the two signature-dependent slashable
-///         offenses (ADR 014): rate manipulation and blacklist violation.
+/// @notice On-chain adjudicator for the signature-dependent slashable
+///         offense (ADR 014): blacklist violation.
 ///         Challenging is a two-phase commit–reveal flow
 ///         (ADR 014 § Challenge front-running mitigation, #854): the challenger
 ///         first `commitChallenge`s an opaque
 ///         `keccak256(abi.encode(evidenceHash, salt, challenger))`, then reveals via a
-///         `submit*Challenge` once the commitment has matured. Each reveal
+///         `submitBlacklistChallenge` once the commitment has matured. Each reveal
 ///         verifies secp256k1 EIP-712 `slash_sig` evidence by ECDSA recovery
 ///         alone — never ERC-1271, so code the operator attaches to its address
 ///         (e.g. an EIP-7702 delegate) cannot reject a proof — confirms the challenged address is a registered
@@ -53,9 +53,6 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     // EIP-712 typing (ADR 014 § EIP-712 Type Definitions)
     // -----------------------------------------------------------------
 
-    bytes32 public constant PROBE_RESPONSE_TYPEHASH =
-        keccak256("ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)");
-
     bytes32 public constant STREAM_RESPONSE_TYPEHASH =
         keccak256("StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)");
 
@@ -63,9 +60,6 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     // Constants (ADR 014 § Governable Parameters with Safety Bounds)
     // -----------------------------------------------------------------
 
-    /// @dev 30-second requester-anchored window for the two-message
-    ///      rate-manipulation offense.
-    uint64 internal constant SLASH_WINDOW_US = 30_000_000;
     /// @dev Fixed NTP-drift tolerance; not governable (ADR 014).
     uint64 internal constant MAX_FUTURE_SKEW_US = 60_000_000;
 
@@ -90,7 +84,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     uint256 internal constant EMERGENCY_EXPIRY_SEVERE = 90 days;
 
     /// @dev Commit–reveal anti-front-running bounds (ADR 014 § Challenge
-    ///      front-running mitigation, #854). A reveal (`submit*Challenge`) is
+    ///      front-running mitigation, #854). A reveal (`submitBlacklistChallenge`) is
     ///      valid only once its commitment has aged `MIN_REVEAL_DELAY` and before
     ///      it expires at `REVEAL_WINDOW`. The 1-minute maturation is negligible
     ///      against the ≥1-day evidence-age window, so it never stales otherwise
@@ -150,15 +144,8 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     uint64 internal _pausedAt;
 
     // -----------------------------------------------------------------
-    // Decoded evidence structs (ABI layout of the `*ResponseData` args)
+    // Decoded evidence struct (ABI layout of the `responseData` arg)
     // -----------------------------------------------------------------
-
-    struct ProbeMsg {
-        bytes32 hash;
-        bool hasBlob;
-        uint64 ratePerMb;
-        uint64 timestampUs;
-    }
 
     struct StreamMsg {
         bytes32 hash;
@@ -180,13 +167,9 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     error ZeroAddress();
     error NodeNotRegistered(address challengedNode);
     error NodeIdMismatch(bytes32 provided, bytes32 bound);
-    error InvalidProbeSignature();
-    error InvalidStreamSignature();
     error InvalidResponseSignature();
     error HashMismatch(bytes32 expected, bytes32 actual);
-    error NotRateManipulation();
     error NotBlacklistViolation();
-    error TimestampWindowViolated(uint64 probeTsUs, uint64 streamTsUs);
     error EvidenceInFuture(uint64 evidenceTsUs);
     error EvidenceTooOld(uint256 ageUs, uint256 maxAgeUs);
     error HashNotBlacklisted(bytes32 hash);
@@ -279,67 +262,30 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     }
 
     /// @inheritdoc ISlashJudge
-    function submitRateChallenge(
-        address challengedNode,
-        bytes32 nodeId,
-        bytes calldata probeResponseData,
-        bytes calldata probeSlashSig,
-        bytes calldata streamResponseData,
-        bytes calldata streamSlashSig,
-        bytes32 salt
-    ) external override nonReentrant whenNotPaused {
-        _checkRegistered(challengedNode, nodeId);
-        bytes32 evidenceHash = _verifyPair(
-            challengedNode,
-            probeResponseData,
-            probeSlashSig,
-            streamResponseData,
-            streamSlashSig,
-            OffenseType.RateManipulation
-        );
-        _resolve(challengedNode, OffenseType.RateManipulation, evidenceHash, salt);
-    }
-
-    /// @inheritdoc ISlashJudge
     function submitBlacklistChallenge(
         address challengedNode,
         bytes32 nodeId,
         bytes32 blobHash,
         bytes calldata responseData,
         bytes calldata slashSig,
-        bool isStreamResponse,
         bytes32 salt
     ) external override nonReentrant whenNotPaused {
         _checkRegistered(challengedNode, nodeId);
 
-        bytes32 responseHash;
-        bytes32 structHash;
-        uint64 responseTsUs;
-        bool servedClaim;
-        if (isStreamResponse) {
-            StreamMsg memory s = abi.decode(responseData, (StreamMsg));
-            structHash = _streamStructHash(s);
-            responseHash = s.hash;
-            responseTsUs = s.timestampUs;
-            servedClaim = s.ok;
-        } else {
-            ProbeMsg memory p = abi.decode(responseData, (ProbeMsg));
-            structHash = _probeStructHash(p);
-            responseHash = p.hash;
-            responseTsUs = p.timestampUs;
-            servedClaim = p.hasBlob;
-        }
+        StreamMsg memory s = abi.decode(responseData, (StreamMsg));
+        bytes32 structHash = _streamStructHash(s);
 
         if (!_signedBy(challengedNode, structHash, slashSig)) revert InvalidResponseSignature();
-        if (responseHash != blobHash) revert HashMismatch(blobHash, responseHash);
-        if (!servedClaim) revert NotBlacklistViolation();
-        _checkStaleness(responseTsUs);
-        _checkBlacklistedBefore(challengedNode, blobHash, responseTsUs);
+        if (s.hash != blobHash) revert HashMismatch(blobHash, s.hash);
+        // A signed refusal (`ok:false`) delivers nothing, so it is never
+        // evidence of a served blacklisted blob.
+        if (!s.ok) revert NotBlacklistViolation();
+        _checkStaleness(s.timestampUs);
+        _checkBlacklistedBefore(challengedNode, blobHash, s.timestampUs);
 
         // Keyed on the challenged address: another signer's identical response
         // is separate evidence and cannot spend this operator's.
-        bytes32 evidenceHash =
-            keccak256(abi.encode(uint8(OffenseType.Blacklist), challengedNode, structHash, isStreamResponse));
+        bytes32 evidenceHash = keccak256(abi.encode(uint8(OffenseType.Blacklist), challengedNode, structHash));
         _resolve(challengedNode, OffenseType.Blacklist, evidenceHash, salt);
     }
 
@@ -398,49 +344,6 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     // Internal — verification
     // -----------------------------------------------------------------
 
-    /// @dev Rate-manipulation path: decode + verify both signatures, confirm
-    ///      same-hash, the 30s window, and evidence freshness, then apply the
-    ///      rate predicate and return the `evidenceHash`. Registration
-    ///      is checked by the caller; the predicate and hashing fold in here
-    ///      (rather than returning the decoded messages) so the reveal entry
-    ///      points stay within the stack limit once `salt` rides along (via_ir is
-    ///      off).
-    function _verifyPair(
-        address challengedNode,
-        bytes calldata probeData,
-        bytes calldata probeSig,
-        bytes calldata streamData,
-        bytes calldata streamSig,
-        OffenseType offense
-    ) internal view returns (bytes32 evidenceHash) {
-        ProbeMsg memory p = abi.decode(probeData, (ProbeMsg));
-        StreamMsg memory s = abi.decode(streamData, (StreamMsg));
-        bytes32 probeHash = _probeStructHash(p);
-        bytes32 streamHash = _streamStructHash(s);
-
-        if (!_signedBy(challengedNode, probeHash, probeSig)) revert InvalidProbeSignature();
-        if (!_signedBy(challengedNode, streamHash, streamSig)) revert InvalidStreamSignature();
-
-        if (p.hash != s.hash) revert HashMismatch(p.hash, s.hash);
-        // 30s requester-anchored window: stream at/after probe, delta < 30s.
-        if (s.timestampUs < p.timestampUs || s.timestampUs - p.timestampUs >= SLASH_WINDOW_US) {
-            revert TimestampWindowViolated(p.timestampUs, s.timestampUs);
-        }
-        _checkStaleness(p.timestampUs);
-
-        // Rate manipulation = delivered (`ok:true`) at a higher stream rate than
-        // was probe-quoted. The `ok` requirement is load-bearing: it keeps a
-        // signed refusal (`ok:false`) inert as evidence — you cannot overcharge
-        // on a delivery you declined, so a refusal is definitionally not rate
-        // manipulation, and the node may sign `ok:false` freely.
-        if (!s.ok || s.ratePerMb <= p.ratePerMb) revert NotRateManipulation();
-
-        // Keyed on the challenged address and the overcharged stream alone: one
-        // overcharge is one offense, however many probes it pairs with, and
-        // another signer's identical stream cannot spend this operator's.
-        evidenceHash = keccak256(abi.encode(uint8(offense), challengedNode, streamHash));
-    }
-
     /// @dev ECDSA recovery of the EIP-712 digest of `structHash`. The operator
     ///      signs evidence with its EOA key; ERC-1271 is not consulted, so code
     ///      attached to the operator's address (e.g. an EIP-7702 delegate)
@@ -451,10 +354,6 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         // slither-disable-next-line unused-return
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(_hashTypedDataV4(structHash), sig);
         return err == ECDSA.RecoverError.NoError && recovered == signer;
-    }
-
-    function _probeStructHash(ProbeMsg memory p) internal pure returns (bytes32) {
-        return keccak256(abi.encode(PROBE_RESPONSE_TYPEHASH, p.hash, p.hasBlob, p.ratePerMb, p.timestampUs));
     }
 
     function _streamStructHash(StreamMsg memory s) internal pure returns (bytes32) {

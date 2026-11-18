@@ -1193,13 +1193,13 @@ async fn decode_to_vec_rejects_wrong_root() -> anyhow::Result<()> {
 ///
 /// This is the seam that makes real daemon output admissible on-chain. The
 /// `slash_sig` here is produced by the same `StreamSlashData` signer the node
-/// uses and covers the same EIP-712 digest `SlashJudge._verifyPair` checks, so
-/// what the assertion actually proves is that the operator's self-incriminating
-/// attestation survives the client's error path intact — byte-for-byte, still
-/// recovering to the signer. Before #1042 `refusal()` took only
-/// `response.error` and dropped the body and signature on the floor, leaving
-/// `SlashJudge`'s rate path reachable only from a test that holds the
-/// operator's key and synthesises its own evidence.
+/// uses and covers the same EIP-712 digest `SlashJudge.submitBlacklistChallenge`
+/// checks, so what the assertion actually proves is that the operator's
+/// self-incriminating attestation survives the client's error path intact —
+/// byte-for-byte, still recovering to the signer. A `refusal()` that kept only
+/// `response.error` would drop the body and signature on the floor, leaving
+/// `SlashJudge` reachable only from a test that holds the operator's key and
+/// synthesises its own evidence.
 ///
 /// Deliberately routed through the private [`UpstreamRefused::open`] — the one
 /// constructor the open stage uses — rather

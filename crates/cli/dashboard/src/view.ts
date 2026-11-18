@@ -437,7 +437,6 @@ export function earningsRows(e: EarningsResponse): EarningsRow[] {
 
 /** A slash's offense type by name (ADR 014), or its number. */
 export function offense(type: number): string {
-  if (type === 0) return "Rate manipulation";
-  if (type === 1) return "Blacklist";
+  if (type === 0) return "Blacklist";
   return `Offense ${type}`;
 }

@@ -672,8 +672,8 @@ describe("earningsRows", () => {
 
 describe("offense", () => {
   it("names the known offenses and numbers the rest", () => {
-    expect(offense(0)).toBe("Rate manipulation");
-    expect(offense(1)).toBe("Blacklist");
+    expect(offense(0)).toBe("Blacklist");
+    expect(offense(1)).toBe("Offense 1");
     expect(offense(4)).toBe("Offense 4");
   });
 });

@@ -197,11 +197,7 @@ impl NodeFixture {
     ///
     /// `payment.rate_per_mb` is restart-required — the client handler reads it
     /// as a value fixed at startup — so repricing a running node means
-    /// rewriting the config and bouncing the process ([`Self::restart`]). The
-    /// captured probe (before) and stream (after) form the bait-and-switch pair a
-    /// `SlashJudge` rate challenge punishes (#1042); the judge sees two
-    /// operator-signed messages within the 30s window, and a restart is fast
-    /// relative to it.
+    /// rewriting the config and bouncing the process ([`Self::restart`]).
     ///
     /// The returned value is the configured rate this call wrote. The rate the node
     /// signs is clamped into the on-chain `[floor, ceiling]` band per response

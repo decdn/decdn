@@ -18,7 +18,7 @@
 //! | Spend delegation | [`capability`] (the signed capability), [`capability_grant`] (its transferable `dcap1:` form) |
 //! | Lane state | [`lane`] (the seller's per-lane watermark), [`store`] (persistence traits and in-memory stores, the settlement ledger among them), [`earnings`] (sums over the ledger for `decdn node earnings`), [`deployment`] (which `PaymentPool` a state belongs to) |
 //! | Buyer bookkeeping | [`buyer_pool`] (the buyer's pools and lanes), `buyer_pool_table` and `buyer_pool_redb` (an on-disk `redb` store, behind the `buyer-store-core` and `redb` features) |
-//! | Response signatures | [`probe_sig`] and [`stream_sig`] (the `slash_sig` on probe and stream responses), [`bind_sig`] (client bindings), [`sig_canon`] (canonical `s`) |
+//! | Response signatures | [`stream_sig`] (the `slash_sig` on stream responses and the `SlashJudge` domain), [`bind_sig`] (client bindings), [`sig_canon`] (canonical `s`) |
 //! | Keys | [`eth_identity`] (Web3 Secret Storage keystores and the `PrivateKeySigner` they load) |
 //! | Contract bindings | [`payment_pool`], [`capacity_bond`], [`node_register`], [`erc20`], [`slash_judge`], [`slash_appeal`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
 //! | Transactions | [`tx`] (send, await the receipt, fail on a revert), [`pool_open_error`] (`PaymentPool` revert decoding), [`log_scan`] (bounded `eth_getLogs` windows that learn a provider's range cap) |
@@ -87,7 +87,6 @@ pub mod node_register;
 pub mod origin_assignment;
 pub mod payment_pool;
 pub mod pool_open_error;
-pub mod probe_sig;
 pub mod publisher_registry;
 pub mod rate;
 pub mod sig_canon;
@@ -127,17 +126,16 @@ pub use lane::{
 pub use pool_open_error::{
     PoolLifecycleRevert, PoolOpenFailureReason, is_erc20_allowance_shortfall, is_pool_not_open,
 };
-pub use probe_sig::{
-    PROBE_RESPONSE_TYPEHASH, ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME,
-    SLASH_JUDGE_DOMAIN_VERSION, slash_judge_domain,
-};
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 pub use store::{
     CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, MemorySettlementLedger,
     PendingSettle, PendingSettleStore, PoolStateStore, SettlementLedger, SettlementRecord,
     StoreError,
 };
-pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSlashData, StreamSlashError};
+pub use stream_sig::{
+    SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION, STREAM_RESPONSE_TYPEHASH, StreamSlashData,
+    StreamSlashError, slash_judge_domain,
+};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,
 };

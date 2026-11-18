@@ -217,7 +217,8 @@ impl ClientMessage {
 ///
 /// `timestamp_us` is a requester-generated microsecond timestamp echoed back in
 /// [`StreamResponseBody::timestamp_us`]; it both correlates the response and
-/// drives rate-manipulation slashing (ADR 005, ADR 014). `byte_offset` supports
+/// dates the signed evidence of blacklist-violation slashing (ADR 005,
+/// ADR 014). `byte_offset` supports
 /// seek/resume on failover — the requester reconnects to another node and
 /// resumes from the last BLAKE3-verified byte.
 ///
@@ -702,8 +703,8 @@ pub fn parse_stream_response_ext(remainder: &[u8]) -> Result<StreamResponseExt, 
 pub struct StreamResponseBody {
     /// BLAKE3 hash this response answers for, echoed from the request.
     pub hash: [u8; 32],
-    /// Whether the node will serve the blob. A node MUST NOT sign `true` unless
-    /// it can deliver within the slashing window.
+    /// Whether the node will serve the blob. A signed `true` commits the node to
+    /// deliver; for a blacklisted hash it is slash evidence (ADR 014).
     pub ok: bool,
     /// Quoted rate in token base units per MB. Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "crate::message::deserialize_rate_per_mb")]

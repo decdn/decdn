@@ -550,14 +550,14 @@ impl ClientFixture {
     }
 
     /// Capture the daemon's signed `StreamResponse { ok: true }` for a **held**
-    /// blob at a caller-chosen `timestamp_us` — the delivery side of a real
-    /// rate-manipulation evidence pair (#1042).
+    /// blob at a caller-chosen `timestamp_us` — real blacklist-violation evidence
+    /// once the hash is blacklisted (#1042).
     ///
     /// The node signs the open-stage `StreamResponse` (committing to deliver at
     /// its *current* rate) before any voucher is exchanged, so this reads only
     /// the first frame and never pays. Unlike [`Self::capture_delivery_wire`] the
-    /// timestamp is caller-controlled, so the response lands inside the 30s
-    /// probe↔stream slashing window; unlike [`Self::refused_stream`] it requires
+    /// timestamp is caller-controlled, so the caller knows exactly when the
+    /// evidence says the node served; unlike [`Self::refused_stream`] it requires
     /// the node to actually deliver (`ok == true`) — a refusal here means the
     /// blob was not held or the pool was not yet served, a setup failure.
     pub async fn capture_delivery_response(

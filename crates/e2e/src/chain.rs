@@ -31,18 +31,18 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolEvent, SolValue};
 use anyhow::Context;
-use decdn_incentive::probe_sig::ProbeSlashData;
 use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{
     bind_node_id_domain, binding_signing_hash, node_register, register_node_signing_hash,
     slash_judge_domain,
 };
 use decdn_node::chain_events::shared_head::SNAPSHOT_LAG_MARGIN_BLOCKS;
+use decdn_protocol::client::{StreamResponse, StreamResponseBody};
 
 use crate::bindings::{
     AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, DecdnGovernor, Erc20,
     FeeRouterParams, ManualVettingPolicy, OriginAssignment, PaymentPoolParams, PublisherRegistry,
-    SlashAppeal, SlashJudge, TimelockController,
+    SlashAppeal, SlashJudge, SlashJudgeBlacklist, TimelockController,
 };
 
 /// The single chain id every anvil-e2e chain runs on: the one-time protocol
@@ -138,68 +138,6 @@ const POOL_DRAIN_SETTLE: Duration = Duration::from_millis(250);
 const ANVIL_START_TIMEOUT: Duration = Duration::from_secs(20);
 /// The stdout line in which anvil reports its listen address.
 const ANVIL_LISTENING: &str = "Listening on ";
-
-/// The `SlashJudge._verifyPair` offense a signed probe/stream pair can prove
-/// (#1042). Mirrors the paired entry of `ISlashJudge.OffenseType`; `Blacklist`
-/// is excluded because it takes a single response, not a pair, and has its own
-/// entry point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Offense {
-    /// `stream.ok && stream.ratePerMb > probe.ratePerMb` within the 30s window —
-    /// quoted low to win selection, then delivered at a higher rate.
-    RateManipulation,
-}
-
-impl Offense {
-    /// The generated, contract-canonical `OffenseType`. Going through the `sol!`
-    /// enum rather than a hand-written ordinal keeps this pinned to the one
-    /// declaration a Solidity reorder would have to touch anyway
-    /// (`decdn_incentive::slash_judge`) — a stale literal here would instead
-    /// corrupt `evidenceHash` and surface as a misleading `NoCommitment()`.
-    const fn offense_type(self) -> SlashJudge::OffenseType {
-        match self {
-            Self::RateManipulation => SlashJudge::OffenseType::RateManipulation,
-        }
-    }
-
-    /// Contract-canonical `OffenseType` discriminant, folded into `evidenceHash`.
-    const fn discriminant(self) -> u8 {
-        self.offense_type() as u8
-    }
-
-    /// The reveal entry point, for error context.
-    const fn entry_point(self) -> &'static str {
-        match self {
-            Self::RateManipulation => "submitRateChallenge",
-        }
-    }
-}
-
-/// The two signed wire messages a `_verifyPair` challenge is built from, exactly
-/// as the daemon emitted them — `slash_sig` included and never re-signed. Borrowed
-/// so a negative case can perturb one field of a clone and resubmit (#1042).
-///
-/// Deliberately **unvalidated**: no same-hash, same-signer, or window check. The
-/// judge is the only arbiter, and the negative journeys submit deliberately
-/// incoherent pairs (a 41s-apart pair, a probe re-signed by an impostor), so a
-/// validating constructor would make half the coverage unwritable.
-#[derive(Debug, Clone, Copy)]
-pub struct EvidencePair<'a> {
-    /// The signed probe leg.
-    pub probe: &'a SignedProbe,
-    /// The signed `cdn/client/v1` open-stage response.
-    pub stream: &'a decdn_protocol::client::StreamResponse,
-}
-
-/// A signed probe leg for a `_verifyPair` challenge: the EIP-712 fields
-/// `SlashJudge` reads, and the `slash_sig` over them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SignedProbe {
-    /// The signed fields.
-    pub body: ProbeSlashData,
-    /// EIP-712 secp256k1 signature over `body` (`r‖s‖v`).
-    pub slash_sig: Vec<u8>,
-}
 
 /// Deployed protocol contract addresses, read from the forge-script manifest.
 #[derive(Debug, Clone, Copy)]
@@ -1596,17 +1534,76 @@ impl ChainFixture {
             .context("read TOKEN balance")
     }
 
-    /// Slash `operator` through a real `SlashJudge` rate-manipulation
-    /// commit-reveal challenge (#1032, G-NODE-05). Builds the operator's own
-    /// self-incriminating probe (`hasBlob=true`, low rate) + stream (`ok=true`,
-    /// higher rate) evidence for the same `blob_hash`, signs it with the
-    /// operator's eth key over the `SlashJudge` EIP-712 domain, commits, warps
-    /// past `MIN_REVEAL_DELAY`, and reveals as `challenger`. Returns the minted
-    /// `slashId`.
-    // The commit-reveal flow (arm challenger → build+sign evidence → commit →
-    // warp → reveal → extract slashId) reads linearly; splitting it would
-    // scatter the evidence construction across helpers.
-    #[allow(clippy::too_many_lines)]
+    /// Make `hash` an enforceable GLOBAL blacklist entry: add it as governance
+    /// unless an entry already exists, then advance chain time past its
+    /// `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance Window).
+    /// Evidence stamped at the head afterwards post-dates the entry's
+    /// enforceability, so `SlashJudge` accepts it rather than reverting
+    /// `BlacklistAfterResponse`. The window comes off the entry, not a hardcoded
+    /// value, so a governance change to the default cannot turn this into a no-op.
+    pub async fn ensure_hash_enforceable(&self, hash: B256) -> anyhow::Result<()> {
+        let blacklist = ContentBlacklist::new(self.addrs.content_blacklist, &self.admin);
+        let mut entry = blacklist
+            .getHashEntry(global_region(), hash)
+            .call()
+            .await
+            .context("getHashEntry")?;
+        if entry.addedAt == 0 {
+            self.add_hash_global(hash).await?;
+            entry = blacklist
+                .getHashEntry(global_region(), hash)
+                .call()
+                .await
+                .context("getHashEntry after add")?;
+        }
+        // Evidence must sit strictly after `effectiveAt`; the margin keeps the
+        // head clear of the boundary.
+        let enforceable_at = entry.effectiveAt + 60;
+        let head = self.head_timestamp().await?;
+        if head < enforceable_at {
+            self.advance_time(enforceable_at - head).await?;
+        }
+        Ok(())
+    }
+
+    /// Add `hash` to the GLOBAL blacklist with `addedAt == added_at`, a chain
+    /// time before the current head, then put the chain clock back where it was.
+    ///
+    /// A daemon only signs a request timestamp near its own wall clock, and
+    /// `SlashJudge` only slashes a response stamped after the entry's
+    /// `effectiveAt`. A real daemon response is therefore admissible only once
+    /// the entry has been on chain for a full compliance window before the
+    /// response. A journey cannot wait out that window, so it backdates the
+    /// entry instead: anvil sets the clock back for the one block that adds it.
+    pub async fn add_hash_global_at(&self, hash: B256, added_at: u64) -> anyhow::Result<()> {
+        let head = self.head_timestamp().await?;
+        anyhow::ensure!(
+            added_at < head,
+            "a backdated entry must precede the head ({added_at} >= {head})"
+        );
+        self.set_chain_time(added_at).await?;
+        self.add_hash_global(hash).await?;
+        self.set_chain_time(head + 1).await
+    }
+
+    /// Set anvil's clock: the next block is stamped `secs` plus the time that
+    /// passes before it is mined. Unlike `evm_increaseTime`, it can move back.
+    async fn set_chain_time(&self, secs: u64) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .admin
+            .raw_request("anvil_setTime".into(), (secs,))
+            .await
+            .context("anvil_setTime")?;
+        Ok(())
+    }
+
+    /// Slash `operator` through a real `SlashJudge` blacklist-violation
+    /// commit-reveal challenge (#1032, G-NODE-05). Makes `blob_hash` an
+    /// enforceable blacklist entry ([`Self::ensure_hash_enforceable`]), signs the
+    /// operator's own self-incriminating `StreamResponse { ok: true }` for it at
+    /// the chain head with the operator's eth key over the `SlashJudge` EIP-712
+    /// domain, and reveals it as `challenger`
+    /// ([`Self::submit_blacklist_challenge`]). Returns the minted `slashId`.
     pub async fn slash_operator_via_judge(
         &self,
         challenger: &PrivateKeySigner,
@@ -1614,51 +1611,81 @@ impl ChainFixture {
         node_id: B256,
         blob_hash: B256,
     ) -> anyhow::Result<U256> {
-        self.arm_challenger(challenger).await?;
-        let ch_provider = self.provider_for(challenger);
+        self.ensure_hash_enforceable(blob_hash).await?;
 
-        // Evidence timestamps anchored just behind the current chain time
-        // (within the 5-day age bound and the 30s probe↔stream window).
-        let now = self.head_timestamp().await?;
-        let probe_ts_us = (now - 10) * 1_000_000;
-        let stream_ts_us = (now - 5) * 1_000_000;
-        // Rate manipulation: probe quotes `probe_rate`, delivery charges a
-        // higher `stream_rate` for the same hash inside the 30s window.
-        let probe_rate: u64 = 10;
-        let stream_rate: u64 = 25;
-
-        let probe = ProbeSlashData {
-            hash: blob_hash,
-            has_blob: true,
-            rate_per_mb: probe_rate,
-            timestamp_us: probe_ts_us,
-        };
-        let stream = StreamSlashData {
-            hash: blob_hash,
+        // Stamped at the head: after the entry's `effectiveAt`, and fresh
+        // against the evidence-age bound.
+        let body = StreamResponseBody {
+            hash: blob_hash.0,
             ok: true,
-            rate_per_mb: stream_rate,
-            timestamp_us: stream_ts_us,
+            rate_per_mb: 10,
+            timestamp_us: self.head_timestamp().await? * 1_000_000,
         };
         let domain = slash_judge_domain(self.chain_id, self.addrs.slash_judge);
-        let probe_sig = probe
-            .sign(operator, &domain)
-            .context("sign probe evidence")?
-            .as_bytes()
-            .to_vec();
-        let stream_sig = stream
+        let slash_sig = StreamSlashData::from_response_body(&body)
             .sign(operator, &domain)
             .context("sign stream evidence")?
             .as_bytes()
             .to_vec();
+        let evidence = StreamResponse { body, slash_sig };
 
-        // evidenceHash = keccak256(abi.encode(uint8(RateManipulation),
-        // challengedNode, streamStructHash)); commitment binds it to (salt,
-        // challenger). `abi.encode(uint8 v)` right-aligns `v` in a 32-byte word
-        // — byte-identical to `uint256(v)`, which alloy's `SolValue` encodes.
-        let offense = U256::from(Offense::RateManipulation.discriminant());
-        let evidence_hash =
-            keccak256((offense, operator.address(), stream.struct_hash()).abi_encode());
-        let salt = B256::repeat_byte(0x99);
+        self.submit_blacklist_challenge(
+            challenger,
+            operator.address(),
+            node_id,
+            &evidence,
+            B256::repeat_byte(0x99),
+        )
+        .await
+    }
+
+    /// Drive a `SlashJudge.submitBlacklistChallenge` commit-reveal from a signed
+    /// `StreamResponse`, forwarded verbatim — `slash_sig` included and never
+    /// re-signed. The evidence may be a real daemon capture (G-GOV-03, #1042) or
+    /// one signed in the test ([`Self::slash_operator_via_judge`]); a negative
+    /// case perturbs one field of a real capture and resubmits.
+    ///
+    /// Arms `challenger` with gas and the challenge bond, commits the evidence
+    /// under `salt`, matures the commitment past `MIN_REVEAL_DELAY`, and reveals.
+    /// `salt` is caller-supplied so two challenges in one journey cannot collide
+    /// on a commitment slot. The challenged blob is the evidence's own hash.
+    ///
+    /// Returns the minted `slashId`, checked to be a `Blacklist` slash on the
+    /// induced `evidenceHash`. An `Err` is the point of a negative case: a
+    /// challenge that fails verification reverts, and per
+    /// [ADR 014 § Bond Handling](https://github.com/decdn/decdn/blob/main/adr/014-on-chain-verification.md)
+    /// the bond is never transferred on a failed verification — assert the
+    /// challenger's TOKEN balance directly.
+    ///
+    /// **Side effect:** advances chain time ~65s on *every* call, including ones
+    /// that revert, to mature the commitment. Chain time only drifts *ahead* of
+    /// the wall clock here, so a daemon capture between challenges must NOT
+    /// anchor on [`Self::head_timestamp`] — the daemon refuses a timestamp more
+    /// than its clock-skew bound from the wall clock.
+    pub async fn submit_blacklist_challenge(
+        &self,
+        challenger: &PrivateKeySigner,
+        operator: Address,
+        node_id: B256,
+        evidence: &StreamResponse,
+        salt: B256,
+    ) -> anyhow::Result<U256> {
+        let bond = self.arm_challenger(challenger).await?;
+        anyhow::ensure!(bond > U256::ZERO, "challenge bond must be non-zero");
+        let ch_provider = self.provider_for(challenger);
+
+        // Rebuild the EIP-712 struct hash with the production signer's view of
+        // the wire body, so the commitment binds the exact message the reveal
+        // submits. evidenceHash = keccak256(abi.encode(uint8(Blacklist),
+        // challengedNode, streamStructHash)); `abi.encode(uint8 v)` right-aligns
+        // `v` in a 32-byte word — byte-identical to `uint256(v)`, which alloy's
+        // `SolValue` encodes. Going through the generated `sol!` enum rather
+        // than a literal keeps the ordinal pinned to the one declaration a
+        // Solidity reorder would have to touch; a stale literal would corrupt
+        // `evidenceHash` and surface as a misleading `NoCommitment()`.
+        let data = StreamSlashData::from_response_body(&evidence.body);
+        let offense = U256::from(SlashJudge::OffenseType::Blacklist as u8);
+        let evidence_hash = keccak256((offense, operator, data.struct_hash()).abi_encode());
         let commitment = keccak256((evidence_hash, salt, challenger.address()).abi_encode());
 
         let judge = SlashJudge::new(self.addrs.slash_judge, &ch_provider);
@@ -1675,41 +1702,31 @@ impl ChainFixture {
         // Mature the commitment past MIN_REVEAL_DELAY (1 minute) with margin.
         crate::time::increase_time(&self.admin, 65).await?;
 
-        let probe_msg = SlashJudge::ProbeMsg {
-            hash: blob_hash,
-            hasBlob: true,
-            ratePerMb: probe_rate,
-            timestampUs: probe_ts_us,
-        };
-        let stream_msg = SlashJudge::StreamMsg {
-            hash: blob_hash,
-            ok: true,
-            ratePerMb: stream_rate,
-            timestampUs: stream_ts_us,
-        };
-        let receipt = crate::bindings::SlashJudgeRate::new(self.addrs.slash_judge, &ch_provider)
-            .submitRateChallenge(
-                operator.address(),
+        let response_data = SlashJudge::StreamMsg {
+            hash: data.hash,
+            ok: data.ok,
+            ratePerMb: data.rate_per_mb,
+            timestampUs: data.timestamp_us,
+        }
+        .abi_encode();
+        let receipt = SlashJudgeBlacklist::new(self.addrs.slash_judge, &ch_provider)
+            .submitBlacklistChallenge(
+                operator,
                 node_id,
-                Bytes::from(probe_msg.abi_encode()),
-                Bytes::from(probe_sig),
-                Bytes::from(stream_msg.abi_encode()),
-                Bytes::from(stream_sig),
+                data.hash,
+                Bytes::from(response_data),
+                Bytes::from(evidence.slash_sig.clone()),
                 salt,
             )
             .send()
             .await
-            .context("submitRateChallenge send")?
+            .context("submitBlacklistChallenge send")?
             .get_receipt()
             .await
-            .context("submitRateChallenge receipt")?;
-        crate::ensure_mined(&receipt, "submitRateChallenge")?;
+            .context("submitBlacklistChallenge receipt")?;
+        crate::ensure_mined(&receipt, "submitBlacklistChallenge")?;
 
-        self.extract_slash_id(
-            receipt.inner.logs(),
-            "submitRateChallenge",
-            Some((Offense::RateManipulation, evidence_hash)),
-        )
+        self.extract_slash_id(receipt.inner.logs(), evidence_hash)
     }
 
     /// Extract the `SlashJudge.Slashed` `slashId` from a reveal receipt's logs,
@@ -1719,8 +1736,8 @@ impl ChainFixture {
     ///    surfaced as the ABI mismatch it is, rather than swallowed by an
     ///    `if let Ok(..)` that bails "emitted no Slashed event" and points at the
     ///    contract when the cause is a stale hand-written binding;
-    ///  * when `expected` is supplied, the decoded `offenseType` and
-    ///    `evidenceHash` must match, pinning "slashed for the reason we induced"
+    ///  * the decoded `offenseType` must be `Blacklist` and the `evidenceHash`
+    ///    must be `evidence_hash`, pinning "slashed for the reason we induced"
     ///    inside the fixture instead of leaving it to each journey.
     ///
     /// `CapacityBond.Slashed` is emitted in the same tx but under a different
@@ -1728,9 +1745,9 @@ impl ChainFixture {
     fn extract_slash_id(
         &self,
         logs: &[alloy::rpc::types::Log],
-        what: &str,
-        expected: Option<(Offense, B256)>,
+        evidence_hash: B256,
     ) -> anyhow::Result<U256> {
+        let what = "submitBlacklistChallenge";
         for log in logs {
             if log.address() != self.addrs.slash_judge
                 || log.topic0() != Some(&SlashJudge::Slashed::SIGNATURE_HASH)
@@ -1740,21 +1757,19 @@ impl ChainFixture {
             let ev = SlashJudge::Slashed::decode_log_data(&log.inner.data).with_context(|| {
                 format!("{what}: a SlashJudge Slashed log failed to decode (ABI drift?)")
             })?;
-            if let Some((offense, evidence_hash)) = expected {
-                // `OffenseType` (a generated `sol!` enum) derives neither
-                // `PartialEq` nor `Debug`, so compare the canonical u8
-                // discriminants — the same encoding folded into `evidenceHash`.
-                let got = ev.offenseType as u8;
-                let want = offense.discriminant();
-                anyhow::ensure!(
-                    got == want,
-                    "{what}: slashed for offenseType {got}, but induced {want}",
-                );
-                anyhow::ensure!(
-                    ev.evidenceHash == evidence_hash,
-                    "{what}: slashed on a different evidenceHash than the one induced",
-                );
-            }
+            // `OffenseType` (a generated `sol!` enum) derives neither
+            // `PartialEq` nor `Debug`, so compare the canonical u8
+            // discriminants — the same encoding folded into `evidenceHash`.
+            let got = ev.offenseType as u8;
+            let want = SlashJudge::OffenseType::Blacklist as u8;
+            anyhow::ensure!(
+                got == want,
+                "{what}: slashed for offenseType {got}, but induced {want}",
+            );
+            anyhow::ensure!(
+                ev.evidenceHash == evidence_hash,
+                "{what}: slashed on a different evidenceHash than the one induced",
+            );
             return Ok(ev.slashId);
         }
         anyhow::bail!("{what} mined but emitted no SlashJudge Slashed event")
@@ -1792,128 +1807,6 @@ impl ChainFixture {
             .context("challenger token.approve receipt")?;
         crate::ensure_mined(&approve, "challenger token.approve")?;
         Ok(bond)
-    }
-
-    /// Drive a `SlashJudge` commit-reveal challenge from **caller-supplied**
-    /// evidence — a [`SignedProbe`] and the real signed `StreamResponse` a live
-    /// daemon produced (#1042, G-GOV-03).
-    ///
-    /// The sibling of [`Self::slash_operator_via_judge`], which synthesises its
-    /// own evidence and signs it with the operator key the test happens to hold.
-    /// That is exactly what `SlashJudge.t.sol` can already do; what it cannot do
-    /// is prove the *daemon's* signing path emits court-admissible bytes. So this
-    /// one takes the wire messages verbatim — including `slash_sig`, which it
-    /// never re-signs — and is therefore also the entry point for the negatives
-    /// (forged signature, out-of-window pair), which are just the same call with
-    /// one field of the real evidence perturbed.
-    ///
-    /// Handles the `_verifyPair` offense [`Offense::RateManipulation`]
-    /// (`stream.ok && stream.rate_per_mb > probe.rate_per_mb`). `salt` is
-    /// caller-supplied so two challenges in one journey cannot collide on a
-    /// commitment slot.
-    ///
-    /// Returns the minted `slashId`. An `Err` here is the *whole point* for the
-    /// negative cases: a challenge that fails verification reverts, and per
-    /// [ADR 014 § Bond Handling](https://github.com/decdn/decdn/blob/main/adr/014-on-chain-verification.md) the
-    /// bond is never transferred on a failed verification — assert the
-    /// challenger's TOKEN balance directly.
-    ///
-    /// **Side effect:** advances chain time ~65s on *every* call, including ones
-    /// that revert, to mature the commitment past `MIN_REVEAL_DELAY`. Chain time
-    /// only drifts *ahead* of the wall clock, so a daemon capture between
-    /// challenges must NOT anchor on [`Self::head_timestamp`] — the daemon
-    /// refuses a timestamp more than its clock-skew bound from the wall clock.
-    /// Stamp daemon captures from the wall clock (which evidence then ages
-    /// against the evidence-age ceiling); read chain time only for evidence
-    /// built and signed locally in the test.
-    pub async fn challenge_with_real_evidence(
-        &self,
-        challenger: &PrivateKeySigner,
-        operator: Address,
-        node_id: B256,
-        offense: Offense,
-        evidence: EvidencePair<'_>,
-        salt: B256,
-    ) -> anyhow::Result<U256> {
-        let EvidencePair { probe, stream } = evidence;
-        let bond = self.arm_challenger(challenger).await?;
-        anyhow::ensure!(bond > U256::ZERO, "challenge bond must be non-zero");
-        let ch_provider = self.provider_for(challenger);
-
-        // Rebuild the EIP-712 struct hashes from the wire bodies with the same
-        // production signers the daemon used, so the commitment binds the exact
-        // messages the reveal submits.
-        let probe_data = probe.body;
-        let stream_data = StreamSlashData::from_response_body(&stream.body);
-        // Keyed on the challenged operator and the stream alone, mirroring
-        // `SlashJudge._verifyPair`.
-        let evidence_hash = keccak256(
-            (
-                U256::from(offense.discriminant()),
-                operator,
-                stream_data.struct_hash(),
-            )
-                .abi_encode(),
-        );
-        let commitment = keccak256((evidence_hash, salt, challenger.address()).abi_encode());
-
-        let judge = SlashJudge::new(self.addrs.slash_judge, &ch_provider);
-        let commit = judge
-            .commitChallenge(commitment)
-            .send()
-            .await
-            .context("commitChallenge send")?
-            .get_receipt()
-            .await
-            .context("commitChallenge receipt")?;
-        crate::ensure_mined(&commit, "commitChallenge")?;
-
-        // Mature past MIN_REVEAL_DELAY (1 minute) with margin.
-        crate::time::increase_time(&self.admin, 65).await?;
-
-        let probe_msg = SlashJudge::ProbeMsg {
-            hash: probe_data.hash,
-            hasBlob: probe_data.has_blob,
-            ratePerMb: probe_data.rate_per_mb,
-            timestampUs: probe_data.timestamp_us,
-        };
-        let stream_msg = SlashJudge::StreamMsg {
-            hash: stream_data.hash,
-            ok: stream_data.ok,
-            ratePerMb: stream_data.rate_per_mb,
-            timestampUs: stream_data.timestamp_us,
-        };
-        // The daemon's own signatures, forwarded byte-for-byte.
-        let probe_sig = Bytes::from(probe.slash_sig.clone());
-        let stream_sig = Bytes::from(stream.slash_sig.clone());
-        let probe_bytes = Bytes::from(probe_msg.abi_encode());
-        let stream_bytes = Bytes::from(stream_msg.abi_encode());
-
-        let pending = match offense {
-            Offense::RateManipulation => {
-                crate::bindings::SlashJudgeRate::new(self.addrs.slash_judge, &ch_provider)
-                    .submitRateChallenge(
-                        operator,
-                        node_id,
-                        probe_bytes,
-                        probe_sig,
-                        stream_bytes,
-                        stream_sig,
-                        salt,
-                    )
-                    .send()
-                    .await
-            }
-        };
-        let what = offense.entry_point();
-        let receipt = pending
-            .with_context(|| format!("{what} send"))?
-            .get_receipt()
-            .await
-            .with_context(|| format!("{what} receipt"))?;
-        crate::ensure_mined(&receipt, what)?;
-
-        self.extract_slash_id(receipt.inner.logs(), what, Some((offense, evidence_hash)))
     }
 
     /// `CapacityBond.escrowedTotal()` — TOKEN currently parked in slash escrow.

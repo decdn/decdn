@@ -1214,16 +1214,14 @@ pub struct DecdnMetrics {
     /// provider's reputation. A sustained rate
     /// means this node's ceiling is below the content it is trying to warm.
     pub node_pull_too_large: Counter,
-    /// `decdn_node_pull_rate_above_ceiling_total` (#1375): a selected upstream
-    /// signed an open-stage `StreamResponse` quoting a per-MB rate above this
-    /// node's effective buyer ceiling (the lower of the candidate's discovery rate and
-    /// the configured `cache.max_rate_per_mb`), so the buyer refused before paying
-    /// any voucher. Sibling of [`Self::node_pull_too_large`]: a buyer-side policy
-    /// decision that does NOT tar the provider (an over-*config* quote is our tight
-    /// policy; an over-*discovery* quote is a possible bait-and-switch we do not
-    /// adjudicate here). A sustained rate is the operator's signal that nodes
-    /// quote above their discovery rate — the one refusal on this path that
-    /// guards a slashable offense, so it earns a counter of its own.
+    /// `decdn_node_pull_rate_above_ceiling_total` (#1375): an upstream signed a
+    /// `StreamResponse` quoting a per-MB rate above this node's effective buyer
+    /// ceiling (the configured `cache.max_rate_per_mb`, lowered by the
+    /// serve-economics buy cap when one applies), so the buyer refused before
+    /// paying any voucher. Sibling of [`Self::node_pull_too_large`]: a buyer-side
+    /// policy decision that does NOT tar the provider, because the ceiling is this
+    /// node's own policy. A sustained rate is the operator's signal that the
+    /// upstreams it finds quote above what it is configured to pay.
     pub node_pull_rate_above_ceiling: Counter,
     /// `decdn_serve_economics_refused_total` (ADR 041): candidates existed for a
     /// cache-miss buy but every one quoted above this node's serve-economics buy

@@ -362,7 +362,7 @@ export interface BuyerPoolsResponse {
 export interface SlashRecordDto {
   /** A `uint256`, in decimal. */
   slash_id: string;
-  /** `0` rate manipulation, `1` blacklist. */
+  /** `0` blacklist. */
   offense_type: number;
   /** TOKEN base units, in decimal. */
   amount: string;

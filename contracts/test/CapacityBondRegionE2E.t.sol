@@ -351,7 +351,7 @@ contract CapacityBondRegionE2ETest is Test {
         // no commitment is needed; `salt` is still a required argument (#854).
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, true, SALT);
+        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, SALT);
         assertEq(bond.lifetimeOffenseCount(REG_OPERATOR), 0);
     }
 
@@ -402,7 +402,7 @@ contract CapacityBondRegionE2ETest is Test {
         bytes memory sig = _signStream(judge, s);
 
         bytes32 evidenceHash = keccak256(
-            abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), REG_OPERATOR, _streamStructHash(judge, s), true)
+            abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), REG_OPERATOR, _streamStructHash(judge, s))
         );
         vm.prank(challenger);
         judge.commitChallenge(keccak256(abi.encode(evidenceHash, SALT, challenger)));
@@ -410,7 +410,7 @@ contract CapacityBondRegionE2ETest is Test {
         vm.warp(block.timestamp + REVEAL_DELAY + 1);
 
         vm.prank(challenger);
-        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, true, SALT);
+        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, SALT);
     }
 
     function _stream(uint64 tsUs) internal pure returns (SlashJudge.StreamMsg memory) {
