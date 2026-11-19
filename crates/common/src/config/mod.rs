@@ -1127,7 +1127,8 @@ fn resolve_rpc_url(
 /// Resolve the `[[blockchain.payment_chains]]` entries. At least one entry;
 /// each names an http(s) `rpc_url`, a nonzero `chain_id` no other entry
 /// names, and at least one nonzero, checksummed `PaymentPool` address no
-/// other entry or position names. Problems record under
+/// other entry or position names. All entries together name at most
+/// [`decdn_protocol::MAX_PAYMENT_POOLS`] pools. Problems record under
 /// `blockchain.payment_chains[i].<field>`.
 fn resolve_payment_chains(
     entries: &[types::PaymentChainConfig],
@@ -1206,6 +1207,19 @@ fn resolve_payment_chains(
             payment_pools,
         });
     }
+    // Every stream answer lists the pools a node accepts, and a receiver keeps
+    // the first `MAX_PAYMENT_POOLS` of them (ADR 005 § Payment pool routing).
+    let pools: usize = out.iter().map(|chain| chain.payment_pools.len()).sum();
+    bag.check_with(
+        pools <= decdn_protocol::MAX_PAYMENT_POOLS,
+        "blockchain.payment_chains",
+        || {
+            format!(
+                "blockchain.payment_chains lists {pools} payment pools; name at most {}",
+                decdn_protocol::MAX_PAYMENT_POOLS
+            )
+        },
+    );
     out
 }
 

@@ -16242,6 +16242,56 @@ async fn an_open_on_a_hit_answers_its_quote_size_and_full_coverage() -> anyhow::
     Ok(())
 }
 
+/// An open the requester leaves without paying refreshes no eviction
+/// recency. Otherwise any peer could keep a blob resident for free with
+/// opens it cancels.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpaid_open_leaves_eviction_recency_alone() -> anyhow::Result<()> {
+    let (cache, hash, _cache_tmp) = cache_with_blob(&vec![0x72u8; 300_000]).await?;
+    let observer = cache.clone();
+    let last_access = || {
+        observer
+            .eviction_candidates()
+            .into_inner()
+            .get(&hash)
+            .copied()
+    };
+    let before = last_access().ok_or_else(|| anyhow::anyhow!("the blob is a candidate"))?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let view = Arc::new(ReadCountingPoolView::new(operator_addr()));
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_open_server(cache, store, Some(view as _), 16).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = StreamRequestExt {
+        pull_through: false,
+        ..binding_ext(&signer, client_node_id)?
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (_send, _recv, resp, _) =
+        open_and_read_answer(&conn, &whole_blob_request(*hash.as_bytes()), Some(&ext)).await?;
+    anyhow::ensure!(resp.body.ok, "a hit answers ok: true");
+    conn.close(0u32.into(), b"done");
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        eventually(Duration::from_secs(5), || last_access().is_some()).await,
+        "the blob is a candidate again once the open ends"
+    );
+    anyhow::ensure!(
+        last_access() == Some(before),
+        "an unpaid open must not refresh the blob's recency"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// Deterministic pseudo-random payload of `len` bytes and its pre-order
 /// outboard.
 fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, bytes::Bytes) {

@@ -4282,7 +4282,8 @@ struct StreamMeter {
     anchored_root: Option<B256>,
     /// The last proof THIS stream claimed money with, so a `VoucherRejected`
     /// read here whose reason refuses the proof
-    /// ([`VoucherRejectReason::refuses_proof`]) rewinds that proof and not
+    /// ([`VoucherRejectReason::refuses_proof`]), or a refusal at admission,
+    /// rewinds that proof and not
     /// whatever a sibling stream has done
     /// on the lane since (see [`PoolLedger::resolve_reject`]). `None` before the
     /// stream has claimed anything, and left alone by a re-anchor — which claims
@@ -4497,7 +4498,8 @@ impl StreamMeter {
 /// class as [`UpstreamRefused`] so a refusing peer is scored on its real class
 /// rather than the `Unreachable` catch-all (#1145 review). `before_delivery`
 /// says the stream had received no byte: the node refused it at its admission
-/// ([`UpstreamRefused::at_admission`]).
+/// ([`UpstreamRefused::at_admission`]) without taking the stream's proof, so
+/// that proof rewinds.
 fn voucher_rejection(
     ledger: &PoolLedger,
     meter: &StreamMeter,
@@ -4525,7 +4527,16 @@ fn voucher_rejection(
                 proof_generation,
             })
         }
-        other if before_delivery => anyhow::Error::new(UpstreamRefused::at_admission(other)),
+        other if before_delivery => {
+            // A refusal before the first byte comes from the node's admission,
+            // which refuses before it reads any proof the stream sent. The
+            // node never takes that proof, so rewind it, and only it: a
+            // sibling's proof on the shared lane stays committed.
+            if let Some(proof) = meter.last_proof {
+                ledger.resolve_reject(proof);
+            }
+            anyhow::Error::new(UpstreamRefused::at_admission(other))
+        }
         other => anyhow::Error::new(UpstreamRefused::mid_stream(other)),
     }
 }

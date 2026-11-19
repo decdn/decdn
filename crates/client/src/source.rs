@@ -480,8 +480,13 @@ impl<'a> PeerSource<'a> {
         // A place on the node's connection, held until the pull's first
         // voucher, so this command's opens never pass the node's bound on
         // streams with no voucher. Taken before the timestamp is stamped: a
-        // wait for a place must not age the request.
-        let permit = connections.open_permit(self.target.id).await?;
+        // wait for a place must not age the request. The wait runs under the
+        // open's budget, so a node whose places are all held times out.
+        let permit = crate::opened::permit_within(
+            self.deadlines.open,
+            connections.open_permit(self.target.id),
+        )
+        .await?;
         let args = crate::opened::OpenArgs {
             ctx,
             slash_domain: self.slash_domain,

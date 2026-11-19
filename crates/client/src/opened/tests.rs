@@ -184,6 +184,49 @@ async fn discovery_opens_on_one_node_wait_past_the_permit_bound() -> anyhow::Res
     Ok(())
 }
 
+/// The wait for a discovery place runs under the open's budget. While other
+/// streams hold every place on a node, an open times out with
+/// [`crate::PullTimeout`] instead of waiting without end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discovery_open_times_out_while_every_place_is_held() -> anyhow::Result<()> {
+    use crate::connection::MAX_DISCOVERY_OPENS_PER_NODE;
+    let (ep, conns) = client().await?;
+    let target = iroh::EndpointAddr::new(iroh::SecretKey::generate().public());
+    let mut held = Vec::new();
+    for _ in 0..MAX_DISCOVERY_OPENS_PER_NODE {
+        held.push(conns.discovery_permit(target.id).await?);
+    }
+    let open = Duration::from_millis(200);
+    let result = tokio::time::timeout(
+        OPEN,
+        discovery_open(
+            &conns,
+            &target,
+            Address::ZERO,
+            &ctx(1),
+            &domain(),
+            [0x42; 32],
+            decdn_protocol::client::NO_NAMESPACE,
+            (0, 0),
+            false,
+            open,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the open waited past its budget for a place"))?;
+    let Err(err) = result else {
+        anyhow::bail!("an open with no free place must not succeed");
+    };
+    anyhow::ensure!(
+        err.downcast_ref::<crate::PullTimeout>()
+            .is_some_and(|t| t.after == open),
+        "the open times out with its own budget: {err:#}"
+    );
+    drop(held);
+    ep.close().await;
+    Ok(())
+}
+
 /// Cancelling a stream resets it at the node, and the shared connection stays
 /// open: the next open on the node takes a new stream on it, with no dial.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

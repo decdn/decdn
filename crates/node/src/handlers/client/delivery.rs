@@ -221,10 +221,6 @@ impl ClientHandler {
         // proof across waits, so every proof read MUST go through it — a second
         // reader would lose bytes it read ahead.
         let mut reader = BufferedProofReader::default();
-        // Refresh recency before the first byte goes out, so a blob still
-        // carrying the open-time seed does not rank oldest for eviction while it
-        // streams. Recency only: the frequency sighting waits for `StreamEnd`.
-        self.cache.touch_recency(hash);
         self.deliver_loop(
             conn,
             send,
@@ -338,6 +334,12 @@ impl ClientHandler {
                 }
             }
         };
+        // Refresh recency once the stream is admitted and before the first
+        // byte goes out, so a blob still carrying the open-time seed does not
+        // rank oldest for eviction while it streams. An open the payer never
+        // takes refreshes nothing, so unpaid opens cannot keep a blob resident.
+        // Recency only: the frequency sighting waits for `StreamEnd`.
+        self.cache.touch_recency(hash);
         let Admitted {
             lane_key,
             lane,

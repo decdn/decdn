@@ -1066,6 +1066,43 @@ fn coverage_spans_needs_every_block_from_a_sized_holder() {
     );
 }
 
+/// A refusal of a span to the end states no size, so its receiver cannot judge
+/// its coverage. One that claims every block while it refuses the blob
+/// contradicts itself once another holder proves the size: it counts no
+/// block, and the union does not span, so the origin directory still joins.
+#[test]
+fn a_refusal_that_claims_every_block_does_not_close_the_union() {
+    let hash = [7u8; 32];
+    let size = 3 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
+    let blocks = |set: &[u32]| Coverage::from_block_indices(3, set.iter().copied());
+    let liar = || {
+        holder(
+            Coverage::full(decdn_protocol::coverage::MAX_COVERAGE_BLOCKS),
+            None,
+        )
+    };
+
+    assert!(
+        !coverage_spans(hash, &[holder(blocks(&[0]), Some(size)), liar()]),
+        "a refusal that claims every block counts none of them"
+    );
+    assert!(
+        !coverage_spans(hash, &[liar(), holder(blocks(&[1]), Some(size))]),
+        "the order the answers land in does not matter"
+    );
+    assert!(
+        coverage_spans(
+            hash,
+            &[
+                holder(blocks(&[0]), Some(size)),
+                liar(),
+                holder(blocks(&[1, 2]), None),
+            ]
+        ),
+        "a consistent partial refusal still joins the union beside it"
+    );
+}
+
 /// #2526: the empty blob spans zero discovery blocks, so no holder can report a
 /// block for the union to cover. For `EMPTY_ROOT` one admitted holder spans
 /// the blob. The rule keys on the requested hash, never on the unsigned

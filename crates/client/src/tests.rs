@@ -1654,8 +1654,7 @@ async fn a_refused_proof_still_rewinds_its_reveal() -> anyhow::Result<()> {
 /// A refusal class in a `StreamError` frame, which a node may write before
 /// the first `ChunkData` when it refuses admission at the first payment
 /// proof, is the same typed refusal a signed `ok: false` answer gives. It
-/// rewinds no proof, carries no signed response, and `Unfunded` still drives
-/// funding recovery.
+/// carries no signed response, and `Unfunded` still drives funding recovery.
 #[tokio::test]
 async fn a_refusal_frame_before_any_chunk_is_a_typed_refusal() -> anyhow::Result<()> {
     use decdn_protocol::client::StreamError;
@@ -1669,7 +1668,6 @@ async fn a_refusal_frame_before_any_chunk_is_a_typed_refusal() -> anyhow::Result
         (StreamError::Unfunded, true),
     ] {
         let (ledger, meter) = ledger_with_a_released_reveal().await?;
-        let before = ledger.committed();
         let err = super::voucher_rejection(&ledger, &meter, error.clone(), true);
         let refused = err
             .downcast_ref::<UpstreamRefused>()
@@ -1690,10 +1688,6 @@ async fn a_refusal_frame_before_any_chunk_is_a_typed_refusal() -> anyhow::Result
             refused.evidence().is_none(),
             "a bare frame carries no signed response"
         );
-        anyhow::ensure!(
-            ledger.committed() == before,
-            "{error:?} is no verdict on the proof"
-        );
         let fault = classify(&err);
         anyhow::ensure!(
             if unfunded {
@@ -1702,6 +1696,39 @@ async fn a_refusal_frame_before_any_chunk_is_a_typed_refusal() -> anyhow::Result
                 matches!(fault, Fault::Source)
             },
             "{error:?} classifies as a funding wait only when unfunded"
+        );
+    }
+    Ok(())
+}
+
+/// A refusal at admission rewinds the stream's own proof. The node refuses
+/// before it reads that proof, so leaving it committed would fold it into the
+/// next cumulative voucher on the lane, and the node could redeem bytes it
+/// never delivered. A refusal after delivered bytes is no verdict on the
+/// proof and rewinds nothing.
+#[tokio::test]
+async fn a_refusal_at_admission_rewinds_the_streams_proof() -> anyhow::Result<()> {
+    use decdn_protocol::client::StreamError;
+
+    for error in [
+        StreamError::NotFound,
+        StreamError::Declined,
+        StreamError::Unfunded,
+    ] {
+        let (ledger, meter) = ledger_with_a_released_reveal().await?;
+        let before = ledger.committed();
+        let _ = super::voucher_rejection(&ledger, &meter, error.clone(), true);
+        anyhow::ensure!(
+            ledger.committed().amount == before.amount - U256::from(10u64),
+            "{error:?} at admission gives back the stream's reveal"
+        );
+
+        let (ledger, meter) = ledger_with_a_released_reveal().await?;
+        let before = ledger.committed();
+        let _ = super::voucher_rejection(&ledger, &meter, error.clone(), false);
+        anyhow::ensure!(
+            ledger.committed() == before,
+            "{error:?} mid-stream is no verdict on the proof"
         );
     }
     Ok(())

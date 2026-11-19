@@ -199,6 +199,12 @@ pub(crate) enum OpenGather {
 /// the union as they stand. The union spans the blob only once some holder has
 /// proved a size, and only the blocks below that size count.
 ///
+/// A refusal that covers every block below the proven size contradicts
+/// itself: a node that holds every block serves the blob. Its receiver could
+/// not judge it when it arrived, because a refusal of a span to the end
+/// states no end (`StreamResponseExt::consistent_with`). The union judges it
+/// once a size is known and counts none of its blocks.
+///
 /// The empty blob ([`decdn_protocol::EMPTY_ROOT`]) spans zero blocks, so no
 /// holder reports a block for the union to cover. For that hash the union
 /// spans the blob once one holder is admitted (#2526). The rule keys on the
@@ -210,8 +216,11 @@ struct CoverageUnionTracker {
     /// Holders admitted so far, a holder that proved no size included. Read
     /// only when `empty_root` is set.
     holders: usize,
-    /// Covered discovery blocks seen so far.
+    /// Covered discovery blocks of the holders that proved a size.
     blocks: std::collections::BTreeSet<u32>,
+    /// The coverage of each holder that proved no size, judged against
+    /// `target` in [`Self::spans`].
+    sizeless: Vec<decdn_protocol::Coverage>,
     /// The largest block count any holder has proved for this blob.
     target: u32,
 }
@@ -223,6 +232,7 @@ impl CoverageUnionTracker {
             empty_root: hash_bytes == decdn_protocol::EMPTY_ROOT,
             holders: 0,
             blocks: std::collections::BTreeSet::new(),
+            sizeless: Vec::new(),
             target: 0,
         }
     }
@@ -239,11 +249,12 @@ impl CoverageUnionTracker {
     /// Fold `candidate`'s coverage into the union.
     fn add(&mut self, candidate: &Candidate) {
         self.holders += 1;
-        let holder_blocks = candidate.total_bytes_hint.map_or(u32::MAX, |bytes| {
-            let blocks = decdn_protocol::num_blocks(bytes);
-            self.target = self.target.max(blocks);
-            blocks
-        });
+        let Some(bytes) = candidate.total_bytes_hint else {
+            self.sizeless.push(candidate.coverage.clone());
+            return;
+        };
+        let holder_blocks = decdn_protocol::num_blocks(bytes);
+        self.target = self.target.max(holder_blocks);
         self.blocks.extend(
             candidate
                 .coverage
@@ -254,11 +265,20 @@ impl CoverageUnionTracker {
 
     /// Every block `0..target` is in the union. False while no holder has
     /// proved a size. For the empty root, true once one holder is admitted.
+    /// A holder that proved no size and covers every block counts none.
     fn spans(&self) -> bool {
         if self.empty_root {
             return self.holders > 0;
         }
-        self.target > 0 && (0..self.target).all(|block| self.blocks.contains(&block))
+        let consistent: Vec<&decdn_protocol::Coverage> = self
+            .sizeless
+            .iter()
+            .filter(|coverage| !(0..self.target).all(|block| coverage.covers(block)))
+            .collect();
+        self.target > 0
+            && (0..self.target).all(|block| {
+                self.blocks.contains(&block) || consistent.iter().any(|c| c.covers(block))
+            })
     }
 }
 

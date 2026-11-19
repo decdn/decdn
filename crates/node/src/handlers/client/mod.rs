@@ -1482,10 +1482,14 @@ impl ClientHandler {
             .collect()
     }
 
-    /// The `payment_pools` hint every answer carries: the pools this node
-    /// accepts ([`Self::accepted_pools`]), or `None` when it accepts none.
+    /// The `payment_pools` hint every answer carries: the first
+    /// [`decdn_protocol::MAX_PAYMENT_POOLS`] pools this node accepts
+    /// ([`Self::accepted_pools`]), or `None` when it accepts none. The limit
+    /// keeps the answer inside its frame; the config resolver refuses a node
+    /// that accepts more.
     pub(super) fn payment_pools_hint(&self) -> Option<Vec<decdn_protocol::PoolAccount>> {
-        let pools = self.accepted_pools();
+        let mut pools = self.accepted_pools();
+        pools.truncate(decdn_protocol::MAX_PAYMENT_POOLS);
         (!pools.is_empty()).then_some(pools)
     }
 

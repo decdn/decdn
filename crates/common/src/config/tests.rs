@@ -1368,6 +1368,44 @@ fn a_payment_chain_with_no_pool_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A node lists every pool it accepts in each stream answer, and a receiver
+/// keeps only the first `MAX_PAYMENT_POOLS`. A config past that limit would
+/// hide a pool the node serves, so it does not resolve, across chains too.
+#[test]
+fn more_than_max_payment_pools_is_refused() -> anyhow::Result<()> {
+    let pool = |i: usize| -> anyhow::Result<String> {
+        Ok(Address::repeat_byte(u8::try_from(i)?.saturating_add(0x10)).to_checksum(None))
+    };
+    let list = |range: std::ops::Range<usize>| -> anyhow::Result<String> {
+        Ok(range
+            .map(|i| pool(i).map(|p| format!("\"{p}\"")))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .join(", "))
+    };
+    let max = decdn_protocol::MAX_PAYMENT_POOLS;
+    let chains = |split: usize, total: usize| -> anyhow::Result<String> {
+        Ok(format!(
+            "[[blockchain.payment_chains]]\n\
+             rpc_url = \"https://base.example/rpc\"\n\
+             chain_id = 84532\n\
+             payment_pools = [{}]\n\
+             [[blockchain.payment_chains]]\n\
+             rpc_url = \"https://arb.example/rpc\"\n\
+             chain_id = 421614\n\
+             payment_pools = [{}]\n",
+            list(0..split)?,
+            list(split..total)?
+        ))
+    };
+    resolve_blockchain_toml(&blockchain_toml(&chains(max / 2, max)?))?;
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml(&chains(max / 2, max + 1)?)) else {
+        anyhow::bail!("{} pools must not resolve", max + 1);
+    };
+    let msg = format!("{err:#}");
+    anyhow::ensure!(msg.contains(&format!("at most {max}")), "{msg}");
+    Ok(())
+}
+
 #[test]
 fn a_duplicate_pool_is_refused() -> anyhow::Result<()> {
     let Err(err) = resolve_blockchain_toml(&blockchain_toml(&format!(

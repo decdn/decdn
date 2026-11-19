@@ -900,6 +900,21 @@ async fn handler_with_pool_view_and_freshness(
     view: Option<Arc<dyn crate::pool_view::PoolView>>,
     freshness: Option<crate::chain_freshness::ChainFreshness>,
 ) -> (Arc<ClientHandler>, tempfile::TempDir) {
+    handler_with_deps(metrics, |deps| {
+        if let Some(pool) = deps.pools.first_mut() {
+            pool.pool_view = view;
+        }
+        deps.chain_freshness = freshness;
+    })
+    .await
+}
+
+/// A handler on one accepted pool with no pool view, after `configure` edits
+/// its dependencies.
+async fn handler_with_deps(
+    metrics: &Arc<Metrics>,
+    configure: impl FnOnce(&mut ClientHandlerDeps),
+) -> (Arc<ClientHandler>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
         .await
@@ -932,12 +947,44 @@ async fn handler_with_pool_view_and_freshness(
         U256::ZERO,
         always_admit_shed(),
     );
-    if let Some(pool) = deps.pools.first_mut() {
-        pool.pool_view = view;
-    }
-    deps.chain_freshness = freshness;
+    configure(&mut deps);
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
+}
+
+/// Every answer lists the accepted pools, cut to `MAX_PAYMENT_POOLS`. A
+/// longer list would push the answer toward its frame limit, and a receiver
+/// keeps only the first `MAX_PAYMENT_POOLS` anyway.
+#[tokio::test]
+async fn the_payment_pools_hint_keeps_max_payment_pools() {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_with_deps(&metrics, |deps| {
+        for i in 1u8..10 {
+            deps.pools.push(PoolRoute::new(
+                decdn_incentive::Deployment {
+                    chain_id: TEST_DEPLOYMENT.chain_id,
+                    payment_pool: Address::repeat_byte(0x60 + i),
+                },
+                Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+                    as Arc<dyn PoolStateStore>,
+            ));
+        }
+    })
+    .await;
+    assert_eq!(handler.accepted_pools().len(), 10);
+    let hint = handler
+        .payment_pools_hint()
+        .expect("the node accepts pools");
+    assert_eq!(hint.len(), decdn_protocol::MAX_PAYMENT_POOLS);
+    let first: Vec<_> = handler
+        .accepted_pools()
+        .into_iter()
+        .take(decdn_protocol::MAX_PAYMENT_POOLS)
+        .collect();
+    assert_eq!(
+        hint, first,
+        "the hint keeps the first pools in configuration order"
+    );
 }
 
 /// Fix 1 (security): capability intake verifies the owner signature against

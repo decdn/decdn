@@ -497,6 +497,23 @@ pub(crate) async fn open_shared(
         .with_context(|| format!("after a redial; the pinned connection failed: {err:#}"))
 }
 
+/// Wait for an open's place on its node's connection (`permit`), under
+/// `open`. A node whose places are all held makes the open time out rather
+/// than wait without end.
+///
+/// # Errors
+///
+/// [`PullTimeout`] when no place frees within `open`, or the error the wait
+/// returns.
+pub(crate) async fn permit_within(
+    open: Duration,
+    permit: impl Future<Output = anyhow::Result<crate::connection::OpenPermit>>,
+) -> anyhow::Result<crate::connection::OpenPermit> {
+    tokio::time::timeout(open, permit)
+        .await
+        .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
+}
+
 /// `target`'s connection in `conns`, dialled when it has none, under `open`.
 async fn lease_conn(
     conns: &Connections,
@@ -552,7 +569,8 @@ async fn open_on_warm(
 /// work the node did before it answered.
 ///
 /// `open` bounds the dial, and again the exchange. Before either, the open
-/// waits for a discovery place on the target's connection in `conns`. The
+/// waits for a discovery place on the target's connection in `conns`, also
+/// under `open`. The
 /// stream holds it until it ends, or
 /// until its adopting pull sends its first voucher: a node resets the streams
 /// past its bound on one connection's streams with no voucher yet, so a
@@ -593,7 +611,7 @@ pub async fn discovery_open(
 ) -> anyhow::Result<OpenedStream> {
     // Taken before the timestamp is stamped: a wait for a permit must not
     // age the request.
-    let permit = conns.discovery_permit(target.id).await?;
+    let permit = permit_within(open, conns.discovery_permit(target.id)).await?;
     let args = OpenArgs {
         ctx,
         slash_domain,
