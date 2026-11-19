@@ -63,18 +63,23 @@ proptest! {
     /// A stream never pays for one byte twice: whatever the window and the
     /// frame sizes, it pays ahead of delivery, never beyond the bytes it is
     /// asked to deliver, and every delivered byte was paid before it was sent.
+    ///
+    /// A node cuts its frames by chunk group, so a frame is at least one chunk
+    /// group unless the credit or the tail cuts it shorter. A step that a
+    /// sliver of credit cuts short is followed by a payment, so the transfer
+    /// ends within two steps per chunk group.
     #[test]
     fn a_stream_never_pays_twice_for_the_same_bytes(
         total in 1u64..(40 * MIB),
         window in WINDOW_FLOOR_BYTES..(70 * MIB),
-        frames in proptest::collection::vec(1u64..(2 * MIB), 1..64),
+        frames in proptest::collection::vec(CHUNK_GROUP_BYTES..(2 * MIB), 1..64),
     ) {
         let mut left = total;
         let mut held = 0u64;
         let mut paid = 0u64;
         let mut received = 0u64;
         let mut frame = frames.iter().cycle();
-        for _ in 0..4096 {
+        for _ in 0..=2 * total.div_ceil(CHUNK_GROUP_BYTES) {
             if left == 0 {
                 break;
             }
@@ -85,6 +90,7 @@ proptest! {
             held += pay;
             // The node sends only while the stream's credit covers the frame.
             let len = (*frame.next().unwrap()).min(left).min(held);
+            prop_assert!(len > 0, "the stream stalled with {} bytes left", left);
             held -= len;
             received += len;
             left -= len;
